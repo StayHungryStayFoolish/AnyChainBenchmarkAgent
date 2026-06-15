@@ -52,6 +52,7 @@ Edit these values in `config/user_config.sh` before a production benchmark:
 | `NETWORK_INTERFACE` | Optional | Network interface name. Leave empty to auto-detect. |
 | `OBSERVABILITY_STACK_ENABLED` | Optional | When `true`, the benchmark entry script starts the read-only Prometheus/Grafana stack before benchmark traffic. Defaults to `false`. |
 | `OBSERVABILITY_STACK_AUTO_STOP` | Optional | When `true`, a stack started by the entry script is stopped during framework cleanup. Defaults to `true`. |
+| `OBSERVABILITY_STACK_MODE` | Optional | `local` starts exporter + local Prometheus/Grafana. `exporter` starts only the exporter for an existing Prometheus/Grafana environment. Defaults to `local`. |
 
 ## Optional Chain Sample Overrides
 

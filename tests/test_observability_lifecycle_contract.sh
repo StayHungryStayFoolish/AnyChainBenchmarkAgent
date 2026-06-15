@@ -9,6 +9,7 @@ from pathlib import Path
 
 entry = Path("blockchain_node_benchmark.sh").read_text()
 user_config = Path("config/user_config.sh").read_text()
+start_script = Path("deploy/observability/start.sh").read_text()
 
 required_entry_tokens = [
     "start_observability_stack()",
@@ -39,10 +40,19 @@ if stop_call > cleanup_temp:
 for token in [
     'OBSERVABILITY_STACK_ENABLED="${OBSERVABILITY_STACK_ENABLED:-false}"',
     'OBSERVABILITY_STACK_AUTO_STOP="${OBSERVABILITY_STACK_AUTO_STOP:-true}"',
-    "export OBSERVABILITY_STACK_ENABLED OBSERVABILITY_STACK_AUTO_STOP",
+    'OBSERVABILITY_STACK_MODE="${OBSERVABILITY_STACK_MODE:-local}"',
+    "export OBSERVABILITY_STACK_ENABLED OBSERVABILITY_STACK_AUTO_STOP OBSERVABILITY_STACK_MODE",
 ]:
     if token not in user_config:
         raise SystemExit(f"user_config observability token missing: {token}")
+
+for token in [
+    "OBSERVABILITY_STACK_MODE",
+    "--exporter-only",
+    "up -d exporter",
+]:
+    if token not in start_script:
+        raise SystemExit(f"start.sh observability mode token missing: {token}")
 
 print("observability lifecycle contract ok")
 PY

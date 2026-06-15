@@ -18,6 +18,57 @@ benchmark runtime files -> monitoring/prometheus_exporter.py -> Prometheus -> Gr
 - `prometheus`: scrapes the exporter
 - `grafana`: loads a pre-provisioned datasource and dashboard
 
+## Two Integration Modes
+
+### Mode 1: Local Stack
+
+Use this when you want the framework to start a self-contained local exporter,
+Prometheus, and Grafana stack:
+
+```bash
+OBSERVABILITY_STACK_ENABLED=true
+OBSERVABILITY_STACK_MODE=local
+OBSERVABILITY_STACK_AUTO_STOP=true
+```
+
+This mode is useful for single-host testing, demos, and users who do not
+already operate Prometheus/Grafana. The entrypoint starts the stack before
+benchmark traffic and stops it during cleanup when auto-stop is enabled.
+
+### Mode 2: Existing Prometheus/Grafana
+
+Use this when your environment already has Prometheus and Grafana. In this
+mode, the framework starts only the read-only exporter:
+
+```bash
+OBSERVABILITY_STACK_ENABLED=true
+OBSERVABILITY_STACK_MODE=exporter
+OBSERVABILITY_STACK_AUTO_STOP=true
+EXPORTER_PORT=9108
+```
+
+Then add a scrape job to your existing Prometheus. Replace
+`<benchmark-host>` with the host or service name where this framework runs:
+
+```yaml
+scrape_configs:
+  - job_name: blockchain-node-benchmark
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - <benchmark-host>:9108
+```
+
+In an existing Grafana deployment, add or reuse the Prometheus datasource, then
+import `deploy/observability/grafana/dashboards/blockchain-node-benchmark.json`
+or copy the panel queries from that dashboard.
+
+When the benchmark exits, `OBSERVABILITY_STACK_AUTO_STOP=true` stops the
+exporter. Your existing Prometheus keeps already-scraped time series according
+to its own retention policy, but it will not receive new samples after the
+exporter stops. The durable benchmark outputs remain in the framework archive
+and HTML reports.
+
 ## Start
 
 From the repository root:
@@ -120,6 +171,7 @@ Common overrides:
 ```bash
 OBSERVABILITY_STACK_ENABLED=true
 OBSERVABILITY_STACK_AUTO_STOP=true
+OBSERVABILITY_STACK_MODE=local
 BLOCKCHAIN_NODE=ethereum
 RPC_MODE=mixed
 EXPORTER_PORT=9108
@@ -137,6 +189,14 @@ The observability stack must remain optional:
 - it does not write benchmark runtime files;
 - it does not replace CSV/HTML reports;
 - exporter failure must not fail a benchmark run.
+
+Retention belongs to the Prometheus that scrapes the exporter:
+
+- Local-stack mode keeps Prometheus/Grafana volumes unless you run
+  `deploy/observability/stop.sh -v`.
+- Existing-Prometheus mode stores samples in the user's Prometheus. Stopping
+  the framework exporter only stops future scrapes; historical samples remain
+  until that Prometheus retention expires.
 
 The stack is controlled by `OBSERVABILITY_STACK_ENABLED=false` in
 `config/user_config.sh`. When enabled through the benchmark entry command, it is
