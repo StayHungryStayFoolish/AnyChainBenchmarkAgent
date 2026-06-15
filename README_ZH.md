@@ -189,6 +189,7 @@ Prometheus 和 Grafana，并默认在框架清理阶段自动停止。
 # config/user_config.sh
 OBSERVABILITY_STACK_ENABLED=true
 OBSERVABILITY_STACK_AUTO_STOP=true
+OBSERVABILITY_STACK_MODE=local   # local | exporter
 EXPORTER_PORT=9108
 PROMETHEUS_PORT=9091
 GRAFANA_PORT=3001
@@ -209,6 +210,12 @@ deploy/observability/stop.sh
 
 Docker Compose、路径覆盖和 dashboard 行为见
 [Prometheus / Grafana Observability](./deploy/observability/README.md)。
+
+如果用户已经有 Prometheus/Grafana，使用 `OBSERVABILITY_STACK_MODE=exporter`。
+该模式只启动只读 exporter，已有 Prometheus 抓取
+`http://<benchmark-host>:9108/metrics` 即可。框架停止后，已经被 Prometheus
+抓取的数据会继续保留在用户自己的 Prometheus 中，直到该 Prometheus 的 retention
+策略过期；停止 exporter 只会停止后续新样本。
 
 
 

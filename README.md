@@ -206,6 +206,7 @@ then stops the stack during framework cleanup by default.
 # config/user_config.sh
 OBSERVABILITY_STACK_ENABLED=true
 OBSERVABILITY_STACK_AUTO_STOP=true
+OBSERVABILITY_STACK_MODE=local   # local | exporter
 EXPORTER_PORT=9108
 PROMETHEUS_PORT=9091
 GRAFANA_PORT=3001
@@ -226,6 +227,12 @@ Open:
 
 See [Prometheus / Grafana Observability](./deploy/observability/README.md)
 for Docker Compose details, path overrides, and dashboard behavior.
+
+Use `OBSERVABILITY_STACK_MODE=exporter` when you already have
+Prometheus/Grafana. In that mode the framework starts only the read-only
+exporter, and your Prometheus should scrape `http://<benchmark-host>:9108/metrics`.
+Already-scraped data remains in your Prometheus after the framework stops,
+subject to your Prometheus retention policy.
 
 
 
