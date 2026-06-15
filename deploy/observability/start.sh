@@ -29,6 +29,16 @@ export BENCHMARK_DATA_DIR="${BENCHMARK_DATA_DIR:-${DEPLOYMENT_ROOT}/blockchain-n
 export BENCHMARK_MEMORY_DIR="${BENCHMARK_MEMORY_DIR:-${BENCHMARK_DATA_DIR}/current/memory}"
 mkdir -p "$BENCHMARK_DATA_DIR/current/logs" "$BENCHMARK_MEMORY_DIR"
 
+if ! command -v docker >/dev/null 2>&1; then
+  echo "Docker is required to start the optional observability stack." >&2
+  exit 1
+fi
+
+if ! docker compose version >/dev/null 2>&1; then
+  echo "Docker Compose v2 is required to start the optional observability stack." >&2
+  exit 1
+fi
+
 docker compose -f deploy/observability/docker-compose.yml up -d
 
 cat <<EOF

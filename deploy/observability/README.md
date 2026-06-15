@@ -3,9 +3,10 @@
 This directory contains an optional local observability stack for
 blockchain-node-benchmark.
 
-It is disabled by default and is not part of the benchmark runtime lifecycle.
-The stack reads the framework's existing output files through the read-only
-exporter:
+It is disabled by default. When `OBSERVABILITY_STACK_ENABLED=true`, the
+benchmark entry script starts it before benchmark traffic begins and stops it
+during framework cleanup by default. The stack reads the framework's existing
+output files through the read-only exporter:
 
 ```text
 benchmark runtime files -> monitoring/prometheus_exporter.py -> Prometheus -> Grafana
@@ -29,9 +30,11 @@ Or set the switch once in `config/user_config.sh`:
 
 ```bash
 OBSERVABILITY_STACK_ENABLED=true
+OBSERVABILITY_STACK_AUTO_STOP=true
 ```
 
-Then run:
+Then either run the benchmark entry script, which starts and stops the stack
+automatically, or start the stack manually:
 
 ```bash
 deploy/observability/start.sh
@@ -116,6 +119,7 @@ Common overrides:
 
 ```bash
 OBSERVABILITY_STACK_ENABLED=true
+OBSERVABILITY_STACK_AUTO_STOP=true
 BLOCKCHAIN_NODE=ethereum
 RPC_MODE=mixed
 EXPORTER_PORT=9108
@@ -135,5 +139,5 @@ The observability stack must remain optional:
 - exporter failure must not fail a benchmark run.
 
 The stack is controlled by `OBSERVABILITY_STACK_ENABLED=false` in
-`config/user_config.sh`. The benchmark entry command does not start it
-automatically.
+`config/user_config.sh`. When enabled through the benchmark entry command, it is
+stopped automatically if `OBSERVABILITY_STACK_AUTO_STOP=true`.
