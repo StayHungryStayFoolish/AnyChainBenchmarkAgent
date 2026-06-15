@@ -50,6 +50,8 @@ Edit these values in `config/user_config.sh` before a production benchmark:
 | `ACCOUNTS_VOL_*` | Optional | Account/state disk type, size, IOPS, and throughput baselines. Used only when `ACCOUNTS_DEVICE` is set. |
 | `NETWORK_MAX_BANDWIDTH_GBPS` | Yes for network charts | Instance network bandwidth in Gbps. |
 | `NETWORK_INTERFACE` | Optional | Network interface name. Leave empty to auto-detect. |
+| `OBSERVABILITY_STACK_ENABLED` | Optional | When `true`, the benchmark entry script starts the read-only Prometheus/Grafana stack before benchmark traffic. Defaults to `false`. |
+| `OBSERVABILITY_STACK_AUTO_STOP` | Optional | When `true`, a stack started by the entry script is stopped during framework cleanup. Defaults to `true`. |
 
 ## Optional Chain Sample Overrides
 

@@ -129,6 +129,48 @@ MONITORING_PIDS=()
 TEST_SESSION_ID="session_${SESSION_TIMESTAMP}"
 BOTTLENECK_DETECTED=false
 BOTTLENECK_INFO=""
+OBSERVABILITY_STACK_STARTED=false
+
+start_observability_stack() {
+    [[ "${OBSERVABILITY_STACK_ENABLED:-false}" == "true" ]] || return 0
+
+    local start_script="${SCRIPT_DIR}/deploy/observability/start.sh"
+    if [[ ! -x "$start_script" ]]; then
+        echo "⚠️  Observability stack enabled but start script is not executable: $start_script"
+        return 0
+    fi
+
+    echo "📈 Starting optional Prometheus/Grafana observability stack..."
+    if BENCHMARK_DATA_DIR="${BENCHMARK_DATA_DIR:-$BASE_DATA_DIR}" \
+       BENCHMARK_MEMORY_DIR="${BENCHMARK_MEMORY_DIR:-$MEMORY_SHARE_DIR}" \
+       "$start_script"; then
+        OBSERVABILITY_STACK_STARTED=true
+        echo "✅ Observability stack startup command completed"
+    else
+        echo "⚠️  Observability stack startup failed; continuing benchmark without Prometheus/Grafana"
+    fi
+}
+
+stop_observability_stack() {
+    [[ "${OBSERVABILITY_STACK_STARTED:-false}" == "true" ]] || return 0
+    [[ "${OBSERVABILITY_STACK_AUTO_STOP:-true}" == "true" ]] || return 0
+
+    local stop_script="${SCRIPT_DIR}/deploy/observability/stop.sh"
+    if [[ ! -x "$stop_script" ]]; then
+        echo "⚠️  Observability stack auto-stop requested but stop script is not executable: $stop_script"
+        return 0
+    fi
+
+    echo "🧹 Stopping optional Prometheus/Grafana observability stack..."
+    if BENCHMARK_DATA_DIR="${BENCHMARK_DATA_DIR:-$BASE_DATA_DIR}" \
+       BENCHMARK_MEMORY_DIR="${BENCHMARK_MEMORY_DIR:-$MEMORY_SHARE_DIR}" \
+       "$stop_script"; then
+        OBSERVABILITY_STACK_STARTED=false
+        echo "✅ Observability stack stopped"
+    else
+        echo "⚠️  Observability stack stop failed; please run deploy/observability/stop.sh manually"
+    fi
+}
 
 # Cleanup function
 cleanup_framework() {
@@ -150,6 +192,9 @@ cleanup_framework() {
 
     # Stop monitoring system
     stop_monitoring_system || true
+
+    # Stop optional observability stack if this entrypoint started it.
+    stop_observability_stack || true
 
     # Clean up temporary files
     cleanup_temp_files
@@ -1102,6 +1147,11 @@ main() {
     # Optional fake-node test mode (disabled by default; enabled only with --fake-node).
     # Must run before check_deployment because it points LOCAL_RPC_URL to local fake-node.
     start_fake_node_for_testing
+
+    # Optional read-only Prometheus/Grafana stack. Start after runtime paths are
+    # initialized so the exporter can read the same data and memory directories
+    # as the benchmark.
+    start_observability_stack
 
     echo "🚀 Starting Blockchain Node Performance Benchmark Framework"
     echo "   RPC mode: $RPC_MODE"

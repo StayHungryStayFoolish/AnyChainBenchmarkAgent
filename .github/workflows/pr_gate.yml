@@ -174,6 +174,7 @@ jobs:
           python3 tests/test_disk_visualization_synthetic.py
           python3 tests/test_mock_bottleneck_report.py
           python3 tests/test_prometheus_exporter.py
+          bash tests/test_observability_lifecycle_contract.sh
 
   monitoring-contracts:
     name: monitoring lifecycle and runtime file contracts

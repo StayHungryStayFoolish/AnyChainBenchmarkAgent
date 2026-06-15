@@ -110,6 +110,7 @@ Edit `config/user_config.sh` before running real benchmarks:
 BLOCKCHAIN_NODE="solana"
 RPC_MODE="single"
 LOCAL_RPC_URL="http://localhost:8899"
+MAINNET_RPC_URL=""
 
 BLOCKCHAIN_PROCESS_NAMES=(
     "agave-validator"
@@ -164,6 +165,20 @@ runner with the same `config/user_config.sh` configuration:
 
 Use fake-node when you want to validate chain templates, proxy extraction,
 fixtures, per-method attribution, and HTML output without a real chain node.
+This path requires the Go toolchain because the entry script builds
+`tools/fake-node` locally.
+
+```bash
+BLOCKCHAIN_NODE=solana \
+RPC_MODE=single \
+QUICK_INITIAL_QPS=1 \
+QUICK_MAX_QPS=1 \
+QUICK_QPS_STEP=1 \
+QUICK_DURATION=3 \
+QPS_WARMUP_DURATION=0 \
+QPS_COOLDOWN=0 \
+./blockchain_node_benchmark.sh --quick --single --fake-node
+```
 
 See [Local closed-loop testing with fake-node](./docs/en/local-closed-loop-testing.md).
 
@@ -179,6 +194,38 @@ are archived after the run. The key outputs are:
 
 Prometheus/Grafana is disabled by default. Enable it only when you want the
 optional read-only observability stack.
+
+### 5. Optional Prometheus/Grafana
+
+The optional stack is controlled by `OBSERVABILITY_STACK_ENABLED` in
+`config/user_config.sh`. When enabled, the benchmark entry script starts the
+read-only exporter, Prometheus, and Grafana before benchmark traffic begins,
+then stops the stack during framework cleanup by default.
+
+```bash
+# config/user_config.sh
+OBSERVABILITY_STACK_ENABLED=true
+OBSERVABILITY_STACK_AUTO_STOP=true
+EXPORTER_PORT=9108
+PROMETHEUS_PORT=9091
+GRAFANA_PORT=3001
+```
+
+You can also start or stop it manually:
+
+```bash
+deploy/observability/start.sh
+deploy/observability/stop.sh
+```
+
+Open:
+
+- Exporter: `http://localhost:9108/metrics`
+- Prometheus: `http://localhost:9091`
+- Grafana: `http://localhost:3001`
+
+See [Prometheus / Grafana Observability](./deploy/observability/README.md)
+for Docker Compose details, path overrides, and dashboard behavior.
 
 
 
@@ -196,13 +243,13 @@ LOCAL_RPC_URL="http://localhost:8899"  # Your blockchain node RPC endpoint
 MAINNET_RPC_URL=""                     # Optional reference endpoint override; empty uses config/chains defaults
 
 # 2. Blockchain Type (Required)
-BLOCKCHAIN_NODE="solana"  # One of config/chains/*.json, e.g. solana, ethereum, bitcoin, cosmos-hub
-RPC_MODE="single"         # Options: single | mixed
+BLOCKCHAIN_NODE="solana"               # One of config/chains/*.json, e.g. solana, ethereum, bitcoin, cosmos-hub
+RPC_MODE="single"                      # Options: single | mixed
 
 # 3. Blockchain Process Names (Required for monitoring)
 BLOCKCHAIN_PROCESS_NAMES=(
-    "agave-validator"    # Your actual blockchain node process name or command-line keyword
-    "solana-validator"   # Add every possible name used by your deployment
+    "agave-validator"                  # Your actual blockchain node process name or command-line keyword
+    "solana-validator"                 # Add every possible name used by your deployment
     "validator"
 )
 # Check your process name with: ps aux | grep -i validator
@@ -224,22 +271,22 @@ runtime. You can also set `DEPLOYMENT_MODE` explicitly.
 CLOUD_PROVIDER="gcp"                  # Options: gcp | aws | azure | other
 CLOUD_REGION="us-central1"            # Example: us-central1, ap-east-1
 CLOUD_ZONE="us-central1-a"            # Optional outside GCP
-MACHINE_TYPE="c3-standard-22"          # Example: c3-standard-22, m7i.4xlarge
+MACHINE_TYPE="c3-standard-22"         # Example: c3-standard-22, m7i.4xlarge
 
 # 5. DATA Device Configuration (Required)
-LEDGER_DEVICE="sdb"                  # DATA device name (check with 'lsblk')
-DATA_VOL_TYPE="hyperdisk-extreme"    # Examples: hyperdisk-extreme, hyperdisk-balanced, pd-ssd, gp3, io2, instance-store
-DATA_VOL_MAX_IOPS="30000"            # Provisioned disk IOPS or equivalent baseline
-DATA_VOL_MAX_THROUGHPUT="700"        # Provisioned disk throughput (MiB/s)
+LEDGER_DEVICE="sdb"                   # DATA device name (check with 'lsblk')
+DATA_VOL_TYPE="hyperdisk-extreme"     # Examples: hyperdisk-extreme, hyperdisk-balanced, pd-ssd, gp3, io2, instance-store
+DATA_VOL_MAX_IOPS="30000"             # Provisioned disk IOPS or equivalent baseline
+DATA_VOL_MAX_THROUGHPUT="700"         # Provisioned disk throughput (MiB/s)
 
 # 6. ACCOUNTS Device (Optional, but recommended for complete monitoring)
-ACCOUNTS_DEVICE="sdc"                # Optional ACCOUNTS device name; leave empty for single-disk nodes
+ACCOUNTS_DEVICE="sdc"                 # Optional ACCOUNTS device name; leave empty for single-disk nodes
 ACCOUNTS_VOL_TYPE="hyperdisk-extreme" # Examples: hyperdisk-extreme, hyperdisk-balanced, pd-ssd, gp3, io2, instance-store
-ACCOUNTS_VOL_MAX_IOPS="30000"        # ACCOUNTS disk provisioned IOPS or equivalent baseline
-ACCOUNTS_VOL_MAX_THROUGHPUT="700"    # ACCOUNTS disk throughput (MiB/s)
+ACCOUNTS_VOL_MAX_IOPS="30000"         # ACCOUNTS disk provisioned IOPS or equivalent baseline
+ACCOUNTS_VOL_MAX_THROUGHPUT="700"     # ACCOUNTS disk throughput (MiB/s)
 
 # 7. Network Configuration
-NETWORK_MAX_BANDWIDTH_GBPS=25        # Your instance's network bandwidth (Gbps)
+NETWORK_MAX_BANDWIDTH_GBPS=25         # Your instance's network bandwidth (Gbps)
 ```
 
 Some chains use optional auxiliary endpoints for indexers, REST/LCD APIs,
@@ -681,6 +728,11 @@ runtime path.
 #### Chain Extension and Closed-Loop Testing
 - [How to add a chain or RPC method](./docs/en/how-to-add-chain.md)
 - [Local closed-loop testing with fake-node](./docs/en/local-closed-loop-testing.md)
+
+Language-specific documentation indexes:
+
+- [English documentation index](./docs/en/README.md)
+- [Chinese documentation index](./docs/zh/README.md)
 
 ## ⚙️ Configuration Reference
 
