@@ -73,6 +73,22 @@ authentication:
 | `GOOGLE_APPLICATION_CREDENTIALS` | Optional fallback | Local service-account JSON path. Prefer ADC or impersonation in enterprise environments. |
 | `OPENAI_API_KEY` | Required only for OpenAI | API key for `LLM_PROVIDER=openai`. |
 
+## Optional Agent Chat Memory Configuration
+
+The terminal Agent can compact long chat sessions into `.agent/chat/memory.json`.
+Defaults assume modern long-context models while keeping a turn-count safety
+guard for local REPL usability.
+
+| Variable | Required | Description |
+| --- | --- | --- |
+| `AGENT_CONTEXT_WINDOW_TOKENS` | Optional | Default context window used by the chat compactor. Defaults to `1000000`. |
+| `AGENT_COMPACT_TRIGGER_RATIO` | Optional | Auto-compact when estimated tokens reach `context_window * ratio`. Defaults to `0.7`. |
+| `AGENT_COMPACT_TURN_THRESHOLD` | Optional | Auto-compact after this many chat turns even if token usage is low. Defaults to `40`. |
+| `AGENT_COMPACT_KEEP_RECENT_TURNS` | Optional | Number of raw recent turns kept after compaction. Defaults to `8`. |
+
+Token usage is estimated locally with an approximate 4 characters per token
+unless a future provider-specific tokenizer is added.
+
 Check the configuration without calling a model:
 
 ```bash

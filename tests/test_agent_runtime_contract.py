@@ -8,6 +8,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 AGENT = REPO / "agent" / "cli.py"
+AGENT_BIN = REPO / "bin" / "anychain-agent"
 sys.path.insert(0, str(REPO / "agent"))
 
 from discovery.environment import discover_environment  # noqa: E402
@@ -15,7 +16,9 @@ from knowledge.framework_capabilities import load_framework_capabilities  # noqa
 from llm.config import load_llm_config  # noqa: E402
 from llm.google_auth import credential_plan  # noqa: E402
 from llm.providers import provider_from_config  # noqa: E402
+from memory.compactor import compact_session_state, should_auto_compact  # noqa: E402
 from runners.guardrails import validate_execution_plan  # noqa: E402
+from chat import ChatSession  # noqa: E402
 from wizard import run_wizard  # noqa: E402
 
 
@@ -327,6 +330,102 @@ class AgentRuntimeContractTest(unittest.TestCase):
             new_chain_gap = run_agent("ask", "--prompt", "How do I add new chain foochain?")
             self.assertEqual(new_chain_gap["intent"], "framework_question")
             self.assertIn("chain_template", {gap["type"] for gap in new_chain_gap["gap_analysis"]["gaps"]})
+
+    def test_terminal_chat_agent_entrypoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            chat_dir = Path(tmp) / "chat"
+            session = ChatSession(output_dir=chat_dir)
+            answer = session.handle("How many chains and RPC methods are supported?")
+            self.assertIn("Current chain templates define", answer)
+
+            plan_answer = session.handle("Create a Solana fake-node smoke benchmark at 1 QPS")
+            self.assertIn("Created a benchmark plan", plan_answer)
+            self.assertIn("solana", plan_answer)
+            self.assertTrue((chat_dir / "plan.json").is_file())
+            self.assertIn("Preflight passed", session.handle("preflight"))
+            mock_answer = session.handle("run mock")
+            self.assertIn("Submitted mock job", mock_answer)
+            self.assertIn("job_", mock_answer)
+            self.assertIn("Mock lifecycle completed", session.handle("analyze"))
+            self.assertIn("runtime_env_file", session.handle("qa What evidence was generated?"))
+            compact_answer = session.handle("compact")
+            self.assertIn("Context compacted", compact_answer)
+            self.assertTrue((chat_dir / "memory.json").is_file())
+            memory = json.loads((chat_dir / "memory.json").read_text(encoding="utf-8"))
+            self.assertEqual(memory["preserved_state"]["chain"], "solana")
+            self.assertTrue(memory["preserved_state"]["job_id"].startswith("job_"))
+            self.assertEqual(memory["thresholds"]["context_window_tokens"], 1000000)
+            self.assertEqual(memory["thresholds"]["token_threshold"], 700000)
+            self.assertLessEqual(len(session.turns), 9)
+            self.assertIn("preserved_state", session.handle("memory"))
+            self.assertIn("Mock lifecycle completed", session.handle("analyze"))
+
+            one_shot = subprocess.run(
+                [
+                    str(AGENT_BIN),
+                    "--prompt",
+                    "How many chains and RPC methods are supported?",
+                    "--output-dir",
+                    str(Path(tmp) / "one-shot"),
+                ],
+                cwd=REPO,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            self.assertIn("AnyChain Benchmark Agent", one_shot.stdout)
+            self.assertIn("Current chain templates define", one_shot.stdout)
+
+            repl = subprocess.run(
+                [str(AGENT_BIN), "--output-dir", str(Path(tmp) / "repl")],
+                cwd=REPO,
+                input="Create a Solana fake-node smoke benchmark at 1 QPS\nrun mock\ncompact\nmemory\nstatus\nexit\n",
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            self.assertIn("Created a benchmark plan", repl.stdout)
+            self.assertIn("Submitted mock job", repl.stdout)
+            self.assertIn("Context compacted", repl.stdout)
+            self.assertIn("\"status\": \"completed\"", repl.stdout)
+            self.assertTrue((Path(tmp) / "repl" / "memory.json").is_file())
+
+    def test_compactor_preserves_current_state_and_recent_turns(self):
+        turns = [{"role": "user", "content": f"turn {idx}"} for idx in range(20)]
+        summary = compact_session_state(
+            turns=turns,
+            request={"chain": "solana", "rpc_mode": "mixed", "use_fake_node": True},
+            plan={
+                "plan_id": "plan_test",
+                "chain": "solana",
+                "strategy": "smoke",
+                "rpc_mode": "mixed",
+                "required_questions": [
+                    {"id": "ledger_device_confirmation", "severity": "blocker", "prompt": "Confirm ledger device."}
+                ],
+            },
+            job={"job_id": "job_test", "status": "completed", "artifact_index": "/tmp/artifact_index.json"},
+            discovery={"deployment": {"type": "vm"}, "cloud": {"provider": "gcp"}},
+            keep_recent=4,
+            reason="test",
+        )
+        self.assertEqual(summary["preserved_state"]["chain"], "solana")
+        self.assertEqual(summary["preserved_state"]["job_id"], "job_test")
+        self.assertEqual(len(summary["recent_turns"]), 4)
+        self.assertEqual(summary["compacted_turn_count"], 16)
+        self.assertEqual(summary["thresholds"]["context_window_tokens"], 1000000)
+        self.assertEqual(summary["thresholds"]["trigger_ratio"], 0.7)
+        self.assertTrue(summary["open_questions"])
+        self.assertFalse(should_auto_compact(turns=turns, turn_threshold=1000))
+        self.assertTrue(should_auto_compact(turns=turns, turn_threshold=10))
+        self.assertTrue(should_auto_compact(
+            turns=[{"role": "user", "content": "x" * 100}],
+            context_window_tokens=10,
+            trigger_ratio=0.5,
+            turn_threshold=1000,
+        ))
 
     def test_wizard_applies_required_answers(self):
         with tempfile.TemporaryDirectory() as tmp:

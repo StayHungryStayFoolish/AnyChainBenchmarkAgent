@@ -50,7 +50,18 @@ Agent 是有边界的：
 - Agent 生成的运行配置写入 job-local `runtime.env`，不会修改
   `config/user_config.sh`。
 
-## 使用 Agent 快速开始
+## 5 分钟快速开始
+
+这是在终端里使用 AnyChain Benchmark Agent 的最快路径。它不需要真实区块链节点，
+也不需要 LLM key。Agent 会把你的测试目标转换成 request，自动发现本地环境，生成
+plan，执行 preflight，提交 mock job，回答问题，并分析证据。
+
+克隆仓库：
+
+```bash
+git clone git@github.com:StayHungryStayFoolish/AnyChainBenchmarkAgent.git
+cd AnyChainBenchmarkAgent
+```
 
 只检查依赖，不修改宿主机：
 
@@ -58,53 +69,125 @@ Agent 是有边界的：
 bash scripts/install_deps.sh --check
 ```
 
-查看当前框架能力：
+启动 Agent 终端会话：
 
 ```bash
-python3 agent/cli.py capabilities
-python3 agent/cli.py ask --prompt "How many chains and RPC methods does the framework support?"
+./bin/anychain-agent
 ```
 
-从 prompt 生成 benchmark request：
+然后直接和它对话：
 
-```bash
-python3 agent/cli.py draft-request \
-  --prompt "Test Solana maximum stable QPS on GKE with fake-node smoke first" \
-  --output /tmp/request.json
+```text
+> What chains and RPC methods do you support?
+> Create a Solana fake-node smoke benchmark at 1 QPS
+> plan
+> preflight
+> run mock
+> status
+> analyze
+> compact
+> memory
+> qa What evidence was generated?
 ```
 
-生成并检查 plan：
+也可以使用一句 prompt 运行：
 
 ```bash
-python3 agent/cli.py plan \
-  --request /tmp/request.json \
-  --output /tmp/plan.json \
-  --discover \
-  --dry-run
-
-python3 agent/cli.py preflight --plan /tmp/plan.json
-python3 agent/cli.py risk-score --plan /tmp/plan.json
-python3 agent/cli.py runbook --plan /tmp/plan.json --output /tmp/runbook.md
+./bin/anychain-agent \
+  --prompt "Create a Solana fake-node smoke benchmark at 1 QPS"
 ```
 
-提交 lifecycle-only mock job：
+在会话中，`run mock` 会提交 lifecycle-only Agent job。真实 benchmark 执行需要在
+review plan 和 runbook 后，通过 `yes run` 明确确认。长会话可以使用 `compact`
+压缩上下文；Agent 会把结构化 memory 写入 `.agent/chat/memory.json`，同时保留当前
+request、plan、job、证据路径、未解决问题和最近几轮对话。自动压缩默认按照
+1,000,000 token context window 和 70% trigger ratio 判断，可以通过
+`AGENT_CONTEXT_WINDOW_TOKENS` 和 `AGENT_COMPACT_TRIGGER_RATIO` 调整。
+
+你也可以随时询问 Agent 当前框架能力：
 
 ```bash
-python3 agent/cli.py submit --plan /tmp/plan.json --mock
+./bin/anychain-agent --prompt "How many chains and RPC methods are supported?"
+./bin/anychain-agent --prompt "How do I add a custom RPC method with three params?"
 ```
 
-review plan 和 runbook 后再提交真实 benchmark：
+配置 provider 后，可以使用 LLM-assisted request drafting：
 
 ```bash
-python3 agent/cli.py submit --plan /tmp/plan.json --approved
+./bin/anychain-agent \
+  --prompt "Test my Ethereum node with a weighted mixed workload" \
+  --use-llm
 ```
 
-查询或分析 job：
+高级子命令仍然保留给 CI 和自动化：
 
 ```bash
-python3 agent/cli.py status --job-id <job_id>
-python3 agent/cli.py analyze --job-id <job_id>
-python3 agent/cli.py artifact-qa --job-id <job_id> --question "Why are charts empty?"
+python3 agent/cli.py --help
+```
+
+修改项目后，可以运行离线 Agent contract 测试：
+
+```bash
+python3 -m unittest tests.test_agent_runtime_contract -v
+```
+
+## 运行本地 Fake-Node Benchmark
+
+如果你希望在没有生产节点的情况下运行真实 benchmark engine，可以使用：
+
+```bash
+BLOCKCHAIN_NODE=solana \
+RPC_MODE=single \
+QUICK_INITIAL_QPS=1 \
+QUICK_MAX_QPS=1 \
+QUICK_QPS_STEP=1 \
+QUICK_DURATION=3 \
+QPS_WARMUP_DURATION=0 \
+QPS_COOLDOWN=0 \
+./blockchain_node_benchmark.sh --quick --single --fake-node
+```
+
+运行结束后打开生成的 HTML 报告：
+
+```bash
+ls -lt blockchain-node-benchmark-result/current/reports/*.html
+```
+
+## 连接真实节点运行
+
+先编辑 `config/user_config.sh`：
+
+```bash
+BLOCKCHAIN_NODE="solana"
+RPC_MODE="single"
+LOCAL_RPC_URL="http://your-node-rpc:8899"
+MAINNET_RPC_URL=""
+
+BLOCKCHAIN_PROCESS_NAMES=("agave-validator" "solana-validator" "validator")
+
+CLOUD_PROVIDER="gcp"
+CLOUD_REGION="us-central1"
+MACHINE_TYPE="c3-standard-22"
+LEDGER_DEVICE="sdb"
+DATA_VOL_TYPE="hyperdisk-extreme"
+DATA_VOL_MAX_IOPS="30000"
+DATA_VOL_MAX_THROUGHPUT="700"
+NETWORK_MAX_BANDWIDTH_GBPS=25
+```
+
+然后运行：
+
+```bash
+./blockchain_node_benchmark.sh --quick
+```
+
+最重要的输出文件：
+
+```text
+blockchain-node-benchmark-result/current/reports/performance_report_*.html
+blockchain-node-benchmark-result/current/logs/proxy_method.csv
+blockchain-node-benchmark-result/current/logs/performance_latest.csv
+blockchain-node-benchmark-result/archives/<run-id>/test_summary.json
 ```
 
 ## 可选 LLM Provider
