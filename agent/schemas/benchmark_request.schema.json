@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AnyChain Benchmark Agent Request",
+  "type": "object",
+  "required": ["chain", "goal"],
+  "properties": {
+    "chain": {"type": "string"},
+    "goal": {
+      "type": "string",
+      "enum": ["smoke", "baseline", "max_stable_qps", "stress", "bottleneck_confirmation", "regression"]
+    },
+    "rpc_mode": {"type": "string", "enum": ["single", "mixed"]},
+    "local_rpc_url": {"type": "string"},
+    "mainnet_rpc_url": {"type": "string"},
+    "use_fake_node": {"type": "boolean"},
+    "recommended_initial_validation": {"type": "string", "enum": ["smoke"]},
+    "source_prompt": {"type": "string"},
+    "llm_status": {"type": "string", "enum": ["accepted", "fallback"]},
+    "llm_source": {"type": "string"},
+    "llm_error": {"type": "string"},
+    "deployment": {
+      "type": "object",
+      "properties": {
+        "type": {"type": "string", "enum": ["vm", "kubernetes", "unknown"]},
+        "provider": {"type": "string"},
+        "namespace": {"type": "string"},
+        "pod": {"type": "string"},
+        "service": {"type": "string"}
+      }
+    },
+    "qps": {
+      "type": "object",
+      "properties": {
+        "initial": {"type": "integer", "minimum": 1},
+        "max": {"type": "integer", "minimum": 1},
+        "step": {"type": "integer", "minimum": 1},
+        "duration_seconds": {"type": "integer", "minimum": 1}
+      }
+    },
+    "observability": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "mode": {"type": "string", "enum": ["local", "exporter"]}
+      }
+    },
+    "dependency_mode": {
+      "type": "string",
+      "enum": ["audit", "isolated", "managed"],
+      "default": "audit"
+    },
+    "bottleneck_focus": {
+      "type": "array",
+      "items": {"type": "string", "enum": ["cpu", "memory", "disk", "network", "sync_health", "rpc_errors"]}
+    },
+    "workload": {
+      "type": "object",
+      "properties": {
+        "methods": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/workload_method"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "workload_method": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": {"type": "string"},
+        "weight": {"type": "number", "exclusiveMinimum": 0},
+        "params": {"type": "array"},
+        "custom": {"type": "boolean"},
+        "param_format": {"type": "string"},
+        "rest_path": {"type": "string"}
+      }
+    }
+  }
+}

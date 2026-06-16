@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Documentation
-    url: https://github.com/StayHungryStayFoolish/blockchain-node-benchmark#documentation
+    url: https://github.com/StayHungryStayFoolish/AnyChainBenchmarkAgent#documentation
     about: Read the current framework, module, chain-extension, and fake-node documentation.
   - name: Security vulnerability
-    url: https://github.com/StayHungryStayFoolish/blockchain-node-benchmark/security/policy
+    url: https://github.com/StayHungryStayFoolish/AnyChainBenchmarkAgent/security/policy
     about: Report suspected security vulnerabilities privately when possible.

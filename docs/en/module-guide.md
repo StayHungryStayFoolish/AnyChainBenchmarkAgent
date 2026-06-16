@@ -26,7 +26,7 @@ flowchart TD
 ## Source Directory Layout
 
 ```text
-blockchain-node-benchmark/
+AnyChainBenchmarkAgent/
   blockchain_node_benchmark.sh      Main entry command and lifecycle owner
   config/                           User config, runtime detection, chain templates
   core/                             QPS executor and shared shell functions

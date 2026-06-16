@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AnyChain Benchmark Agent Plan",
+  "type": "object",
+  "required": ["plan_id", "chain", "strategy", "execution", "required_inputs", "artifacts"],
+  "properties": {
+    "plan_id": {"type": "string"},
+    "chain": {"type": "string"},
+    "strategy": {"type": "string"},
+    "rpc_mode": {"type": "string"},
+    "required_inputs": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "required_questions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "category", "severity", "prompt"],
+        "properties": {
+          "id": {"type": "string"},
+          "category": {"type": "string"},
+          "severity": {"type": "string", "enum": ["blocker", "warning", "info"]},
+          "prompt": {"type": "string"},
+          "candidates": {"type": "array", "items": {"type": "string"}},
+          "missing": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "confidence": {
+      "type": "object",
+      "properties": {
+        "chain": {"type": "number", "minimum": 0, "maximum": 1},
+        "deployment": {"type": "number", "minimum": 0, "maximum": 1},
+        "ledger_device": {"type": "number", "minimum": 0, "maximum": 1},
+        "workload": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "requires_confirmation": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "confirmed_inputs": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "materialized_config": {"type": "object"},
+    "risk": {
+      "type": "object",
+      "properties": {
+        "risk_score": {"type": "number", "minimum": 0, "maximum": 100},
+        "risk_level": {"type": "string", "enum": ["low", "medium", "high"]},
+        "findings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "severity": {"type": "string", "enum": ["low", "medium", "high"]},
+              "points": {"type": "number"},
+              "message": {"type": "string"}
+            }
+          }
+        },
+        "recommendations": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "approval_checkpoints": {
+      "type": "array",
+      "items": {"type": "string", "enum": ["plan_execution", "dependency_install", "stress_execution"]}
+    },
+    "plan_diff": {
+      "type": "object",
+      "properties": {
+        "baseline_plan_id": {"type": "string"},
+        "changed": {"type": "array", "items": {"type": "string"}},
+        "added": {"type": "array", "items": {"type": "string"}},
+        "removed": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "config_snapshot": {
+      "type": "object",
+      "properties": {
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {"type": "string"},
+              "sha256": {"type": "string"},
+              "mtime": {"type": "number"}
+            }
+          }
+        }
+      }
+    },
+    "redaction_policy": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "patterns": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "advanced_defaults": {"type": "object"},
+    "dependency_mode": {
+      "type": "string",
+      "enum": ["audit", "isolated", "managed"]
+    },
+    "discovery": {
+      "type": "object",
+      "properties": {
+        "source": {"type": "string"},
+        "warnings": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "workload": {
+      "type": "object",
+      "properties": {
+        "methods": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/workload_method"}
+        },
+        "validation": {
+          "type": "object",
+          "properties": {
+            "weights_total": {"type": "number"},
+            "requires_fixture_recording": {"type": "boolean"},
+            "warnings": {"type": "array", "items": {"type": "string"}}
+          }
+        }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "required": ["command", "environment"],
+      "properties": {
+        "command": {"type": "array", "items": {"type": "string"}},
+        "environment": {"type": "object"}
+      }
+    },
+    "preflight_checks": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "artifacts": {"type": "object"}
+  },
+  "$defs": {
+    "workload_method": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": {"type": "string"},
+        "weight": {"type": "number", "exclusiveMinimum": 0},
+        "params": {"type": "array"},
+        "custom": {"type": "boolean"},
+        "param_format": {"type": "string"},
+        "rest_path": {"type": "string"}
+      }
+    }
+  }
+}

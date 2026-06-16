@@ -25,7 +25,7 @@ flowchart TD
 ## 源码目录
 
 ```text
-blockchain-node-benchmark/
+AnyChainBenchmarkAgent/
   blockchain_node_benchmark.sh      主入口和生命周期 owner
   config/                           用户配置、runtime detection、chain templates
   core/                             QPS executor 和共享 shell 函数

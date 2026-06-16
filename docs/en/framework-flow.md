@@ -3,7 +3,7 @@
 [中文](../zh/framework-flow.md) | [English](framework-flow.md)
 
 This document describes the current end-to-end runtime path of
-`blockchain-node-benchmark`: from the entry command, through RPC workload
+AnyChain Benchmark Agent: from the entry command, through RPC workload
 generation and monitoring, to HTML reports, archives, and the optional
 Prometheus/Grafana data stream.
 

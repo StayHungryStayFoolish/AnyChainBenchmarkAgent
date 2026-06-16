@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AnyChain Benchmark Agent Job",
+  "type": "object",
+  "required": ["job_id", "plan_id", "status", "created_at", "updated_at"],
+  "properties": {
+    "job_id": {"type": "string"},
+    "plan_id": {"type": "string"},
+    "status": {"type": "string", "enum": ["pending", "running", "completed", "failed", "cancelled"]},
+    "created_at": {"type": "string"},
+    "updated_at": {"type": "string"},
+    "plan_file": {"type": "string"},
+    "run_dir": {"type": "string"},
+    "runtime_env_file": {"type": "string"},
+    "artifacts": {"type": "object"},
+    "artifact_index": {"type": "string"},
+    "analysis": {"type": "object"},
+    "error": {"type": "string"}
+  }
+}

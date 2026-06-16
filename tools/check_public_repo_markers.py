@@ -10,12 +10,16 @@ from pathlib import Path
 
 
 DEFAULT_ROOTS = (
+    "README.md",
+    "README_ZH.md",
+    "agent",
     "analysis",
     "blockchain_node_benchmark.sh",
     "ci",
     "config",
     "core",
     "deploy",
+    "docs",
     "lib",
     "monitoring",
     "scripts",
@@ -52,7 +56,7 @@ MARKER_RE = re.compile(
     r"\b(?:wave|proposal|writer-first)\b|"
     r"hard gate|"
     r"\u65b9\u6848\u7532|\u65b9\u6848\u4e59|\u65b9\u6848\u4e19|\u4e2d\u7acb\u547d\u540d|\u9009\u7532|"
-    r"\u786c\u95e8|\u5b88\u62a4|\u94c1\u5f8b|\u9a8c\u6536|\u88c1\u51b3|\u6ce2\u6b21|\u8303\u5f0f|\u7ea0\u6b63|\u5b9e\u8bc1\u6765\u6e90|\u8fc1\u79fb\u53c2\u8003|"
+    r"\u786c\u95e8|\u5b88\u62a4|\u94c1\u5f8b|\u88c1\u51b3|\u6ce2\u6b21|\u8303\u5f0f|\u7ea0\u6b63|\u5b9e\u8bc1\u6765\u6e90|\u8fc1\u79fb\u53c2\u8003|"
     r"subagent|Hermes|Claude|Opus|Kiro|round-05|fix_wave|pre-S0|"
     r"plan §|§S\d+"
     r")",
@@ -85,6 +89,8 @@ def should_skip_line(path: Path, line: str) -> bool:
     if path.match("config/chains/*.json") and '"system_addresses"' in stripped:
         return True
     if "MISSING_PY" in stripped:
+        return True
+    if re.search(r"\b(vertex[_ -]?claude|VertexClaudeProvider|claude-\d|Vertex Claude|Claude partner|Claude protocol)\b", stripped, re.IGNORECASE):
         return True
     return False
 

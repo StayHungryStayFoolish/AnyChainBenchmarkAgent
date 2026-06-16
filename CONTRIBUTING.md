@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for improving `blockchain-node-benchmark`. This project is a benchmark
+Thanks for improving AnyChain Benchmark Agent. This project is a benchmark
 framework, not only a script wrapper around Vegeta, so PRs must preserve the
 runtime data contracts as well as code correctness.
 

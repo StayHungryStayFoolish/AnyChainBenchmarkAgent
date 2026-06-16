@@ -117,6 +117,7 @@ jobs:
           bash ci/check_parallel_entry.sh
           bash ci/check_csv_registry_bypass.sh
           python3 tools/check_public_repo_markers.py --root .
+          python3 -m unittest tests.test_agent_runtime_contract -v
 
   chain-and-fixture-contracts:
     name: chain templates, adapters, and fake-node fixtures
