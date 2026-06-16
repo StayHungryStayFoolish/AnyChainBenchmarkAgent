@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AnyChain Benchmark Agent Result",
+  "type": "object",
+  "required": ["job_id", "status", "summary"],
+  "properties": {
+    "job_id": {"type": "string"},
+    "status": {"type": "string"},
+    "summary": {
+      "type": "object",
+      "properties": {
+        "chain": {"type": "string"},
+        "strategy": {"type": "string"},
+        "max_stable_qps": {"type": "number"},
+        "bottleneck": {"type": "string"},
+        "error_rate": {"type": "number"},
+        "p50_ms": {"type": "number"},
+        "p90_ms": {"type": "number"},
+        "p99_ms": {"type": "number"}
+      }
+    },
+    "grade": {
+      "type": "string",
+      "enum": ["PASS", "WARNING", "FAIL", "INCONCLUSIVE"]
+    },
+    "grade_reason": {"type": "string"},
+    "artifacts": {"type": "object"},
+    "evidence": {
+      "type": "object",
+      "properties": {
+        "html_report": {"type": "string"},
+        "archive_summary": {"type": "string"},
+        "proxy_method_csv": {"type": "string"},
+        "performance_csv": {"type": "string"},
+        "sync_health_csv": {"type": "string"},
+        "runtime_env_file": {"type": "string"},
+        "prometheus_url": {"type": "string"},
+        "grafana_url": {"type": "string"},
+        "exporter_url": {"type": "string"}
+      }
+    },
+    "recommendations": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  }
+}

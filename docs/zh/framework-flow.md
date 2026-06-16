@@ -2,7 +2,7 @@
 
 [中文](framework-flow.md) | [English](../en/framework-flow.md)
 
-本文档描述 `blockchain-node-benchmark` 当前维护中的端到端运行路径：从入口脚本、
+本文档描述 AnyChain Benchmark Agent 当前维护中的端到端运行路径：从入口脚本、
 RPC workload 生成、监控采集，到 HTML 报告、归档和可选 Prometheus/Grafana
 数据流。
 

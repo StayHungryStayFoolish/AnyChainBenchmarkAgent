@@ -118,6 +118,18 @@ PROMETHEUS_PORT="${PROMETHEUS_PORT:-9091}"                         # Local Prome
 GRAFANA_PORT="${GRAFANA_PORT:-3001}"                                # Local Grafana UI port
 PROMETHEUS_EXPORTER_MAX_PROXY_ROWS="${PROMETHEUS_EXPORTER_MAX_PROXY_ROWS:-20000}"
 
+# ----- Optional Agent LLM Configuration -----
+# The Agent remains usable without an LLM. When enabled, prefer Vertex AI with
+# Google ADC or service-account impersonation for enterprise environments.
+LLM_PROVIDER="${LLM_PROVIDER:-vertex_gemini_openai}"               # Options: vertex_gemini_openai | vertex_claude | openai
+LLM_MODEL="${LLM_MODEL:-gemini-2.5-pro}"                           # Examples: gemini-2.5-pro, claude-3-7-sonnet@20250219, gpt-4.1
+GOOGLE_AUTH_MODE="${GOOGLE_AUTH_MODE:-adc}"                        # Options: adc | attached_service_account | service_account_impersonation | service_account_file
+GOOGLE_CLOUD_PROJECT="${GOOGLE_CLOUD_PROJECT:-}"                   # Required for Vertex providers
+GOOGLE_CLOUD_LOCATION="${GOOGLE_CLOUD_LOCATION:-us-central1}"       # Vertex region
+GOOGLE_SERVICE_ACCOUNT_EMAIL="${GOOGLE_SERVICE_ACCOUNT_EMAIL:-}"    # Required for service_account_impersonation; no JSON key required
+GOOGLE_APPLICATION_CREDENTIALS="${GOOGLE_APPLICATION_CREDENTIALS:-}" # Optional local JSON key fallback
+OPENAI_API_KEY="${OPENAI_API_KEY:-}"                                # Required only when LLM_PROVIDER=openai
+
 # ----- QPS Benchmark Configuration -----
 # Quick benchmark mode (verify basic QPS capability)
 QUICK_INITIAL_QPS=${QUICK_INITIAL_QPS:-1000}
@@ -155,6 +167,7 @@ export DATA_VOL_TYPE DATA_VOL_SIZE DATA_VOL_MAX_IOPS DATA_VOL_MAX_THROUGHPUT
 export ACCOUNTS_VOL_TYPE ACCOUNTS_VOL_SIZE ACCOUNTS_VOL_MAX_IOPS ACCOUNTS_VOL_MAX_THROUGHPUT
 export NETWORK_INTERFACE NETWORK_MAX_BANDWIDTH_GBPS ENA_MONITOR_ENABLED MONITOR_INTERVAL DISK_MONITOR_RATE
 export OBSERVABILITY_STACK_ENABLED OBSERVABILITY_STACK_AUTO_STOP OBSERVABILITY_STACK_MODE EXPORTER_PORT PROMETHEUS_PORT GRAFANA_PORT PROMETHEUS_EXPORTER_MAX_PROXY_ROWS
+export LLM_PROVIDER LLM_MODEL GOOGLE_AUTH_MODE GOOGLE_CLOUD_PROJECT GOOGLE_CLOUD_LOCATION GOOGLE_SERVICE_ACCOUNT_EMAIL GOOGLE_APPLICATION_CREDENTIALS OPENAI_API_KEY
 export QUICK_INITIAL_QPS QUICK_MAX_QPS QUICK_QPS_STEP QUICK_DURATION
 export STANDARD_INITIAL_QPS STANDARD_MAX_QPS STANDARD_QPS_STEP STANDARD_DURATION
 export INTENSIVE_INITIAL_QPS INTENSIVE_MAX_QPS INTENSIVE_QPS_STEP INTENSIVE_DURATION INTENSIVE_AUTO_STOP

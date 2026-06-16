@@ -54,6 +54,31 @@ Edit these values in `config/user_config.sh` before a production benchmark:
 | `OBSERVABILITY_STACK_AUTO_STOP` | Optional | When `true`, a stack started by the entry script is stopped during framework cleanup. Defaults to `true`. |
 | `OBSERVABILITY_STACK_MODE` | Optional | `local` starts exporter + local Prometheus/Grafana. `exporter` starts only the exporter for an existing Prometheus/Grafana environment. Defaults to `local`. |
 
+## Optional Agent LLM Configuration
+
+The benchmark engine can run without an LLM. The Agent control plane can use a
+model provider when prompt-first planning is enabled.
+
+Recommended enterprise path is Vertex AI with Google service-account based
+authentication:
+
+| Variable | Required | Description |
+| --- | --- | --- |
+| `LLM_PROVIDER` | Optional | `vertex_gemini_openai`, `vertex_claude`, or `openai`. Defaults to `vertex_gemini_openai`. |
+| `LLM_MODEL` | Optional | Model name, for example `gemini-2.5-pro` or `claude-3-7-sonnet@20250219`. |
+| `GOOGLE_AUTH_MODE` | Required for Vertex | `adc`, `attached_service_account`, `service_account_impersonation`, or `service_account_file`. |
+| `GOOGLE_CLOUD_PROJECT` | Required for Vertex | Google Cloud project containing the Vertex AI endpoint. |
+| `GOOGLE_CLOUD_LOCATION` | Required for Vertex | Vertex AI location, for example `us-central1` or `us-east5`. |
+| `GOOGLE_SERVICE_ACCOUNT_EMAIL` | Required for impersonation | Target service account email. This avoids downloading JSON keys when the current identity can impersonate it. |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Optional fallback | Local service-account JSON path. Prefer ADC or impersonation in enterprise environments. |
+| `OPENAI_API_KEY` | Required only for OpenAI | API key for `LLM_PROVIDER=openai`. |
+
+Check the configuration without calling a model:
+
+```bash
+python3 agent/cli.py llm-config
+```
+
 ## Optional Chain Sample Overrides
 
 Chain templates include measured sample values for addresses, transactions,
