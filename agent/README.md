@@ -108,6 +108,8 @@ jobs, inspect status, and analyze artifacts in one session:
 ```text
 > What chains and RPC methods do you support?
 > Create a Solana fake-node smoke benchmark at 1 QPS
+> set max qps to 5000
+> change mixed weights to getSlot 70%, getBlockHeight 30%
 > plan
 > preflight
 > run mock
