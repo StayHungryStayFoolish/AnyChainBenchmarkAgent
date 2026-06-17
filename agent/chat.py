@@ -22,6 +22,8 @@ from memory.token_estimator import (
     DEFAULT_CONTEXT_WINDOW_TOKENS,
 )
 from planners.preflight import run_preflight
+from planners.diff import diff_plans
+from planners.request_modifier import apply_request_modification, looks_like_plan_modification
 from planners.risk import score_plan_risk
 from planners.strategy_planner import generate_plan, write_json
 from qa.framework_answers import answer_framework_question, out_of_scope_response
@@ -108,6 +110,8 @@ class ChatSession:
             return self._respond(self._answer_question(text[4:].strip()))
         if command.startswith("qa "):
             return self._respond(self._artifact_qa(text[3:].strip()))
+        if self.plan and self.request and looks_like_plan_modification(text):
+            return self._respond(self._modify_plan(text))
         if self._looks_like_question(text):
             return self._respond(self._answer_question(text))
         return self._respond(self._create_plan(text))
@@ -118,6 +122,8 @@ class ChatSession:
             "- What chains and RPC methods do you support?\n"
             "- Create a Solana fake-node smoke benchmark at 1 QPS\n"
             "- Create an Ethereum weighted mixed workload plan\n"
+            "- Set max qps to 5000\n"
+            "- Change mixed weights to getSlot 70%, getBlockHeight 30%\n"
             "- plan\n"
             "- preflight\n"
             "- run mock\n"
@@ -161,6 +167,28 @@ class ChatSession:
         write_json(self.plan_file, self.plan)
         self.runbook_file.write_text(render_runbook(self.plan, self.preflight), encoding="utf-8")
         return self._plan_summary(prefix="Created a benchmark plan.")
+
+    def _modify_plan(self, text: str) -> str:
+        if not self.request or not self.plan:
+            return "No active plan yet. Describe the benchmark you want to run."
+        updated_request, changes = apply_request_modification(self.request, text)
+        if not changes:
+            return "I could not identify a supported plan edit. Try `set max qps to 5000` or `getSlot 70%, getBlockHeight 30%`."
+        old_plan = self.plan
+        self.request = updated_request
+        self.plan = generate_plan(self.request, discovery=self.discovery)
+        self.preflight = run_preflight(self.plan)
+        plan_diff = diff_plans(old_plan, self.plan)
+        self.plan["plan_diff"] = plan_diff
+        write_json(self.request_file, self.request)
+        write_json(self.plan_file, self.plan)
+        self.runbook_file.write_text(render_runbook(self.plan, self.preflight), encoding="utf-8")
+        return "\n".join([
+            "Updated the current benchmark plan.",
+            "Changes:",
+            *[f"- {change}" for change in changes],
+            self._plan_summary(prefix="Updated plan summary."),
+        ])
 
     def _show_plan(self) -> str:
         if not self.plan:

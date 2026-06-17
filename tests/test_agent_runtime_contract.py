@@ -17,6 +17,7 @@ from llm.config import load_llm_config  # noqa: E402
 from llm.google_auth import credential_plan  # noqa: E402
 from llm.providers import provider_from_config  # noqa: E402
 from memory.compactor import compact_session_state, should_auto_compact  # noqa: E402
+from planners.request_modifier import apply_request_modification  # noqa: E402
 from runners.guardrails import validate_execution_plan  # noqa: E402
 from chat import ChatSession  # noqa: E402
 from wizard import run_wizard  # noqa: E402
@@ -342,6 +343,18 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertIn("Created a benchmark plan", plan_answer)
             self.assertIn("solana", plan_answer)
             self.assertTrue((chat_dir / "plan.json").is_file())
+            qps_update = session.handle("set max qps to 5000 and duration 120 seconds")
+            self.assertIn("Updated the current benchmark plan", qps_update)
+            updated_plan = json.loads((chat_dir / "plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(updated_plan["advanced_defaults"]["qps"]["max"], 5000)
+            self.assertEqual(updated_plan["advanced_defaults"]["qps"]["duration_seconds"], 120)
+            weight_update = session.handle("change mixed weights to getSlot 70%, getBlockHeight 30%")
+            self.assertIn("mixed workload methods", weight_update)
+            updated_request = json.loads((chat_dir / "request.json").read_text(encoding="utf-8"))
+            self.assertEqual(updated_request["rpc_mode"], "mixed")
+            self.assertEqual(sum(item["weight"] for item in updated_request["workload"]["methods"]), 100)
+            question_answer = session.handle("What does qps mean in this framework?")
+            self.assertNotIn("I could not identify a supported plan edit", question_answer)
             self.assertIn("Preflight passed", session.handle("preflight"))
             mock_answer = session.handle("run mock")
             self.assertIn("Submitted mock job", mock_answer)
@@ -380,17 +393,39 @@ class AgentRuntimeContractTest(unittest.TestCase):
             repl = subprocess.run(
                 [str(AGENT_BIN), "--output-dir", str(Path(tmp) / "repl")],
                 cwd=REPO,
-                input="Create a Solana fake-node smoke benchmark at 1 QPS\nrun mock\ncompact\nmemory\nstatus\nexit\n",
+                input="Create a Solana fake-node smoke benchmark at 1 QPS\nset max qps to 5000\nrun mock\ncompact\nmemory\nstatus\nexit\n",
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=True,
             )
             self.assertIn("Created a benchmark plan", repl.stdout)
+            self.assertIn("Updated the current benchmark plan", repl.stdout)
             self.assertIn("Submitted mock job", repl.stdout)
             self.assertIn("Context compacted", repl.stdout)
             self.assertIn("\"status\": \"completed\"", repl.stdout)
             self.assertTrue((Path(tmp) / "repl" / "memory.json").is_file())
+
+    def test_request_modifier_updates_qps_and_mixed_weights(self):
+        request = {"chain": "solana", "rpc_mode": "single", "use_fake_node": True}
+        updated, changes = apply_request_modification(
+            request,
+            "Set max qps to 5000, initial qps 100, step 250, duration 120 seconds.",
+        )
+        self.assertEqual(updated["qps"]["max"], 5000)
+        self.assertEqual(updated["qps"]["initial"], 100)
+        self.assertEqual(updated["qps"]["step"], 250)
+        self.assertEqual(updated["qps"]["duration_seconds"], 120)
+        self.assertTrue(changes)
+
+        updated, changes = apply_request_modification(
+            updated,
+            "Change mixed weights to getSlot 70%, getBlockHeight 30%",
+        )
+        self.assertEqual(updated["rpc_mode"], "mixed")
+        self.assertEqual(updated["workload"]["methods"][0]["method"], "getSlot")
+        self.assertEqual(sum(item["weight"] for item in updated["workload"]["methods"]), 100)
+        self.assertIn("mixed_weights_confirmation", updated["confirmations"])
 
     def test_compactor_preserves_current_state_and_recent_turns(self):
         turns = [{"role": "user", "content": f"turn {idx}"} for idx in range(20)]
