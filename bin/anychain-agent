@@ -5,4 +5,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 cd "$REPO_ROOT"
+if [[ -f "$REPO_ROOT/config/user_config.sh" ]]; then
+  # Load persistent Agent defaults. Environment variables set by the caller
+  # still win because user_config.sh uses ${VAR:-default} assignments.
+  # shellcheck source=/dev/null
+  source "$REPO_ROOT/config/user_config.sh"
+fi
 exec python3 agent/cli.py chat "$@"

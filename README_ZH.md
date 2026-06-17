@@ -52,9 +52,9 @@ Agent 是有边界的：
 
 ## 5 分钟快速开始
 
-这是在终端里使用 AnyChain Benchmark Agent 的最快路径。它不需要真实区块链节点，
-也不需要 LLM key。Agent 会把你的测试目标转换成 request，自动发现本地环境，生成
-plan，执行 preflight，提交 mock job，回答问题，并分析证据。
+这是在终端里使用 AnyChain Benchmark Agent 的最快路径。不配置 LLM 时，Agent 仍可
+使用确定性解析和本地仓库能力回答问题；如果希望启用模型辅助 planning，需要先在
+`config/user_config.sh` 中配置 provider、模型和认证方式。
 
 克隆仓库：
 
@@ -69,32 +69,70 @@ cd AnyChainBenchmarkAgent
 bash scripts/install_deps.sh --check
 ```
 
+在 `config/user_config.sh` 中配置持久化的 Agent 和 benchmark 参数。本地 fake-node
+smoke 测试最重要的配置是：
+
+```bash
+BLOCKCHAIN_NODE="solana"
+RPC_MODE="single"
+
+# 可选 LLM。保持 fake 表示确定性/离线模式。
+LLM_PROVIDER="fake"                       # fake | vertex_gemini_openai | vertex_claude | openai
+LLM_MODEL="fake"
+GOOGLE_AUTH_MODE="adc"                    # adc | attached_service_account | service_account_impersonation | service_account_file
+GOOGLE_CLOUD_PROJECT=""                   # 使用 Vertex + --use-llm 时必填
+GOOGLE_CLOUD_LOCATION="us-central1"
+GOOGLE_SERVICE_ACCOUNT_EMAIL=""           # service_account_impersonation 时必填
+GOOGLE_APPLICATION_CREDENTIALS=""         # 可选 JSON key fallback
+OPENAI_API_KEY=""                         # 仅 LLM_PROVIDER=openai 时必填
+```
+
+如果要测试真实节点，还需要配置节点地址和机器上下文：
+
+```bash
+LOCAL_RPC_URL="http://your-node-rpc:8899"
+MAINNET_RPC_URL=""
+BLOCKCHAIN_PROCESS_NAMES=("agave-validator" "solana-validator" "validator")
+
+CLOUD_PROVIDER="gcp"
+CLOUD_REGION="us-central1"
+MACHINE_TYPE="c3-standard-22"
+LEDGER_DEVICE="sdb"
+DATA_VOL_TYPE="hyperdisk-extreme"
+DATA_VOL_MAX_IOPS="30000"
+DATA_VOL_MAX_THROUGHPUT="700"
+NETWORK_MAX_BANDWIDTH_GBPS=25
+```
+
 启动 Agent 终端会话：
 
 ```bash
 ./bin/anychain-agent
 ```
 
-然后直接和它对话：
+然后直接和它对话。下面这些行是你在 Agent 交互窗口中输入的内容，不是 shell 命令：
 
 ```text
 > doctor
-> What chains and RPC methods do you support?
 > Create a Solana fake-node smoke benchmark at 1 QPS
-> set max qps to 5000
-> change mixed weights to getSlot 70%, getBlockHeight 30%
 > plan
 > preflight
 > run mock
 > status
 > analyze
-> compact
-> memory
 > qa What evidence was generated?
 ```
 
 在新环境中建议先输入 `doctor`。它会以只读方式检查 cloud/deployment 识别结果、
 必需依赖、LLM/Vertex 配置和当前框架能力覆盖情况。
+
+只有在配置好 LLM provider 后才需要使用 `--use-llm`：
+
+```bash
+./bin/anychain-agent --use-llm
+```
+
+不加 `--use-llm` 时，Agent 仍然可以通过确定性解析和仓库状态回答问题、生成 plan。
 
 也可以使用一句 prompt 运行：
 
@@ -103,26 +141,15 @@ bash scripts/install_deps.sh --check
   --prompt "Create a Solana fake-node smoke benchmark at 1 QPS"
 ```
 
-在会话中，`run mock` 会提交 lifecycle-only Agent job。真实 benchmark 执行需要在
-review plan 和 runbook 后，通过 `yes run` 明确确认。长会话可以使用 `compact`
-压缩上下文；Agent 会把结构化 memory 写入 `.agent/chat/memory.json`，同时保留当前
-request、plan、job、证据路径、未解决问题和最近几轮对话。自动压缩默认按照
-1,000,000 token context window 和 70% trigger ratio 判断，可以通过
-`AGENT_CONTEXT_WINDOW_TOKENS` 和 `AGENT_COMPACT_TRIGGER_RATIO` 调整。
+在会话中，`run mock` 会提交 lifecycle-only Agent job，用于本地验证 Agent 生命周期。
+真实 benchmark 执行需要在 review plan 和 runbook 后，通过 `yes run` 明确确认。
+长会话会自动压缩上下文；也可以输入 `compact` 写入 `.agent/chat/memory.json`。
 
 你也可以随时询问 Agent 当前框架能力：
 
 ```bash
 ./bin/anychain-agent --prompt "How many chains and RPC methods are supported?"
 ./bin/anychain-agent --prompt "How do I add a custom RPC method with three params?"
-```
-
-配置 provider 后，可以使用 LLM-assisted request drafting：
-
-```bash
-./bin/anychain-agent \
-  --prompt "Test my Ethereum node with a weighted mixed workload" \
-  --use-llm
 ```
 
 高级子命令仍然保留给 CI 和自动化：
@@ -139,52 +166,49 @@ python3 -m unittest tests.test_agent_runtime_contract -v
 
 ## 运行本地 Fake-Node Benchmark
 
-如果你希望在没有生产节点的情况下运行真实 benchmark engine，可以使用：
+如果你希望在没有生产节点的情况下通过 Agent 验证 benchmark 流程，启动
+`./bin/anychain-agent` 后输入：
 
-```bash
-BLOCKCHAIN_NODE=solana \
-RPC_MODE=single \
-QUICK_INITIAL_QPS=1 \
-QUICK_MAX_QPS=1 \
-QUICK_QPS_STEP=1 \
-QUICK_DURATION=3 \
-QPS_WARMUP_DURATION=0 \
-QPS_COOLDOWN=0 \
-./blockchain_node_benchmark.sh --quick --single --fake-node
+```text
+> doctor
+> Create a Solana fake-node smoke benchmark at 1 QPS
+> preflight
+> run mock
+> analyze
 ```
 
-运行结束后打开生成的 HTML 报告：
+`run mock` 只验证 Agent 生命周期，不会发送真实 benchmark 流量。如果希望让 Agent
+规划并执行真实 fake-node benchmark engine，可以输入：
 
-```bash
-ls -lt blockchain-node-benchmark-result/current/reports/*.html
+```text
+> Create a Solana fake-node quick benchmark and run the real benchmark engine
+> plan
+> preflight
+> yes run
 ```
+
+执行 `yes run` 前请先 review 生成的 runbook；Agent 只会执行 allowlisted benchmark
+command。
 
 ## 连接真实节点运行
 
-先编辑 `config/user_config.sh`：
+先编辑 `config/user_config.sh`。至少需要配置 `BLOCKCHAIN_NODE`、`RPC_MODE`、
+`LOCAL_RPC_URL`、`BLOCKCHAIN_PROCESS_NAMES`、cloud/machine 信息、ledger disk 参数和
+网络带宽。然后启动 Agent：
 
 ```bash
-BLOCKCHAIN_NODE="solana"
-RPC_MODE="single"
-LOCAL_RPC_URL="http://your-node-rpc:8899"
-MAINNET_RPC_URL=""
-
-BLOCKCHAIN_PROCESS_NAMES=("agave-validator" "solana-validator" "validator")
-
-CLOUD_PROVIDER="gcp"
-CLOUD_REGION="us-central1"
-MACHINE_TYPE="c3-standard-22"
-LEDGER_DEVICE="sdb"
-DATA_VOL_TYPE="hyperdisk-extreme"
-DATA_VOL_MAX_IOPS="30000"
-DATA_VOL_MAX_THROUGHPUT="700"
-NETWORK_MAX_BANDWIDTH_GBPS=25
+./bin/anychain-agent
 ```
 
-然后运行：
+真实节点对话示例：
 
-```bash
-./blockchain_node_benchmark.sh --quick
+```text
+> doctor
+> Test my Solana node at http://your-node-rpc:8899 with a quick single-method benchmark
+> plan
+> preflight
+> yes run
+> analyze
 ```
 
 最重要的输出文件：
@@ -208,15 +232,25 @@ classification，随后仍会经过确定性校验。
 - `openai`：OpenAI API。
 - `fake`：离线 protocol smoke provider，用于测试。
 
-企业环境推荐使用 Vertex AI 的 ADC 或 service-account impersonation，而不是静态 API key：
+企业环境推荐使用 Vertex AI 的 ADC 或 service-account impersonation，而不是静态 API
+key。请在 `config/user_config.sh` 中持久化配置这些变量；`./bin/anychain-agent`
+启动时会自动加载该文件，临时测试时仍可用环境变量覆盖。
 
 ```bash
-export LLM_PROVIDER=vertex_gemini_openai
-export LLM_MODEL=gemini-2.5-pro
-export GOOGLE_AUTH_MODE=service_account_impersonation
-export GOOGLE_CLOUD_PROJECT=your-project
-export GOOGLE_CLOUD_LOCATION=us-central1
-export GOOGLE_SERVICE_ACCOUNT_EMAIL=benchmark-agent@your-project.iam.gserviceaccount.com
+LLM_PROVIDER="vertex_gemini_openai"
+LLM_MODEL="gemini-2.5-pro"
+GOOGLE_AUTH_MODE="service_account_impersonation"
+GOOGLE_CLOUD_PROJECT="your-project"
+GOOGLE_CLOUD_LOCATION="us-central1"
+GOOGLE_SERVICE_ACCOUNT_EMAIL="benchmark-agent@your-project.iam.gserviceaccount.com"
+```
+
+如果使用 OpenAI：
+
+```bash
+LLM_PROVIDER="openai"
+LLM_MODEL="gpt-4.1"
+OPENAI_API_KEY="sk-..."
 ```
 
 不调用模型，只检查配置：
@@ -267,19 +301,10 @@ NETWORK_MAX_BANDWIDTH_GBPS=25
 ./blockchain_node_benchmark.sh --quick
 ```
 
-运行本地 fake-node 闭环：
-
-```bash
-BLOCKCHAIN_NODE=solana \
-RPC_MODE=single \
-QUICK_INITIAL_QPS=1 \
-QUICK_MAX_QPS=1 \
-QUICK_QPS_STEP=1 \
-QUICK_DURATION=3 \
-QPS_WARMUP_DURATION=0 \
-QPS_COOLDOWN=0 \
-./blockchain_node_benchmark.sh --quick --single --fake-node
-```
+本地 fake-node 闭环建议优先使用
+[运行本地 Fake-Node Benchmark](#运行本地-fake-node-benchmark) 中的 Agent 对话。
+直接调用 fake-node engine 的高级命令见
+[使用 fake-node 进行本地闭环测试](docs/zh/local-closed-loop-testing.md)。
 
 如果节点部署在 Kubernetes 中，请先部署 collector：
 

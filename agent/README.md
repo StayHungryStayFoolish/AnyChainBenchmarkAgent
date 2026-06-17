@@ -308,21 +308,24 @@ The benchmark engine does not depend on a model provider.
 
 Supported provider contracts:
 
+- `fake`: offline deterministic provider for local smoke tests.
 - `vertex_gemini_openai`: Gemini on Vertex AI through the OpenAI-compatible
   endpoint.
 - `vertex_claude`: Claude partner models on Vertex AI.
 - `openai`: OpenAI API.
 
 Recommended enterprise configuration uses Google ADC or service-account
-impersonation, not static API keys:
+impersonation, not static API keys. Store persistent Agent defaults in
+`config/user_config.sh`; `./bin/anychain-agent` loads that file at startup, and
+temporary environment variables can still override it.
 
 ```bash
-export LLM_PROVIDER=vertex_gemini_openai
-export LLM_MODEL=gemini-2.5-pro
-export GOOGLE_AUTH_MODE=service_account_impersonation
-export GOOGLE_CLOUD_PROJECT=your-project
-export GOOGLE_CLOUD_LOCATION=us-central1
-export GOOGLE_SERVICE_ACCOUNT_EMAIL=benchmark-agent@your-project.iam.gserviceaccount.com
+LLM_PROVIDER="vertex_gemini_openai"
+LLM_MODEL="gemini-2.5-pro"
+GOOGLE_AUTH_MODE="service_account_impersonation"
+GOOGLE_CLOUD_PROJECT="your-project"
+GOOGLE_CLOUD_LOCATION="us-central1"
+GOOGLE_SERVICE_ACCOUNT_EMAIL="benchmark-agent@your-project.iam.gserviceaccount.com"
 ```
 
 `GOOGLE_AUTH_MODE=adc` or `attached_service_account` is preferred on GCE/GKE
