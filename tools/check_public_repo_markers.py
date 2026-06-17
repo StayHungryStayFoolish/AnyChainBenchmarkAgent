@@ -14,6 +14,7 @@ DEFAULT_ROOTS = (
     "README_ZH.md",
     "agent",
     "analysis",
+    "bin",
     "blockchain_node_benchmark.sh",
     "ci",
     "config",

@@ -53,61 +53,148 @@ The Agent is intentionally bounded:
 - It writes Agent-generated runtime config to job-local `runtime.env`, not to
   `config/user_config.sh`.
 
-## Quick Start With The Agent
+## 5-Minute Quick Start
 
-Check local dependencies without modifying the host:
+This is the fastest way to use AnyChain Benchmark Agent from a terminal. It does
+not require a real blockchain node or an LLM key. The Agent will turn your goal
+into a request, discover the local environment, generate a plan, run preflight,
+submit a mock job, answer questions, and analyze evidence.
+
+Clone the repository:
+
+```bash
+git clone git@github.com:StayHungryStayFoolish/AnyChainBenchmarkAgent.git
+cd AnyChainBenchmarkAgent
+```
+
+Check dependencies without modifying the host:
 
 ```bash
 bash scripts/install_deps.sh --check
 ```
 
-Inspect what the framework currently supports:
+Start the Agent terminal session:
 
 ```bash
-python3 agent/cli.py capabilities
-python3 agent/cli.py ask --prompt "How many chains and RPC methods does the framework support?"
+./bin/anychain-agent
 ```
 
-Draft a benchmark request from a prompt:
+Then talk to it:
 
-```bash
-python3 agent/cli.py draft-request \
-  --prompt "Test Solana maximum stable QPS on GKE with fake-node smoke first" \
-  --output /tmp/request.json
+```text
+> What chains and RPC methods do you support?
+> Create a Solana fake-node smoke benchmark at 1 QPS
+> plan
+> preflight
+> run mock
+> status
+> analyze
+> compact
+> memory
+> qa What evidence was generated?
 ```
 
-Generate and inspect a plan:
+You can also run a one-shot prompt:
 
 ```bash
-python3 agent/cli.py plan \
-  --request /tmp/request.json \
-  --output /tmp/plan.json \
-  --discover \
-  --dry-run
-
-python3 agent/cli.py preflight --plan /tmp/plan.json
-python3 agent/cli.py risk-score --plan /tmp/plan.json
-python3 agent/cli.py runbook --plan /tmp/plan.json --output /tmp/runbook.md
+./bin/anychain-agent \
+  --prompt "Create a Solana fake-node smoke benchmark at 1 QPS"
 ```
 
-Submit a lifecycle-only mock job:
+Inside the session, `run mock` submits a lifecycle-only Agent job. Real benchmark
+execution requires explicit confirmation with `yes run` after reviewing the
+plan and runbook. Long sessions can be summarized with `compact`; the Agent
+writes structured memory to `.agent/chat/memory.json` while preserving the
+current request, plan, job, evidence paths, open questions, and recent turns.
+Auto-compaction defaults to a 1,000,000-token context window with a 70% trigger
+ratio, configurable through `AGENT_CONTEXT_WINDOW_TOKENS` and
+`AGENT_COMPACT_TRIGGER_RATIO`.
+
+Ask the Agent about framework capabilities at any time:
 
 ```bash
-python3 agent/cli.py submit --plan /tmp/plan.json --mock
+./bin/anychain-agent --prompt "How many chains and RPC methods are supported?"
+./bin/anychain-agent --prompt "How do I add a custom RPC method with three params?"
 ```
 
-Submit a real benchmark only after reviewing the plan and runbook:
+Use LLM-assisted request drafting only after configuring a provider:
 
 ```bash
-python3 agent/cli.py submit --plan /tmp/plan.json --approved
+./bin/anychain-agent \
+  --prompt "Test my Ethereum node with a weighted mixed workload" \
+  --use-llm
 ```
 
-Check or analyze a job:
+Advanced subcommands remain available for CI and automation:
 
 ```bash
-python3 agent/cli.py status --job-id <job_id>
-python3 agent/cli.py analyze --job-id <job_id>
-python3 agent/cli.py artifact-qa --job-id <job_id> --question "Why are charts empty?"
+python3 agent/cli.py --help
+```
+
+Validate the offline Agent contract when you modify the project:
+
+```bash
+python3 -m unittest tests.test_agent_runtime_contract -v
+```
+
+## Run A Local Fake-Node Benchmark
+
+Use this when you want to exercise the real benchmark engine locally without a
+production node:
+
+```bash
+BLOCKCHAIN_NODE=solana \
+RPC_MODE=single \
+QUICK_INITIAL_QPS=1 \
+QUICK_MAX_QPS=1 \
+QUICK_QPS_STEP=1 \
+QUICK_DURATION=3 \
+QPS_WARMUP_DURATION=0 \
+QPS_COOLDOWN=0 \
+./blockchain_node_benchmark.sh --quick --single --fake-node
+```
+
+After the run, open the generated HTML report:
+
+```bash
+ls -lt blockchain-node-benchmark-result/current/reports/*.html
+```
+
+## Run Against A Real Node
+
+Edit `config/user_config.sh` first:
+
+```bash
+BLOCKCHAIN_NODE="solana"
+RPC_MODE="single"
+LOCAL_RPC_URL="http://your-node-rpc:8899"
+MAINNET_RPC_URL=""
+
+BLOCKCHAIN_PROCESS_NAMES=("agave-validator" "solana-validator" "validator")
+
+CLOUD_PROVIDER="gcp"
+CLOUD_REGION="us-central1"
+MACHINE_TYPE="c3-standard-22"
+LEDGER_DEVICE="sdb"
+DATA_VOL_TYPE="hyperdisk-extreme"
+DATA_VOL_MAX_IOPS="30000"
+DATA_VOL_MAX_THROUGHPUT="700"
+NETWORK_MAX_BANDWIDTH_GBPS=25
+```
+
+Then run:
+
+```bash
+./blockchain_node_benchmark.sh --quick
+```
+
+The most important output files are:
+
+```text
+blockchain-node-benchmark-result/current/reports/performance_report_*.html
+blockchain-node-benchmark-result/current/logs/proxy_method.csv
+blockchain-node-benchmark-result/current/logs/performance_latest.csv
+blockchain-node-benchmark-result/archives/<run-id>/test_summary.json
 ```
 
 ## Optional LLM Providers

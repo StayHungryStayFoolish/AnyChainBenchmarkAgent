@@ -57,7 +57,7 @@ The Agent must implement these controls before it is considered Phase 2 ready:
 - plan confidence and `requires_confirmation`.
 - command safety guardrails.
 - runbook mode for auditable execution.
-- interactive CLI/wizard.
+- terminal chat entrypoint and interactive wizard.
 - plan diff with config snapshots.
 - artifact index generation.
 - secret redaction.
@@ -93,6 +93,37 @@ job-local env file:
 Real benchmark execution loads this file, and the artifact index records it as
 evidence. This keeps Agent-generated runtime values reproducible without
 polluting the user's default configuration.
+
+## Terminal Entry
+
+The user-facing entrypoint is the terminal Agent:
+
+```bash
+./bin/anychain-agent
+```
+
+Users can ask framework questions, create plans, run preflight, submit mock
+jobs, inspect status, and analyze artifacts in one session:
+
+```text
+> What chains and RPC methods do you support?
+> Create a Solana fake-node smoke benchmark at 1 QPS
+> plan
+> preflight
+> run mock
+> analyze
+> compact
+> memory
+```
+
+Long chat sessions use deterministic context compaction. The `compact` command
+writes `.agent/chat/memory.json` with the current request, plan, job, evidence
+paths, open questions, and recent turns. This keeps the local Agent usable
+without an LLM and gives future LLM providers a bounded context contract. The
+default window is `1,000,000` estimated tokens with a `0.7` trigger ratio.
+
+The lower-level `agent/cli.py` subcommands are kept for tests, CI, automation,
+and advanced scripting.
 
 ## CLI Preview
 

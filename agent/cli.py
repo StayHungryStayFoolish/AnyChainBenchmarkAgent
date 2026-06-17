@@ -29,6 +29,7 @@ from qa.request_drafter import draft_request
 from runners.job_manager import get_job, submit_job
 from runners.runbook import render_runbook
 from wizard import run_wizard
+from chat import run_chat
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -125,6 +126,12 @@ def main(argv: list[str] | None = None) -> int:
     wizard.add_argument("--answers-file", help="JSON object with answers keyed by required question id")
     wizard.add_argument("--use-llm", action="store_true", help="Use configured LLM provider to draft the request")
     wizard.add_argument("--mock-llm", action="store_true", help="Use the offline fake LLM provider")
+
+    chat = sub.add_parser("chat", help="Start the terminal Agent chat session")
+    chat.add_argument("--prompt", help="Run one prompt and exit")
+    chat.add_argument("--output-dir", default=".agent/chat")
+    chat.add_argument("--use-llm", action="store_true", help="Use configured LLM provider for request drafting/routing")
+    chat.add_argument("--mock-llm", action="store_true", help="Use the offline fake LLM provider")
 
     args = parser.parse_args(argv)
 
@@ -257,6 +264,14 @@ def main(argv: list[str] | None = None) -> int:
             llm_provider=_fake_provider() if args.mock_llm else None,
         )
         return _emit(payload, None)
+
+    if args.command == "chat":
+        return run_chat(
+            prompt=args.prompt,
+            output_dir=args.output_dir,
+            use_llm=args.use_llm,
+            llm_provider=_fake_provider() if args.mock_llm else None,
+        )
 
     parser.error(f"unsupported command: {args.command}")
     return 2
