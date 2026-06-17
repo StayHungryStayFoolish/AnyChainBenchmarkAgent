@@ -20,6 +20,7 @@ from memory.compactor import compact_session_state, should_auto_compact  # noqa:
 from planners.request_modifier import apply_request_modification  # noqa: E402
 from runners.guardrails import validate_execution_plan  # noqa: E402
 from chat import ChatSession  # noqa: E402
+from diagnostics.doctor import format_doctor_report, run_doctor  # noqa: E402
 from wizard import run_wizard  # noqa: E402
 
 
@@ -166,6 +167,11 @@ class AgentRuntimeContractTest(unittest.TestCase):
                 "--discover",
             )
             self.assertNotEqual(discovered_plan["discovery"]["source"], "not_collected")
+
+            doctor = run_agent("doctor")
+            self.assertIn(doctor["status"], {"ready", "ready_without_llm", "needs_dependencies"})
+            self.assertEqual(doctor["capabilities"]["chain_count"], 36)
+            self.assertIn("next_actions", doctor)
 
             validation = run_agent("validate-plan", str(plan_file))
             self.assertTrue(validation["valid"])
@@ -338,6 +344,9 @@ class AgentRuntimeContractTest(unittest.TestCase):
             session = ChatSession(output_dir=chat_dir)
             answer = session.handle("How many chains and RPC methods are supported?")
             self.assertIn("Current chain templates define", answer)
+            doctor_answer = session.handle("doctor")
+            self.assertIn("Agent doctor report", doctor_answer)
+            self.assertIn("capabilities:", doctor_answer)
 
             plan_answer = session.handle("Create a Solana fake-node smoke benchmark at 1 QPS")
             self.assertIn("Created a benchmark plan", plan_answer)
@@ -405,6 +414,24 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertIn("Context compacted", repl.stdout)
             self.assertIn("\"status\": \"completed\"", repl.stdout)
             self.assertTrue((Path(tmp) / "repl" / "memory.json").is_file())
+
+    def test_agent_doctor_formats_readiness_report(self):
+        report = run_doctor({
+            "cloud": {"provider": "gcp", "platform": "gce", "confidence": 0.8},
+            "deployment": {"type": "vm"},
+            "network": {"default_interface": "eth0"},
+            "disks": {"ambiguous_candidates": ["sdb", "sdc"]},
+            "dependencies": {
+                "missing_required": ["vegeta"],
+                "missing_optional": ["kubectl"],
+            },
+            "warnings": ["Multiple plausible data disks were found; confirm ledger/accounts devices."],
+        })
+        self.assertEqual(report["status"], "needs_dependencies")
+        self.assertEqual(report["environment"]["dependencies"]["missing_required"], ["vegeta"])
+        text = format_doctor_report(report)
+        self.assertIn("Agent doctor report", text)
+        self.assertIn("required dependencies missing: vegeta", text)
 
     def test_request_modifier_updates_qps_and_mixed_weights(self):
         request = {"chain": "solana", "rpc_mode": "single", "use_fake_node": True}

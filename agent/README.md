@@ -106,6 +106,7 @@ Users can ask framework questions, create plans, run preflight, submit mock
 jobs, inspect status, and analyze artifacts in one session:
 
 ```text
+> doctor
 > What chains and RPC methods do you support?
 > Create a Solana fake-node smoke benchmark at 1 QPS
 > set max qps to 5000
@@ -117,6 +118,10 @@ jobs, inspect status, and analyze artifacts in one session:
 > compact
 > memory
 ```
+
+`doctor` is a read-only readiness check. It reports dependency gaps,
+cloud/deployment hints, LLM/Vertex configuration errors, and live capability
+coverage before the user starts a real benchmark.
 
 Long chat sessions use deterministic context compaction. The `compact` command
 writes `.agent/chat/memory.json` with the current request, plan, job, evidence

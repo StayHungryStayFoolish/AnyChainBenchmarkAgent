@@ -11,6 +11,7 @@ from pathlib import Path
 from analyzers.result_analyzer import analyze_job
 from analyzers.history import compare_latest, list_history
 from analyzers.artifact_qa import answer_artifact_question
+from diagnostics.doctor import run_doctor
 from discovery.environment import discover_environment
 from knowledge.gap_analyzer import analyze_capability_gap, answer_gap_question
 from knowledge.framework_capabilities import answer_capability_question, load_framework_capabilities
@@ -79,6 +80,9 @@ def main(argv: list[str] | None = None) -> int:
 
     discover = sub.add_parser("discover", help="Run read-only environment discovery")
     discover.add_argument("--output")
+
+    doctor = sub.add_parser("doctor", help="Run read-only Agent readiness diagnostics")
+    doctor.add_argument("--output")
 
     llm_config = sub.add_parser("llm-config", help="Validate LLM provider and auth configuration")
     llm_config.add_argument("--output")
@@ -192,6 +196,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "discover":
         payload = discover_environment()
         return _emit(payload, args.output)
+
+    if args.command == "doctor":
+        return _emit(run_doctor(), args.output)
 
     if args.command == "llm-config":
         config = load_llm_config()
