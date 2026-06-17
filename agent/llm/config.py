@@ -24,6 +24,7 @@ SUPPORTED_GOOGLE_AUTH_MODES = {
 }
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+AGENT_CONFIG = REPO_ROOT / "config" / "agent_config.sh"
 USER_CONFIG = REPO_ROOT / "config" / "user_config.sh"
 
 
@@ -72,7 +73,7 @@ class LLMConfig:
 
 
 def load_llm_config(env: Mapping[str, str] | None = None) -> LLMConfig:
-    source = env or _load_user_config_env()
+    source = env or load_agent_environment()
     provider = source.get("LLM_PROVIDER", "fake").strip().lower()
     default_model = "fake"
     if provider == "vertex_gemini_openai":
@@ -93,11 +94,13 @@ def load_llm_config(env: Mapping[str, str] | None = None) -> LLMConfig:
     )
 
 
-def _load_user_config_env() -> Mapping[str, str]:
-    """Load exported config/user_config.sh values while preserving process env overrides."""
-    if not USER_CONFIG.is_file():
+def load_agent_environment() -> Mapping[str, str]:
+    """Load persistent Agent config while preserving process env overrides."""
+    config_files = [path for path in (AGENT_CONFIG, USER_CONFIG) if path.is_file()]
+    if not config_files:
         return os.environ
-    command = f"set -a; source {str(USER_CONFIG)!r}; env -0"
+    source_lines = "; ".join(f"source {str(path)!r}" for path in config_files)
+    command = f"set -a; {source_lines}; env -0"
     try:
         completed = subprocess.run(
             ["bash", "-lc", command],

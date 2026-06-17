@@ -50,11 +50,41 @@ Agent 是有边界的：
 - Agent 生成的运行配置写入 job-local `runtime.env`，不会修改
   `config/user_config.sh`。
 
+## 配置模型
+
+大多数用户启动 Agent 前只需要关注一个文件：
+
+```text
+config/agent_config.sh
+```
+
+这个文件只配置 Agent 自身：LLM provider、模型、Vertex/OpenAI 认证、上下文压缩和
+可选企业 Knowledge Base 集成。每个变量后面都有注释。
+
+底层 benchmark engine 的默认配置仍然在：
+
+```text
+config/user_config.sh
+```
+
+用户不需要一开始理解所有 benchmark 变量。启动 Agent 后先运行 `doctor`，再描述测试
+目标，Agent 会告诉你还缺哪些必需值。
+
+Agent 提交 job 时会生成：
+
+```text
+.agent/jobs/<job_id>/runtime.env
+```
+
+`runtime.env` 是这一次 job 的最终配置快照。通过 Agent 启动 benchmark 时，它的优先级
+高于 `config/user_config.sh`。用户不需要也不应该手动编辑它；它是报告和分析时证明
+本次运行使用了哪些变量的证据。
+
 ## 5 分钟快速开始
 
 这是在终端里使用 AnyChain Benchmark Agent 的最快路径。不配置 LLM 时，Agent 仍可
 使用确定性解析和本地仓库能力回答问题；如果希望启用模型辅助 planning，需要先在
-`config/user_config.sh` 中配置 provider、模型和认证方式。
+`config/agent_config.sh` 中配置 provider、模型和认证方式。
 
 克隆仓库：
 
@@ -69,16 +99,18 @@ cd AnyChainBenchmarkAgent
 bash scripts/install_deps.sh --check
 ```
 
-在 `config/user_config.sh` 中配置持久化的 Agent 和 benchmark 参数。本地 fake-node
-smoke 测试最重要的配置是：
+在 `config/agent_config.sh` 中配置持久化的 Agent 参数。确定性/离线模式保持默认值：
 
 ```bash
-BLOCKCHAIN_NODE="solana"
-RPC_MODE="single"
-
-# 可选 LLM。保持 fake 表示确定性/离线模式。
 LLM_PROVIDER="fake"                       # fake | vertex_gemini_openai | vertex_claude | openai
 LLM_MODEL="fake"
+```
+
+如果需要模型辅助 planning，配置一个真实 provider：
+
+```bash
+LLM_PROVIDER="vertex_gemini_openai"
+LLM_MODEL="gemini-2.5-pro"
 GOOGLE_AUTH_MODE="adc"                    # adc | attached_service_account | service_account_impersonation | service_account_file
 GOOGLE_CLOUD_PROJECT=""                   # 使用 Vertex + --use-llm 时必填
 GOOGLE_CLOUD_LOCATION="us-central1"
@@ -87,22 +119,8 @@ GOOGLE_APPLICATION_CREDENTIALS=""         # 可选 JSON key fallback
 OPENAI_API_KEY=""                         # 仅 LLM_PROVIDER=openai 时必填
 ```
 
-如果要测试真实节点，还需要配置节点地址和机器上下文：
-
-```bash
-LOCAL_RPC_URL="http://your-node-rpc:8899"
-MAINNET_RPC_URL=""
-BLOCKCHAIN_PROCESS_NAMES=("agave-validator" "solana-validator" "validator")
-
-CLOUD_PROVIDER="gcp"
-CLOUD_REGION="us-central1"
-MACHINE_TYPE="c3-standard-22"
-LEDGER_DEVICE="sdb"
-DATA_VOL_TYPE="hyperdisk-extreme"
-DATA_VOL_MAX_IOPS="30000"
-DATA_VOL_MAX_THROUGHPUT="700"
-NETWORK_MAX_BANDWIDTH_GBPS=25
-```
+chain、RPC URL、磁盘、机器类型等 benchmark 信息可以先不配置。Agent 会自动发现能
+发现的信息，并在真实运行前提示你补充缺少的必需值。
 
 启动 Agent 终端会话：
 
@@ -110,17 +128,38 @@ NETWORK_MAX_BANDWIDTH_GBPS=25
 ./bin/anychain-agent
 ```
 
-然后直接和它对话。下面这些行是你在 Agent 交互窗口中输入的内容，不是 shell 命令：
+然后直接和它对话。`anychain>` 后面的内容是你在 Agent 交互窗口中输入的消息，不是
+shell 命令。
 
 ```text
-> doctor
-> Create a Solana fake-node smoke benchmark at 1 QPS
-> plan
-> preflight
-> run mock
-> status
-> analyze
-> qa What evidence was generated?
+anychain> doctor
+# 只读检查：依赖、cloud/deployment、LLM 配置、Knowledge Base 开关、
+# 支持的链/RPC method，以及明显缺失的配置。
+
+anychain> Create a Solana fake-node smoke benchmark at 1 QPS
+# 用自然语言描述测试目标。Agent 会生成 request，发现环境，生成 plan，
+# 并记录还缺哪些必需值。
+
+anychain> plan
+# 查看当前计划：chain、RPC mode、fake-node/real-node、QPS 策略、命令、
+# 必需输入、生成文件和下一步。
+
+anychain> preflight
+# 执行运行前校验，发现缺失 chain template、必需变量、fake-node 支持、
+# 输出目录权限等问题。
+
+anychain> run mock
+# 只验证 Agent job 生命周期，不运行 Vegeta 压测流量。
+# 会生成 job metadata、artifact_index 和 runtime.env。
+
+anychain> status
+# 查看最近一次 job 状态。
+
+anychain> analyze
+# 基于 artifact 分析结果，并给出 PASS/WARNING/FAIL/INCONCLUSIVE 和证据路径。
+
+anychain> qa What evidence was generated?
+# 对结果继续提问，例如报告在哪里、哪些 CSV 有数据、runtime.env 是什么。
 ```
 
 在新环境中建议先输入 `doctor`。它会以只读方式检查 cloud/deployment 识别结果、
@@ -164,27 +203,49 @@ python3 agent/cli.py --help
 python3 -m unittest tests.test_agent_runtime_contract -v
 ```
 
+## Agent 入口
+
+普通用户只需要使用一个推荐入口：
+
+```bash
+./bin/anychain-agent
+```
+
+其他入口用于自动化和高级场景：
+
+- `python3 agent/cli.py ...`：开发、CI、企业 Agent 平台集成。适合需要 JSON 输入/输出
+  的场景。
+- `./blockchain_node_benchmark.sh`：底层压测执行引擎。Agent 在计划确认后会调用它。
+  普通用户不建议直接使用。
+
+三个入口最终都需要 chain、RPC URL、QPS mode、进程名、磁盘基线和网络带宽等运行值。
+区别是：
+
+- `./bin/anychain-agent` 会检测并在执行前追问缺失值。
+- `agent/cli.py` 通常由脚本传入 request/plan JSON。
+- `blockchain_node_benchmark.sh` 要求配置已经存在。
+
 ## 运行本地 Fake-Node Benchmark
 
 如果你希望在没有生产节点的情况下通过 Agent 验证 benchmark 流程，启动
 `./bin/anychain-agent` 后输入：
 
 ```text
-> doctor
-> Create a Solana fake-node smoke benchmark at 1 QPS
-> preflight
-> run mock
-> analyze
+anychain> doctor
+anychain> Create a Solana fake-node smoke benchmark at 1 QPS
+anychain> preflight
+anychain> run mock
+anychain> analyze
 ```
 
 `run mock` 只验证 Agent 生命周期，不会发送真实 benchmark 流量。如果希望让 Agent
 规划并执行真实 fake-node benchmark engine，可以输入：
 
 ```text
-> Create a Solana fake-node quick benchmark and run the real benchmark engine
-> plan
-> preflight
-> yes run
+anychain> Create a Solana fake-node quick benchmark and run the real benchmark engine
+anychain> plan
+anychain> preflight
+anychain> yes run
 ```
 
 执行 `yes run` 前请先 review 生成的 runbook；Agent 只会执行 allowlisted benchmark
@@ -203,12 +264,12 @@ command。
 真实节点对话示例：
 
 ```text
-> doctor
-> Test my Solana node at http://your-node-rpc:8899 with a quick single-method benchmark
-> plan
-> preflight
-> yes run
-> analyze
+anychain> doctor
+anychain> Test my Solana node at http://your-node-rpc:8899 with a quick single-method benchmark
+anychain> plan
+anychain> preflight
+anychain> yes run
+anychain> analyze
 ```
 
 最重要的输出文件：
@@ -219,6 +280,19 @@ blockchain-node-benchmark-result/current/logs/proxy_method.csv
 blockchain-node-benchmark-result/current/logs/performance_latest.csv
 blockchain-node-benchmark-result/archives/<run-id>/test_summary.json
 ```
+
+## 必需值和 Checklist
+
+Agent 分三层检查配置：
+
+- **Agent checklist**：`config/agent_config.sh`，检查 LLM provider、模型、
+  Vertex/OpenAI 认证、上下文压缩和可选 Knowledge Base。
+- **Benchmark checklist**：`plan` 和 `preflight` 检查 chain、RPC mode、真实节点
+  `LOCAL_RPC_URL`、进程名、ledger 磁盘、磁盘基线和网络带宽等运行值。
+- **Advanced checklist**：监控频率、瓶颈阈值、同步健康阈值、Prometheus/Grafana、
+  Kubernetes 和 runtime paths。大多数用户不需要修改。
+
+Agent 应该在 `yes run` 前暴露缺失的必需值；高级配置保留给需要调优的 operator。
 
 ## 可选 LLM Provider
 
@@ -233,7 +307,7 @@ classification，随后仍会经过确定性校验。
 - `fake`：离线 protocol smoke provider，用于测试。
 
 企业环境推荐使用 Vertex AI 的 ADC 或 service-account impersonation，而不是静态 API
-key。请在 `config/user_config.sh` 中持久化配置这些变量；`./bin/anychain-agent`
+key。请在 `config/agent_config.sh` 中持久化配置这些变量；`./bin/anychain-agent`
 启动时会自动加载该文件，临时测试时仍可用环境变量覆盖。
 
 ```bash
@@ -317,6 +391,31 @@ deploy/k8s/validate.sh --post-deploy
 
 然后在选定的 runner 上使用同一份 `config/user_config.sh` 运行 benchmark。
 
+## 企业 Agent 平台集成
+
+本项目可以通过两种方式嵌入企业内部 Agent 平台：
+
+- **终端模式**：在受控 shell 中运行 `./bin/anychain-agent`。
+- **程序化模式**：调用 `python3 agent/cli.py` 子命令，通过 JSON 交换数据。
+  常用命令包括 `doctor`、`capabilities`、`draft-request`、`plan`、`preflight`、
+  `submit`、`status`、`analyze` 和 `artifact-qa`。
+
+企业环境建议在运行镜像或部署 profile 中配置一次 `config/agent_config.sh`。密钥应由
+企业 secret manager 注入环境变量，不要写入 git。
+
+Knowledge Base 集成默认关闭：
+
+```bash
+AGENT_KNOWLEDGE_PROVIDER="disabled"       # disabled | noop | custom
+AGENT_KNOWLEDGE_PROVIDER_MODULE=""        # example: my_company.anychain_kb:Provider
+AGENT_KNOWLEDGE_BASE_URL=""
+AGENT_KNOWLEDGE_AUTH_REF=""
+```
+
+内置 Agent 已经可以基于仓库状态回答：chain template、fake-node fixture、docs、
+artifact 和运行历史。只有企业需要私有节点样本、内部 RPC 证据、事故历史或公司内部
+workload 建议时，才需要启用自定义 Knowledge Base。
+
 ## 报告与 Artifact
 
 当前运行文件写入 runtime `current/` 目录，最终结果会在运行结束后归档。
@@ -328,7 +427,7 @@ deploy/k8s/validate.sh --post-deploy
 - `current/logs/performance_latest.csv`
 - `archives/<run-id>/test_summary.json`
 - `.agent/jobs/<job_id>/artifact_index.json`
-- `.agent/jobs/<job_id>/runtime.env`
+- `.agent/jobs/<job_id>/runtime.env`：Agent 为该 job 生成的最终配置快照，用户不要手动编辑。
 
 ## 可选 Prometheus/Grafana
 

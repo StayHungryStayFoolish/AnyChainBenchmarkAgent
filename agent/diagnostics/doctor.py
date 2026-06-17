@@ -6,13 +6,14 @@ from typing import Any
 
 from discovery.environment import discover_environment
 from knowledge.framework_capabilities import load_framework_capabilities
-from llm.config import load_llm_config
+from llm.config import load_agent_environment, load_llm_config
 from llm.google_auth import credential_plan
 
 
 def run_doctor(discovery: dict[str, Any] | None = None) -> dict[str, Any]:
     """Return a read-only readiness report for first-run Agent users."""
     environment = discovery or discover_environment()
+    agent_env = load_agent_environment()
     llm_config = load_llm_config()
     llm_errors = llm_config.validate()
     capabilities = load_framework_capabilities()
@@ -41,6 +42,12 @@ def run_doctor(discovery: dict[str, Any] | None = None) -> dict[str, Any]:
             },
         },
         "llm": llm_config.safe_dict(),
+        "knowledge_base": {
+            "provider": agent_env.get("AGENT_KNOWLEDGE_PROVIDER", "disabled"),
+            "provider_module_configured": bool(agent_env.get("AGENT_KNOWLEDGE_PROVIDER_MODULE", "")),
+            "url_configured": bool(agent_env.get("AGENT_KNOWLEDGE_BASE_URL", "")),
+            "auth_ref_configured": bool(agent_env.get("AGENT_KNOWLEDGE_AUTH_REF", "")),
+        },
         "google_credential_plan": (
             credential_plan(llm_config).safe_dict()
             if llm_config.provider.startswith("vertex_")
@@ -64,6 +71,7 @@ def format_doctor_report(report: dict[str, Any]) -> str:
     deployment = env.get("deployment", {})
     deps = env.get("dependencies", {})
     llm = report.get("llm", {})
+    kb = report.get("knowledge_base", {})
     capabilities = report.get("capabilities", {})
     lines = [
         "Agent doctor report.",
@@ -74,6 +82,7 @@ def format_doctor_report(report: dict[str, Any]) -> str:
         f"- optional dependencies missing: {', '.join(deps.get('missing_optional', [])) or '<none>'}",
         f"- LLM provider: {llm.get('provider')} / {llm.get('model')}",
         f"- LLM validation errors: {', '.join(llm.get('validation_errors', [])) or '<none>'}",
+        f"- knowledge base: {kb.get('provider', 'disabled')}",
         (
             "- capabilities: "
             f"{capabilities.get('chain_count')} chains, "

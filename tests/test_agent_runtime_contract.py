@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -20,6 +21,7 @@ from llm.providers import provider_from_config  # noqa: E402
 from memory.compactor import compact_session_state, should_auto_compact  # noqa: E402
 from planners.request_modifier import apply_request_modification  # noqa: E402
 from runners.guardrails import validate_execution_plan  # noqa: E402
+from runners.job_manager import submit_job  # noqa: E402
 from chat import ChatSession  # noqa: E402
 from diagnostics.doctor import format_doctor_report, run_doctor  # noqa: E402
 from wizard import run_wizard  # noqa: E402
@@ -563,13 +565,14 @@ class AgentRuntimeContractTest(unittest.TestCase):
         })
         self.assertIn("GOOGLE_SERVICE_ACCOUNT_EMAIL is required", "; ".join(missing_impersonation.validate()))
 
-    def test_llm_config_can_load_persistent_user_config(self):
+    def test_llm_config_can_load_persistent_agent_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             config_dir = repo / "config"
             config_dir.mkdir()
+            agent_config = config_dir / "agent_config.sh"
             user_config = config_dir / "user_config.sh"
-            user_config.write_text(
+            agent_config.write_text(
                 "\n".join([
                     'LLM_PROVIDER="${LLM_PROVIDER:-openai}"',
                     'LLM_MODEL="${LLM_MODEL:-gpt-4.1}"',
@@ -578,18 +581,63 @@ class AgentRuntimeContractTest(unittest.TestCase):
                 ]),
                 encoding="utf-8",
             )
+            user_config.write_text('LLM_PROVIDER="${LLM_PROVIDER:-vertex_gemini_openai}"\nexport LLM_PROVIDER\n', encoding="utf-8")
             old_root = llm_config_module.REPO_ROOT
+            old_agent_config = llm_config_module.AGENT_CONFIG
             old_config = llm_config_module.USER_CONFIG
             try:
                 llm_config_module.REPO_ROOT = repo
+                llm_config_module.AGENT_CONFIG = agent_config
                 llm_config_module.USER_CONFIG = user_config
                 config = load_llm_config()
             finally:
                 llm_config_module.REPO_ROOT = old_root
+                llm_config_module.AGENT_CONFIG = old_agent_config
                 llm_config_module.USER_CONFIG = old_config
             self.assertEqual(config.provider, "openai")
             self.assertEqual(config.model, "gpt-4.1")
             self.assertTrue(config.openai_api_key_present)
+
+    def test_agent_runtime_env_overrides_parent_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            output_file = tmp_path / "runtime_value.txt"
+            runner = tmp_path / "blockchain_node_benchmark.sh"
+            runner.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' \"$BLOCKCHAIN_NODE\" > \"$1\"\n",
+                encoding="utf-8",
+            )
+            runner.chmod(0o755)
+            plan_file = tmp_path / "plan.json"
+            plan_file.write_text(json.dumps({
+                "plan_id": "plan_runtime_priority",
+                "chain": "solana",
+                "strategy": "smoke",
+                "rpc_mode": "single",
+                "use_fake_node": True,
+                "required_inputs": [],
+                "execution": {
+                    "working_dir": str(tmp_path),
+                    "command": ["./blockchain_node_benchmark.sh", str(output_file)],
+                    "environment": {"BLOCKCHAIN_NODE": "solana"},
+                },
+                "materialized_config": {},
+                "artifacts": {},
+            }), encoding="utf-8")
+            old_value = os.environ.get("BLOCKCHAIN_NODE")
+            os.environ["BLOCKCHAIN_NODE"] = "ethereum"
+            try:
+                job = submit_job(plan_file, jobs_dir=tmp_path / "jobs", approved=True)
+            finally:
+                if old_value is None:
+                    os.environ.pop("BLOCKCHAIN_NODE", None)
+                else:
+                    os.environ["BLOCKCHAIN_NODE"] = old_value
+            self.assertEqual(job["status"], "completed")
+            self.assertEqual(output_file.read_text(encoding="utf-8").strip(), "solana")
+            runtime_env = Path(job["runtime_env_file"]).read_text(encoding="utf-8")
+            self.assertIn("export BLOCKCHAIN_NODE='solana'", runtime_env)
 
     def test_dynamic_framework_capabilities_are_loaded_from_current_templates(self):
         capabilities = load_framework_capabilities()

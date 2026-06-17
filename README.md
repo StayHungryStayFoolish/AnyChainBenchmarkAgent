@@ -53,11 +53,44 @@ The Agent is intentionally bounded:
 - It writes Agent-generated runtime config to job-local `runtime.env`, not to
   `config/user_config.sh`.
 
+## Configuration Model
+
+Most users only need one file before starting the Agent:
+
+```text
+config/agent_config.sh
+```
+
+Use it to configure the Agent itself: LLM provider, model, Vertex/OpenAI
+credentials, context compaction, and optional enterprise Knowledge Base
+integration. Every variable has an inline comment.
+
+The benchmark engine still has default settings in:
+
+```text
+config/user_config.sh
+```
+
+You normally do not need to understand or edit all benchmark variables up
+front. Start the Agent, run `doctor`, describe what you want to test, and let
+the Agent tell you which required values are missing.
+
+When the Agent submits a job, it writes:
+
+```text
+.agent/jobs/<job_id>/runtime.env
+```
+
+`runtime.env` is the final configuration snapshot for that one job. It has
+higher priority than `config/user_config.sh` during Agent-launched benchmark
+runs. Do not edit it by hand; it exists so reports and analysis can prove which
+values were used.
+
 ## 5-Minute Quick Start
 
 This is the fastest way to use AnyChain Benchmark Agent from a terminal. You can
 run the deterministic Agent without an LLM key, but model-assisted planning
-requires a provider configuration in `config/user_config.sh`.
+requires a provider configuration in `config/agent_config.sh`.
 
 Clone the repository:
 
@@ -72,17 +105,19 @@ Check dependencies without modifying the host:
 bash scripts/install_deps.sh --check
 ```
 
-Configure the persistent Agent and benchmark settings in
-`config/user_config.sh`. For an offline fake-node smoke test, the most important
-values are:
+Configure the persistent Agent settings in `config/agent_config.sh`.
+For deterministic/offline mode, keep the defaults:
 
 ```bash
-BLOCKCHAIN_NODE="solana"
-RPC_MODE="single"
-
-# Optional LLM. Keep fake for deterministic/offline mode.
 LLM_PROVIDER="fake"                       # fake | vertex_gemini_openai | vertex_claude | openai
 LLM_MODEL="fake"
+```
+
+For model-assisted planning, configure one real provider:
+
+```bash
+LLM_PROVIDER="vertex_gemini_openai"
+LLM_MODEL="gemini-2.5-pro"
 GOOGLE_AUTH_MODE="adc"                    # adc | attached_service_account | service_account_impersonation | service_account_file
 GOOGLE_CLOUD_PROJECT=""                   # required only when using Vertex with --use-llm
 GOOGLE_CLOUD_LOCATION="us-central1"
@@ -91,22 +126,9 @@ GOOGLE_APPLICATION_CREDENTIALS=""         # optional JSON key fallback
 OPENAI_API_KEY=""                         # required only when LLM_PROVIDER=openai
 ```
 
-For a real node, also set the node endpoint and machine context:
-
-```bash
-LOCAL_RPC_URL="http://your-node-rpc:8899"
-MAINNET_RPC_URL=""
-BLOCKCHAIN_PROCESS_NAMES=("agave-validator" "solana-validator" "validator")
-
-CLOUD_PROVIDER="gcp"
-CLOUD_REGION="us-central1"
-MACHINE_TYPE="c3-standard-22"
-LEDGER_DEVICE="sdb"
-DATA_VOL_TYPE="hyperdisk-extreme"
-DATA_VOL_MAX_IOPS="30000"
-DATA_VOL_MAX_THROUGHPUT="700"
-NETWORK_MAX_BANDWIDTH_GBPS=25
-```
+You can leave benchmark details such as chain, RPC URL, disk, and machine
+metadata unset at first. The Agent will detect what it can and ask for missing
+required values before a real run.
 
 Start the Agent terminal session:
 
@@ -114,18 +136,39 @@ Start the Agent terminal session:
 ./bin/anychain-agent
 ```
 
-Then talk to it. The lines below are examples of what you type inside the
-interactive Agent session; they are not shell commands:
+Then talk to it. Lines prefixed with `anychain>` are messages you type inside
+the Agent session; they are not shell commands.
 
 ```text
-> doctor
-> Create a Solana fake-node smoke benchmark at 1 QPS
-> plan
-> preflight
-> run mock
-> status
-> analyze
-> qa What evidence was generated?
+anychain> doctor
+# Read-only environment check: dependencies, cloud/deployment hints, LLM config,
+# Knowledge Base switch, supported chains/RPC methods, and obvious missing items.
+
+anychain> Create a Solana fake-node smoke benchmark at 1 QPS
+# Natural-language goal. The Agent turns it into a request, discovers the
+# environment, creates a plan, and records any missing required values.
+
+anychain> plan
+# Show the current plan: chain, RPC mode, fake-node/real-node mode, QPS profile,
+# command, required inputs, generated files, and next actions.
+
+anychain> preflight
+# Validate the plan before execution. This catches missing chain templates,
+# missing required values, missing fake-node support, and unwritable output dirs.
+
+anychain> run mock
+# Validate the Agent job lifecycle only. This creates job metadata, artifact
+# index, and runtime.env without running Vegeta traffic.
+
+anychain> status
+# Show the latest job state.
+
+anychain> analyze
+# Analyze generated artifacts and return PASS/WARNING/FAIL/INCONCLUSIVE with
+# evidence paths.
+
+anychain> qa What evidence was generated?
+# Ask follow-up questions about report files, CSVs, runtime.env, or missing data.
 ```
 
 Use `doctor` first on a new host. It performs read-only readiness diagnostics
@@ -172,27 +215,51 @@ Validate the offline Agent contract when you modify the project:
 python3 -m unittest tests.test_agent_runtime_contract -v
 ```
 
+## Agent Entry Points
+
+Use one recommended user entry:
+
+```bash
+./bin/anychain-agent
+```
+
+Other entry points exist for automation and advanced users:
+
+- `python3 agent/cli.py ...`: developer, CI, and enterprise platform
+  integration subcommands. Use this when another Agent platform wants JSON
+  input/output instead of a terminal session.
+- `./blockchain_node_benchmark.sh`: low-level execution engine. The Agent calls
+  this after plan approval. Direct use is for advanced automation only.
+
+All three paths eventually need runtime values such as chain, RPC URL, QPS
+mode, process names, disk baseline, and network bandwidth. The difference is
+how missing values are handled:
+
+- `./bin/anychain-agent` detects and asks before execution.
+- `agent/cli.py` expects request/plan JSON or scripted inputs.
+- `blockchain_node_benchmark.sh` expects configuration to already be present.
+
 ## Run A Local Fake-Node Benchmark
 
 Use this when you want the Agent to exercise the benchmark flow without a real
 production node. Start `./bin/anychain-agent`, then type:
 
 ```text
-> doctor
-> Create a Solana fake-node smoke benchmark at 1 QPS
-> preflight
-> run mock
-> analyze
+anychain> doctor
+anychain> Create a Solana fake-node smoke benchmark at 1 QPS
+anychain> preflight
+anychain> run mock
+anychain> analyze
 ```
 
 `run mock` validates the Agent lifecycle without sending benchmark traffic. To
 ask the Agent for a real fake-node benchmark plan, type:
 
 ```text
-> Create a Solana fake-node quick benchmark and run the real benchmark engine
-> plan
-> preflight
-> yes run
+anychain> Create a Solana fake-node quick benchmark and run the real benchmark engine
+anychain> plan
+anychain> preflight
+anychain> yes run
 ```
 
 Review the generated runbook before `yes run`; the Agent will execute only the
@@ -211,12 +278,12 @@ ledger disk settings, and network bandwidth. Then start the Agent:
 Example real-node conversation:
 
 ```text
-> doctor
-> Test my Solana node at http://your-node-rpc:8899 with a quick single-method benchmark
-> plan
-> preflight
-> yes run
-> analyze
+anychain> doctor
+anychain> Test my Solana node at http://your-node-rpc:8899 with a quick single-method benchmark
+anychain> plan
+anychain> preflight
+anychain> yes run
+anychain> analyze
 ```
 
 The most important output files are:
@@ -227,6 +294,22 @@ blockchain-node-benchmark-result/current/logs/proxy_method.csv
 blockchain-node-benchmark-result/current/logs/performance_latest.csv
 blockchain-node-benchmark-result/archives/<run-id>/test_summary.json
 ```
+
+## Required Values And Checklists
+
+The Agent has three levels of configuration checks:
+
+- **Agent checklist**: `config/agent_config.sh` validates LLM provider, model,
+  Vertex/OpenAI auth, context compaction, and optional Knowledge Base settings.
+- **Benchmark checklist**: `plan` and `preflight` validate required runtime
+  values such as chain, RPC mode, local RPC URL for real nodes, process names,
+  ledger disk, disk baseline, and network bandwidth.
+- **Advanced checklist**: system/internal defaults for monitoring intervals,
+  bottleneck thresholds, sync-health thresholds, Prometheus/Grafana, Kubernetes,
+  and runtime paths. Most users leave these defaults alone.
+
+The Agent should surface missing required values before `yes run`. Advanced
+settings remain available for operators who intentionally tune the framework.
 
 ## Optional LLM Providers
 
@@ -242,7 +325,7 @@ Supported provider contracts:
 
 Recommended enterprise Vertex configuration uses ADC or service-account
 impersonation instead of static API keys. Configure these values persistently in
-`config/user_config.sh`; `./bin/anychain-agent` loads that file at startup, and
+`config/agent_config.sh`; `./bin/anychain-agent` loads that file at startup, and
 environment variables can still override it for temporary tests.
 
 ```bash
@@ -328,6 +411,33 @@ deploy/k8s/validate.sh --post-deploy
 Then run the benchmark from your selected runner with the same
 `config/user_config.sh` settings.
 
+## Enterprise Agent Platform Integration
+
+The project can be embedded into enterprise Agent platforms in two ways:
+
+- **Terminal mode**: run `./bin/anychain-agent` in a controlled shell session.
+- **Programmatic mode**: call `python3 agent/cli.py` subcommands and exchange
+  JSON for `doctor`, `draft-request`, `plan`, `preflight`, `submit`, `status`,
+  `analyze`, `artifact-qa`, and `capabilities`.
+
+For enterprise use, configure `config/agent_config.sh` once in the runtime
+image or deployment profile. Keep secrets in the enterprise secret manager and
+inject them as environment variables at runtime.
+
+Optional Knowledge Base integration is disabled by default:
+
+```bash
+AGENT_KNOWLEDGE_PROVIDER="disabled"       # disabled | noop | custom
+AGENT_KNOWLEDGE_PROVIDER_MODULE=""        # example: my_company.anychain_kb:Provider
+AGENT_KNOWLEDGE_BASE_URL=""
+AGENT_KNOWLEDGE_AUTH_REF=""
+```
+
+The built-in Agent already answers from repository state: chain templates,
+fake-node fixtures, docs, artifacts, and run history. Enable a custom Knowledge
+Base only when an enterprise wants private node samples, internal RPC evidence,
+incident history, or company-specific workload guidance.
+
 ## Reports And Artifacts
 
 Current-run files are written under the runtime `current/` directory and durable
@@ -340,7 +450,8 @@ Key artifacts:
 - `current/logs/performance_latest.csv`
 - `archives/<run-id>/test_summary.json`
 - `.agent/jobs/<job_id>/artifact_index.json` for Agent jobs
-- `.agent/jobs/<job_id>/runtime.env` for Agent materialized runtime config
+- `.agent/jobs/<job_id>/runtime.env` for the Agent-generated final config
+  snapshot for that job. Users should not edit this file manually.
 
 ## Optional Prometheus/Grafana
 
