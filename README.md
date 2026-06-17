@@ -82,6 +82,7 @@ Start the Agent terminal session:
 Then talk to it:
 
 ```text
+> doctor
 > What chains and RPC methods do you support?
 > Create a Solana fake-node smoke benchmark at 1 QPS
 > set max qps to 5000
@@ -95,6 +96,10 @@ Then talk to it:
 > memory
 > qa What evidence was generated?
 ```
+
+Use `doctor` first on a new host. It performs read-only readiness diagnostics
+for cloud/deployment detection, required dependencies, LLM/Vertex configuration,
+and current framework capability coverage.
 
 You can also run a one-shot prompt:
 

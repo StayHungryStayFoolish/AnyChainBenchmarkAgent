@@ -78,6 +78,7 @@ bash scripts/install_deps.sh --check
 然后直接和它对话：
 
 ```text
+> doctor
 > What chains and RPC methods do you support?
 > Create a Solana fake-node smoke benchmark at 1 QPS
 > set max qps to 5000
@@ -91,6 +92,9 @@ bash scripts/install_deps.sh --check
 > memory
 > qa What evidence was generated?
 ```
+
+在新环境中建议先输入 `doctor`。它会以只读方式检查 cloud/deployment 识别结果、
+必需依赖、LLM/Vertex 配置和当前框架能力覆盖情况。
 
 也可以使用一句 prompt 运行：
 

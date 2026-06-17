@@ -10,6 +10,7 @@ from typing import Any, TextIO
 
 from analyzers.artifact_qa import answer_artifact_question
 from analyzers.result_analyzer import analyze_job
+from diagnostics.doctor import format_doctor_report, run_doctor
 from discovery.environment import discover_environment
 from knowledge.framework_capabilities import answer_capability_question
 from knowledge.gap_analyzer import answer_gap_question
@@ -68,7 +69,7 @@ class ChatSession:
         return (
             "AnyChain Benchmark Agent\n"
             "Type a benchmark goal, ask a framework question, or use: "
-            "help, plan, preflight, run mock, run, status, analyze, compact, memory, exit."
+            "help, doctor, plan, preflight, run mock, run, status, analyze, compact, memory, exit."
         )
 
     def handle(self, text: str) -> str:
@@ -85,6 +86,8 @@ class ChatSession:
             return self._respond(self._compact(reason="manual"))
         if command in {"memory", "context", "show memory"}:
             return self._respond(self._show_memory())
+        if command in {"doctor", "diagnose", "readiness", "check readiness"}:
+            return self._respond(self._doctor())
         if command in {"discover", "detect environment"}:
             self.discovery = discover_environment()
             return self._respond(self._format_discovery())
@@ -126,6 +129,7 @@ class ChatSession:
             "- Change mixed weights to getSlot 70%, getBlockHeight 30%\n"
             "- plan\n"
             "- preflight\n"
+            "- doctor\n"
             "- run mock\n"
             "- status\n"
             "- analyze\n"
@@ -134,6 +138,10 @@ class ChatSession:
             "- qa What evidence was generated?\n\n"
             "Real benchmark execution requires `yes run` or `confirm run` after reviewing the plan."
         )
+
+    def _doctor(self) -> str:
+        self.discovery = discover_environment()
+        return format_doctor_report(run_doctor(self.discovery))
 
     def _answer_question(self, question: str) -> str:
         route = route_intent(question, provider=self.llm_provider, use_llm=self.use_llm)
