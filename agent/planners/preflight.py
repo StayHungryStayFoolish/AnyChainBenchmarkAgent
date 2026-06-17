@@ -19,6 +19,12 @@ def run_preflight(plan: dict[str, Any]) -> dict[str, Any]:
         not plan.get("required_inputs"),
         f"missing: {', '.join(plan.get('required_inputs', []))}" if plan.get("required_inputs") else "",
     ))
+    checklist_missing = plan.get("configuration_checklist", {}).get("missing_blockers", [])
+    checks.append(_check(
+        "configuration_checklist_complete",
+        not checklist_missing,
+        f"missing: {', '.join(checklist_missing)}" if checklist_missing else "",
+    ))
 
     chain_template = REPO_ROOT / "config" / "chains" / f"{chain}.json"
     checks.append(_check("chain_template_exists", chain_template.is_file(), str(chain_template)))

@@ -29,6 +29,11 @@ not execute commands directly.
 - Provides optional Prometheus/Grafana telemetry through a read-only exporter.
 - Provides an Agent control plane for prompt-first planning, risk scoring,
   capability gap analysis, artifact-aware Q&A, and long-running job tracking.
+- Guides missing configuration through Agent checklists instead of expecting
+  users to understand every benchmark variable up front.
+- Explains report charts and empty-chart causes from artifacts.
+- Generates plugin-style onboarding plans for new chains, RPC methods, and
+  weighted workloads.
 
 ## How The Agent Works
 
@@ -154,7 +159,8 @@ anychain> plan
 
 anychain> preflight
 # Validate the plan before execution. This catches missing chain templates,
-# missing required values, missing fake-node support, and unwritable output dirs.
+# missing required values, missing fake-node support, unwritable output dirs,
+# and incomplete configuration checklist items.
 
 anychain> run mock
 # Validate the Agent job lifecycle only. This creates job metadata, artifact
@@ -169,6 +175,10 @@ anychain> analyze
 
 anychain> qa What evidence was generated?
 # Ask follow-up questions about report files, CSVs, runtime.env, or missing data.
+
+anychain> qa Why are some charts empty?
+# Explain each report chart group, which CSV/fields it needs, and why a chart is
+# available, empty, or missing.
 ```
 
 Use `doctor` first on a new host. It performs read-only readiness diagnostics
@@ -310,6 +320,27 @@ The Agent has three levels of configuration checks:
 
 The Agent should surface missing required values before `yes run`. Advanced
 settings remain available for operators who intentionally tune the framework.
+
+## Report Preview And Chart Explanation
+
+Users can preview the report shape without running a benchmark:
+
+- [English HTML preview](docs/report-previews/report-preview.en.html)
+- [English PDF preview](docs/report-previews/report-preview.en.pdf)
+- [中文 HTML 预览](docs/report-previews/report-preview.zh.html)
+- [中文 PDF 预览](docs/report-previews/report-preview.zh.pdf)
+
+After a real run, ask the Agent chart questions:
+
+```text
+anychain> qa Why are charts empty?
+anychain> qa Explain the CPU-disk correlation chart
+anychain> qa Which files prove per-method latency?
+```
+
+The Agent checks registered artifacts and explains performance overview,
+CPU-disk correlation, disk thresholds, per-method attribution, sync health, and
+monitoring overhead.
 
 ## Optional LLM Providers
 
@@ -478,6 +509,16 @@ python3 agent/cli.py gap-analysis \
   --chain solana \
   --method getBalance \
   --method customMethod
+```
+
+Generate a plugin-style onboarding package:
+
+```bash
+python3 agent/cli.py onboarding-plan \
+  --chain foochain \
+  --adapter-family jsonrpc \
+  --method foo_getBalance \
+  --method foo_getBlock
 ```
 
 For unsupported chains, the Agent returns an onboarding plan instead of editing

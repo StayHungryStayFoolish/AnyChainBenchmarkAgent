@@ -132,6 +132,19 @@ def _apply_answer(updated: dict[str, Any], confirmations: set[str], qid: str, an
     elif qid == "ledger_device_confirmation":
         updated["ledger_device"] = answer
         confirmations.add(qid)
+    elif qid == "ledger_device":
+        updated["ledger_device"] = answer
+    elif qid == "blockchain_process_names":
+        updated["blockchain_process_names"] = [item.strip() for item in answer.replace(",", " ").split() if item.strip()]
+    elif qid == "data_vol_max_iops":
+        updated["data_vol_max_iops"] = answer
+    elif qid == "data_vol_max_throughput":
+        updated["data_vol_max_throughput"] = answer
+    elif qid == "network_max_bandwidth_gbps":
+        updated["network_max_bandwidth_gbps"] = answer
+    elif qid == "rpc_mode":
+        if answer.lower() in {"single", "mixed"}:
+            updated["rpc_mode"] = answer.lower()
     elif qid == "dependency_mode_confirmation":
         if answer in {"audit", "isolated", "managed"}:
             updated["dependency_mode"] = answer

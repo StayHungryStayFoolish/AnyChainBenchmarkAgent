@@ -65,6 +65,19 @@ def render_runbook(plan: dict[str, Any], preflight: dict[str, Any] | None = None
             if question.get("missing"):
                 lines.append(f"  missing: {', '.join(question['missing'])}")
 
+    checklist = safe_plan.get("configuration_checklist", {})
+    if checklist:
+        lines.extend(["", "## Configuration Checklist", ""])
+        lines.append(f"- summary: {checklist.get('summary', '<unknown>')}")
+        for section in ("agent", "benchmark", "advanced"):
+            items = checklist.get(section, [])
+            if not items:
+                continue
+            lines.append(f"- {section}:")
+            for item in items:
+                status = "OK" if item.get("present") else "MISSING"
+                lines.append(f"  - {status} [{item.get('severity')}] {item.get('id')}: {item.get('description')}")
+
     materialized = safe_plan.get("materialized_config", {})
     if materialized:
         lines.extend(["", "## Materialized Config", ""])

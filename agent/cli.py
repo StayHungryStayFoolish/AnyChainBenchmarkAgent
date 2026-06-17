@@ -19,6 +19,7 @@ from llm.config import load_llm_config
 from llm.google_auth import credential_plan
 from llm.providers import provider_from_config
 from llm.types import LLMMessage, LLMRequest
+from onboarding.chain_onboarding import generate_onboarding_package
 from planners.preflight import run_preflight
 from planners.diff import diff_plans
 from planners.risk import score_plan_risk
@@ -59,6 +60,12 @@ def main(argv: list[str] | None = None) -> int:
     gap = sub.add_parser("gap-analysis", help="Analyze chain/RPC method support gaps")
     gap.add_argument("--chain", required=True)
     gap.add_argument("--method", action="append", default=[])
+
+    onboarding = sub.add_parser("onboarding-plan", help="Generate plugin-style chain/RPC workload onboarding plan")
+    onboarding.add_argument("--chain", required=True)
+    onboarding.add_argument("--method", action="append", default=[])
+    onboarding.add_argument("--adapter-family")
+    onboarding.add_argument("--rpc-mode", default="mixed", choices=["single", "mixed"])
 
     risk = sub.add_parser("risk-score", help="Score risk for a benchmark plan")
     risk.add_argument("--plan", required=True)
@@ -170,6 +177,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "gap-analysis":
         return _emit(analyze_capability_gap(args.chain, args.method), None)
+
+    if args.command == "onboarding-plan":
+        return _emit(
+            generate_onboarding_package(
+                args.chain,
+                methods=args.method,
+                adapter_family=args.adapter_family,
+                rpc_mode=args.rpc_mode,
+            ),
+            None,
+        )
 
     if args.command == "risk-score":
         return _emit(score_plan_risk(load_json(args.plan)), None)
