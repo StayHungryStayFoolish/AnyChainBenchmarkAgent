@@ -106,17 +106,17 @@ Users can ask framework questions, create plans, run preflight, submit mock
 jobs, inspect status, and analyze artifacts in one session:
 
 ```text
-> doctor
-> What chains and RPC methods do you support?
-> Create a Solana fake-node smoke benchmark at 1 QPS
-> set max qps to 5000
-> change mixed weights to getSlot 70%, getBlockHeight 30%
-> plan
-> preflight
-> run mock
-> analyze
-> compact
-> memory
+anychain> doctor
+anychain> What chains and RPC methods do you support?
+anychain> Create a Solana fake-node smoke benchmark at 1 QPS
+anychain> set max qps to 5000
+anychain> change mixed weights to getSlot 70%, getBlockHeight 30%
+anychain> plan
+anychain> preflight
+anychain> run mock
+anychain> analyze
+anychain> compact
+anychain> memory
 ```
 
 `doctor` is a read-only readiness check. It reports dependency gaps,
@@ -131,6 +131,17 @@ default window is `1,000,000` estimated tokens with a `0.7` trigger ratio.
 
 The lower-level `agent/cli.py` subcommands are kept for tests, CI, automation,
 and advanced scripting.
+
+## Configuration And Runtime Priority
+
+Agent defaults live in `config/agent_config.sh`. Benchmark engine defaults live
+in `config/user_config.sh`.
+
+When the Agent submits a job, it writes `.agent/jobs/<job_id>/runtime.env`.
+That file is the final configuration snapshot for the job. For Agent-launched
+benchmark runs, `runtime.env` is injected into the child process environment and
+therefore has higher priority than defaults in `config/user_config.sh`. Users
+should not edit `runtime.env`; it is evidence for reproducibility and analysis.
 
 ## CLI Preview
 
@@ -301,6 +312,22 @@ coverage. External RAG is only needed when the user wants to integrate
 enterprise-private node knowledge, internal RPC samples, incident history, or
 unsupported-chain research.
 
+Enterprise platforms can keep Knowledge Base integration disabled and still use
+the Agent with repository-local capabilities. To enable a future custom adapter,
+configure `config/agent_config.sh`:
+
+```bash
+AGENT_KNOWLEDGE_PROVIDER="custom"
+AGENT_KNOWLEDGE_PROVIDER_MODULE="my_company.anychain_kb:Provider"
+AGENT_KNOWLEDGE_BASE_URL="https://kb.example.internal"
+AGENT_KNOWLEDGE_AUTH_REF="secret-manager://anychain/kb-token"
+```
+
+The recommended enterprise integration point is `python3 agent/cli.py` with
+JSON input/output. Typical platform calls are `doctor`, `capabilities`,
+`draft-request`, `plan`, `preflight`, `submit`, `status`, `analyze`, and
+`artifact-qa`.
+
 ## LLM Providers
 
 The Agent LLM layer uses an internal message contract and provider adapters.
@@ -316,7 +343,7 @@ Supported provider contracts:
 
 Recommended enterprise configuration uses Google ADC or service-account
 impersonation, not static API keys. Store persistent Agent defaults in
-`config/user_config.sh`; `./bin/anychain-agent` loads that file at startup, and
+`config/agent_config.sh`; `./bin/anychain-agent` loads that file at startup, and
 temporary environment variables can still override it.
 
 ```bash

@@ -1,17 +1,24 @@
 # Configuration Guide
 
-This directory is split into one user-facing configuration file and several
-advanced/default layers.
+This directory is split into one Agent configuration file, one benchmark
+configuration file, and several advanced/default layers.
 
-For a normal benchmark run, start with only:
+For normal Agent usage, start with:
+
+```bash
+config/agent_config.sh
+```
+
+For direct benchmark-engine usage, configure:
 
 ```bash
 config/user_config.sh
 ```
 
-`./bin/anychain-agent` also loads `config/user_config.sh` at startup, so Agent
-LLM settings, context compaction settings, and benchmark defaults can be stored
-there persistently instead of re-exported in every terminal session.
+`./bin/anychain-agent` loads `config/agent_config.sh` at startup. It also loads
+`config/user_config.sh` as a compatibility/default layer, but Agent-submitted
+jobs write `.agent/jobs/<job_id>/runtime.env`. That job-local file has higher
+priority than `user_config.sh` during Agent-launched benchmark runs.
 
 Do not edit `config/config_loader.sh` for normal usage. It loads all layers,
 detects runtime paths, resolves cloud/provider details, validates the selected
@@ -21,7 +28,8 @@ chain template, and exports derived variables for child processes.
 
 | File or directory | Audience | Purpose |
 | --- | --- | --- |
-| `user_config.sh` | All users | Required benchmark inputs: chain name, local RPC endpoint, RPC mode, node process names, cloud/machine metadata, disk baselines, network bandwidth, QPS profile defaults. |
+| `agent_config.sh` | All Agent users | Agent provider settings: LLM provider/model/auth, context compaction, default Agent output dir, and optional enterprise Knowledge Base integration. |
+| `user_config.sh` | Direct engine users / advanced users | Benchmark defaults: chain name, local RPC endpoint, RPC mode, node process names, cloud/machine metadata, disk baselines, network bandwidth, QPS profile defaults. Agent jobs normally materialize final values into `runtime.env`. |
 | `chains/*.json` | Chain integrators | Chain templates for the 36 supported blockchains. Add or modify these only when adding a chain or changing RPC method coverage. |
 | `system_config.sh` | Advanced users | Deployment platform override, logging behavior, monitoring overhead process list, and generic runtime behavior. Defaults are suitable for most runs. |
 | `provider_disk_config.sh` | Framework maintainers | Provider-specific post-processing for disk baseline values after `user_config.sh` is loaded. |
@@ -34,7 +42,9 @@ chain template, and exports derived variables for child processes.
 
 ## First-Run Required Settings
 
-Edit these values in `config/user_config.sh` before a production benchmark:
+Most users should start the Agent and let `doctor`, `plan`, and `preflight`
+tell them which benchmark values are missing. Direct engine users should edit
+these values in `config/user_config.sh` before a production benchmark:
 
 | Variable | Required | Description |
 | --- | --- | --- |
@@ -58,10 +68,11 @@ Edit these values in `config/user_config.sh` before a production benchmark:
 | `OBSERVABILITY_STACK_AUTO_STOP` | Optional | When `true`, a stack started by the entry script is stopped during framework cleanup. Defaults to `true`. |
 | `OBSERVABILITY_STACK_MODE` | Optional | `local` starts exporter + local Prometheus/Grafana. `exporter` starts only the exporter for an existing Prometheus/Grafana environment. Defaults to `local`. |
 
-## Optional Agent LLM Configuration
+## Agent Configuration
 
-The benchmark engine can run without an LLM. The Agent control plane can use a
-model provider when prompt-first planning is enabled.
+Edit these values in `config/agent_config.sh`. The benchmark engine can run
+without an LLM. The Agent control plane can use a model provider when
+prompt-first planning is enabled.
 
 Recommended enterprise path is Vertex AI with Google service-account based
 authentication:
@@ -76,6 +87,21 @@ authentication:
 | `GOOGLE_SERVICE_ACCOUNT_EMAIL` | Required for impersonation | Target service account email. This avoids downloading JSON keys when the current identity can impersonate it. |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Optional fallback | Local service-account JSON path. Prefer ADC or impersonation in enterprise environments. |
 | `OPENAI_API_KEY` | Required only for OpenAI | API key for `LLM_PROVIDER=openai`. |
+
+## Agent Knowledge Base Integration
+
+Knowledge Base integration is disabled by default. The built-in Agent can
+already answer from repository-local capabilities, docs, chain templates,
+fixtures, artifacts, and run history. Enable a custom Knowledge Base only when
+an enterprise wants private RPC samples, internal node knowledge, incident
+history, or company-specific workload guidance.
+
+| Variable | Required | Description |
+| --- | --- | --- |
+| `AGENT_KNOWLEDGE_PROVIDER` | Optional | `disabled`, `noop`, or `custom`. Defaults to `disabled`. |
+| `AGENT_KNOWLEDGE_PROVIDER_MODULE` | Required for custom | Python adapter path, for example `my_company.anychain_kb:Provider`. |
+| `AGENT_KNOWLEDGE_BASE_URL` | Optional | Enterprise KB/RAG service endpoint. |
+| `AGENT_KNOWLEDGE_AUTH_REF` | Optional | Secret reference or token provided by the enterprise platform. Do not commit real tokens. |
 
 ## Optional Agent Chat Memory Configuration
 
