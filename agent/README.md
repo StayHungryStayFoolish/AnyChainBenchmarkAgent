@@ -276,6 +276,25 @@ python3 agent/cli.py analyze --job-id <job_id>
 python3 agent/cli.py artifact-qa --job-id <job_id> --question "Why are charts empty?"
 ```
 
+`artifact-qa` includes chart-level explanations for performance overview,
+CPU-disk correlation, disk thresholds, per-method attribution, sync health, and
+monitoring overhead. It reports whether each chart is available, empty, missing
+input data, or missing expected columns.
+
+Generate plugin-style onboarding guidance for secondary development:
+
+```bash
+python3 agent/cli.py onboarding-plan \
+  --chain foochain \
+  --adapter-family jsonrpc \
+  --method foo_getBalance \
+  --method foo_getBlock
+```
+
+The output includes workload snippets, fake-node fixture steps, and validation
+commands so enterprise teams can add chains or RPC methods without guessing the
+framework contracts.
+
 Compare plans or archived runs:
 
 ```bash

@@ -62,6 +62,12 @@ def _required_prompt(item: str) -> str:
     prompts = {
         "chain": "Which blockchain node should be tested?",
         "local_rpc_url": "Provide the local RPC endpoint, or choose fake-node for closed-loop testing.",
+        "blockchain_process_names": "Provide blockchain node process names or command keywords for resource attribution.",
+        "ledger_device": "Confirm the ledger/data disk device used by the node.",
+        "data_vol_max_iops": "Provide the provisioned ledger/data disk IOPS baseline.",
+        "data_vol_max_throughput": "Provide the provisioned ledger/data disk throughput baseline in MiB/s.",
+        "network_max_bandwidth_gbps": "Provide the instance or pod network bandwidth baseline in Gbps.",
+        "rpc_mode": "Choose single or mixed RPC workload mode.",
     }
     return prompts.get(item, f"Provide required value: {item}")
 

@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from analyzers.chart_explainer import explain_charts, format_chart_explanation
+
 
 def answer_artifact_question(question: str, job: dict[str, Any] | None = None, artifact_index: str | Path | None = None) -> dict[str, Any]:
     lowered = question.lower()
@@ -45,13 +47,20 @@ def answer_artifact_question(question: str, job: dict[str, Any] | None = None, a
 
     if not evidence:
         findings.append("No artifact evidence was registered for this job.")
-    answer = "Artifact inspection summary:\n" + "\n".join(f"- {item}" for item in findings)
+    chart_explanation = explain_charts(evidence)
+    answer = (
+        "Artifact inspection summary:\n"
+        + "\n".join(f"- {item}" for item in findings)
+        + "\n\n"
+        + format_chart_explanation(chart_explanation)
+    )
     return {
         "intent": "framework_question",
         "answer": answer,
         "confidence": 0.85 if evidence else 0.35,
         "sources": sources,
         "artifact_index": index,
+        "chart_explanation": chart_explanation,
     }
 
 

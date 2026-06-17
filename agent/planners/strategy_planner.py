@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from planners.config_checklist import build_configuration_checklist, missing_required_from_checklist
 from planners.risk import score_plan_risk
 from qa.questions import required_questions
 
@@ -86,6 +87,16 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
         ).lower(),
         "OBSERVABILITY_STACK_MODE": request.get("observability", {}).get("mode", "local"),
     }
+    materialized_config = {
+        "LEDGER_DEVICE": request.get("ledger_device", ""),
+        "ACCOUNTS_DEVICE": request.get("accounts_device", ""),
+        "BLOCKCHAIN_PROCESS_NAMES_STR": " ".join(request.get("blockchain_process_names", []))
+        if isinstance(request.get("blockchain_process_names"), list)
+        else request.get("blockchain_process_names", ""),
+        "DATA_VOL_MAX_IOPS": request.get("data_vol_max_iops", ""),
+        "DATA_VOL_MAX_THROUGHPUT": request.get("data_vol_max_throughput", request.get("data_vol_max_throughput_mibs", "")),
+        "NETWORK_MAX_BANDWIDTH_GBPS": request.get("network_max_bandwidth_gbps", ""),
+    }
 
     discovery_payload = discovery or request.get("discovery") or {
         "source": "not_collected",
@@ -122,10 +133,7 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
         },
         "bottleneck_focus": request.get("bottleneck_focus", []),
         "confirmed_inputs": sorted(confirmations),
-        "materialized_config": {
-            "LEDGER_DEVICE": request.get("ledger_device", ""),
-            "ACCOUNTS_DEVICE": request.get("accounts_device", ""),
-        },
+        "materialized_config": materialized_config,
         "required_inputs": required_inputs,
         "advanced_defaults": {
             "qps": qps,
@@ -151,6 +159,10 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
             "performance_latest_csv": "current/logs/performance_latest.csv",
         },
     }
+    checklist = build_configuration_checklist(request, plan)
+    plan["configuration_checklist"] = checklist
+    combined_required = sorted(set(plan["required_inputs"]) | set(missing_required_from_checklist(checklist)))
+    plan["required_inputs"] = combined_required
     plan["required_questions"] = required_questions(plan)
     plan["risk"] = score_plan_risk(plan)
     return plan

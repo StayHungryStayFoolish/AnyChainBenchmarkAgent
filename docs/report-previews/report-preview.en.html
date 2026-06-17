@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>AnyChain Report Preview</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; margin: 40px; color: #182230; background: #f6f8fb; }
+    main { max-width: 980px; margin: auto; }
+    h1 { font-size: 38px; margin-bottom: 8px; }
+    .subtitle { color: #526173; font-size: 18px; margin-bottom: 28px; }
+    section { background: white; border: 1px solid #d9e1ec; border-radius: 8px; padding: 20px; margin: 16px 0; }
+    h2 { margin: 0 0 10px; font-size: 22px; }
+    p { line-height: 1.55; }
+    .bars { height: 12px; background: #e8eef6; border-radius: 999px; overflow: hidden; }
+    .bars span { display: block; height: 100%; background: linear-gradient(90deg, #2563eb, #16a34a); }
+  </style>
+</head>
+<body><main>
+  <h1>AnyChain Benchmark Agent - Report Preview</h1>
+  <p class="subtitle">This preview shows the report sections users will see after a benchmark run.</p>
+  <section><h2>Executive Summary</h2><p>The report starts with run metadata, cloud provider, region, machine type, disk baseline, RPC mode, and maximum stable QPS.</p><div class='bars'><span style='width:61%'></span></div></section>
+<section><h2>Core Performance Charts</h2><p>Performance overview explains CPU, memory, disk IOPS, throughput, and utilization trends.</p><div class='bars'><span style='width:67%'></span></div></section>
+<section><h2>CPU-disk correlation helps identify whether high CPU time is actually disk wait or queue depth.</h2><p>Disk threshold charts compare observed utilization and latency with configured IOPS and throughput baselines.</p><div class='bars'><span style='width:73%'></span></div></section>
+<section><h2>Per-Method RPC Attribution</h2><p>Per-method charts show success/failure counts and P50/P90/P99 latency for workload RPC methods only.</p><div class='bars'><span style='width:79%'></span></div></section>
+<section><h2>Sync Health</h2><p>Sync-health charts show height gap, reported lag, or freshness depending on the chain family.</p><div class='bars'><span style='width:85%'></span></div></section>
+<section><h2>Artifact Evidence</h2><p>The Agent cites HTML, CSV, runtime.env, archive summary, and optional Prometheus/Grafana endpoints.</p><div class='bars'><span style='width:56%'></span></div></section>
+</main></body></html>

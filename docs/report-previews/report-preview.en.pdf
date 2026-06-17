@@ -1,0 +1,92 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [5 0 R 7 0 R] /Count 2 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+4 0 obj
+<< /Length 664 >>
+stream
+BT
+/F1 18 Tf
+72 730 Td
+/F1 11 Tf
+(AnyChain Benchmark Agent - Report Preview) Tj
+0 -38 Td
+/F1 11 Tf
+(This preview shows the report sections users will see after a benchmark run.) Tj
+0 -38 Td
+/F1 14 Tf
+(Executive Summary) Tj
+0 -38 Td
+/F1 11 Tf
+(The report starts with run metadata, cloud provider, region, machine type, disk baseline, RPC mode, and maximum stable QPS.) Tj
+0 -38 Td
+/F1 14 Tf
+(Core Performance Charts) Tj
+0 -38 Td
+/F1 11 Tf
+(Performance overview explains CPU, memory, disk IOPS, throughput, and utilization trends.) Tj
+0 -38 Td
+/F1 14 Tf
+(CPU-disk correlation helps identify whether high CPU time is actually disk wait or queue depth.) Tj
+0 -38 Td
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R >>
+endobj
+6 0 obj
+<< /Length 655 >>
+stream
+BT
+/F1 18 Tf
+72 730 Td
+/F1 11 Tf
+(Disk threshold charts compare observed utilization and latency with configured IOPS and throughput baselines.) Tj
+0 -38 Td
+/F1 11 Tf
+(Per-Method RPC Attribution) Tj
+0 -38 Td
+/F1 14 Tf
+(Per-method charts show success/failure counts and P50/P90/P99 latency for workload RPC methods only.) Tj
+0 -38 Td
+/F1 11 Tf
+(Sync Health) Tj
+0 -38 Td
+/F1 14 Tf
+(Sync-health charts show height gap, reported lag, or freshness depending on the chain family.) Tj
+0 -38 Td
+/F1 11 Tf
+(Artifact Evidence) Tj
+0 -38 Td
+/F1 14 Tf
+(The Agent cites HTML, CSV, runtime.env, archive summary, and optional Prometheus/Grafana endpoints.) Tj
+0 -38 Td
+ET
+endstream
+endobj
+7 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 6 0 R >>
+endobj
+xref
+0 8
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000127 00000 n 
+0000000197 00000 n 
+0000000912 00000 n 
+0000001038 00000 n 
+0000001744 00000 n 
+trailer
+<< /Size 8 /Root 1 0 R >>
+startxref
+1870
+%%EOF

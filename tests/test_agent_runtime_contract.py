@@ -24,6 +24,7 @@ from runners.guardrails import validate_execution_plan  # noqa: E402
 from runners.job_manager import submit_job  # noqa: E402
 from chat import ChatSession  # noqa: E402
 from diagnostics.doctor import format_doctor_report, run_doctor  # noqa: E402
+from onboarding.chain_onboarding import generate_onboarding_package  # noqa: E402
 from wizard import run_wizard  # noqa: E402
 
 
@@ -156,6 +157,8 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertIn("required_questions", plan)
             self.assertIn("risk", plan)
             self.assertIn(plan["risk"]["risk_level"], {"low", "medium", "high"})
+            self.assertIn("configuration_checklist", plan)
+            self.assertFalse(plan["configuration_checklist"]["missing_blockers"])
 
             risk = run_agent("risk-score", "--plan", str(plan_file))
             self.assertEqual(risk["risk_level"], plan["risk"]["risk_level"])
@@ -245,6 +248,8 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertIn("CSV has 2 data rows", synthetic_artifact_answer["answer"])
             self.assertIn("CSV exists but has no data rows", synthetic_artifact_answer["answer"])
             self.assertIn("missing file", synthetic_artifact_answer["answer"])
+            self.assertIn("Report chart explanation", synthetic_artifact_answer["answer"])
+            self.assertIn("per_method_attribution", {chart["chart_id"] for chart in synthetic_artifact_answer["chart_explanation"]["charts"]})
 
             runbook_file = tmp_path / "runbook.md"
             completed = subprocess.run(
@@ -340,6 +345,18 @@ class AgentRuntimeContractTest(unittest.TestCase):
             new_chain_gap = run_agent("ask", "--prompt", "How do I add new chain foochain?")
             self.assertEqual(new_chain_gap["intent"], "framework_question")
             self.assertIn("chain_template", {gap["type"] for gap in new_chain_gap["gap_analysis"]["gaps"]})
+            onboarding = run_agent(
+                "onboarding-plan",
+                "--chain",
+                "foochain",
+                "--method",
+                "foo_getBalance",
+                "--adapter-family",
+                "jsonrpc",
+            )
+            self.assertEqual(onboarding["status"], "needs_onboarding")
+            self.assertEqual(onboarding["adapter_family"], "jsonrpc")
+            self.assertTrue(onboarding["validation_commands"])
 
     def test_terminal_chat_agent_entrypoint(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -519,6 +536,11 @@ class AgentRuntimeContractTest(unittest.TestCase):
                     "chain": "solana",
                     "local_rpc_url": "http://127.0.0.1:8899",
                     "ledger_device_confirmation": "sdb",
+                    "ledger_device": "sdb",
+                    "blockchain_process_names": "agave-validator solana-validator",
+                    "data_vol_max_iops": "30000",
+                    "data_vol_max_throughput": "700",
+                    "network_max_bandwidth_gbps": "25",
                     "dependency_mode_confirmation": "audit",
                 },
                 yes=False,
@@ -531,6 +553,13 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertEqual(plan["execution"]["environment"]["LOCAL_RPC_URL"], "http://127.0.0.1:8899")
             self.assertEqual(plan["materialized_config"]["LEDGER_DEVICE"], "sdb")
             self.assertIn("ledger_device_confirmation", plan["confirmed_inputs"])
+
+    def test_onboarding_package_contains_workload_and_validation_contract(self):
+        package = generate_onboarding_package("foochain", ["foo_methodA", "foo_methodB"], adapter_family="jsonrpc")
+        self.assertEqual(package["workload_plugin"]["rpc_mode"], "mixed")
+        self.assertEqual(sum(item["weight"] for item in package["workload_plugin"]["mixed_weighted"]), 100)
+        self.assertIn("jsonrpc", package["supported_families"])
+        self.assertTrue(package["fake_node_steps"])
 
     def test_llm_provider_config_supports_vertex_service_accounts(self):
         config = load_llm_config({
