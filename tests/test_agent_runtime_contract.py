@@ -13,6 +13,7 @@ sys.path.insert(0, str(REPO / "agent"))
 
 from discovery.environment import discover_environment  # noqa: E402
 from knowledge.framework_capabilities import load_framework_capabilities  # noqa: E402
+from llm import config as llm_config_module  # noqa: E402
 from llm.config import load_llm_config  # noqa: E402
 from llm.google_auth import credential_plan  # noqa: E402
 from llm.providers import provider_from_config  # noqa: E402
@@ -561,6 +562,34 @@ class AgentRuntimeContractTest(unittest.TestCase):
             "GOOGLE_CLOUD_LOCATION": "us-central1",
         })
         self.assertIn("GOOGLE_SERVICE_ACCOUNT_EMAIL is required", "; ".join(missing_impersonation.validate()))
+
+    def test_llm_config_can_load_persistent_user_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            config_dir = repo / "config"
+            config_dir.mkdir()
+            user_config = config_dir / "user_config.sh"
+            user_config.write_text(
+                "\n".join([
+                    'LLM_PROVIDER="${LLM_PROVIDER:-openai}"',
+                    'LLM_MODEL="${LLM_MODEL:-gpt-4.1}"',
+                    'OPENAI_API_KEY="${OPENAI_API_KEY:-test-key}"',
+                    'export LLM_PROVIDER LLM_MODEL OPENAI_API_KEY',
+                ]),
+                encoding="utf-8",
+            )
+            old_root = llm_config_module.REPO_ROOT
+            old_config = llm_config_module.USER_CONFIG
+            try:
+                llm_config_module.REPO_ROOT = repo
+                llm_config_module.USER_CONFIG = user_config
+                config = load_llm_config()
+            finally:
+                llm_config_module.REPO_ROOT = old_root
+                llm_config_module.USER_CONFIG = old_config
+            self.assertEqual(config.provider, "openai")
+            self.assertEqual(config.model, "gpt-4.1")
+            self.assertTrue(config.openai_api_key_present)
 
     def test_dynamic_framework_capabilities_are_loaded_from_current_templates(self):
         capabilities = load_framework_capabilities()

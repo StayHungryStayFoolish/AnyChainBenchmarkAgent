@@ -121,8 +121,8 @@ PROMETHEUS_EXPORTER_MAX_PROXY_ROWS="${PROMETHEUS_EXPORTER_MAX_PROXY_ROWS:-20000}
 # ----- Optional Agent LLM Configuration -----
 # The Agent remains usable without an LLM. When enabled, prefer Vertex AI with
 # Google ADC or service-account impersonation for enterprise environments.
-LLM_PROVIDER="${LLM_PROVIDER:-vertex_gemini_openai}"               # Options: vertex_gemini_openai | vertex_claude | openai
-LLM_MODEL="${LLM_MODEL:-gemini-2.5-pro}"                           # Examples: gemini-2.5-pro, claude-3-7-sonnet@20250219, gpt-4.1
+LLM_PROVIDER="${LLM_PROVIDER:-fake}"                               # Options: fake | vertex_gemini_openai | vertex_claude | openai
+LLM_MODEL="${LLM_MODEL:-fake}"                                     # Examples: fake, gemini-2.5-pro, claude-3-7-sonnet@20250219, gpt-4.1
 GOOGLE_AUTH_MODE="${GOOGLE_AUTH_MODE:-adc}"                        # Options: adc | attached_service_account | service_account_impersonation | service_account_file
 GOOGLE_CLOUD_PROJECT="${GOOGLE_CLOUD_PROJECT:-}"                   # Required for Vertex providers
 GOOGLE_CLOUD_LOCATION="${GOOGLE_CLOUD_LOCATION:-us-central1}"       # Vertex region

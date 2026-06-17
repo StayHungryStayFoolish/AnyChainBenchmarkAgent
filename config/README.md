@@ -9,6 +9,10 @@ For a normal benchmark run, start with only:
 config/user_config.sh
 ```
 
+`./bin/anychain-agent` also loads `config/user_config.sh` at startup, so Agent
+LLM settings, context compaction settings, and benchmark defaults can be stored
+there persistently instead of re-exported in every terminal session.
+
 Do not edit `config/config_loader.sh` for normal usage. It loads all layers,
 detects runtime paths, resolves cloud/provider details, validates the selected
 chain template, and exports derived variables for child processes.
@@ -64,8 +68,8 @@ authentication:
 
 | Variable | Required | Description |
 | --- | --- | --- |
-| `LLM_PROVIDER` | Optional | `vertex_gemini_openai`, `vertex_claude`, or `openai`. Defaults to `vertex_gemini_openai`. |
-| `LLM_MODEL` | Optional | Model name, for example `gemini-2.5-pro` or `claude-3-7-sonnet@20250219`. |
+| `LLM_PROVIDER` | Optional | `fake`, `vertex_gemini_openai`, `vertex_claude`, or `openai`. Defaults to `fake` for deterministic/offline mode. |
+| `LLM_MODEL` | Optional | Model name, for example `fake`, `gemini-2.5-pro`, or `claude-3-7-sonnet@20250219`. |
 | `GOOGLE_AUTH_MODE` | Required for Vertex | `adc`, `attached_service_account`, `service_account_impersonation`, or `service_account_file`. |
 | `GOOGLE_CLOUD_PROJECT` | Required for Vertex | Google Cloud project containing the Vertex AI endpoint. |
 | `GOOGLE_CLOUD_LOCATION` | Required for Vertex | Vertex AI location, for example `us-central1` or `us-east5`. |
