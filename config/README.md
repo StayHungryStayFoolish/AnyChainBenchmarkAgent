@@ -74,34 +74,42 @@ Edit these values in `config/agent_config.sh`. The benchmark engine can run
 without an LLM. The Agent control plane can use a model provider when
 prompt-first planning is enabled.
 
-Recommended enterprise path is Vertex AI with Google service-account based
-authentication:
+Supported auth paths are direct API keys and Vertex AI with Google
+service-account based authentication:
 
 | Variable | Required | Description |
 | --- | --- | --- |
-| `LLM_PROVIDER` | Optional | `fake`, `vertex_gemini_openai`, `vertex_claude`, or `openai`. Defaults to `fake` for deterministic/offline mode. |
-| `LLM_MODEL` | Optional | Model name, for example `fake`, `gemini-2.5-pro`, or `claude-3-7-sonnet@20250219`. |
-| `GOOGLE_AUTH_MODE` | Required for Vertex | `adc`, `attached_service_account`, `service_account_impersonation`, or `service_account_file`. |
-| `GOOGLE_CLOUD_PROJECT` | Required for Vertex | Google Cloud project containing the Vertex AI endpoint. |
-| `GOOGLE_CLOUD_LOCATION` | Required for Vertex | Vertex AI location, for example `us-central1` or `us-east5`. |
+| `LLM_PROVIDER` | Optional | `fake`, `gemini`, `claude`, or `openai`. Defaults to `fake` for deterministic/offline mode. |
+| `LLM_MODEL` | Optional | Model name, for example `fake`, `gemini-3.1-pro`, `claude-opus-4-8`, or `gpt-5.5`. |
+| `LLM_AUTH_MODE` | Required for real providers | `api_key`, `google_adc`, `attached_service_account`, `service_account_impersonation`, or `service_account_file`. |
+| `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Required for Gemini API-key mode | Direct Gemini API key. |
+| `ANTHROPIC_API_KEY` | Required for Claude API-key mode | Direct Anthropic API key. |
+| `OPENAI_API_KEY` | Required for OpenAI | API key for `LLM_PROVIDER=openai`. |
+| `GOOGLE_CLOUD_PROJECT` | Required for Google auth modes | Google Cloud project containing the Vertex AI endpoint. |
+| `GOOGLE_CLOUD_LOCATION` | Required for Google auth modes | Vertex AI location, for example `us-central1` or `us-east5`. |
 | `GOOGLE_SERVICE_ACCOUNT_EMAIL` | Required for impersonation | Target service account email. This avoids downloading JSON keys when the current identity can impersonate it. |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Optional fallback | Local service-account JSON path. Prefer ADC or impersonation in enterprise environments. |
-| `OPENAI_API_KEY` | Required only for OpenAI | API key for `LLM_PROVIDER=openai`. |
 
 ## Agent Knowledge Base Integration
 
 Knowledge Base integration is disabled by default. The built-in Agent can
 already answer from repository-local capabilities, docs, chain templates,
-fixtures, artifacts, and run history. Enable a custom Knowledge Base only when
-an enterprise wants private RPC samples, internal node knowledge, incident
-history, or company-specific workload guidance.
+fixtures, artifacts, and run history. Enable an HTTP or custom Knowledge Base
+only when an enterprise wants private RPC samples, internal node knowledge,
+incident history, or company-specific workload guidance.
 
 | Variable | Required | Description |
 | --- | --- | --- |
-| `AGENT_KNOWLEDGE_PROVIDER` | Optional | `disabled`, `noop`, or `custom`. Defaults to `disabled`. |
+| `AGENT_KNOWLEDGE_PROVIDER` | Optional | `disabled`, `noop`, `http`, or `custom`. Defaults to `disabled`. |
 | `AGENT_KNOWLEDGE_PROVIDER_MODULE` | Required for custom | Python adapter path, for example `my_company.anychain_kb:Provider`. |
-| `AGENT_KNOWLEDGE_BASE_URL` | Optional | Enterprise KB/RAG service endpoint. |
+| `AGENT_KNOWLEDGE_BASE_URL` | Required for http | Enterprise KB/RAG service endpoint. |
 | `AGENT_KNOWLEDGE_AUTH_REF` | Optional | Secret reference or token provided by the enterprise platform. Do not commit real tokens. |
+
+Validate a generic HTTP adapter:
+
+```bash
+python3 agent/cli.py knowledge-smoke --query "solana rpc methods" --chain solana
+```
 
 ## Optional Agent Chat Memory Configuration
 
@@ -118,6 +126,16 @@ guard for local REPL usability.
 
 Token usage is estimated locally with an approximate 4 characters per token
 unless a future provider-specific tokenizer is added.
+
+## Optional Job Notifications
+
+Notifications are disabled by default. Configure them only when an enterprise
+Agent platform or automation runner needs a webhook after long-running jobs.
+
+| Variable | Required | Description |
+| --- | --- | --- |
+| `AGENT_NOTIFY_WEBHOOK_URL` | Optional | Webhook endpoint that receives job status JSON. Empty disables notifications. |
+| `AGENT_NOTIFY_ON` | Optional | Comma-separated statuses to notify. Defaults to `completed,failed`. |
 
 Check the configuration without calling a model:
 

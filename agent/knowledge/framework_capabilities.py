@@ -66,11 +66,11 @@ def load_framework_capabilities(root: str | Path = REPO_ROOT) -> dict[str, Any]:
 def answer_capability_question(question: str, root: str | Path = REPO_ROOT) -> dict[str, Any] | None:
     lowered = question.lower()
     if any(token in lowered for token in ("does ", "do ", "support ", "missing", "缺少", "是否支持")) and not any(
-        token in lowered for token in ("how many", "which chains", "支持多少", "支持哪些", "多少个")
+        token in lowered for token in ("how many", "which chains", "what chains", "支持多少", "支持哪些", "多少个")
     ):
         return None
     keywords = (
-        "how many chains", "supported chains", "which chains", "rpc method", "rpc methods",
+        "how many chains", "supported chains", "which chains", "what chains", "rpc method", "rpc methods",
         "adapter family", "fake-node fixture", "capability",
         "多少个链", "支持多少", "哪些链", "rpc method", "方法数量", "能力", "支持哪些",
     )

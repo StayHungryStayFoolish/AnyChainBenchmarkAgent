@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from llm.orchestrator import PromptOrchestrator
 from llm.providers import provider_from_config
 from llm.types import LLMMessage, LLMProvider, LLMRequest
 from qa.intent_router import _json_text
@@ -27,12 +28,7 @@ def draft_request_with_llm(prompt: str, provider: LLMProvider | None = None) -> 
                 messages=[
                     LLMMessage(
                         role="system",
-                        content=(
-                            "Turn the user benchmark goal into JSON only. "
-                            "Allowed fields: chain, goal, rpc_mode, use_fake_node, deployment, "
-                            "observability, dependency_mode, bottleneck_focus, qps, workload. "
-                            "Do not invent endpoints, credentials, commands, or shell scripts."
-                        ),
+                        content=PromptOrchestrator(provider).system_prompt("request"),
                     ),
                     LLMMessage(role="user", content=prompt),
                 ],

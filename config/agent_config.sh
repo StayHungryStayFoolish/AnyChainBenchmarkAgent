@@ -7,41 +7,60 @@
 # =====================================================================
 
 # ----- LLM Provider -----
+# Required for AI-assisted planning:
+#   1. Set LLM_PROVIDER to one real provider.
+#   2. Set LLM_MODEL to a model available in that provider.
+#   3. Configure that provider's auth variables below.
+#
+# Defaults keep the Agent runnable without network credentials. In this mode the
+# Agent can still answer framework-capability questions and create deterministic
+# plans, but it will not use a real LLM.
 # fake: deterministic/offline mode. No credentials required.
-# vertex_gemini_openai: Gemini on Vertex AI through the OpenAI-compatible API.
-# vertex_claude: Claude partner models on Vertex AI.
+# gemini: Gemini API key or Gemini on Vertex AI.
+# claude: Anthropic API key or Claude partner models on Vertex AI.
 # openai: OpenAI API.
 LLM_PROVIDER="${LLM_PROVIDER:-fake}"
 
 # Model name for the selected provider.
-# Examples: fake, gemini-2.5-pro, claude-3-7-sonnet@20250219, gpt-4.1.
+# Examples: fake, gemini-3.1-pro, claude-opus-4-8, gpt-5.5.
 LLM_MODEL="${LLM_MODEL:-fake}"
 
-# Google auth mode for Vertex providers.
-# adc: local Application Default Credentials.
+# Authentication mode for the selected provider.
+# api_key: GEMINI_API_KEY/GOOGLE_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY.
+# google_adc: local Application Default Credentials for Vertex AI.
 # attached_service_account: use the VM/GKE attached service account.
 # service_account_impersonation: impersonate GOOGLE_SERVICE_ACCOUNT_EMAIL.
 # service_account_file: use GOOGLE_APPLICATION_CREDENTIALS JSON file.
-GOOGLE_AUTH_MODE="${GOOGLE_AUTH_MODE:-adc}"
+LLM_AUTH_MODE="${LLM_AUTH_MODE:-api_key}"
 
+# Required when LLM_PROVIDER is gemini or claude and LLM_AUTH_MODE is not api_key.
 # Google Cloud project that contains the Vertex AI endpoint.
-# Required only for vertex_gemini_openai or vertex_claude with --use-llm.
 GOOGLE_CLOUD_PROJECT="${GOOGLE_CLOUD_PROJECT:-}"
 
-# Vertex AI location.
+# Required when LLM_PROVIDER is gemini or claude and LLM_AUTH_MODE is not api_key.
+# Vertex AI location/region.
 # Examples: us-central1 for Gemini, us-east5 for some Claude partner models.
 GOOGLE_CLOUD_LOCATION="${GOOGLE_CLOUD_LOCATION:-us-central1}"
 
+# Required only when LLM_AUTH_MODE=service_account_impersonation.
 # Target service account email for service_account_impersonation.
 # This avoids downloading JSON keys in enterprise environments.
 GOOGLE_SERVICE_ACCOUNT_EMAIL="${GOOGLE_SERVICE_ACCOUNT_EMAIL:-}"
 
+# Required only when LLM_AUTH_MODE=service_account_file.
 # Optional local service-account JSON key fallback.
 # Prefer ADC, attached service accounts, or impersonation in enterprise usage.
 GOOGLE_APPLICATION_CREDENTIALS="${GOOGLE_APPLICATION_CREDENTIALS:-}"
 
-# OpenAI API key.
+# Required when LLM_PROVIDER=gemini and LLM_AUTH_MODE=api_key.
+GEMINI_API_KEY="${GEMINI_API_KEY:-}"
+GOOGLE_API_KEY="${GOOGLE_API_KEY:-}"
+
+# Required when LLM_PROVIDER=claude and LLM_AUTH_MODE=api_key.
+ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
+
 # Required only when LLM_PROVIDER=openai.
+# OpenAI API key.
 OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 
 # ----- Agent Chat Memory -----
@@ -60,14 +79,16 @@ AGENT_COMPACT_KEEP_RECENT_TURNS="${AGENT_COMPACT_KEEP_RECENT_TURNS:-8}"
 # ----- Enterprise Knowledge Base Integration -----
 # disabled: use only repository-local capabilities and docs.
 # noop: explicitly use the built-in no-op provider contract.
-# custom: load an enterprise adapter in a future integration package.
+# http: call a generic enterprise KB/RAG HTTP service.
+# custom: load an enterprise adapter module from AGENT_KNOWLEDGE_PROVIDER_MODULE.
 AGENT_KNOWLEDGE_PROVIDER="${AGENT_KNOWLEDGE_PROVIDER:-disabled}"
 
 # Optional module path for enterprise knowledge provider adapters.
 # Example: my_company.anychain_kb:Provider
 AGENT_KNOWLEDGE_PROVIDER_MODULE="${AGENT_KNOWLEDGE_PROVIDER_MODULE:-}"
 
-# Optional endpoint for enterprise KB/RAG service adapters.
+# Required when AGENT_KNOWLEDGE_PROVIDER=http.
+# Expected base URL for the generic KB contract.
 AGENT_KNOWLEDGE_BASE_URL="${AGENT_KNOWLEDGE_BASE_URL:-}"
 
 # Optional secret reference or token for enterprise KB adapters.
@@ -78,9 +99,15 @@ AGENT_KNOWLEDGE_AUTH_REF="${AGENT_KNOWLEDGE_AUTH_REF:-}"
 # Default directory for terminal chat state when no --output-dir is passed.
 AGENT_OUTPUT_DIR="${AGENT_OUTPUT_DIR:-.agent/chat}"
 
-export LLM_PROVIDER LLM_MODEL
-export GOOGLE_AUTH_MODE GOOGLE_CLOUD_PROJECT GOOGLE_CLOUD_LOCATION GOOGLE_SERVICE_ACCOUNT_EMAIL GOOGLE_APPLICATION_CREDENTIALS
-export OPENAI_API_KEY
+# ----- Optional Job Notification -----
+# Disabled by default. When set, the Agent posts job status JSON to this URL
+# when the job status is listed in AGENT_NOTIFY_ON.
+AGENT_NOTIFY_WEBHOOK_URL="${AGENT_NOTIFY_WEBHOOK_URL:-}"
+AGENT_NOTIFY_ON="${AGENT_NOTIFY_ON:-completed,failed}"
+
+export LLM_PROVIDER LLM_MODEL LLM_AUTH_MODE
+export GOOGLE_CLOUD_PROJECT GOOGLE_CLOUD_LOCATION GOOGLE_SERVICE_ACCOUNT_EMAIL GOOGLE_APPLICATION_CREDENTIALS
+export GEMINI_API_KEY GOOGLE_API_KEY ANTHROPIC_API_KEY OPENAI_API_KEY
 export AGENT_CONTEXT_WINDOW_TOKENS AGENT_COMPACT_TRIGGER_RATIO AGENT_COMPACT_TURN_THRESHOLD AGENT_COMPACT_KEEP_RECENT_TURNS
 export AGENT_KNOWLEDGE_PROVIDER AGENT_KNOWLEDGE_PROVIDER_MODULE AGENT_KNOWLEDGE_BASE_URL AGENT_KNOWLEDGE_AUTH_REF
-export AGENT_OUTPUT_DIR
+export AGENT_OUTPUT_DIR AGENT_NOTIFY_WEBHOOK_URL AGENT_NOTIFY_ON

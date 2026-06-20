@@ -18,7 +18,11 @@ def required_questions(plan: dict[str, Any]) -> list[dict[str, Any]]:
 
     confidence = plan.get("confidence", {})
     confirmed = set(plan.get("confirmed_inputs", []))
-    if confidence.get("ledger_device", 1.0) < 0.6 and "ledger_device_confirmation" not in confirmed:
+    if (
+        not plan.get("use_fake_node")
+        and confidence.get("ledger_device", 1.0) < 0.6
+        and "ledger_device_confirmation" not in confirmed
+    ):
         disks = plan.get("discovery", {}).get("disks", {})
         questions.append({
             "id": "ledger_device_confirmation",

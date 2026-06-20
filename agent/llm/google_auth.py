@@ -30,7 +30,7 @@ class GoogleCredentialPlan:
 
 def credential_plan(config: LLMConfig) -> GoogleCredentialPlan:
     return GoogleCredentialPlan(
-        mode=config.google_auth_mode,
+        mode=config.auth_mode,
         project=config.google_project,
         location=config.google_location,
         service_account_email=config.google_service_account_email,
@@ -50,7 +50,7 @@ def get_google_access_token(config: LLMConfig) -> str:
         ) from exc
 
     scopes = [CLOUD_PLATFORM_SCOPE]
-    if config.google_auth_mode == "service_account_file":
+    if config.auth_mode == "service_account_file":
         try:
             from google.oauth2 import service_account
         except ImportError as exc:  # pragma: no cover - optional dependency guard
@@ -61,7 +61,7 @@ def get_google_access_token(config: LLMConfig) -> str:
         )
     else:
         credentials, _ = google.auth.default(scopes=scopes)
-        if config.google_auth_mode == "service_account_impersonation":
+        if config.auth_mode == "service_account_impersonation":
             try:
                 from google.auth import impersonated_credentials
             except ImportError as exc:  # pragma: no cover - optional dependency guard

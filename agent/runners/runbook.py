@@ -17,6 +17,7 @@ def render_runbook(plan: dict[str, Any], preflight: dict[str, Any] | None = None
         f"Strategy: {safe_plan.get('strategy')}",
         f"RPC mode: {safe_plan.get('rpc_mode')}",
         f"fake-node: {safe_plan.get('use_fake_node')}",
+        f"Execution mode: {safe_plan.get('execution', {}).get('runner_mode', 'foreground')}",
         f"Dependency mode: {safe_plan.get('dependency_mode', 'audit')}",
         "",
         "## Command",

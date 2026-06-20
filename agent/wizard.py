@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from discovery.environment import discover_environment
+from llm.runtime import detect_llm_runtime
 from planners.preflight import run_preflight
 from planners.strategy_planner import generate_plan, write_json
 from qa.llm_drafter import draft_request_with_llm
@@ -24,11 +25,11 @@ def run_wizard(
     answers: dict[str, str] | None = None,
     discovery_override: dict[str, Any] | None = None,
     quiet: bool = False,
-    use_llm: bool = False,
     llm_provider: Any | None = None,
 ) -> dict[str, Any]:
     prompt = prompt or _ask("Describe the benchmark goal")
-    request = draft_request_with_llm(prompt, provider=llm_provider) if use_llm or llm_provider else draft_request(prompt)
+    llm_runtime = detect_llm_runtime(mock_provider=llm_provider)
+    request = draft_request_with_llm(prompt, provider=llm_runtime.provider) if llm_runtime.enabled else draft_request(prompt)
     discovery = discovery_override or discover_environment()
     request["discovery"] = discovery
 

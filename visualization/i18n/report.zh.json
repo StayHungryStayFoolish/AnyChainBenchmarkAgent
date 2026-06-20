@@ -254,7 +254,7 @@
   "device_throughput_high": "DeviceThroughput利用率过高",
   "device_type": "Device类型",
   "device_type_list": "设备类型列表",
-  "disk_analysis_based_on": "磁盘瓶颈分析基于AWS推荐的性能指标，包括利用率、延迟、折算IOPS和吞吐量。",
+  "disk_analysis_based_on": "磁盘瓶颈分析基于 provider-normalized 性能指标，包括利用率、延迟、折算 IOPS 和吞吐量。",
   "disk_baseline_analysis": "Disk基准分析",
   "disk_baseline_generation_failed": "磁盘基准分析生成失败",
   "disk_baseline_notes": "磁盘基准分析说明",

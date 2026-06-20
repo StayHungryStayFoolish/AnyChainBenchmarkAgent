@@ -50,7 +50,7 @@ def run_doctor(discovery: dict[str, Any] | None = None) -> dict[str, Any]:
         },
         "google_credential_plan": (
             credential_plan(llm_config).safe_dict()
-            if llm_config.provider.startswith("vertex_")
+            if llm_config.provider in {"gemini", "claude"} and llm_config.auth_mode != "api_key"
             else {}
         ),
         "capabilities": {

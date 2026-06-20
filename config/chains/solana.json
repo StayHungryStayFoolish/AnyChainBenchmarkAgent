@@ -84,6 +84,11 @@
         "healthy_value": ".result == \"ok\""
       }
     },
+    "local_height_probe": {
+      "method": "getBlockHeight",
+      "params": [],
+      "parse_jq": ".result"
+    },
     "sync_health": {
       "mode": "reported_lag",
       "local_probe": "adapter.health_check_request(local_rpc_url)",
