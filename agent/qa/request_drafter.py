@@ -40,6 +40,7 @@ def draft_request(prompt: str) -> dict[str, Any]:
             "mode": "exporter" if "exporter" in lowered else "local",
         },
         "dependency_mode": "audit",
+        "runner_mode": _extract_runner_mode(lowered),
         "bottleneck_focus": _extract_bottleneck_focus(lowered),
         "source_prompt": text,
     }
@@ -119,3 +120,11 @@ def _extract_qps(text: str) -> dict[str, int]:
         "step": max(1, max_qps // 10),
         "duration_seconds": 60,
     }
+
+
+def _extract_runner_mode(text: str) -> str:
+    if any(token in text for token in ("foreground", "前台", "keep terminal", "terminal")):
+        return "foreground"
+    if any(token in text for token in ("background", "detached", "后台", "断开", "resume")):
+        return "detached"
+    return "detached"

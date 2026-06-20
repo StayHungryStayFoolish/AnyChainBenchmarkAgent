@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from knowledge.gap_analyzer import analyze_capability_gap
+from llm.orchestrator import synthesize_with_fallback
 
 
 SUPPORTED_FAMILIES = [
@@ -22,6 +23,7 @@ def generate_onboarding_package(
     methods: list[str] | None = None,
     adapter_family: str | None = None,
     rpc_mode: str = "mixed",
+    llm_provider: Any | None = None,
 ) -> dict[str, Any]:
     methods = methods or []
     gap = analyze_capability_gap(chain, methods)
@@ -30,7 +32,7 @@ def generate_onboarding_package(
     if method_entries:
         remainder = 100 - sum(item["weight"] for item in method_entries)
         method_entries[-1]["weight"] += remainder
-    return {
+    package = {
         "chain": chain,
         "adapter_family": family,
         "supported_families": SUPPORTED_FAMILIES,
@@ -68,6 +70,14 @@ def generate_onboarding_package(
             "Keep workload methods and fake-node fixtures aligned; per-method charts depend on method names in proxy_method.csv.",
         ],
     }
+    package["llm_summary"] = synthesize_with_fallback(
+        llm_provider,
+        "onboarding",
+        str(package),
+        "",
+        max_tokens=1400,
+    )
+    return package
 
 
 def format_onboarding_package(package: dict[str, Any]) -> str:

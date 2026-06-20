@@ -6,20 +6,76 @@
 # Eliminate empirical values, calculate precisely based on real-time data
 # =====================================================================
 
-# Safely load configuration file to avoid readonly variable conflicts
-if ! source "$(dirname "${BASH_SOURCE[0]}")/../config/config_loader.sh" 2>/dev/null; then
-    echo "Warning: Configuration file loading failed, using default configuration"
+# Safely load configuration file to avoid readonly variable conflicts.
+# Unit tests can skip the full config loader when they only need parser helpers.
+if [[ "${IOSTAT_COLLECTOR_SKIP_CONFIG_LOAD:-0}" != "1" ]]; then
+    if ! source "$(dirname "${BASH_SOURCE[0]}")/../config/config_loader.sh" 2>/dev/null; then
+        echo "Warning: Configuration file loading failed, using default configuration"
+        LOGS_DIR=${LOGS_DIR:-"/tmp/blockchain-node-benchmark/logs"}
+    fi
+else
     LOGS_DIR=${LOGS_DIR:-"/tmp/blockchain-node-benchmark/logs"}
 fi
 source "$(dirname "${BASH_SOURCE[0]}")/../utils/disk_converter.sh"
 # CSV Schema Registry for disk headers
 source "$(dirname "${BASH_SOURCE[0]}")/../config/csv_schema_registry.sh"
 
-# Load logging functions
-source "$(dirname "${BASH_SOURCE[0]}")/../utils/unified_logger.sh" 2>/dev/null || {
+# Load logging functions. In parser-only unit tests, avoid unified_logger
+# because it intentionally loads the full runtime configuration.
+if [[ "${IOSTAT_COLLECTOR_SKIP_CONFIG_LOAD:-0}" == "1" ]]; then
+    log_warn() { echo "WARN: $*" >&2; }
+    log_debug() { :; }
+else
+    source "$(dirname "${BASH_SOURCE[0]}")/../utils/unified_logger.sh" 2>/dev/null || {
     # Provide simple alternatives if logging functions are unavailable
-    log_warn() { echo "⚠️ $*" >&2; }
-    log_debug() { echo "🔍 $*" >&2; }
+        log_warn() { echo "WARN: $*" >&2; }
+        log_debug() { :; }
+    }
+fi
+
+_iostat_field_by_header() {
+    local header="$1"
+    local stats="$2"
+    local field_name="$3"
+    local default_value="${4:-0}"
+
+    awk -v header="$header" -v stats="$stats" -v field="$field_name" -v default_value="$default_value" '
+        BEGIN {
+            split(header, header_fields)
+            split(stats, stats_fields)
+            for (i = 1; i in header_fields; i++) {
+                if (header_fields[i] == field) {
+                    if ((i in stats_fields) && stats_fields[i] != "") {
+                        print stats_fields[i]
+                    } else {
+                        print default_value
+                    }
+                    exit
+                }
+            }
+            print default_value
+        }
+    '
+}
+
+_device_visible_to_iostat() {
+    local device="$1"
+
+    [[ -z "$device" ]] && return 1
+    command -v iostat >/dev/null 2>&1 || return 1
+
+    iostat -dx 1 1 2>/dev/null | awk -v dev="$device" '
+        $1 == dev { found = 1 }
+        END { exit(found ? 0 : 1) }
+    '
+}
+
+_device_is_monitorable() {
+    local device="$1"
+
+    [[ -z "$device" ]] && return 1
+    [[ -b "/dev/$device" ]] && return 0
+    _device_visible_to_iostat "$device"
 }
 
 # Get complete iostat data
@@ -53,31 +109,46 @@ get_iostat_data() {
         fi
     fi
     
-    # Get latest device data line
-    local device_stats=$(tail -n 20 "$iostat_data_file" 2>/dev/null | awk "/^${device}[[:space:]]/ {latest=\$0} END {print latest}")
+    # Get latest iostat header and matching device data line.
+    # sysstat field order differs across Linux distributions and versions
+    # (for example discard/flush fields may appear before aqu-sz/%util), so
+    # parsing by fixed column index silently corrupts disk metrics.
+    local iostat_record
+    iostat_record=$(tail -n 120 "$iostat_data_file" 2>/dev/null | awk -v dev="$device" '
+        $1 == "Device" { header = $0 }
+        $1 == dev { latest_header = header; latest = $0 }
+        END {
+            if (latest != "") {
+                print latest_header
+                print latest
+            }
+        }
+    ')
+    local iostat_header
+    iostat_header=$(printf "%s\n" "$iostat_record" | sed -n '1p')
+    local device_stats
+    device_stats=$(printf "%s\n" "$iostat_record" | sed -n '2p')
     
-    if [[ -z "$device_stats" ]]; then
+    if [[ -z "$device_stats" || -z "$iostat_header" ]]; then
         echo "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0"
         return
     fi
-    
-    local fields=($device_stats)
-    
-    # Extract iostat fields (eliminate hardcoded indices)
-    local r_s=${fields[1]:-0}
-    local rkb_s=${fields[2]:-0}
-    local rrqm_s=${fields[3]:-0}
-    local rrqm_pct=${fields[4]:-0}
-    local r_await=${fields[5]:-0}
-    local rareq_sz=${fields[6]:-0}
-    local w_s=${fields[7]:-0}
-    local wkb_s=${fields[8]:-0}
-    local wrqm_s=${fields[9]:-0}
-    local wrqm_pct=${fields[10]:-0}
-    local w_await=${fields[11]:-0}
-    local wareq_sz=${fields[12]:-0}
-    local aqu_sz=${fields[21]:-0}
-    local util=${fields[22]:-0}
+
+    # Extract iostat fields by header name instead of fixed position.
+    local r_s=$(_iostat_field_by_header "$iostat_header" "$device_stats" "r/s")
+    local rkb_s=$(_iostat_field_by_header "$iostat_header" "$device_stats" "rkB/s")
+    local rrqm_s=$(_iostat_field_by_header "$iostat_header" "$device_stats" "rrqm/s")
+    local rrqm_pct=$(_iostat_field_by_header "$iostat_header" "$device_stats" "%rrqm")
+    local r_await=$(_iostat_field_by_header "$iostat_header" "$device_stats" "r_await")
+    local rareq_sz=$(_iostat_field_by_header "$iostat_header" "$device_stats" "rareq-sz")
+    local w_s=$(_iostat_field_by_header "$iostat_header" "$device_stats" "w/s")
+    local wkb_s=$(_iostat_field_by_header "$iostat_header" "$device_stats" "wkB/s")
+    local wrqm_s=$(_iostat_field_by_header "$iostat_header" "$device_stats" "wrqm/s")
+    local wrqm_pct=$(_iostat_field_by_header "$iostat_header" "$device_stats" "%wrqm")
+    local w_await=$(_iostat_field_by_header "$iostat_header" "$device_stats" "w_await")
+    local wareq_sz=$(_iostat_field_by_header "$iostat_header" "$device_stats" "wareq-sz")
+    local aqu_sz=$(_iostat_field_by_header "$iostat_header" "$device_stats" "aqu-sz")
+    local util=$(_iostat_field_by_header "$iostat_header" "$device_stats" "%util")
     
     # Calculate derived metrics (based on real-time data, no empirical values)
     local total_iops=$(awk "BEGIN {printf \"%.2f\", $r_s + $w_s}" 2>/dev/null || echo "0")
@@ -269,12 +340,12 @@ validate_devices() {
     # DATA device validation (required)
     if [[ -z "$LEDGER_DEVICE" ]]; then
         errors+=("LEDGER_DEVICE is required but not configured")
-    elif [[ ! -b "/dev/$LEDGER_DEVICE" ]]; then
-        errors+=("LEDGER_DEVICE /dev/$LEDGER_DEVICE does not exist")
+    elif ! _device_is_monitorable "$LEDGER_DEVICE"; then
+        errors+=("LEDGER_DEVICE '$LEDGER_DEVICE' is not visible as /dev/$LEDGER_DEVICE or in iostat output")
     fi
 
-    if [[ -n "$ACCOUNTS_DEVICE" && ! -b "/dev/$ACCOUNTS_DEVICE" ]]; then
-        errors+=("ACCOUNTS_DEVICE /dev/$ACCOUNTS_DEVICE does not exist")
+    if [[ -n "$ACCOUNTS_DEVICE" ]] && ! _device_is_monitorable "$ACCOUNTS_DEVICE"; then
+        errors+=("ACCOUNTS_DEVICE '$ACCOUNTS_DEVICE' is not visible as /dev/$ACCOUNTS_DEVICE or in iostat output")
     fi
 
     if [[ ${#errors[@]} -gt 0 ]]; then
@@ -286,7 +357,7 @@ validate_devices() {
             printf "⚠️  Device validation WARN (degraded mode, STRICT_DEVICE_VALIDATION=false):\n" >&2
             printf "  - %s\n" "${errors[@]}" >&2
             printf "⚠️  Disk I/O columns will be filled with N/A; CPU/mem/net monitoring still active.\n" >&2
-            printf "💡 Set STRICT_DEVICE_VALIDATION=true to enforce hard failure (AWS EC2 default expectation).\n" >&2
+            printf "💡 Set STRICT_DEVICE_VALIDATION=true to enforce hard failure when disk devices are not monitorable.\n" >&2
             export DEVICE_VALIDATION_DEGRADED=1
             return 0
         fi

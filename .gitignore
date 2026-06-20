@@ -6,6 +6,7 @@ __pycache__/
 .mypy_cache/
 
 # Local agent runtime state
+.agent/
 .hermes/
 .hermes-handoff-*.md
 

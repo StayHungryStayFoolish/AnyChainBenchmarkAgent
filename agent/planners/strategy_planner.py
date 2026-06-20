@@ -56,6 +56,9 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
     use_fake_node = bool(request.get("use_fake_node", False))
     qps = {**DEFAULT_QPS[strategy], **request.get("qps", {})}
     confirmations = set(request.get("confirmations", []))
+    runner_mode = request.get("runner_mode", "detached")
+    if runner_mode not in {"detached", "foreground"}:
+        runner_mode = "detached"
 
     required_inputs = []
     if not chain:
@@ -143,6 +146,7 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
             "working_dir": str(REPO_ROOT),
             "command": command,
             "environment": env,
+            "runner_mode": runner_mode,
         },
         "preflight_checks": [
             "chain_template_exists",

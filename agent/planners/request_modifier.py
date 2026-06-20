@@ -16,6 +16,8 @@ def looks_like_plan_modification(text: str) -> bool:
         return True
     if _extract_method_weights(text):
         return True
+    if any(token in lowered for token in ("background", "detached", "foreground", "后台", "前台", "断开")):
+        return True
     return bool(re.search(r"(?:max(?:imum)?|initial|start|step|duration)\s*qps?[^\d]*(\d+)", lowered))
 
 
@@ -47,6 +49,14 @@ def apply_request_modification(request: dict[str, Any], text: str) -> tuple[dict
         if updated.get("use_fake_node"):
             updated["use_fake_node"] = False
             changes.append("use_fake_node -> false")
+    if any(token in lowered for token in ("background", "detached", "后台", "断开")):
+        if updated.get("runner_mode") != "detached":
+            updated["runner_mode"] = "detached"
+            changes.append("runner_mode -> detached")
+    if any(token in lowered for token in ("foreground", "前台", "keep terminal")):
+        if updated.get("runner_mode") != "foreground":
+            updated["runner_mode"] = "foreground"
+            changes.append("runner_mode -> foreground")
 
     qps_changes = _apply_qps(updated, lowered)
     changes.extend(qps_changes)

@@ -153,14 +153,9 @@ python3 agent/cli.py draft-request \
   --output /tmp/agent_request.json
 ```
 
-Use the configured LLM provider for request drafting, with deterministic
-fallback if the model or credentials are unavailable:
-
-```bash
-python3 agent/cli.py draft-request \
-  --prompt "Test Solana maximum stable QPS on GKE with fake-node smoke first" \
-  --use-llm
-```
+If `config/agent_config.sh` contains a valid real LLM provider, request
+drafting and intent routing use it automatically. If not, the Agent falls back
+to deterministic parsing and repository-grounded answers.
 
 Run the same flow with the offline fake provider for local contract tests:
 
@@ -274,12 +269,41 @@ Query or analyze:
 python3 agent/cli.py status --job-id <job_id>
 python3 agent/cli.py analyze --job-id <job_id>
 python3 agent/cli.py artifact-qa --job-id <job_id> --question "Why are charts empty?"
+python3 agent/cli.py diagnose-artifacts --artifact-index .agent/jobs/<job_id>/artifact_index.json
+python3 agent/cli.py jobs
+python3 agent/cli.py resume --job-id <job_id>
+python3 agent/cli.py logs --job-id <job_id>
 ```
 
 `artifact-qa` includes chart-level explanations for performance overview,
 CPU-disk correlation, disk thresholds, per-method attribution, sync health, and
 monitoring overhead. It reports whether each chart is available, empty, missing
 input data, or missing expected columns.
+
+`diagnose-artifacts` adds deterministic bottleneck rules for CPU saturation,
+disk latency/queueing, disk IOPS or throughput pressure, RPC method
+errors/latency, and sync-health warnings.
+
+For long-running jobs, `resume` and `logs` are file-backed and can be called
+from a later Agent session. Optional webhook notifications are controlled by
+`AGENT_NOTIFY_WEBHOOK_URL` and `AGENT_NOTIFY_ON`; they are disabled by default.
+
+Inside `./bin/anychain-agent`, type `trace` to inspect the recent workflow
+graph decisions. The trace is written to `.agent/chat/workflow_trace.jsonl` and
+records intent, selected workflow, prompt bundle, deterministic tools, artifact
+paths, fallback mode, and next actions.
+
+Type `checklist` after creating a plan to see the next missing configuration
+item. The Agent accepts either a direct value or `answer <value>`, then
+regenerates the plan, preflight state, and runbook.
+
+Default real execution is detached/background. The Agent starts a worker process
+that continues after the terminal session disconnects, writes job state to
+`.agent/chat/jobs/<job_id>/job.json`, and writes benchmark output to
+`.agent/chat/jobs/<job_id>/benchmark.log`. Restarting `./bin/anychain-agent`
+from the same output directory restores the latest job metadata and suggests
+`status`, `logs`, `analyze`, or `qa`. Type `run in foreground` before `yes run`
+only when you intentionally want terminal-bound execution.
 
 Generate plugin-style onboarding guidance for secondary development:
 
@@ -294,6 +318,20 @@ python3 agent/cli.py onboarding-plan \
 The output includes workload snippets, fake-node fixture steps, and validation
 commands so enterprise teams can add chains or RPC methods without guessing the
 framework contracts.
+
+Generate a conservative chain template draft:
+
+```bash
+python3 agent/cli.py draft-chain-template \
+  --chain foochain \
+  --adapter-family jsonrpc \
+  --method foo_getBalance \
+  --method foo_getBlock \
+  --output /tmp/foochain.json
+```
+
+The draft is marked `needs_review`; review parameter contracts, sync-health,
+proxy extraction, and fake-node fixtures before adding it to `config/chains`.
 
 Compare plans or archived runs:
 
@@ -332,18 +370,28 @@ enterprise-private node knowledge, internal RPC samples, incident history, or
 unsupported-chain research.
 
 Enterprise platforms can keep Knowledge Base integration disabled and still use
-the Agent with repository-local capabilities. To enable a future custom adapter,
-configure `config/agent_config.sh`:
+the Agent with repository-local capabilities. To enable a generic HTTP KB/RAG
+adapter or a custom adapter, configure `config/agent_config.sh`:
 
 ```bash
-AGENT_KNOWLEDGE_PROVIDER="custom"
+AGENT_KNOWLEDGE_PROVIDER="http"           # disabled | noop | http | custom
 AGENT_KNOWLEDGE_PROVIDER_MODULE="my_company.anychain_kb:Provider"
 AGENT_KNOWLEDGE_BASE_URL="https://kb.example.internal"
 AGENT_KNOWLEDGE_AUTH_REF="secret-manager://anychain/kb-token"
 ```
 
+Validate the configured provider:
+
+```bash
+python3 agent/cli.py knowledge-smoke --query "solana rpc methods" --chain solana
+```
+
 The recommended enterprise integration point is `python3 agent/cli.py` with
-JSON input/output. Typical platform calls are `doctor`, `capabilities`,
+JSON input/output. `python3 agent/cli.py tool-schema` exports an
+OpenAI-compatible function-tool schema when the enterprise platform wants a
+stable tool catalog. `python3 agent/cli.py tool-call --name <tool> --arguments '<json>'`
+executes one named Agent tool without requiring the platform to know every
+lower-level subcommand. Typical platform calls are `doctor`, `capabilities`,
 `draft-request`, `plan`, `preflight`, `submit`, `status`, `analyze`, and
 `artifact-qa`.
 
@@ -352,31 +400,40 @@ JSON input/output. Typical platform calls are `doctor`, `capabilities`,
 The Agent LLM layer uses an internal message contract and provider adapters.
 The benchmark engine does not depend on a model provider.
 
-Supported provider contracts:
+Supported providers:
 
 - `fake`: offline deterministic provider for local smoke tests.
-- `vertex_gemini_openai`: Gemini on Vertex AI through the OpenAI-compatible
-  endpoint.
-- `vertex_claude`: Claude partner models on Vertex AI.
-- `openai`: OpenAI API.
+- `gemini`: Gemini API key, or Gemini on Vertex AI with Google auth.
+- `claude`: Anthropic API key, or Claude on Vertex AI with Google auth.
+- `openai`: OpenAI API key.
 
-Recommended enterprise configuration uses Google ADC or service-account
-impersonation, not static API keys. Store persistent Agent defaults in
-`config/agent_config.sh`; `./bin/anychain-agent` loads that file at startup, and
-temporary environment variables can still override it.
+Store persistent Agent defaults in `config/agent_config.sh`;
+`./bin/anychain-agent` loads that file at startup, and temporary environment
+variables can still override it.
+
+Direct API-key mode:
 
 ```bash
-LLM_PROVIDER="vertex_gemini_openai"
-LLM_MODEL="gemini-2.5-pro"
-GOOGLE_AUTH_MODE="service_account_impersonation"
+LLM_PROVIDER="gemini"
+LLM_MODEL="gemini-3.1-pro"
+LLM_AUTH_MODE="api_key"
+GEMINI_API_KEY="AIza..."
+```
+
+Google service-account mode for Vertex AI:
+
+```bash
+LLM_PROVIDER="gemini"
+LLM_MODEL="gemini-3.1-pro"
+LLM_AUTH_MODE="service_account_impersonation"
 GOOGLE_CLOUD_PROJECT="your-project"
 GOOGLE_CLOUD_LOCATION="us-central1"
 GOOGLE_SERVICE_ACCOUNT_EMAIL="benchmark-agent@your-project.iam.gserviceaccount.com"
 ```
 
-`GOOGLE_AUTH_MODE=adc` or `attached_service_account` is preferred on GCE/GKE
+`LLM_AUTH_MODE=google_adc` or `attached_service_account` is preferred on GCE/GKE
 when the runtime identity is already bound to the correct service account. Use
-`GOOGLE_AUTH_MODE=service_account_file` with `GOOGLE_APPLICATION_CREDENTIALS`
+`LLM_AUTH_MODE=service_account_file` with `GOOGLE_APPLICATION_CREDENTIALS`
 only as a local fallback.
 
 Validate the local configuration without calling a model:

@@ -5,6 +5,7 @@
 - [Full Framework Reference](framework-reference.md)
 - [How to Add a Chain or RPC Method](how-to-add-chain.md)
 - [Local Closed-Loop Testing with fake-node](local-closed-loop-testing.md)
+- [Secondary Development Guide](secondary-development-guide.md)
 - [GitHub PR Gates and Branch Protection](github-pr-gates.md)
 
 Related docs:

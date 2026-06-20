@@ -91,7 +91,21 @@ def should_skip_line(path: Path, line: str) -> bool:
         return True
     if "MISSING_PY" in stripped:
         return True
-    if re.search(r"\b(vertex[_ -]?claude|VertexClaudeProvider|claude-\d|Vertex Claude|Claude partner|Claude protocol)\b", stripped, re.IGNORECASE):
+    if re.search(
+        r"(vertex_claude|VertexClaudeProvider|Gemini/Claude|Gemini or Claude|Gemini, Claude|Gemini 或 Claude|"
+        r"claude-\d|claude-opus|claude_|\"claude\"|`claude`|Claude partner|Claude API|Claude on Vertex|"
+        r"Claude with Anthropic|Claude through Vertex|ANTHROPIC_API_KEY|AnthropicAPIKeyProvider)",
+        stripped,
+        re.IGNORECASE,
+    ):
+        return True
+    if re.search(r"\bclaude\b", stripped, re.IGNORECASE) and re.search(
+        r"(LLM_PROVIDER|provider|SUPPORTED_LLM_PROVIDERS|VertexClaudeProvider|"
+        r"partner models?|model|GOOGLE_CLOUD_LOCATION|claude-\d|"
+        r'"claude"|`claude`|vertex_claude)',
+        stripped,
+        re.IGNORECASE,
+    ):
         return True
     return False
 

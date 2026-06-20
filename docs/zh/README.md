@@ -5,6 +5,7 @@
 - [完整框架 Reference](framework-reference.md)
 - [如何新增区块链或 RPC Method](how-to-add-chain.md)
 - [使用 fake-node 进行本地闭环测试](local-closed-loop-testing.md)
+- [二次开发指南](secondary-development-guide.md)
 - [GitHub PR Gate 与分支保护](github-pr-gates.md)
 
 相关文档：

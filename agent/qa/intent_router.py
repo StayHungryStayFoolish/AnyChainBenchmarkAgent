@@ -5,11 +5,19 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from llm.orchestrator import PromptOrchestrator
 from llm.providers import provider_from_config
 from llm.types import LLMMessage, LLMProvider, LLMRequest
 
 
-INTENTS = {"benchmark_request", "framework_question", "out_of_scope"}
+INTENTS = {
+    "benchmark_request",
+    "framework_question",
+    "artifact_question",
+    "plan_edit",
+    "onboarding_request",
+    "out_of_scope",
+}
 
 
 def route_intent(prompt: str, provider: LLMProvider | None = None, use_llm: bool = False) -> dict[str, Any]:
@@ -24,11 +32,7 @@ def route_intent(prompt: str, provider: LLMProvider | None = None, use_llm: bool
                 messages=[
                     LLMMessage(
                         role="system",
-                        content=(
-                            "Classify the user prompt for a blockchain benchmark Agent. "
-                            "Return JSON only with intent, confidence, and reason. "
-                            "intent must be benchmark_request, framework_question, or out_of_scope."
-                        ),
+                        content=PromptOrchestrator(provider).system_prompt("intent"),
                     ),
                     LLMMessage(role="user", content=prompt),
                 ],
@@ -63,10 +67,19 @@ def _deterministic_route(prompt: str) -> dict[str, Any]:
     out_tokens = ("stock", "movie", "weather", "recipe", "股票", "天气", "菜谱")
     if any(token in lowered for token in out_tokens) and not any(token in lowered for token in benchmark_tokens):
         return {"intent": "out_of_scope", "confidence": 0.8, "reason": "prompt does not match benchmark domain", "source": "deterministic"}
+    if _looks_like_onboarding(lowered):
+        return {"intent": "onboarding_request", "confidence": 0.88, "reason": "secondary development or onboarding request detected", "source": "deterministic"}
     if any(token in lowered for token in ("how many", "supported", "which chains", "support", "capability", "多少", "哪些", "支持")) and any(
         token in lowered for token in ("chain", "chains", "rpc", "method", "family", "fixture", "链", "方法", "能力")
     ):
         return {"intent": "framework_question", "confidence": 0.85, "reason": "framework capability question detected", "source": "deterministic"}
+    if any(lowered.startswith(prefix) for prefix in ("what ", "how ", "why ", "where ", "does ", "do ", "can ")):
+        if not any(token in lowered for token in ("create ", "run ", "execute ", "start ", "submit ", "压测", "执行")):
+            return {"intent": "framework_question", "confidence": 0.75, "reason": "explanatory framework question detected", "source": "deterministic"}
+    if any(token in lowered for token in ("create ", "run ", "test ", "benchmark", "execute ", "压测", "测试")) and any(
+        token in lowered for token in benchmark_tokens
+    ):
+        return {"intent": "benchmark_request", "confidence": 0.85, "reason": "benchmark action detected", "source": "deterministic"}
     if any(token in lowered for token in question_tokens) and any(
         token in lowered for token in ("fake-node", "fake node", "config", "readme", "report", "prometheus", "grafana", "配置", "报告")
     ):
@@ -76,6 +89,76 @@ def _deterministic_route(prompt: str) -> dict[str, Any]:
     if any(token in lowered for token in question_tokens):
         return {"intent": "framework_question", "confidence": 0.65, "reason": "framework question terms detected", "source": "deterministic"}
     return {"intent": "framework_question", "confidence": 0.4, "reason": "default to framework question", "source": "deterministic"}
+
+
+def _looks_like_onboarding(lowered: str) -> bool:
+    explicit_extension_tokens = (
+        "secondary development",
+        "extend",
+        "extension",
+        "onboard",
+        "onboarding",
+        "add a new chain",
+        "add new chain",
+        "add chain",
+        "new protocol",
+        "protocol family",
+        "new family",
+        "custom rpc",
+        "add rpc",
+        "chain template",
+        "draft chain",
+        "integrate kb",
+        "agent platform",
+        "internal agent",
+        "enterprise agent",
+        "tool schema",
+        "tool-call",
+        "knowledge base",
+        "二次开发",
+        "扩展",
+        "新增链",
+        "添加链",
+        "新增区块链",
+        "增加区块链",
+        "新增协议",
+        "协议 family",
+        "新增 rpc",
+        "增加 rpc",
+        "自定义 rpc",
+        "chain template",
+        "知识库",
+        "企业 agent",
+        "内部 agent",
+        "agent 平台",
+        "工具 schema",
+    )
+    action_tokens = (
+        "how",
+        "where",
+        "generate",
+        "plan",
+        "draft",
+        "create",
+        "support",
+        "integrate",
+        "如何",
+        "怎么",
+        "哪里",
+        "生成",
+        "计划",
+        "支持",
+        "集成",
+        "接入",
+    )
+    if any(token in lowered for token in explicit_extension_tokens):
+        return True
+    if any(token in lowered for token in ("rpc method", "rpc 方法", "方法")) and any(token in lowered for token in action_tokens):
+        if any(token in lowered for token in ("add", "new", "custom", "extend", "onboard", "draft", "新增", "增加", "添加", "自定义", "扩展")):
+            return True
+    if any(token in lowered for token in ("kb", "rag")) and any(token in lowered for token in action_tokens):
+        return True
+    return False
 
 
 def _json_text(text: str) -> str:

@@ -722,11 +722,45 @@ class ReportGenerator:
     def _format_stat_value(self, value, decimal=0):
         """Format statistical value"""
         if isinstance(value, (int, float)):
+            if pd.isna(value) or np.isinf(value):
+                return 'N/A'
             if decimal == 0:
                 return f"{value:.0f}"
             else:
                 return f"{value:.{decimal}f}"
         return 'N/A'
+
+    def _numeric_series(self, df, column):
+        """Return finite numeric values for one column."""
+        if df is None or column not in df.columns:
+            return pd.Series(dtype='float64')
+        values = pd.to_numeric(df[column], errors='coerce')
+        return values.replace([np.inf, -np.inf], np.nan).dropna()
+
+    def _metric_stats(self, df, column, min_threshold=None):
+        """Return min/avg/max for a metric column, or None when no valid samples exist."""
+        values = self._numeric_series(df, column)
+        if values.empty:
+            return None
+        if min_threshold is None:
+            min_values = values
+        else:
+            min_values = values[values >= min_threshold]
+        return {
+            'min': min_values.min() if not min_values.empty else values.min(),
+            'avg': values.mean(),
+            'max': values.max(),
+            'count': int(values.count()),
+        }
+
+    def _format_metric_stats(self, stats, decimal=0):
+        if not stats:
+            return ('N/A', 'N/A', 'N/A')
+        return (
+            self._format_stat_value(stats.get('min'), decimal),
+            self._format_stat_value(stats.get('avg'), decimal),
+            self._format_stat_value(stats.get('max'), decimal),
+        )
 
     @staticmethod
     def _provider_from_df(df):
@@ -897,52 +931,19 @@ class ReportGenerator:
             accounts_max_iops = self.config.get('ACCOUNTS_VOL_MAX_IOPS', 'N/A')
             accounts_max_throughput = self.config.get('ACCOUNTS_VOL_MAX_THROUGHPUT', 'N/A')
 
-            # Calculate actual usage statistics
-            stats_data = {}
-
             # DATA device provider-adjusted fields resolved through the registry.
             data_iops_col = self._resolve_disk_columns(df, 'data', 'disk_iops_provider_adjusted')
             data_throughput_col = self._resolve_disk_columns(df, 'data', 'disk_throughput_provider_adjusted')
-
-            if data_iops_col:
-                # Filter out noise values (< 10 IOPS) for Min calculation
-                meaningful_data = df[df[data_iops_col[0]] >= 10][data_iops_col[0]]
-                stats_data['DATA_IOPS_Min'] = meaningful_data.min() if len(meaningful_data) > 0 else 0
-                stats_data['DATA_IOPS_Max'] = df[data_iops_col[0]].max()
-                stats_data['DATA_IOPS_Avg'] = df[data_iops_col[0]].mean()
-
-            if data_throughput_col:
-                # Filter out noise values (< 1.0 MiB/s) for Min calculation
-                meaningful_data = df[df[data_throughput_col[0]] >= 1.0][data_throughput_col[0]]
-                stats_data['DATA_Throughput_Min'] = meaningful_data.min() if len(meaningful_data) > 0 else 0
-                stats_data['DATA_Throughput_Max'] = df[data_throughput_col[0]].max()
-                stats_data['DATA_Throughput_Avg'] = df[data_throughput_col[0]].mean()
 
             # ACCOUNTS device provider-adjusted fields resolved through the registry.
             accounts_iops_col = self._resolve_disk_columns(df, 'accounts', 'disk_iops_provider_adjusted')
             accounts_throughput_col = self._resolve_disk_columns(df, 'accounts', 'disk_throughput_provider_adjusted')
 
-            if accounts_iops_col:
-                # Filter out noise values (< 10 IOPS) for Min calculation
-                meaningful_data = df[df[accounts_iops_col[0]] >= 10][accounts_iops_col[0]]
-                stats_data['ACCOUNTS_IOPS_Min'] = meaningful_data.min() if len(meaningful_data) > 0 else 0
-                stats_data['ACCOUNTS_IOPS_Max'] = df[accounts_iops_col[0]].max()
-                stats_data['ACCOUNTS_IOPS_Avg'] = df[accounts_iops_col[0]].mean()
-
-            if accounts_throughput_col:
-                # Filter out noise values (< 1.0 MiB/s) for Min calculation
-                meaningful_data = df[df[accounts_throughput_col[0]] >= 1.0][accounts_throughput_col[0]]
-                stats_data['ACCOUNTS_Throughput_Min'] = meaningful_data.min() if len(meaningful_data) > 0 else 0
-                stats_data['ACCOUNTS_Throughput_Max'] = df[accounts_throughput_col[0]].max()
-                stats_data['ACCOUNTS_Throughput_Avg'] = df[accounts_throughput_col[0]].mean()
-
             # Format values
-            data_iops_min = self._format_stat_value(stats_data.get('DATA_IOPS_Min'), 0)
-            data_iops_avg = self._format_stat_value(stats_data.get('DATA_IOPS_Avg'), 0)
-            data_iops_max = self._format_stat_value(stats_data.get('DATA_IOPS_Max'), 0)
-            data_tp_min = self._format_stat_value(stats_data.get('DATA_Throughput_Min'), 1)
-            data_tp_avg = self._format_stat_value(stats_data.get('DATA_Throughput_Avg'), 1)
-            data_tp_max = self._format_stat_value(stats_data.get('DATA_Throughput_Max'), 1)
+            data_iops_stats = self._metric_stats(df, data_iops_col[0], 10) if data_iops_col else None
+            data_tp_stats = self._metric_stats(df, data_throughput_col[0], 1.0) if data_throughput_col else None
+            data_iops_min, data_iops_avg, data_iops_max = self._format_metric_stats(data_iops_stats, 0)
+            data_tp_min, data_tp_avg, data_tp_max = self._format_metric_stats(data_tp_stats, 1)
 
             html += f'''
                 <table class="report-table disk-stats-table">
@@ -976,12 +977,10 @@ class ReportGenerator:
 
             # If ACCOUNTS device data exists, add ACCOUNTS rows
             if accounts_iops_col or accounts_throughput_col:
-                acc_iops_min = self._format_stat_value(stats_data.get('ACCOUNTS_IOPS_Min'), 0)
-                acc_iops_avg = self._format_stat_value(stats_data.get('ACCOUNTS_IOPS_Avg'), 0)
-                acc_iops_max = self._format_stat_value(stats_data.get('ACCOUNTS_IOPS_Max'), 0)
-                acc_tp_min = self._format_stat_value(stats_data.get('ACCOUNTS_Throughput_Min'), 1)
-                acc_tp_avg = self._format_stat_value(stats_data.get('ACCOUNTS_Throughput_Avg'), 1)
-                acc_tp_max = self._format_stat_value(stats_data.get('ACCOUNTS_Throughput_Max'), 1)
+                acc_iops_stats = self._metric_stats(df, accounts_iops_col[0], 10) if accounts_iops_col else None
+                acc_tp_stats = self._metric_stats(df, accounts_throughput_col[0], 1.0) if accounts_throughput_col else None
+                acc_iops_min, acc_iops_avg, acc_iops_max = self._format_metric_stats(acc_iops_stats, 0)
+                acc_tp_min, acc_tp_avg, acc_tp_max = self._format_metric_stats(acc_tp_stats, 1)
 
                 html += f'''
                         <tr>
@@ -1017,47 +1016,24 @@ class ReportGenerator:
         '''
 
         if df is not None and not df.empty:
-            iostat_stats = {}
-
             # DATA Device iostat fields
+            iostat_stats = {}
             for metric in ['total_iops', 'total_throughput_mibs', 'util', 'avg_await']:
                 data_col = [col for col in df.columns if col.startswith('data_') and col.endswith(f'_{metric}')]
                 if data_col:
-                    # Filter out noise values for Min calculation
-                    if metric == 'total_iops':
-                        meaningful_data = df[df[data_col[0]] >= 10][data_col[0]]  # >= 10 IOPS
-                    elif metric == 'total_throughput_mibs':
-                        meaningful_data = df[df[data_col[0]] >= 1.0][data_col[0]]  # >= 1.0 MiB/s
-                    elif metric == 'util':
-                        meaningful_data = df[df[data_col[0]] >= 1.0][data_col[0]]  # >= 1.0%
-                    elif metric == 'avg_await':
-                        meaningful_data = df[df[data_col[0]] >= 0.1][data_col[0]]  # >= 0.1 ms
-                    else:
-                        meaningful_data = df[df[data_col[0]] > 0][data_col[0]]
-
-                    iostat_stats[f'DATA_{metric}_Min'] = meaningful_data.min() if len(meaningful_data) > 0 else 0
-                    iostat_stats[f'DATA_{metric}_Max'] = df[data_col[0]].max()
-                    iostat_stats[f'DATA_{metric}_Avg'] = df[data_col[0]].mean()
+                    threshold = {'total_iops': 10, 'total_throughput_mibs': 1.0, 'util': 1.0, 'avg_await': 0.1}.get(metric)
+                    stats = self._metric_stats(df, data_col[0], threshold)
+                    if stats:
+                        iostat_stats[f'DATA_{metric}'] = stats
 
             # ACCOUNTS Device iostat fields
             for metric in ['total_iops', 'total_throughput_mibs', 'util', 'avg_await']:
                 accounts_col = [col for col in df.columns if col.startswith('accounts_') and col.endswith(f'_{metric}')]
                 if accounts_col:
-                    # Filter out noise values for Min calculation
-                    if metric == 'total_iops':
-                        meaningful_data = df[df[accounts_col[0]] >= 10][accounts_col[0]]  # >= 10 IOPS
-                    elif metric == 'total_throughput_mibs':
-                        meaningful_data = df[df[accounts_col[0]] >= 1.0][accounts_col[0]]  # >= 1.0 MiB/s
-                    elif metric == 'util':
-                        meaningful_data = df[df[accounts_col[0]] >= 1.0][accounts_col[0]]  # >= 1.0%
-                    elif metric == 'avg_await':
-                        meaningful_data = df[df[accounts_col[0]] >= 0.1][accounts_col[0]]  # >= 0.1 ms
-                    else:
-                        meaningful_data = df[df[accounts_col[0]] > 0][accounts_col[0]]
-
-                    iostat_stats[f'ACCOUNTS_{metric}_Min'] = meaningful_data.min() if len(meaningful_data) > 0 else 0
-                    iostat_stats[f'ACCOUNTS_{metric}_Max'] = df[accounts_col[0]].max()
-                    iostat_stats[f'ACCOUNTS_{metric}_Avg'] = df[accounts_col[0]].mean()
+                    threshold = {'total_iops': 10, 'total_throughput_mibs': 1.0, 'util': 1.0, 'avg_await': 0.1}.get(metric)
+                    stats = self._metric_stats(df, accounts_col[0], threshold)
+                    if stats:
+                        iostat_stats[f'ACCOUNTS_{metric}'] = stats
 
             html += f'''
                 <table class="report-table disk-stats-table">
@@ -1075,18 +1051,10 @@ class ReportGenerator:
 
             # DATA Device data
             if any(k.startswith('DATA_') for k in iostat_stats.keys()):
-                d_iops_min = self._format_stat_value(iostat_stats.get('DATA_total_iops_Min'), 0)
-                d_iops_avg = self._format_stat_value(iostat_stats.get('DATA_total_iops_Avg'), 0)
-                d_iops_max = self._format_stat_value(iostat_stats.get('DATA_total_iops_Max'), 0)
-                d_tp_min = self._format_stat_value(iostat_stats.get('DATA_total_throughput_mibs_Min'), 1)
-                d_tp_avg = self._format_stat_value(iostat_stats.get('DATA_total_throughput_mibs_Avg'), 1)
-                d_tp_max = self._format_stat_value(iostat_stats.get('DATA_total_throughput_mibs_Max'), 1)
-                d_util_min = self._format_stat_value(iostat_stats.get('DATA_util_Min'), 1)
-                d_util_avg = self._format_stat_value(iostat_stats.get('DATA_util_Avg'), 1)
-                d_util_max = self._format_stat_value(iostat_stats.get('DATA_util_Max'), 1)
-                d_lat_min = self._format_stat_value(iostat_stats.get('DATA_avg_await_Min'), 2)
-                d_lat_avg = self._format_stat_value(iostat_stats.get('DATA_avg_await_Avg'), 2)
-                d_lat_max = self._format_stat_value(iostat_stats.get('DATA_avg_await_Max'), 2)
+                d_iops_min, d_iops_avg, d_iops_max = self._format_metric_stats(iostat_stats.get('DATA_total_iops'), 0)
+                d_tp_min, d_tp_avg, d_tp_max = self._format_metric_stats(iostat_stats.get('DATA_total_throughput_mibs'), 1)
+                d_util_min, d_util_avg, d_util_max = self._format_metric_stats(iostat_stats.get('DATA_util'), 1)
+                d_lat_min, d_lat_avg, d_lat_max = self._format_metric_stats(iostat_stats.get('DATA_avg_await'), 2)
 
                 html += f'''
                         <tr>
@@ -1118,18 +1086,10 @@ class ReportGenerator:
 
             # ACCOUNTS Device data
             if any(k.startswith('ACCOUNTS_') for k in iostat_stats.keys()):
-                a_iops_min = self._format_stat_value(iostat_stats.get('ACCOUNTS_total_iops_Min'), 0)
-                a_iops_avg = self._format_stat_value(iostat_stats.get('ACCOUNTS_total_iops_Avg'), 0)
-                a_iops_max = self._format_stat_value(iostat_stats.get('ACCOUNTS_total_iops_Max'), 0)
-                a_tp_min = self._format_stat_value(iostat_stats.get('ACCOUNTS_total_throughput_mibs_Min'), 1)
-                a_tp_avg = self._format_stat_value(iostat_stats.get('ACCOUNTS_total_throughput_mibs_Avg'), 1)
-                a_tp_max = self._format_stat_value(iostat_stats.get('ACCOUNTS_total_throughput_mibs_Max'), 1)
-                a_util_min = self._format_stat_value(iostat_stats.get('ACCOUNTS_util_Min'), 1)
-                a_util_avg = self._format_stat_value(iostat_stats.get('ACCOUNTS_util_Avg'), 1)
-                a_util_max = self._format_stat_value(iostat_stats.get('ACCOUNTS_util_Max'), 1)
-                a_lat_min = self._format_stat_value(iostat_stats.get('ACCOUNTS_avg_await_Min'), 2)
-                a_lat_avg = self._format_stat_value(iostat_stats.get('ACCOUNTS_avg_await_Avg'), 2)
-                a_lat_max = self._format_stat_value(iostat_stats.get('ACCOUNTS_avg_await_Max'), 2)
+                a_iops_min, a_iops_avg, a_iops_max = self._format_metric_stats(iostat_stats.get('ACCOUNTS_total_iops'), 0)
+                a_tp_min, a_tp_avg, a_tp_max = self._format_metric_stats(iostat_stats.get('ACCOUNTS_total_throughput_mibs'), 1)
+                a_util_min, a_util_avg, a_util_max = self._format_metric_stats(iostat_stats.get('ACCOUNTS_util'), 1)
+                a_lat_min, a_lat_avg, a_lat_max = self._format_metric_stats(iostat_stats.get('ACCOUNTS_avg_await'), 2)
 
                 html += f'''
                         <tr>
@@ -2723,6 +2683,20 @@ class ReportGenerator:
                 break
 
         if chart_src:
+            if self.language == 'zh':
+                signal_items = """
+                        <li><strong>主信号</strong>: 根据链模板的 sync_health.mode 展示高度差、reported lag 或健康状态</li>
+                        <li><strong>同步状态</strong>: 当无法获取数值高度差时，显示 healthy / warning / unhealthy 状态时间线</li>
+                        <li><strong>阈值</strong>: 数值型 gap/lag 使用 BLOCK_HEIGHT_DIFF_THRESHOLD；持续异常使用 BLOCK_HEIGHT_TIME_THRESHOLD</li>
+                        <li><strong>异常区间</strong>: data_loss 或持续不健康状态会在图中标注</li>
+                """
+            else:
+                signal_items = """
+                        <li><strong>Primary signal</strong>: Shows height gap, reported lag, or health state based on sync_health.mode from the chain template</li>
+                        <li><strong>Sync status</strong>: Shows healthy / warning / unhealthy timeline when numeric height gap is unavailable</li>
+                        <li><strong>Thresholds</strong>: Numeric gap/lag uses BLOCK_HEIGHT_DIFF_THRESHOLD; sustained unhealthy state uses BLOCK_HEIGHT_TIME_THRESHOLD</li>
+                        <li><strong>Anomaly regions</strong>: data_loss or sustained unhealthy state is highlighted when present</li>
+                """
             return f"""
             <div class="info-card">
                 <h3>📊 {self.t['block_height_sync_time_series']}</h3>
@@ -2732,11 +2706,7 @@ class ReportGenerator:
                 <div class="chart-info">
                     <p>{self.t['chart_shows_sync_health']}:</p>
                     <ul>
-                        <li><strong>{self.t['blue_curve']}</strong>: {self.t['block_height_diff_mainnet_minus_local']}</li>
-                        <li><strong>{self.t['sync_status']}</strong>: {self.t['sync_health_status_timeline']}</li>
-                        <li><strong>{self.t['red_dashed_line']}</strong>: {self.t['anomaly_threshold_50_blocks']}</li>
-                        <li><strong>{self.t['red_area']}</strong>: {self.t['data_loss_detected_periods']}</li>
-                        <li><strong>{self.t['statistics_info']}</strong>: {self.t['sync_quality_stats_top_left']}</li>
+                        {signal_items}
                     </ul>
                 </div>
             </div>
@@ -3485,6 +3455,73 @@ class ReportGenerator:
 
         return methods or None
 
+    def _bottleneck_criteria_items(self):
+        """Render bottleneck criteria from the active threshold variables."""
+        cpu = os.getenv('BOTTLENECK_CPU_THRESHOLD', '85')
+        memory = os.getenv('BOTTLENECK_MEMORY_THRESHOLD', '90')
+        disk_iops = os.getenv('BOTTLENECK_DISK_IOPS_THRESHOLD', '90')
+        disk_tp = os.getenv('BOTTLENECK_DISK_THROUGHPUT_THRESHOLD', '90')
+        network = os.getenv('BOTTLENECK_NETWORK_THRESHOLD', '80')
+        success = os.getenv('SUCCESS_RATE_THRESHOLD', '95')
+        latency = os.getenv('MAX_LATENCY_THRESHOLD', '1000')
+        errors = os.getenv('BOTTLENECK_ERROR_RATE_THRESHOLD', '5')
+        sync_gap = os.getenv('BLOCK_HEIGHT_DIFF_THRESHOLD', '50')
+        sync_time = os.getenv('BLOCK_HEIGHT_TIME_THRESHOLD', '300')
+
+        if self.language == 'zh':
+            return [
+                (
+                    f"<strong>检测维度（8个指标）：</strong><br>"
+                    f"&nbsp;&nbsp;• 资源指标：CPU>{cpu}%、内存>{memory}%、"
+                    f"Disk provider-normalized IOPS>{disk_iops}%、"
+                    f"Disk provider-normalized 吞吐量>{disk_tp}%、网络>{network}%<br>"
+                    f"&nbsp;&nbsp;• <strong>RPC 性能：</strong>成功率&lt;{success}% 或 P99 延迟>{latency}ms<br>"
+                    f"&nbsp;&nbsp;• RPC 错误：错误率>{errors}%、连接失败"
+                ),
+                (
+                    "<strong>五场景判断逻辑：</strong><br>"
+                    "&nbsp;&nbsp;• <strong>场景A-Resource：</strong>资源超标 + 节点健康 → 误判 → 重置计数器 → 继续测试<br>"
+                    "&nbsp;&nbsp;• <strong>场景A-RPC：</strong>RPC性能违规 → 真瓶颈 → 累积计数 → 连续阈值后停止<br>"
+                    "&nbsp;&nbsp;• <strong>场景B：</strong>任意瓶颈 + 节点不健康 → 真瓶颈 → 累积计数 → 连续阈值后停止<br>"
+                    "&nbsp;&nbsp;• <strong>场景C：</strong>无资源瓶颈 + 节点持续不健康 → 节点故障 → 停止<br>"
+                    "&nbsp;&nbsp;• <strong>场景D：</strong>全部指标正常 + 节点健康 → 继续测试"
+                ),
+                (
+                    f"<strong>节点同步健康验证：</strong><br>"
+                    f"&nbsp;&nbsp;• 支持 absolute_gap、conditional_gap、reported_lag、freshness_only、health_only 等模式<br>"
+                    f"&nbsp;&nbsp;• 数值型 gap/lag 复用 BLOCK_HEIGHT_DIFF_THRESHOLD={sync_gap}；持续异常复用 BLOCK_HEIGHT_TIME_THRESHOLD={sync_time}s<br>"
+                    f"&nbsp;&nbsp;• RPC 性能违规可以直接触发瓶颈判断，不要求必须同时出现高度差异常"
+                ),
+            ]
+
+        return [
+            (
+                f"<strong>Detection Dimensions (8 metrics):</strong><br>"
+                f"&nbsp;&nbsp;• Resource metrics: CPU>{cpu}%, Memory>{memory}%, "
+                f"Disk provider-normalized IOPS>{disk_iops}%, "
+                f"Disk provider-normalized throughput>{disk_tp}%, Network>{network}%<br>"
+                f"&nbsp;&nbsp;• <strong>RPC performance:</strong> Success rate&lt;{success}% or P99 latency>{latency}ms<br>"
+                f"&nbsp;&nbsp;• RPC errors: Error rate>{errors}%, connection failures"
+            ),
+            (
+                "<strong>5-scenario decision logic:</strong><br>"
+                "&nbsp;&nbsp;• <strong>Scenario A-Resource:</strong> Resource exceeded + node healthy → false positive → reset counter → continue<br>"
+                "&nbsp;&nbsp;• <strong>Scenario A-RPC:</strong> RPC performance violation → true bottleneck → accumulate count → stop after consecutive threshold<br>"
+                "&nbsp;&nbsp;• <strong>Scenario B:</strong> Any bottleneck + node unhealthy → true bottleneck → accumulate count → stop after consecutive threshold<br>"
+                "&nbsp;&nbsp;• <strong>Scenario C:</strong> No resource bottleneck + node persistently unhealthy → node failure → stop<br>"
+                "&nbsp;&nbsp;• <strong>Scenario D:</strong> All metrics normal + node healthy → continue testing"
+            ),
+            (
+                f"<strong>Node sync-health verification:</strong><br>"
+                f"&nbsp;&nbsp;• Supports absolute_gap, conditional_gap, reported_lag, freshness_only, and health_only modes<br>"
+                f"&nbsp;&nbsp;• Numeric gap/lag reuses BLOCK_HEIGHT_DIFF_THRESHOLD={sync_gap}; sustained unhealthy state reuses BLOCK_HEIGHT_TIME_THRESHOLD={sync_time}s<br>"
+                f"&nbsp;&nbsp;• RPC performance violations can trigger bottleneck classification without requiring a height-gap anomaly"
+            ),
+        ]
+
+    def _bottleneck_criteria_list_html(self):
+        return "\n".join(f"<li>{item}</li>" for item in self._bottleneck_criteria_items())
+
     def _generate_bottleneck_section(self):
         """Generate system-level bottleneck analysis section - always display"""
         try:
@@ -3546,9 +3583,7 @@ class ReportGenerator:
                         <h3 style="margin-top: 0;">&#128203; {self.t['bottleneck_criteria_title']}</h3>
                         <p><strong>{self.t['bottleneck_criteria_note']}</strong></p>
                         <ol class="bottleneck-criteria-list">
-                            <li>{self.t['bottleneck_condition_1']}</li>
-                            <li>{self.t['bottleneck_condition_2']}</li>
-                            <li>{self.t['bottleneck_condition_3']}</li>
+                            {self._bottleneck_criteria_list_html()}
                         </ol>
                     </div>
                 </div>
@@ -3567,9 +3602,7 @@ class ReportGenerator:
                         <h3 style="margin-top: 0;">&#128203; {self.t['bottleneck_criteria_title']}</h3>
                         <p><strong>{self.t['bottleneck_criteria_note']}</strong></p>
                         <ol class="bottleneck-criteria-list">
-                            <li>{self.t['bottleneck_condition_1']}</li>
-                            <li>{self.t['bottleneck_condition_2']}</li>
-                            <li>{self.t['bottleneck_condition_3']}</li>
+                            {self._bottleneck_criteria_list_html()}
                         </ol>
                     </div>
 
@@ -4504,13 +4537,21 @@ class ReportGenerator:
             cpu_max = df['cpu_usage'].max() if 'cpu_usage' in df.columns and len(df) > 0 else 0
             mem_avg = df['mem_usage'].mean() if 'mem_usage' in df.columns and len(df) > 0 else 0
 
-            # DATA Device statistics - using unified field format matching
+            # DATA Device statistics - using unified field format matching.
             data_iops_cols = [col for col in df.columns if col.startswith('data_') and col.endswith('_total_iops')]
-            data_iops_avg = df[data_iops_cols[0]].mean() if data_iops_cols and len(df) > 0 else 0
+            data_iops_stats = self._metric_stats(df, data_iops_cols[0]) if data_iops_cols else None
+            data_iops_avg = self._format_metric_stats(data_iops_stats, 0)[1]
 
-            # ACCOUNTS Device statistics - using unified field format matching
+            # ACCOUNTS Device statistics - only show when runtime data is present.
             accounts_iops_cols = [col for col in df.columns if col.startswith('accounts_') and col.endswith('_total_iops')]
-            accounts_iops_avg = df[accounts_iops_cols[0]].mean() if accounts_iops_cols and len(df) > 0 else 0
+            accounts_iops_stats = self._metric_stats(df, accounts_iops_cols[0]) if accounts_iops_cols else None
+            accounts_iops_row = ""
+            if accounts_iops_cols:
+                accounts_iops_avg = self._format_metric_stats(accounts_iops_stats, 0)[1]
+                accounts_iops_row = (
+                    f"<tr><td>{self.t['accounts_device_avg_iops']}</td>"
+                    f"<td class=\"numeric-cell metric-value\">{accounts_iops_avg}</td></tr>"
+                )
 
             return f"""
             <div class="section">
@@ -4526,8 +4567,8 @@ class ReportGenerator:
                         <tr><td>{self.t['avg_cpu_usage']}</td><td class="numeric-cell metric-value">{cpu_avg:.1f}%</td></tr>
                         <tr><td>{self.t['peak_cpu_usage']}</td><td class="numeric-cell metric-value">{cpu_max:.1f}%</td></tr>
                         <tr><td>{self.t['avg_memory_usage']}</td><td class="numeric-cell metric-value">{mem_avg:.1f}%</td></tr>
-                        <tr><td>{self.t['data_device_avg_iops']}</td><td class="numeric-cell metric-value">{data_iops_avg:.0f}</td></tr>
-                        <tr><td>{self.t['accounts_device_avg_iops']}</td><td class="numeric-cell metric-value">{accounts_iops_avg:.0f}</td></tr>
+                        <tr><td>{self.t['data_device_avg_iops']}</td><td class="numeric-cell metric-value">{data_iops_avg}</td></tr>
+                        {accounts_iops_row}
                         <tr><td>{self.t['monitoring_data_points']}</td><td class="numeric-cell metric-value">{len(df):,}</td></tr>
                     </tbody>
                 </table>

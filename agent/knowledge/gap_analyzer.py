@@ -130,7 +130,7 @@ def _find_chain(text: str, inventory: dict[str, Any]) -> str:
 def _find_unknown_chain(question: str) -> str:
     tokens = [token.strip("`'\".,:;()[]{}?").lower() for token in question.split()]
     markers = {"chain", "chains", "node", "新增", "添加", "支持"}
-    stop = markers | {"new", "add", "support", "does", "the", "a", "an", "rpc", "method", "methods", "如何", "怎么"}
+    stop = markers | {"new", "add", "support", "supported", "does", "the", "a", "an", "and", "or", "rpc", "method", "methods", "如何", "怎么"}
     for idx, token in enumerate(tokens):
         if token in {"chain", "node"} and idx > 0:
             candidate = tokens[idx - 1]

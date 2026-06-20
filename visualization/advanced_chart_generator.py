@@ -568,6 +568,18 @@ class AdvancedChartGenerator(CSVDataProcessor):
         
         # Check ACCOUNTS device configuration
         accounts_configured = DeviceManager.is_accounts_configured(self.df)
+
+        def numeric_series(col):
+            return pd.to_numeric(self.df[col], errors='coerce').replace([np.inf, -np.inf], np.nan)
+
+        def has_valid_data(cols):
+            return any(numeric_series(col).notna().any() for col in cols)
+
+        def no_data(ax, title, reason='No valid samples in this run'):
+            ax.text(0.5, 0.5, reason, ha='center', va='center',
+                    transform=ax.transAxes, fontsize=12, color='#627d98')
+            ax.set_title(f'{title} (No Data)', fontsize=UnifiedChartStyle.FONT_CONFIG['subtitle_size'])
+            ax.grid(True, alpha=0.2)
         
         fig, axes = plt.subplots(3, 2, figsize=(18, 15))
         fig.suptitle('CPU-Disk Performance Trend Analysis', fontsize=UnifiedChartStyle.FONT_CONFIG["title_size"], fontweight='bold')
@@ -584,76 +596,91 @@ class AdvancedChartGenerator(CSVDataProcessor):
         data_util_cols = [col for col in self.df.columns if col.startswith('data_') and col.endswith('_util')]
         accounts_util_cols = [col for col in self.df.columns if col.startswith('accounts_') and col.endswith('_util')] if accounts_configured else []
         
-        if data_util_cols:
-            axes[0, 1].plot(self.df['timestamp'], self.df[data_util_cols[0]], color=UnifiedChartStyle.COLORS['data_primary'], linewidth=2, alpha=0.7, label='DATA')
-        if accounts_util_cols:
-            axes[0, 1].plot(self.df['timestamp'], self.df[accounts_util_cols[0]], color=UnifiedChartStyle.COLORS['accounts_primary'], linewidth=2, alpha=0.7, label='ACCOUNTS')
-        if data_util_cols or accounts_util_cols:
+        util_cols = data_util_cols + accounts_util_cols
+        if has_valid_data(util_cols):
+            if data_util_cols and numeric_series(data_util_cols[0]).notna().any():
+                axes[0, 1].plot(self.df['timestamp'], numeric_series(data_util_cols[0]), color=UnifiedChartStyle.COLORS['data_primary'], linewidth=2, alpha=0.7, label='DATA')
+            if accounts_util_cols and numeric_series(accounts_util_cols[0]).notna().any():
+                axes[0, 1].plot(self.df['timestamp'], numeric_series(accounts_util_cols[0]), color=UnifiedChartStyle.COLORS['accounts_primary'], linewidth=2, alpha=0.7, label='ACCOUNTS')
             axes[0, 1].set_title('Disk Device Utilization Trends', fontsize=UnifiedChartStyle.FONT_CONFIG['subtitle_size'])
             axes[0, 1].set_ylabel('Utilization (%)', fontsize=UnifiedChartStyle.FONT_CONFIG['label_size'])
             axes[0, 1].legend(fontsize=UnifiedChartStyle.FONT_CONFIG['legend_size'])
             axes[0, 1].grid(True, alpha=0.3)
             UnifiedChartStyle.format_time_axis(axes[0, 1], self.df['timestamp'])
+        else:
+            no_data(axes[0, 1], 'Disk Device Utilization Trends')
         
         # IOPS trends - show DATA and ACCOUNTS
         data_iops_cols = [col for col in self.df.columns if col.startswith('data_') and 'total_iops' in col]
         accounts_iops_cols = [col for col in self.df.columns if col.startswith('accounts_') and 'total_iops' in col] if accounts_configured else []
         
-        if data_iops_cols:
-            axes[1, 0].plot(self.df['timestamp'], self.df[data_iops_cols[0]], color=UnifiedChartStyle.COLORS['data_primary'], linewidth=2, alpha=0.7, label='DATA')
-        if accounts_iops_cols:
-            axes[1, 0].plot(self.df['timestamp'], self.df[accounts_iops_cols[0]], color=UnifiedChartStyle.COLORS['accounts_primary'], linewidth=2, alpha=0.7, label='ACCOUNTS')
-        if data_iops_cols or accounts_iops_cols:
+        iops_cols = data_iops_cols + accounts_iops_cols
+        if has_valid_data(iops_cols):
+            if data_iops_cols and numeric_series(data_iops_cols[0]).notna().any():
+                axes[1, 0].plot(self.df['timestamp'], numeric_series(data_iops_cols[0]), color=UnifiedChartStyle.COLORS['data_primary'], linewidth=2, alpha=0.7, label='DATA')
+            if accounts_iops_cols and numeric_series(accounts_iops_cols[0]).notna().any():
+                axes[1, 0].plot(self.df['timestamp'], numeric_series(accounts_iops_cols[0]), color=UnifiedChartStyle.COLORS['accounts_primary'], linewidth=2, alpha=0.7, label='ACCOUNTS')
             axes[1, 0].set_title('IOPS Trends', fontsize=UnifiedChartStyle.FONT_CONFIG['subtitle_size'])
             axes[1, 0].set_ylabel('IOPS', fontsize=UnifiedChartStyle.FONT_CONFIG['label_size'])
             axes[1, 0].legend(fontsize=UnifiedChartStyle.FONT_CONFIG['legend_size'])
             axes[1, 0].grid(True, alpha=0.3)
             UnifiedChartStyle.format_time_axis(axes[1, 0], self.df['timestamp'])
+        else:
+            no_data(axes[1, 0], 'IOPS Trends')
         
         # Throughput trends - show DATA and ACCOUNTS
         data_throughput_cols = [col for col in self.df.columns if col.startswith('data_') and 'throughput' in col and 'mibs' in col]
         accounts_throughput_cols = [col for col in self.df.columns if col.startswith('accounts_') and 'throughput' in col and 'mibs' in col] if accounts_configured else []
         
-        if data_throughput_cols:
-            axes[1, 1].plot(self.df['timestamp'], self.df[data_throughput_cols[0]], color=UnifiedChartStyle.COLORS['data_primary'], linewidth=2, alpha=0.7, label='DATA')
-        if accounts_throughput_cols:
-            axes[1, 1].plot(self.df['timestamp'], self.df[accounts_throughput_cols[0]], color=UnifiedChartStyle.COLORS['accounts_primary'], linewidth=2, alpha=0.7, label='ACCOUNTS')
-        if data_throughput_cols or accounts_throughput_cols:
+        throughput_cols = data_throughput_cols + accounts_throughput_cols
+        if has_valid_data(throughput_cols):
+            if data_throughput_cols and numeric_series(data_throughput_cols[0]).notna().any():
+                axes[1, 1].plot(self.df['timestamp'], numeric_series(data_throughput_cols[0]), color=UnifiedChartStyle.COLORS['data_primary'], linewidth=2, alpha=0.7, label='DATA')
+            if accounts_throughput_cols and numeric_series(accounts_throughput_cols[0]).notna().any():
+                axes[1, 1].plot(self.df['timestamp'], numeric_series(accounts_throughput_cols[0]), color=UnifiedChartStyle.COLORS['accounts_primary'], linewidth=2, alpha=0.7, label='ACCOUNTS')
             axes[1, 1].set_title('Throughput Trends', fontsize=UnifiedChartStyle.FONT_CONFIG['subtitle_size'])
             axes[1, 1].set_ylabel('Throughput (MiB/s)', fontsize=UnifiedChartStyle.FONT_CONFIG['label_size'])
             axes[1, 1].legend(fontsize=UnifiedChartStyle.FONT_CONFIG['legend_size'])
             axes[1, 1].grid(True, alpha=0.3)
             UnifiedChartStyle.format_time_axis(axes[1, 1], self.df['timestamp'])
+        else:
+            no_data(axes[1, 1], 'Throughput Trends')
         
         # Latency trends - show DATA and ACCOUNTS
         data_await_cols = [col for col in self.df.columns if col.startswith('data_') and 'avg_await' in col]
         accounts_await_cols = [col for col in self.df.columns if col.startswith('accounts_') and 'avg_await' in col] if accounts_configured else []
         
-        if data_await_cols:
-            axes[2, 0].plot(self.df['timestamp'], self.df[data_await_cols[0]], color=UnifiedChartStyle.COLORS['data_primary'], linewidth=2, alpha=0.7, label='DATA')
-        if accounts_await_cols:
-            axes[2, 0].plot(self.df['timestamp'], self.df[accounts_await_cols[0]], color=UnifiedChartStyle.COLORS['accounts_primary'], linewidth=2, alpha=0.7, label='ACCOUNTS')
-        if data_await_cols or accounts_await_cols:
+        await_cols = data_await_cols + accounts_await_cols
+        if has_valid_data(await_cols):
+            if data_await_cols and numeric_series(data_await_cols[0]).notna().any():
+                axes[2, 0].plot(self.df['timestamp'], numeric_series(data_await_cols[0]), color=UnifiedChartStyle.COLORS['data_primary'], linewidth=2, alpha=0.7, label='DATA')
+            if accounts_await_cols and numeric_series(accounts_await_cols[0]).notna().any():
+                axes[2, 0].plot(self.df['timestamp'], numeric_series(accounts_await_cols[0]), color=UnifiedChartStyle.COLORS['accounts_primary'], linewidth=2, alpha=0.7, label='ACCOUNTS')
             axes[2, 0].set_title('I/O Latency Trends', fontsize=UnifiedChartStyle.FONT_CONFIG['subtitle_size'])
             axes[2, 0].set_ylabel('Latency (ms)', fontsize=UnifiedChartStyle.FONT_CONFIG['label_size'])
             axes[2, 0].legend(fontsize=UnifiedChartStyle.FONT_CONFIG['legend_size'])
             axes[2, 0].grid(True, alpha=0.3)
             UnifiedChartStyle.format_time_axis(axes[2, 0], self.df['timestamp'])
+        else:
+            no_data(axes[2, 0], 'I/O Latency Trends')
         
         # Queue depth trends - show DATA and ACCOUNTS
         data_queue_cols = [col for col in self.df.columns if col.startswith('data_') and 'aqu_sz' in col]
         accounts_queue_cols = [col for col in self.df.columns if col.startswith('accounts_') and 'aqu_sz' in col] if accounts_configured else []
         
-        if data_queue_cols:
-            axes[2, 1].plot(self.df['timestamp'], self.df[data_queue_cols[0]], color=UnifiedChartStyle.COLORS['data_primary'], linewidth=2, alpha=0.7, label='DATA')
-        if accounts_queue_cols:
-            axes[2, 1].plot(self.df['timestamp'], self.df[accounts_queue_cols[0]], color=UnifiedChartStyle.COLORS['accounts_primary'], linewidth=2, alpha=0.7, label='ACCOUNTS')
-        if data_queue_cols or accounts_queue_cols:
+        queue_cols = data_queue_cols + accounts_queue_cols
+        if has_valid_data(queue_cols):
+            if data_queue_cols and numeric_series(data_queue_cols[0]).notna().any():
+                axes[2, 1].plot(self.df['timestamp'], numeric_series(data_queue_cols[0]), color=UnifiedChartStyle.COLORS['data_primary'], linewidth=2, alpha=0.7, label='DATA')
+            if accounts_queue_cols and numeric_series(accounts_queue_cols[0]).notna().any():
+                axes[2, 1].plot(self.df['timestamp'], numeric_series(accounts_queue_cols[0]), color=UnifiedChartStyle.COLORS['accounts_primary'], linewidth=2, alpha=0.7, label='ACCOUNTS')
             axes[2, 1].set_title('I/O Queue Depth Trends', fontsize=UnifiedChartStyle.FONT_CONFIG['subtitle_size'])
             axes[2, 1].set_ylabel('Queue Depth', fontsize=UnifiedChartStyle.FONT_CONFIG['label_size'])
             axes[2, 1].legend(fontsize=UnifiedChartStyle.FONT_CONFIG['legend_size'])
             axes[2, 1].grid(True, alpha=0.3)
             UnifiedChartStyle.format_time_axis(axes[2, 1], self.df['timestamp'])
+        else:
+            no_data(axes[2, 1], 'I/O Queue Depth Trends')
         
         UnifiedChartStyle.apply_layout(fig, 'auto')
         chart_file = os.path.join(self.output_dir, 'performance_trend_analysis.png')
