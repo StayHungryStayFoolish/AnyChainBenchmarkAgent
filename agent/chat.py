@@ -594,8 +594,7 @@ def run_chat(
         print(f"> {prompt}", file=output_stream)
         response = session.handle(prompt)
         if response != "__EXIT__":
-            # codeql[py/clear-text-logging-sensitive-data] response is sanitized by utils.redaction.redact before display.
-            print(redact(response), file=output_stream)
+            _write_redacted_response(output_stream, response)
         return 0
     while True:
         print("> ", end="", file=output_stream, flush=True)
@@ -607,5 +606,9 @@ def run_chat(
         if response == "__EXIT__":
             print("Goodbye.", file=output_stream)
             return 0
-        # codeql[py/clear-text-logging-sensitive-data] response is sanitized by utils.redaction.redact before display.
-        print(redact(response), file=output_stream)
+        _write_redacted_response(output_stream, response)
+
+
+def _write_redacted_response(output_stream: TextIO, response: str) -> None:
+    output_stream.write(str(redact(response)))
+    output_stream.write("\n")
