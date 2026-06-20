@@ -36,6 +36,7 @@ from qa.llm_drafter import draft_request_with_llm
 from qa.request_drafter import draft_request
 from runners.job_manager import get_job, list_jobs, submit_job, tail_job_log
 from runners.runbook import render_runbook
+from utils.redaction import redact
 from workflows.checklist import apply_checklist_answer, format_checklist, next_blocker
 from workflows.onboarding_request import answer_onboarding_request
 from workflows.router import prompt_bundle_for_workflow, select_workflow
@@ -593,7 +594,7 @@ def run_chat(
         print(f"> {prompt}", file=output_stream)
         response = session.handle(prompt)
         if response != "__EXIT__":
-            print(response, file=output_stream)
+            print(redact(response), file=output_stream)
         return 0
     while True:
         print("> ", end="", file=output_stream, flush=True)
@@ -605,4 +606,4 @@ def run_chat(
         if response == "__EXIT__":
             print("Goodbye.", file=output_stream)
             return 0
-        print(response, file=output_stream)
+        print(redact(response), file=output_stream)
