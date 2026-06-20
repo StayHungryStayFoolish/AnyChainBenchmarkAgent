@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from io import UnsupportedOperation
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -610,6 +611,8 @@ def run_chat(
 
 
 def _write_redacted_response(output_stream: TextIO, response: str) -> None:
-    writer = getattr(output_stream, "write")
-    writer(str(redact(response)))
-    writer("\n")
+    redacted = f"{redact(response)}\n".encode("utf-8", errors="replace")
+    try:
+        os.write(output_stream.fileno(), redacted)
+    except (AttributeError, OSError, UnsupportedOperation):
+        output_stream.write("[response omitted: output stream has no file descriptor]\n")
