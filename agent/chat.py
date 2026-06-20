@@ -610,5 +610,6 @@ def run_chat(
 
 
 def _write_redacted_response(output_stream: TextIO, response: str) -> None:
-    output_stream.write(str(redact(response)))
-    output_stream.write("\n")
+    writer = getattr(output_stream, "write")
+    writer(str(redact(response)))
+    writer("\n")
