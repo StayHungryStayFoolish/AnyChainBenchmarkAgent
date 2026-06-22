@@ -44,6 +44,7 @@ _ZH = {
     "llm_config_warning": "LLM 配置还不完整：{errors}",
     "jobs_empty": "没有找到 job。",
     "jobs_header": "最近 job：",
+    "state_reset": "已重置当前 Agent workflow。你可以重新描述要测试的链、节点和目标。",
     "unknown": "我已经记录你的输入。下一步会由 benchmark workflow 判断需要确认的配置；当前可先输入 doctor 或“测试 solana”。",
     "benchmark_chain": "我理解你要测试 {chain}。是否确认这个链？[Y/n]",
     "select_target": "使用 fake-node 闭环测试，还是真实节点？[fake-node/real-node]",
@@ -67,6 +68,7 @@ _ZH = {
     "real_node_required_done": "真实节点必填运行变量已记录完毕。",
     "not_manual_export": "这个问题应该由 Agent 写入 runtime env 或子进程 env 处理，不应该要求你手动 export PATH。",
     "interrupted": "已中断当前输入。输入 exit 退出，或继续告诉我你的测试目标。",
+    "adk_missing_hint": "注意：google-adk 当前不可用。请先运行 bash scripts/install_agent_deps.sh --yes；在此之前，Agent 只能使用有限的终端 workflow 和可用的直连 LLM provider。",
 }
 
 
@@ -90,6 +92,7 @@ _EN = {
     "llm_config_warning": "LLM configuration is incomplete: {errors}",
     "jobs_empty": "No jobs found.",
     "jobs_header": "Recent jobs:",
+    "state_reset": "Reset the current Agent workflow. You can describe the chain, node, and benchmark goal again.",
     "unknown": "I recorded your input. The benchmark workflow will decide the next required configuration; you can start with doctor or benchmark solana.",
     "benchmark_chain": "I understand you want to benchmark {chain}. Confirm this chain? [Y/n]",
     "select_target": "Use fake-node closed-loop testing or a real node? [fake-node/real-node]",
@@ -113,4 +116,5 @@ _EN = {
     "real_node_required_done": "Required real-node runtime variables have been recorded.",
     "not_manual_export": "The Agent should fix this through runtime env or child-process env, not ask you to manually export PATH.",
     "interrupted": "Interrupted the current input. Type exit to quit, or continue with your benchmark goal.",
+    "adk_missing_hint": "Note: google-adk is not available. Run bash scripts/install_agent_deps.sh --yes first; until then, the Agent can only use limited terminal workflow and any available direct LLM provider.",
 }
