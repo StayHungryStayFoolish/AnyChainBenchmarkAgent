@@ -15,18 +15,25 @@ from knowledge.loader import load_knowledge_provider, provider_status
 from onboarding.template_drafter import draft_chain_template
 from planners.preflight import run_preflight
 from planners.strategy_planner import generate_plan
-from qa.request_drafter import draft_request
 from runners.job_manager import get_job, submit_job, tail_job_log
+from adk_app.tools.actions import run_fake_node_smoke_benchmark
+from adk_app.tools.actions import install_dependencies
+from adk_app.tools.planning import prepare_benchmark_run
+from adk_app.tools.read_only import audit_dependencies
 
 
 def execute_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     args = arguments or {}
     if name == "discover_environment":
         return discover_environment()
+    if name == "audit_dependencies":
+        return audit_dependencies()
     if name == "load_capabilities":
         return load_framework_capabilities()
+    if name == "prepare_benchmark_run":
+        return prepare_benchmark_run(**args)
     if name == "draft_request":
-        return draft_request(_required(args, "prompt"))
+        return _structured_request(args)
     if name == "generate_plan":
         return generate_plan(_required(args, "request"), discovery=args.get("discovery"))
     if name == "run_preflight":
@@ -36,6 +43,22 @@ def execute_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str
         if args.get("jobs_dir"):
             kwargs["jobs_dir"] = args["jobs_dir"]
         return submit_job(_required(args, "plan_file"), **kwargs)
+    if name == "run_fake_node_smoke_benchmark":
+        return run_fake_node_smoke_benchmark(
+            _required(args, "plan_file"),
+            jobs_dir=args.get("jobs_dir", ".agent/jobs"),
+            approved=bool(args.get("approved", False)),
+        )
+    if name == "install_dependencies":
+        return install_dependencies(
+            approved=bool(args.get("approved", False)),
+            no_sudo=bool(args.get("no_sudo", True)),
+            include_vegeta=bool(args.get("include_vegeta", True)),
+            include_agent_runtime=bool(args.get("include_agent_runtime", True)),
+            include_gcloud=bool(args.get("include_gcloud", False)),
+            adk_venv=args.get("adk_venv", ".venv-adk"),
+            allow_system_python=bool(args.get("allow_system_python", False)),
+        )
     if name == "get_job_status":
         return _get_job(args)
     if name == "tail_job_log":
@@ -101,3 +124,65 @@ def _get_job(args: dict[str, Any]) -> dict[str, Any]:
     if args.get("jobs_dir"):
         return get_job(_required(args, "job_id"), jobs_dir=args["jobs_dir"])
     return get_job(_required(args, "job_id"))
+
+
+def _structured_request(args: dict[str, Any]) -> dict[str, Any]:
+    request: dict[str, Any] = {
+        "chain": args.get("chain", ""),
+        "goal": args.get("goal", "baseline"),
+        "rpc_mode": args.get("rpc_mode", "single"),
+        "use_fake_node": bool(args.get("use_fake_node", False)),
+        "deployment": {
+            "type": args.get("deployment_type", "unknown"),
+            "provider": args.get("cloud_provider", ""),
+        },
+        "observability": {"enabled": False, "mode": "local"},
+        "dependency_mode": "audit",
+        "runner_mode": "detached",
+        "bottleneck_focus": ["cpu", "memory", "disk", "network", "rpc_errors"],
+        "source_prompt": args.get("source_prompt", ""),
+    }
+    if args.get("target_rpc_url"):
+        request["local_rpc_url"] = args["target_rpc_url"]
+        request["target_rpc_url"] = args["target_rpc_url"]
+    for key in ("mainnet_rpc_url", "ledger_device", "accounts_device"):
+        if args.get(key):
+            request[key] = args[key]
+    for key in (
+        "cloud_region",
+        "cloud_zone",
+        "machine_type",
+        "data_vol_type",
+        "data_vol_size",
+        "data_vol_max_iops",
+        "data_vol_max_throughput",
+        "accounts_vol_type",
+        "accounts_vol_size",
+        "accounts_vol_max_iops",
+        "accounts_vol_max_throughput",
+        "network_interface",
+        "network_max_bandwidth_gbps",
+    ):
+        if args.get(key):
+            request[key] = args[key]
+    if args.get("blockchain_process_names"):
+        request["blockchain_process_names"] = list(args["blockchain_process_names"])
+    qps: dict[str, int] = {}
+    for arg_key, qps_key in (
+        ("qps_initial", "initial"),
+        ("qps_max", "max"),
+        ("qps_step", "step"),
+        ("duration_seconds", "duration_seconds"),
+    ):
+        if args.get(arg_key) is not None:
+            qps[qps_key] = int(args[arg_key])
+    if qps:
+        request["qps"] = qps
+    if args.get("rpc_methods"):
+        request["rpc_methods"] = list(args["rpc_methods"])
+    if args.get("mixed_weights"):
+        request["mixed_weighted"] = [
+            {"method": method, "weight": int(weight)}
+            for method, weight in args["mixed_weights"].items()
+        ]
+    return request

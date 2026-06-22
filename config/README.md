@@ -71,16 +71,17 @@ these values in `config/user_config.sh` before a production benchmark:
 ## Agent Configuration
 
 Edit these values in `config/agent_config.sh`. The benchmark engine can run
-without an LLM. The Agent control plane can use a model provider when
-prompt-first planning is enabled.
+without an LLM when invoked directly, but the human-facing Agent runtime is
+Google ADK and requires a real configured model provider for natural-language
+interaction. No-key checks validate configuration and tool contracts only.
 
 Supported auth paths are direct API keys and Vertex AI with Google
 service-account based authentication:
 
 | Variable | Required | Description |
 | --- | --- | --- |
-| `LLM_PROVIDER` | Optional | `fake`, `gemini`, `claude`, or `openai`. Defaults to `fake` for deterministic/offline mode. |
-| `LLM_MODEL` | Optional | Model name, for example `fake`, `gemini-3.1-pro`, `claude-opus-4-8`, or `gpt-5.5`. |
+| `LLM_PROVIDER` | Required for Agent chat | `gemini`, `claude`, or `openai`. Defaults to `gemini`. |
+| `LLM_MODEL` | Required for Agent chat | Model name, for example `gemini-3.1-pro`, `gemini-3.5-flash`, `claude-opus-4-8`, or `gpt-5.5`. |
 | `LLM_AUTH_MODE` | Required for real providers | `api_key`, `google_adc`, `attached_service_account`, `service_account_impersonation`, or `service_account_file`. |
 | `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Required for Gemini API-key mode | Direct Gemini API key. |
 | `ANTHROPIC_API_KEY` | Required for Claude API-key mode | Direct Anthropic API key. |
@@ -88,7 +89,15 @@ service-account based authentication:
 | `GOOGLE_CLOUD_PROJECT` | Required for Google auth modes | Google Cloud project containing the Vertex AI endpoint. |
 | `GOOGLE_CLOUD_LOCATION` | Required for Google auth modes | Vertex AI location, for example `us-central1` or `us-east5`. |
 | `GOOGLE_SERVICE_ACCOUNT_EMAIL` | Required for impersonation | Target service account email. This avoids downloading JSON keys when the current identity can impersonate it. |
-| `GOOGLE_APPLICATION_CREDENTIALS` | Optional fallback | Local service-account JSON path. Prefer ADC or impersonation in enterprise environments. |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Required for `service_account_file` | Local service-account JSON path. Prefer ADC or impersonation in enterprise environments. |
+
+`scripts/install_deps.sh` installs benchmark-engine dependencies.
+`scripts/install_agent_deps.sh` installs Agent runtime dependencies: Google ADK
+in an isolated Python 3.10+ venv, and optionally Google Cloud CLI with
+`--with-gcloud`. Google Cloud CLI is required only for local ADC setup
+(`LLM_AUTH_MODE=google_adc`) or local impersonation bootstrap; `doctor` reports
+whether `gcloud` and the ADC file are available, and the Agent can call the
+installer after explicit user approval.
 
 ## Agent Knowledge Base Integration
 
@@ -110,22 +119,6 @@ Validate a generic HTTP adapter:
 ```bash
 python3 agent/cli.py knowledge-smoke --query "solana rpc methods" --chain solana
 ```
-
-## Optional Agent Chat Memory Configuration
-
-The terminal Agent can compact long chat sessions into `.agent/chat/memory.json`.
-Defaults assume modern long-context models while keeping a turn-count safety
-guard for local REPL usability.
-
-| Variable | Required | Description |
-| --- | --- | --- |
-| `AGENT_CONTEXT_WINDOW_TOKENS` | Optional | Default context window used by the chat compactor. Defaults to `1000000`. |
-| `AGENT_COMPACT_TRIGGER_RATIO` | Optional | Auto-compact when estimated tokens reach `context_window * ratio`. Defaults to `0.7`. |
-| `AGENT_COMPACT_TURN_THRESHOLD` | Optional | Auto-compact after this many chat turns even if token usage is low. Defaults to `40`. |
-| `AGENT_COMPACT_KEEP_RECENT_TURNS` | Optional | Number of raw recent turns kept after compaction. Defaults to `8`. |
-
-Token usage is estimated locally with an approximate 4 characters per token
-unless a future provider-specific tokenizer is added.
 
 ## Optional Job Notifications
 

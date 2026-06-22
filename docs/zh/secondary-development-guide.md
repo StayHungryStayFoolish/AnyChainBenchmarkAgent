@@ -74,7 +74,8 @@ agent_config.sh
 - `agent/knowledge/base.py`：provider contract。
 - `agent/knowledge/http_provider.py`：通用 HTTP adapter。
 - `agent/knowledge/loader.py`：provider 选择。
-- `agent/prompts/kb_grounding.md`：KB evidence 如何被 Agent 使用。
+- `agent/adk_app/instructions.py`：ADK 如何使用 KB evidence，并避免声明未验证能力。
+- `agent/adk_app/tools/read_only.py`：暴露 KB search 和本地 capability evidence 的 ADK read-only tools。
 - `agent/cli.py`：smoke 命令和集成入口。
 
 基本原则：
@@ -96,7 +97,6 @@ POST /workload/suggest
 
 ```bash
 python3 agent/cli.py knowledge-smoke
-python3 agent/cli.py ask --prompt "What chains and RPC methods do you support?"
 python3 -m unittest tests.test_agent_runtime_contract -v
 ```
 
@@ -118,7 +118,9 @@ PR 要求：
 - `agent/tools/executor.py`：稳定的 named tool execution。
 - `config/agent_config.sh`：LLM、Google auth 和可选 KB 默认配置。
 - `agent/runners/job_manager.py`：job status、artifact index 和 detached run 生命周期。
-- `agent/prompts/`：Agent workflow 使用的 domain prompts。
+- `agent/adk_app/instructions.py`：ADK root instruction。
+- `agent/adk_app/tools/`：ADK function-tool wrappers。
+- `agent/adk_app/evals/`：无 key ADK package 和 tool-contract checks。
 
 支持的集成模式：
 

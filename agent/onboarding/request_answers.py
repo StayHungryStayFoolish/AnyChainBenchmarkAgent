@@ -1,9 +1,8 @@
-"""Natural-language onboarding request handling."""
+"""Natural-language onboarding request answers for ADK and CLI paths."""
 
 from __future__ import annotations
 
 import re
-from typing import Any
 
 from onboarding.chain_onboarding import generate_onboarding_package, format_onboarding_package
 
@@ -11,7 +10,7 @@ from onboarding.chain_onboarding import generate_onboarding_package, format_onbo
 SUPPORTED_FAMILIES = {"jsonrpc", "rest", "bitcoin_jsonrpc", "substrate", "tendermint", "hedera_dual"}
 
 
-def answer_onboarding_request(prompt: str, *, llm_provider: Any | None = None) -> str:
+def answer_onboarding_request(prompt: str) -> str:
     lowered = prompt.lower()
     if _looks_like_agent_platform(lowered):
         return _agent_platform_plan()
@@ -28,7 +27,6 @@ def answer_onboarding_request(prompt: str, *, llm_provider: Any | None = None) -
         chain,
         methods=methods,
         adapter_family=family,
-        llm_provider=llm_provider,
     )
     lines = [
         format_onboarding_package(package),
@@ -42,8 +40,6 @@ def answer_onboarding_request(prompt: str, *, llm_provider: Any | None = None) -
         "- docs/en/secondary-development-guide.md",
         "- docs/zh/secondary-development-guide.md",
     ]
-    if package.get("llm_summary"):
-        lines.extend(["", "LLM summary:", str(package["llm_summary"])])
     return "\n".join(lines)
 
 
@@ -80,7 +76,7 @@ def _agent_platform_plan() -> str:
         "",
         "Detailed guide:",
         "- README.md#enterprise-agent-platform-integration",
-        "- agent/README.md#phase-3-extension-points",
+        "- agent/README.md#knowledge-base-and-enterprise-integration",
         "- docs/en/secondary-development-guide.md",
         "- docs/zh/secondary-development-guide.md",
     ])

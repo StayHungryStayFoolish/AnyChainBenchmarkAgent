@@ -12,18 +12,14 @@
 #   2. Set LLM_MODEL to a model available in that provider.
 #   3. Configure that provider's auth variables below.
 #
-# Defaults keep the Agent runnable without network credentials. In this mode the
-# Agent can still answer framework-capability questions and create deterministic
-# plans, but it will not use a real LLM.
-# fake: deterministic/offline mode. No credentials required.
 # gemini: Gemini API key or Gemini on Vertex AI.
 # claude: Anthropic API key or Claude partner models on Vertex AI.
 # openai: OpenAI API.
-LLM_PROVIDER="${LLM_PROVIDER:-fake}"
+LLM_PROVIDER="${LLM_PROVIDER:-gemini}"
 
 # Model name for the selected provider.
-# Examples: fake, gemini-3.1-pro, claude-opus-4-8, gpt-5.5.
-LLM_MODEL="${LLM_MODEL:-fake}"
+# Examples: gemini-3.1-pro, claude-opus-4-8, gpt-5.5.
+LLM_MODEL="${LLM_MODEL:-gemini-3.1-pro}"
 
 # Authentication mode for the selected provider.
 # api_key: GEMINI_API_KEY/GOOGLE_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY.
@@ -48,7 +44,7 @@ GOOGLE_CLOUD_LOCATION="${GOOGLE_CLOUD_LOCATION:-us-central1}"
 GOOGLE_SERVICE_ACCOUNT_EMAIL="${GOOGLE_SERVICE_ACCOUNT_EMAIL:-}"
 
 # Required only when LLM_AUTH_MODE=service_account_file.
-# Optional local service-account JSON key fallback.
+# Local service-account JSON key file.
 # Prefer ADC, attached service accounts, or impersonation in enterprise usage.
 GOOGLE_APPLICATION_CREDENTIALS="${GOOGLE_APPLICATION_CREDENTIALS:-}"
 
@@ -62,19 +58,6 @@ ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
 # Required only when LLM_PROVIDER=openai.
 # OpenAI API key.
 OPENAI_API_KEY="${OPENAI_API_KEY:-}"
-
-# ----- Agent Chat Memory -----
-# Approximate context window used by deterministic auto-compaction.
-AGENT_CONTEXT_WINDOW_TOKENS="${AGENT_CONTEXT_WINDOW_TOKENS:-1000000}"
-
-# Auto-compact when estimated tokens reach context_window * ratio.
-AGENT_COMPACT_TRIGGER_RATIO="${AGENT_COMPACT_TRIGGER_RATIO:-0.7}"
-
-# Also compact after this many terminal chat turns.
-AGENT_COMPACT_TURN_THRESHOLD="${AGENT_COMPACT_TURN_THRESHOLD:-40}"
-
-# Number of recent raw turns kept after compaction.
-AGENT_COMPACT_KEEP_RECENT_TURNS="${AGENT_COMPACT_KEEP_RECENT_TURNS:-8}"
 
 # ----- Enterprise Knowledge Base Integration -----
 # disabled: use only repository-local capabilities and docs.
@@ -95,10 +78,6 @@ AGENT_KNOWLEDGE_BASE_URL="${AGENT_KNOWLEDGE_BASE_URL:-}"
 # Do not commit real tokens to git.
 AGENT_KNOWLEDGE_AUTH_REF="${AGENT_KNOWLEDGE_AUTH_REF:-}"
 
-# ----- Default Agent Output -----
-# Default directory for terminal chat state when no --output-dir is passed.
-AGENT_OUTPUT_DIR="${AGENT_OUTPUT_DIR:-.agent/chat}"
-
 # ----- Optional Job Notification -----
 # Disabled by default. When set, the Agent posts job status JSON to this URL
 # when the job status is listed in AGENT_NOTIFY_ON.
@@ -108,6 +87,5 @@ AGENT_NOTIFY_ON="${AGENT_NOTIFY_ON:-completed,failed}"
 export LLM_PROVIDER LLM_MODEL LLM_AUTH_MODE
 export GOOGLE_CLOUD_PROJECT GOOGLE_CLOUD_LOCATION GOOGLE_SERVICE_ACCOUNT_EMAIL GOOGLE_APPLICATION_CREDENTIALS
 export GEMINI_API_KEY GOOGLE_API_KEY ANTHROPIC_API_KEY OPENAI_API_KEY
-export AGENT_CONTEXT_WINDOW_TOKENS AGENT_COMPACT_TRIGGER_RATIO AGENT_COMPACT_TURN_THRESHOLD AGENT_COMPACT_KEEP_RECENT_TURNS
 export AGENT_KNOWLEDGE_PROVIDER AGENT_KNOWLEDGE_PROVIDER_MODULE AGENT_KNOWLEDGE_BASE_URL AGENT_KNOWLEDGE_AUTH_REF
-export AGENT_OUTPUT_DIR AGENT_NOTIFY_WEBHOOK_URL AGENT_NOTIFY_ON
+export AGENT_NOTIFY_WEBHOOK_URL AGENT_NOTIFY_ON

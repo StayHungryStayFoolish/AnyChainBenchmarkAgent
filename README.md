@@ -4,7 +4,8 @@
 
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/License-AGPL--3.0--or--later-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Commercial License](https://img.shields.io/badge/License-Commercial-green.svg)](COMMERCIAL.md)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Benchmark Python 3.8+](https://img.shields.io/badge/benchmark_python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![ADK Python 3.10+](https://img.shields.io/badge/adk_python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Shell Script](https://img.shields.io/badge/shell-bash-green.svg)](https://www.gnu.org/software/bash/)
 
 A production-oriented Agent and benchmark framework for any blockchain node QPS,
@@ -14,15 +15,17 @@ tracks artifacts, and explains the result with evidence.
 
 The benchmark execution plane remains deterministic: Vegeta, RPC proxy,
 monitoring collectors, fake-node, report generation, and archiving are still the
-source of truth. LLMs are optional and only draft structured requests; they do
-not execute commands directly.
+source of truth. The human-facing Agent runtime is Google ADK and expects a real
+configured model provider; no-key checks are for CI and development only. Model
+output can draft structured requests, plans, and explanations, but it does not
+execute commands directly.
 
 ## Report Preview
 
 Preview the generated benchmark report before running the framework:
 
 - [Sample English PDF report](docs/en/performance_report_en.pdf)
-- [Chinese PDF report](docs/zh/performance_report_zh.pdf)
+- [Sample Chinese PDF report](docs/zh/performance_report_zh.pdf)
 
 ## What It Does
 
@@ -105,7 +108,7 @@ the Agent tell you which required values are missing.
 When the Agent submits a job, it writes:
 
 ```text
-<agent-output-dir>/jobs/<job_id>/runtime.env
+.agent/jobs/<job_id>/runtime.env
 ```
 
 `runtime.env` is the final configuration snapshot for that one job. It has
@@ -113,16 +116,17 @@ higher priority than `config/user_config.sh` during Agent-launched benchmark
 runs. Do not edit it by hand; it exists so reports and analysis can prove which
 values were used.
 
-For the terminal Agent, the default output directory is `.agent/chat`, so the
-default runtime file is `.agent/chat/jobs/<job_id>/runtime.env`. Low-level
-`python3 agent/cli.py submit` defaults to `.agent/jobs` unless `--jobs-dir` is
+Agent-launched jobs default to `.agent/jobs`. Low-level
+`python3 agent/cli.py submit` uses the same location unless `--jobs-dir` is
 provided.
 
 ## 5-Minute Quick Start
 
-This is the fastest way to use AnyChain Benchmark Agent from a terminal. You can
-run the deterministic Agent without an LLM key, but model-assisted planning
-requires a provider configuration in `config/agent_config.sh`.
+This is the fastest way to use AnyChain Benchmark Agent from a terminal. The
+human-facing Agent runtime is Google ADK, so configure a model provider in
+`config/agent_config.sh` before expecting model-assisted interaction. No-key
+offline checks are available for CI and development, but they are not the
+product Agent runtime.
 
 Clone the repository:
 
@@ -137,17 +141,29 @@ Check dependencies without modifying the host:
 bash scripts/install_deps.sh --check
 ```
 
-Configure the persistent Agent settings in `config/agent_config.sh`.
-For deterministic/offline mode, keep the defaults:
+This script checks and can install benchmark-engine dependencies such as
+`jq`, `curl`, `vegeta`, Python packages from `requirements.txt`, and system
+monitoring tools.
+
+Create an isolated Google ADK runtime. Do not install ADK into the Python
+environment used by production blockchain nodes. You can let the Agent install
+this after it asks for confirmation, or run the same installer yourself:
 
 ```bash
-LLM_PROVIDER="fake"                       # fake | gemini | claude | openai
-LLM_MODEL="fake"
+bash scripts/install_agent_deps.sh --yes
 ```
 
-For model-assisted planning, configure one real provider. Direct API-key mode
-works for Gemini, Claude, and OpenAI. Google service-account modes work for
-Gemini or Claude through Vertex AI.
+If your host does not provide `python3.11`, use any Python 3.10+ interpreter.
+The benchmark engine still supports older Python for non-Agent automation, but
+the human-facing Agent requires the ADK runtime environment. The launcher
+automatically prefers `.venv-adk/bin/adk`, so users do not need to activate the
+venv before running `./bin/anychain-agent`.
+
+Configure the persistent Agent settings in `config/agent_config.sh`.
+The human-facing Agent runtime is ADK-only, so configure one real provider
+before starting a natural-language session. Direct API-key mode works for
+Gemini, Claude, and OpenAI. Google service-account modes work for Gemini or
+Claude through Vertex AI.
 
 ```bash
 LLM_PROVIDER="gemini"
@@ -159,68 +175,80 @@ OPENAI_API_KEY=""                         # required for OpenAI
 GOOGLE_CLOUD_PROJECT=""                   # required only for Google service-account modes
 GOOGLE_CLOUD_LOCATION="us-central1"       # Vertex AI location/region
 GOOGLE_SERVICE_ACCOUNT_EMAIL=""           # required for service_account_impersonation
-GOOGLE_APPLICATION_CREDENTIALS=""         # optional JSON key fallback
+GOOGLE_APPLICATION_CREDENTIALS=""         # required only for service_account_file
+```
+
+Choose one authentication path:
+
+- Gemini API key: set `LLM_PROVIDER=gemini`, `LLM_AUTH_MODE=api_key`, and
+  `GEMINI_API_KEY` or `GOOGLE_API_KEY`.
+- Claude API key: set `LLM_PROVIDER=claude`, `LLM_AUTH_MODE=api_key`, and
+  `ANTHROPIC_API_KEY`.
+- OpenAI API key: set `LLM_PROVIDER=openai`, `LLM_AUTH_MODE=api_key`, and
+  `OPENAI_API_KEY`.
+- Google Vertex AI: set `LLM_PROVIDER=gemini` or `LLM_PROVIDER=claude`, set
+  `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION`, then choose
+  `google_adc`, `attached_service_account`, `service_account_impersonation`, or
+  `service_account_file`.
+
+Google Cloud CLI is needed only for local ADC workflows such as
+`LLM_AUTH_MODE=google_adc`, or when a host must create ADC before service-account
+impersonation. The Agent can detect whether `gcloud` and the local ADC file are
+present through `doctor`; after explicit approval it can install Google Cloud
+CLI with:
+
+```bash
+bash scripts/install_agent_deps.sh --yes --with-gcloud
+```
+
+After `gcloud` is available, create local ADC credentials when that auth mode is
+used:
+
+```bash
+gcloud auth application-default login
+```
+
+On GCE/GKE/Cloud Run with an attached service account, `gcloud` is not required
+for runtime auth if the workload identity already has Vertex AI access.
+
+Validate the Agent and LLM configuration before starting an interactive
+session:
+
+```bash
+python3 agent/cli.py adk-status
+python3 agent/cli.py llm-config
 ```
 
 You can leave benchmark details such as chain, RPC URL, disk, and machine
 metadata unset at first. The Agent will detect what it can and ask for missing
 required values before a real run.
 
-Start the Agent terminal session:
+Start the Agent. This command delegates to the official Google ADK CLI and
+loads the ADK package under `agent/adk_app/`:
 
 ```bash
 ./bin/anychain-agent
 ```
 
-Then talk to it. Lines prefixed with `anychain>` are messages you type inside
-the Agent session.
+Then talk to it in the ADK session. The Agent should use its function tools to
+inspect the environment, prepare a benchmark run, generate a plan, run
+preflight, request approval, run smoke checks, and submit only
+confirmation-gated jobs.
 
 ```text
-anychain> doctor
-# Read-only environment check: dependencies, cloud/deployment hints, LLM config,
-# Knowledge Base switch, supported chains/RPC methods, and obvious missing items.
-
-anychain> Create a Solana fake-node smoke benchmark at 1 QPS
-# Natural-language goal. The Agent turns it into a request, discovers the
-# environment, creates a plan, and records any missing required values.
-
-anychain> plan
-# Show the current plan: chain, RPC mode, fake-node/real-node mode, QPS profile,
-# command, required inputs, generated files, and next actions.
-
-anychain> checklist
-# Show the next missing configuration item. Reply with the value directly, or
-# use `answer <value>` when you want to be explicit.
-
-anychain> preflight
-# Validate the plan before execution. This catches missing chain templates,
-# missing required values, missing fake-node support, unwritable output dirs,
-# and incomplete configuration checklist items.
-
-anychain> run mock
-# Validate the Agent job lifecycle only. This creates job metadata, artifact
-# index, and runtime.env without running Vegeta traffic.
-
-anychain> status
-# Show the latest job state.
-
-anychain> analyze
-# Analyze generated artifacts and return PASS/WARNING/FAIL/INCONCLUSIVE with
-# evidence paths.
-
-anychain> qa What evidence was generated?
-# Ask follow-up questions about report files, CSVs, runtime.env, or missing data.
-
-anychain> trace
-# Show recent Agent workflow decisions: intent, selected workflow, prompt bundle,
-# deterministic tools, generated files, and next actions.
+Check this host and tell me what is missing before a benchmark.
+Install missing benchmark and Agent runtime dependencies after I approve.
+I use Google ADC; install gcloud too if it is missing and you need it.
+Prepare a Solana fake-node smoke benchmark at 1 QPS.
+Run lifecycle smoke after showing me the generated plan.
+Run a real fake-node benchmark smoke only after I approve it.
+After smoke passes, ask me before submitting a detached benchmark job.
+What chains, RPC methods, and fake-node fixtures are currently supported?
 ```
 
-Use `doctor` first on a new host. It performs read-only readiness diagnostics
-for cloud/deployment detection, required dependencies, LLM/Vertex configuration,
-and current framework capability coverage. The Agent prints its mode when it
-starts. A valid LLM configuration enables AI-assisted mode automatically;
-otherwise it runs in deterministic/offline mode.
+Use a readiness check first on a new host. The Agent has a read-only doctor tool
+for cloud/deployment detection, dependencies, LLM/Vertex configuration,
+Knowledge Base configuration, and current framework capability coverage.
 
 You can also run a one-shot prompt:
 
@@ -229,27 +257,24 @@ You can also run a one-shot prompt:
   --prompt "Create a Solana fake-node smoke benchmark at 1 QPS"
 ```
 
-Inside the session, `run mock` submits a lifecycle-only Agent job for local
-validation. Real benchmark execution requires explicit confirmation with
-`yes run` after reviewing the plan and runbook. Long sessions are summarized
-automatically; you can also type `compact` to write `.agent/chat/memory.json`.
+Real benchmark execution still uses confirmation-gated tools and must pass
+preflight and smoke before launch. The model output is never executed directly.
 
-Default real benchmark execution is detached/background. The benchmark worker
-continues after the Agent terminal disconnects, writes
-`<agent-output-dir>/jobs/<job_id>/job.json`, and streams benchmark output to
-`<agent-output-dir>/jobs/<job_id>/benchmark.log`. If you want terminal-bound
-execution instead, type `run in foreground` before `yes run`.
+Default real benchmark execution is detached/background in the lower-level job
+runner. The benchmark worker continues after the Agent terminal disconnects,
+writes `.agent/jobs/<job_id>/job.json`, and streams benchmark output to
+`.agent/jobs/<job_id>/benchmark.log` unless a custom jobs directory is passed to
+the lower-level CLI.
 
-To resume after disconnecting, start the Agent with the same output directory:
+To resume after disconnecting, start the Agent again from the same repository.
+The Agent tools can inspect `.agent/jobs` and recover the latest job state:
 
 ```bash
 ./bin/anychain-agent
-# or, when you used a custom directory:
-./bin/anychain-agent --output-dir /path/to/previous-agent-output
 ```
 
-On startup, the Agent scans that directory, restores the latest job context,
-and prints the next useful commands.
+After restart, ask the Agent to inspect the latest job. It can use file-backed
+job tools to recover status, logs, runtime.env, and artifact paths.
 
 Ask the Agent about framework capabilities at any time:
 
@@ -291,25 +316,22 @@ Use this when you want the Agent to exercise the benchmark flow without a real
 production node. Start `./bin/anychain-agent`, then type:
 
 ```text
-anychain> doctor
-anychain> Create a Solana fake-node smoke benchmark at 1 QPS
-anychain> preflight
-anychain> run mock
-anychain> analyze
+Check this host and dependencies.
+Prepare a Solana fake-node smoke benchmark at 1 QPS.
+Run lifecycle smoke after showing me the generated plan.
+Show job status.
 ```
 
-`run mock` validates the Agent lifecycle without sending benchmark traffic. To
-ask the Agent to run the real benchmark engine against fake-node, type:
+Lifecycle smoke validates the Agent job lifecycle without sending benchmark
+traffic. To ask the Agent to run the real benchmark engine against fake-node,
+type:
 
 ```text
-anychain> Create a Solana fake-node quick benchmark and run the real benchmark engine
-anychain> plan
-anychain> preflight
-anychain> yes run
+Run a real fake-node benchmark smoke in isolated output directories.
 ```
 
-Review the generated runbook before `yes run`; the Agent will execute only the
-allowlisted benchmark command.
+Review the generated runbook and smoke result before asking the Agent to submit
+any real benchmark.
 
 ## Run Against A Real Node
 
@@ -325,12 +347,11 @@ do not edit that file.
 Example real-node conversation:
 
 ```text
-anychain> doctor
-anychain> Test my Solana node at http://your-node-rpc:8899 with a quick single-method benchmark
-anychain> plan
-anychain> preflight
-anychain> yes run
-anychain> analyze
+Check this host and dependencies.
+Prepare a quick single-method benchmark for my Solana node at http://your-node-rpc:8899.
+Show me inferred values and ask me to confirm anything uncertain.
+Run lifecycle smoke after preflight passes.
+Show job status.
 ```
 
 During planning/preflight, the Agent checks the chain, RPC mode, local RPC URL,
@@ -354,7 +375,7 @@ blockchain-node-benchmark-result/archives/<run-id>/test_summary.json
 The Agent checks three configuration layers:
 
 - **Agent checklist**: `config/agent_config.sh` validates LLM provider, model,
-  Vertex/OpenAI auth, context compaction, and optional Knowledge Base settings.
+  Vertex/OpenAI auth, and optional Knowledge Base settings.
 - **Benchmark checklist**: `plan` and `preflight` validate required runtime
   values such as chain, RPC mode, local RPC URL for real nodes, process names,
   ledger disk, disk baseline, and network bandwidth.
@@ -362,21 +383,26 @@ The Agent checks three configuration layers:
   bottleneck thresholds, sync-health thresholds, Prometheus/Grafana, Kubernetes,
   and runtime paths. Most users leave these defaults alone.
 
-`plan` and `preflight` surface missing required values before `yes run`.
+Planning and preflight surface missing required values before real submission.
 Advanced settings remain available for operators who intentionally tune the
 framework.
 
 ## LLM Providers
 
-The Agent works without an LLM. If enabled, LLMs draft requests and classify
-intent; deterministic validation still controls execution.
+The official ADK runtime owns model execution. AnyChain reads
+`config/agent_config.sh` to resolve the model name and to run safe auth
+diagnostics, but the human-facing Agent path must not use AnyChain's old custom
+provider adapters as a replacement for ADK model calls.
+
+No-key checks are available only for CI/development. They validate ADK package
+loading, tool registration, and safety callbacks; they do not simulate
+natural-language intent recognition and are not the product Agent runtime.
 
 Supported providers and auth modes:
 
 - `gemini`: Gemini API key, or Gemini on Vertex AI with Google auth.
 - `claude`: Anthropic API key, or Claude on Vertex AI with Google auth.
 - `openai`: OpenAI API key.
-- `fake`: offline protocol smoke provider for tests.
 
 Configure these values persistently in `config/agent_config.sh`;
 `./bin/anychain-agent` loads that file at startup, and environment variables can
@@ -423,12 +449,6 @@ Validate config without calling a model:
 
 ```bash
 python3 agent/cli.py llm-config
-```
-
-Run an offline LLM protocol smoke without credentials:
-
-```bash
-python3 agent/cli.py llm-smoke --mock
 ```
 
 Run a real provider smoke only after credentials are configured:
@@ -491,8 +511,8 @@ The project can be embedded into enterprise Agent platforms in two ways:
 
 - **Terminal mode**: run `./bin/anychain-agent` in a controlled shell session.
 - **Programmatic mode**: call `python3 agent/cli.py` subcommands and exchange
-  JSON for `doctor`, `draft-request`, `plan`, `preflight`, `submit`, `status`,
-  `analyze`, `artifact-qa`, and `capabilities`.
+  JSON for `doctor`, `plan`, `preflight`, `submit`, `status`, `analyze`,
+  `artifact-qa`, and `capabilities`.
 - **Tool-schema mode**: call `python3 agent/cli.py tool-schema` to export an
   OpenAI-compatible function-tool schema for enterprise Agent orchestrators.
 - **Tool-call mode**: call `python3 agent/cli.py tool-call --name <tool> --arguments '<json>'`
@@ -529,7 +549,7 @@ Enterprise Agent platforms can inspect and call the tool catalog directly:
 python3 agent/cli.py tool-schema
 python3 agent/cli.py tool-call --name load_capabilities
 python3 agent/cli.py tool-call --name draft_request \
-  --arguments '{"prompt":"Create a Solana fake-node smoke benchmark at 1 QPS"}'
+  --arguments '{"chain":"solana","goal":"smoke","rpc_mode":"single","use_fake_node":true,"qps_max":1,"source_prompt":"Create a Solana fake-node smoke benchmark at 1 QPS"}'
 ```
 
 ## Reports And Artifacts
@@ -550,12 +570,9 @@ Key artifacts:
 - `<agent-output-dir>/jobs/<job_id>/artifact_index.json` for Agent jobs
 - `<agent-output-dir>/jobs/<job_id>/runtime.env` for the Agent-generated final config
   snapshot for that job. Users should not edit this file manually.
-- `.agent/chat/workflow_trace.jsonl` for Agent intent routing, workflow
-  selection, prompt bundle, tool calls, artifact paths, and next actions.
 
-For terminal sessions, `<agent-output-dir>` defaults to `.agent/chat`. For
-low-level CLI job commands, it defaults to `.agent` unless `--jobs-dir` points
-elsewhere.
+For low-level CLI job commands, job state defaults to `.agent/jobs` unless
+`--jobs-dir` points elsewhere.
 
 Agent job helpers:
 
@@ -571,10 +588,9 @@ CPU saturation, disk latency/queueing, disk IOPS or throughput pressure, RPC
 method errors/latency, and sync-health warnings.
 
 If a terminal session disconnects, start `./bin/anychain-agent` again from the
-same output directory. The Agent restores the latest job context from
-`<agent-output-dir>/jobs/<job_id>/job.json`. Detached jobs continue in their worker
-process; use `status`, `logs`, `resume`, and `analyze` to inspect progress or
-completed evidence.
+same repository. Detached jobs continue in their worker process; use the Agent
+or the low-level `jobs`, `status`, `logs`, `resume`, and `analyze` commands to
+inspect progress or completed evidence.
 
 Optional job notifications are disabled by default. Set
 `AGENT_NOTIFY_WEBHOOK_URL` and `AGENT_NOTIFY_ON` in `config/agent_config.sh`

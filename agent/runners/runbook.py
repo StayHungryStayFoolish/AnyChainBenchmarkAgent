@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from utils.redaction import redact
+try:
+    from agent.utils.redaction import redact
+except ImportError:  # pragma: no cover - legacy script execution path
+    from utils.redaction import redact
 
 
 def render_runbook(plan: dict[str, Any], preflight: dict[str, Any] | None = None) -> str:

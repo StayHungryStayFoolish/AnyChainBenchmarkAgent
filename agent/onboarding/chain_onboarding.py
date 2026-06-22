@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from knowledge.gap_analyzer import analyze_capability_gap
-from llm.orchestrator import synthesize_with_fallback
 
 
 SUPPORTED_FAMILIES = [
@@ -23,8 +20,7 @@ def generate_onboarding_package(
     methods: list[str] | None = None,
     adapter_family: str | None = None,
     rpc_mode: str = "mixed",
-    llm_provider: Any | None = None,
-) -> dict[str, Any]:
+) -> dict:
     methods = methods or []
     gap = analyze_capability_gap(chain, methods)
     family = adapter_family or gap.get("family") or "<choose-family>"
@@ -70,13 +66,6 @@ def generate_onboarding_package(
             "Keep workload methods and fake-node fixtures aligned; per-method charts depend on method names in proxy_method.csv.",
         ],
     }
-    package["llm_summary"] = synthesize_with_fallback(
-        llm_provider,
-        "onboarding",
-        str(package),
-        "",
-        max_tokens=1400,
-    )
     return package
 
 

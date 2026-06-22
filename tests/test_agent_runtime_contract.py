@@ -20,18 +20,38 @@ from knowledge.framework_capabilities import load_framework_capabilities  # noqa
 from llm import config as llm_config_module  # noqa: E402
 from llm.config import load_llm_config  # noqa: E402
 from llm.google_auth import credential_plan  # noqa: E402
-from llm.orchestrator import PROMPT_BUNDLES, prompt_coverage  # noqa: E402
-from llm.prompt_loader import compose_prompt, load_prompt  # noqa: E402
 from llm.providers import provider_from_config  # noqa: E402
-from llm.types import LLMResponse  # noqa: E402
-from memory.compactor import compact_session_state, should_auto_compact  # noqa: E402
-from planners.request_modifier import apply_request_modification  # noqa: E402
+from runners.materialize import build_runtime_env  # noqa: E402
 from runners.guardrails import validate_execution_plan  # noqa: E402
 from runners.job_manager import get_job, submit_job  # noqa: E402
-from chat import ChatSession  # noqa: E402
+from adk_app.app import status_payload as adk_status_payload  # noqa: E402
+from adk_app.callbacks import before_tool_callback  # noqa: E402
+from adk_app.evals.runner import run_offline_evals as run_adk_offline_evals  # noqa: E402
+from adk_app.instructions import ROOT_INSTRUCTION  # noqa: E402
+from adk_app.root_agent import resolve_adk_model  # noqa: E402
+from adk_app.runtime import run_adk_cli  # noqa: E402
+from adk_app.state import load_startup_state as adk_load_startup_state  # noqa: E402
+from adk_app.state import preserved_state_for_adk  # noqa: E402
+from adk_app.tools.auth import inspect_llm_auth as adk_inspect_llm_auth  # noqa: E402
+from adk_app.tools.registry import get_adk_tools  # noqa: E402
+from adk_app.tools.actions import install_dependencies as adk_install_dependencies  # noqa: E402
+from adk_app.tools.actions import _fake_node_smoke_plan  # noqa: E402
+from adk_app.tools.actions import run_fake_node_smoke_benchmark as adk_run_fake_node_smoke_benchmark  # noqa: E402
+from adk_app.tools.actions import run_smoke as adk_run_smoke  # noqa: E402
+from adk_app.tools.actions import submit_benchmark_job as adk_submit_benchmark_job  # noqa: E402
+from adk_app.tools.enterprise import enterprise_integration_manifest  # noqa: E402
+from adk_app.tools.planning import draft_benchmark_request as adk_draft_benchmark_request  # noqa: E402
+from adk_app.tools.planning import generate_benchmark_plan as adk_generate_benchmark_plan  # noqa: E402
+from adk_app.tools.planning import prepare_benchmark_run as adk_prepare_benchmark_run  # noqa: E402
+from adk_app.tools.planning import render_runbook as adk_render_runbook  # noqa: E402
+from adk_app.tools.planning import run_preflight as adk_run_preflight  # noqa: E402
+from adk_app.tools.read_only import audit_dependencies as adk_audit_dependencies  # noqa: E402
+from adk_app.tools.read_only import load_framework_capabilities as adk_load_framework_capabilities  # noqa: E402
+from adk_app.tools.read_only import list_rpc_methods as adk_list_rpc_methods  # noqa: E402
+from adk_app.tools.read_only import list_supported_chains as adk_list_supported_chains  # noqa: E402
 from diagnostics.doctor import format_doctor_report, run_doctor  # noqa: E402
 from onboarding.chain_onboarding import generate_onboarding_package  # noqa: E402
-from wizard import run_wizard  # noqa: E402
+from onboarding.request_answers import answer_onboarding_request  # noqa: E402
 
 
 def run_agent(*args, env=None):
@@ -83,13 +103,20 @@ class AgentRuntimeContractTest(unittest.TestCase):
             plan_file = tmp_path / "plan.json"
             jobs_dir = tmp_path / "jobs"
 
-            request = run_agent(
-                "draft-request",
-                "--prompt",
-                "Test Solana maximum stable QPS on GKE with fake-node smoke first and focus on disk P99.",
-                "--output",
-                str(request_file),
-            )
+            request = {
+                "chain": "solana",
+                "goal": "max_stable_qps",
+                "rpc_mode": "single",
+                "use_fake_node": True,
+                "deployment": {"type": "kubernetes", "provider": "gcp"},
+                "observability": {"enabled": False, "mode": "local"},
+                "dependency_mode": "audit",
+                "runner_mode": "detached",
+                "bottleneck_focus": ["disk"],
+                "recommended_initial_validation": "smoke",
+                "source_prompt": "Test Solana maximum stable QPS on GKE with fake-node smoke first and focus on disk P99.",
+            }
+            request_file.write_text(json.dumps(request), encoding="utf-8")
             self.assertEqual(request["chain"], "solana")
             self.assertEqual(request["goal"], "max_stable_qps")
             self.assertTrue(request["use_fake_node"])
@@ -97,60 +124,16 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertIn("disk", request["bottleneck_focus"])
             self.assertEqual(request["recommended_initial_validation"], "smoke")
 
-            llm_request = run_agent(
-                "draft-request",
-                "--prompt",
-                "Test Solana maximum stable QPS on GKE with fake-node smoke first and focus on disk P99.",
-                "--mock-llm",
-            )
-            self.assertEqual(llm_request["chain"], "solana")
-            self.assertEqual(llm_request["llm_status"], "accepted")
-
-            route = run_agent(
-                "route-intent",
-                "--prompt",
-                "How do I configure mixed RPC weights?",
-                "--mock-llm",
-            )
-            self.assertIn(route["intent"], {"benchmark_request", "framework_question"})
-
-            framework_answer = run_agent(
-                "ask",
-                "--prompt",
-                "How do I use fake-node for local closed loop testing?",
-            )
-            self.assertEqual(framework_answer["intent"], "framework_question")
-            self.assertTrue(framework_answer["sources"])
-
-            out_of_scope = run_agent("ask", "--prompt", "Write me a stock trading robot")
-            self.assertEqual(out_of_scope["intent"], "out_of_scope")
-
-            smoke = run_agent("llm-smoke", "--mock")
-            self.assertEqual(smoke["provider"], "fake")
-
             capabilities = run_agent("capabilities")
             self.assertEqual(capabilities["chain_count"], 36)
             self.assertEqual(capabilities["family_count"], 6)
             self.assertGreater(capabilities["unique_rpc_method_count"], 100)
-
-            capability_answer = run_agent(
-                "ask",
-                "--prompt",
-                "How many chains and RPC methods does the framework support?",
-            )
-            self.assertEqual(capability_answer["intent"], "framework_question")
-            self.assertEqual(capability_answer["capabilities"]["chain_count"], 36)
-            self.assertIn("families", capability_answer["capabilities"])
 
             gap = run_agent("gap-analysis", "--chain", "solana", "--method", "getBalance", "--method", "missingMethod")
             self.assertEqual(gap["chain"], "solana")
             self.assertIn("getBalance", gap["supported_methods"])
             self.assertIn("missingMethod", gap["missing_methods"])
             self.assertTrue(gap["onboarding_plan"])
-
-            gap_answer = run_agent("ask", "--prompt", "Does solana support missingMethod RPC method?")
-            self.assertEqual(gap_answer["intent"], "framework_question")
-            self.assertIn("gap_analysis", gap_answer)
 
             plan = run_agent("plan", "--request", str(request_file), "--output", str(plan_file), "--dry-run")
             self.assertEqual(plan["chain"], "solana")
@@ -230,10 +213,6 @@ class AgentRuntimeContractTest(unittest.TestCase):
             )
             self.assertEqual(artifact_answer["intent"], "framework_question")
             self.assertIn("runtime_env_file", artifact_answer["answer"])
-
-            updated_request, runner_changes = apply_request_modification(request, "run in foreground")
-            self.assertEqual(updated_request["runner_mode"], "foreground")
-            self.assertIn("runner_mode -> foreground", runner_changes)
 
             jobs = run_agent("jobs", "--jobs-dir", str(jobs_dir))
             self.assertEqual(jobs["jobs"][0]["job_id"], job["job_id"])
@@ -343,24 +322,6 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertIn("Benchmark Agent Runbook", completed.stdout)
             self.assertTrue(runbook_file.is_file())
 
-            wizard_dir = tmp_path / "wizard"
-            wizard_result = run_agent(
-                "wizard",
-                "--prompt",
-                "Test Solana maximum stable QPS on GKE with fake-node smoke first and focus on disk P99.",
-                "--output-dir",
-                str(wizard_dir),
-                "--yes",
-                "--mock",
-                "--mock-llm",
-            )
-            self.assertEqual(wizard_result["status"], "submitted")
-            self.assertEqual(wizard_result["job"]["status"], "completed")
-            self.assertTrue((wizard_dir / "runbook.md").is_file())
-            wizard_plan = json.loads((wizard_dir / "plan.json").read_text())
-            self.assertNotEqual(wizard_plan["discovery"]["source"], "not_collected")
-            self.assertIn("required_questions", wizard_plan)
-
             changed_request_file = tmp_path / "changed_request.json"
             changed_plan_file = tmp_path / "changed_plan.json"
             changed_request = dict(request)
@@ -396,46 +357,23 @@ class AgentRuntimeContractTest(unittest.TestCase):
             comparison = run_agent("history", "--archives-dir", str(archives_dir), "--compare-latest")
             self.assertEqual(comparison["status"], "compared")
 
-            answers_file = tmp_path / "answers.json"
-            answers_file.write_text(json.dumps({
-                "ledger_device_confirmation": "sdb",
-                "dependency_mode_confirmation": "audit",
-            }), encoding="utf-8")
-            answers_wizard_dir = tmp_path / "answers_wizard"
-            answers_result = run_agent(
-                "wizard",
-                "--prompt",
-                "Test Solana maximum stable QPS on GKE with fake-node smoke first.",
-                "--output-dir",
-                str(answers_wizard_dir),
-                "--answers-file",
-                str(answers_file),
-                "--quiet",
-            )
-            self.assertIn(answers_result["status"], {"planned", "needs_input"})
+            new_chain_gap = answer_onboarding_request("How do I add new chain foochain?")
+            self.assertIn("Onboarding package for foochain", new_chain_gap)
+            self.assertIn("docs/en/secondary-development-guide.md", new_chain_gap)
 
-            new_chain_gap = run_agent("ask", "--prompt", "How do I add new chain foochain?")
-            self.assertEqual(new_chain_gap["intent"], "onboarding_request")
-            self.assertIn("Onboarding package for foochain", new_chain_gap["answer"])
-            self.assertIn("docs/en/secondary-development-guide.md", new_chain_gap["answer"])
+            kb_onboarding = answer_onboarding_request("How do I integrate our enterprise Knowledge Base?")
+            self.assertIn("Enterprise Knowledge Base onboarding plan", kb_onboarding)
 
-            kb_onboarding = run_agent("ask", "--prompt", "How do I integrate our enterprise Knowledge Base?")
-            self.assertEqual(kb_onboarding["intent"], "onboarding_request")
-            self.assertIn("Enterprise Knowledge Base onboarding plan", kb_onboarding["answer"])
+            platform_onboarding = answer_onboarding_request("How do we embed this into our internal Agent platform?")
+            self.assertIn("Enterprise Agent platform integration plan", platform_onboarding)
+            self.assertIn("tool-schema", platform_onboarding)
+            self.assertIn("tool-call", platform_onboarding)
 
-            platform_onboarding = run_agent("ask", "--prompt", "How do we embed this into our internal Agent platform?")
-            self.assertEqual(platform_onboarding["intent"], "onboarding_request")
-            self.assertIn("Enterprise Agent platform integration plan", platform_onboarding["answer"])
-            self.assertIn("tool-schema", platform_onboarding["answer"])
-            self.assertIn("tool-call", platform_onboarding["answer"])
+            protocol_onboarding = answer_onboarding_request("Generate a plan to add a new protocol family for FooVM")
+            self.assertIn("New protocol family onboarding plan", protocol_onboarding)
 
-            protocol_onboarding = run_agent("ask", "--prompt", "Generate a plan to add a new protocol family for FooVM")
-            self.assertEqual(protocol_onboarding["intent"], "onboarding_request")
-            self.assertIn("New protocol family onboarding plan", protocol_onboarding["answer"])
-
-            rpc_onboarding = run_agent("ask", "--prompt", "Add custom RPC method foo_getBalance to chain foochain")
-            self.assertEqual(rpc_onboarding["intent"], "onboarding_request")
-            self.assertIn("foo_getBalance", rpc_onboarding["answer"])
+            rpc_onboarding = answer_onboarding_request("Add custom RPC method foo_getBalance to chain foochain")
+            self.assertIn("foo_getBalance", rpc_onboarding)
             onboarding = run_agent(
                 "onboarding-plan",
                 "--chain",
@@ -477,6 +415,12 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertIn("draft_chain_template", tool_names)
             self.assertIn("knowledge_search", tool_names)
             self.assertTrue(all(tool["type"] == "function" for tool in schema["tools"]))
+            install_tool = next(tool for tool in schema["tools"] if tool["function"]["name"] == "install_dependencies")
+            install_props = install_tool["function"]["parameters"]["properties"]
+            self.assertTrue(install_props["include_agent_runtime"]["default"])
+            self.assertTrue(install_props["include_vegeta"]["default"])
+            self.assertTrue(install_props["no_sudo"]["default"])
+            self.assertFalse(install_props["include_gcloud"]["default"])
             for tool in schema["tools"]:
                 params = tool["function"]["parameters"]
                 self.assertEqual(params["type"], "object")
@@ -488,9 +432,35 @@ class AgentRuntimeContractTest(unittest.TestCase):
                 "--name",
                 "draft_request",
                 "--arguments",
-                '{"prompt":"Create a Solana fake-node smoke benchmark at 1 QPS"}',
+                json.dumps({
+                    "source_prompt": "Create a Solana fake-node smoke benchmark at 1 QPS",
+                    "chain": "solana",
+                    "goal": "smoke",
+                    "rpc_mode": "single",
+                    "use_fake_node": True,
+                    "qps_max": 1,
+                }),
             )
             self.assertEqual(draft_tool["chain"], "solana")
+            structured_draft_tool = run_agent(
+                "tool-call",
+                "--name",
+                "draft_request",
+                "--arguments",
+                json.dumps({
+                    "chain": "ethereum",
+                    "goal": "stress",
+                    "rpc_mode": "mixed",
+                    "use_fake_node": False,
+                    "qps_max": 2000,
+                    "rpc_methods": ["eth_blockNumber", "eth_getBalance"],
+                    "mixed_weights": {"eth_blockNumber": 60, "eth_getBalance": 40},
+                }),
+            )
+            self.assertEqual(structured_draft_tool["chain"], "ethereum")
+            self.assertEqual(structured_draft_tool["rpc_mode"], "mixed")
+            self.assertEqual(structured_draft_tool["qps"]["max"], 2000)
+            self.assertEqual(sum(item["weight"] for item in structured_draft_tool["mixed_weighted"]), 100)
             generated_tool_plan = run_agent(
                 "tool-call",
                 "--name",
@@ -507,226 +477,72 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertEqual(generated_tool_plan["chain"], "solana")
             self.assertEqual(generated_tool_plan["execution"]["runner_mode"], "detached")
 
-    def test_terminal_chat_agent_entrypoint(self):
+    def test_human_entrypoint_delegates_to_official_adk_runtime(self):
         with tempfile.TemporaryDirectory() as tmp:
-            chat_dir = Path(tmp) / "chat"
-            session = ChatSession(output_dir=chat_dir)
-            answer = session.handle("How many chains and RPC methods are supported?")
-            self.assertIn("Current chain templates define", answer)
-            doctor_answer = session.handle("doctor")
-            self.assertIn("Agent doctor report", doctor_answer)
-            self.assertIn("capabilities:", doctor_answer)
+            fake_adk = Path(tmp) / "fake-adk"
+            fake_adk.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' \"$@\" > \"$FAKE_ADK_ARGS_FILE\"\n"
+                "cat > \"$FAKE_ADK_STDIN_FILE\"\n",
+                encoding="utf-8",
+            )
+            fake_adk.chmod(0o755)
+            args_file = Path(tmp) / "args.txt"
+            stdin_file = Path(tmp) / "stdin.txt"
+            env = os.environ.copy()
+            env["FAKE_ADK_ARGS_FILE"] = str(args_file)
+            env["FAKE_ADK_STDIN_FILE"] = str(stdin_file)
 
-            plan_answer = session.handle("Create a Solana fake-node smoke benchmark at 1 QPS")
-            self.assertIn("Created a benchmark plan", plan_answer)
-            self.assertIn("solana", plan_answer)
-            self.assertTrue((chat_dir / "plan.json").is_file())
-            checklist_view = session.handle("checklist")
-            self.assertIn("Checklist passed", checklist_view)
-            checklist_plan = json.loads((chat_dir / "plan.json").read_text(encoding="utf-8"))
-            self.assertFalse([
-                question
-                for question in checklist_plan["required_questions"]
-                if question.get("severity") == "blocker"
-            ])
-            qps_update = session.handle("set max qps to 5000 and duration 120 seconds")
-            self.assertIn("Updated the current benchmark plan", qps_update)
-            updated_plan = json.loads((chat_dir / "plan.json").read_text(encoding="utf-8"))
-            self.assertEqual(updated_plan["advanced_defaults"]["qps"]["max"], 5000)
-            self.assertEqual(updated_plan["advanced_defaults"]["qps"]["duration_seconds"], 120)
-            weight_update = session.handle("change mixed weights to getSlot 70%, getBlockHeight 30%")
-            self.assertIn("mixed workload methods", weight_update)
-            updated_request = json.loads((chat_dir / "request.json").read_text(encoding="utf-8"))
-            self.assertEqual(updated_request["rpc_mode"], "mixed")
-            self.assertEqual(sum(item["weight"] for item in updated_request["workload"]["methods"]), 100)
-            question_answer = session.handle("What does qps mean in this framework?")
-            self.assertNotIn("I could not identify a supported plan edit", question_answer)
-            self.assertIn("Preflight passed", session.handle("preflight"))
-            mock_answer = session.handle("run mock")
-            self.assertIn("Submitted mock job", mock_answer)
-            self.assertIn("job_", mock_answer)
-            self.assertIn("Mock lifecycle completed", session.handle("analyze"))
-            self.assertIn("runtime_env_file", session.handle("qa What evidence was generated?"))
-            trace_answer = session.handle("trace")
-            self.assertIn("workflow_trace.jsonl", trace_answer)
-            trace_rows = [
-                json.loads(line)
-                for line in (chat_dir / "workflow_trace.jsonl").read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
-            workflows = {row["workflow"] for row in trace_rows}
-            self.assertIn("benchmark_request", workflows)
-            self.assertIn("checklist", workflows)
-            self.assertIn("plan_edit", workflows)
-            restored_session = ChatSession(output_dir=chat_dir)
-            restored_greeting = restored_session.greeting()
-            self.assertIn("Latest job:", restored_greeting)
-            self.assertIn("(completed)", restored_greeting)
-            self.assertIn("Mock lifecycle completed", restored_session.handle("analyze"))
-            compact_answer = session.handle("compact")
-            self.assertIn("Context compacted", compact_answer)
-            self.assertTrue((chat_dir / "memory.json").is_file())
-            memory = json.loads((chat_dir / "memory.json").read_text(encoding="utf-8"))
-            self.assertEqual(memory["preserved_state"]["chain"], "solana")
-            self.assertTrue(memory["preserved_state"]["job_id"].startswith("job_"))
-            self.assertEqual(memory["thresholds"]["context_window_tokens"], 1000000)
-            self.assertEqual(memory["thresholds"]["token_threshold"], 700000)
-            self.assertLessEqual(len(session.turns), 9)
-            self.assertIn("preserved_state", session.handle("memory"))
-            self.assertIn("Mock lifecycle completed", session.handle("analyze"))
-
-            one_shot = subprocess.run(
-                [
-                    str(AGENT_BIN),
-                    "--prompt",
-                    "How many chains and RPC methods are supported?",
-                    "--output-dir",
-                    str(Path(tmp) / "one-shot"),
-                ],
+            completed = subprocess.run(
+                [str(AGENT_BIN), "--adk-bin", str(fake_adk), "--prompt", "How many chains are supported?"],
                 cwd=REPO,
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                env=env,
                 check=True,
             )
-            self.assertIn("AnyChain Benchmark Agent", one_shot.stdout)
-            self.assertIn("Mode: deterministic/offline", one_shot.stdout)
-            self.assertIn("Current chain templates define", one_shot.stdout)
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(args_file.read_text(encoding="utf-8").splitlines()[0], "run")
+            self.assertIn("agent/adk_app", args_file.read_text(encoding="utf-8"))
+            self.assertIn("How many chains are supported?", stdin_file.read_text(encoding="utf-8"))
+            self.assertIn("exit", stdin_file.read_text(encoding="utf-8"))
 
-            repl = subprocess.run(
-                [str(AGENT_BIN), "--output-dir", str(Path(tmp) / "repl")],
-                cwd=REPO,
-                input="Create a Solana fake-node smoke benchmark at 1 QPS\nset max qps to 5000\nrun mock\ncompact\nmemory\nstatus\nexit\n",
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=True,
-            )
-            self.assertIn("Created a benchmark plan", repl.stdout)
-            self.assertIn("Updated the current benchmark plan", repl.stdout)
-            self.assertIn("Submitted mock job", repl.stdout)
-            self.assertIn("Context compacted", repl.stdout)
-            self.assertIn("\"status\": \"completed\"", repl.stdout)
-            self.assertTrue((Path(tmp) / "repl" / "memory.json").is_file())
+            missing_status = run_adk_cli(["--adk-bin", str(Path(tmp) / "missing-adk")])
+            self.assertEqual(missing_status, 2)
 
     def test_agent_doctor_formats_readiness_report(self):
-        report = run_doctor({
-            "cloud": {"provider": "gcp", "platform": "gce", "confidence": 0.8},
-            "deployment": {"type": "vm"},
-            "network": {"default_interface": "eth0"},
-            "disks": {"ambiguous_candidates": ["sdb", "sdc"]},
-            "dependencies": {
-                "missing_required": ["vegeta"],
-                "missing_optional": ["kubectl"],
-            },
-            "warnings": ["Multiple plausible data disks were found; confirm ledger/accounts devices."],
-        })
+        old_env = os.environ.copy()
+        try:
+            os.environ.update({
+                "LLM_PROVIDER": "gemini",
+                "LLM_MODEL": "gemini-3.1-pro",
+                "LLM_AUTH_MODE": "google_adc",
+                "GOOGLE_CLOUD_PROJECT": "example-project",
+                "GOOGLE_CLOUD_LOCATION": "us-central1",
+            })
+            report = run_doctor({
+                "cloud": {"provider": "gcp", "platform": "gce", "confidence": 0.8},
+                "deployment": {"type": "vm"},
+                "network": {"default_interface": "eth0"},
+                "disks": {"ambiguous_candidates": ["sdb", "sdc"]},
+                "dependencies": {
+                    "missing_required": ["vegeta"],
+                    "missing_optional": ["kubectl"],
+                },
+                "warnings": ["Multiple plausible data disks were found; confirm ledger/accounts devices."],
+            })
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
         self.assertEqual(report["status"], "needs_dependencies")
         self.assertEqual(report["environment"]["dependencies"]["missing_required"], ["vegeta"])
+        self.assertEqual(report["google_auth"]["auth_mode"], "google_adc")
+        self.assertIn("gcloud_available", report["google_auth"])
         text = format_doctor_report(report)
         self.assertIn("Agent doctor report", text)
         self.assertIn("required dependencies missing: vegeta", text)
-
-    def test_request_modifier_updates_qps_and_mixed_weights(self):
-        request = {"chain": "solana", "rpc_mode": "single", "use_fake_node": True}
-        updated, changes = apply_request_modification(
-            request,
-            "Set max qps to 5000, initial qps 100, step 250, duration 120 seconds.",
-        )
-        self.assertEqual(updated["qps"]["max"], 5000)
-        self.assertEqual(updated["qps"]["initial"], 100)
-        self.assertEqual(updated["qps"]["step"], 250)
-        self.assertEqual(updated["qps"]["duration_seconds"], 120)
-        self.assertTrue(changes)
-
-        updated, changes = apply_request_modification(
-            updated,
-            "Change mixed weights to getSlot 70%, getBlockHeight 30%",
-        )
-        self.assertEqual(updated["rpc_mode"], "mixed")
-        self.assertEqual(updated["workload"]["methods"][0]["method"], "getSlot")
-        self.assertEqual(sum(item["weight"] for item in updated["workload"]["methods"]), 100)
-        self.assertIn("mixed_weights_confirmation", updated["confirmations"])
-
-    def test_compactor_preserves_current_state_and_recent_turns(self):
-        turns = [{"role": "user", "content": f"turn {idx}"} for idx in range(20)]
-        summary = compact_session_state(
-            turns=turns,
-            request={"chain": "solana", "rpc_mode": "mixed", "use_fake_node": True},
-            plan={
-                "plan_id": "plan_test",
-                "chain": "solana",
-                "strategy": "smoke",
-                "rpc_mode": "mixed",
-                "required_questions": [
-                    {"id": "ledger_device_confirmation", "severity": "blocker", "prompt": "Confirm ledger device."}
-                ],
-            },
-            job={"job_id": "job_test", "status": "completed", "artifact_index": "/tmp/artifact_index.json"},
-            discovery={"deployment": {"type": "vm"}, "cloud": {"provider": "gcp"}},
-            keep_recent=4,
-            reason="test",
-        )
-        self.assertEqual(summary["preserved_state"]["chain"], "solana")
-        self.assertEqual(summary["preserved_state"]["job_id"], "job_test")
-        self.assertEqual(len(summary["recent_turns"]), 4)
-        self.assertEqual(summary["compacted_turn_count"], 16)
-        self.assertEqual(summary["thresholds"]["context_window_tokens"], 1000000)
-        self.assertEqual(summary["thresholds"]["trigger_ratio"], 0.7)
-        self.assertTrue(summary["open_questions"])
-        self.assertFalse(should_auto_compact(turns=turns, turn_threshold=1000))
-        self.assertTrue(should_auto_compact(turns=turns, turn_threshold=10))
-        self.assertTrue(should_auto_compact(
-            turns=[{"role": "user", "content": "x" * 100}],
-            context_window_tokens=10,
-            trigger_ratio=0.5,
-            turn_threshold=1000,
-        ))
-
-    def test_wizard_applies_required_answers(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            result = run_wizard(
-                prompt="Run a baseline benchmark on my node.",
-                output_dir=tmp,
-                discovery_override={
-                    "source": "test",
-                    "mode": "read_only",
-                    "deployment": {"type": "vm"},
-                    "cloud": {"provider": "gcp", "platform": "gce", "confidence": 0.8},
-                    "disks": {
-                        "confidence": 0.0,
-                        "proposed_ledger_device": "",
-                        "proposed_accounts_device": "",
-                        "ambiguous_candidates": ["sdb", "sdc"],
-                        "candidates": [
-                            {"name": "sdb", "mountpoint": "/data"},
-                            {"name": "sdc", "mountpoint": "/accounts"},
-                        ],
-                    },
-                    "dependencies": {"mode": "audit", "missing_required": ["vegeta"], "missing_optional": []},
-                    "warnings": [],
-                },
-                answers={
-                    "chain": "solana",
-                    "local_rpc_url": "http://127.0.0.1:8899",
-                    "ledger_device_confirmation": "sdb",
-                    "ledger_device": "sdb",
-                    "blockchain_process_names": "agave-validator solana-validator",
-                    "data_vol_max_iops": "30000",
-                    "data_vol_max_throughput": "700",
-                    "network_max_bandwidth_gbps": "25",
-                    "dependency_mode_confirmation": "audit",
-                },
-                yes=False,
-                mock=False,
-                quiet=True,
-            )
-            self.assertEqual(result["status"], "planned")
-            plan = json.loads((Path(tmp) / "plan.json").read_text())
-            self.assertEqual(plan["chain"], "solana")
-            self.assertEqual(plan["execution"]["environment"]["LOCAL_RPC_URL"], "http://127.0.0.1:8899")
-            self.assertEqual(plan["materialized_config"]["LEDGER_DEVICE"], "sdb")
-            self.assertIn("ledger_device_confirmation", plan["confirmed_inputs"])
+        self.assertIn("Google auth mode: google_adc", text)
 
     def test_onboarding_package_contains_workload_and_validation_contract(self):
         package = generate_onboarding_package("foochain", ["foo_methodA", "foo_methodB"], adapter_family="jsonrpc")
@@ -807,53 +623,405 @@ class AgentRuntimeContractTest(unittest.TestCase):
         })
         self.assertIn("GOOGLE_SERVICE_ACCOUNT_EMAIL is required", "; ".join(missing_impersonation.validate()))
 
+    def test_adk_model_resolution_uses_configured_real_model(self):
+        old_env = os.environ.copy()
+        try:
+            os.environ.clear()
+            self.assertEqual(resolve_adk_model(), "gemini-3.1-pro")
+            os.environ.update({
+                "LLM_PROVIDER": "gemini",
+                "LLM_MODEL": "gemini-3.5-flash",
+                "LLM_AUTH_MODE": "api_key",
+                "GEMINI_API_KEY": "test-key",
+            })
+            self.assertEqual(resolve_adk_model(), "gemini-3.5-flash")
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
     def test_prompt_contracts_are_explicit_and_tool_bounded(self):
-        system_prompt = load_prompt("system")
-        request_prompt = compose_prompt("system", "safety_guardrails", "config_interviewer", "request_drafter", "workload_designer")
-        result_prompt = compose_prompt("system", "result_analyzer", "chart_diagnostics")
-        onboarding_prompt = compose_prompt("system", "chain_onboarding")
+        self.assertIn("deterministic benchmark tools", ROOT_INSTRUCTION)
+        self.assertIn("Do not invent", ROOT_INSTRUCTION)
+        self.assertIn("runtime.env", ROOT_INSTRUCTION)
+        self.assertIn("custom RPC methods", ROOT_INSTRUCTION)
+        self.assertIn("weighted", ROOT_INSTRUCTION)
+        self.assertIn("P50/P90/P99", ROOT_INSTRUCTION)
+        self.assertIn("CPU-disk correlation", ROOT_INSTRUCTION)
+        self.assertIn("needs_review", ROOT_INSTRUCTION)
+        self.assertIn("fake-node fixtures", ROOT_INSTRUCTION)
+        self.assertIn("Choose tools directly", ROOT_INSTRUCTION)
+        self.assertIn("prepare_benchmark_run", ROOT_INSTRUCTION)
+        self.assertIn("run_fake_node_smoke_benchmark", ROOT_INSTRUCTION)
+        self.assertIn("audit_dependencies", ROOT_INSTRUCTION)
+        tool_names = {tool.__name__ for tool in get_adk_tools(include_actions=True)}
+        self.assertIn("prepare_benchmark_run", tool_names)
+        self.assertIn("draft_benchmark_request", tool_names)
+        self.assertIn("generate_benchmark_plan", tool_names)
+        self.assertIn("run_smoke", tool_names)
+        self.assertIn("run_fake_node_smoke_benchmark", tool_names)
+        self.assertIn("install_dependencies", tool_names)
+        self.assertIn("submit_benchmark_job", tool_names)
+        self.assertFalse((REPO / "agent" / "prompts").exists())
 
-        self.assertIn("deterministic framework tools", system_prompt)
-        self.assertIn("Do not invent", request_prompt)
-        self.assertIn("runtime.env", request_prompt)
-        self.assertIn("custom RPC methods", request_prompt)
-        self.assertIn("weighted", request_prompt)
-        self.assertIn("P50/P90/P99", result_prompt)
-        self.assertIn("CPU-disk correlation", result_prompt)
-        self.assertIn("needs_review", onboarding_prompt)
-        self.assertIn("fake-node fixtures", onboarding_prompt)
-        prompt_files = {path.stem for path in (REPO / "agent" / "prompts").glob("*.md")}
-        self.assertEqual(prompt_files - set(prompt_coverage()), set())
-        self.assertIn("artifact_analysis", PROMPT_BUNDLES)
-        self.assertIn("onboarding", PROMPT_BUNDLES)
+    def test_adk_action_callback_blocks_unapproved_execution(self):
+        class Tool:
+            name = "submit_benchmark_job"
 
-    def test_prompt_orchestrator_is_used_by_artifact_and_onboarding_flows(self):
+        for tool_name in ("submit_benchmark_job", "run_fake_node_smoke_benchmark", "install_dependencies"):
+            Tool.name = tool_name
+            blocked = before_tool_callback(Tool(), {"plan_file": "/tmp/plan.json"}, tool_context=None)
+            self.assertIsNotNone(blocked)
+            self.assertEqual(blocked["status"], "needs_confirmation")
+            self.assertTrue(blocked["requires_user_confirmation"])
+
+        Tool.name = "submit_benchmark_job"
+        allowed = before_tool_callback(Tool(), {"plan_file": "/tmp/plan.json", "approved": True}, tool_context=None)
+        self.assertIsNone(allowed)
+
+        class ReadOnlyTool:
+            name = "run_doctor"
+
+        self.assertIsNone(before_tool_callback(ReadOnlyTool(), {}, tool_context=None))
+
+    def test_adk_skeleton_is_offline_safe_and_tool_bounded(self):
+        status = adk_status_payload()
+        self.assertIn(status["status"], {"ready", "not_installed"})
+        self.assertIn("adk", status)
+        self.assertTrue(status["root_instruction_present"])
+        self.assertIn("deterministic benchmark tools", ROOT_INSTRUCTION)
+        self.assertIn("Never install dependencies without explicit user confirmation", ROOT_INSTRUCTION)
+        self.assertIn("Never launch a real benchmark without explicit user confirmation", ROOT_INSTRUCTION)
+        self.assertIn("cite concrete artifact paths", ROOT_INSTRUCTION)
+
+        cli_status = run_agent("adk-status")
+        self.assertEqual(cli_status["root_instruction_present"], status["root_instruction_present"])
+
+    def test_adk_read_only_tool_wrappers_are_structured(self):
+        tools = get_adk_tools(include_actions=False)
+        tool_names = {tool.__name__ for tool in tools}
+        self.assertIn("discover_environment", tool_names)
+        self.assertIn("run_doctor", tool_names)
+        self.assertIn("audit_dependencies", tool_names)
+        self.assertIn("load_framework_capabilities", tool_names)
+        self.assertIn("list_supported_chains", tool_names)
+        self.assertIn("knowledge_search", tool_names)
+        self.assertNotIn("submit_benchmark_job", tool_names)
+
+        root_tool_names = {tool.__name__ for tool in get_adk_tools(include_actions=True)}
+        self.assertIn("run_smoke", root_tool_names)
+        self.assertIn("run_fake_node_smoke_benchmark", root_tool_names)
+        self.assertIn("submit_benchmark_job", root_tool_names)
+
+        capabilities = adk_load_framework_capabilities()
+        self.assertEqual(capabilities["status"], "ok")
+        self.assertFalse(capabilities["requires_user_confirmation"])
+        self.assertEqual(capabilities["data"]["chain_count"], 36)
+        self.assertTrue(capabilities["next_actions"])
+
+        chains = adk_list_supported_chains()
+        self.assertEqual(chains["status"], "ok")
+        self.assertIn("solana", chains["data"]["chains"])
+
+        solana_methods = adk_list_rpc_methods("solana")
+        self.assertEqual(solana_methods["status"], "ok")
+        self.assertEqual(solana_methods["data"]["chain"], "solana")
+        self.assertTrue(solana_methods["next_actions"])
+
+        missing = adk_list_rpc_methods("not-a-chain")
+        self.assertEqual(missing["status"], "not_found")
+        self.assertTrue(missing["warnings"])
+
+    def test_adk_planning_and_action_tools_are_confirmation_gated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            prepared = adk_prepare_benchmark_run(
+                source_prompt="Create a Solana fake-node smoke benchmark at 1 QPS",
+                chain="solana",
+                goal="smoke",
+                rpc_mode="single",
+                use_fake_node=True,
+                qps_max=1,
+                output_dir=str(tmp_path / "prepared"),
+            )
+            self.assertIn(prepared["status"], {"ok", "blocked"})
+            self.assertTrue(Path(prepared["data"]["plan_file"]).is_file())
+            self.assertTrue(Path(prepared["data"]["runbook_file"]).is_file())
+            self.assertIn("inferred_values", prepared["data"])
+            self.assertIn("missing_required", prepared["data"])
+            self.assertIn("questions", prepared["data"])
+
+            request = adk_draft_benchmark_request(
+                source_prompt="Create a Solana fake-node smoke benchmark at 1 QPS",
+                chain="solana",
+                goal="smoke",
+                rpc_mode="single",
+                use_fake_node=True,
+                qps_max=1,
+            )
+            self.assertEqual(request["status"], "ok")
+            self.assertEqual(request["data"]["chain"], "solana")
+
+            structured_request = adk_draft_benchmark_request(
+                source_prompt="benchmark my node",
+                chain="ethereum",
+                goal="stress",
+                rpc_mode="mixed",
+                use_fake_node=False,
+                deployment_type="kubernetes",
+                cloud_provider="gcp",
+                cloud_region="us-central1",
+                cloud_zone="us-central1-a",
+                machine_type="c3-standard-22",
+                blockchain_process_names=["reth", "ethereum"],
+                ledger_device="sdb",
+                data_vol_type="hyperdisk-extreme",
+                data_vol_size="2000",
+                data_vol_max_iops="30000",
+                data_vol_max_throughput="700",
+                accounts_device="sdc",
+                accounts_vol_type="hyperdisk-balanced",
+                accounts_vol_size="500",
+                accounts_vol_max_iops="10000",
+                accounts_vol_max_throughput="300",
+                network_interface="eth0",
+                network_max_bandwidth_gbps="25",
+                qps_initial=100,
+                qps_max=1000,
+                qps_step=100,
+                duration_seconds=300,
+                rpc_methods=["eth_blockNumber", "eth_getBalance"],
+                mixed_weights={"eth_blockNumber": 70, "eth_getBalance": 30},
+            )
+            self.assertEqual(structured_request["data"]["chain"], "ethereum")
+            self.assertEqual(structured_request["data"]["goal"], "stress")
+            self.assertEqual(structured_request["data"]["rpc_mode"], "mixed")
+            self.assertEqual(structured_request["data"]["deployment"]["type"], "kubernetes")
+            self.assertEqual(structured_request["data"]["qps"]["max"], 1000)
+            self.assertEqual(sum(item["weight"] for item in structured_request["data"]["mixed_weighted"]), 100)
+            self.assertEqual(structured_request["data"]["cloud_region"], "us-central1")
+            self.assertEqual(structured_request["data"]["blockchain_process_names"], ["reth", "ethereum"])
+            real_node_request = adk_draft_benchmark_request(
+                source_prompt="benchmark my real Solana node",
+                chain="solana",
+                goal="smoke",
+                rpc_mode="single",
+                use_fake_node=False,
+                target_rpc_url="http://127.0.0.1:8899",
+            )
+            real_node_plan = adk_generate_benchmark_plan(real_node_request["data"])["data"]
+            self.assertEqual(real_node_plan["execution"]["environment"]["LOCAL_RPC_URL"], "http://127.0.0.1:8899")
+            self.assertNotIn("local_rpc_url", real_node_plan["required_inputs"])
+            full_real_plan = adk_generate_benchmark_plan(structured_request["data"])["data"]
+            materialized = full_real_plan["materialized_config"]
+            self.assertEqual(materialized["CLOUD_REGION"], "us-central1")
+            self.assertEqual(materialized["MACHINE_TYPE"], "c3-standard-22")
+            self.assertEqual(materialized["BLOCKCHAIN_PROCESS_NAMES_STR"], "reth ethereum")
+            self.assertEqual(materialized["DATA_VOL_TYPE"], "hyperdisk-extreme")
+            self.assertEqual(materialized["DATA_VOL_SIZE"], "2000")
+            self.assertEqual(materialized["ACCOUNTS_DEVICE"], "sdc")
+            self.assertEqual(materialized["ACCOUNTS_VOL_MAX_IOPS"], "10000")
+            self.assertEqual(materialized["NETWORK_INTERFACE"], "eth0")
+            self.assertEqual(materialized["NETWORK_MAX_BANDWIDTH_GBPS"], "25")
+            self.assertTrue(full_real_plan["chain_template_requirements"]["mixed_weighted"])
+            self.assertIn("custom_rpc_extension_fields", full_real_plan["chain_template_requirements"])
+            self.assertIn("param_spec", full_real_plan["chain_template_requirements"]["custom_rpc_extension_fields"])
+            question_ids = {item["id"] for item in full_real_plan["required_questions"]}
+            self.assertIn("rpc_workload_confirmation", question_ids)
+            self.assertIn("custom_rpc_method_review", question_ids)
+            self.assertIn("rpc_param_samples_confirmation", question_ids)
+            self.assertIn("advanced_config_review", question_ids)
+            disk_discovery = {
+                "source": "test",
+                "deployment": {"type": "vm"},
+                "cloud": {"provider": "gcp", "confidence": 0.9},
+                "disks": {
+                    "candidates": [
+                        {"name": "sda", "type": "disk", "size": "100G", "mountpoint": "/", "fstype": "ext4", "label": ""},
+                        {"name": "sdb", "type": "disk", "size": "2T", "mountpoint": "/var/lib/solana/ledger", "fstype": "xfs", "label": "ledger"},
+                        {"name": "sdc", "type": "disk", "size": "500G", "mountpoint": "/var/lib/solana/accounts", "fstype": "xfs", "label": "accounts"},
+                    ],
+                    "proposed_ledger_device": "sdb",
+                    "proposed_accounts_device": "sdc",
+                    "confidence": 0.9,
+                },
+                "dependencies": {"missing_required": []},
+                "warnings": [],
+            }
+            disk_plan = adk_generate_benchmark_plan(structured_request["data"], discovery=disk_discovery)["data"]
+            disk_question = next(
+                item for item in disk_plan["required_questions"]
+                if item["id"] == "disk_inventory_confirmation"
+            )
+            self.assertEqual(disk_question["proposed_ledger_device"], "sdb")
+            self.assertEqual(disk_question["proposed_accounts_device"], "sdc")
+            self.assertEqual({item["name"] for item in disk_question["candidates"]}, {"sda", "sdb", "sdc"})
+            runtime_env = build_runtime_env(full_real_plan)
+            self.assertEqual(runtime_env["DATA_VOL_TYPE"], "hyperdisk-extreme")
+            self.assertEqual(runtime_env["ACCOUNTS_VOL_TYPE"], "hyperdisk-balanced")
+            self.assertEqual(runtime_env["NETWORK_INTERFACE"], "eth0")
+            self.assertEqual(runtime_env["BLOCKCHAIN_PROCESS_NAMES_STR"], "reth ethereum")
+
+            plan_payload = adk_generate_benchmark_plan(request["data"])
+            self.assertEqual(plan_payload["status"], "ok")
+            plan = plan_payload["data"]
+            self.assertEqual(plan["chain"], "solana")
+            self.assertTrue(plan["use_fake_node"])
+
+            preflight = adk_run_preflight(plan)
+            self.assertEqual(preflight["status"], "ok")
+            self.assertTrue(preflight["data"]["passed"])
+
+            runbook_file = tmp_path / "runbook.md"
+            runbook = adk_render_runbook(plan, output=str(runbook_file))
+            self.assertEqual(runbook["status"], "ok")
+            self.assertTrue(runbook_file.is_file())
+            self.assertIn(str(runbook_file), runbook["evidence_paths"])
+
+            plan_file = tmp_path / "plan.json"
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+            smoke_without_approval = adk_run_smoke(str(plan_file), jobs_dir=str(tmp_path / "jobs"), approved=False)
+            self.assertEqual(smoke_without_approval["status"], "needs_confirmation")
+            self.assertTrue(smoke_without_approval["requires_user_confirmation"])
+
+            smoke = adk_run_smoke(str(plan_file), jobs_dir=str(tmp_path / "jobs"), approved=True)
+            self.assertEqual(smoke["status"], "ok")
+            self.assertEqual(smoke["data"]["job"]["status"], "completed")
+            self.assertTrue(smoke["evidence_paths"])
+
+            fake_node_without_approval = adk_run_fake_node_smoke_benchmark(
+                str(plan_file),
+                jobs_dir=str(tmp_path / "jobs"),
+                approved=False,
+            )
+            self.assertEqual(fake_node_without_approval["status"], "needs_confirmation")
+            self.assertTrue(fake_node_without_approval["requires_user_confirmation"])
+            isolated_plan = _fake_node_smoke_plan(plan_file, tmp_path / "jobs" / "fake_node_smoke")
+            isolated_env = isolated_plan["execution"]["environment"]
+            self.assertTrue(isolated_plan["use_fake_node"])
+            self.assertEqual(isolated_plan["execution"]["runner_mode"], "foreground")
+            self.assertIn("--fake-node", isolated_plan["execution"]["command"])
+            self.assertIn(str(tmp_path / "jobs" / "fake_node_smoke"), isolated_env["BLOCKCHAIN_BENCHMARK_DATA_DIR"])
+            self.assertIn(str(tmp_path / "jobs" / "fake_node_smoke"), isolated_env["MEMORY_SHARE_DIR"])
+            self.assertNotIn("local_rpc_url", isolated_plan.get("required_inputs", []))
+            self.assertNotIn("local_rpc_url", isolated_plan.get("configuration_checklist", {}).get("missing_blockers", []))
+
+            real_without_approval = adk_submit_benchmark_job(str(plan_file), jobs_dir=str(tmp_path / "jobs"), approved=False)
+            self.assertEqual(real_without_approval["status"], "needs_confirmation")
+            self.assertTrue(real_without_approval["requires_user_confirmation"])
+
+            dependency_install_without_approval = adk_install_dependencies(approved=False)
+            self.assertEqual(dependency_install_without_approval["status"], "needs_confirmation")
+            self.assertTrue(dependency_install_without_approval["requires_user_confirmation"])
+
+            audit = adk_audit_dependencies()
+            self.assertIn(audit["status"], {"ok", "needs_dependencies"})
+            self.assertIn("--check", audit["data"]["benchmark"]["command"])
+            self.assertIn("--check", audit["data"]["agent_runtime"]["command"])
+
+    def test_adk_offline_eval_is_contract_based_not_intent_router(self):
+        payload = run_adk_offline_evals()
+        self.assertEqual(payload["status"], "passed")
+        self.assertEqual(payload["case_count"], payload["passed_count"])
+        self.assertIn("contract eval", payload["note"])
+
+    def test_adk_auth_diagnostics_are_safe_and_actionable(self):
+        old_env = os.environ.copy()
+        try:
+            for key in (
+                "LLM_PROVIDER",
+                "LLM_MODEL",
+                "LLM_AUTH_MODE",
+                "GEMINI_API_KEY",
+                "GOOGLE_API_KEY",
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "GOOGLE_CLOUD_PROJECT",
+                "GOOGLE_CLOUD_LOCATION",
+                "GOOGLE_SERVICE_ACCOUNT_EMAIL",
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                "XDG_CONFIG_HOME",
+            ):
+                os.environ.pop(key, None)
+            os.environ.update({
+                "LLM_PROVIDER": "gemini",
+                "LLM_MODEL": "gemini-3.1-pro",
+                "LLM_AUTH_MODE": "google_adc",
+                "GOOGLE_CLOUD_PROJECT": "example-project",
+                "GOOGLE_CLOUD_LOCATION": "us-central1",
+            })
+            with tempfile.TemporaryDirectory() as tmp:
+                os.environ["XDG_CONFIG_HOME"] = tmp
+                auth = adk_inspect_llm_auth()
+            self.assertEqual(auth["status"], "ok")
+            self.assertEqual(auth["data"]["llm"]["auth_mode"], "google_adc")
+            self.assertIn("gcloud", auth["data"])
+            self.assertIn("local_adc", auth["data"])
+            self.assertFalse(auth["data"]["local_adc"]["well_known_file_exists"])
+            self.assertTrue(any("gcloud auth application-default login" in action for action in auth["next_actions"]))
+
+            os.environ["LLM_AUTH_MODE"] = "service_account_file"
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/tmp/nonexistent-service-account.json"
+            auth = adk_inspect_llm_auth()
+            self.assertEqual(auth["status"], "ok")
+            self.assertTrue(auth["data"]["service_account_file"]["configured"])
+            self.assertFalse(auth["data"]["service_account_file"]["file_exists"])
+            serialized = json.dumps(auth).lower()
+            self.assertNotIn("private_key", serialized)
+            self.assertNotIn("access_token", serialized)
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+    def test_adk_startup_state_recovers_latest_file_backed_job(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            request = adk_draft_benchmark_request(
+                source_prompt="Create a Solana fake-node smoke benchmark at 1 QPS",
+                chain="solana",
+                goal="smoke",
+                rpc_mode="single",
+                use_fake_node=True,
+                qps_max=1,
+            )
+            plan = adk_generate_benchmark_plan(request["data"])["data"]
+            plan_file = tmp_path / "plan.json"
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+            jobs_dir = tmp_path / "jobs"
+            smoke = adk_run_smoke(str(plan_file), jobs_dir=str(jobs_dir), approved=True)
+            job = smoke["data"]["job"]
+
+            state = adk_load_startup_state(jobs_dir=jobs_dir)
+            self.assertTrue(state["resume_available"])
+            self.assertEqual(state["latest_job"]["job_id"], job["job_id"])
+            self.assertIn("analyze latest job", state["next_actions"])
+
+            preserved = preserved_state_for_adk(state)
+            self.assertEqual(preserved["job_id"], job["job_id"])
+            self.assertEqual(preserved["job_status"], "completed")
+            self.assertTrue(preserved["runtime_env_file"])
+            self.assertTrue(preserved["artifact_index"])
+
+    def test_adk_enterprise_manifest_describes_tool_boundaries(self):
+        manifest = enterprise_integration_manifest()
+        self.assertEqual(manifest["status"], "ok")
+        self.assertIn("discover_environment", manifest["read_only_tools"])
+        self.assertIn("generate_benchmark_plan", manifest["planning_tools"])
+        self.assertIn("submit_benchmark_job", manifest["confirmation_gated_tools"])
+        self.assertIn("real benchmark launch must follow preflight and smoke", manifest["requirements"])
+        self.assertIn("POST /search", manifest["knowledge_base"]["optional_http_contract"])
+
+    def test_adk_offline_eval_runner_passes(self):
+        payload = run_adk_offline_evals()
+        self.assertEqual(payload["status"], "passed")
+        self.assertEqual(payload["case_count"], payload["passed_count"])
+        cli_payload = run_agent("adk-eval")
+        self.assertEqual(cli_payload["status"], "passed")
+
+    def test_artifact_flow_is_deterministic(self):
         from analyzers.artifact_qa import answer_artifact_question
 
-        class SpyProvider:
-            def __init__(self):
-                self.system_prompts = []
-
-            def complete(self, request):
-                self.system_prompts.append(request.messages[0].content)
-                return LLMResponse(text="spy synthesis", model="spy", provider="spy", raw={})
-
-        provider = SpyProvider()
-        answer = answer_artifact_question("Why are charts empty?", artifact_index=None, llm_provider=provider)
-        self.assertEqual(answer["answer"], "spy synthesis")
-        self.assertIn("Analyze benchmark artifacts", provider.system_prompts[0])
-        self.assertIn("Explain benchmark charts", provider.system_prompts[0])
-
-        provider = SpyProvider()
-        package = generate_onboarding_package(
-            "foochain",
-            ["foo_getBalance"],
-            adapter_family="jsonrpc",
-            llm_provider=provider,
-        )
-        self.assertEqual(package["llm_summary"], "spy synthesis")
-        self.assertIn("onboard a new blockchain node", provider.system_prompts[0])
-        self.assertIn("Design blockchain RPC workloads", provider.system_prompts[0])
+        answer = answer_artifact_question("Why are charts empty?", artifact_index=None)
+        self.assertIn("No artifact evidence", answer["answer"])
 
     def test_http_knowledge_provider_contract(self):
         class Handler(BaseHTTPRequestHandler):

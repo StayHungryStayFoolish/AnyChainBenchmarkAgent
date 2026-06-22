@@ -10,7 +10,6 @@ from typing import Mapping
 
 
 SUPPORTED_LLM_PROVIDERS = {
-    "fake",
     "gemini",
     "claude",
     "openai",
@@ -51,8 +50,6 @@ class LLMConfig:
             errors.append(f"unsupported LLM_PROVIDER: {self.provider}")
         if self.auth_mode not in SUPPORTED_LLM_AUTH_MODES:
             errors.append(f"unsupported LLM_AUTH_MODE: {self.auth_mode}")
-        if self.provider == "fake":
-            return errors
         if self.provider == "openai":
             if self.auth_mode != "api_key":
                 errors.append("LLM_AUTH_MODE=api_key is required for LLM_PROVIDER=openai")
@@ -94,8 +91,8 @@ class LLMConfig:
 
 def load_llm_config(env: Mapping[str, str] | None = None) -> LLMConfig:
     source = env or load_agent_environment()
-    provider = source.get("LLM_PROVIDER", "fake").strip().lower()
-    default_model = "fake"
+    provider = source.get("LLM_PROVIDER", "gemini").strip().lower()
+    default_model = "gemini-3.1-pro"
     if provider == "gemini":
         default_model = "gemini-3.1-pro"
     elif provider == "claude":

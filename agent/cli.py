@@ -12,15 +12,17 @@ from analyzers.result_analyzer import analyze_job
 from analyzers.history import compare_latest, list_history
 from analyzers.artifact_qa import answer_artifact_question
 from analyzers.bottleneck_rules import diagnose_artifacts
+from adk_app.app import status_payload as adk_status_payload
+from adk_app.evals.runner import run_offline_evals as run_adk_offline_evals
+from adk_app.runtime import run_adk_cli
 from diagnostics.doctor import run_doctor
 from discovery.environment import discover_environment
-from knowledge.gap_analyzer import analyze_capability_gap, answer_gap_question
-from knowledge.framework_capabilities import answer_capability_question, load_framework_capabilities
+from knowledge.gap_analyzer import analyze_capability_gap
+from knowledge.framework_capabilities import load_framework_capabilities
 from knowledge.loader import load_knowledge_provider, provider_status
 from llm.config import load_llm_config
 from llm.google_auth import credential_plan
 from llm.providers import provider_from_config
-from llm.runtime import detect_llm_runtime
 from llm.types import LLMMessage, LLMRequest
 from onboarding.chain_onboarding import generate_onboarding_package
 from onboarding.template_drafter import draft_chain_template
@@ -28,35 +30,15 @@ from planners.preflight import run_preflight
 from planners.diff import diff_plans
 from planners.risk import score_plan_risk
 from planners.strategy_planner import generate_plan, load_json, validate_plan_shape, write_json
-from qa.framework_answers import answer_framework_question, out_of_scope_response
-from qa.intent_router import route_intent
-from qa.llm_drafter import draft_request_with_llm
-from qa.request_drafter import draft_request
 from runners.job_manager import get_job, list_jobs, resume_job, submit_job, tail_job_log
 from runners.runbook import render_runbook
 from tools.executor import execute_tool, load_arguments
 from tools.schema import tool_schema
-from workflows.onboarding_request import answer_onboarding_request
-from wizard import run_wizard
-from chat import run_chat
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="AnyChain Benchmark Agent control-plane CLI")
     sub = parser.add_subparsers(dest="command", required=True)
-
-    draft = sub.add_parser("draft-request", help="Draft a request JSON from a natural-language prompt")
-    draft.add_argument("--prompt", required=True)
-    draft.add_argument("--output")
-    draft.add_argument("--mock-llm", action="store_true", help="Use the offline fake LLM provider")
-
-    route = sub.add_parser("route-intent", help="Classify a prompt before planning")
-    route.add_argument("--prompt", required=True)
-    route.add_argument("--mock-llm", action="store_true")
-
-    ask = sub.add_parser("ask", help="Answer framework questions from local docs or report out-of-scope")
-    ask.add_argument("--prompt", required=True)
-    ask.add_argument("--mock-llm", action="store_true")
 
     capabilities = sub.add_parser("capabilities", help="Show dynamic framework capability inventory")
     capabilities.add_argument("--output")
@@ -115,7 +97,6 @@ def main(argv: list[str] | None = None) -> int:
 
     llm_smoke = sub.add_parser("llm-smoke", help="Run a model provider smoke test")
     llm_smoke.add_argument("--prompt", default='Return JSON only: {"ok": true}')
-    llm_smoke.add_argument("--mock", action="store_true", help="Use the offline fake provider")
 
     tool_schema_cmd = sub.add_parser("tool-schema", help="Print OpenAI-compatible tool schema for enterprise Agent platforms")
     tool_schema_cmd.add_argument("--output")
@@ -167,59 +148,18 @@ def main(argv: list[str] | None = None) -> int:
     runbook.add_argument("--plan", required=True)
     runbook.add_argument("--output")
 
-    wizard = sub.add_parser("wizard", help="Prompt-first interactive benchmark wizard")
-    wizard.add_argument("--prompt")
-    wizard.add_argument("--output-dir")
-    wizard.add_argument("--yes", action="store_true", help="Auto-approve for non-interactive tests")
-    wizard.add_argument("--mock", action="store_true", help="Submit a lifecycle-only mock job")
-    wizard.add_argument("--quiet", action="store_true", help="Suppress human-readable wizard output on stderr")
-    wizard.add_argument("--answers-file", help="JSON object with answers keyed by required question id")
-    wizard.add_argument("--mock-llm", action="store_true", help="Use the offline fake LLM provider")
+    chat = sub.add_parser("chat", help="Run the official ADK CLI for the AnyChain agent")
+    chat.add_argument("--prompt", help="Send one prompt to the ADK CLI through stdin, then exit")
+    chat.add_argument("--agent-dir", default=None)
+    chat.add_argument("--adk-bin", default="adk")
+    chat.add_argument("adk_arg", nargs=argparse.REMAINDER)
 
-    chat = sub.add_parser("chat", help="Start the terminal Agent chat session")
-    chat.add_argument("--prompt", help="Run one prompt and exit")
-    chat.add_argument("--output-dir", default=".agent/chat")
-    chat.add_argument("--mock-llm", action="store_true", help="Use the offline fake LLM provider")
+    adk_status_cmd = sub.add_parser("adk-status", help="Show optional ADK runtime availability")
+    adk_status_cmd.add_argument("--output")
+
+    sub.add_parser("adk-eval", help="Run no-key ADK package and tool-contract checks")
 
     args = parser.parse_args(argv)
-
-    if args.command == "draft-request":
-        llm_runtime = detect_llm_runtime(mock_provider=_fake_provider() if args.mock_llm else None)
-        payload = draft_request_with_llm(args.prompt, provider=llm_runtime.provider) if llm_runtime.enabled else draft_request(args.prompt)
-        return _emit(payload, args.output)
-
-    if args.command == "route-intent":
-        llm_runtime = detect_llm_runtime(mock_provider=_fake_provider() if args.mock_llm else None)
-        return _emit(route_intent(args.prompt, provider=llm_runtime.provider, use_llm=llm_runtime.enabled), None)
-
-    if args.command == "ask":
-        llm_runtime = detect_llm_runtime(mock_provider=_fake_provider() if args.mock_llm else None)
-        route_payload = route_intent(args.prompt, provider=llm_runtime.provider, use_llm=llm_runtime.enabled)
-        if route_payload["intent"] == "out_of_scope":
-            return _emit({**route_payload, **out_of_scope_response(args.prompt)}, None)
-        if route_payload["intent"] == "onboarding_request":
-            return _emit(
-                {
-                    "intent": "onboarding_request",
-                    "answer": answer_onboarding_request(
-                        args.prompt,
-                        llm_provider=llm_runtime.provider if llm_runtime.enabled else None,
-                    ),
-                    "route": route_payload,
-                },
-                None,
-            )
-        if route_payload["intent"] == "benchmark_request":
-            request = draft_request_with_llm(args.prompt, provider=llm_runtime.provider) if llm_runtime.enabled else draft_request(args.prompt)
-            return _emit({"intent": "benchmark_request", "request": request, "route": route_payload}, None)
-        capability_answer = answer_capability_question(args.prompt)
-        if capability_answer:
-            return _emit({**capability_answer, "route": route_payload}, None)
-        gap_answer = answer_gap_question(args.prompt)
-        if gap_answer:
-            return _emit({**gap_answer, "route": route_payload}, None)
-        answer = answer_framework_question(args.prompt)
-        return _emit({**answer, "route": route_payload}, None)
 
     if args.command == "capabilities":
         return _emit(load_framework_capabilities(), args.output)
@@ -228,14 +168,12 @@ def main(argv: list[str] | None = None) -> int:
         return _emit(analyze_capability_gap(args.chain, args.method), None)
 
     if args.command == "onboarding-plan":
-        llm_runtime = detect_llm_runtime()
         return _emit(
             generate_onboarding_package(
                 args.chain,
                 methods=args.method,
                 adapter_family=args.adapter_family,
                 rpc_mode=args.rpc_mode,
-                llm_provider=llm_runtime.provider if llm_runtime.enabled else None,
             ),
             None,
         )
@@ -247,13 +185,11 @@ def main(argv: list[str] | None = None) -> int:
         job = None
         if args.job_id:
             job = get_job(args.job_id, jobs_dir=args.jobs_dir) if args.jobs_dir else get_job(args.job_id)
-        llm_runtime = detect_llm_runtime()
         return _emit(
             answer_artifact_question(
                 args.question,
                 job=job,
                 artifact_index=args.artifact_index,
-                llm_provider=llm_runtime.provider if llm_runtime.enabled else None,
             ),
             None,
         )
@@ -316,7 +252,7 @@ def main(argv: list[str] | None = None) -> int:
         return _emit(payload, args.output)
 
     if args.command == "llm-smoke":
-        provider = _fake_provider() if args.mock else provider_from_config()
+        provider = provider_from_config()
         response = provider.complete(
             LLMRequest(
                 messages=[
@@ -381,24 +317,24 @@ def main(argv: list[str] | None = None) -> int:
         print(text, end="")
         return 0
 
-    if args.command == "wizard":
-        payload = run_wizard(
-            prompt=args.prompt,
-            output_dir=args.output_dir,
-            yes=args.yes,
-            mock=args.mock,
-            answers=load_json(args.answers_file) if args.answers_file else None,
-            quiet=args.quiet,
-            llm_provider=_fake_provider() if args.mock_llm else None,
-        )
-        return _emit(payload, None)
-
     if args.command == "chat":
-        return run_chat(
-            prompt=args.prompt,
-            output_dir=args.output_dir,
-            llm_provider=_fake_provider() if args.mock_llm else None,
-        )
+        runtime_args: list[str] = []
+        if args.prompt:
+            runtime_args.extend(["--prompt", args.prompt])
+        if args.agent_dir:
+            runtime_args.extend(["--agent-dir", args.agent_dir])
+        if args.adk_bin:
+            runtime_args.extend(["--adk-bin", args.adk_bin])
+        runtime_args.extend(args.adk_arg or [])
+        return run_adk_cli(runtime_args)
+
+    if args.command == "adk-status":
+        return _emit(adk_status_payload(), args.output)
+
+    if args.command == "adk-eval":
+        payload = run_adk_offline_evals()
+        _emit(payload, None)
+        return 0 if payload["status"] == "passed" else 1
 
     parser.error(f"unsupported command: {args.command}")
     return 2
@@ -422,13 +358,6 @@ def _print_dry_run(plan: dict) -> None:
     print(f"  Command: {' '.join(plan['execution']['command'])}", file=sys.stderr)
     if plan["required_inputs"]:
         print(f"  Missing required inputs: {', '.join(plan['required_inputs'])}", file=sys.stderr)
-
-
-def _fake_provider():
-    from llm.config import LLMConfig
-    from llm.providers import FakeProvider
-
-    return FakeProvider(LLMConfig(provider="fake", model="fake"))
 
 
 if __name__ == "__main__":

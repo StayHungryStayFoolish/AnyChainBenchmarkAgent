@@ -1,0 +1,10 @@
+# Optional ADK runtime dependencies.
+#
+# Install in an isolated virtual environment. Do not install into the host
+# Python used by blockchain nodes.
+#
+# Google ADK runtime dependencies emit warnings on Python 3.9. Use Python 3.10+
+# for ADK runtime testing and production Agent usage.
+
+google-adk
+

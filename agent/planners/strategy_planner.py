@@ -8,9 +8,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+from planners.chain_template_requirements import inspect_chain_template
 from planners.config_checklist import build_configuration_checklist, missing_required_from_checklist
 from planners.risk import score_plan_risk
-from qa.questions import required_questions
+from planners.config_questions import required_questions
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -90,17 +91,6 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
         ).lower(),
         "OBSERVABILITY_STACK_MODE": request.get("observability", {}).get("mode", "local"),
     }
-    materialized_config = {
-        "LEDGER_DEVICE": request.get("ledger_device", ""),
-        "ACCOUNTS_DEVICE": request.get("accounts_device", ""),
-        "BLOCKCHAIN_PROCESS_NAMES_STR": " ".join(request.get("blockchain_process_names", []))
-        if isinstance(request.get("blockchain_process_names"), list)
-        else request.get("blockchain_process_names", ""),
-        "DATA_VOL_MAX_IOPS": request.get("data_vol_max_iops", ""),
-        "DATA_VOL_MAX_THROUGHPUT": request.get("data_vol_max_throughput", request.get("data_vol_max_throughput_mibs", "")),
-        "NETWORK_MAX_BANDWIDTH_GBPS": request.get("network_max_bandwidth_gbps", ""),
-    }
-
     discovery_payload = discovery or request.get("discovery") or {
         "source": "not_collected",
         "warnings": ["Environment discovery was not collected for this plan."],
@@ -108,6 +98,35 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
     deployment = request.get("deployment", {"type": "unknown"})
     if deployment.get("type") == "unknown" and discovery_payload.get("deployment", {}).get("type"):
         deployment = {"type": discovery_payload["deployment"]["type"], "provider": discovery_payload.get("cloud", {}).get("provider", "")}
+
+    materialized_config = {
+        "CLOUD_PROVIDER": deployment.get("provider") or discovery_payload.get("cloud", {}).get("provider", ""),
+        "REPORT_CLOUD_PROVIDER": deployment.get("provider") or discovery_payload.get("cloud", {}).get("provider", ""),
+        "CLOUD_REGION": request.get("cloud_region", ""),
+        "CLOUD_ZONE": request.get("cloud_zone", ""),
+        "MACHINE_TYPE": request.get("machine_type", ""),
+        "LEDGER_DEVICE": request.get("ledger_device", ""),
+        "ACCOUNTS_DEVICE": request.get("accounts_device", ""),
+        "BLOCKCHAIN_PROCESS_NAMES_STR": " ".join(request.get("blockchain_process_names", []))
+        if isinstance(request.get("blockchain_process_names"), list)
+        else request.get("blockchain_process_names", ""),
+        "DATA_VOL_TYPE": request.get("data_vol_type", ""),
+        "DATA_VOL_SIZE": request.get("data_vol_size", ""),
+        "DATA_VOL_MAX_IOPS": request.get("data_vol_max_iops", ""),
+        "DATA_VOL_MAX_THROUGHPUT": request.get("data_vol_max_throughput", request.get("data_vol_max_throughput_mibs", "")),
+        "ACCOUNTS_VOL_TYPE": request.get("accounts_vol_type", ""),
+        "ACCOUNTS_VOL_SIZE": request.get("accounts_vol_size", ""),
+        "ACCOUNTS_VOL_MAX_IOPS": request.get("accounts_vol_max_iops", ""),
+        "ACCOUNTS_VOL_MAX_THROUGHPUT": request.get("accounts_vol_max_throughput", ""),
+        "NETWORK_INTERFACE": request.get("network_interface", ""),
+        "NETWORK_MAX_BANDWIDTH_GBPS": request.get("network_max_bandwidth_gbps", ""),
+        "CHAIN_REST_URL": request.get("chain_rest_url", ""),
+        "CHAIN_INDEXER_URL": request.get("chain_indexer_url", ""),
+        "CHAIN_SIDECAR_URL": request.get("chain_sidecar_url", ""),
+        "CHAIN_EVM_RPC_URL": request.get("chain_evm_rpc_url", ""),
+        "CHAIN_JSON_RPC_URL": request.get("chain_json_rpc_url", ""),
+        "CHAIN_MIRROR_URL": request.get("chain_mirror_url", ""),
+    }
 
     plan_id = f"plan_{int(time.time())}"
     plan = {
@@ -137,6 +156,7 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
         "bottleneck_focus": request.get("bottleneck_focus", []),
         "confirmed_inputs": sorted(confirmations),
         "materialized_config": materialized_config,
+        "chain_template_requirements": inspect_chain_template(chain),
         "required_inputs": required_inputs,
         "advanced_defaults": {
             "qps": qps,

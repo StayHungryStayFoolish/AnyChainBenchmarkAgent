@@ -15,9 +15,6 @@
     "use_fake_node": {"type": "boolean"},
     "recommended_initial_validation": {"type": "string", "enum": ["smoke"]},
     "source_prompt": {"type": "string"},
-    "llm_status": {"type": "string", "enum": ["accepted", "fallback"]},
-    "llm_source": {"type": "string"},
-    "llm_error": {"type": "string"},
     "deployment": {
       "type": "object",
       "properties": {
