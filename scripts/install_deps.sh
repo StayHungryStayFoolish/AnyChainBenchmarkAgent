@@ -12,6 +12,11 @@
 #   - Does NOT run any benchmark
 #   - Does NOT touch .git or any source files
 #   - Does NOT modify system Python packages by default
+#   - Does NOT install Agent runtime dependencies
+#
+# For Agent runtime dependencies, including Google ADK and optional gcloud:
+#   bash scripts/install_agent_deps.sh --yes
+#   bash scripts/install_agent_deps.sh --yes --with-gcloud
 #
 # After this script finishes, you still run:
 #   ./blockchain_node_benchmark.sh --quick

@@ -83,7 +83,10 @@ Development locations:
 - `agent/knowledge/base.py`: provider contract.
 - `agent/knowledge/http_provider.py`: generic HTTP adapter.
 - `agent/knowledge/loader.py`: provider selection.
-- `agent/prompts/kb_grounding.md`: how KB evidence is used.
+- `agent/adk_app/instructions.py`: how ADK should ground KB evidence and avoid
+  unsupported claims.
+- `agent/adk_app/tools/read_only.py`: ADK read-only tools that expose KB search
+  and local capability evidence.
 - `agent/cli.py`: smoke commands and integration entrypoints.
 
 Expected contract:
@@ -107,7 +110,6 @@ Validation:
 
 ```bash
 python3 agent/cli.py knowledge-smoke
-python3 agent/cli.py ask --prompt "What chains and RPC methods do you support?"
 python3 -m unittest tests.test_agent_runtime_contract -v
 ```
 
@@ -131,7 +133,9 @@ Development locations:
 - `config/agent_config.sh`: LLM, Google auth, and optional KB defaults.
 - `agent/runners/job_manager.py`: job status, artifact index, and detached run
   lifecycle.
-- `agent/prompts/`: domain prompts used by the Agent workflows.
+- `agent/adk_app/instructions.py`: root ADK instruction.
+- `agent/adk_app/tools/`: ADK function-tool wrappers.
+- `agent/adk_app/evals/`: no-key ADK package and tool-contract checks.
 
 Supported integration modes:
 

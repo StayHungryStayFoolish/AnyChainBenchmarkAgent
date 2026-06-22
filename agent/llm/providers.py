@@ -12,43 +12,6 @@ from llm.google_auth import get_google_access_token
 from llm.types import LLMMessage, LLMProvider, LLMRequest, LLMResponse
 
 
-class FakeProvider:
-    """Deterministic provider for offline Agent contract tests."""
-
-    def __init__(self, config: LLMConfig):
-        self.config = config
-
-    def complete(self, request: LLMRequest) -> LLMResponse:
-        text = "\n".join(message.content for message in request.messages)
-        lowered = text.lower()
-        if "intent" in lowered:
-            payload = {
-                "intent": "framework_question" if "how" in lowered or "what" in lowered else "benchmark_request",
-                "confidence": 0.8,
-                "reason": "offline fake provider contract response",
-            }
-        elif "return json" in lowered or "benchmark request" in lowered:
-            payload = {
-                "chain": "solana" if "solana" in lowered else "",
-                "goal": "max_stable_qps" if "max" in lowered or "maximum" in lowered else "baseline",
-                "rpc_mode": "mixed" if "mixed" in lowered else "single",
-                "use_fake_node": "fake" in lowered or "mock" in lowered,
-                "deployment": {
-                    "type": "kubernetes" if "gke" in lowered or "kubernetes" in lowered else "unknown",
-                    "provider": "gcp" if "gke" in lowered or "gcp" in lowered or "google" in lowered else "",
-                },
-                "bottleneck_focus": ["disk"] if "disk" in lowered else ["cpu", "memory", "disk", "network", "rpc_errors"],
-            }
-        else:
-            payload = {"ok": True, "provider": "fake", "message": "offline smoke response"}
-        return LLMResponse(
-            text=json.dumps(payload, sort_keys=True),
-            model=self.config.model or "fake",
-            provider="fake",
-            raw=payload,
-        )
-
-
 class OpenAIProvider:
     def __init__(self, config: LLMConfig):
         self.config = config
@@ -227,8 +190,6 @@ def provider_from_config(config: LLMConfig | None = None) -> LLMProvider:
     errors = config.validate()
     if errors:
         raise ValueError("; ".join(errors))
-    if config.provider == "fake":
-        return FakeProvider(config)
     if config.provider == "openai":
         return OpenAIProvider(config)
     if config.provider == "gemini":

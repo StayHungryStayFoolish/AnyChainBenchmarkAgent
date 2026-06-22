@@ -9,14 +9,12 @@ from typing import Any
 
 from analyzers.bottleneck_rules import diagnose_artifacts, format_diagnostics
 from analyzers.chart_explainer import explain_charts, format_chart_explanation
-from llm.orchestrator import synthesize_with_fallback
 
 
 def answer_artifact_question(
     question: str,
     job: dict[str, Any] | None = None,
     artifact_index: str | Path | None = None,
-    llm_provider: Any | None = None,
 ) -> dict[str, Any]:
     lowered = question.lower()
     if not any(token in lowered for token in ("artifact", "report", "chart", "csv", "empty", "bottleneck", "evidence", "图表", "报告", "瓶颈", "为空")):
@@ -56,25 +54,13 @@ def answer_artifact_question(
         findings.append("No artifact evidence was registered for this job.")
     chart_explanation = explain_charts(evidence)
     diagnostics = diagnose_artifacts(job=job, artifact_index=artifact_index)
-    deterministic_answer = (
+    answer = (
         "Artifact inspection summary:\n"
         + "\n".join(f"- {item}" for item in findings)
         + "\n\n"
         + format_chart_explanation(chart_explanation)
         + "\n\n"
         + format_diagnostics(diagnostics)
-    )
-    answer = synthesize_with_fallback(
-        llm_provider,
-        "artifact_analysis",
-        json.dumps({
-            "question": question,
-            "artifact_findings": findings,
-            "chart_explanation": chart_explanation,
-            "diagnostics": diagnostics,
-        }, indent=2, sort_keys=True),
-        deterministic_answer,
-        max_tokens=1800,
     )
     return {
         "intent": "framework_question",

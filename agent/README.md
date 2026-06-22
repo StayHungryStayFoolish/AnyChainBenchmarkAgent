@@ -1,460 +1,185 @@
-# AnyChain Benchmark Agent
+# AnyChain ADK Agent
 
-The Agent is a control plane for the existing benchmark engine. It turns user
-intent into structured benchmark plans, runs dry-run/preflight checks, submits
-background jobs, and analyzes artifacts after execution.
-
-The first implementation is deterministic and does not require an LLM. This is
-intentional: CI and local support workflows need the same runtime contract that
-the future prompt-first Agent will use.
-
-## UX Principles
-
-- Users describe goals; the Agent translates them into plans.
-- The Agent discovers safely before asking.
-- Advanced values default conservatively and are shown before execution.
-- Host dependency changes require explicit approval.
-- Final analysis must cite concrete artifacts.
-
-## Workload Requirements
-
-The Agent must support the same RPC workload model as the benchmark engine:
-
-- single mode with one selected RPC method.
-- mixed mode with weighted RPC methods.
-- custom RPC methods that use the chain template contracts for `rpc_methods`,
-  `param_formats`, REST path bindings, and optional `param_spec`.
-
-Plans must preserve method names, weights, and params so target generation,
-fake-node coverage checks, proxy telemetry, per-method success/error counts,
-and P50/P90/P99 latency attribution stay aligned.
-
-## Runtime Contract
-
-```text
-request -> plan -> preflight -> job -> status -> analysis
-```
-
-Phase 2 expands this contract with safe discovery:
-
-```text
-prompt/request -> discovery -> plan -> preflight -> job -> status -> analysis
-```
-
-Discovery and dependency checks must be read-only by default. The Agent should
-prefer Docker or a project-local virtual environment and must not install,
-upgrade, or replace system dependencies without explicit user confirmation.
-
-LLM output is never executed directly. When enabled, the model can only produce
-an intent classification or a benchmark request draft. The Agent then applies
-deterministic normalization, schema checks, preflight checks, command
-allowlists, and approval checkpoints before any benchmark command runs.
-
-## Phase 2 Reliability
-
-The Agent must implement these controls before it is considered Phase 2 ready:
-
-- plan confidence and `requires_confirmation`.
-- command safety guardrails.
-- runbook mode for auditable execution.
-- terminal chat entrypoint and interactive wizard.
-- plan diff with config snapshots.
-- artifact index generation.
-- secret redaction.
-- machine-readable JSON output.
-- result grading: `PASS`, `WARNING`, `FAIL`, `INCONCLUSIVE`.
-- experiment history comparison.
-- human approval checkpoints for execution, dependency changes, and
-  stress/intensive tests.
-
-## Analysis Evidence
-
-Final Agent analysis must include the files and endpoints used as evidence:
-
-- HTML report.
-- archive `test_summary.json`.
-- proxy/per-method CSV.
-- performance CSV.
-- sync-health data when relevant.
-- job-local `runtime.env`, which records the exact environment values used for
-  this run.
-- optional Prometheus/Grafana URLs or exporter endpoint.
-
-## Runtime Config Materialization
-
-The Agent does not edit `config/user_config.sh` when it turns QA answers or
-discovered values into executable settings. At job submission time it writes a
-job-local env file:
-
-```text
-.agent/jobs/<job_id>/runtime.env
-```
-
-Real benchmark execution loads this file, and the artifact index records it as
-evidence. This keeps Agent-generated runtime values reproducible without
-polluting the user's default configuration.
-
-## Terminal Entry
-
-The user-facing entrypoint is the terminal Agent:
+`agent/` contains the Google ADK control plane for the benchmark engine. The
+human-facing Agent entrypoint is ADK-only:
 
 ```bash
 ./bin/anychain-agent
 ```
 
-Users can ask framework questions, create plans, run preflight, submit mock
-jobs, inspect status, and analyze artifacts in one session:
+The old custom chat loop, wizard, intent router, workflow router, and prompt
+orchestrator have been removed. Reusable benchmark tools remain available as
+deterministic modules and ADK function tools.
+
+## Runtime Contract
 
 ```text
-anychain> doctor
-anychain> What chains and RPC methods do you support?
-anychain> Create a Solana fake-node smoke benchmark at 1 QPS
-anychain> set max qps to 5000
-anychain> change mixed weights to getSlot 70%, getBlockHeight 30%
-anychain> plan
-anychain> preflight
-anychain> run mock
-anychain> analyze
-anychain> compact
-anychain> memory
+user message
+-> ADK instruction and model reasoning
+-> prepare_benchmark_run
+-> preflight, runbook, and user confirmation
+-> lifecycle smoke or isolated fake-node benchmark smoke
+-> confirmation-gated benchmark job
+-> artifact index
+-> evidence-based analysis
 ```
 
-`doctor` is a read-only readiness check. It reports dependency gaps,
-cloud/deployment hints, LLM/Vertex configuration errors, and live capability
-coverage before the user starts a real benchmark.
+ADK may help interpret the user's intent, but benchmark execution still uses
+the repository's deterministic tools. LLM output is never executed directly.
 
-Long chat sessions use deterministic context compaction. The `compact` command
-writes `.agent/chat/memory.json` with the current request, plan, job, evidence
-paths, open questions, and recent turns. This keeps the local Agent usable
-without an LLM and gives future LLM providers a bounded context contract. The
-default window is `1,000,000` estimated tokens with a `0.7` trigger ratio.
+## Main Modules
 
-The lower-level `agent/cli.py` subcommands are kept for tests, CI, automation,
-and advanced scripting.
+- `adk_app/instructions.py`: root ADK instruction and migration boundary.
+- `adk_app/root_agent.py`: optional real ADK `Agent` construction.
+- `adk_app/agent.py`: official ADK discovery module exposing `root_agent`.
+- `adk_app/runtime.py`: thin bridge to the official `adk run` CLI.
+- `adk_app/tools/`: ADK function-tool wrappers around deterministic modules.
+- `adk_app/evals/`: no-key ADK package and tool-contract checks.
+- `planners/`, `runners/`, `analyzers/`, `knowledge/`, `onboarding/`: benchmark
+  engine control-plane tools reused by ADK.
 
-## Configuration And Runtime Priority
+## ADK Runtime Use
 
-Agent defaults live in `config/agent_config.sh`. Benchmark engine defaults live
-in `config/user_config.sh`.
-
-When the Agent submits a job, it writes `.agent/jobs/<job_id>/runtime.env`.
-That file is the final configuration snapshot for the job. For Agent-launched
-benchmark runs, `runtime.env` is injected into the child process environment and
-therefore has higher priority than defaults in `config/user_config.sh`. Users
-should not edit `runtime.env`; it is evidence for reproducibility and analysis.
-
-## CLI Preview
-
-Create a request from a prompt:
+Install the ADK runtime in an isolated Python 3.10+ environment:
 
 ```bash
-python3 agent/cli.py draft-request \
-  --prompt "Test Solana maximum stable QPS on GKE with fake-node smoke first" \
-  --output /tmp/agent_request.json
+bash scripts/install_agent_deps.sh --yes
 ```
 
-If `config/agent_config.sh` contains a valid real LLM provider, request
-drafting and intent routing use it automatically. If not, the Agent falls back
-to deterministic parsing and repository-grounded answers.
+`./bin/anychain-agent` automatically prefers `.venv-adk/bin/adk`, so users do
+not need to activate the venv before starting the Agent.
 
-Run the same flow with the offline fake provider for local contract tests:
+Then start the human-facing Agent:
 
 ```bash
-python3 agent/cli.py draft-request \
-  --prompt "Test Solana maximum stable QPS on GKE with fake-node smoke first" \
-  --mock-llm
+./bin/anychain-agent
 ```
 
-Classify or answer a prompt before planning:
+This delegates to:
 
 ```bash
-python3 agent/cli.py route-intent --prompt "How do I configure mixed RPC weights?"
-python3 agent/cli.py ask --prompt "How do I use fake-node for local closed-loop testing?"
+adk run agent/adk_app
 ```
 
-Inspect the Agent's dynamic view of framework capabilities:
+Natural-language benchmark requests should be handled by the ADK model through
+the registered function tools:
+
+```text
+Prepare a Solana fake-node smoke benchmark at 1 QPS
+Run a real fake-node benchmark smoke only after I approve it
+```
+
+The ADK runtime should call planning, preflight, action, and read-only tools as
+needed. The old local terminal facade has been removed.
+
+Detached benchmark jobs write:
+
+```text
+.agent/jobs/<job_id>/job.json
+.agent/jobs/<job_id>/artifact_index.json
+.agent/jobs/<job_id>/runtime.env
+```
+
+`runtime.env` is the per-job final configuration artifact. Users should not edit
+it by hand.
+
+## CLI Tools For Automation
+
+`python3 agent/cli.py` exposes JSON commands for CI and enterprise Agent
+platforms:
 
 ```bash
+python3 agent/cli.py adk-status
+python3 agent/cli.py adk-eval
 python3 agent/cli.py capabilities
-python3 agent/cli.py ask --prompt "How many chains and RPC methods does the framework support?"
-```
-
-Capability questions are answered from the current repository state, not from a
-static README paragraph. The Agent reads `config/chains/*.json` and
-`tools/fake-node/fixtures/` to report supported chains, adapter families,
-configured RPC methods, and fake-node fixture coverage.
-
-Analyze support gaps before adding a new chain or RPC method:
-
-```bash
-python3 agent/cli.py gap-analysis \
-  --chain solana \
-  --method getBalance \
-  --method customMethod
-```
-
-For secondary development, the Agent should produce an onboarding plan,
-checklist, template gaps, and validation commands. It should not autonomously
-edit chain templates or execute arbitrary generated code just because an LLM
-suggested it. Users can review the plan, apply changes, then validate with
-fake-node and preflight.
-
-Generate a plan:
-
-```bash
-python3 agent/cli.py plan \
-  --request /tmp/agent_request.json \
-  --output /tmp/agent_plan.json \
-  --dry-run
-```
-
-Generate a plan with read-only discovery:
-
-```bash
-python3 agent/cli.py plan \
-  --request /tmp/agent_request.json \
-  --output /tmp/agent_plan.json \
-  --discover \
-  --dry-run
-```
-
-Run preflight:
-
-```bash
-python3 agent/cli.py preflight --plan /tmp/agent_plan.json
-```
-
-Score plan risk:
-
-```bash
-python3 agent/cli.py risk-score --plan /tmp/agent_plan.json
-```
-
-Run read-only discovery:
-
-```bash
-python3 agent/cli.py discover --output /tmp/agent_discovery.json
-```
-
-Start the prompt-first wizard:
-
-```bash
-python3 agent/cli.py wizard
-```
-
-Provide answers non-interactively:
-
-```bash
-python3 agent/cli.py wizard \
-  --prompt "Run a baseline benchmark on my node" \
-  --answers-file /tmp/agent_answers.json \
-  --quiet
-```
-
-Submit a lifecycle-only mock job:
-
-```bash
-python3 agent/cli.py submit --plan /tmp/agent_plan.json --mock
-```
-
-Submit a real benchmark job only after approval checkpoints are satisfied:
-
-```bash
-python3 agent/cli.py submit --plan /tmp/agent_plan.json --approved
-```
-
-Query or analyze:
-
-```bash
+python3 agent/cli.py tool-call --name prepare_benchmark_run --arguments '{"chain":"solana","goal":"smoke","rpc_mode":"single","use_fake_node":true}'
+python3 agent/cli.py plan --request /tmp/request.json --output /tmp/plan.json --dry-run
+python3 agent/cli.py preflight --plan /tmp/plan.json
+python3 agent/cli.py submit --plan /tmp/plan.json --mock
 python3 agent/cli.py status --job-id <job_id>
 python3 agent/cli.py analyze --job-id <job_id>
-python3 agent/cli.py artifact-qa --job-id <job_id> --question "Why are charts empty?"
-python3 agent/cli.py diagnose-artifacts --artifact-index .agent/jobs/<job_id>/artifact_index.json
-python3 agent/cli.py jobs
-python3 agent/cli.py resume --job-id <job_id>
-python3 agent/cli.py logs --job-id <job_id>
+python3 agent/cli.py tool-schema
+python3 agent/cli.py tool-call --name load_capabilities
 ```
 
-`artifact-qa` includes chart-level explanations for performance overview,
-CPU-disk correlation, disk thresholds, per-method attribution, sync health, and
-monitoring overhead. It reports whether each chart is available, empty, missing
-input data, or missing expected columns.
-
-`diagnose-artifacts` adds deterministic bottleneck rules for CPU saturation,
-disk latency/queueing, disk IOPS or throughput pressure, RPC method
-errors/latency, and sync-health warnings.
-
-For long-running jobs, `resume` and `logs` are file-backed and can be called
-from a later Agent session. Optional webhook notifications are controlled by
-`AGENT_NOTIFY_WEBHOOK_URL` and `AGENT_NOTIFY_ON`; they are disabled by default.
-
-Inside `./bin/anychain-agent`, type `trace` to inspect the recent workflow
-graph decisions. The trace is written to `.agent/chat/workflow_trace.jsonl` and
-records intent, selected workflow, prompt bundle, deterministic tools, artifact
-paths, fallback mode, and next actions.
-
-Type `checklist` after creating a plan to see the next missing configuration
-item. The Agent accepts either a direct value or `answer <value>`, then
-regenerates the plan, preflight state, and runbook.
-
-Default real execution is detached/background. The Agent starts a worker process
-that continues after the terminal session disconnects, writes job state to
-`.agent/chat/jobs/<job_id>/job.json`, and writes benchmark output to
-`.agent/chat/jobs/<job_id>/benchmark.log`. Restarting `./bin/anychain-agent`
-from the same output directory restores the latest job metadata and suggests
-`status`, `logs`, `analyze`, or `qa`. Type `run in foreground` before `yes run`
-only when you intentionally want terminal-bound execution.
-
-Generate plugin-style onboarding guidance for secondary development:
+Real benchmark submission is confirmation-gated:
 
 ```bash
-python3 agent/cli.py onboarding-plan \
-  --chain foochain \
-  --adapter-family jsonrpc \
-  --method foo_getBalance \
-  --method foo_getBlock
+python3 agent/cli.py submit --plan /tmp/plan.json --approved
 ```
 
-The output includes workload snippets, fake-node fixture steps, and validation
-commands so enterprise teams can add chains or RPC methods without guessing the
-framework contracts.
+## LLM And Google Auth
 
-Generate a conservative chain template draft:
+Persistent Agent defaults live in:
+
+```text
+config/agent_config.sh
+```
+
+The human-facing Agent model is executed by ADK. These provider settings are
+used to resolve the configured model name and to provide safe setup diagnostics;
+direct provider adapters are dev/test diagnostics, not the ADK runtime.
+
+Supported provider modes:
+
+- `gemini`: Gemini API key, Google ADC, attached service account,
+  service-account impersonation, or JSON key file.
+- `claude`: Anthropic API key or Claude on Vertex AI with Google auth.
+- `openai`: OpenAI API key.
+
+At minimum, configure `LLM_PROVIDER`, `LLM_MODEL`, `LLM_AUTH_MODE`, and the
+matching provider credential. For Vertex AI, also configure
+`GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION`.
+
+Google Cloud CLI is needed only for local ADC workflows such as
+`LLM_AUTH_MODE=google_adc`, or when the host must create ADC before
+service-account impersonation. The ADK Agent can inspect this through
+`doctor` / `inspect_llm_auth`, and can install it after explicit approval:
 
 ```bash
-python3 agent/cli.py draft-chain-template \
-  --chain foochain \
-  --adapter-family jsonrpc \
-  --method foo_getBalance \
-  --method foo_getBlock \
-  --output /tmp/foochain.json
+bash scripts/install_agent_deps.sh --yes --with-gcloud
 ```
 
-The draft is marked `needs_review`; review parameter contracts, sync-health,
-proxy extraction, and fake-node fixtures before adding it to `config/chains`.
-
-Compare plans or archived runs:
+Validate configuration without calling a model:
 
 ```bash
-python3 agent/cli.py diff-plan --old /tmp/old_plan.json --new /tmp/new_plan.json
-python3 agent/cli.py history --limit 5
-python3 agent/cli.py history --compare-latest
+python3 agent/cli.py adk-status
+python3 agent/cli.py llm-config
 ```
 
-Run a non-interactive wizard smoke for automation tests:
+Run `python3 agent/cli.py adk-eval` for no-key ADK contract checks. It does
+not simulate prompt understanding; real natural-language behavior requires ADK
+with a configured model provider.
 
-```bash
-python3 agent/cli.py wizard \
-  --prompt "Test Solana maximum stable QPS with fake-node smoke first" \
-  --output-dir /tmp/agent_wizard \
-  --yes \
-  --mock
-```
+## Knowledge Base And Enterprise Integration
 
-## Phase 3 Extension Points
+The local repository capability provider is enough for questions about current
+chains, RPC methods, fake-node fixtures, and generated artifacts. Optional
+enterprise Knowledge Base integration is configured through
+`config/agent_config.sh`.
 
-The `knowledge/` package contains the provider contract for future enterprise
-knowledge base integrations. Phase 2 keeps this interface stable while the
-initial provider remains local and deterministic.
-
-Knowledge providers are capability-based. They can supply chain identification,
-RPC method catalogs, parameter samples, response fixtures, workload weights,
-chain template fragments, sync-health hints, known bottlenecks, and runtime
-notes. Missing high-impact data must still be confirmed with the user.
-
-The built-in framework capability provider is local and deterministic. It is
-enough for questions about this repository's supported chains, RPC methods,
-adapter families, configuration extension points, and fake-node fixture
-coverage. External RAG is only needed when the user wants to integrate
-enterprise-private node knowledge, internal RPC samples, incident history, or
-unsupported-chain research.
-
-Enterprise platforms can keep Knowledge Base integration disabled and still use
-the Agent with repository-local capabilities. To enable a generic HTTP KB/RAG
-adapter or a custom adapter, configure `config/agent_config.sh`:
-
-```bash
-AGENT_KNOWLEDGE_PROVIDER="http"           # disabled | noop | http | custom
-AGENT_KNOWLEDGE_PROVIDER_MODULE="my_company.anychain_kb:Provider"
-AGENT_KNOWLEDGE_BASE_URL="https://kb.example.internal"
-AGENT_KNOWLEDGE_AUTH_REF="secret-manager://anychain/kb-token"
-```
-
-Validate the configured provider:
+Validate a configured provider:
 
 ```bash
 python3 agent/cli.py knowledge-smoke --query "solana rpc methods" --chain solana
 ```
 
-The recommended enterprise integration point is `python3 agent/cli.py` with
-JSON input/output. `python3 agent/cli.py tool-schema` exports an
-OpenAI-compatible function-tool schema when the enterprise platform wants a
-stable tool catalog. `python3 agent/cli.py tool-call --name <tool> --arguments '<json>'`
-executes one named Agent tool without requiring the platform to know every
-lower-level subcommand. Typical platform calls are `doctor`, `capabilities`,
-`draft-request`, `plan`, `preflight`, `submit`, `status`, `analyze`, and
-`artifact-qa`.
-
-## LLM Providers
-
-The Agent LLM layer uses an internal message contract and provider adapters.
-The benchmark engine does not depend on a model provider.
-
-Supported providers:
-
-- `fake`: offline deterministic provider for local smoke tests.
-- `gemini`: Gemini API key, or Gemini on Vertex AI with Google auth.
-- `claude`: Anthropic API key, or Claude on Vertex AI with Google auth.
-- `openai`: OpenAI API key.
-
-Store persistent Agent defaults in `config/agent_config.sh`;
-`./bin/anychain-agent` loads that file at startup, and temporary environment
-variables can still override it.
-
-Direct API-key mode:
+Enterprise platforms should prefer:
 
 ```bash
-LLM_PROVIDER="gemini"
-LLM_MODEL="gemini-3.1-pro"
-LLM_AUTH_MODE="api_key"
-GEMINI_API_KEY="AIza..."
+python3 agent/cli.py tool-schema
+python3 agent/cli.py tool-call --name <tool> --arguments '<json>'
 ```
 
-Google service-account mode for Vertex AI:
+## Development Checks
+
+Run the no-key ADK contract tests:
 
 ```bash
-LLM_PROVIDER="gemini"
-LLM_MODEL="gemini-3.1-pro"
-LLM_AUTH_MODE="service_account_impersonation"
-GOOGLE_CLOUD_PROJECT="your-project"
-GOOGLE_CLOUD_LOCATION="us-central1"
-GOOGLE_SERVICE_ACCOUNT_EMAIL="benchmark-agent@your-project.iam.gserviceaccount.com"
+python3 -m unittest tests.test_agent_runtime_contract -v
+python3 agent/cli.py adk-eval
 ```
 
-`LLM_AUTH_MODE=google_adc` or `attached_service_account` is preferred on GCE/GKE
-when the runtime identity is already bound to the correct service account. Use
-`LLM_AUTH_MODE=service_account_file` with `GOOGLE_APPLICATION_CREDENTIALS`
-only as a local fallback.
-
-Validate the local configuration without calling a model:
-
-```bash
-python3 agent/cli.py llm-config
-```
-
-Run an offline LLM smoke test without credentials:
-
-```bash
-python3 agent/cli.py llm-smoke --mock
-```
-
-Run a real provider smoke only after credentials are configured:
-
-```bash
-python3 agent/cli.py llm-smoke \
-  --prompt 'Return JSON only: {"ok": true}'
-```
-
-The mock smoke validates Agent parsing, routing, fallback, and schema behavior.
-It does not prove Vertex or OpenAI credentials are valid; real provider smoke is
-the explicit cloud connectivity check.
+Before adding a new chain or RPC method, generate an onboarding package and a
+draft template, then validate chain templates, fake-node fixtures, target
+generation, and smoke execution.

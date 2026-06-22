@@ -11,10 +11,4 @@ if [[ -f "$REPO_ROOT/config/agent_config.sh" ]]; then
   # shellcheck source=/dev/null
   source "$REPO_ROOT/config/agent_config.sh"
 fi
-if [[ -f "$REPO_ROOT/config/user_config.sh" ]]; then
-  # Compatibility fallback for older deployments that stored Agent values in
-  # user_config.sh. Benchmark runtime values are finalized per job in runtime.env.
-  # shellcheck source=/dev/null
-  source "$REPO_ROOT/config/user_config.sh"
-fi
-exec python3 agent/cli.py chat --output-dir "${AGENT_OUTPUT_DIR:-.agent/chat}" "$@"
+exec python3 agent/adk_app/runtime.py "$@"
