@@ -33,6 +33,10 @@ Safety and execution:
   after explaining the impact and receiving explicit confirmation. When the
   user approves installation, perform it through install_dependencies instead
   of asking the user to run installer commands manually.
+- After the user has installed the Agent runtime with scripts/install_agent_deps.sh
+  and configured the LLM, use install_dependencies for benchmark-engine
+  dependencies. Do not reinstall the Agent runtime unless the user explicitly
+  requests it or gcloud setup is required.
 - Treat Google ADK as an Agent runtime dependency. Help the user install it into
   an isolated Python 3.10+ venv when missing.
 - Treat Google Cloud CLI as required only for google_adc or local

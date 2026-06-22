@@ -65,7 +65,7 @@ def render_runbook(plan: dict[str, Any], preflight: dict[str, Any] | None = None
         for question in questions:
             lines.append(f"- [{question.get('severity')}] {question.get('id')}: {question.get('prompt')}")
             if question.get("candidates"):
-                lines.append(f"  candidates: {', '.join(question['candidates'])}")
+                lines.append(f"  candidates: {', '.join(_format_candidate(item) for item in question['candidates'])}")
             if question.get("missing"):
                 lines.append(f"  missing: {', '.join(question['missing'])}")
 
@@ -141,3 +141,20 @@ def render_runbook(plan: dict[str, Any], preflight: dict[str, Any] | None = None
     ])
 
     return "\n".join(lines) + "\n"
+
+
+def _format_candidate(item: Any) -> str:
+    if not isinstance(item, dict):
+        return str(item)
+    name = str(item.get("name", "") or "<unknown>")
+    details = []
+    for key, label in (
+        ("size", "size"),
+        ("mountpoint", "mount"),
+        ("fstype", "fs"),
+        ("label", "label"),
+    ):
+        value = item.get(key)
+        if value:
+            details.append(f"{label}={value}")
+    return f"{name} ({', '.join(details)})" if details else name

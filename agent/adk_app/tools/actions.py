@@ -111,15 +111,16 @@ def install_dependencies(
     approved: bool = False,
     no_sudo: bool = True,
     include_vegeta: bool = True,
-    include_agent_runtime: bool = True,
+    include_agent_runtime: bool = False,
     include_gcloud: bool = False,
     adk_venv: str = ".venv-adk",
     allow_system_python: bool = False,
 ) -> dict[str, Any]:
-    """Install benchmark and Agent dependencies after explicit user approval.
+    """Install benchmark dependencies after explicit user approval.
 
-    Defaults avoid sudo and install Google ADK into an isolated venv. Google
-    Cloud CLI is installed only when include_gcloud=true.
+    Normal Agent usage installs the ADK runtime once before launch, then lets
+    this tool install the benchmark engine dependencies. Google ADK/gcloud setup
+    is repeated only when explicitly requested.
     """
     if not approved:
         return _confirmation_required(
@@ -144,7 +145,7 @@ def install_dependencies(
         check=False,
     )
     agent = None
-    if include_agent_runtime:
+    if include_agent_runtime or include_gcloud:
         agent_command = ["bash", "scripts/install_agent_deps.sh", "--yes", "--adk-venv", adk_venv]
         if no_sudo:
             agent_command.append("--no-sudo")
