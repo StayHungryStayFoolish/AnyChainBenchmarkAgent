@@ -8,6 +8,8 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -417,7 +419,7 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertTrue(all(tool["type"] == "function" for tool in schema["tools"]))
             install_tool = next(tool for tool in schema["tools"] if tool["function"]["name"] == "install_dependencies")
             install_props = install_tool["function"]["parameters"]["properties"]
-            self.assertTrue(install_props["include_agent_runtime"]["default"])
+            self.assertFalse(install_props["include_agent_runtime"]["default"])
             self.assertTrue(install_props["include_vegeta"]["default"])
             self.assertTrue(install_props["no_sudo"]["default"])
             self.assertFalse(install_props["include_gcloud"]["default"])
@@ -682,6 +684,31 @@ class AgentRuntimeContractTest(unittest.TestCase):
             name = "run_doctor"
 
         self.assertIsNone(before_tool_callback(ReadOnlyTool(), {}, tool_context=None))
+
+    def test_dependency_install_defaults_to_benchmark_engine_only(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            return SimpleNamespace(returncode=0, stdout="ok", args=command)
+
+        with patch("adk_app.tools.actions.subprocess.run", side_effect=fake_run):
+            result = adk_install_dependencies(approved=True)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(calls[0][:2], ["bash", "scripts/install_deps.sh"])
+        self.assertIn("--yes", calls[0])
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(result["data"]["agent_runtime"]["skipped"])
+
+        calls.clear()
+        with patch("adk_app.tools.actions.subprocess.run", side_effect=fake_run):
+            result = adk_install_dependencies(approved=True, include_gcloud=True)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(calls[0][:2], ["bash", "scripts/install_deps.sh"])
+        self.assertEqual(calls[1][:2], ["bash", "scripts/install_agent_deps.sh"])
+        self.assertIn("--with-gcloud", calls[1])
 
     def test_adk_skeleton_is_offline_safe_and_tool_bounded(self):
         status = adk_status_payload()

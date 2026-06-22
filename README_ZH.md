@@ -119,17 +119,8 @@ git clone git@github.com:StayHungryStayFoolish/AnyChainBenchmarkAgent.git
 cd AnyChainBenchmarkAgent
 ```
 
-只检查依赖，不修改宿主机：
-
-```bash
-bash scripts/install_deps.sh --check
-```
-
-这个脚本检查并可安装 benchmark engine 依赖，例如 `jq`、`curl`、`vegeta`、
-`requirements.txt` 中的 Python 包和系统监控工具。
-
-创建隔离的 Google ADK 运行环境。不要把 ADK 安装到生产区块链节点使用的 Python
-环境中。你可以让 Agent 在请求确认后帮你安装，也可以手动运行同一个 installer：
+先安装 Agent 运行时。这个脚本只为 AnyChain Benchmark Agent 创建隔离的 Google ADK
+环境，不要把 ADK 安装到生产区块链节点使用的 Python 环境中：
 
 ```bash
 bash scripts/install_agent_deps.sh --yes
@@ -139,6 +130,12 @@ bash scripts/install_agent_deps.sh --yes
 engine 的非 Agent 自动化仍可使用较旧 Python，但 ADK Agent 运行时需要 Python 3.10+。
 启动脚本会自动优先使用 `.venv-adk/bin/adk`，所以用户不需要先手动 activate venv
 再运行 `./bin/anychain-agent`。
+
+普通 Agent 使用路径不要求用户先手动安装 benchmark engine 依赖。用户只需要先安装
+Agent runtime、配置 LLM，然后进入 Agent。Agent 会检查 benchmark 依赖，并在说明将要
+安装的内容后请求用户授权；用户确认后，Agent 会通过受控的 `install_dependencies`
+工具调用 `scripts/install_deps.sh --yes`。直接运行 `scripts/install_deps.sh` 主要保留给
+CI、Docker 镜像和非 Agent 自动化场景。
 
 在 `config/agent_config.sh` 中配置持久化的 Agent 参数。支持的 provider 可以使用
 API Key 模式；Gemini 或 Vertex partner model 也可以通过 Vertex AI 使用 Google
@@ -211,7 +208,7 @@ job。
 
 ```text
 Check this host and tell me what is missing before a benchmark.
-Install missing benchmark and Agent runtime dependencies after I approve.
+Install missing benchmark dependencies after I approve.
 I use Google ADC; install gcloud too if it is missing and you need it.
 Prepare a Solana fake-node smoke benchmark at 1 QPS.
 Run lifecycle smoke after showing me the generated plan.
@@ -222,6 +219,7 @@ What chains, RPC methods, and fake-node fixtures are currently supported?
 
 在新环境中建议先输入 `doctor`。它会以只读方式检查 cloud/deployment 识别结果、
 必需依赖、LLM/Vertex 配置、Knowledge Base 配置和当前框架能力覆盖情况。
+如果缺少 benchmark 依赖，Agent 应该先说明计划安装的内容，并在用户明确授权后再执行安装。
 
 也可以使用一句 prompt 运行：
 

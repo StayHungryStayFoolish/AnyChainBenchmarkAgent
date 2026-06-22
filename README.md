@@ -135,19 +135,9 @@ git clone git@github.com:StayHungryStayFoolish/AnyChainBenchmarkAgent.git
 cd AnyChainBenchmarkAgent
 ```
 
-Check dependencies without modifying the host:
-
-```bash
-bash scripts/install_deps.sh --check
-```
-
-This script checks and can install benchmark-engine dependencies such as
-`jq`, `curl`, `vegeta`, Python packages from `requirements.txt`, and system
-monitoring tools.
-
-Create an isolated Google ADK runtime. Do not install ADK into the Python
-environment used by production blockchain nodes. You can let the Agent install
-this after it asks for confirmation, or run the same installer yourself:
+Install the Agent runtime first. This creates an isolated Google ADK
+environment only for AnyChain Benchmark Agent. Do not install ADK into the
+Python environment used by production blockchain nodes:
 
 ```bash
 bash scripts/install_agent_deps.sh --yes
@@ -158,6 +148,13 @@ The benchmark engine still supports older Python for non-Agent automation, but
 the human-facing Agent requires the ADK runtime environment. The launcher
 automatically prefers `.venv-adk/bin/adk`, so users do not need to activate the
 venv before running `./bin/anychain-agent`.
+
+Do not start by installing benchmark-engine dependencies manually. In the
+normal Agent flow, users install the Agent runtime once, configure the LLM, then
+let the Agent inspect benchmark dependencies and ask for approval before it
+calls `scripts/install_deps.sh --yes` through the confirmation-gated
+`install_dependencies` tool. Direct `scripts/install_deps.sh` usage is kept for
+CI, Docker images, and non-Agent automation.
 
 Configure the persistent Agent settings in `config/agent_config.sh`.
 The human-facing Agent runtime is ADK-only, so configure one real provider
@@ -237,7 +234,7 @@ confirmation-gated jobs.
 
 ```text
 Check this host and tell me what is missing before a benchmark.
-Install missing benchmark and Agent runtime dependencies after I approve.
+Install missing benchmark dependencies after I approve.
 I use Google ADC; install gcloud too if it is missing and you need it.
 Prepare a Solana fake-node smoke benchmark at 1 QPS.
 Run lifecycle smoke after showing me the generated plan.
@@ -249,6 +246,8 @@ What chains, RPC methods, and fake-node fixtures are currently supported?
 Use a readiness check first on a new host. The Agent has a read-only doctor tool
 for cloud/deployment detection, dependencies, LLM/Vertex configuration,
 Knowledge Base configuration, and current framework capability coverage.
+If benchmark dependencies are missing, the Agent should explain the planned
+changes and ask for explicit approval before installing them.
 
 You can also run a one-shot prompt:
 

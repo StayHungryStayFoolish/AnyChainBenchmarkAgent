@@ -133,12 +133,12 @@ def tool_schema() -> dict[str, list[dict[str, Any]]]:
         ),
         _tool(
             "install_dependencies",
-            "Install benchmark and Agent runtime dependencies after explicit approval. Defaults avoid sudo and install ADK into an isolated venv.",
+            "Install benchmark engine dependencies after explicit approval. Agent runtime/gcloud setup runs only when explicitly requested.",
             {
                 "approved": _boolean("Explicit approval for installation."),
                 "no_sudo": _boolean("Avoid sudo/system package changes. Defaults to true.", default=True),
                 "include_vegeta": _boolean("Install vegeta when possible. Defaults to true.", default=True),
-                "include_agent_runtime": _boolean("Install Google ADK into an isolated venv. Defaults to true.", default=True),
+                "include_agent_runtime": _boolean("Reinstall/update Google ADK into an isolated venv. Defaults to false.", default=False),
                 "include_gcloud": _boolean("Install Google Cloud CLI for ADC/impersonation workflows. Defaults to false."),
                 "adk_venv": _string("ADK virtualenv path. Defaults to .venv-adk."),
                 "allow_system_python": _boolean("Allow system Python package changes when required."),
