@@ -4,6 +4,7 @@ import tempfile
 import unittest
 import os
 from pathlib import Path
+from unittest.mock import patch
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -21,12 +22,26 @@ from workflows.state import WorkflowState, WorkflowStateStore  # noqa: E402
 class CapturingIO(TerminalIO):
     def __init__(self):
         self.messages = []
+        self.inputs = []
 
     def input(self, language: str) -> str:  # pragma: no cover - not used by these tests
+        if self.inputs:
+            item = self.inputs.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            return item
         raise EOFError()
 
     def agent(self, language: str, message: str) -> None:
         self.messages.append(message)
+
+
+class FakeADKStatus:
+    def __init__(self, available: bool):
+        self.available = available
+
+    def as_dict(self):
+        return {"available": self.available, "reason": "available" if self.available else "missing"}
 
 
 class AgentProductTerminalTest(unittest.TestCase):
@@ -222,6 +237,66 @@ class AgentProductTerminalTest(unittest.TestCase):
         self.assertEqual(state.stage, "dependency_install_declined")
         self.assertEqual(state.current_question_id, "")
         self.assertTrue(any("已跳过依赖安装" in message for message in io.messages))
+
+    def test_startup_runs_read_only_doctor_and_sets_dependency_confirmation(self):
+        io = CapturingIO()
+        state = WorkflowState(language="zh")
+        app = AnyChainTerminal(state=state, io=io)
+        report = {
+            "status": "needs_dependencies",
+            "environment": {
+                "cloud": {"provider": "gcp"},
+                "deployment": {"type": "vm"},
+                "dependencies": {"missing_required": ["jq"], "missing_optional": []},
+            },
+            "capabilities": {"chain_count": 36, "unique_rpc_method_count": 184},
+        }
+        with patch("terminal.repl.adk_status", return_value=FakeADKStatus(True)), patch("terminal.repl.run_doctor", return_value=report):
+            app._startup()
+        self.assertEqual(state.current_question_id, "install_dependencies")
+        self.assertIn("jq", state.missing_blockers)
+        self.assertTrue(any("启动检查完成" in message for message in io.messages))
+        self.assertTrue(any("是否允许" in message for message in io.messages))
+
+    def test_startup_prioritizes_agent_runtime_install_when_adk_is_missing(self):
+        io = CapturingIO()
+        state = WorkflowState(language="zh")
+        app = AnyChainTerminal(state=state, io=io)
+        report = {
+            "status": "needs_dependencies",
+            "environment": {
+                "cloud": {"provider": "gcp"},
+                "deployment": {"type": "vm"},
+                "dependencies": {"missing_required": ["jq"], "missing_optional": []},
+            },
+            "capabilities": {"chain_count": 36, "unique_rpc_method_count": 184},
+        }
+        with patch("terminal.repl.adk_status", return_value=FakeADKStatus(False)), patch("terminal.repl.run_doctor", return_value=report):
+            app._startup()
+        self.assertEqual(state.current_question_id, "install_agent_runtime")
+        self.assertEqual(state.missing_blockers, ["google-adk"])
+        self.assertTrue(any("install_agent_deps.sh" in message for message in io.messages))
+
+    def test_ctrl_c_exits_instead_of_being_swallowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            io = CapturingIO()
+            io.inputs = [KeyboardInterrupt()]
+            store = WorkflowStateStore(Path(tmp) / "state.json")
+            app = AnyChainTerminal(state=WorkflowState(language="zh"), store=store, io=io)
+            report = {
+                "status": "ready",
+                "environment": {
+                    "cloud": {"provider": "gcp"},
+                    "deployment": {"type": "vm"},
+                    "dependencies": {"missing_required": [], "missing_optional": []},
+                },
+                "capabilities": {"chain_count": 36, "unique_rpc_method_count": 184},
+            }
+            with patch("terminal.repl.adk_status", return_value=FakeADKStatus(True)), patch("terminal.repl.run_doctor", return_value=report):
+                exit_code = app.run()
+            self.assertEqual(exit_code, 130)
+            self.assertTrue((Path(tmp) / "state.json").is_file())
+            self.assertTrue(any("Ctrl+C" in message for message in io.messages))
 
     def test_general_question_does_not_fill_pending_configuration_value(self):
         old_env = os.environ.copy()

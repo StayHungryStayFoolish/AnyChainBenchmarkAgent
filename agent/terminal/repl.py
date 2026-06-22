@@ -62,8 +62,9 @@ class AnyChainTerminal:
             try:
                 text = self.io.input(self.state.language).strip()
             except KeyboardInterrupt:
-                self.io.agent(self.state.language, t(self.state.language, "interrupted"))
-                continue
+                self.io.agent(self.state.language, t(self.state.language, "ctrl_c_exit"))
+                self.store.save(self.state)
+                return 130
             except EOFError:
                 self.io.agent(self.state.language, t(self.state.language, "bye"))
                 return 0
@@ -95,6 +96,15 @@ class AnyChainTerminal:
         if lowered == "status" or "状态" in text:
             self._status()
             return
+        if self.state.current_question_id == "install_agent_runtime":
+            if lowered in {"y", "yes", "确认", "是"}:
+                self._install_agent_runtime()
+                return
+            if lowered in {"n", "no", "否"}:
+                self.state.stage = "agent_runtime_install_declined"
+                self.state.current_question_id = ""
+                self.io.agent(self.state.language, t(self.state.language, "agent_runtime_declined"))
+                return
         if self.state.current_question_id == "install_dependencies":
             if lowered in {"y", "yes", "确认", "是"}:
                 self._install_dependencies()
@@ -168,6 +178,11 @@ class AnyChainTerminal:
         self.io.agent(self.state.language, t(self.state.language, "adk", status=status.get("reason", status.get("available"))))
         if not status.get("available"):
             self.io.agent(self.state.language, t(self.state.language, "adk_missing_hint"))
+            self.state.stage = "agent_runtime_install_confirmation"
+            self.state.current_question_id = "install_agent_runtime"
+            self.state.missing_blockers = ["google-adk"]
+            self.io.agent(self.state.language, t(self.state.language, "agent_runtime_offer"))
+        self._startup_doctor()
         if latest_job:
             self.io.agent(
                 self.state.language,
@@ -184,27 +199,68 @@ class AnyChainTerminal:
             self.io.agent(self.state.language, t(self.state.language, "job_none"))
         self.io.agent(self.state.language, t(self.state.language, "help"))
 
+    def _startup_doctor(self) -> None:
+        self.io.agent(self.state.language, t(self.state.language, "startup_doctor_start"))
+        report = run_doctor()
+        self._emit_doctor_summary(report, startup=True)
+
     def _doctor(self) -> None:
         self.io.agent(self.state.language, t(self.state.language, "doctor_start"))
         report = run_doctor()
+        self._emit_doctor_summary(report, startup=False)
+
+    def _emit_doctor_summary(self, report: dict[str, Any], startup: bool) -> None:
         caps = report.get("capabilities", {})
+        env = report.get("environment", {})
+        cloud = env.get("cloud", {})
+        deployment = env.get("deployment", {})
         missing = report.get("environment", {}).get("dependencies", {}).get("missing_required", [])
-        self.io.agent(
-            self.state.language,
-            t(
+        if startup:
+            self.io.agent(
                 self.state.language,
-                "doctor_summary",
-                status=report.get("status", "unknown"),
-                missing=", ".join(missing) if missing else "<none>",
-                chains=caps.get("chain_count", "?"),
-                methods=caps.get("unique_rpc_method_count", "?"),
-            ),
-        )
-        if missing:
+                t(
+                    self.state.language,
+                    "startup_doctor_summary",
+                    status=report.get("status", "unknown"),
+                    cloud=cloud.get("provider", "unknown"),
+                    deployment=deployment.get("type", "unknown"),
+                    missing=", ".join(missing) if missing else "<none>",
+                    chains=caps.get("chain_count", "?"),
+                    methods=caps.get("unique_rpc_method_count", "?"),
+                ),
+            )
+        else:
+            self.io.agent(
+                self.state.language,
+                t(
+                    self.state.language,
+                    "doctor_summary",
+                    status=report.get("status", "unknown"),
+                    missing=", ".join(missing) if missing else "<none>",
+                    chains=caps.get("chain_count", "?"),
+                    methods=caps.get("unique_rpc_method_count", "?"),
+                ),
+            )
+        if missing and self.state.current_question_id != "install_agent_runtime":
             self.state.stage = "dependency_install_confirmation"
             self.state.current_question_id = "install_dependencies"
             self.state.missing_blockers = list(missing)
             self.io.agent(self.state.language, t(self.state.language, "dependency_offer", missing=", ".join(missing)))
+
+    def _install_agent_runtime(self) -> None:
+        self.io.agent(self.state.language, t(self.state.language, "agent_runtime_install_start"))
+        completed = subprocess.run(
+            ["bash", "scripts/install_agent_deps.sh", "--yes"],
+            cwd=REPO_ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        self.state.stage = "agent_runtime_install_completed" if completed.returncode == 0 else "agent_runtime_install_failed"
+        self.state.current_question_id = ""
+        self.state.confirmed_values["agent_runtime_install_exit_code"] = completed.returncode
+        self.io.agent(self.state.language, t(self.state.language, "agent_runtime_install_done", exit_code=completed.returncode))
 
     def _jobs(self) -> None:
         jobs = list_jobs(limit=5)
