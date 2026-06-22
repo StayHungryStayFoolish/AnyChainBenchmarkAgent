@@ -15,17 +15,17 @@ tracks artifacts, and explains the result with evidence.
 
 The benchmark execution plane remains deterministic: Vegeta, RPC proxy,
 monitoring collectors, fake-node, report generation, and archiving are still the
-source of truth. The human-facing Agent runtime is Google ADK and expects a real
-configured model provider; no-key checks are for CI and development only. Model
-output can draft structured requests, plans, and explanations, but it does not
-execute commands directly.
+source of truth. The human-facing entrypoint is `./bin/anychain-agent`; it owns
+the terminal experience, workflow state, confirmations, and job recovery while
+using Google ADK underneath for Agent runtime capabilities. Model output can
+draft structured requests, plans, and explanations, but it does not execute
+commands directly.
 
 ## Report Preview
 
 Preview the generated benchmark report before running the framework:
 
 - [Sample English PDF report](docs/en/performance_report_en.pdf)
-- [Sample Chinese PDF report](docs/zh/performance_report_zh.pdf)
 
 ## What It Does
 
@@ -123,10 +123,10 @@ provided.
 ## 5-Minute Quick Start
 
 This is the fastest way to use AnyChain Benchmark Agent from a terminal. The
-human-facing Agent runtime is Google ADK, so configure a model provider in
+user-facing command is `./bin/anychain-agent`. Configure a model provider in
 `config/agent_config.sh` before expecting model-assisted interaction. No-key
-offline checks are available for CI and development, but they are not the
-product Agent runtime.
+offline checks are available for CI and development, but they are not a
+substitute for a configured model provider.
 
 Clone the repository:
 
@@ -145,9 +145,9 @@ bash scripts/install_agent_deps.sh --yes
 
 If your host does not provide `python3.11`, use any Python 3.10+ interpreter.
 The benchmark engine still supports older Python for non-Agent automation, but
-the human-facing Agent requires the ADK runtime environment. The launcher
-automatically prefers `.venv-adk/bin/adk`, so users do not need to activate the
-venv before running `./bin/anychain-agent`.
+the Agent requires a Python 3.10+ ADK runtime environment for model-backed
+sessions. The product launcher uses its own terminal workflow and does not ask
+users to run `adk run` directly.
 
 Do not start by installing benchmark-engine dependencies manually. In the
 normal Agent flow, users install the Agent runtime once, configure the LLM, then
@@ -157,10 +157,9 @@ calls `scripts/install_deps.sh --yes` through the confirmation-gated
 CI, Docker images, and non-Agent automation.
 
 Configure the persistent Agent settings in `config/agent_config.sh`.
-The human-facing Agent runtime is ADK-only, so configure one real provider
-before starting a natural-language session. Direct API-key mode works for
-Gemini, Claude, and OpenAI. Google service-account modes work for Gemini or
-Claude through Vertex AI.
+Configure one real provider before starting a natural-language session. Direct
+API-key mode works for Gemini, Claude, and OpenAI. Google service-account modes
+work for Gemini or Claude through Vertex AI.
 
 ```bash
 LLM_PROVIDER="gemini"
@@ -220,27 +219,35 @@ You can leave benchmark details such as chain, RPC URL, disk, and machine
 metadata unset at first. The Agent will detect what it can and ask for missing
 required values before a real run.
 
-Start the Agent. This command delegates to the official Google ADK CLI and
-loads the ADK package under `agent/adk_app/`:
+Start the Agent. This command opens the AnyChain product terminal. It uses
+Google ADK underneath for Agent runtime capabilities, but it does not expose
+the raw `adk run` terminal UI:
 
 ```bash
 ./bin/anychain-agent
 ```
 
-Then talk to it in the ADK session. The Agent should use its function tools to
-inspect the environment, prepare a benchmark run, generate a plan, run
-preflight, request approval, run smoke checks, and submit only
-confirmation-gated jobs.
+Then talk to it from the `User>` prompt. The Agent replies as `Agent>`, keeps
+the response language aligned with the user's input, stores workflow state
+under `.agent/session`, and asks one confirmation at a time before creating a
+plan or launching a job.
 
 ```text
-Check this host and tell me what is missing before a benchmark.
-Install missing benchmark dependencies after I approve.
-I use Google ADC; install gcloud too if it is missing and you need it.
-Prepare a Solana fake-node smoke benchmark at 1 QPS.
-Run lifecycle smoke after showing me the generated plan.
-Run a real fake-node benchmark smoke only after I approve it.
-After smoke passes, ask me before submitting a detached benchmark job.
-What chains, RPC methods, and fake-node fixtures are currently supported?
+User> doctor
+Agent> ...summarizes dependencies and asks before installing anything...
+
+User> I want to benchmark Solana
+Agent> ...asks whether to use fake-node or a real node...
+
+User> fake-node
+Agent> ...explains that fake-node does not need a real LOCAL_RPC_URL but still
+       requires RPC mode, workload, weights, and TARGET_* samples...
+
+User> single
+Agent> ...asks you to confirm the workload and parameter samples...
+
+User> yes
+Agent> ...generates a benchmark plan, runs preflight, and asks before smoke...
 ```
 
 Use a readiness check first on a new host. The Agent has a read-only doctor tool
@@ -249,15 +256,25 @@ Knowledge Base configuration, and current framework capability coverage.
 If benchmark dependencies are missing, the Agent should explain the planned
 changes and ask for explicit approval before installing them.
 
-You can also run a one-shot prompt:
+For development or CI, you can replay a scripted transcript without opening an
+interactive terminal:
 
 ```bash
 ./bin/anychain-agent \
-  --prompt "Create a Solana fake-node smoke benchmark at 1 QPS"
+  --language en \
+  --prompt "I want to benchmark Solana" \
+  --prompt "fake-node" \
+  --prompt "single" \
+  --prompt "yes" \
+  --prompt "yes" \
+  --prompt "yes" \
+  --prompt "yes"
 ```
 
-Real benchmark execution still uses confirmation-gated tools and must pass
-preflight and smoke before launch. The model output is never executed directly.
+This scripted path generates a plan, runs preflight, writes the job-local
+`runtime.env`, and submits a mock smoke lifecycle job. Real benchmark execution
+still uses confirmation-gated tools and must pass preflight and smoke before
+launch. The model output is never executed directly.
 
 Default real benchmark execution is detached/background in the lower-level job
 runner. The benchmark worker continues after the Agent terminal disconnects,
@@ -272,8 +289,8 @@ The Agent tools can inspect `.agent/jobs` and recover the latest job state:
 ./bin/anychain-agent
 ```
 
-After restart, ask the Agent to inspect the latest job. It can use file-backed
-job tools to recover status, logs, runtime.env, and artifact paths.
+After restart, the Agent reports the latest job it finds. You can type `status`
+or `jobs` to recover job state, runtime.env, and artifact paths.
 
 Ask the Agent about framework capabilities at any time:
 
@@ -315,10 +332,15 @@ Use this when you want the Agent to exercise the benchmark flow without a real
 production node. Start `./bin/anychain-agent`, then type:
 
 ```text
-Check this host and dependencies.
-Prepare a Solana fake-node smoke benchmark at 1 QPS.
-Run lifecycle smoke after showing me the generated plan.
-Show job status.
+doctor
+I want to benchmark Solana
+fake-node
+single
+yes
+yes
+yes
+yes
+status
 ```
 
 Lifecycle smoke validates the Agent job lifecycle without sending benchmark
@@ -346,12 +368,28 @@ do not edit that file.
 Example real-node conversation:
 
 ```text
-Check this host and dependencies.
-Prepare a quick single-method benchmark for my Solana node at http://your-node-rpc:8899.
-Show me inferred values and ask me to confirm anything uncertain.
-Run lifecycle smoke after preflight passes.
-Show job status.
+doctor
+I want to benchmark Solana
+real-node
+http://your-node-rpc:8899
+agave-validator
+sdb
+pd-ssd
+2048
+12000
+500
+eth0
+16
+single
+yes
+yes
+yes
+status
 ```
+
+The real-node flow asks for these values one at a time. The example answers are
+illustrative; use the values detected from your host or confirmed by your
+infrastructure team.
 
 During planning/preflight, the Agent checks the chain, RPC mode, local RPC URL,
 node process names, ledger/data disk, disk IOPS/throughput baseline, network

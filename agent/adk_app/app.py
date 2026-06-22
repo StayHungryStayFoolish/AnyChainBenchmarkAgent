@@ -4,14 +4,17 @@ from __future__ import annotations
 
 from .instructions import ADK_MIGRATION_BOUNDARY, ROOT_INSTRUCTION
 from .models import adk_status
+from .runner_bridge import runner_bridge_status
 
 
 def status_payload() -> dict:
     """Return ADK readiness without requiring model credentials."""
     status = adk_status().as_dict()
+    runner_status = runner_bridge_status().as_dict()
     return {
         "status": "ready" if status["available"] else "not_installed",
         "adk": status,
+        "runner": runner_status,
         "root_instruction_present": bool(ROOT_INSTRUCTION),
         "migration_boundary": ADK_MIGRATION_BOUNDARY,
         "next_actions": [

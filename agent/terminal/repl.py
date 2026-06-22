@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""Product CLI for AnyChain Benchmark Agent.
+
+This is intentionally not a wrapper around ``adk run``. ADK remains the Agent
+runtime, but the user-facing terminal experience is owned here so benchmark
+workflows can provide stable prompts, confirmations, progress, and recovery.
+"""
+
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+AGENT_ROOT = REPO_ROOT / "agent"
+if str(AGENT_ROOT) not in sys.path:
+    sys.path.insert(0, str(AGENT_ROOT))
+
+from adk_app.models import adk_status  # noqa: E402
+from adk_app.state import load_startup_state  # noqa: E402
+from diagnostics.doctor import run_doctor  # noqa: E402
+from knowledge.framework_capabilities import load_framework_capabilities  # noqa: E402
+from llm.config import load_llm_config  # noqa: E402
+from runners.job_manager import list_jobs  # noqa: E402
+from terminal.io import TerminalIO  # noqa: E402
+from terminal.language import detect_language, t  # noqa: E402
+from workflows.benchmark_wizard import BenchmarkWizard  # noqa: E402
+from workflows.planning_bridge import prepare_plan_from_state, submit_mock_smoke_from_plan  # noqa: E402
+from workflows.state import WorkflowState, WorkflowStateStore  # noqa: E402
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    store = WorkflowStateStore(args.state_file) if args.state_file else WorkflowStateStore()
+    state = store.load()
+    state.language = args.language or state.language
+    app = AnyChainTerminal(state=state, store=store)
+    if args.prompt:
+        for prompt in args.prompt:
+            app.handle_user_text(prompt)
+            store.save(state)
+        return 0
+    return app.run()
+
+
+class AnyChainTerminal:
+    def __init__(self, state: WorkflowState | None = None, store: WorkflowStateStore | None = None, io: TerminalIO | None = None) -> None:
+        self.state = state or WorkflowState()
+        self.store = store or WorkflowStateStore()
+        self.io = io or TerminalIO()
+        self.capabilities: dict[str, Any] | None = None
+        self.wizard = BenchmarkWizard(self.state)
+
+    def run(self) -> int:
+        self._startup()
+        while True:
+            try:
+                text = self.io.input(self.state.language).strip()
+            except KeyboardInterrupt:
+                self.io.agent(self.state.language, t(self.state.language, "interrupted"))
+                continue
+            except EOFError:
+                self.io.agent(self.state.language, t(self.state.language, "bye"))
+                return 0
+
+            if not text:
+                continue
+            if text.lower() in {"exit", "quit", "q"}:
+                self.io.agent(self.state.language, t(self.state.language, "bye"))
+                self.store.save(self.state)
+                return 0
+            self.handle_user_text(text)
+            self.store.save(self.state)
+
+    def handle_user_text(self, text: str) -> None:
+        self.state.language = detect_language(text, self.state.language)
+        lowered = text.lower()
+        if lowered in {"help", "?"} or text in {"帮助", "？"}:
+            self.io.agent(self.state.language, t(self.state.language, "help"))
+            return
+        if lowered == "doctor" or "环境检查" in text:
+            self._doctor()
+            return
+        if lowered == "jobs" or "任务" in text:
+            self._jobs()
+            return
+        if lowered == "status" or "状态" in text:
+            self._status()
+            return
+        if self.state.current_question_id == "install_dependencies":
+            if lowered in {"y", "yes", "确认", "是"}:
+                self._install_dependencies()
+                return
+            if lowered in {"n", "no", "否"}:
+                self.state.stage = "dependency_install_declined"
+                self.state.current_question_id = ""
+                self.io.agent(self.state.language, t(self.state.language, "dependency_declined"))
+                return
+        if self.state.current_question_id == "smoke_confirmation":
+            if lowered in {"y", "yes", "确认", "是"}:
+                self._prepare_smoke()
+                return
+            if lowered in {"n", "no", "否"}:
+                self.state.stage = "smoke_declined"
+                self.state.current_question_id = ""
+                self.io.agent(self.state.language, t(self.state.language, "smoke_declined"))
+                return
+        if self.state.current_question_id == "run_mock_smoke":
+            if lowered in {"y", "yes", "确认", "是"}:
+                self._run_mock_smoke()
+                return
+            if lowered in {"n", "no", "否"}:
+                self.state.stage = "mock_smoke_declined"
+                self.state.current_question_id = ""
+                self.io.agent(self.state.language, t(self.state.language, "smoke_declined"))
+                return
+        response = self.wizard.handle(text)
+        if response.handled:
+            for message in response.messages:
+                self.io.agent(self.state.language, message)
+            return
+        self.io.agent(self.state.language, t(self.state.language, "unknown"))
+
+    def _startup(self) -> None:
+        config = load_llm_config()
+        status = adk_status().as_dict()
+        startup = load_startup_state()
+        latest_job = startup.get("latest_job", {})
+        next_actions = startup.get("next_actions", [])
+        if latest_job:
+            self.state.job_id = latest_job.get("job_id", "")
+        self.io.agent(self.state.language, t(self.state.language, "welcome"))
+        self.io.agent(
+            self.state.language,
+            t(self.state.language, "mode", provider=config.provider, model=config.model, auth_mode=config.auth_mode),
+        )
+        config_errors = config.validate()
+        if config_errors:
+            self.io.agent(self.state.language, t(self.state.language, "llm_config_warning", errors="; ".join(config_errors)))
+        self.io.agent(self.state.language, t(self.state.language, "adk", status=status.get("reason", status.get("available"))))
+        if latest_job:
+            self.io.agent(
+                self.state.language,
+                t(
+                    self.state.language,
+                    "job_found",
+                    job_id=latest_job.get("job_id", ""),
+                    status=latest_job.get("status", "unknown"),
+                ),
+            )
+            if next_actions:
+                self.io.agent(self.state.language, t(self.state.language, "job_next_actions", actions=", ".join(next_actions)))
+        else:
+            self.io.agent(self.state.language, t(self.state.language, "job_none"))
+        self.io.agent(self.state.language, t(self.state.language, "help"))
+
+    def _doctor(self) -> None:
+        self.io.agent(self.state.language, t(self.state.language, "doctor_start"))
+        report = run_doctor()
+        caps = report.get("capabilities", {})
+        missing = report.get("environment", {}).get("dependencies", {}).get("missing_required", [])
+        self.io.agent(
+            self.state.language,
+            t(
+                self.state.language,
+                "doctor_summary",
+                status=report.get("status", "unknown"),
+                missing=", ".join(missing) if missing else "<none>",
+                chains=caps.get("chain_count", "?"),
+                methods=caps.get("unique_rpc_method_count", "?"),
+            ),
+        )
+        if missing:
+            self.state.stage = "dependency_install_confirmation"
+            self.state.current_question_id = "install_dependencies"
+            self.state.missing_blockers = list(missing)
+            self.io.agent(self.state.language, t(self.state.language, "dependency_offer", missing=", ".join(missing)))
+
+    def _jobs(self) -> None:
+        jobs = list_jobs(limit=5)
+        if not jobs:
+            self.io.agent(self.state.language, t(self.state.language, "jobs_empty"))
+            return
+        lines = [t(self.state.language, "jobs_header")]
+        for job in jobs:
+            lines.append(f"{job.get('job_id')}  {job.get('status')}  {job.get('updated_at')}")
+        self.io.agent(self.state.language, "\n".join(lines))
+
+    def _status(self) -> None:
+        jobs = list_jobs(limit=1)
+        latest = jobs[0] if jobs else {}
+        if not latest:
+            self.io.agent(self.state.language, t(self.state.language, "jobs_empty"))
+            return
+        self.io.agent(
+            self.state.language,
+            t(self.state.language, "job_found", job_id=latest.get("job_id", ""), status=latest.get("status", "unknown")),
+        )
+
+    def _install_dependencies(self) -> None:
+        self.io.agent(self.state.language, t(self.state.language, "dependency_install_start"))
+        completed = subprocess.run(
+            ["bash", "scripts/install_deps.sh", "--yes"],
+            cwd=REPO_ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        self.state.stage = "dependency_install_completed" if completed.returncode == 0 else "dependency_install_failed"
+        self.state.current_question_id = ""
+        self.state.confirmed_values["dependency_install_exit_code"] = completed.returncode
+        self.io.agent(self.state.language, t(self.state.language, "dependency_install_done", exit_code=completed.returncode))
+
+    def _prepare_smoke(self) -> None:
+        self.io.agent(self.state.language, t(self.state.language, "prepare_start"))
+        prepared = prepare_plan_from_state(self.state)
+        self.state.plan_file = prepared["plan_file"]
+        preflight = prepared["preflight"]
+        if not preflight.get("passed"):
+            blockers = [
+                f"{check.get('name')}: {check.get('detail')}"
+                for check in preflight.get("checks", [])
+                if not check.get("passed")
+            ]
+            self.state.stage = "preflight_blocked"
+            self.state.current_question_id = ""
+            self.state.missing_blockers = blockers
+            self.io.agent(
+                self.state.language,
+                t(
+                    self.state.language,
+                    "prepare_blocked",
+                    blockers="; ".join(blockers) if blockers else "<unknown>",
+                    plan_file=prepared["plan_file"],
+                ),
+            )
+            return
+        self.state.stage = "mock_smoke_confirmation"
+        self.state.current_question_id = "run_mock_smoke"
+        self.io.agent(
+            self.state.language,
+            t(
+                self.state.language,
+                "prepare_ok",
+                plan_file=prepared["plan_file"],
+                runbook_file=prepared["runbook_file"],
+            ),
+        )
+
+    def _run_mock_smoke(self) -> None:
+        if not self.state.plan_file:
+            self.state.stage = "ready_for_smoke"
+            self.state.current_question_id = "smoke_confirmation"
+            self.io.agent(self.state.language, t(self.state.language, "prepare_smoke_offer"))
+            return
+        self.io.agent(self.state.language, t(self.state.language, "mock_smoke_start"))
+        job = submit_mock_smoke_from_plan(self.state.plan_file)
+        self.state.stage = "mock_smoke_completed" if job.get("status") == "completed" else "mock_smoke_failed"
+        self.state.current_question_id = ""
+        self.state.job_id = job.get("job_id", "")
+        self.state.runtime_env_file = job.get("runtime_env_file", "")
+        self.io.agent(
+            self.state.language,
+            t(
+                self.state.language,
+                "mock_smoke_done",
+                job_id=job.get("job_id", ""),
+                status=job.get("status", "unknown"),
+                runtime_env_file=job.get("runtime_env_file", ""),
+                artifact_index=job.get("artifact_index", ""),
+            ),
+        )
+
+    def _load_capabilities(self) -> dict[str, Any]:
+        if self.capabilities is None:
+            self.capabilities = load_framework_capabilities()
+        return self.capabilities
+
+
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the AnyChain Benchmark Agent product CLI.")
+    parser.add_argument("--prompt", action="append", help="Run one or more scripted user turns, then exit.")
+    parser.add_argument("--language", choices=["zh", "en"], default="en", help="Initial terminal language.")
+    parser.add_argument("--state-file", help="Use an alternate workflow state file for tests or isolated sessions.")
+    return parser.parse_args(argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

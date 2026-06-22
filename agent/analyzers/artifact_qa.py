@@ -9,6 +9,7 @@ from typing import Any
 
 from analyzers.bottleneck_rules import diagnose_artifacts, format_diagnostics
 from analyzers.chart_explainer import explain_charts, format_chart_explanation
+from analyzers.execution_artifacts import diagnose_execution_artifacts
 
 
 def answer_artifact_question(
@@ -54,9 +55,14 @@ def answer_artifact_question(
         findings.append("No artifact evidence was registered for this job.")
     chart_explanation = explain_charts(evidence)
     diagnostics = diagnose_artifacts(job=job, artifact_index=artifact_index)
+    execution_diagnostics = diagnose_execution_artifacts(job=job, artifact_index=artifact_index)
     answer = (
         "Artifact inspection summary:\n"
         + "\n".join(f"- {item}" for item in findings)
+        + "\n\n"
+        + "Execution artifact diagnosis:\n"
+        + f"- conclusion: {execution_diagnostics['conclusion']}\n"
+        + f"- summary: {execution_diagnostics['summary']}"
         + "\n\n"
         + format_chart_explanation(chart_explanation)
         + "\n\n"
@@ -70,6 +76,7 @@ def answer_artifact_question(
         "artifact_index": index,
         "chart_explanation": chart_explanation,
         "diagnostics": diagnostics,
+        "execution_diagnostics": execution_diagnostics,
     }
 
 
