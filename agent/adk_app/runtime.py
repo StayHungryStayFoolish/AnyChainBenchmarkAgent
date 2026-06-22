@@ -1,8 +1,7 @@
-"""Runtime bridge to the official Google ADK CLI.
+"""Development bridge to the official Google ADK CLI.
 
-This module is deliberately not a chat loop. It only locates the installed ADK
-CLI and delegates execution to ``adk run`` so the human-facing entrypoint uses
-the ADK runtime instead of a custom terminal facade.
+This module is not the product terminal entrypoint. It remains available for
+developer diagnostics that explicitly need ``adk run`` behavior.
 """
 
 from __future__ import annotations
@@ -50,7 +49,7 @@ def run_adk_cli(argv: list[str] | None = None) -> int:
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run AnyChain Benchmark Agent through the official Google ADK CLI.",
+        description="Run the AnyChain ADK app through the official Google ADK CLI for diagnostics.",
     )
     parser.add_argument(
         "--prompt",
@@ -84,8 +83,9 @@ def _default_adk_bin() -> str:
 def _print_missing_adk(adk_bin: str) -> None:
     message = f"""Google ADK CLI was not found: {adk_bin}
 
-AnyChain Benchmark Agent now uses Google ADK as the only human-facing Agent
-runtime. Install ADK in an isolated Python 3.10+ environment, then run:
+AnyChain Benchmark Agent uses its own product terminal entrypoint and uses
+Google ADK underneath for Agent runtime capabilities. Install ADK in an
+isolated Python 3.10+ environment, then run:
 
   bash scripts/install_agent_deps.sh --yes
   ./bin/anychain-agent

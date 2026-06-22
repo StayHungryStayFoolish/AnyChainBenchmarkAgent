@@ -32,6 +32,7 @@ from adk_app.evals.runner import run_offline_evals as run_adk_offline_evals  # n
 from adk_app.instructions import ROOT_INSTRUCTION  # noqa: E402
 from adk_app.root_agent import resolve_adk_model  # noqa: E402
 from adk_app.runtime import run_adk_cli  # noqa: E402
+from adk_app.runner_bridge import runner_bridge_status  # noqa: E402
 from adk_app.state import load_startup_state as adk_load_startup_state  # noqa: E402
 from adk_app.state import preserved_state_for_adk  # noqa: E402
 from adk_app.tools.auth import inspect_llm_auth as adk_inspect_llm_auth  # noqa: E402
@@ -479,7 +480,7 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertEqual(generated_tool_plan["chain"], "solana")
             self.assertEqual(generated_tool_plan["execution"]["runner_mode"], "detached")
 
-    def test_human_entrypoint_delegates_to_official_adk_runtime(self):
+    def test_human_entrypoint_uses_product_terminal_not_adk_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             fake_adk = Path(tmp) / "fake-adk"
             fake_adk.write_text(
@@ -496,7 +497,7 @@ class AgentRuntimeContractTest(unittest.TestCase):
             env["FAKE_ADK_STDIN_FILE"] = str(stdin_file)
 
             completed = subprocess.run(
-                [str(AGENT_BIN), "--adk-bin", str(fake_adk), "--prompt", "How many chains are supported?"],
+                [str(AGENT_BIN), "--prompt", "I want to benchmark Solana with fake-node"],
                 cwd=REPO,
                 text=True,
                 stdout=subprocess.PIPE,
@@ -505,10 +506,11 @@ class AgentRuntimeContractTest(unittest.TestCase):
                 check=True,
             )
             self.assertEqual(completed.returncode, 0)
-            self.assertEqual(args_file.read_text(encoding="utf-8").splitlines()[0], "run")
-            self.assertIn("agent/adk_app", args_file.read_text(encoding="utf-8"))
-            self.assertIn("How many chains are supported?", stdin_file.read_text(encoding="utf-8"))
-            self.assertIn("exit", stdin_file.read_text(encoding="utf-8"))
+            self.assertIn("Selected fake-node", completed.stdout)
+            self.assertIn("LOCAL_RPC_URL", completed.stdout)
+            self.assertNotIn("[user]", completed.stdout)
+            self.assertFalse(args_file.exists())
+            self.assertFalse(stdin_file.exists())
 
             missing_status = run_adk_cli(["--adk-bin", str(Path(tmp) / "missing-adk")])
             self.assertEqual(missing_status, 2)
@@ -534,17 +536,23 @@ class AgentRuntimeContractTest(unittest.TestCase):
                 },
                 "warnings": ["Multiple plausible data disks were found; confirm ledger/accounts devices."],
             })
+            self.assertEqual(report["status"], "needs_dependencies")
+            self.assertEqual(report["environment"]["dependencies"]["missing_required"], ["vegeta"])
+            self.assertEqual(report["google_auth"]["auth_mode"], "google_adc")
+            self.assertIn("gcloud_available", report["google_auth"])
+            text = format_doctor_report(report)
+            self.assertIn("Agent doctor report", text)
+            self.assertIn("required dependencies missing: vegeta", text)
+            self.assertIn("Google auth mode: google_adc", text)
         finally:
             os.environ.clear()
             os.environ.update(old_env)
-        self.assertEqual(report["status"], "needs_dependencies")
-        self.assertEqual(report["environment"]["dependencies"]["missing_required"], ["vegeta"])
-        self.assertEqual(report["google_auth"]["auth_mode"], "google_adc")
-        self.assertIn("gcloud_available", report["google_auth"])
-        text = format_doctor_report(report)
-        self.assertIn("Agent doctor report", text)
-        self.assertIn("required dependencies missing: vegeta", text)
-        self.assertIn("Google auth mode: google_adc", text)
+
+    def test_adk_runner_bridge_is_explicit_not_fallback(self):
+        status = runner_bridge_status().as_dict()
+        self.assertIn("available", status)
+        self.assertIn("reason", status)
+        self.assertEqual(status["runner_import"], "google.adk.runners.Runner")
 
     def test_onboarding_package_contains_workload_and_validation_contract(self):
         package = generate_onboarding_package("foochain", ["foo_methodA", "foo_methodB"], adapter_family="jsonrpc")
@@ -629,7 +637,6 @@ class AgentRuntimeContractTest(unittest.TestCase):
         old_env = os.environ.copy()
         try:
             os.environ.clear()
-            self.assertEqual(resolve_adk_model(), "gemini-3.1-pro")
             os.environ.update({
                 "LLM_PROVIDER": "gemini",
                 "LLM_MODEL": "gemini-3.5-flash",

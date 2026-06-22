@@ -11,4 +11,4 @@ if [[ -f "$REPO_ROOT/config/agent_config.sh" ]]; then
   # shellcheck source=/dev/null
   source "$REPO_ROOT/config/agent_config.sh"
 fi
-exec python3 agent/adk_app/runtime.py "$@"
+exec python3 agent/terminal/repl.py "$@"

@@ -1,21 +1,23 @@
 # AnyChain ADK Agent
 
-`agent/` contains the Google ADK control plane for the benchmark engine. The
-human-facing Agent entrypoint is ADK-only:
+`agent/` contains the AnyChain Agent control plane for the benchmark engine.
+The human-facing product entrypoint is:
 
 ```bash
 ./bin/anychain-agent
 ```
 
-The old custom chat loop, wizard, intent router, workflow router, and prompt
-orchestrator have been removed. Reusable benchmark tools remain available as
+The product terminal owns prompt input, language consistency, one-question
+confirmation flow, workflow state, and job recovery. Google ADK remains the
+Agent runtime layer underneath; reusable benchmark logic remains available as
 deterministic modules and ADK function tools.
 
 ## Runtime Contract
 
 ```text
 user message
--> ADK instruction and model reasoning
+-> AnyChain terminal workflow state
+-> ADK instruction and model reasoning when configured
 -> prepare_benchmark_run
 -> preflight, runbook, and user confirmation
 -> lifecycle smoke or isolated fake-node benchmark smoke
@@ -25,16 +27,19 @@ user message
 ```
 
 ADK may help interpret the user's intent, but benchmark execution still uses
-the repository's deterministic tools. LLM output is never executed directly.
+the repository's deterministic tools and terminal workflow gates. LLM output is
+never executed directly.
 
 ## Main Modules
 
 - `adk_app/instructions.py`: root ADK instruction and migration boundary.
 - `adk_app/root_agent.py`: optional real ADK `Agent` construction.
 - `adk_app/agent.py`: official ADK discovery module exposing `root_agent`.
-- `adk_app/runtime.py`: thin bridge to the official `adk run` CLI.
+- `adk_app/runtime.py`: development bridge for explicit `adk run` diagnostics.
 - `adk_app/tools/`: ADK function-tool wrappers around deterministic modules.
 - `adk_app/evals/`: no-key ADK package and tool-contract checks.
+- `terminal/`: product terminal, prompt input, language policy, and recovery.
+- `workflows/`: deterministic benchmark setup state machine and planner bridge.
 - `planners/`, `runners/`, `analyzers/`, `knowledge/`, `onboarding/`: benchmark
   engine control-plane tools reused by ADK.
 
@@ -46,8 +51,8 @@ Install the ADK runtime in an isolated Python 3.10+ environment:
 bash scripts/install_agent_deps.sh --yes
 ```
 
-`./bin/anychain-agent` automatically prefers `.venv-adk/bin/adk`, so users do
-not need to activate the venv before starting the Agent.
+`./bin/anychain-agent` starts the AnyChain product terminal. Users do not need
+to run `adk run` directly.
 
 Then start the human-facing Agent:
 
@@ -55,22 +60,17 @@ Then start the human-facing Agent:
 ./bin/anychain-agent
 ```
 
-This delegates to:
-
-```bash
-adk run agent/adk_app
-```
-
-Natural-language benchmark requests should be handled by the ADK model through
-the registered function tools:
+The terminal asks one question at a time and then calls deterministic tools:
 
 ```text
-Prepare a Solana fake-node smoke benchmark at 1 QPS
-Run a real fake-node benchmark smoke only after I approve it
+User> I want to benchmark Solana
+Agent> ...asks fake-node or real-node...
+User> fake-node
+Agent> ...asks RPC mode, workload, and parameter-sample confirmation...
 ```
 
-The ADK runtime should call planning, preflight, action, and read-only tools as
-needed. The old local terminal facade has been removed.
+Development-only ADK CLI checks remain available through `agent/adk_app/runtime.py`
+and `python3 agent/cli.py adk-status`, but they are not the product UX.
 
 Detached benchmark jobs write:
 

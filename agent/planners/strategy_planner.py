@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -128,7 +129,7 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
         "CHAIN_MIRROR_URL": request.get("chain_mirror_url", ""),
     }
 
-    plan_id = f"plan_{int(time.time())}"
+    plan_id = f"plan_{int(time.time())}_{uuid.uuid4().hex[:8]}"
     plan = {
         "plan_id": plan_id,
         "chain": chain,
