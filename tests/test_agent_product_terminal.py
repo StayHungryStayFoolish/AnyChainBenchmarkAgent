@@ -2,6 +2,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import os
 from pathlib import Path
 
 
@@ -221,6 +222,38 @@ class AgentProductTerminalTest(unittest.TestCase):
         self.assertEqual(state.stage, "dependency_install_declined")
         self.assertEqual(state.current_question_id, "")
         self.assertTrue(any("已跳过依赖安装" in message for message in io.messages))
+
+    def test_general_question_does_not_fill_pending_configuration_value(self):
+        old_env = os.environ.copy()
+        try:
+            os.environ["LLM_PROVIDER"] = "unsupported_provider_for_test"
+            io = CapturingIO()
+            state = WorkflowState(language="zh", stage="collect_data_vol_max_throughput", current_question_id="data_vol_max_throughput")
+            state.confirmed_values.update({
+                "chain": "solana",
+                "use_fake_node": False,
+                "rpc_mode": "single",
+            })
+            app = AnyChainTerminal(state=state, io=io)
+            app.handle_user_text("你是 AI 么？")
+            self.assertNotIn("data_vol_max_throughput", state.confirmed_values)
+            self.assertEqual(state.current_question_id, "data_vol_max_throughput")
+            self.assertTrue(any("AnyChain Benchmark Agent" in message for message in io.messages))
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+    def test_reset_clears_pending_workflow_but_keeps_language(self):
+        io = CapturingIO()
+        state = WorkflowState(language="zh", stage="collect_network_interface", current_question_id="network_interface", job_id="job_1")
+        state.confirmed_values["chain"] = "solana"
+        app = AnyChainTerminal(state=state, io=io)
+        app.handle_user_text("重新开始")
+        self.assertEqual(state.stage, "start")
+        self.assertEqual(state.current_question_id, "")
+        self.assertEqual(state.confirmed_values, {})
+        self.assertEqual(state.job_id, "job_1")
+        self.assertTrue(any("已重置" in message for message in io.messages))
 
     def test_execution_artifact_diagnosis_does_not_treat_missing_performance_as_no_traffic(self):
         with tempfile.TemporaryDirectory() as tmp:

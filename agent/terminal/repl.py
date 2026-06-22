@@ -28,6 +28,7 @@ from llm.config import load_llm_config  # noqa: E402
 from runners.job_manager import list_jobs  # noqa: E402
 from terminal.io import TerminalIO  # noqa: E402
 from terminal.language import detect_language, t  # noqa: E402
+from terminal.responder import answer_conversation, should_answer_as_conversation  # noqa: E402
 from workflows.benchmark_wizard import BenchmarkWizard  # noqa: E402
 from workflows.planning_bridge import prepare_plan_from_state, submit_mock_smoke_from_plan  # noqa: E402
 from workflows.state import WorkflowState, WorkflowStateStore  # noqa: E402
@@ -79,6 +80,9 @@ class AnyChainTerminal:
     def handle_user_text(self, text: str) -> None:
         self.state.language = detect_language(text, self.state.language)
         lowered = text.lower()
+        if lowered in {"reset", "restart", "new", "重新开始", "重置"}:
+            self._reset_workflow()
+            return
         if lowered in {"help", "?"} or text in {"帮助", "？"}:
             self.io.agent(self.state.language, t(self.state.language, "help"))
             return
@@ -118,12 +122,32 @@ class AnyChainTerminal:
                 self.state.current_question_id = ""
                 self.io.agent(self.state.language, t(self.state.language, "smoke_declined"))
                 return
+        if should_answer_as_conversation(text):
+            self.io.agent(self.state.language, answer_conversation(text, self.state, load_llm_config()))
+            return
         response = self.wizard.handle(text)
         if response.handled:
             for message in response.messages:
                 self.io.agent(self.state.language, message)
             return
         self.io.agent(self.state.language, t(self.state.language, "unknown"))
+
+    def _reset_workflow(self) -> None:
+        language = self.state.language
+        job_id = self.state.job_id
+        self.state.intent = ""
+        self.state.stage = "start"
+        self.state.current_question_id = ""
+        self.state.confirmed_values.clear()
+        self.state.defaulted_values.clear()
+        self.state.skipped_values.clear()
+        self.state.missing_blockers.clear()
+        self.state.pending_confirmations.clear()
+        self.state.plan_file = ""
+        self.state.runtime_env_file = ""
+        self.state.job_id = job_id
+        self.state.language = language
+        self.io.agent(self.state.language, t(self.state.language, "state_reset"))
 
     def _startup(self) -> None:
         config = load_llm_config()
@@ -142,6 +166,8 @@ class AnyChainTerminal:
         if config_errors:
             self.io.agent(self.state.language, t(self.state.language, "llm_config_warning", errors="; ".join(config_errors)))
         self.io.agent(self.state.language, t(self.state.language, "adk", status=status.get("reason", status.get("available"))))
+        if not status.get("available"):
+            self.io.agent(self.state.language, t(self.state.language, "adk_missing_hint"))
         if latest_job:
             self.io.agent(
                 self.state.language,
