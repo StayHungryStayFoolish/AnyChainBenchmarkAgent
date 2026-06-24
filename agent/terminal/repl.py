@@ -28,7 +28,7 @@ from knowledge.framework_capabilities import load_framework_capabilities  # noqa
 from knowledge.framework_context import load_framework_context  # noqa: E402
 from llm.config import load_llm_config  # noqa: E402
 from runners.job_manager import list_jobs  # noqa: E402
-from terminal.io import TerminalIO  # noqa: E402
+from terminal.io import OutputOnlyIO, TerminalIO  # noqa: E402
 from terminal.language import detect_language, t  # noqa: E402
 from terminal.responder import answer_conversation, should_answer_as_conversation  # noqa: E402
 from workflows.benchmark_wizard import BenchmarkWizard  # noqa: E402
@@ -41,12 +41,13 @@ def main(argv: list[str] | None = None) -> int:
     store = WorkflowStateStore(args.state_file) if args.state_file else WorkflowStateStore()
     state = store.load()
     state.language = args.language or state.language
-    app = AnyChainTerminal(state=state, store=store)
     if args.prompt:
+        app = AnyChainTerminal(state=state, store=store, io=OutputOnlyIO())
         for prompt in args.prompt:
             app.handle_user_text(prompt)
             store.save(state)
         return 0
+    app = AnyChainTerminal(state=state, store=store)
     return app.run()
 
 
