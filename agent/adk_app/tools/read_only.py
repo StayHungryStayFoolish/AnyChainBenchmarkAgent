@@ -11,6 +11,15 @@ from analyzers.result_analyzer import analyze_job
 from diagnostics.doctor import run_doctor as _run_doctor
 from discovery.environment import discover_environment as _discover_environment
 from knowledge.framework_capabilities import load_framework_capabilities as _load_framework_capabilities
+from knowledge.framework_context import load_framework_context as _load_framework_context
+from knowledge.entry_contract import (
+    ENTRYPOINT_PHASES,
+    OPTIONAL_ACCOUNTS_FIELDS,
+    REAL_NODE_ENDPOINT_FIELDS,
+    RUNTIME_BASELINE_FIELDS,
+    dependency_names,
+    required_keys_for_target,
+)
 from knowledge.loader import load_knowledge_provider, provider_status
 from runners.job_manager import get_job, list_jobs, resume_job, tail_job_log as _tail_job_log
 
@@ -93,6 +102,59 @@ def load_framework_capabilities() -> dict[str, Any]:
     return _tool_result(
         data=capabilities,
         next_actions=["answer framework question", "run gap_analysis", "draft onboarding plan"],
+    )
+
+
+def load_framework_context(language: str = "en") -> dict[str, Any]:
+    """Load compact framework context for LLM grounding.
+
+    Use this at the beginning of an Agent session or before answering questions
+    about how the framework works. It returns a concise map, current capability
+    facts, config layers, runtime flow, and authoritative docs without loading
+    full markdown files into context.
+    """
+    context = _load_framework_context(language=language)
+    return _tool_result(
+        data=context,
+        next_actions=["answer from context", "load_framework_capabilities", "knowledge_search"],
+    )
+
+
+def load_execution_contract(use_fake_node: bool | None = None) -> dict[str, Any]:
+    """Load the benchmark execution contract the Agent must not bypass.
+
+    Use this before planning or explaining a benchmark workflow. It describes
+    entrypoint phases, required runtime variables, optional accounts-disk
+    variables, real-node endpoint requirements, and dependency expectations.
+    """
+    target_required = {
+        "unknown_target": list(required_keys_for_target(None)),
+        "fake_node": list(required_keys_for_target(True)),
+        "real_node": list(required_keys_for_target(False)),
+    }
+    if use_fake_node is True:
+        selected_required = target_required["fake_node"]
+        deps = list(dependency_names(True))
+    elif use_fake_node is False:
+        selected_required = target_required["real_node"]
+        deps = list(dependency_names(False))
+    else:
+        selected_required = target_required["unknown_target"]
+        deps = []
+    data = {
+        "entrypoint": "./blockchain_node_benchmark.sh",
+        "phases": list(ENTRYPOINT_PHASES),
+        "runtime_baseline_fields": [_field_payload(field) for field in RUNTIME_BASELINE_FIELDS],
+        "real_node_endpoint_fields": [_field_payload(field) for field in REAL_NODE_ENDPOINT_FIELDS],
+        "optional_accounts_fields": [_field_payload(field) for field in OPTIONAL_ACCOUNTS_FIELDS],
+        "required_keys": target_required,
+        "selected_required_keys": selected_required,
+        "expected_dependencies": deps,
+        "mandatory_gates": ["doctor", "configuration_checklist", "preflight", "smoke", "explicit_user_approval"],
+    }
+    return _tool_result(
+        data=data,
+        next_actions=["confirm missing values", "generate_benchmark_plan", "run_preflight"],
     )
 
 
@@ -235,6 +297,8 @@ def get_read_only_tools() -> list:
         discover_environment,
         run_doctor,
         audit_dependencies,
+        load_framework_context,
+        load_execution_contract,
         load_framework_capabilities,
         list_supported_chains,
         list_rpc_methods,
@@ -262,6 +326,19 @@ def _tool_result(
         "warnings": [warning for warning in (warnings or []) if warning],
         "next_actions": next_actions or [],
         "requires_user_confirmation": False,
+    }
+
+
+def _field_payload(field: Any) -> dict[str, Any]:
+    return {
+        "key": field.key,
+        "env": field.env,
+        "label": field.label,
+        "reason": field.reason,
+        "value_kind": field.value_kind,
+        "required": field.required,
+        "inferred": field.inferred,
+        "optional_when": field.optional_when,
     }
 
 

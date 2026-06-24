@@ -92,6 +92,8 @@ platforms:
 python3 agent/cli.py adk-status
 python3 agent/cli.py adk-eval
 python3 agent/cli.py capabilities
+python3 agent/cli.py tool-call --name load_framework_context --arguments '{"language":"en"}'
+python3 agent/cli.py tool-call --name load_execution_contract --arguments '{"use_fake_node":true}'
 python3 agent/cli.py tool-call --name prepare_benchmark_run --arguments '{"chain":"solana","goal":"smoke","rpc_mode":"single","use_fake_node":true}'
 python3 agent/cli.py plan --request /tmp/request.json --output /tmp/plan.json --dry-run
 python3 agent/cli.py preflight --plan /tmp/plan.json

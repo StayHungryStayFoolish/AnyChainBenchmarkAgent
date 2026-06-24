@@ -194,26 +194,32 @@ python3 agent/cli.py llm-config
 chain、RPC URL、磁盘、机器类型等 benchmark 信息可以先不配置。Agent 会自动发现能
 发现的信息，并在真实运行前提示你补充缺少的必需值。
 
-启动 Agent。该命令会委托给官方 Google ADK CLI，并加载 `agent/adk_app/` 下的
-ADK package：
+启动 Agent。该命令会打开 AnyChain 产品终端。底层使用 Google ADK runtime
+能力，但不会把原始 `adk run` 终端 UI 暴露给用户：
 
 ```bash
 ./bin/anychain-agent
 ```
 
-然后在 ADK 会话里直接输入你的需求。Agent 应该使用 function tools 检查环境、准备
-benchmark run、生成 plan、执行 preflight、请求确认、运行 smoke，并只提交经过确认的
-job。
+然后在 `User>` 提示符里直接输入你的需求。Agent 会以 `Agent>` 回复，响应语言会跟随
+用户输入语言，并按一项一项确认的方式检查环境、准备 benchmark run、生成 plan、
+执行 preflight、请求确认、运行 smoke，并只提交经过确认的 job。
 
 ```text
-Check this host and tell me what is missing before a benchmark.
-Install missing benchmark dependencies after I approve.
-I use Google ADC; install gcloud too if it is missing and you need it.
-Prepare a Solana fake-node smoke benchmark at 1 QPS.
-Run lifecycle smoke after showing me the generated plan.
-Run a real fake-node benchmark smoke only after I approve it.
-After smoke passes, ask me before submitting a detached benchmark job.
-What chains, RPC methods, and fake-node fixtures are currently supported?
+User> doctor
+Agent> ...只读检查环境和依赖，如果缺少依赖，会先询问是否允许安装...
+
+User> 我要压测一个区块链节点
+Agent> ...询问要测试哪个链...
+
+User> solana
+Agent> ...询问 [1] fake-node 闭环测试 / [2] real-node 真实节点...
+
+User> 1
+Agent> ...继续确认 cloud/zone/machine/disk/network，然后询问是否查看高级配置...
+
+User> 2
+Agent> ...在 RPC 模式阶段，2 表示 mixed 多方法加权 workload...
 ```
 
 在新环境中建议先输入 `doctor`。它会以只读方式检查 cloud/deployment 识别结果、

@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from onboarding.chain_onboarding import SUPPORTED_FAMILIES
+from onboarding.families import SUPPORTED_FAMILIES
 
 
 def draft_chain_template(

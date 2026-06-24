@@ -28,13 +28,20 @@ def answer_onboarding_request(prompt: str) -> str:
         methods=methods,
         adapter_family=family,
     )
+    evidence_note = _evidence_note(package)
     lines = [
         format_onboarding_package(package),
+        "",
+        evidence_note,
         "",
         "Developer boundaries:",
         "- Keep chain-specific logic in config/chains, chain adapters, fake-node configs/fixtures, or sync-health metadata.",
         "- Do not mark the chain or RPC method as supported until validation and fake-node smoke pass.",
+        "- Do not rely only on the underlying LLM's blockchain knowledge. Treat it as a hypothesis until docs, KB evidence, or real node samples are attached.",
         "- Update docs/en and docs/zh for user-visible behavior.",
+        "",
+        "Coding handoff:",
+        package.get("coding_brief", ""),
         "",
         "Detailed guide:",
         "- docs/en/secondary-development-guide.md",
@@ -109,6 +116,8 @@ def _generic_onboarding_plan() -> str:
         "- For a new protocol family, add chain adapter code, fake-node handler/config, template, fixtures, and lifecycle tests.",
         "- For a new RPC method, add rpc_methods.mixed_weighted, param_formats or param_spec, fake-node fixture mapping, and per-method report validation.",
         "- For workload changes, validate target generation, proxy attribution, per-method success/error counts, and latency percentiles.",
+        "- If the Agent cannot classify the protocol family with repository evidence, ask the user for official RPC docs, endpoint type, real request/response samples, sync-health method, and fixture samples before coding.",
+        "- Generate a coding brief before handing work to a coding-capable LLM; the brief must include files to edit, quality gates, validation commands, and evidence requirements.",
         "",
         "Required checks:",
         "- python3 tools/chain_adapters/cli.py validate-template --chain all",
@@ -120,6 +129,22 @@ def _generic_onboarding_plan() -> str:
         "Detailed guide:",
         "- docs/en/secondary-development-guide.md",
         "- docs/zh/secondary-development-guide.md",
+    ])
+
+
+def _evidence_note(package: dict) -> str:
+    gate = package.get("quality_gate", {})
+    if gate.get("family_known"):
+        return "\n".join([
+            "Evidence policy:",
+            "- The proposed adapter family is known, but support is not complete until the evidence checklist and validation gates pass.",
+            "- If the user's new chain or RPC methods differ from this family shape, stop and request official docs/samples before coding.",
+        ])
+    return "\n".join([
+        "Evidence policy:",
+        "- The adapter family is unknown or not one of the six supported families.",
+        "- Ask the user for: official RPC docs or internal KB page, endpoint type, request/response samples, parameter contracts, and sync-health method.",
+        "- Produce a new-family design before writing code.",
     ])
 
 

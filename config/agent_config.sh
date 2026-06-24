@@ -18,8 +18,8 @@
 LLM_PROVIDER="${LLM_PROVIDER:-gemini}"
 
 # Model name for the selected provider.
-# Examples: gemini-3.1-pro, claude-opus-4-8, gpt-5.5.
-LLM_MODEL="${LLM_MODEL:-gemini-3.1-pro}"
+# Examples: gemini-3.1-pro-preview, claude-opus-4-8, gpt-5.5.
+LLM_MODEL="${LLM_MODEL:-gemini-3.1-pro-preview}"
 
 # Authentication mode for the selected provider.
 # api_key: GEMINI_API_KEY/GOOGLE_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY.
@@ -27,7 +27,7 @@ LLM_MODEL="${LLM_MODEL:-gemini-3.1-pro}"
 # attached_service_account: use the VM/GKE attached service account.
 # service_account_impersonation: impersonate GOOGLE_SERVICE_ACCOUNT_EMAIL.
 # service_account_file: use GOOGLE_APPLICATION_CREDENTIALS JSON file.
-LLM_AUTH_MODE="${LLM_AUTH_MODE:-api_key}"
+LLM_AUTH_MODE="${LLM_AUTH_MODE:-google_adc}"
 
 # Required when LLM_PROVIDER is gemini or claude and LLM_AUTH_MODE is not api_key.
 # Google Cloud project that contains the Vertex AI endpoint.
@@ -35,8 +35,8 @@ GOOGLE_CLOUD_PROJECT="${GOOGLE_CLOUD_PROJECT:-}"
 
 # Required when LLM_PROVIDER is gemini or claude and LLM_AUTH_MODE is not api_key.
 # Vertex AI location/region.
-# Examples: us-central1 for Gemini, us-east5 for some Claude partner models.
-GOOGLE_CLOUD_LOCATION="${GOOGLE_CLOUD_LOCATION:-us-central1}"
+# Examples: global for Gemini, global for some Claude partner models.
+GOOGLE_CLOUD_LOCATION="${GOOGLE_CLOUD_LOCATION:-global}"
 
 # Required only when LLM_AUTH_MODE=service_account_impersonation.
 # Target service account email for service_account_impersonation.

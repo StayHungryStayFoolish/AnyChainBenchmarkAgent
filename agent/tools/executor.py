@@ -10,6 +10,7 @@ from analyzers.bottleneck_rules import diagnose_artifacts
 from analyzers.result_analyzer import analyze_job
 from discovery.environment import discover_environment
 from knowledge.framework_capabilities import load_framework_capabilities
+from knowledge.framework_context import load_framework_context
 from knowledge.gap_analyzer import analyze_capability_gap
 from knowledge.loader import load_knowledge_provider, provider_status
 from onboarding.template_drafter import draft_chain_template
@@ -20,6 +21,7 @@ from adk_app.tools.actions import run_fake_node_smoke_benchmark
 from adk_app.tools.actions import install_dependencies
 from adk_app.tools.planning import prepare_benchmark_run
 from adk_app.tools.read_only import audit_dependencies
+from adk_app.tools.read_only import load_execution_contract
 
 
 def execute_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -30,6 +32,12 @@ def execute_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str
         return audit_dependencies()
     if name == "load_capabilities":
         return load_framework_capabilities()
+    if name == "load_framework_context":
+        return load_framework_context(language=args.get("language", "en"))
+    if name == "load_execution_contract":
+        raw = args.get("use_fake_node")
+        use_fake_node = raw if isinstance(raw, bool) else None
+        return load_execution_contract(use_fake_node=use_fake_node)
     if name == "prepare_benchmark_run":
         return prepare_benchmark_run(**args)
     if name == "draft_request":

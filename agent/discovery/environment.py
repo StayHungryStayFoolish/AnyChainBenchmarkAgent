@@ -96,6 +96,9 @@ def _discover_cloud(runner: CommandRunner, kubernetes: dict[str, Any]) -> dict[s
     provider = "other"
     confidence = 0.2
     variant = ""
+    region = ""
+    zone = ""
+    machine_type = ""
 
     code, stdout, _ = runner(["bash", "-lc", "source config/cloud_provider.sh >/dev/null 2>&1; printf '%s,%s,%s' \"${CLOUD_PROVIDER:-other}\" \"${CLOUD_PROVIDER_VARIANT:-}\" \"${NETWORK_INTERFACE:-}\""], 5)
     if code == 0 and stdout.strip():
@@ -115,11 +118,96 @@ def _discover_cloud(runner: CommandRunner, kubernetes: dict[str, Any]) -> dict[s
     else:
         platform_name = "unknown"
 
+    if provider == "gcp":
+        metadata = _discover_gcp_instance_metadata(runner)
+        region = metadata.get("region", "")
+        zone = metadata.get("zone", "")
+        machine_type = metadata.get("machine_type", "")
+        if zone or machine_type:
+            confidence = max(confidence, 0.9)
+    elif provider == "aws":
+        metadata = _discover_aws_instance_metadata(runner)
+        region = metadata.get("region", "")
+        zone = metadata.get("zone", "")
+        machine_type = metadata.get("machine_type", "")
+        if zone or machine_type:
+            confidence = max(confidence, 0.9)
+
     return {
         "provider": provider,
         "platform": platform_name,
         "variant": variant,
+        "region": region,
+        "zone": zone,
+        "machine_type": machine_type,
         "confidence": confidence,
+    }
+
+
+def _discover_gcp_instance_metadata(runner: CommandRunner) -> dict[str, str]:
+    base = "http://metadata.google.internal/computeMetadata/v1/instance"
+    header = "Metadata-Flavor: Google"
+    zone = _metadata_last_segment(
+        runner,
+        ["curl", "-s", "-m", "2", "-H", header, f"{base}/zone"],
+    )
+    machine_type = _metadata_last_segment(
+        runner,
+        ["curl", "-s", "-m", "2", "-H", header, f"{base}/machine-type"],
+    )
+    return {
+        "zone": zone,
+        "region": _gcp_region_from_zone(zone),
+        "machine_type": machine_type,
+    }
+
+
+def _discover_aws_instance_metadata(runner: CommandRunner) -> dict[str, str]:
+    token_code, token, _ = runner(
+        [
+            "curl",
+            "-s",
+            "-m",
+            "2",
+            "-X",
+            "PUT",
+            "http://169.254.169.254/latest/api/token",
+            "-H",
+            "X-aws-ec2-metadata-token-ttl-seconds: 60",
+        ],
+        2,
+    )
+    if token_code != 0 or not token.strip():
+        return {"region": "", "zone": "", "machine_type": ""}
+    token = token.strip()
+    zone = _metadata_text(
+        runner,
+        [
+            "curl",
+            "-s",
+            "-m",
+            "2",
+            "-H",
+            f"X-aws-ec2-metadata-token: {token}",
+            "http://169.254.169.254/latest/meta-data/placement/availability-zone",
+        ],
+    )
+    machine_type = _metadata_text(
+        runner,
+        [
+            "curl",
+            "-s",
+            "-m",
+            "2",
+            "-H",
+            f"X-aws-ec2-metadata-token: {token}",
+            "http://169.254.169.254/latest/meta-data/instance-type",
+        ],
+    )
+    return {
+        "zone": zone,
+        "region": _aws_region_from_zone(zone),
+        "machine_type": machine_type,
     }
 
 
@@ -253,6 +341,34 @@ def _run_command(command: list[str], timeout: float) -> tuple[int, str, str]:
         return completed.returncode, completed.stdout, completed.stderr
     except Exception as exc:  # pragma: no cover - defensive discovery guard
         return 1, "", str(exc)
+
+
+def _metadata_text(runner: CommandRunner, command: list[str]) -> str:
+    code, stdout, _ = runner(command, 2)
+    if code != 0:
+        return ""
+    text = stdout.strip()
+    if not text or "<html" in text.lower():
+        return ""
+    return text
+
+
+def _metadata_last_segment(runner: CommandRunner, command: list[str]) -> str:
+    text = _metadata_text(runner, command)
+    if not text:
+        return ""
+    return text.rsplit("/", 1)[-1].strip()
+
+
+def _gcp_region_from_zone(zone: str) -> str:
+    parts = zone.rsplit("-", 1)
+    return parts[0] if len(parts) == 2 else ""
+
+
+def _aws_region_from_zone(zone: str) -> str:
+    if len(zone) < 2:
+        return ""
+    return zone[:-1]
 
 
 def _shorten(text: str, limit: int = 500) -> str:

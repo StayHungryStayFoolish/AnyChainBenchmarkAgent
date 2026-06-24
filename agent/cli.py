@@ -13,6 +13,10 @@ from analyzers.history import compare_latest, list_history
 from analyzers.artifact_qa import answer_artifact_question
 from analyzers.bottleneck_rules import diagnose_artifacts
 from adk_app.app import status_payload as adk_status_payload
+from adk_app.agents.router import route_user_intent
+from adk_app.compat import adk_feature_report
+from adk_app.workflow.root_workflow import root_workflow_dry_run
+from adk_app.workflow.native_smoke import run_native_workflow_smoke
 from adk_app.evals.runner import run_offline_evals as run_adk_offline_evals
 from adk_app.runtime import run_adk_cli
 from diagnostics.doctor import run_doctor
@@ -105,6 +109,16 @@ def main(argv: list[str] | None = None) -> int:
     tool_call.add_argument("--name", required=True)
     tool_call.add_argument("--arguments", default="{}", help="JSON object or path to a JSON file")
 
+    route_intent = sub.add_parser("route-intent", help="Route one user utterance into the ADK workflow intent schema")
+    route_intent.add_argument("--text", required=True)
+    route_intent.add_argument("--language", default="en", choices=["zh", "en"])
+
+    workflow_dry_run = sub.add_parser("workflow-dry-run", help="Run the offline-safe ADK workflow contract for one utterance")
+    workflow_dry_run.add_argument("--text", required=True)
+    workflow_dry_run.add_argument("--language", default="en", choices=["zh", "en"])
+
+    sub.add_parser("adk-native-smoke", help="Run a credential-free native google-adk Workflow smoke test")
+
     validate = sub.add_parser("validate-plan", help="Validate plan shape")
     validate.add_argument("plan")
 
@@ -156,6 +170,9 @@ def main(argv: list[str] | None = None) -> int:
 
     adk_status_cmd = sub.add_parser("adk-status", help="Show optional ADK runtime availability")
     adk_status_cmd.add_argument("--output")
+
+    adk_feature_cmd = sub.add_parser("adk-feature-report", help="Show offline-safe Google ADK feature compatibility")
+    adk_feature_cmd.add_argument("--output")
 
     sub.add_parser("adk-eval", help="Run no-key ADK package and tool-contract checks")
 
@@ -271,6 +288,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "tool-call":
         return _emit(execute_tool(args.name, load_arguments(args.arguments)), None)
 
+    if args.command == "route-intent":
+        return _emit(route_user_intent(args.text, default_language=args.language), None)
+
+    if args.command == "workflow-dry-run":
+        return _emit(root_workflow_dry_run(args.text, language=args.language), None)
+
+    if args.command == "adk-native-smoke":
+        payload = run_native_workflow_smoke()
+        return _emit(payload, None)
+
     if args.command == "validate-plan":
         errors = validate_plan_shape(load_json(args.plan))
         payload = {"valid": not errors, "errors": errors}
@@ -331,6 +358,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "adk-status":
         return _emit(adk_status_payload(), args.output)
 
+    if args.command == "adk-feature-report":
+        return _emit(adk_feature_report(), args.output)
+
     if args.command == "adk-eval":
         payload = run_adk_offline_evals()
         _emit(payload, None)
@@ -349,15 +379,13 @@ def _emit(payload: dict, output: str | None) -> int:
 
 
 def _print_dry_run(plan: dict) -> None:
-    print("Dry run", file=sys.stderr)
-    print(f"  Plan ID: {plan['plan_id']}", file=sys.stderr)
-    print(f"  Chain: {plan.get('chain') or '<missing>'}", file=sys.stderr)
-    print(f"  Strategy: {plan['strategy']}", file=sys.stderr)
-    print(f"  RPC mode: {plan['rpc_mode']}", file=sys.stderr)
-    print(f"  fake-node: {plan['use_fake_node']}", file=sys.stderr)
-    print(f"  Command: {' '.join(plan['execution']['command'])}", file=sys.stderr)
-    if plan["required_inputs"]:
-        print(f"  Missing required inputs: {', '.join(plan['required_inputs'])}", file=sys.stderr)
+    plan_id = str(plan.get("plan_id") or "<unknown>")
+    required_count = len(plan.get("required_inputs") or [])
+    command_count = len((plan.get("execution") or {}).get("command") or [])
+    print("Dry run completed", file=sys.stderr)
+    print(f"  Plan ID length: {len(plan_id)}", file=sys.stderr)
+    print(f"  Required input count: {required_count}", file=sys.stderr)
+    print(f"  Execution command argument count: {command_count}", file=sys.stderr)
 
 
 if __name__ == "__main__":
