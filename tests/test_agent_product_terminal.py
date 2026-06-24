@@ -603,8 +603,18 @@ class AgentProductTerminalTest(unittest.TestCase):
         report = {
             "status": "needs_dependencies",
             "environment": {
-                "cloud": {"provider": "gcp"},
+                "host": {"cpu_count": 22, "memory_gib": 88},
+                "cloud": {"provider": "gcp", "platform": "gce", "region": "us-central1", "zone": "us-central1-a", "machine_type": "c3-standard-22"},
                 "deployment": {"type": "vm"},
+                "network": {"default_interface": "eth0"},
+                "disks": {
+                    "proposed_ledger_device": "sdb",
+                    "proposed_accounts_device": "sdc",
+                    "candidates": [
+                        {"name": "sdb", "type": "disk", "size": "2048G", "mountpoint": "/mnt/ledger", "label": "ledger"},
+                        {"name": "sdc", "type": "disk", "size": "512G", "mountpoint": "/mnt/accounts", "label": "accounts"},
+                    ],
+                },
                 "dependencies": {"missing_required": ["jq"], "missing_optional": []},
             },
             "capabilities": {"chain_count": 36, "unique_rpc_method_count": 184},
@@ -616,6 +626,9 @@ class AgentProductTerminalTest(unittest.TestCase):
         self.assertTrue(state.defaulted_values["framework_context_loaded"])
         self.assertEqual(state.defaulted_values["framework_context_summary"]["chain_count"], 36)
         self.assertTrue(any("启动检查完成" in message for message in io.messages))
+        self.assertTrue(any("CLOUD_REGION: us-central1" in message for message in io.messages))
+        self.assertTrue(any("CPU: 22" in message for message in io.messages))
+        self.assertTrue(any("[1] sdb" in message for message in io.messages))
         self.assertTrue(any("已加载框架事实" in message for message in io.messages))
         self.assertTrue(any("是否允许" in message for message in io.messages))
 

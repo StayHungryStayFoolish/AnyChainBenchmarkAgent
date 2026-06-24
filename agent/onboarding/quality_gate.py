@@ -88,6 +88,21 @@ def coding_brief(package: dict[str, Any]) -> str:
         "- tools/fake-node/configs/<family>.yaml and tools/fake-node/fixtures/<chain>/",
         "- docs/en/how-to-add-chain.md and docs/zh/how-to-add-chain.md only for user-visible behavior changes",
         "",
+        "Existing-family chain path:",
+        "- Choose one of the supported families only when the request envelope, parameter binding, proxy extraction, fake-node routing, and sync-health shape match repository evidence.",
+        "- Prefer config-only changes: chain template, rpc_methods, param_formats/param_spec, proxy_extraction, _meta.sync_health, and fixture mappings.",
+        "- Do not add adapter or fake-node handler code unless the existing family cannot express the method shape.",
+        "",
+        "New-family path:",
+        "- Stop before coding unless the brief explains why all six current families are insufficient.",
+        "- Add a design section covering transport, request envelope, parameter model, response envelope, sync-health semantics, proxy extraction, fake-node routing, and report impact.",
+        "- Add new adapter/fake-node code only after the design and evidence are complete.",
+        "",
+        "New RPC method path:",
+        "- For every method, define request parameters, sample values, expected response shape, error behavior, and method name as it must appear in proxy_method.csv.",
+        "- Add the method to rpc_methods.single or rpc_methods.mixed_weighted, ensure mixed weights total 100, and add param_formats or param_spec.",
+        "- Record or provide fake-node fixtures that exactly match method + params + chain response structure.",
+        "",
         "RPC methods to implement:",
     ])
     if method_names:
@@ -103,5 +118,6 @@ def coding_brief(package: dict[str, Any]) -> str:
         "",
         "Completion rule:",
         "- Do not call this supported until every quality gate passes and fake-node smoke proves request/response fixtures are usable.",
+        "- If official docs, internal KB evidence, real request samples, or real response samples are missing, ask the user for them instead of inventing support.",
     ])
     return "\n".join(lines)
