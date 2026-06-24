@@ -143,6 +143,13 @@ Python environment used by production blockchain nodes:
 bash scripts/install_agent_deps.sh --yes
 ```
 
+If you skip this step and start the interactive Agent anyway, the launcher
+checks the required terminal dependency before entering the REPL. When
+`prompt-toolkit` is missing, it asks for confirmation and then runs
+`scripts/install_agent_deps.sh --yes` for you. It does not silently fall back to
+Python `input()`, because reliable Ctrl+C and Chinese/wide-character editing
+are baseline Agent terminal requirements.
+
 If your host does not provide `python3.11`, use any Python 3.10+ interpreter.
 The benchmark engine still supports older Python for non-Agent automation, but
 the Agent requires a Python 3.10+ ADK runtime environment for model-backed
