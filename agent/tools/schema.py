@@ -24,6 +24,16 @@ def tool_schema() -> dict[str, list[dict[str, Any]]]:
             {},
         ),
         _tool(
+            "load_framework_context",
+            "Return compact AnyChain framework context for Agent grounding: runtime flow, config layers, current capability summary, and authoritative docs.",
+            {"language": _string("Optional response/document language: en or zh.")},
+        ),
+        _tool(
+            "load_execution_contract",
+            "Return the hard benchmark execution contract: entrypoint phases, required variables, dependency expectations, and mandatory gates.",
+            {"use_fake_node": {"type": "boolean", "description": "Optional target mode. true=fake-node, false=real-node, omitted=unknown target."}},
+        ),
+        _tool(
             "prepare_benchmark_run",
             "Run discovery, doctor, request drafting, plan generation, preflight, and runbook rendering without launching traffic.",
             {

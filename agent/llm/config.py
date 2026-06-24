@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -102,11 +103,15 @@ def load_llm_config(env: Mapping[str, str] | None = None) -> LLMConfig:
     default_auth_mode = "api_key"
     if provider in {"gemini", "claude"}:
         default_auth_mode = source.get("LLM_AUTH_MODE", "api_key").strip().lower()
+    auth_mode = source.get("LLM_AUTH_MODE", default_auth_mode).strip().lower()
+    google_project = source.get("GOOGLE_CLOUD_PROJECT", "").strip()
+    if provider in {"gemini", "claude"} and auth_mode in {"google_adc", "attached_service_account", "service_account_impersonation", "service_account_file"}:
+        google_project = google_project or _infer_google_project(source)
     return LLMConfig(
         provider=provider,
         model=source.get("LLM_MODEL", default_model).strip(),
-        auth_mode=source.get("LLM_AUTH_MODE", default_auth_mode).strip().lower(),
-        google_project=source.get("GOOGLE_CLOUD_PROJECT", "").strip(),
+        auth_mode=auth_mode,
+        google_project=google_project,
         google_location=source.get("GOOGLE_CLOUD_LOCATION", "us-central1").strip(),
         google_service_account_email=source.get("GOOGLE_SERVICE_ACCOUNT_EMAIL", "").strip(),
         google_application_credentials=source.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip(),
@@ -117,6 +122,60 @@ def load_llm_config(env: Mapping[str, str] | None = None) -> LLMConfig:
         anthropic_api_key_present=bool(source.get("ANTHROPIC_API_KEY", "")),
         openai_api_key_present=bool(source.get("OPENAI_API_KEY", "")),
     )
+
+
+def _infer_google_project(source: Mapping[str, str]) -> str:
+    for key in ("GOOGLE_CLOUD_PROJECT", "GOOGLE_PROJECT_ID", "GCLOUD_PROJECT", "CLOUDSDK_CORE_PROJECT"):
+        value = source.get(key, "").strip()
+        if value:
+            return value
+    adc_file = source.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    candidates = []
+    if adc_file:
+        candidates.append(Path(adc_file).expanduser())
+    cloud_sdk_config = source.get("CLOUDSDK_CONFIG", "").strip()
+    if cloud_sdk_config:
+        candidates.append(Path(cloud_sdk_config).expanduser() / "application_default_credentials.json")
+    candidates.append(Path.home() / ".config" / "gcloud" / "application_default_credentials.json")
+    for path in candidates:
+        project = _read_project_from_adc(path)
+        if project:
+            return project
+    return _read_project_from_gcloud()
+
+
+def _read_project_from_adc(path: Path) -> str:
+    try:
+        if not path.is_file():
+            return ""
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    for key in ("quota_project_id", "project_id"):
+        value = str(payload.get(key, "")).strip()
+        if value:
+            return value
+    return ""
+
+
+def _read_project_from_gcloud() -> str:
+    try:
+        completed = subprocess.run(
+            ["gcloud", "config", "get-value", "project"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        )
+    except Exception:
+        return ""
+    if completed.returncode != 0:
+        return ""
+    value = completed.stdout.strip()
+    if not value or value == "(unset)":
+        return ""
+    return value
 
 
 def load_agent_environment() -> Mapping[str, str]:

@@ -19,6 +19,7 @@ sys.path.insert(0, str(REPO / "agent"))
 
 from discovery.environment import discover_environment  # noqa: E402
 from knowledge.framework_capabilities import load_framework_capabilities  # noqa: E402
+from knowledge.framework_context import load_framework_context, render_framework_context_for_prompt  # noqa: E402
 from llm import config as llm_config_module  # noqa: E402
 from llm.config import load_llm_config  # noqa: E402
 from llm.google_auth import credential_plan  # noqa: E402
@@ -28,7 +29,11 @@ from runners.guardrails import validate_execution_plan  # noqa: E402
 from runners.job_manager import get_job, submit_job  # noqa: E402
 from adk_app.app import status_payload as adk_status_payload  # noqa: E402
 from adk_app.callbacks import before_tool_callback  # noqa: E402
+from adk_app.compat import adk_feature_report  # noqa: E402
 from adk_app.evals.runner import run_offline_evals as run_adk_offline_evals  # noqa: E402
+from adk_app.workflow.schemas import validate_intent_route  # noqa: E402
+from adk_app.workflow.root_workflow import root_workflow_dry_run  # noqa: E402
+from adk_app.agents.router import route_user_intent  # noqa: E402
 from adk_app.instructions import ROOT_INSTRUCTION  # noqa: E402
 from adk_app.root_agent import resolve_adk_model  # noqa: E402
 from adk_app.runtime import run_adk_cli  # noqa: E402
@@ -49,6 +54,8 @@ from adk_app.tools.planning import prepare_benchmark_run as adk_prepare_benchmar
 from adk_app.tools.planning import render_runbook as adk_render_runbook  # noqa: E402
 from adk_app.tools.planning import run_preflight as adk_run_preflight  # noqa: E402
 from adk_app.tools.read_only import audit_dependencies as adk_audit_dependencies  # noqa: E402
+from adk_app.tools.read_only import load_execution_contract as adk_load_execution_contract  # noqa: E402
+from adk_app.tools.read_only import load_framework_context as adk_load_framework_context  # noqa: E402
 from adk_app.tools.read_only import load_framework_capabilities as adk_load_framework_capabilities  # noqa: E402
 from adk_app.tools.read_only import list_rpc_methods as adk_list_rpc_methods  # noqa: E402
 from adk_app.tools.read_only import list_supported_chains as adk_list_supported_chains  # noqa: E402
@@ -79,6 +86,10 @@ class AgentRuntimeContractTest(unittest.TestCase):
             joined = " ".join(command)
             if "config/cloud_provider.sh" in joined:
                 return 0, "gcp,gcp_gvnic,eth0", ""
+            if "computeMetadata/v1/instance/zone" in joined:
+                return 0, "projects/123/zones/us-central1-a", ""
+            if "computeMetadata/v1/instance/machine-type" in joined:
+                return 0, "projects/123/machineTypes/c3-standard-22", ""
             if "ip route" in joined:
                 return 0, "eth0\n", ""
             if command[:3] == ["lsblk", "-J", "-o"]:
@@ -95,6 +106,9 @@ class AgentRuntimeContractTest(unittest.TestCase):
         discovery = discover_environment(command_runner=fake_runner)
         self.assertEqual(discovery["cloud"]["provider"], "gcp")
         self.assertEqual(discovery["cloud"]["platform"], "gce")
+        self.assertEqual(discovery["cloud"]["region"], "us-central1")
+        self.assertEqual(discovery["cloud"]["zone"], "us-central1-a")
+        self.assertEqual(discovery["cloud"]["machine_type"], "c3-standard-22")
         self.assertEqual(discovery["network"]["default_interface"], "eth0")
         self.assertEqual(discovery["disks"]["proposed_ledger_device"], "sdb")
         self.assertEqual(discovery["dependencies"]["mode"], "audit")
@@ -362,6 +376,9 @@ class AgentRuntimeContractTest(unittest.TestCase):
 
             new_chain_gap = answer_onboarding_request("How do I add new chain foochain?")
             self.assertIn("Onboarding package for foochain", new_chain_gap)
+            self.assertIn("Evidence policy", new_chain_gap)
+            self.assertIn("Coding handoff", new_chain_gap)
+            self.assertIn("official RPC docs", new_chain_gap)
             self.assertIn("docs/en/secondary-development-guide.md", new_chain_gap)
 
             kb_onboarding = answer_onboarding_request("How do I integrate our enterprise Knowledge Base?")
@@ -389,6 +406,10 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertEqual(onboarding["status"], "needs_onboarding")
             self.assertEqual(onboarding["adapter_family"], "jsonrpc")
             self.assertTrue(onboarding["validation_commands"])
+            self.assertIn("quality_gate", onboarding)
+            self.assertIn("coding_brief", onboarding)
+            self.assertTrue(onboarding["quality_gate"]["family_known"])
+            self.assertIn("official protocol/RPC documentation", onboarding["quality_gate"]["required_chain_evidence"][0])
 
             draft_template_file = tmp_path / "foochain.json"
             draft_template = run_agent(
@@ -417,6 +438,7 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertIn("submit_job", tool_names)
             self.assertIn("draft_chain_template", tool_names)
             self.assertIn("knowledge_search", tool_names)
+            self.assertIn("load_execution_contract", tool_names)
             self.assertTrue(all(tool["type"] == "function" for tool in schema["tools"]))
             install_tool = next(tool for tool in schema["tools"] if tool["function"]["name"] == "install_dependencies")
             install_props = install_tool["function"]["parameters"]["properties"]
@@ -497,7 +519,13 @@ class AgentRuntimeContractTest(unittest.TestCase):
             env["FAKE_ADK_STDIN_FILE"] = str(stdin_file)
 
             completed = subprocess.run(
-                [str(AGENT_BIN), "--prompt", "I want to benchmark Solana with fake-node"],
+                [
+                    str(AGENT_BIN),
+                    "--state-file",
+                    str(Path(tmp) / "state.json"),
+                    "--prompt",
+                    "I want to benchmark Solana with fake-node",
+                ],
                 cwd=REPO,
                 text=True,
                 stdout=subprocess.PIPE,
@@ -507,7 +535,7 @@ class AgentRuntimeContractTest(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0)
             self.assertIn("Selected fake-node", completed.stdout)
-            self.assertIn("LOCAL_RPC_URL", completed.stdout)
+            self.assertIn("CLOUD", completed.stdout)
             self.assertNotIn("[user]", completed.stdout)
             self.assertFalse(args_file.exists())
             self.assertFalse(stdin_file.exists())
@@ -560,6 +588,11 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertEqual(sum(item["weight"] for item in package["workload_plugin"]["mixed_weighted"]), 100)
         self.assertIn("jsonrpc", package["supported_families"])
         self.assertTrue(package["fake_node_steps"])
+        self.assertIn("quality_gate", package)
+        self.assertIn("coding_brief", package)
+        self.assertIn("Implementation brief", package["coding_brief"])
+        self.assertIn("fake-node smoke", package["coding_brief"])
+        self.assertIn("Do not rely on the model's general blockchain knowledge", package["quality_gate"]["llm_policy"][0])
 
     def test_llm_provider_config_supports_api_keys_and_google_auth(self):
         gemini_key_config = load_llm_config({
@@ -615,6 +648,19 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertEqual(partner_model_config.validate(), [])
         self.assertEqual(provider_from_config(partner_model_config).__class__.__name__, "VertexClaudeProvider")
 
+        with tempfile.TemporaryDirectory() as tmp:
+            adc_file = Path(tmp) / "application_default_credentials.json"
+            adc_file.write_text('{"quota_project_id": "adc-quota-project"}\n', encoding="utf-8")
+            adc_config = load_llm_config({
+                "LLM_PROVIDER": "gemini",
+                "LLM_MODEL": "gemini-3.1-pro",
+                "LLM_AUTH_MODE": "google_adc",
+                "GOOGLE_CLOUD_LOCATION": "us-central1",
+                "GOOGLE_APPLICATION_CREDENTIALS": str(adc_file),
+            })
+        self.assertEqual(adc_config.google_project, "adc-quota-project")
+        self.assertEqual(adc_config.validate(), [])
+
         json_key_config = load_llm_config({
             "LLM_PROVIDER": "gemini",
             "LLM_MODEL": "gemini-3.1-pro",
@@ -658,7 +704,7 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertIn("CPU-disk correlation", ROOT_INSTRUCTION)
         self.assertIn("needs_review", ROOT_INSTRUCTION)
         self.assertIn("fake-node fixtures", ROOT_INSTRUCTION)
-        self.assertIn("Choose tools directly", ROOT_INSTRUCTION)
+        self.assertIn("Use a structured router only for intent classification", ROOT_INSTRUCTION)
         self.assertIn("prepare_benchmark_run", ROOT_INSTRUCTION)
         self.assertIn("run_fake_node_smoke_benchmark", ROOT_INSTRUCTION)
         self.assertIn("audit_dependencies", ROOT_INSTRUCTION)
@@ -726,9 +772,65 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertIn("Never install dependencies without explicit user confirmation", ROOT_INSTRUCTION)
         self.assertIn("Never launch a real benchmark without explicit user confirmation", ROOT_INSTRUCTION)
         self.assertIn("cite concrete artifact paths", ROOT_INSTRUCTION)
+        self.assertIn("Do not rely on the model's general blockchain knowledge", ROOT_INSTRUCTION)
+        self.assertIn("produce a coding brief", ROOT_INSTRUCTION)
+        self.assertIn("Use a structured router only for intent classification", ROOT_INSTRUCTION)
 
         cli_status = run_agent("adk-status")
         self.assertEqual(cli_status["root_instruction_present"], status["root_instruction_present"])
+
+    def test_adk_feature_report_is_offline_safe(self):
+        report = adk_feature_report()
+        self.assertIn("package", report)
+        self.assertIn("features", report)
+        self.assertIn("workflow", report["features"])
+        self.assertIn("implementation_recommendation", report)
+
+        cli_report = run_agent("adk-feature-report")
+        self.assertIn("workflow", cli_report["features"])
+
+    def test_adk_native_workflow_smoke_is_credential_free(self):
+        payload = run_agent("adk-native-smoke")
+        self.assertIn(payload["status"], {"passed", "not_installed", "failed"})
+        if payload["status"] == "passed":
+            self.assertEqual(payload["workflow"], "anychain_native_workflow_smoke")
+            self.assertEqual(payload["nodes"], ["startup_doctor", "intent_route"])
+            self.assertGreaterEqual(payload["event_count"], 1)
+        elif payload["status"] == "not_installed":
+            self.assertIn("recommendation", payload)
+        else:
+            self.fail(payload.get("error", "native ADK workflow smoke failed"))
+
+    def test_router_outputs_valid_workflow_intent_schema(self):
+        route = route_user_intent("请用 fake-node 测试 solana mixed getSlot=70 getBlockHeight=30", default_language="zh")
+        self.assertEqual(route["intent"], "START_BENCHMARK")
+        self.assertEqual(route["language"], "zh")
+        self.assertEqual(route["entities"]["chain"], "solana")
+        self.assertEqual(route["entities"]["target"], "fake-node")
+        self.assertEqual(validate_intent_route(route), [])
+
+        real_node_route = route_user_intent("我想测试真实 solana 节点", default_language="zh")
+        self.assertEqual(real_node_route["intent"], "START_BENCHMARK")
+        self.assertEqual(real_node_route["entities"]["target"], "real-node")
+        self.assertNotIn("target", real_node_route["missing_clarifications"])
+
+        onboarding = run_agent("route-intent", "--text", "Add custom RPC method foo_getBalance to chain foochain")
+        self.assertEqual(onboarding["intent"], "ONBOARD_CHAIN_RPC")
+        self.assertEqual(validate_intent_route(onboarding), [])
+
+    def test_root_workflow_dry_run_emits_workflow_events(self):
+        payload = root_workflow_dry_run("请用 fake-node 测试 solana", language="zh")
+        event_types = [event["event_type"] for event in payload["events"]]
+        self.assertEqual(event_types[:4], ["startup_doctor", "framework_context_loaded", "session_resume", "intent_route"])
+        self.assertIn("benchmark_workflow_selected", event_types)
+        self.assertEqual(payload["status"], "ok")
+        context_event = payload["events"][1]
+        self.assertEqual(context_event["data"]["capability_summary"]["chain_count"], 36)
+        self.assertFalse(context_event["data"]["context_policy"]["load_full_docs_by_default"])
+
+        cli_payload = run_agent("workflow-dry-run", "--text", "Add custom RPC method foo_getBalance to chain foochain")
+        cli_events = [event["event_type"] for event in cli_payload["events"]]
+        self.assertIn("onboarding_workflow_selected", cli_events)
 
     def test_adk_read_only_tool_wrappers_are_structured(self):
         tools = get_adk_tools(include_actions=False)
@@ -736,6 +838,8 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertIn("discover_environment", tool_names)
         self.assertIn("run_doctor", tool_names)
         self.assertIn("audit_dependencies", tool_names)
+        self.assertIn("load_framework_context", tool_names)
+        self.assertIn("load_execution_contract", tool_names)
         self.assertIn("load_framework_capabilities", tool_names)
         self.assertIn("list_supported_chains", tool_names)
         self.assertIn("knowledge_search", tool_names)
@@ -752,6 +856,17 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertEqual(capabilities["data"]["chain_count"], 36)
         self.assertTrue(capabilities["next_actions"])
 
+        context = adk_load_framework_context(language="zh")
+        self.assertEqual(context["status"], "ok")
+        self.assertEqual(context["data"]["capability_summary"]["chain_count"], 36)
+        self.assertIn("runtime.env", [item["name"] for item in context["data"]["configuration_layers"]])
+        self.assertTrue(context["data"]["authoritative_docs"])
+
+        contract = adk_load_execution_contract(use_fake_node=False)
+        self.assertEqual(contract["status"], "ok")
+        self.assertIn("local_rpc_url", contract["data"]["selected_required_keys"])
+        self.assertIn("preflight", contract["data"]["mandatory_gates"])
+
         chains = adk_list_supported_chains()
         self.assertEqual(chains["status"], "ok")
         self.assertIn("solana", chains["data"]["chains"])
@@ -760,6 +875,27 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertEqual(solana_methods["status"], "ok")
         self.assertEqual(solana_methods["data"]["chain"], "solana")
         self.assertTrue(solana_methods["next_actions"])
+
+    def test_framework_context_is_compact_and_tool_callable(self):
+        context = load_framework_context(language="en")
+        self.assertEqual(context["capability_summary"]["chain_count"], 36)
+        self.assertFalse(context["context_policy"]["load_full_docs_by_default"])
+        topics = {item["topic"] for item in context["authoritative_docs"]}
+        self.assertIn("add_chain_or_rpc", topics)
+        self.assertIn("framework_flow", topics)
+
+        rendered = render_framework_context_for_prompt(language="zh")
+        self.assertIn("AnyChain framework context", rendered)
+        self.assertIn("36 chains", rendered)
+        self.assertIn("runtime flow", rendered)
+
+        payload = run_agent("tool-call", "--name", "load_framework_context", "--arguments", '{"language":"zh"}')
+        self.assertEqual(payload["capability_summary"]["chain_count"], 36)
+        self.assertTrue(payload["authoritative_docs"])
+
+        contract_payload = run_agent("tool-call", "--name", "load_execution_contract", "--arguments", '{"use_fake_node":true}')
+        self.assertIn("ledger_device", contract_payload["data"]["selected_required_keys"])
+        self.assertNotIn("local_rpc_url", contract_payload["data"]["selected_required_keys"])
 
         missing = adk_list_rpc_methods("not-a-chain")
         self.assertEqual(missing["status"], "not_found")
@@ -952,11 +1088,11 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertIn("--check", audit["data"]["benchmark"]["command"])
             self.assertIn("--check", audit["data"]["agent_runtime"]["command"])
 
-    def test_adk_offline_eval_is_contract_based_not_intent_router(self):
+    def test_adk_offline_eval_includes_router_schema_contract(self):
         payload = run_adk_offline_evals()
         self.assertEqual(payload["status"], "passed")
         self.assertEqual(payload["case_count"], payload["passed_count"])
-        self.assertIn("contract eval", payload["note"])
+        self.assertIn("structured router schema", payload["note"])
 
     def test_adk_auth_diagnostics_are_safe_and_actionable(self):
         old_env = os.environ.copy()

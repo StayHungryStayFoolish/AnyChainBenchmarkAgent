@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from adk_app.instructions import ROOT_INSTRUCTION
+from adk_app.runner_bridge import run_text_once
+from knowledge.framework_context import render_framework_context_for_prompt
 from llm.config import LLMConfig
 from llm.providers import provider_from_config
 from llm.types import LLMMessage, LLMRequest
@@ -32,12 +34,28 @@ def answer_conversation(text: str, state: WorkflowState, config: LLMConfig) -> s
     validation_errors = config.validate()
     if validation_errors:
         return _fallback_answer(text, state, "LLM configuration is incomplete: " + "; ".join(validation_errors))
+    adk_prompt = "\n\n".join([
+        render_framework_context_for_prompt(language=state.language),
+        _state_context(state),
+        text,
+    ])
+    try:
+        response = run_text_once(adk_prompt, state_delta=_adk_state_delta(state))
+        if response.strip():
+            return response.strip()
+    except Exception as exc:
+        adk_error = f"ADK Runner call failed: {type(exc).__name__}: {exc}"
+        if config.provider in {"gemini", "claude"}:
+            return _fallback_answer(text, state, adk_error)
+    # Non-ADK direct adapters remain a compatibility bridge for providers that
+    # are not currently executable through the installed ADK runtime.
     try:
         provider = provider_from_config(config)
         response = provider.complete(
             LLMRequest(
                 messages=[
                     LLMMessage(role="system", content=_terminal_instruction()),
+                    LLMMessage(role="user", content=render_framework_context_for_prompt(language=state.language)),
                     LLMMessage(role="user", content=_state_context(state)),
                     LLMMessage(role="user", content=text),
                 ],
@@ -71,6 +89,17 @@ def _state_context(state: WorkflowState) -> str:
         f"- current_question_id={state.current_question_id or '<none>'}\n"
         f"- confirmed_keys={sorted(state.confirmed_values.keys())}\n"
     )
+
+
+def _adk_state_delta(state: WorkflowState) -> dict[str, object]:
+    return {
+        "language": state.language,
+        "intent": state.intent,
+        "stage": state.stage,
+        "current_question_id": state.current_question_id,
+        "confirmed_values": dict(state.confirmed_values),
+        "job_id": state.job_id,
+    }
 
 
 def _fallback_answer(text: str, state: WorkflowState, reason: str) -> str:

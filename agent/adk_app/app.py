@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .instructions import ADK_MIGRATION_BOUNDARY, ROOT_INSTRUCTION
+from .compat import adk_feature_report
 from .models import adk_status
 from .runner_bridge import runner_bridge_status
 
@@ -14,6 +15,7 @@ def status_payload() -> dict:
     return {
         "status": "ready" if status["available"] else "not_installed",
         "adk": status,
+        "features": adk_feature_report().get("features", {}),
         "runner": runner_status,
         "root_instruction_present": bool(ROOT_INSTRUCTION),
         "migration_boundary": ADK_MIGRATION_BOUNDARY,

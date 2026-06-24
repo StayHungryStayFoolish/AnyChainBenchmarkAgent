@@ -9,6 +9,7 @@ workflows can provide stable prompts, confirmations, progress, and recovery.
 from __future__ import annotations
 
 import argparse
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -24,6 +25,7 @@ from adk_app.models import adk_status  # noqa: E402
 from adk_app.state import load_startup_state  # noqa: E402
 from diagnostics.doctor import run_doctor  # noqa: E402
 from knowledge.framework_capabilities import load_framework_capabilities  # noqa: E402
+from knowledge.framework_context import load_framework_context  # noqa: E402
 from llm.config import load_llm_config  # noqa: E402
 from runners.job_manager import list_jobs  # noqa: E402
 from terminal.io import TerminalIO  # noqa: E402
@@ -54,7 +56,8 @@ class AnyChainTerminal:
         self.store = store or WorkflowStateStore()
         self.io = io or TerminalIO()
         self.capabilities: dict[str, Any] | None = None
-        self.wizard = BenchmarkWizard(self.state)
+        self.discovery: dict[str, Any] | None = None
+        self.wizard = BenchmarkWizard(self.state, discovery=self.discovery)
 
     def run(self) -> int:
         self._startup()
@@ -182,6 +185,7 @@ class AnyChainTerminal:
             self.state.current_question_id = "install_agent_runtime"
             self.state.missing_blockers = ["google-adk"]
             self.io.agent(self.state.language, t(self.state.language, "agent_runtime_offer"))
+        self._load_framework_context()
         self._startup_doctor()
         if latest_job:
             self.io.agent(
@@ -212,6 +216,8 @@ class AnyChainTerminal:
     def _emit_doctor_summary(self, report: dict[str, Any], startup: bool) -> None:
         caps = report.get("capabilities", {})
         env = report.get("environment", {})
+        self.discovery = env
+        self.wizard = BenchmarkWizard(self.state, discovery=self.discovery)
         cloud = env.get("cloud", {})
         deployment = env.get("deployment", {})
         missing = report.get("environment", {}).get("dependencies", {}).get("missing_required", [])
@@ -249,8 +255,16 @@ class AnyChainTerminal:
 
     def _install_agent_runtime(self) -> None:
         self.io.agent(self.state.language, t(self.state.language, "agent_runtime_install_start"))
+        config = load_llm_config()
+        command = ["bash", "scripts/install_agent_deps.sh", "--yes"]
+        if (
+            config.provider in {"gemini", "claude"}
+            and config.auth_mode in {"google_adc", "service_account_impersonation"}
+            and not shutil.which("gcloud")
+        ):
+            command.append("--with-gcloud")
         completed = subprocess.run(
-            ["bash", "scripts/install_agent_deps.sh", "--yes"],
+            command,
             cwd=REPO_ROOT,
             text=True,
             stdout=subprocess.PIPE,
@@ -261,6 +275,7 @@ class AnyChainTerminal:
         self.state.current_question_id = ""
         self.state.confirmed_values["agent_runtime_install_exit_code"] = completed.returncode
         self.io.agent(self.state.language, t(self.state.language, "agent_runtime_install_done", exit_code=completed.returncode))
+        self._startup_doctor()
 
     def _jobs(self) -> None:
         jobs = list_jobs(limit=5)
@@ -297,12 +312,18 @@ class AnyChainTerminal:
         self.state.current_question_id = ""
         self.state.confirmed_values["dependency_install_exit_code"] = completed.returncode
         self.io.agent(self.state.language, t(self.state.language, "dependency_install_done", exit_code=completed.returncode))
+        self._startup_doctor()
 
     def _prepare_smoke(self) -> None:
         self.io.agent(self.state.language, t(self.state.language, "prepare_start"))
         prepared = prepare_plan_from_state(self.state)
         self.state.plan_file = prepared["plan_file"]
         preflight = prepared["preflight"]
+        if preflight.get("warnings"):
+            self.io.agent(
+                self.state.language,
+                t(self.state.language, "prepare_warnings", warnings="; ".join(preflight.get("warnings", []))),
+            )
         if not preflight.get("passed"):
             blockers = [
                 f"{check.get('name')}: {check.get('detail')}"
@@ -362,6 +383,24 @@ class AnyChainTerminal:
         if self.capabilities is None:
             self.capabilities = load_framework_capabilities()
         return self.capabilities
+
+    def _load_framework_context(self) -> None:
+        context = load_framework_context(language=self.state.language)
+        summary = context.get("capability_summary", {})
+        self.capabilities = load_framework_capabilities()
+        self.state.defaulted_values["framework_context_loaded"] = True
+        self.state.defaulted_values["framework_context_summary"] = summary
+        self.io.agent(
+            self.state.language,
+            t(
+                self.state.language,
+                "framework_context_loaded",
+                chains=summary.get("chain_count", "?"),
+                families=summary.get("family_count", "?"),
+                methods=summary.get("unique_rpc_method_count", "?"),
+                fixtures=summary.get("fake_node_fixture_file_count", "?"),
+            ),
+        )
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:

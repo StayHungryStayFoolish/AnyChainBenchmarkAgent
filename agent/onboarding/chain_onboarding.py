@@ -3,16 +3,8 @@
 from __future__ import annotations
 
 from knowledge.gap_analyzer import analyze_capability_gap
-
-
-SUPPORTED_FAMILIES = [
-    "jsonrpc",
-    "rest",
-    "bitcoin_jsonrpc",
-    "substrate",
-    "tendermint",
-    "hedera_dual",
-]
+from onboarding.families import SUPPORTED_FAMILIES
+from onboarding.quality_gate import coding_brief, onboarding_quality_gate
 
 
 def generate_onboarding_package(
@@ -66,6 +58,8 @@ def generate_onboarding_package(
             "Keep workload methods and fake-node fixtures aligned; per-method charts depend on method names in proxy_method.csv.",
         ],
     }
+    package["quality_gate"] = onboarding_quality_gate(chain, family, methods)
+    package["coding_brief"] = coding_brief(package)
     return package
 
 
@@ -86,6 +80,10 @@ def format_onboarding_package(package: dict[str, Any]) -> str:
     lines.extend(f"- {step}" for step in package["fake_node_steps"])
     lines.append("Validation commands:")
     lines.extend(f"- {cmd}" for cmd in package["validation_commands"])
+    lines.append("Quality gates:")
+    lines.extend(f"- {gate}" for gate in package.get("quality_gate", {}).get("quality_gates", []))
+    lines.append("Coding brief:")
+    lines.append(package.get("coding_brief", ""))
     return "\n".join(lines)
 
 

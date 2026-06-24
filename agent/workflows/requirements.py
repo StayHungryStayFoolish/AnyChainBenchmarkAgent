@@ -4,26 +4,20 @@ from __future__ import annotations
 
 from typing import Any
 
+from knowledge.entry_contract import REAL_NODE_ENDPOINT_FIELDS, runtime_baseline_keys
 
 COMMON_BLOCKERS = ("chain", "rpc_mode", "rpc_workload_confirmed", "rpc_param_samples_confirmed")
+ENVIRONMENT_BLOCKERS = runtime_baseline_keys()
 FAKE_NODE_BLOCKERS = ("use_fake_node",)
-REAL_NODE_BLOCKERS = (
-    "local_rpc_url",
-    "blockchain_process_names",
-    "ledger_device",
-    "data_vol_type",
-    "data_vol_size",
-    "data_vol_max_iops",
-    "data_vol_max_throughput",
-    "network_interface",
-    "network_max_bandwidth_gbps",
-)
+REAL_NODE_ENDPOINT_BLOCKERS = tuple(field.key for field in REAL_NODE_ENDPOINT_FIELDS)
+REAL_NODE_BLOCKERS = (*REAL_NODE_ENDPOINT_BLOCKERS, *ENVIRONMENT_BLOCKERS)
 
 
 def missing_smoke_blockers(values: dict[str, Any]) -> list[str]:
     blockers = list(COMMON_BLOCKERS)
     if values.get("use_fake_node") is True:
         blockers.extend(FAKE_NODE_BLOCKERS)
+        blockers.extend(ENVIRONMENT_BLOCKERS)
     elif values.get("use_fake_node") is False:
         blockers.extend(REAL_NODE_BLOCKERS)
     else:

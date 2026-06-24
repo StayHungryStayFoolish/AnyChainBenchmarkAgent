@@ -11,7 +11,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from adk_app.agents.router import route_user_intent
 from adk_app.callbacks import before_tool_callback
+from adk_app.workflow.schemas import validate_intent_route
 from adk_app.instructions import ROOT_INSTRUCTION
 from adk_app.root_agent import resolve_adk_model
 from adk_app.tools.registry import get_adk_tools
@@ -28,6 +30,7 @@ def run_offline_evals() -> dict[str, Any]:
         "discover_environment",
         "run_doctor",
         "audit_dependencies",
+        "load_framework_context",
         "load_framework_capabilities",
         "prepare_benchmark_run",
         "draft_benchmark_request",
@@ -52,7 +55,7 @@ def run_offline_evals() -> dict[str, Any]:
     results = [
         {
             "name": "root_instruction_present",
-            "passed": bool(ROOT_INSTRUCTION and "Choose tools directly" in ROOT_INSTRUCTION),
+            "passed": bool(ROOT_INSTRUCTION and "Use a structured router only for intent classification" in ROOT_INSTRUCTION),
         },
         {
             "name": "required_tools_registered",
@@ -68,11 +71,17 @@ def run_offline_evals() -> dict[str, Any]:
             "passed": resolve_adk_model() != "fake",
             "model": resolve_adk_model(),
         },
+        {
+            "name": "router_schema_contract",
+            "passed": validate_intent_route(
+                route_user_intent("benchmark solana with fake-node", default_language="en")
+            ) == [],
+        },
     ]
     return {
         "status": "passed" if all(item["passed"] for item in results) else "failed",
         "case_count": len(results),
         "passed_count": sum(1 for item in results if item["passed"]),
         "results": results,
-        "note": "This is an ADK contract eval, not a deterministic intent router.",
+        "note": "This is an ADK contract eval with an offline-safe structured router schema check.",
     }
