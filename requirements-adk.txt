@@ -7,4 +7,4 @@
 # for ADK runtime testing and production Agent usage.
 
 google-adk
-
+prompt-toolkit

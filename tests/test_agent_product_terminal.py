@@ -47,6 +47,12 @@ class FakeADKStatus:
         return {"available": self.available, "reason": "available" if self.available else "missing"}
 
 
+class AgentDependencyTests(unittest.TestCase):
+    def test_adk_requirements_include_prompt_toolkit(self):
+        requirements = (REPO / "requirements-adk.txt").read_text(encoding="utf-8")
+        self.assertIn("prompt-toolkit", requirements)
+
+
 def _complete_environment(wizard: BenchmarkWizard, state: WorkflowState) -> None:
     answers = [
         ("us-central1", "cloud_zone"),
