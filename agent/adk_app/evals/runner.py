@@ -31,6 +31,7 @@ def run_offline_evals() -> dict[str, Any]:
         "run_doctor",
         "audit_dependencies",
         "load_framework_context",
+        "load_framework_index",
         "load_framework_capabilities",
         "prepare_benchmark_run",
         "draft_benchmark_request",

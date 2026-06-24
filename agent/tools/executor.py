@@ -11,6 +11,7 @@ from analyzers.result_analyzer import analyze_job
 from discovery.environment import discover_environment
 from knowledge.framework_capabilities import load_framework_capabilities
 from knowledge.framework_context import load_framework_context
+from knowledge.framework_index import load_or_build_framework_index
 from knowledge.gap_analyzer import analyze_capability_gap
 from knowledge.loader import load_knowledge_provider, provider_status
 from onboarding.template_drafter import draft_chain_template
@@ -34,6 +35,8 @@ def execute_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str
         return load_framework_capabilities()
     if name == "load_framework_context":
         return load_framework_context(language=args.get("language", "en"))
+    if name == "load_framework_index":
+        return load_or_build_framework_index(index_path=args.get("index_path"))
     if name == "load_execution_contract":
         raw = args.get("use_fake_node")
         use_fake_node = raw if isinstance(raw, bool) else None

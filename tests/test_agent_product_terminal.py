@@ -228,6 +228,57 @@ class AgentProductTerminalTest(unittest.TestCase):
         self.assertEqual(state.confirmed_values["rpc_mode"], "mixed")
         self.assertEqual(state.current_question_id, "mixed_weights_confirm")
 
+    def test_rpc_workload_default_and_custom_choices_are_explicit(self):
+        state = WorkflowState(language="en")
+        wizard = BenchmarkWizard(state, discovery={"cloud": {"provider": "gcp", "platform": "gce"}, "deployment": {"type": "vm"}, "network": {}, "disks": {"candidates": []}})
+
+        self.assertTrue(wizard.handle("benchmark solana").handled)
+        self.assertTrue(wizard.handle("1").handled)
+        _complete_environment(wizard, state)
+        response = wizard.handle("1")
+        self.assertTrue(response.handled)
+        self.assertEqual(state.confirmed_values["rpc_mode"], "single")
+        self.assertEqual(state.current_question_id, "single_method_confirm")
+
+        response = wizard.handle("2")
+        self.assertTrue(response.handled)
+        self.assertEqual(state.current_question_id, "rpc_workload")
+        self.assertIn("Provide the RPC method", "\n".join(response.messages))
+
+    def test_unknown_chain_generates_existing_family_handoff(self):
+        state = WorkflowState(language="zh")
+        wizard = BenchmarkWizard(state, discovery={"cloud": {"provider": "gcp", "platform": "gce"}, "deployment": {"type": "vm"}, "network": {}, "disks": {"candidates": []}})
+
+        self.assertTrue(wizard.handle("我要压测一个区块链节点").handled)
+        response = wizard.handle("foochain")
+        self.assertTrue(response.handled)
+        self.assertEqual(state.current_question_id, "unsupported_chain_family")
+        self.assertIn("adapter family", "\n".join(response.messages))
+
+        response = wizard.handle("1")
+        self.assertTrue(response.handled)
+        self.assertEqual(state.confirmed_values["onboarding_family"], "jsonrpc")
+        self.assertEqual(state.current_question_id, "unsupported_chain_methods")
+
+        response = wizard.handle("foo_getBalance,foo_getTransaction")
+        self.assertTrue(response.handled)
+        output = "\n".join(response.messages)
+        self.assertIn("Onboarding package for foochain", output)
+        self.assertIn("foo_getBalance", output)
+        self.assertIn("Documentation sync required", output)
+
+    def test_unknown_chain_can_generate_new_family_plan(self):
+        state = WorkflowState(language="en")
+        wizard = BenchmarkWizard(state, discovery={"cloud": {"provider": "gcp", "platform": "gce"}, "deployment": {"type": "vm"}, "network": {}, "disks": {"candidates": []}})
+
+        self.assertTrue(wizard.handle("benchmark a node").handled)
+        self.assertTrue(wizard.handle("foovm").handled)
+        response = wizard.handle("7")
+        self.assertTrue(response.handled)
+        self.assertEqual(state.stage, "onboarding_handoff_ready")
+        output = "\n".join(response.messages)
+        self.assertIn("New protocol family onboarding plan", output)
+
     def test_confirmed_fake_node_workflow_generates_plan_and_mock_job(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = WorkflowState(language="zh", stage="ready_for_smoke", current_question_id="smoke_confirmation")
@@ -362,6 +413,8 @@ class AgentProductTerminalTest(unittest.TestCase):
         self.assertTrue(wizard.handle("fake-node").handled)
         _complete_environment(wizard, state)
         self.assertTrue(wizard.handle("mixed").handled)
+        self.assertTrue(wizard.handle("2").handled)
+        self.assertEqual(state.current_question_id, "rpc_workload")
 
         response = wizard.handle("getSlot=60,getBlockHeight=20")
         self.assertTrue(response.handled)

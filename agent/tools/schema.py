@@ -29,6 +29,11 @@ def tool_schema() -> dict[str, list[dict[str, Any]]]:
             {"language": _string("Optional response/document language: en or zh.")},
         ),
         _tool(
+            "load_framework_index",
+            "Return the local framework knowledge index: supported chains, RPC methods, authoritative docs, key code paths, extension boundaries, and validation commands.",
+            {"index_path": _string("Optional framework index path. Defaults to .agent/knowledge/framework_index.json if present, otherwise builds from repo state.")},
+        ),
+        _tool(
             "load_execution_contract",
             "Return the hard benchmark execution contract: entrypoint phases, required variables, dependency expectations, and mandatory gates.",
             {"use_fake_node": {"type": "boolean", "description": "Optional target mode. true=fake-node, false=real-node, omitted=unknown target."}},
