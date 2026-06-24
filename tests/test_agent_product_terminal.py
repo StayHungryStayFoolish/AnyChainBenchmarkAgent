@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 import os
+import builtins
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -51,6 +52,18 @@ class AgentDependencyTests(unittest.TestCase):
     def test_adk_requirements_include_prompt_toolkit(self):
         requirements = (REPO / "requirements-adk.txt").read_text(encoding="utf-8")
         self.assertIn("prompt-toolkit", requirements)
+
+    def test_terminal_io_requires_prompt_toolkit(self):
+        real_import = builtins.__import__
+
+        def guarded_import(name, *args, **kwargs):
+            if name == "prompt_toolkit":
+                raise ImportError("missing prompt_toolkit")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=guarded_import):
+            with self.assertRaisesRegex(RuntimeError, "prompt-toolkit is required"):
+                TerminalIO()
 
 
 def _complete_environment(wizard: BenchmarkWizard, state: WorkflowState) -> None:
