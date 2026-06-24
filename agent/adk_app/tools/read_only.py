@@ -12,6 +12,7 @@ from diagnostics.doctor import run_doctor as _run_doctor
 from discovery.environment import discover_environment as _discover_environment
 from knowledge.framework_capabilities import load_framework_capabilities as _load_framework_capabilities
 from knowledge.framework_context import load_framework_context as _load_framework_context
+from knowledge.framework_index import load_or_build_framework_index as _load_or_build_framework_index
 from knowledge.entry_contract import (
     ENTRYPOINT_PHASES,
     OPTIONAL_ACCOUNTS_FIELDS,
@@ -116,7 +117,20 @@ def load_framework_context(language: str = "en") -> dict[str, Any]:
     context = _load_framework_context(language=language)
     return _tool_result(
         data=context,
-        next_actions=["answer from context", "load_framework_capabilities", "knowledge_search"],
+        next_actions=["answer from context", "load_framework_index", "load_framework_capabilities", "knowledge_search"],
+    )
+
+
+def load_framework_index(index_path: str = "") -> dict[str, Any]:
+    """Load the local framework knowledge index for precise repo-grounded answers.
+
+    Use this before answering extension, onboarding, documentation, or code-path
+    questions. The index is built from current repo state if no generated copy
+    exists, so it avoids stale model memory.
+    """
+    return _tool_result(
+        data=_load_or_build_framework_index(index_path=index_path or None),
+        next_actions=["answer with repo facts", "draft onboarding handoff", "run validation commands"],
     )
 
 
@@ -298,6 +312,7 @@ def get_read_only_tools() -> list:
         run_doctor,
         audit_dependencies,
         load_framework_context,
+        load_framework_index,
         load_execution_contract,
         load_framework_capabilities,
         list_supported_chains,

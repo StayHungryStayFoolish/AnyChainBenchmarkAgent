@@ -23,6 +23,7 @@ from diagnostics.doctor import run_doctor
 from discovery.environment import discover_environment
 from knowledge.gap_analyzer import analyze_capability_gap
 from knowledge.framework_capabilities import load_framework_capabilities
+from knowledge.framework_index import load_or_build_framework_index, write_framework_index
 from knowledge.loader import load_knowledge_provider, provider_status
 from llm.config import load_llm_config
 from llm.google_auth import credential_plan
@@ -46,6 +47,9 @@ def main(argv: list[str] | None = None) -> int:
 
     capabilities = sub.add_parser("capabilities", help="Show dynamic framework capability inventory")
     capabilities.add_argument("--output")
+
+    framework_index = sub.add_parser("framework-index", help="Build or show the local framework knowledge index")
+    framework_index.add_argument("--output")
 
     gap = sub.add_parser("gap-analysis", help="Analyze chain/RPC method support gaps")
     gap.add_argument("--chain", required=True)
@@ -180,6 +184,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "capabilities":
         return _emit(load_framework_capabilities(), args.output)
+
+    if args.command == "framework-index":
+        payload = write_framework_index(args.output) if args.output else load_or_build_framework_index()
+        return _emit(payload, None)
 
     if args.command == "gap-analysis":
         return _emit(analyze_capability_gap(args.chain, args.method), None)

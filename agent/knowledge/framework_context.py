@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from knowledge.framework_capabilities import REPO_ROOT, load_framework_capabilities
+from knowledge.framework_index import load_or_build_framework_index
 
 
 DOC_INDEX = [
@@ -69,6 +70,7 @@ def load_framework_context(root: str | Path = REPO_ROOT, language: str = "en") -
     """Return a compact, current framework context for LLM grounding."""
     root = Path(root)
     capabilities = load_framework_capabilities(root)
+    index = load_or_build_framework_index(root)
     docs = _doc_index(root, language)
     return {
         "identity": {
@@ -114,6 +116,12 @@ def load_framework_context(root: str | Path = REPO_ROOT, language: str = "en") -
             "fake_node_fixture_file_count": capabilities.get("fake_node", {}).get("fixture_file_count"),
         },
         "extension_points": capabilities.get("extension_points", []),
+        "framework_index": {
+            "schema_version": index.get("schema_version"),
+            "summary": index.get("summary", {}),
+            "key_code_paths": index.get("key_code_paths", []),
+            "validation_commands": index.get("validation_commands", []),
+        },
         "authoritative_docs": docs,
         "context_policy": {
             "load_full_docs_by_default": False,

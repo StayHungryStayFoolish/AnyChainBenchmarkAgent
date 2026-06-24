@@ -86,7 +86,9 @@ def coding_brief(package: dict[str, Any]) -> str:
         "- config/chains/<chain>.json",
         "- tools/chain_adapters/<family>.py only if existing param formats cannot express the requests",
         "- tools/fake-node/configs/<family>.yaml and tools/fake-node/fixtures/<chain>/",
-        "- docs/en/how-to-add-chain.md and docs/zh/how-to-add-chain.md only for user-visible behavior changes",
+        "- docs/en/how-to-add-chain.md and docs/zh/how-to-add-chain.md for chain/RPC onboarding behavior",
+        "- docs/en/secondary-development-guide.md and docs/zh/secondary-development-guide.md for developer handoff behavior",
+        "- README.md and README_ZH.md if the user-facing Agent capability, command, or configuration flow changes",
         "",
         "Existing-family chain path:",
         "- Choose one of the supported families only when the request envelope, parameter binding, proxy extraction, fake-node routing, and sync-health shape match repository evidence.",
@@ -115,6 +117,11 @@ def coding_brief(package: dict[str, Any]) -> str:
     ])
     lines.extend(f"- {cmd}" for cmd in package.get("validation_commands", []))
     lines.extend([
+        "",
+        "Documentation sync required:",
+        "- Update the matching docs/en and docs/zh pages when support boundaries, chain/RPC behavior, fake-node fixtures, or validation steps change.",
+        "- Regenerate or validate the framework knowledge index with: python3 agent/cli.py framework-index --output /tmp/framework_index.json",
+        "- Treat documentation as Agent knowledge: stale docs can make the Agent give incorrect guidance.",
         "",
         "Completion rule:",
         "- Do not call this supported until every quality gate passes and fake-node smoke proves request/response fixtures are usable.",

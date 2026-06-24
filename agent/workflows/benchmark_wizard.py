@@ -10,6 +10,9 @@ from urllib.parse import urlparse
 from discovery.environment import discover_environment
 from knowledge.entry_contract import OPTIONAL_ACCOUNTS_FIELDS
 from knowledge.framework_capabilities import load_framework_capabilities
+from onboarding.chain_onboarding import generate_onboarding_package, format_onboarding_package
+from onboarding.families import SUPPORTED_FAMILIES
+from onboarding.request_answers import answer_onboarding_request
 from terminal.language import t
 from workflows.requirements import ENVIRONMENT_BLOCKERS, REAL_NODE_BLOCKERS, missing_smoke_blockers
 from workflows.state import WorkflowState
@@ -74,6 +77,8 @@ NUMERIC_FIELDS = {
     "network_max_bandwidth_gbps",
 }
 OPTIONAL_ACCOUNTS_BLOCKERS = tuple(field.key for field in OPTIONAL_ACCOUNTS_FIELDS if field.key != "accounts_device")
+_DEFAULT_CONFIRMATIONS = {"y", "yes", "确认", "是", "1", "default", "默认", "use default"}
+_CUSTOM_CONFIRMATIONS = {"n", "no", "否", "2", "custom", "自定义", "修改", "change"}
 
 
 @dataclass
@@ -115,6 +120,16 @@ class BenchmarkWizard:
             chain_response = self._handle_chain_choice(text)
             if chain_response.handled:
                 return chain_response
+
+        if self.state.current_question_id == "unsupported_chain_family":
+            family_response = self._handle_unsupported_chain_family(text)
+            if family_response.handled:
+                return family_response
+
+        if self.state.current_question_id == "unsupported_chain_methods":
+            methods_response = self._handle_unsupported_chain_methods(text)
+            if methods_response.handled:
+                return methods_response
 
         if self.state.current_question_id == "target_type":
             target_response = self._handle_target_type_answer(text)
@@ -295,11 +310,15 @@ class BenchmarkWizard:
         ])
 
     def _handle_chain_choice(self, text: str) -> WorkflowResponse:
-        chain = extract_chain(text) or text.lower().strip()
+        chain = extract_chain(text) or _normalize_chain_choice(text)
         chains = set(known_chains())
         if chain not in chains:
+            self.state.confirmed_values["onboarding_chain"] = chain or text.strip()
+            self.state.stage = "classify_unsupported_chain"
+            self.state.current_question_id = "unsupported_chain_family"
             return WorkflowResponse(True, [
-                t(self.state.language, "invalid_chain", chains=_format_chain_sample())
+                t(self.state.language, "unsupported_chain_intro", chain=chain or text.strip(), chains=_format_chain_sample()),
+                t(self.state.language, "ask_unsupported_chain_family", families=_format_family_choices()),
             ])
         self.state.confirmed_values["chain"] = chain
         pending_target = str(self.state.defaulted_values.pop("pending_target", ""))
@@ -333,6 +352,44 @@ class BenchmarkWizard:
         if lowered in {"y", "yes", "确认", "是"}:
             return self._one("select_target")
         return WorkflowResponse(True, [t(self.state.language, "invalid_target_type")])
+
+    def _handle_unsupported_chain_family(self, text: str) -> WorkflowResponse:
+        family = _parse_family_choice(text)
+        chain = str(self.state.confirmed_values.get("onboarding_chain", "")).strip()
+        if family == "new_family":
+            self.state.confirmed_values["onboarding_family"] = "new_family"
+            self.state.stage = "onboarding_handoff_ready"
+            self.state.current_question_id = ""
+            return WorkflowResponse(True, [
+                t(self.state.language, "unsupported_chain_new_family"),
+                answer_onboarding_request(f"Generate a plan to add a new protocol family for {chain or 'new chain'}"),
+            ])
+        if not family:
+            return WorkflowResponse(True, [
+                t(self.state.language, "invalid_family_choice"),
+                t(self.state.language, "ask_unsupported_chain_family", families=_format_family_choices()),
+            ])
+        self.state.confirmed_values["onboarding_family"] = family
+        self.state.stage = "collect_unsupported_chain_methods"
+        self.state.current_question_id = "unsupported_chain_methods"
+        return WorkflowResponse(True, [
+            t(self.state.language, "unsupported_chain_family_recorded", chain=chain, family=family),
+            t(self.state.language, "ask_unsupported_chain_methods"),
+        ])
+
+    def _handle_unsupported_chain_methods(self, text: str) -> WorkflowResponse:
+        chain = str(self.state.confirmed_values.get("onboarding_chain", "")).strip() or "newchain"
+        family = str(self.state.confirmed_values.get("onboarding_family", "")).strip() or "<choose-family>"
+        methods = _parse_method_list(text)
+        if not methods:
+            return WorkflowResponse(True, [t(self.state.language, "ask_unsupported_chain_methods")])
+        package = generate_onboarding_package(chain, methods=methods, adapter_family=family)
+        self.state.stage = "onboarding_handoff_ready"
+        self.state.current_question_id = ""
+        return WorkflowResponse(True, [
+            t(self.state.language, "unsupported_chain_onboarding_ready", chain=chain),
+            format_onboarding_package(package),
+        ])
 
     def _handle_advanced_config_review(self, text: str) -> WorkflowResponse:
         lowered = text.lower().strip()
@@ -626,7 +683,7 @@ class BenchmarkWizard:
         if key == "single_method_confirm":
             lowered = text.lower().strip()
             default_method = str(self.state.defaulted_values.get("single_method", ""))
-            if lowered in {"y", "yes", "确认", "是"} and default_method:
+            if lowered in _DEFAULT_CONFIRMATIONS and default_method:
                 self.state.confirmed_values["single_method"] = default_method
                 self.state.confirmed_values["rpc_methods"] = [default_method]
                 self.state.confirmed_values["rpc_workload_confirmed"] = True
@@ -637,13 +694,15 @@ class BenchmarkWizard:
                     t(self.state.language, "recorded_value", name="single_method"),
                     t(self.state.language, "confirm_param_samples"),
                 ])
+            if lowered and lowered not in _CUSTOM_CONFIRMATIONS:
+                return WorkflowResponse(True, [t(self.state.language, "ask_single_default_or_custom")])
             self.state.stage = "collect_single_method"
             self.state.current_question_id = "rpc_workload"
             return WorkflowResponse(True, [t(self.state.language, "ask_custom_single_method")])
         if key == "mixed_weights_confirm":
             lowered = text.lower().strip()
             default_weights = self.state.defaulted_values.get("mixed_weights") or {}
-            if lowered in {"y", "yes", "确认", "是"} and default_weights:
+            if lowered in _DEFAULT_CONFIRMATIONS and default_weights:
                 self.state.confirmed_values["mixed_weights"] = dict(default_weights)
                 self.state.confirmed_values["rpc_methods"] = list(default_weights.keys())
                 self.state.confirmed_values["mixed_weights_confirmed"] = True
@@ -655,6 +714,8 @@ class BenchmarkWizard:
                     t(self.state.language, "recorded_value", name="mixed_weights"),
                     t(self.state.language, "confirm_param_samples"),
                 ])
+            if lowered and lowered not in _CUSTOM_CONFIRMATIONS:
+                return WorkflowResponse(True, [t(self.state.language, "ask_mixed_default_or_custom")])
             self.state.stage = "collect_mixed_weights"
             self.state.current_question_id = "rpc_workload"
             return WorkflowResponse(True, [t(self.state.language, "ask_custom_mixed_weights")])
@@ -701,6 +762,23 @@ def extract_chain(text: str) -> str:
         if chain in lowered:
             return chain
     return ""
+
+
+def _normalize_chain_choice(text: str) -> str:
+    value = text.lower().strip().strip("\"'")
+    if not value:
+        return ""
+    tokens = [
+        token.strip(".,:;()[]{}")
+        for token in value.replace("/", " ").split()
+        if token.strip(".,:;()[]{}")
+    ]
+    stop = {
+        "i", "want", "to", "benchmark", "test", "chain", "node", "with", "use",
+        "我要", "压测", "测试", "节点", "区块链",
+    }
+    candidates = [token for token in tokens if token not in stop]
+    return (candidates[-1] if candidates else value).replace(" ", "-")
 
 
 def known_chains() -> tuple[str, ...]:
@@ -756,6 +834,45 @@ def _format_chain_sample(limit: int = 12) -> str:
     if len(chains) > limit:
         return f"{sample}, ... ({len(chains)} total)"
     return sample
+
+
+def _format_family_choices() -> str:
+    rows = [f"[{index}] {family}" for index, family in enumerate(SUPPORTED_FAMILIES, start=1)]
+    rows.append(f"[{len(SUPPORTED_FAMILIES) + 1}] new/unknown protocol family")
+    return "\n".join(rows)
+
+
+def _parse_family_choice(text: str) -> str:
+    value = text.lower().strip().replace("-", "_")
+    if value.isdigit():
+        index = int(value)
+        if 1 <= index <= len(SUPPORTED_FAMILIES):
+            return SUPPORTED_FAMILIES[index - 1]
+        if index == len(SUPPORTED_FAMILIES) + 1:
+            return "new_family"
+    if value in {"new", "unknown", "new_family", "new protocol", "unknown protocol", "新的协议", "新协议", "不知道"}:
+        return "new_family"
+    for family in SUPPORTED_FAMILIES:
+        if value == family or family in value:
+            return family
+    return ""
+
+
+def _parse_method_list(text: str) -> list[str]:
+    value = text.strip().strip("\"'")
+    if not value:
+        return []
+    raw = value.replace("，", ",").replace("\n", ",").replace(";", ",")
+    methods = []
+    for item in raw.split(","):
+        method = item.strip()
+        if not method:
+            continue
+        if "=" in method:
+            method = method.split("=", 1)[0].strip()
+        if method and method not in methods:
+            methods.append(method)
+    return methods[:20]
 
 
 def _display_key(key: str) -> str:

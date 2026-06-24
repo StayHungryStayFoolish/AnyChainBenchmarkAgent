@@ -56,6 +56,7 @@ from adk_app.tools.planning import run_preflight as adk_run_preflight  # noqa: E
 from adk_app.tools.read_only import audit_dependencies as adk_audit_dependencies  # noqa: E402
 from adk_app.tools.read_only import load_execution_contract as adk_load_execution_contract  # noqa: E402
 from adk_app.tools.read_only import load_framework_context as adk_load_framework_context  # noqa: E402
+from adk_app.tools.read_only import load_framework_index as adk_load_framework_index  # noqa: E402
 from adk_app.tools.read_only import load_framework_capabilities as adk_load_framework_capabilities  # noqa: E402
 from adk_app.tools.read_only import list_rpc_methods as adk_list_rpc_methods  # noqa: E402
 from adk_app.tools.read_only import list_supported_chains as adk_list_supported_chains  # noqa: E402
@@ -145,6 +146,12 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertEqual(capabilities["chain_count"], 36)
             self.assertEqual(capabilities["family_count"], 6)
             self.assertGreater(capabilities["unique_rpc_method_count"], 100)
+
+            index_file = tmp_path / "framework_index.json"
+            framework_index = run_agent("framework-index", "--output", str(index_file))
+            self.assertEqual(framework_index["summary"]["chain_count"], 36)
+            self.assertTrue(index_file.is_file())
+            self.assertIn("authoritative_docs", framework_index)
 
             gap = run_agent("gap-analysis", "--chain", "solana", "--method", "getBalance", "--method", "missingMethod")
             self.assertEqual(gap["chain"], "solana")
@@ -439,6 +446,7 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertIn("draft_chain_template", tool_names)
             self.assertIn("knowledge_search", tool_names)
             self.assertIn("load_execution_contract", tool_names)
+            self.assertIn("load_framework_index", tool_names)
             self.assertTrue(all(tool["type"] == "function" for tool in schema["tools"]))
             install_tool = next(tool for tool in schema["tools"] if tool["function"]["name"] == "install_dependencies")
             install_props = install_tool["function"]["parameters"]["properties"]
@@ -452,6 +460,9 @@ class AgentRuntimeContractTest(unittest.TestCase):
                 self.assertIn("required", params)
             capability_tool = run_agent("tool-call", "--name", "load_capabilities")
             self.assertEqual(capability_tool["chain_count"], 36)
+            index_tool = run_agent("tool-call", "--name", "load_framework_index")
+            self.assertEqual(index_tool["summary"]["chain_count"], 36)
+            self.assertIn("extension_boundaries", index_tool)
             draft_tool = run_agent(
                 "tool-call",
                 "--name",
@@ -595,7 +606,16 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertIn("New-family path", package["coding_brief"])
         self.assertIn("New RPC method path", package["coding_brief"])
         self.assertIn("fake-node smoke", package["coding_brief"])
+        self.assertIn("Documentation sync required", package["coding_brief"])
         self.assertIn("Do not rely on the model's general blockchain knowledge", package["quality_gate"]["llm_policy"][0])
+
+    def test_adk_read_only_framework_index_tool_is_registered_and_grounded(self):
+        tool_names = {tool.__name__ for tool in get_adk_tools(include_actions=False)}
+        self.assertIn("load_framework_index", tool_names)
+        payload = adk_load_framework_index()
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["data"]["summary"]["chain_count"], 36)
+        self.assertTrue(payload["data"]["key_code_paths"])
 
     def test_llm_provider_config_supports_api_keys_and_google_auth(self):
         gemini_key_config = load_llm_config({
