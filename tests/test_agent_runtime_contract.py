@@ -591,6 +591,9 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertIn("quality_gate", package)
         self.assertIn("coding_brief", package)
         self.assertIn("Implementation brief", package["coding_brief"])
+        self.assertIn("Existing-family chain path", package["coding_brief"])
+        self.assertIn("New-family path", package["coding_brief"])
+        self.assertIn("New RPC method path", package["coding_brief"])
         self.assertIn("fake-node smoke", package["coding_brief"])
         self.assertIn("Do not rely on the model's general blockchain knowledge", package["quality_gate"]["llm_policy"][0])
 

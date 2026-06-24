@@ -236,6 +236,12 @@ class AnyChainTerminal:
                     methods=caps.get("unique_rpc_method_count", "?"),
                 ),
             )
+            inference_summary = _format_environment_inference(env)
+            if inference_summary:
+                self.io.agent(
+                    self.state.language,
+                    t(self.state.language, "environment_inference_summary", summary=inference_summary),
+                )
         else:
             self.io.agent(
                 self.state.language,
@@ -410,6 +416,55 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--language", choices=["zh", "en"], default="en", help="Initial terminal language.")
     parser.add_argument("--state-file", help="Use an alternate workflow state file for tests or isolated sessions.")
     return parser.parse_args(argv)
+
+
+def _format_environment_inference(env: dict[str, Any]) -> str:
+    cloud = env.get("cloud", {}) or {}
+    deployment = env.get("deployment", {}) or {}
+    host = env.get("host", {}) or {}
+    network = env.get("network", {}) or {}
+    disks = env.get("disks", {}) or {}
+
+    lines = [
+        f"- CLOUD_PROVIDER: {cloud.get('provider') or '<needs confirmation>'}",
+        f"- deployment: {cloud.get('platform') or deployment.get('type') or '<needs confirmation>'}",
+        f"- CLOUD_REGION: {cloud.get('region') or '<needs confirmation>'}",
+        f"- CLOUD_ZONE: {cloud.get('zone') or '<needs confirmation>'}",
+        f"- MACHINE_TYPE: {cloud.get('machine_type') or '<needs confirmation>'}",
+        f"- CPU: {host.get('cpu_count') or '<unknown>'}",
+        f"- Memory: {_format_memory(host.get('memory_gib'))}",
+        f"- NETWORK_INTERFACE: {network.get('default_interface') or '<needs confirmation>'}",
+    ]
+
+    proposed_ledger = disks.get("proposed_ledger_device") or "<needs confirmation>"
+    proposed_accounts = disks.get("proposed_accounts_device") or "<none detected>"
+    lines.append(f"- LEDGER_DEVICE candidate: {proposed_ledger}")
+    lines.append(f"- ACCOUNTS_DEVICE candidate: {proposed_accounts}")
+
+    candidates = disks.get("candidates") or []
+    if candidates:
+        lines.append("- Disk candidates:")
+        for index, item in enumerate(candidates[:8], start=1):
+            lines.append(
+                "  "
+                f"[{index}] {item.get('name') or '<unknown>'} "
+                f"type={item.get('type') or '<unknown>'} "
+                f"size={item.get('size') or '<unknown>'} "
+                f"mount={item.get('mountpoint') or '<none>'} "
+                f"label={item.get('label') or '<none>'}"
+            )
+        if len(candidates) > 8:
+            lines.append(f"  ... {len(candidates) - 8} more")
+    else:
+        lines.append("- Disk candidates: <none detected; will ask manually>")
+
+    return "\n".join(lines)
+
+
+def _format_memory(value: Any) -> str:
+    if value in {None, ""}:
+        return "<unknown>"
+    return f"{value} GiB"
 
 
 if __name__ == "__main__":
