@@ -125,6 +125,11 @@ cd AnyChainBenchmarkAgent
 bash scripts/install_agent_deps.sh --yes
 ```
 
+如果用户跳过这一步并直接启动交互式 Agent，启动器会先检查终端必需依赖。缺少
+`prompt-toolkit` 时，Agent 会先请求用户确认，然后自动运行
+`scripts/install_agent_deps.sh --yes`。它不会静默回退到 Python `input()`，因为可靠的
+Ctrl+C、中文输入和宽字符删除能力是 Agent 终端的基础要求。
+
 如果宿主机没有 `python3.11`，可以使用任意 Python 3.10+ 解释器。底层 benchmark
 engine 的非 Agent 自动化仍可使用较旧 Python，但 ADK Agent 运行时需要 Python 3.10+。
 启动脚本会自动优先使用 `.venv-adk/bin/adk`，所以用户不需要先手动 activate venv

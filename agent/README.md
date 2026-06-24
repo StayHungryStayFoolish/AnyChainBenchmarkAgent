@@ -54,6 +54,12 @@ bash scripts/install_agent_deps.sh --yes
 `./bin/anychain-agent` starts the AnyChain product terminal. Users do not need
 to run `adk run` directly.
 
+For interactive sessions, `prompt-toolkit` is a required terminal dependency.
+If it is missing, the launcher asks for confirmation and runs
+`scripts/install_agent_deps.sh --yes` before entering the REPL. The Agent does
+not fall back to Python `input()`, because reliable Ctrl+C and wide-character
+editing are part of the product terminal contract.
+
 Then start the human-facing Agent:
 
 ```bash

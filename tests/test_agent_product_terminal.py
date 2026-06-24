@@ -65,6 +65,13 @@ class AgentDependencyTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "prompt-toolkit is required"):
                 TerminalIO()
 
+    def test_entrypoint_bootstraps_interactive_terminal_dependencies(self):
+        entrypoint = AGENT_BIN.read_text(encoding="utf-8")
+        self.assertIn("has_prompt_toolkit", entrypoint)
+        self.assertIn("scripts/install_agent_deps.sh", entrypoint)
+        self.assertIn("Install Agent dependencies into the isolated environment now?", entrypoint)
+        self.assertIn('uses_scripted_prompt" == "0"', entrypoint)
+
 
 def _complete_environment(wizard: BenchmarkWizard, state: WorkflowState) -> None:
     answers = [

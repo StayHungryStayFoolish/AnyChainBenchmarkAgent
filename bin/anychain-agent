@@ -20,4 +20,48 @@ if [[ -z "$AGENT_PYTHON" ]]; then
   AGENT_PYTHON="python3"
 fi
 
+uses_scripted_prompt=0
+for arg in "$@"; do
+  if [[ "$arg" == "--prompt" ]]; then
+    uses_scripted_prompt=1
+    break
+  fi
+done
+
+has_prompt_toolkit() {
+  "$AGENT_PYTHON" - <<'PY' >/dev/null 2>&1
+import prompt_toolkit
+PY
+}
+
+bootstrap_agent_terminal_deps() {
+  if [[ ! -x "$REPO_ROOT/scripts/install_agent_deps.sh" ]]; then
+    echo "Agent terminal dependency is missing: prompt-toolkit." >&2
+    echo "Installer was not found: scripts/install_agent_deps.sh" >&2
+    exit 1
+  fi
+
+  echo "Agent terminal dependency is missing: prompt-toolkit." >&2
+  echo "It is required for reliable Ctrl+C and Chinese/wide-character input editing." >&2
+  printf "Install Agent dependencies into the isolated environment now? [Y/n] " >&2
+  read -r answer
+  case "${answer:-Y}" in
+    y|Y|yes|YES|Yes|"")
+      bash "$REPO_ROOT/scripts/install_agent_deps.sh" --yes
+      if [[ -x "$REPO_ROOT/.venv-adk/bin/python" ]]; then
+        AGENT_PYTHON="$REPO_ROOT/.venv-adk/bin/python"
+      fi
+      ;;
+    *)
+      echo "Cannot start interactive AnyChain Agent without prompt-toolkit." >&2
+      echo "Run: bash scripts/install_agent_deps.sh --yes" >&2
+      exit 1
+      ;;
+  esac
+}
+
+if [[ "$uses_scripted_prompt" == "0" ]] && ! has_prompt_toolkit; then
+  bootstrap_agent_terminal_deps
+fi
+
 exec "$AGENT_PYTHON" agent/terminal/repl.py "$@"
