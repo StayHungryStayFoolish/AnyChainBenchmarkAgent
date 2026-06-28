@@ -8,18 +8,21 @@
 [![ADK Python 3.10+](https://img.shields.io/badge/adk_python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Shell Script](https://img.shields.io/badge/shell-bash-green.svg)](https://www.gnu.org/software/bash/)
 
-A production-oriented Agent and benchmark framework for any blockchain node QPS,
-latency, bottleneck, sync-health, and per-RPC-method analysis. The Agent turns a
-benchmark goal into a validated plan, runs preflight checks, submits a job,
-tracks artifacts, and explains the result with evidence.
+A production-oriented benchmark framework for blockchain node QPS, latency,
+bottleneck, sync-health, and per-RPC-method analysis, with an ADK-based Agent
+control plane.
 
 The benchmark execution plane remains deterministic: Vegeta, RPC proxy,
 monitoring collectors, fake-node, report generation, and archiving are still the
-source of truth. The human-facing entrypoint is `./bin/anychain-agent`; it owns
-the terminal experience, workflow state, confirmations, and job recovery while
-using Google ADK underneath for Agent runtime capabilities. Model output can
-draft structured requests, plans, and explanations, but it does not execute
-commands directly.
+source of truth. The intended human-facing entrypoint is `./bin/anychain-agent`.
+The Agent must use Google ADK for natural-language understanding, typed intent,
+specialized sub-agent delegation, and tool orchestration. Model output may draft
+structured requests, plans, and explanations, but deterministic tools and
+validators own execution gates.
+
+The benchmark engine is the stable execution layer. The Agent routes
+natural-language requests through Google ADK and uses deterministic tools,
+validators, preflight checks, smoke tests, and approval gates before execution.
 
 ## Report Preview
 
@@ -31,20 +34,22 @@ Preview the generated benchmark report before running the framework:
 
 ### Agent Intelligence
 
-- Turns natural-language benchmark goals into structured, validated plans.
-- Detects the local environment and asks only for missing values it cannot
-  safely infer.
-- Guides missing configuration through Agent checklists instead of expecting
+- Turn natural-language benchmark goals into structured, validated plans through
+  Google ADK, not terminal keyword matching.
+- Detect the local environment and ask only for missing values it cannot safely
+  infer.
+- Guide missing configuration through Agent checklists instead of expecting
   users to understand every benchmark variable up front.
-- Scores plan risk, runs preflight, and requires explicit approval before real
+- Use ADK multi-agent orchestration with deterministic tool and validator gates.
+- Score plan risk, run preflight, and require explicit approval before real
   benchmark execution.
-- Runs real benchmarks in detached/background mode by default, so long tests can
-  continue after the terminal disconnects.
-- Restores the latest job context when the Agent is reopened with the same
-  output directory.
-- Answers framework and result questions from repository state, job artifacts,
+- Run long benchmarks in detached/background mode after user approval, so tests
+  can continue after the terminal disconnects.
+- Restore the latest job context when the Agent is reopened with the same output
+  directory.
+- Answer framework and result questions from repository state, job artifacts,
   reports, and optional enterprise Knowledge Base integrations.
-- Generates onboarding plans and conservative chain-template drafts for new
+- Generate onboarding plans and conservative chain-template drafts for new
   chains, RPC methods, and weighted workloads.
 
 ### Benchmark Tools
@@ -64,8 +69,11 @@ Preview the generated benchmark report before running the framework:
 
 ```text
 prompt or request
-  -> intent routing
-  -> request draft
+  -> AnyChain terminal shell for stable I/O only
+  -> ADK root coordinator
+  -> typed intent path
+  -> specialized sub-agent delegation
+  -> deterministic tool and validator gates
   -> read-only discovery
   -> benchmark plan
   -> risk score and preflight
@@ -94,6 +102,16 @@ config/agent_config.sh
 Use it to configure the Agent itself: LLM provider, model, Vertex/OpenAI
 credentials, context compaction, and optional enterprise Knowledge Base
 integration. Every variable has an inline comment.
+
+Write real secrets and local provider choices to:
+
+```text
+config/agent_config.local.sh
+```
+
+That file is gitignored. Another AI assistant helping a user should put API
+keys, ADC/Vertex local settings, and local provider choices there instead of
+committing them to the repository defaults.
 
 The benchmark engine still has default settings in:
 
@@ -163,18 +181,20 @@ calls `scripts/install_deps.sh --yes` through the confirmation-gated
 `install_dependencies` tool. Direct `scripts/install_deps.sh` usage is kept for
 CI, Docker images, and non-Agent automation.
 
-Configure the persistent Agent settings in `config/agent_config.sh`.
-Configure one real provider before starting a natural-language session. Direct
-API-key mode works for Gemini, Claude, and OpenAI. Google service-account modes
-work for Gemini or Claude through Vertex AI.
+Configure the persistent Agent settings in `config/agent_config.sh`. Put real
+secrets in `config/agent_config.local.sh`. Configure one real provider before
+starting a natural-language session. Direct API-key mode works for Gemini,
+`claude`, OpenAI, and DeepSeek. Google service-account modes work for Gemini or
+`claude` through Vertex AI.
 
 ```bash
 LLM_PROVIDER="gemini"
 LLM_MODEL="gemini-3.1-pro"
 LLM_AUTH_MODE="api_key"                   # api_key | google_adc | attached_service_account | service_account_impersonation | service_account_file
 GEMINI_API_KEY=""                         # or GOOGLE_API_KEY, required for Gemini API-key mode
-ANTHROPIC_API_KEY=""                      # required for Claude API-key mode
+ANTHROPIC_API_KEY=""                      # required for `claude` API-key mode
 OPENAI_API_KEY=""                         # required for OpenAI
+DEEPSEEK_API_KEY=""                       # required for DeepSeek
 GOOGLE_CLOUD_PROJECT=""                   # required only for Google service-account modes
 GOOGLE_CLOUD_LOCATION="us-central1"       # Vertex AI location/region
 GOOGLE_SERVICE_ACCOUNT_EMAIL=""           # required for service_account_impersonation
@@ -185,14 +205,23 @@ Choose one authentication path:
 
 - Gemini API key: set `LLM_PROVIDER=gemini`, `LLM_AUTH_MODE=api_key`, and
   `GEMINI_API_KEY` or `GOOGLE_API_KEY`.
-- Claude API key: set `LLM_PROVIDER=claude`, `LLM_AUTH_MODE=api_key`, and
+- `claude` API key: set `LLM_PROVIDER=claude`, `LLM_AUTH_MODE=api_key`, and
   `ANTHROPIC_API_KEY`.
 - OpenAI API key: set `LLM_PROVIDER=openai`, `LLM_AUTH_MODE=api_key`, and
   `OPENAI_API_KEY`.
+- DeepSeek API key: set `LLM_PROVIDER=deepseek`, `LLM_AUTH_MODE=api_key`, and
+  `DEEPSEEK_API_KEY`.
 - Google Vertex AI: set `LLM_PROVIDER=gemini` or `LLM_PROVIDER=claude`, set
   `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION`, then choose
   `google_adc`, `attached_service_account`, `service_account_impersonation`, or
   `service_account_file`.
+
+Web research is provider-limited. ADK `google_search` is enabled only when the
+Agent is running with a Gemini-family model and valid Gemini/Google
+authentication. `claude` on Vertex, DeepSeek, OpenAI, and `claude` API-key modes do
+not enable ADK `google_search`; in those modes the Agent uses repository facts
+and optional enterprise KB evidence, or asks you to provide official docs and
+request/response samples.
 
 Google Cloud CLI is needed only for local ADC workflows such as
 `LLM_AUTH_MODE=google_adc`, or when a host must create ADC before service-account
@@ -226,18 +255,18 @@ You can leave benchmark details such as chain, RPC URL, disk, and machine
 metadata unset at first. The Agent will detect what it can and ask for missing
 required values before a real run.
 
-Start the Agent. This command opens the AnyChain product terminal. It uses
-Google ADK underneath for Agent runtime capabilities, but it does not expose
-the raw `adk run` terminal UI:
+Start the Agent. This command opens the AnyChain product terminal. Google ADK
+owns natural-language understanding and orchestration, while the terminal owns
+stable input/output and startup checks:
 
 ```bash
 ./bin/anychain-agent
 ```
 
 Then talk to it from the `User>` prompt. The Agent replies as `Agent>`, keeps
-the response language aligned with the user's input, stores workflow state
-under `.agent/session`, and asks one confirmation at a time before creating a
-plan or launching a job.
+the response language aligned with the user's input, stores job/session
+artifacts under `.agent`, and asks for explicit approval before installing
+dependencies, running smoke, or launching a benchmark job.
 
 ```text
 User> doctor
@@ -266,8 +295,10 @@ Knowledge Base configuration, and current framework capability coverage.
 If benchmark dependencies are missing, the Agent should explain the planned
 changes and ask for explicit approval before installing them.
 
-For development or CI, you can replay a scripted transcript without opening an
-interactive terminal:
+For development or CI, you can send scripted prompts without opening an
+interactive terminal. This path still routes through the ADK Runner when the
+model provider is configured; without credentials it is only useful for startup
+and terminal-contract checks:
 
 ```bash
 ./bin/anychain-agent \
@@ -281,10 +312,17 @@ interactive terminal:
   --prompt "yes"
 ```
 
-This scripted path generates a plan, runs preflight, writes the job-local
-`runtime.env`, and submits a mock smoke lifecycle job. Real benchmark execution
-still uses confirmation-gated tools and must pass preflight and smoke before
-launch. The model output is never executed directly.
+For deterministic CI that does not require model credentials, use the JSON
+control-plane commands instead:
+
+```bash
+python3 agent/cli.py plan --request /tmp/request.json --output /tmp/plan.json --dry-run
+python3 agent/cli.py preflight --plan /tmp/plan.json
+python3 agent/cli.py submit --plan /tmp/plan.json --mock
+```
+
+Real benchmark execution still uses confirmation-gated tools and must pass
+preflight and smoke before launch. The model output is never executed directly.
 
 Default real benchmark execution is detached/background in the lower-level job
 runner. The benchmark worker continues after the Agent terminal disconnects,
@@ -448,12 +486,15 @@ natural-language intent recognition and are not the product Agent runtime.
 Supported providers and auth modes:
 
 - `gemini`: Gemini API key, or Gemini on Vertex AI with Google auth.
-- `claude`: Anthropic API key, or Claude on Vertex AI with Google auth.
+- `claude`: Anthropic API key, or `claude` on Vertex AI with Google auth.
 - `openai`: OpenAI API key.
+- `deepseek`: DeepSeek API key through the OpenAI-compatible endpoint.
 
-Configure these values persistently in `config/agent_config.sh`;
-`./bin/anychain-agent` loads that file at startup, and environment variables can
-still override it for temporary tests.
+Configure default values in `config/agent_config.sh`; put real secrets and
+local provider choices in gitignored `config/agent_config.local.sh`.
+`./bin/anychain-agent` loads `config/agent_config.sh` at startup, and that file
+loads the local override when present. Environment variables can still override
+both for temporary tests.
 
 Direct Gemini API key:
 
@@ -464,7 +505,7 @@ LLM_AUTH_MODE="api_key"
 GEMINI_API_KEY="AIza..."
 ```
 
-Claude with Anthropic API key:
+`claude` with Anthropic API key:
 
 ```bash
 LLM_PROVIDER="claude"
@@ -473,7 +514,7 @@ LLM_AUTH_MODE="api_key"
 ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
-Gemini or Claude on Vertex AI with service-account impersonation:
+Gemini or `claude` on Vertex AI with service-account impersonation:
 
 ```bash
 LLM_PROVIDER="gemini"
@@ -490,6 +531,15 @@ For OpenAI:
 LLM_PROVIDER="openai"
 LLM_MODEL="gpt-5.5"
 OPENAI_API_KEY="sk-..."
+```
+
+For DeepSeek:
+
+```bash
+LLM_PROVIDER="deepseek"
+LLM_MODEL="deepseek-v4-flash"
+LLM_AUTH_MODE="api_key"
+DEEPSEEK_API_KEY="sk-..."
 ```
 
 Validate config without calling a model:
@@ -705,10 +755,21 @@ code automatically. The usual path is:
 6. Record fake-node fixtures.
 7. Run preflight and fake-node closed-loop tests.
 
+When Gemini web research is enabled, the Chain/RPC onboarding flow may use ADK
+`google_search` to find official RPC documentation, node operator docs, and
+official API examples for unsupported chains or custom RPC methods. Search
+results are evidence only: they do not skip endpoint confirmation, real
+request/response samples, fixture recording, template validation, or fake-node
+smoke.
+
 ## Reference Documentation
 
+- [AI Assistant Operator Guide](AGENTS.md)
 - [Configuration Guide](config/README.md)
 - [Agent Control Plane](agent/README.md)
+- [ADK Agent Architecture](docs/zh/adk-agent-architecture.md)
+- [ADK Terminal Verification Plan](docs/zh/adk-terminal-verification-plan.md)
+- [AnyChain Agent AI Work Gate](docs/zh/anychain-agent-ai-work-gate.md)
 - [Full Framework Reference](docs/en/framework-reference.md)
 - [Framework Flow and Data Lifecycle](docs/en/framework-flow.md)
 - [Module Guide](docs/en/module-guide.md)

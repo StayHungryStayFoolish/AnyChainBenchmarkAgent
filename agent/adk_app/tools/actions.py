@@ -55,7 +55,10 @@ def run_fake_node_smoke_benchmark(
             next_actions=["prepare_benchmark_run", "write plan file"],
         )
 
+    repo = Path(__file__).resolve().parents[3]
     smoke_root = Path(jobs_dir) / "fake_node_smoke"
+    if not smoke_root.is_absolute():
+        smoke_root = repo / smoke_root
     smoke_root.mkdir(parents=True, exist_ok=True)
     smoke_plan = _fake_node_smoke_plan(plan_path, smoke_root)
     smoke_plan_file = smoke_root / f"{smoke_plan['plan_id']}.json"
@@ -237,6 +240,10 @@ def _fake_node_smoke_plan(plan_file: Path, smoke_root: Path) -> dict[str, Any]:
 
     plan = json.loads(plan_file.read_text(encoding="utf-8"))
     plan = dict(plan)
+    if not smoke_root.is_absolute():
+        smoke_root = Path(__file__).resolve().parents[3] / smoke_root
+    smoke_output_root = (smoke_root / "benchmark-data").resolve()
+    smoke_memory_dir = (smoke_root / "memory").resolve()
     plan["plan_id"] = f"{plan.get('plan_id', 'plan')}_fake_node_smoke"
     plan["strategy"] = "smoke"
     plan["goal"] = "smoke"
@@ -247,7 +254,7 @@ def _fake_node_smoke_plan(plan_file: Path, smoke_root: Path) -> dict[str, Any]:
     ]
     plan["required_questions"] = [
         item for item in plan.get("required_questions", [])
-        if item.get("id") not in _FAKE_NODE_IGNORED_REQUIREMENTS and item.get("id") != "ledger_device_confirmation"
+        if item.get("id") not in _FAKE_NODE_IGNORED_REQUIREMENTS
     ]
     checklist = dict(plan.get("configuration_checklist", {}))
     if checklist:
@@ -255,7 +262,7 @@ def _fake_node_smoke_plan(plan_file: Path, smoke_root: Path) -> dict[str, Any]:
             item for item in checklist.get("missing_blockers", [])
             if item not in _FAKE_NODE_IGNORED_REQUIREMENTS
         ]
-        checklist["summary"] = "fake-node smoke configuration uses isolated job-local output and has no real-node blocker requirements."
+        checklist["summary"] = "fake-node smoke uses isolated job-local output; only real-node endpoint blockers are ignored."
         plan["configuration_checklist"] = checklist
     command = ["./blockchain_node_benchmark.sh", "--quick", f"--{plan.get('rpc_mode', 'single')}", "--fake-node"]
     execution = dict(plan.get("execution", {}))
@@ -268,8 +275,8 @@ def _fake_node_smoke_plan(plan_file: Path, smoke_root: Path) -> dict[str, Any]:
         "QUICK_MAX_QPS": "1",
         "QUICK_QPS_STEP": "1",
         "QUICK_DURATION": "10",
-        "BLOCKCHAIN_BENCHMARK_DATA_DIR": str(smoke_root / "benchmark-data"),
-        "MEMORY_SHARE_DIR": str(smoke_root / "memory"),
+        "BLOCKCHAIN_BENCHMARK_DATA_DIR": str(smoke_output_root),
+        "MEMORY_SHARE_DIR": str(smoke_memory_dir),
     })
     execution.update({
         "command": command,
@@ -279,14 +286,14 @@ def _fake_node_smoke_plan(plan_file: Path, smoke_root: Path) -> dict[str, Any]:
     plan["execution"] = execution
     materialized = dict(plan.get("materialized_config", {}))
     materialized.update({
-        "BLOCKCHAIN_BENCHMARK_DATA_DIR": str(smoke_root / "benchmark-data"),
-        "MEMORY_SHARE_DIR": str(smoke_root / "memory"),
+        "BLOCKCHAIN_BENCHMARK_DATA_DIR": str(smoke_output_root),
+        "MEMORY_SHARE_DIR": str(smoke_memory_dir),
     })
     plan["materialized_config"] = materialized
     artifacts = dict(plan.get("artifacts", {}))
     artifacts.update({
-        "fake_node_smoke_output_root": str(smoke_root / "benchmark-data"),
-        "fake_node_smoke_memory_dir": str(smoke_root / "memory"),
+        "fake_node_smoke_output_root": str(smoke_output_root),
+        "fake_node_smoke_memory_dir": str(smoke_memory_dir),
     })
     plan["artifacts"] = artifacts
     return plan
@@ -294,12 +301,5 @@ def _fake_node_smoke_plan(plan_file: Path, smoke_root: Path) -> dict[str, Any]:
 
 _FAKE_NODE_IGNORED_REQUIREMENTS = {
     "local_rpc_url",
-    "blockchain_process_names",
-    "ledger_device",
-    "data_vol_type",
-    "data_vol_size",
-    "data_vol_max_iops",
-    "data_vol_max_throughput",
-    "network_interface",
-    "network_max_bandwidth_gbps",
+    "mainnet_rpc_url_reviewed",
 }

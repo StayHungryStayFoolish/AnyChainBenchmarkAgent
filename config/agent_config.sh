@@ -13,21 +13,22 @@
 #   3. Configure that provider's auth variables below.
 #
 # gemini: Gemini API key or Gemini on Vertex AI.
-# claude: Anthropic API key or Claude partner models on Vertex AI.
+# claude: Anthropic API key or `claude` partner models on Vertex AI.
 # openai: OpenAI API.
-LLM_PROVIDER="${LLM_PROVIDER:-gemini}"
+# deepseek: DeepSeek OpenAI-compatible API.
+LLM_PROVIDER="${LLM_PROVIDER:-openai}"
 
 # Model name for the selected provider.
-# Examples: gemini-3.1-pro-preview, claude-opus-4-8, gpt-5.5.
-LLM_MODEL="${LLM_MODEL:-gemini-3.1-pro-preview}"
+# Examples: gemini-3.1-pro-preview, claude-opus-4-8, gpt-5.5, gpt-4.1-mini, deepseek-v4-flash.
+LLM_MODEL="${LLM_MODEL:-gpt-4.1-mini}"
 
 # Authentication mode for the selected provider.
-# api_key: GEMINI_API_KEY/GOOGLE_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY.
+# api_key: GEMINI_API_KEY/GOOGLE_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, or DEEPSEEK_API_KEY.
 # google_adc: local Application Default Credentials for Vertex AI.
 # attached_service_account: use the VM/GKE attached service account.
 # service_account_impersonation: impersonate GOOGLE_SERVICE_ACCOUNT_EMAIL.
 # service_account_file: use GOOGLE_APPLICATION_CREDENTIALS JSON file.
-LLM_AUTH_MODE="${LLM_AUTH_MODE:-google_adc}"
+LLM_AUTH_MODE="${LLM_AUTH_MODE:-api_key}"
 
 # Required when LLM_PROVIDER is gemini or claude and LLM_AUTH_MODE is not api_key.
 # Google Cloud project that contains the Vertex AI endpoint.
@@ -35,7 +36,7 @@ GOOGLE_CLOUD_PROJECT="${GOOGLE_CLOUD_PROJECT:-}"
 
 # Required when LLM_PROVIDER is gemini or claude and LLM_AUTH_MODE is not api_key.
 # Vertex AI location/region.
-# Examples: global for Gemini, global for some Claude partner models.
+# Examples: global for Gemini, global for some `claude` partner models.
 GOOGLE_CLOUD_LOCATION="${GOOGLE_CLOUD_LOCATION:-global}"
 
 # Required only when LLM_AUTH_MODE=service_account_impersonation.
@@ -59,6 +60,10 @@ ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
 # OpenAI API key.
 OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 
+
+# Required only when LLM_PROVIDER=deepseek.
+# DeepSeek API key. Do not commit a real key to git.
+DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY:-}"
 # ----- Enterprise Knowledge Base Integration -----
 # disabled: use only repository-local capabilities and docs.
 # noop: explicitly use the built-in no-op provider contract.
@@ -84,8 +89,17 @@ AGENT_KNOWLEDGE_AUTH_REF="${AGENT_KNOWLEDGE_AUTH_REF:-}"
 AGENT_NOTIFY_WEBHOOK_URL="${AGENT_NOTIFY_WEBHOOK_URL:-}"
 AGENT_NOTIFY_ON="${AGENT_NOTIFY_ON:-completed,failed}"
 
+# Optional local override for secrets and personal test settings.
+# This file is intentionally gitignored. Use it for API keys or local provider
+# choices that must never be committed to a public repository.
+AGENT_CONFIG_LOCAL="${AGENT_CONFIG_LOCAL:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/agent_config.local.sh}"
+if [[ -f "$AGENT_CONFIG_LOCAL" ]]; then
+    # shellcheck source=/dev/null
+    source "$AGENT_CONFIG_LOCAL"
+fi
+
 export LLM_PROVIDER LLM_MODEL LLM_AUTH_MODE
 export GOOGLE_CLOUD_PROJECT GOOGLE_CLOUD_LOCATION GOOGLE_SERVICE_ACCOUNT_EMAIL GOOGLE_APPLICATION_CREDENTIALS
-export GEMINI_API_KEY GOOGLE_API_KEY ANTHROPIC_API_KEY OPENAI_API_KEY
+export GEMINI_API_KEY GOOGLE_API_KEY ANTHROPIC_API_KEY OPENAI_API_KEY DEEPSEEK_API_KEY
 export AGENT_KNOWLEDGE_PROVIDER AGENT_KNOWLEDGE_PROVIDER_MODULE AGENT_KNOWLEDGE_BASE_URL AGENT_KNOWLEDGE_AUTH_REF
 export AGENT_NOTIFY_WEBHOOK_URL AGENT_NOTIFY_ON

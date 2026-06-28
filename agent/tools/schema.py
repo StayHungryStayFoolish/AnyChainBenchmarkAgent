@@ -73,6 +73,7 @@ def tool_schema() -> dict[str, list[dict[str, Any]]]:
                 "duration_seconds": {"type": "integer", "description": "Optional run duration in seconds."},
                 "rpc_methods": {"type": "array", "items": {"type": "string"}, "description": "Optional RPC methods to test."},
                 "mixed_weights": {"type": "object", "additionalProperties": {"type": "integer"}, "description": "Optional method->weight map for mixed workloads."},
+                "confirmations": {"type": "array", "items": {"type": "string"}, "description": "Confirmed checklist ids, for example rpc_workload_confirmed and rpc_param_samples_confirmed."},
                 "output_dir": _string("Optional directory for prepared plan/runbook artifacts."),
             },
         ),
@@ -111,6 +112,7 @@ def tool_schema() -> dict[str, list[dict[str, Any]]]:
                 "duration_seconds": {"type": "integer", "description": "Optional run duration in seconds."},
                 "rpc_methods": {"type": "array", "items": {"type": "string"}, "description": "Optional RPC methods to test."},
                 "mixed_weights": {"type": "object", "additionalProperties": {"type": "integer"}, "description": "Optional method->weight map for mixed workloads."},
+                "confirmations": {"type": "array", "items": {"type": "string"}, "description": "Confirmed checklist ids, for example rpc_workload_confirmed and rpc_param_samples_confirmed."},
             },
         ),
         _tool(
@@ -214,6 +216,68 @@ def tool_schema() -> dict[str, list[dict[str, Any]]]:
                 "methods": {"type": "array", "items": {"type": "string"}, "description": "RPC methods to check."},
             },
             required=["chain"],
+        ),
+        _tool(
+            "validate_required_config",
+            "Validate required fake-node or real-node runtime configuration without controlling the conversation.",
+            {
+                "target_mode": _string("fake-node, real-node, or omitted."),
+                "confirmed_config": _object("Confirmed configuration values."),
+            },
+        ),
+        _tool(
+            "build_missing_config_questions",
+            "Build missing or ambiguous configuration questions from confirmed values and discovery facts.",
+            {
+                "target_mode": _string("fake-node, real-node, or omitted."),
+                "confirmed_config": _object("Confirmed configuration values."),
+                "discovery": _object("Read-only discovery payload."),
+            },
+        ),
+        _tool(
+            "validate_rpc_workload",
+            "Validate single/custom/mixed RPC workload choices and mixed weights.",
+            {
+                "chain": _string("Chain name."),
+                "rpc_mode": _string("single or mixed."),
+                "methods": {"type": "array", "items": {"type": "string"}, "description": "Selected RPC methods."},
+                "mixed_weights": {"type": "object", "additionalProperties": {"type": "integer"}, "description": "method->weight map."},
+            },
+            required=["chain", "rpc_mode"],
+        ),
+        _tool(
+            "load_default_workload",
+            "Load chain-template default single method and mixed weights.",
+            {"chain": _string("Chain name.")},
+            required=["chain"],
+        ),
+        _tool(
+            "validate_chain_template",
+            "Validate selected chain template readiness.",
+            {"chain": _string("Chain name.")},
+            required=["chain"],
+        ),
+        _tool(
+            "validate_execution_gate",
+            "Validate preflight, smoke, and approval gates before execution.",
+            {
+                "plan": _object("Benchmark plan."),
+                "preflight": _object("Preflight result."),
+                "smoke": _object("Smoke result."),
+                "approved": _boolean("Explicit user approval."),
+                "real_execution": _boolean("Whether this is a real benchmark execution."),
+            },
+        ),
+        _tool(
+            "build_onboarding_handoff",
+            "Build an evidence-aware chain/RPC onboarding handoff.",
+            {
+                "chain": _string("Chain name."),
+                "family": _string("Adapter family."),
+                "methods": {"type": "array", "items": {"type": "string"}, "description": "RPC methods."},
+                "evidence": _object("Docs, KB, request samples, response samples, and sync-health evidence."),
+            },
+            required=["chain", "family"],
         ),
         _tool(
             "knowledge_search",

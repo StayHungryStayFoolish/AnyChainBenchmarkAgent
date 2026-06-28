@@ -14,6 +14,7 @@ SUPPORTED_LLM_PROVIDERS = {
     "gemini",
     "claude",
     "openai",
+    "deepseek",
 }
 
 SUPPORTED_LLM_AUTH_MODES = {
@@ -41,9 +42,11 @@ class LLMConfig:
     gemini_api_key: str = ""
     anthropic_api_key: str = ""
     openai_api_key: str = ""
+    deepseek_api_key: str = ""
     gemini_api_key_present: bool = False
     anthropic_api_key_present: bool = False
     openai_api_key_present: bool = False
+    deepseek_api_key_present: bool = False
 
     def validate(self) -> list[str]:
         errors: list[str] = []
@@ -51,11 +54,13 @@ class LLMConfig:
             errors.append(f"unsupported LLM_PROVIDER: {self.provider}")
         if self.auth_mode not in SUPPORTED_LLM_AUTH_MODES:
             errors.append(f"unsupported LLM_AUTH_MODE: {self.auth_mode}")
-        if self.provider == "openai":
+        if self.provider in {"openai", "deepseek"}:
             if self.auth_mode != "api_key":
-                errors.append("LLM_AUTH_MODE=api_key is required for LLM_PROVIDER=openai")
-            if not self.openai_api_key_present:
+                errors.append(f"LLM_AUTH_MODE=api_key is required for LLM_PROVIDER={self.provider}")
+            if self.provider == "openai" and not self.openai_api_key_present:
                 errors.append("OPENAI_API_KEY is required for LLM_PROVIDER=openai")
+            if self.provider == "deepseek" and not self.deepseek_api_key_present:
+                errors.append("DEEPSEEK_API_KEY is required for LLM_PROVIDER=deepseek")
             return errors
         if self.auth_mode == "api_key":
             if self.provider == "gemini" and not self.gemini_api_key_present:
@@ -65,14 +70,33 @@ class LLMConfig:
             return errors
         if self.provider in {"gemini", "claude"}:
             if not self.google_project:
-                errors.append("GOOGLE_CLOUD_PROJECT is required for Gemini/Claude on Vertex")
+                errors.append("GOOGLE_CLOUD_PROJECT is required for Gemini/`claude` on Vertex")
             if not self.google_location:
-                errors.append("GOOGLE_CLOUD_LOCATION is required for Gemini/Claude on Vertex")
+                errors.append("GOOGLE_CLOUD_LOCATION is required for Gemini/`claude` on Vertex")
             if self.auth_mode == "service_account_impersonation" and not self.google_service_account_email:
                 errors.append("GOOGLE_SERVICE_ACCOUNT_EMAIL is required for service_account_impersonation")
             if self.auth_mode == "service_account_file" and not self.google_application_credentials:
                 errors.append("GOOGLE_APPLICATION_CREDENTIALS is required for service_account_file")
         return errors
+
+    def is_gemini_family(self) -> bool:
+        return self.provider == "gemini" and self.model.lower().startswith("gemini")
+
+    def google_search_eligible(self) -> tuple[bool, str]:
+        """Return whether ADK google_search may be enabled for this config.
+
+        ADK google_search is a Gemini Search Grounding tool. Google Cloud auth
+        alone is not enough: `claude` on Vertex, DeepSeek, and OpenAI must not be
+        advertised as google_search-capable.
+        """
+        if self.provider != "gemini":
+            return False, "unavailable for current provider"
+        if not self.model.lower().startswith("gemini"):
+            return False, "unavailable for non-Gemini model"
+        errors = self.validate()
+        if errors:
+            return False, "Gemini authentication is incomplete"
+        return True, "eligible for ADK google_search"
 
     def safe_dict(self) -> dict[str, str | bool | list[str]]:
         return {
@@ -86,6 +110,9 @@ class LLMConfig:
             "gemini_api_key_configured": self.gemini_api_key_present,
             "anthropic_api_key_configured": self.anthropic_api_key_present,
             "openai_api_key_configured": self.openai_api_key_present,
+            "deepseek_api_key_configured": self.deepseek_api_key_present,
+            "google_search_eligible": self.google_search_eligible()[0],
+            "google_search_reason": self.google_search_eligible()[1],
             "validation_errors": self.validate(),
         }
 
@@ -100,6 +127,8 @@ def load_llm_config(env: Mapping[str, str] | None = None) -> LLMConfig:
         default_model = "claude-opus-4-8"
     elif provider == "openai":
         default_model = "gpt-5.5"
+    elif provider == "deepseek":
+        default_model = "deepseek-v4-flash"
     default_auth_mode = "api_key"
     if provider in {"gemini", "claude"}:
         default_auth_mode = source.get("LLM_AUTH_MODE", "api_key").strip().lower()
@@ -118,9 +147,11 @@ def load_llm_config(env: Mapping[str, str] | None = None) -> LLMConfig:
         gemini_api_key=source.get("GEMINI_API_KEY", source.get("GOOGLE_API_KEY", "")).strip(),
         anthropic_api_key=source.get("ANTHROPIC_API_KEY", "").strip(),
         openai_api_key=source.get("OPENAI_API_KEY", "").strip(),
+        deepseek_api_key=source.get("DEEPSEEK_API_KEY", "").strip(),
         gemini_api_key_present=bool(source.get("GEMINI_API_KEY", "") or source.get("GOOGLE_API_KEY", "")),
         anthropic_api_key_present=bool(source.get("ANTHROPIC_API_KEY", "")),
         openai_api_key_present=bool(source.get("OPENAI_API_KEY", "")),
+        deepseek_api_key_present=bool(source.get("DEEPSEEK_API_KEY", "")),
     )
 
 

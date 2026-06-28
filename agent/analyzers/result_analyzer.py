@@ -12,6 +12,41 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def analyze_job(job: dict[str, Any]) -> dict[str, Any]:
+    artifacts = job.get("artifacts", {})
+    evidence = _evidence_from_artifacts(artifacts)
+    if evidence:
+        summary_path = artifacts.get("summary_json")
+        if summary_path and Path(summary_path).is_file():
+            summary = _read_json(Path(summary_path))
+            grade = "WARNING" if summary.get("bottleneck_detected") else "PASS"
+            return {
+                "job_id": job["job_id"],
+                "status": job["status"],
+                "grade": grade,
+                "grade_reason": "Bottleneck detected." if summary.get("bottleneck_detected") else "Job artifacts and archive summary are available.",
+                "summary": {
+                    "run_id": summary.get("run_id"),
+                    "benchmark_mode": summary.get("benchmark_mode"),
+                    "max_stable_qps": summary.get("max_successful_qps"),
+                    "bottleneck_detected": summary.get("bottleneck_detected"),
+                    "bottleneck_types": summary.get("bottleneck_types", []),
+                },
+                "artifacts": artifacts,
+                "evidence": evidence,
+                "recommendations": _recommendations(summary),
+            }
+        grade, grade_reason = _grade_job(job, evidence)
+        return {
+            "job_id": job["job_id"],
+            "status": job["status"],
+            "grade": grade,
+            "grade_reason": grade_reason,
+            "summary": {"message": "Job evidence artifacts are available."},
+            "artifacts": artifacts,
+            "evidence": evidence,
+            "recommendations": ["Use artifact-qa or diagnose-artifacts for a deeper report explanation."],
+        }
+
     if job.get("analysis"):
         grade, grade_reason = _grade_job(job, _evidence_from_artifacts(job.get("artifacts", {})))
         return {

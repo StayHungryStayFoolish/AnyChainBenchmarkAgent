@@ -9,38 +9,38 @@ def required_questions(plan: dict[str, Any]) -> list[dict[str, Any]]:
     questions: list[dict[str, Any]] = []
 
     for item in plan.get("required_inputs", []):
-        questions.append({
+        if item in _SPECIALIZED_REQUIRED_QUESTIONS:
+            continue
+        questions.append(_with_manual_input({
             "id": item,
             "category": "required_input",
             "severity": "blocker",
             "prompt": _required_prompt(item),
-        })
+        }))
 
     confidence = plan.get("confidence", {})
     confirmed = set(plan.get("confirmed_inputs", []))
     if (
-        not plan.get("use_fake_node")
-        and confidence.get("ledger_device", 1.0) < 0.6
+        confidence.get("ledger_device", 1.0) < 0.6
         and "ledger_device_confirmation" not in confirmed
     ):
         disks = plan.get("discovery", {}).get("disks", {})
-        questions.append({
+        questions.append(_with_manual_input({
             "id": "ledger_device_confirmation",
             "category": "environment",
             "severity": "blocker",
             "prompt": "Confirm the ledger/data disk device before running the benchmark.",
             "candidates": disks.get("ambiguous_candidates") or _candidate_disk_names(disks),
-        })
+        }))
 
     discovery = plan.get("discovery", {})
     disks = discovery.get("disks", {})
     disk_candidates = _disk_candidates(disks)
     if (
-        not plan.get("use_fake_node")
-        and len(disk_candidates) > 1
+        len(disk_candidates) > 1
         and "disk_inventory_confirmation" not in confirmed
     ):
-        questions.append({
+        questions.append(_with_manual_input({
             "id": "disk_inventory_confirmation",
             "category": "storage",
             "severity": "confirm",
@@ -52,7 +52,7 @@ def required_questions(plan: dict[str, Any]) -> list[dict[str, Any]]:
             "candidates": disk_candidates,
             "proposed_ledger_device": disks.get("proposed_ledger_device", ""),
             "proposed_accounts_device": disks.get("proposed_accounts_device", ""),
-        })
+        }))
     missing_required = discovery.get("dependencies", {}).get("missing_required", [])
     if missing_required and "dependency_mode_confirmation" not in confirmed:
         questions.append({
@@ -67,27 +67,101 @@ def required_questions(plan: dict[str, Any]) -> list[dict[str, Any]]:
         })
 
     if "mixed_weights" in plan.get("requires_confirmation", []):
-        questions.append({
+        questions.append(_with_manual_input({
             "id": "mixed_weights_confirmation",
             "category": "workload",
             "severity": "blocker",
             "prompt": "Confirm mixed RPC method weights and parameter samples.",
-        })
+        }))
+
+    if "benchmark_mode_confirmed" not in confirmed:
+        questions.append(_with_manual_input({
+            "id": "benchmark_mode_confirmed",
+            "category": "execution",
+            "severity": "blocker",
+            "prompt": (
+                "Choose benchmark mode. quick is a short smoke/sanity run, standard is the normal "
+                "performance benchmark, and intensive searches for bottlenecks and can run much longer."
+            ),
+            "candidates": [
+                {"id": "quick", "description": "Short validation run; safest first step."},
+                {"id": "standard", "description": "Normal benchmark run using standard QPS settings."},
+                {"id": "intensive", "description": "Long bottleneck discovery run with auto-stop when configured."},
+            ],
+            "current_value": plan.get("benchmark_mode") or plan.get("strategy"),
+        }))
+
+    if "qps_profile_confirmed" not in confirmed:
+        qps = plan.get("advanced_defaults", {}).get("qps", {})
+        questions.append(_with_manual_input({
+            "id": "qps_profile_confirmed",
+            "category": "execution",
+            "severity": "blocker",
+            "prompt": (
+                "Show the selected mode's default QPS profile with parameter meanings, then ask whether "
+                "to keep the defaults. Only if the user wants changes, ask which item to adjust."
+            ),
+            "interaction_mode": "accept_defaults_or_adjust_item",
+            "accepted_reply_examples": ["keep defaults", "use defaults", "yes"],
+            "adjust_reply_examples": ["adjust max_qps", "change duration", "set qps_step to 100"],
+            "current_value": {
+                "initial_qps": qps.get("initial"),
+                "max_qps": qps.get("max"),
+                "qps_step": qps.get("step"),
+                "duration_seconds": qps.get("duration_seconds"),
+            },
+            "parameter_descriptions": {
+                "initial_qps": "Starting request rate for the first QPS level.",
+                "max_qps": "Highest request rate the mode will attempt before stopping or hitting a bottleneck.",
+                "qps_step": "Increment added between QPS levels.",
+                "duration_seconds": "How long each QPS level runs before moving to the next level.",
+            },
+            "adjustable_items": [
+                {"id": "initial_qps", "env_suffix": "INITIAL_QPS"},
+                {"id": "max_qps", "env_suffix": "MAX_QPS"},
+                {"id": "qps_step", "env_suffix": "QPS_STEP"},
+                {"id": "duration_seconds", "env_suffix": "DURATION"},
+            ],
+        }))
+
+    if "observability_choice_confirmed" not in confirmed:
+        observability = plan.get("advanced_defaults", {}).get("observability", {})
+        questions.append(_with_manual_input({
+            "id": "observability_choice_confirmed",
+            "category": "observability",
+            "severity": "confirm",
+            "prompt": (
+                "Choose observability mode: disabled, local Prometheus/Grafana, or exporter-only "
+                "for an existing Prometheus/Grafana environment."
+            ),
+            "candidates": [
+                {"id": "disabled", "description": "Do not start the optional observability stack."},
+                {
+                    "id": "local",
+                    "description": "Start exporter, local Prometheus, and local Grafana; confirm EXPORTER_PORT, PROMETHEUS_PORT, and GRAFANA_PORT.",
+                },
+                {
+                    "id": "exporter",
+                    "description": "Start only the read-only exporter; configure the user's existing Prometheus to scrape http://<benchmark-host>:EXPORTER_PORT/metrics.",
+                },
+            ],
+            "current_value": observability,
+        }))
 
     checklist = plan.get("configuration_checklist", {})
     for item in checklist.get("environment", []):
         if item.get("id") not in confirmed:
-            questions.append({
+            questions.append(_with_manual_input({
                 "id": item["id"],
                 "category": "environment",
                 "severity": "confirm",
                 "prompt": f"Confirm {item['description']}",
                 "current_value": _current_value(plan, item["id"]),
-            })
+            }))
 
     accounts_items = checklist.get("accounts_optional", [])
     if accounts_items and "has_accounts_device" not in confirmed:
-        questions.append({
+        questions.append(_with_manual_input({
             "id": "has_accounts_device",
             "category": "storage",
             "severity": "confirm",
@@ -97,29 +171,43 @@ def required_questions(plan: dict[str, Any]) -> list[dict[str, Any]]:
             ),
             "current_value": _current_value(plan, "accounts_device"),
             "candidates": disk_candidates,
-        })
+        }))
     for item in accounts_items:
         if item.get("severity") == "blocker" and not item.get("present"):
-            questions.append({
+            questions.append(_with_manual_input({
                 "id": item["id"],
                 "category": "storage",
                 "severity": "blocker",
                 "prompt": item["description"],
-            })
+            }))
 
     chain_requirements = plan.get("chain_template_requirements", {})
     if chain_requirements.get("exists"):
+        if "chain_template_reviewed" not in confirmed:
+            questions.append(_with_manual_input({
+                "id": "chain_template_reviewed",
+                "category": "workload",
+                "severity": "blocker",
+                "prompt": (
+                    "Review the selected chain template endpoint overrides, TARGET_* sample variables, "
+                    "default single/mixed workload, and custom RPC extension points."
+                ),
+                "runtime_endpoint_variables": chain_requirements.get("runtime_endpoint_variables", []),
+                "runtime_sample_variables": chain_requirements.get("runtime_sample_variables", []),
+                "single": chain_requirements.get("single_method"),
+                "mixed_weighted": chain_requirements.get("mixed_weighted", []),
+            }))
         if "rpc_workload_confirmation" not in confirmed:
-            questions.append({
+            questions.append(_with_manual_input({
                 "id": "rpc_workload_confirmation",
                 "category": "workload",
                 "severity": "confirm",
                 "prompt": "Confirm the RPC methods and weights to test from the selected chain template.",
                 "single": chain_requirements.get("single_method"),
                 "mixed_weighted": chain_requirements.get("mixed_weighted", []),
-            })
+            }))
         if "custom_rpc_method_review" not in confirmed:
-            questions.append({
+            questions.append(_with_manual_input({
                 "id": "custom_rpc_method_review",
                 "category": "workload",
                 "severity": "confirm",
@@ -131,28 +219,28 @@ def required_questions(plan: dict[str, Any]) -> list[dict[str, Any]]:
                 "extension_fields": chain_requirements.get("custom_rpc_extension_fields", []),
                 "param_formats": chain_requirements.get("param_formats", {}),
                 "param_spec_methods": chain_requirements.get("param_spec_methods", []),
-            })
+            }))
         sample_vars = chain_requirements.get("runtime_sample_variables", [])
         if sample_vars and "rpc_param_samples_confirmation" not in confirmed:
-            questions.append({
+            questions.append(_with_manual_input({
                 "id": "rpc_param_samples_confirmation",
                 "category": "workload",
                 "severity": "confirm",
                 "prompt": "Confirm whether these chain template sample variables should use defaults or user-provided values.",
                 "variables": sample_vars,
-            })
+            }))
         endpoint_vars = chain_requirements.get("runtime_endpoint_variables", [])
         if endpoint_vars and "chain_endpoint_overrides_confirmation" not in confirmed:
-            questions.append({
+            questions.append(_with_manual_input({
                 "id": "chain_endpoint_overrides_confirmation",
                 "category": "endpoint",
                 "severity": "confirm",
                 "prompt": "Confirm whether this chain needs endpoint overrides beyond LOCAL_RPC_URL.",
                 "variables": endpoint_vars,
-            })
+            }))
 
     if "advanced_config_review" not in confirmed:
-        questions.append({
+        questions.append(_with_manual_input({
             "id": "advanced_config_review",
             "category": "advanced",
             "severity": "info",
@@ -161,6 +249,14 @@ def required_questions(plan: dict[str, Any]) -> list[dict[str, Any]]:
                 "Ask whether the user wants a short explanation or wants to adjust bottleneck, latency, success-rate, or sync-health thresholds."
             ),
             "variables": [
+                "ACCOUNT_COUNT",
+                "ACCOUNT_MAX_SIGNATURES",
+                "ACCOUNT_TX_BATCH_SIZE",
+                "ACCOUNT_SEMAPHORE_LIMIT",
+                "MONITOR_INTERVAL",
+                "DISK_MONITOR_RATE",
+                "QPS_COOLDOWN",
+                "QPS_WARMUP_DURATION",
                 "BOTTLENECK_CPU_THRESHOLD",
                 "BOTTLENECK_MEMORY_THRESHOLD",
                 "BOTTLENECK_DISK_UTIL_THRESHOLD",
@@ -172,15 +268,15 @@ def required_questions(plan: dict[str, Any]) -> list[dict[str, Any]]:
                 "BLOCK_HEIGHT_DIFF_THRESHOLD",
                 "BLOCK_HEIGHT_TIME_THRESHOLD",
             ],
-        })
+        }))
 
     if "stress_execution" in plan.get("requires_confirmation", []):
-        questions.append({
+        questions.append(_with_manual_input({
             "id": "stress_execution_confirmation",
             "category": "safety",
             "severity": "blocker",
             "prompt": "Confirm stress/intensive benchmark execution; it may affect the target node.",
-        })
+        }))
 
     return _dedupe_questions(questions)
 
@@ -189,6 +285,7 @@ def _required_prompt(item: str) -> str:
     prompts = {
         "chain": "Which blockchain node should be tested?",
         "local_rpc_url": "Provide the local RPC endpoint, or choose fake-node for closed-loop testing.",
+        "use_fake_node": "Choose fake-node closed-loop testing or real-node testing.",
         "blockchain_process_names": "Provide blockchain node process names or command keywords for resource attribution.",
         "ledger_device": "Confirm the ledger/data disk device used by the node.",
         "data_vol_type": "Provide the ledger/data disk type.",
@@ -198,8 +295,30 @@ def _required_prompt(item: str) -> str:
         "network_interface": "Confirm the network interface used by the node.",
         "network_max_bandwidth_gbps": "Provide the instance or pod network bandwidth baseline in Gbps.",
         "rpc_mode": "Choose single or mixed RPC workload mode.",
+        "benchmark_mode_confirmed": "Choose quick, standard, or intensive benchmark mode.",
+        "qps_profile_confirmed": "Confirm INITIAL_QPS, MAX_QPS, QPS_STEP, and DURATION for the selected mode.",
+        "observability_choice_confirmed": "Choose disabled, local Prometheus/Grafana, or exporter-only observability mode.",
+        "chain_template_reviewed": "Review selected chain template endpoints, TARGET_* sample variables, and default workload.",
     }
     return prompts.get(item, f"Provide required value: {item}")
+
+
+_SPECIALIZED_REQUIRED_QUESTIONS = {
+    "benchmark_mode_confirmed",
+    "qps_profile_confirmed",
+    "observability_choice_confirmed",
+    "chain_template_reviewed",
+}
+
+
+def _with_manual_input(question: dict[str, Any]) -> dict[str, Any]:
+    enriched = dict(question)
+    enriched["manual_input_allowed"] = True
+    enriched.setdefault(
+        "manual_input_hint",
+        "The user may reply with a listed number/id or provide a custom value.",
+    )
+    return enriched
 
 
 def _current_value(plan: dict[str, Any], item_id: str) -> Any:

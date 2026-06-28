@@ -36,7 +36,10 @@ Agent-launched benchmark:
 
 ```text
 user prompt
--> Agent intent router / workflow
+-> ADK root coordinator
+-> typed intent path
+-> specialized sub-agent
+-> deterministic tool and validator gates
 -> benchmark plan
 -> preflight and risk checks
 -> .agent/jobs/<job_id>/runtime.env

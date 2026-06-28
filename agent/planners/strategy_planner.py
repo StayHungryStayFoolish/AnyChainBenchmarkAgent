@@ -29,12 +29,12 @@ GOAL_TO_STRATEGY = {
 
 
 DEFAULT_QPS = {
-    "smoke": {"initial": 1, "max": 1, "step": 1, "duration_seconds": 10},
-    "baseline": {"initial": 100, "max": 500, "step": 100, "duration_seconds": 300},
-    "ramp": {"initial": 100, "max": 5000, "step": 500, "duration_seconds": 300},
-    "stress": {"initial": 1000, "max": 20000, "step": 1000, "duration_seconds": 600},
-    "bottleneck-confirmation": {"initial": 500, "max": 5000, "step": 500, "duration_seconds": 300},
-    "regression": {"initial": 100, "max": 1000, "step": 100, "duration_seconds": 180},
+    "smoke": {"initial": 1000, "max": 1500, "step": 500, "duration_seconds": 60},
+    "baseline": {"initial": 2000, "max": 50000, "step": 500, "duration_seconds": 600},
+    "ramp": {"initial": 2000, "max": 50000, "step": 500, "duration_seconds": 600},
+    "stress": {"initial": 50000, "max": 9999999, "step": 250, "duration_seconds": 600},
+    "bottleneck-confirmation": {"initial": 2000, "max": 50000, "step": 500, "duration_seconds": 600},
+    "regression": {"initial": 2000, "max": 50000, "step": 500, "duration_seconds": 600},
 }
 
 
@@ -53,9 +53,10 @@ def write_json(path: str | Path, payload: dict[str, Any]) -> None:
 def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = None) -> dict[str, Any]:
     chain = (request.get("chain") or "").strip().lower()
     goal = request.get("goal") or "baseline"
-    strategy = GOAL_TO_STRATEGY.get(goal, "baseline")
+    strategy = _strategy_from_mode(request.get("benchmark_mode")) or GOAL_TO_STRATEGY.get(goal, "baseline")
+    benchmark_mode = _benchmark_mode(strategy)
     rpc_mode = request.get("rpc_mode") or "single"
-    use_fake_node = bool(request.get("use_fake_node", False))
+    use_fake_node = request.get("use_fake_node") if isinstance(request.get("use_fake_node"), bool) else None
     qps = {**DEFAULT_QPS[strategy], **request.get("qps", {})}
     confirmations = set(request.get("confirmations", []))
     runner_mode = request.get("runner_mode", "detached")
@@ -65,7 +66,9 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
     required_inputs = []
     if not chain:
         required_inputs.append("chain")
-    if not use_fake_node and not request.get("local_rpc_url"):
+    if use_fake_node is None:
+        required_inputs.append("use_fake_node")
+    if use_fake_node is False and not request.get("local_rpc_url"):
         required_inputs.append("local_rpc_url")
     requires_confirmation = []
     if request.get("workload", {}).get("methods") and "mixed_weights_confirmation" not in confirmations:
@@ -74,7 +77,7 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
         requires_confirmation.append("stress_execution")
 
     command = ["./blockchain_node_benchmark.sh", _mode_flag(strategy), f"--{rpc_mode}"]
-    if use_fake_node:
+    if use_fake_node is True:
         command.append("--fake-node")
 
     qps_prefix = _qps_env_prefix(strategy)
@@ -91,6 +94,12 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
             bool(request.get("observability", {}).get("enabled", False))
         ).lower(),
         "OBSERVABILITY_STACK_MODE": request.get("observability", {}).get("mode", "local"),
+        "OBSERVABILITY_STACK_AUTO_STOP": str(
+            request.get("observability", {}).get("auto_stop", True)
+        ).lower(),
+        "EXPORTER_PORT": str(request.get("exporter_port", "")),
+        "PROMETHEUS_PORT": str(request.get("prometheus_port", "")),
+        "GRAFANA_PORT": str(request.get("grafana_port", "")),
     }
     discovery_payload = discovery or request.get("discovery") or {
         "source": "not_collected",
@@ -121,6 +130,12 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
         "ACCOUNTS_VOL_MAX_THROUGHPUT": request.get("accounts_vol_max_throughput", ""),
         "NETWORK_INTERFACE": request.get("network_interface", ""),
         "NETWORK_MAX_BANDWIDTH_GBPS": request.get("network_max_bandwidth_gbps", ""),
+        "OBSERVABILITY_STACK_ENABLED": str(bool(request.get("observability", {}).get("enabled", False))).lower(),
+        "OBSERVABILITY_STACK_MODE": request.get("observability", {}).get("mode", "local"),
+        "OBSERVABILITY_STACK_AUTO_STOP": str(request.get("observability", {}).get("auto_stop", True)).lower(),
+        "EXPORTER_PORT": str(request.get("exporter_port", "")),
+        "PROMETHEUS_PORT": str(request.get("prometheus_port", "")),
+        "GRAFANA_PORT": str(request.get("grafana_port", "")),
         "CHAIN_REST_URL": request.get("chain_rest_url", ""),
         "CHAIN_INDEXER_URL": request.get("chain_indexer_url", ""),
         "CHAIN_SIDECAR_URL": request.get("chain_sidecar_url", ""),
@@ -153,6 +168,7 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
         "plan_id": plan_id,
         "chain": chain,
         "strategy": strategy,
+        "benchmark_mode": benchmark_mode,
         "goal": goal,
         "rpc_mode": rpc_mode,
         "use_fake_node": use_fake_node,
@@ -205,7 +221,7 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
     }
     checklist = build_configuration_checklist(request, plan)
     plan["configuration_checklist"] = checklist
-    combined_required = sorted(set(plan["required_inputs"]) | set(missing_required_from_checklist(checklist)))
+    combined_required = _ordered_required_inputs(set(plan["required_inputs"]) | set(missing_required_from_checklist(checklist)))
     plan["required_inputs"] = combined_required
     plan["required_questions"] = required_questions(plan)
     plan["risk"] = score_plan_risk(plan)
@@ -231,6 +247,25 @@ def _mode_flag(strategy: str) -> str:
     if strategy == "stress":
         return "--intensive"
     return "--standard"
+
+
+def _strategy_from_mode(mode: Any) -> str:
+    normalized = str(mode or "").strip().lower()
+    if normalized == "quick":
+        return "smoke"
+    if normalized == "standard":
+        return "baseline"
+    if normalized == "intensive":
+        return "stress"
+    return ""
+
+
+def _benchmark_mode(strategy: str) -> str:
+    if strategy == "smoke":
+        return "quick"
+    if strategy == "stress":
+        return "intensive"
+    return "standard"
 
 
 def _qps_env_prefix(strategy: str) -> str:
@@ -272,3 +307,37 @@ def _config_snapshot(chain: str) -> dict[str, list[dict[str, str | float]]]:
             "mtime": stat.st_mtime,
         })
     return {"files": snapshots}
+
+
+def _ordered_required_inputs(items: set[str]) -> list[str]:
+    priority = [
+        "chain",
+        "use_fake_node",
+        "rpc_mode",
+        "benchmark_mode_confirmed",
+        "qps_profile_confirmed",
+        "observability_choice_confirmed",
+        "chain_template_reviewed",
+        "local_rpc_url",
+        "mainnet_rpc_url_reviewed",
+        "blockchain_process_names",
+        "ledger_device",
+        "has_accounts_device",
+        "data_vol_type",
+        "data_vol_size",
+        "data_vol_max_iops",
+        "data_vol_max_throughput",
+        "accounts_device",
+        "accounts_vol_type",
+        "accounts_vol_size",
+        "accounts_vol_max_iops",
+        "accounts_vol_max_throughput",
+        "network_interface",
+        "network_max_bandwidth_gbps",
+        "rpc_workload_confirmed",
+        "mixed_weights_confirmed",
+        "rpc_param_samples_confirmed",
+    ]
+    known = [item for item in priority if item in items]
+    unknown = sorted(item for item in items if item not in priority)
+    return known + unknown

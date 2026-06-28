@@ -107,6 +107,8 @@ def submit_job(
         job["status"] = "completed" if completed.returncode == 0 else "failed"
         if completed.returncode != 0:
             job["error"] = f"benchmark command exited with {completed.returncode}"
+        else:
+            job["artifacts"].update(_discover_completed_artifacts(plan, env))
     except Exception as exc:  # pragma: no cover - defensive lifecycle guard
         job["status"] = "failed"
         job["error"] = str(exc)
@@ -245,3 +247,57 @@ def _notify_status(job: dict[str, Any]) -> None:
             pass
     except Exception:
         return
+
+
+def _discover_completed_artifacts(plan: dict[str, Any], env: dict[str, str]) -> dict[str, str]:
+    """Find benchmark artifacts after a successful foreground engine run.
+
+    The benchmark entrypoint archives ``current`` at the end of a successful
+    run, so Agent evidence must point at the latest archive instead of stale
+    plan-relative ``current/...`` paths.
+    """
+    data_dir = Path(env.get("BLOCKCHAIN_BENCHMARK_DATA_DIR") or "")
+    if not data_dir:
+        return {}
+    if not data_dir.is_absolute():
+        data_dir = (Path(plan.get("execution", {}).get("working_dir", REPO_ROOT)) / data_dir).resolve()
+    archive_dir = _latest_archive_dir(data_dir)
+    root = archive_dir or data_dir / "current"
+    artifacts: dict[str, str] = {}
+    if archive_dir:
+        artifacts["archive_dir"] = str(archive_dir)
+        summary = archive_dir / "test_summary.json"
+        if summary.is_file():
+            artifacts["summary_json"] = str(summary)
+    html = _latest_file(root / "reports", "performance_report_*.html")
+    if html:
+        artifacts["html_report"] = str(html)
+    performance = _latest_file(root / "logs", "performance_*.csv")
+    if performance:
+        artifacts["performance_csv"] = str(performance)
+    proxy = root / "logs" / "proxy_method.csv"
+    if proxy.is_file():
+        artifacts["proxy_method_csv"] = str(proxy)
+    sync_health = _latest_file(root / "logs", "block_height_monitor_*.csv")
+    if sync_health:
+        artifacts["sync_health_csv"] = str(sync_health)
+    vegeta = _latest_file(root / "vegeta_results", "vegeta_*.json")
+    if vegeta:
+        artifacts["vegeta_json"] = str(vegeta)
+    return artifacts
+
+
+def _latest_archive_dir(data_dir: Path) -> Path | None:
+    archives = [path for path in (data_dir / "archives").glob("run_*") if path.is_dir()]
+    if not archives:
+        return None
+    return max(archives, key=lambda path: path.stat().st_mtime)
+
+
+def _latest_file(root: Path, pattern: str) -> Path | None:
+    if not root.is_dir():
+        return None
+    matches = [path for path in root.glob(pattern) if path.is_file()]
+    if not matches:
+        return None
+    return max(matches, key=lambda path: path.stat().st_mtime)

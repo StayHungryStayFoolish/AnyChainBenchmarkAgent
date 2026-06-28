@@ -11,11 +11,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from adk_app.agents.router import route_user_intent
 from adk_app.callbacks import before_tool_callback
 from adk_app.workflow.schemas import validate_intent_route
 from adk_app.instructions import ROOT_INSTRUCTION
 from adk_app.root_agent import resolve_adk_model
+from adk_app.agents.domain import build_domain_agents
 from adk_app.tools.registry import get_adk_tools
 
 
@@ -47,6 +47,31 @@ def run_offline_evals() -> dict[str, Any]:
         "diagnose_artifacts",
         "draft_chain_template",
         "knowledge_search",
+        "validate_required_config",
+        "build_missing_config_questions",
+        "validate_rpc_workload",
+        "load_default_workload",
+        "validate_chain_template",
+        "validate_execution_gate",
+        "build_onboarding_handoff",
+    }
+
+    class _FakeAgent:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    domain_agents = build_domain_agents(_FakeAgent, "eval-model")
+    domain_agent_names = {agent.name for agent in domain_agents}
+    required_domain_agents = {
+        "intent_router_agent",
+        "environment_discovery_agent",
+        "dependency_agent",
+        "benchmark_configuration_agent",
+        "rpc_workload_agent",
+        "chain_rpc_onboarding_agent",
+        "execution_agent",
+        "resume_analyze_agent",
+        "knowledge_agent",
     }
 
     class _Tool:
@@ -64,6 +89,17 @@ def run_offline_evals() -> dict[str, Any]:
             "missing": sorted(required_tools - tool_names),
         },
         {
+            "name": "adk_domain_agents_registered",
+            "passed": required_domain_agents.issubset(domain_agent_names),
+            "missing": sorted(required_domain_agents - domain_agent_names),
+            "agent_count": len(domain_agents),
+        },
+        {
+            "name": "domain_agents_use_narrow_tool_surfaces",
+            "passed": all(getattr(agent, "tools", None) for agent in domain_agents)
+            and len(next(agent for agent in domain_agents if agent.name == "rpc_workload_agent").tools) < len(tool_names),
+        },
+        {
             "name": "action_callback_blocks_unapproved_submit",
             "passed": bool(blocked and blocked.get("requires_user_confirmation")),
         },
@@ -73,10 +109,20 @@ def run_offline_evals() -> dict[str, Any]:
             "model": resolve_adk_model(),
         },
         {
-            "name": "router_schema_contract",
-            "passed": validate_intent_route(
-                route_user_intent("benchmark solana with fake-node", default_language="en")
-            ) == [],
+            "name": "typed_intent_schema_contract",
+            "passed": validate_intent_route({
+                "intent": "START_BENCHMARK",
+                "confidence": 0.82,
+                "language": "en",
+                "entities": {
+                    "chain": "solana",
+                    "rpc_methods": [],
+                    "rpc_mode": "single",
+                    "target": "fake-node",
+                    "job_id": "",
+                },
+                "missing_clarifications": [],
+            }) == [],
         },
     ]
     return {
@@ -84,5 +130,5 @@ def run_offline_evals() -> dict[str, Any]:
         "case_count": len(results),
         "passed_count": sum(1 for item in results if item["passed"]),
         "results": results,
-        "note": "This is an ADK contract eval with an offline-safe structured router schema check.",
+        "note": "This is an ADK contract eval. Natural-language routing requires a configured ADK model provider.",
     }

@@ -1024,6 +1024,12 @@ start_fake_node_for_testing() {
     local port="${FAKE_NODE_PORT:-8899}"
     local fake_node_log="${LOGS_DIR}/fake-node-framework-${chain}.log"
 
+    if [[ "$fake_node_bin" != /* ]]; then
+        fake_node_bin="${SCRIPT_DIR}/${fake_node_bin}"
+    fi
+
+    mkdir -p "$(dirname "$fake_node_bin")" "$LOGS_DIR"
+
     if [[ ! -d "$fake_node_root" ]]; then
         echo "❌ --fake-node: tools/fake-node directory does not exist: $fake_node_root" >&2
         exit 1

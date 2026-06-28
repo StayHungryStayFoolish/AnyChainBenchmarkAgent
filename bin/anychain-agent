@@ -13,7 +13,16 @@ if [[ -f "$REPO_ROOT/config/agent_config.sh" ]]; then
 fi
 
 AGENT_PYTHON="${ANYCHAIN_AGENT_PYTHON:-}"
-if [[ -z "$AGENT_PYTHON" && -x "$REPO_ROOT/.venv-adk/bin/python" ]]; then
+is_usable_python() {
+  local candidate="$1"
+  [[ -n "$candidate" ]] || return 1
+  "$candidate" - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
+PY
+}
+
+if [[ -z "$AGENT_PYTHON" && -x "$REPO_ROOT/.venv-adk/bin/python" ]] && is_usable_python "$REPO_ROOT/.venv-adk/bin/python"; then
   AGENT_PYTHON="$REPO_ROOT/.venv-adk/bin/python"
 fi
 if [[ -z "$AGENT_PYTHON" ]]; then

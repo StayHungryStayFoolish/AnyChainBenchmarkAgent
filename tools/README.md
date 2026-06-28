@@ -35,6 +35,8 @@ Monitoring and public-repo quality gates:
 - `fake-node/audit_health_probe_fixtures.py`: audits health-probe fixture coverage.
 - `framework_data_quality_checker.sh`: validates generated monitoring data shape.
 - `check_public_repo_markers.py`: blocks process-artifact markers and non-English runtime output.
+- `check_agent_boundaries.py`: blocks Agent regressions back to terminal keyword routing,
+  legacy Agent files, or natural-language sanitizer patches.
 
 Local smoke and workload tools:
 

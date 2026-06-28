@@ -18,6 +18,11 @@ from onboarding.template_drafter import draft_chain_template
 from planners.preflight import run_preflight
 from planners.strategy_planner import generate_plan
 from runners.job_manager import get_job, submit_job, tail_job_log
+from validators.config_contract import build_missing_config_questions, validate_required_config
+from validators.execution_gate import validate_execution_gate
+from validators.onboarding_gate import build_onboarding_handoff
+from validators.rpc_workload import default_workload, validate_rpc_workload
+from validators.chain_template import validate_chain_template
 from adk_app.tools.actions import run_fake_node_smoke_benchmark
 from adk_app.tools.actions import install_dependencies
 from adk_app.tools.planning import prepare_benchmark_run
@@ -98,6 +103,40 @@ def execute_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str
         )
     if name == "gap_analysis":
         return analyze_capability_gap(_required(args, "chain"), args.get("methods") or [])
+    if name == "validate_required_config":
+        return validate_required_config(args.get("target_mode"), args.get("confirmed_config") or {})
+    if name == "build_missing_config_questions":
+        return build_missing_config_questions(
+            args.get("target_mode"),
+            args.get("confirmed_config") or {},
+            args.get("discovery") or {},
+        )
+    if name == "validate_rpc_workload":
+        return validate_rpc_workload(
+            _required(args, "chain"),
+            _required(args, "rpc_mode"),
+            args.get("methods") or [],
+            args.get("mixed_weights") or {},
+        )
+    if name == "load_default_workload":
+        return default_workload(_required(args, "chain"))
+    if name == "validate_chain_template":
+        return validate_chain_template(_required(args, "chain"))
+    if name == "validate_execution_gate":
+        return validate_execution_gate(
+            args.get("plan"),
+            args.get("preflight"),
+            args.get("smoke"),
+            bool(args.get("approved", False)),
+            bool(args.get("real_execution", False)),
+        )
+    if name == "build_onboarding_handoff":
+        return build_onboarding_handoff(
+            _required(args, "chain"),
+            _required(args, "family"),
+            args.get("methods") or [],
+            args.get("evidence") or {},
+        )
     if name == "knowledge_search":
         status = provider_status()
         if not status["enabled"] or status["error"]:
@@ -142,7 +181,6 @@ def _structured_request(args: dict[str, Any]) -> dict[str, Any]:
         "chain": args.get("chain", ""),
         "goal": args.get("goal", "baseline"),
         "rpc_mode": args.get("rpc_mode", "single"),
-        "use_fake_node": bool(args.get("use_fake_node", False)),
         "deployment": {
             "type": args.get("deployment_type", "unknown"),
             "provider": args.get("cloud_provider", ""),
@@ -153,6 +191,10 @@ def _structured_request(args: dict[str, Any]) -> dict[str, Any]:
         "bottleneck_focus": ["cpu", "memory", "disk", "network", "rpc_errors"],
         "source_prompt": args.get("source_prompt", ""),
     }
+    if isinstance(args.get("use_fake_node"), bool):
+        request["use_fake_node"] = bool(args["use_fake_node"])
+    if args.get("confirmations"):
+        request["confirmations"] = list(args["confirmations"])
     if args.get("target_rpc_url"):
         request["local_rpc_url"] = args["target_rpc_url"]
         request["target_rpc_url"] = args["target_rpc_url"]
