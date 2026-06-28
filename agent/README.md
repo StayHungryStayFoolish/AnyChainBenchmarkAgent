@@ -35,14 +35,13 @@ contract:
 Then read the project-specific Agent gate:
 
 ```text
-../docs/zh/anychain-agent-ai-work-gate.md
+../docs/en/anychain-agent-ai-work-gate.md
 ```
 
 After that, define the assumption, smallest change scope, success criteria, and
 verification commands before editing.
 
-The product acceptance boundary is documented in
-`../docs/zh/agent-product-acceptance.md`. Mechanical regressions are checked by:
+Mechanical Agent regressions are checked by:
 
 ```bash
 python3 tools/check_agent_boundaries.py --root .

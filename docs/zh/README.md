@@ -9,10 +9,11 @@
 - [二次开发指南](secondary-development-guide.md)
 - [GitHub PR Gate 与分支保护](github-pr-gates.md)
 - [GitHub PR 提交流程](github-pr-workflow.md)
-- [Agent 产品级验收与剩余任务](agent-product-acceptance.md)
 - [AnyChain ADK Agent 架构](adk-agent-architecture.md)
-- [ADK 真实终端验证方案](adk-terminal-verification-plan.md)
 - [AnyChain Agent AI 工作 Gate](anychain-agent-ai-work-gate.md)
+
+中英文 docs 应尽量保持长期文档内容一致。临时 task plan、调试记录、一次性执行计划
+不应作为公开 docs 提交。
 
 相关文档：
 

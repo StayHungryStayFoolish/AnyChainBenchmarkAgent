@@ -4,7 +4,7 @@ This file is for AI assistants helping a user configure, run, validate, or
 extend AnyChain Benchmark Agent.
 
 If you are an AI coding agent modifying this repository, read `AI_CODING_GUIDE.md` and
-`docs/zh/anychain-agent-ai-work-gate.md` first. If you are helping a user use
+`docs/en/anychain-agent-ai-work-gate.md` first. If you are helping a user use
 the project without changing code, start with this file and the linked runtime
 docs.
 
@@ -192,10 +192,11 @@ research is unavailable unless a provider-specific integration is added later.
 
 - `README.md`: user-facing quick start and full overview.
 - `agent/README.md`: Agent runtime and development contract.
-- `docs/zh/adk-agent-architecture.md`: ADK architecture and Agent Loop.
-- `docs/zh/adk-terminal-verification-plan.md`: terminal verification plan for
-  Gemini/google_search environments.
-- `docs/zh/anychain-agent-ai-work-gate.md`: project-specific AI coding gate.
+- `docs/en/adk-agent-architecture.md`: ADK architecture and Agent Loop.
+- `docs/en/anychain-agent-ai-work-gate.md`: project-specific AI coding gate.
+- `docs/zh/adk-agent-architecture.md` and
+  `docs/zh/anychain-agent-ai-work-gate.md`: Chinese-directory mirrors for users
+  browsing localized docs.
 - `docs/zh/how-to-add-chain.md`: adding chain and RPC support.
 - `docs/zh/local-closed-loop-testing.md`: fake-node closed-loop testing.
 - `docs/zh/secondary-development-guide.md`: secondary-development handoff.
@@ -203,6 +204,19 @@ research is unavailable unless a provider-specific integration is added later.
   maintainer workflow for creating PRs, waiting for checks, handling review
   gates, and merging safely. This is for coding/maintenance work, not ordinary
   user setup.
+
+## Documentation Maintenance Rules
+
+- Keep long-lived user, operator, architecture, gate, and extension docs.
+- Do not commit temporary task plans, debugging transcripts, one-off execution
+  plans, or model-specific work logs.
+- When behavior changes, update the user-facing README and the relevant
+  reference document in the same PR.
+- Keep `docs/en` and `docs/zh` aligned for long-lived documentation. If a doc is
+  intentionally available in only one language, explain why in the relevant
+  docs index.
+- Keep AI-facing gate and architecture docs current because other AI assistants
+  use them as repository context.
 
 ## Minimum Validation For AI-Generated Changes
 
