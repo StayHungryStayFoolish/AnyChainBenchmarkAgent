@@ -24,6 +24,18 @@ The benchmark engine is the stable execution layer. The Agent routes
 natural-language requests through Google ADK and uses deterministic tools,
 validators, preflight checks, smoke tests, and approval gates before execution.
 
+## Contents
+
+1. [Overview](#overview)
+2. [Get Started](#get-started)
+3. [Use The Agent](#use-the-agent)
+4. [Running Benchmarks](#running-benchmarks)
+5. [Configuration Reference](#configuration-reference)
+6. [Integrations And Operations](#integrations-and-operations)
+7. [Extending The Framework](#extending-the-framework)
+8. [Reference Documentation](#reference-documentation)
+9. [License](#license)
+
 ## Overview
 
 ### Report Preview
@@ -95,106 +107,20 @@ The Agent is intentionally bounded:
 
 ## Get Started
 
-### Configuration Paths
+Follow these steps in order. Configure the Agent first; benchmark variables can
+be inferred and confirmed during the Agent conversation.
 
-Choose one of two setup paths before editing benchmark variables.
-
-#### AI-Assisted Setup
-
-If you want another AI assistant to configure or operate this project for you,
-give it these files first:
-
-```text
-AGENTS.md
-README.md
-config/agent_config.sh
-agent/README.md
-docs/en/anychain-agent-ai-work-gate.md
-```
-
-`AGENTS.md` is the short handoff guide for AI assistants. It explains how to
-configure provider credentials safely, where local secrets belong, which
-commands validate the Agent, and what an assistant must not bypass. Real API
-keys, ADC settings, Vertex settings, and other local provider choices should go
-into `config/agent_config.local.sh`, which is gitignored.
-
-For code changes, the assistant must also read `AI_CODING_GUIDE.md` before
-editing files. For user-only setup, `AGENTS.md` plus this README is usually
-enough to get started.
-
-#### Manual Setup
-
-If you prefer to configure the project yourself, continue with the
-configuration model below. Start with `config/agent_config.sh`, put real local
-secrets in `config/agent_config.local.sh`, then launch `./bin/anychain-agent`.
-The Agent will inspect the benchmark environment and ask for missing benchmark
-values during the conversation.
-
-### Configuration Model
-
-Most users only need one file before starting the Agent:
-
-```text
-config/agent_config.sh
-```
-
-Use it to configure the Agent itself: LLM provider, model, Vertex/OpenAI
-credentials, context compaction, and optional enterprise Knowledge Base
-integration. Every variable has an inline comment.
-
-Write real secrets and local provider choices to:
-
-```text
-config/agent_config.local.sh
-```
-
-That file is gitignored. Another AI assistant helping a user should put API
-keys, ADC/Vertex local settings, and local provider choices there instead of
-committing them to the repository defaults.
-
-The benchmark engine still has default settings in:
-
-```text
-config/user_config.sh
-```
-
-You normally do not need to understand or edit all benchmark variables up
-front. Start the Agent, run `doctor`, describe what you want to test, and let
-the Agent tell you which required values are missing.
-
-When the Agent submits a job, it writes:
-
-```text
-.agent/jobs/<job_id>/runtime.env
-```
-
-`runtime.env` is the final configuration snapshot for that one job. It has
-higher priority than `config/user_config.sh` during Agent-launched benchmark
-runs. Do not edit it by hand; it exists so reports and analysis can prove which
-values were used.
-
-Agent-launched jobs default to `.agent/jobs`. Low-level
-`python3 agent/cli.py submit` uses the same location unless `--jobs-dir` is
-provided.
-
-### 5-Minute Quick Start
-
-This is the fastest way to use AnyChain Benchmark Agent from a terminal. The
-user-facing command is `./bin/anychain-agent`. Configure a model provider in
-`config/agent_config.sh` before expecting model-assisted interaction. No-key
-offline checks are available for CI and development, but they are not a
-substitute for a configured model provider.
-
-Clone the repository:
+### 1. Download The Repository
 
 ```bash
 git clone git@github.com:StayHungryStayFoolish/AnyChainBenchmarkAgent.git
 cd AnyChainBenchmarkAgent
 ```
 
-Install the Agent runtime first. This creates an isolated Google ADK
-environment only for AnyChain Benchmark Agent. Do not install ADK into the
-Python environment used by production blockchain nodes:
+### 2. Install The Agent Runtime
+
+Install the isolated ADK terminal runtime first. This does not install ADK into
+the Python environment used by production blockchain nodes:
 
 ```bash
 bash scripts/install_agent_deps.sh --yes
@@ -220,11 +146,58 @@ calls `scripts/install_deps.sh --yes` through the confirmation-gated
 `install_dependencies` tool. Direct `scripts/install_deps.sh` usage is kept for
 CI, Docker images, and non-Agent automation.
 
-Configure the persistent Agent settings in `config/agent_config.sh`. Put real
-secrets in `config/agent_config.local.sh`. Configure one real provider before
-starting a natural-language session. Direct API-key mode works for Gemini,
-`claude`, OpenAI, and DeepSeek. Google service-account modes work for Gemini or
-`claude` through Vertex AI.
+### 3. Configure The Agent
+
+Choose one of two setup paths.
+
+#### Option A: AI-Assisted Setup
+
+If you want another AI assistant to configure or operate this project for you,
+give it these files first:
+
+```text
+AGENTS.md
+README.md
+config/agent_config.sh
+agent/README.md
+docs/en/anychain-agent-ai-work-gate.md
+```
+
+`AGENTS.md` is the short handoff guide for AI assistants. It explains how to
+configure provider credentials safely, where local secrets belong, which
+commands validate the Agent, and what an assistant must not bypass. Real API
+keys, ADC settings, Vertex settings, and other local provider choices should go
+into `config/agent_config.local.sh`, which is gitignored.
+
+For code changes, the assistant must also read `AI_CODING_GUIDE.md` before
+editing files. For user-only setup, `AGENTS.md` plus this README is usually
+enough to get started.
+
+#### Option B: Manual Setup
+
+If you prefer to configure the project yourself, start with:
+
+```text
+config/agent_config.sh
+```
+
+Use it to configure the Agent itself: LLM provider, model, Vertex/OpenAI
+credentials, context compaction, and optional enterprise Knowledge Base
+integration. Every variable has an inline comment.
+
+Write real secrets and local provider choices to:
+
+```text
+config/agent_config.local.sh
+```
+
+That file is gitignored. Another AI assistant helping a user should put API
+keys, ADC/Vertex local settings, and local provider choices there instead of
+committing them to the repository defaults.
+
+Configure one real provider before starting a natural-language session. Direct
+API-key mode works for Gemini, `claude`, OpenAI, and DeepSeek. Google
+service-account modes work for Gemini or `claude` through Vertex AI.
 
 ```bash
 LLM_PROVIDER="gemini"
@@ -257,23 +230,23 @@ Choose one authentication path:
 
 Web research is provider-limited. ADK `google_search` is enabled only when the
 Agent is running with a Gemini-family model and valid Gemini/Google
-authentication. `claude` on Vertex, DeepSeek, OpenAI, and `claude` API-key modes do
-not enable ADK `google_search`; in those modes the Agent uses repository facts
-and optional enterprise KB evidence, or asks you to provide official docs and
-request/response samples.
+authentication. `claude` on Vertex, DeepSeek, OpenAI, and `claude` API-key modes
+do not enable ADK `google_search`; in those modes the Agent uses repository
+facts and optional enterprise KB evidence, or asks you to provide official docs
+and request/response samples.
 
 Google Cloud CLI is needed only for local ADC workflows such as
-`LLM_AUTH_MODE=google_adc`, or when a host must create ADC before service-account
-impersonation. The Agent can detect whether `gcloud` and the local ADC file are
-present through `doctor`; after explicit approval it can install Google Cloud
-CLI with:
+`LLM_AUTH_MODE=google_adc`, or when a host must create ADC before
+service-account impersonation. The Agent can detect whether `gcloud` and the
+local ADC file are present through `doctor`; after explicit approval it can
+install Google Cloud CLI with:
 
 ```bash
 bash scripts/install_agent_deps.sh --yes --with-gcloud
 ```
 
-After `gcloud` is available, create local ADC credentials when that auth mode is
-used:
+After `gcloud` is available, create local ADC credentials when that auth mode
+is used:
 
 ```bash
 gcloud auth application-default login
@@ -281,6 +254,35 @@ gcloud auth application-default login
 
 On GCE/GKE/Cloud Run with an attached service account, `gcloud` is not required
 for runtime auth if the workload identity already has Vertex AI access.
+
+#### Benchmark Configuration Model
+
+The benchmark engine still has default settings in:
+
+```text
+config/user_config.sh
+```
+
+You normally do not need to understand or edit all benchmark variables up
+front. Start the Agent, run `doctor`, describe what you want to test, and let
+the Agent tell you which required values are missing.
+
+When the Agent submits a job, it writes:
+
+```text
+.agent/jobs/<job_id>/runtime.env
+```
+
+`runtime.env` is the final configuration snapshot for that one job. It has
+higher priority than `config/user_config.sh` during Agent-launched benchmark
+runs. Do not edit it by hand; it exists so reports and analysis can prove which
+values were used.
+
+Agent-launched jobs default to `.agent/jobs`. Low-level
+`python3 agent/cli.py submit` uses the same location unless `--jobs-dir` is
+provided.
+
+### 4. Validate The Agent Configuration
 
 Validate the Agent and LLM configuration before starting an interactive
 session:
@@ -293,6 +295,10 @@ python3 agent/cli.py llm-config
 You can leave benchmark details such as chain, RPC URL, disk, and machine
 metadata unset at first. The Agent will detect what it can and ask for missing
 required values before a real run.
+
+## Use The Agent
+
+### 5. Start The Agent
 
 Start the Agent. This command opens the AnyChain product terminal. Google ADK
 owns natural-language understanding and orchestration, while the terminal owns
@@ -311,21 +317,16 @@ dependencies, running smoke, or launching a benchmark job.
 User> doctor
 Agent> ...summarizes dependencies and asks before installing anything...
 
-User> I want to benchmark Solana
-Agent> ...asks whether to use [1] fake-node or [2] real-node...
+User> I want to benchmark a Solana node.
+Agent> ...asks whether this is a fake-node closed-loop test or a real node...
 
 User> 1
-Agent> ...explains that fake-node does not need a real LOCAL_RPC_URL but still
-       requires RPC mode, workload, weights, and TARGET_* samples...
+Agent> ...confirms host, disk, network, RPC mode, workload, and optional
+       observability settings one item at a time...
 
-User> n
-Agent> ...keeps advanced config defaults from config/internal_config.sh...
-
-User> 2
-Agent> ...in the RPC-mode step, 2 means weighted mixed RPC workload...
-
-User> yes
-Agent> ...generates a benchmark plan, runs preflight, and asks before smoke...
+User> Use mixed workload with getSlot 70% and getBlockHeight 30%.
+Agent> ...generates a benchmark plan, runs preflight, then asks before smoke
+       and again before launching the benchmark...
 ```
 
 Use a readiness check first on a new host. The Agent has a read-only doctor tool
@@ -333,32 +334,6 @@ for cloud/deployment detection, dependencies, LLM/Vertex configuration,
 Knowledge Base configuration, and current framework capability coverage.
 If benchmark dependencies are missing, the Agent should explain the planned
 changes and ask for explicit approval before installing them.
-
-For development or CI, you can send scripted prompts without opening an
-interactive terminal. This path still routes through the ADK Runner when the
-model provider is configured; without credentials it is only useful for startup
-and terminal-contract checks:
-
-```bash
-./bin/anychain-agent \
-  --language en \
-  --prompt "I want to benchmark Solana" \
-  --prompt "fake-node" \
-  --prompt "single" \
-  --prompt "yes" \
-  --prompt "yes" \
-  --prompt "yes" \
-  --prompt "yes"
-```
-
-For deterministic CI that does not require model credentials, use the JSON
-control-plane commands instead:
-
-```bash
-python3 agent/cli.py plan --request /tmp/request.json --output /tmp/plan.json --dry-run
-python3 agent/cli.py preflight --plan /tmp/plan.json
-python3 agent/cli.py submit --plan /tmp/plan.json --mock
-```
 
 Real benchmark execution still uses confirmation-gated tools and must pass
 preflight and smoke before launch. The model output is never executed directly.
@@ -381,67 +356,28 @@ or `jobs` to recover job state, runtime.env, and artifact paths.
 
 Ask the Agent about framework capabilities at any time:
 
-```bash
-./bin/anychain-agent --prompt "How many chains and RPC methods are supported?"
-./bin/anychain-agent --prompt "How do I add a custom RPC method with three params?"
+```text
+User> How many chains and RPC methods are supported?
+User> How do I add a custom RPC method with three params?
 ```
-
-Advanced subcommands remain available for CI and automation:
-
-```bash
-python3 agent/cli.py --help
-```
-
-Validate the offline Agent contract when you modify the project:
-
-```bash
-python3 -m unittest tests.test_agent_runtime_contract -v
-```
-
-### Entry Points
-
-Most users should start only one command:
-
-```bash
-./bin/anychain-agent
-```
-
-Other entry points are for automation:
-
-- `python3 agent/cli.py ...`: CI, tests, or enterprise platforms that need JSON
-  input/output.
-- `./blockchain_node_benchmark.sh`: low-level execution engine. The Agent calls
-  it after plan approval. Direct use expects configuration to already exist.
 
 ## Running Benchmarks
 
 ### Run A Local Fake-Node Benchmark
 
-Use this when you want the Agent to exercise the benchmark flow without a real
-production node. Start `./bin/anychain-agent`, then type:
+Use this when you want to validate the full benchmark flow without a production
+node. Start `./bin/anychain-agent` and describe the goal in normal language,
+for example:
 
 ```text
-doctor
-I want to benchmark Solana
-fake-node
-single
-yes
-yes
-yes
-yes
-status
+I want to run a Solana fake-node benchmark.
 ```
 
-Lifecycle smoke validates the Agent job lifecycle without sending benchmark
-traffic. To ask the Agent to run the real benchmark engine against fake-node,
-type:
-
-```text
-Run a real fake-node benchmark smoke in isolated output directories.
-```
-
-Review the generated runbook and smoke result before asking the Agent to submit
-any real benchmark.
+The Agent should then walk through the same production-grade checks used for a
+real node: chain, RPC mode, workload, custom RPC methods, weighted mixed
+methods, local host resources, disks, optional Prometheus/Grafana, preflight,
+smoke, and final approval. The fake-node path only avoids requiring a real
+`LOCAL_RPC_URL`; it does not skip benchmark configuration validation.
 
 ### Run Against A Real Node
 
@@ -454,38 +390,17 @@ do not edit that file.
 ./bin/anychain-agent
 ```
 
-Example real-node conversation:
+Then describe the goal:
 
 ```text
-doctor
-I want to benchmark Solana
-real-node
-http://your-node-rpc:8899
-agave-validator
-sdb
-pd-ssd
-2048
-12000
-500
-eth0
-16
-single
-yes
-yes
-yes
-status
+I want to run a quick Solana benchmark against my real node.
 ```
 
-The real-node flow asks for these values one at a time. The example answers are
-illustrative; use the values detected from your host or confirmed by your
-infrastructure team.
-
-During planning/preflight, the Agent checks the chain, RPC mode, local RPC URL,
-node process names, ledger/data disk, disk IOPS/throughput baseline, network
-bandwidth, and output paths. If discovery cannot safely identify a value, the
-Agent marks it as missing instead of guessing. Advanced users can still set
-defaults in `config/user_config.sh`, but Agent-confirmed values in `runtime.env`
-take priority for that one job.
+The Agent should infer what it can, ask one item at a time for values it cannot
+prove, and show choices when discovery is ambiguous. Real-node runs require a
+confirmed `LOCAL_RPC_URL`; `MAINNET_RPC_URL` is used when the selected chain
+sync-health strategy needs a separate reference endpoint. If discovery cannot
+safely identify a value, the Agent must ask instead of guessing.
 
 The most important output files are:
 
@@ -500,92 +415,37 @@ blockchain-node-benchmark-result/archives/<run-id>/test_summary.json
 
 ### Required Values
 
-The Agent checks three configuration layers:
+The Agent checks these configuration layers before submitting a benchmark:
 
-- **Agent checklist**: `config/agent_config.sh` validates LLM provider, model,
-  Vertex/OpenAI auth, and optional Knowledge Base settings.
-- **Benchmark checklist**: `plan` and `preflight` validate required runtime
-  values such as chain, RPC mode, local RPC URL for real nodes, process names,
-  ledger disk, disk baseline, and network bandwidth.
-- **Advanced checklist**: system/internal defaults for monitoring intervals,
-  bottleneck thresholds, sync-health thresholds, Prometheus/Grafana, Kubernetes,
-  and runtime paths. Most users leave these defaults alone.
+- **Agent configuration**: `config/agent_config.sh` and optional
+  gitignored `config/agent_config.local.sh` define the LLM provider, model,
+  authentication, context settings, and optional Knowledge Base integration.
+- **Benchmark runtime configuration**: the Agent confirms chain, node type,
+  RPC mode, RPC methods and weights, real-node RPC URLs, node process names,
+  ledger/data disks, disk baseline, network interface, network bandwidth, and
+  output paths.
+- **Advanced defaults**: `config/internal_config.sh` and related config files
+  hold monitoring intervals, bottleneck thresholds, sync-health thresholds,
+  Prometheus/Grafana defaults, Kubernetes paths, and runtime paths. Most users
+  leave these defaults alone unless the Agent or an operator has a reason to
+  change them.
 
 Planning and preflight surface missing required values before real submission.
-Advanced settings remain available for operators who intentionally tune the
-framework.
+Agent-confirmed values are written to the job-local `runtime.env`, which takes
+priority for that one job.
 
 ### LLM Providers
 
-The official ADK runtime owns model execution. AnyChain reads
-`config/agent_config.sh` to resolve the model name and to run safe auth
-diagnostics, but the human-facing Agent path must not use AnyChain's old custom
-provider adapters as a replacement for ADK model calls.
-
-No-key checks are available only for CI/development. They validate ADK package
-loading, tool registration, and safety callbacks; they do not simulate
-natural-language intent recognition and are not the product Agent runtime.
-
-Supported providers and auth modes:
+Configure the Agent model in step 3 under
+[Configure The Agent](#3-configure-the-agent). The supported provider families
+are:
 
 - `gemini`: Gemini API key, or Gemini on Vertex AI with Google auth.
 - `claude`: Anthropic API key, or `claude` on Vertex AI with Google auth.
 - `openai`: OpenAI API key.
 - `deepseek`: DeepSeek API key through the OpenAI-compatible endpoint.
 
-Configure default values in `config/agent_config.sh`; put real secrets and
-local provider choices in gitignored `config/agent_config.local.sh`.
-`./bin/anychain-agent` loads `config/agent_config.sh` at startup, and that file
-loads the local override when present. Environment variables can still override
-both for temporary tests.
-
-Direct Gemini API key:
-
-```bash
-LLM_PROVIDER="gemini"
-LLM_MODEL="gemini-3.1-pro"
-LLM_AUTH_MODE="api_key"
-GEMINI_API_KEY="AIza..."
-```
-
-`claude` with Anthropic API key:
-
-```bash
-LLM_PROVIDER="claude"
-LLM_MODEL="claude-opus-4-8"
-LLM_AUTH_MODE="api_key"
-ANTHROPIC_API_KEY="sk-ant-..."
-```
-
-Gemini or `claude` on Vertex AI with service-account impersonation:
-
-```bash
-LLM_PROVIDER="gemini"
-LLM_MODEL="gemini-3.1-pro"
-LLM_AUTH_MODE="service_account_impersonation"
-GOOGLE_CLOUD_PROJECT="your-project"
-GOOGLE_CLOUD_LOCATION="global"
-GOOGLE_SERVICE_ACCOUNT_EMAIL="benchmark-agent@your-project.iam.gserviceaccount.com"
-```
-
-For OpenAI:
-
-```bash
-LLM_PROVIDER="openai"
-LLM_MODEL="gpt-5.5"
-OPENAI_API_KEY="sk-..."
-```
-
-For DeepSeek:
-
-```bash
-LLM_PROVIDER="deepseek"
-LLM_MODEL="deepseek-v4-flash"
-LLM_AUTH_MODE="api_key"
-DEEPSEEK_API_KEY="sk-..."
-```
-
-Validate config without calling a model:
+Validate the config without calling a model:
 
 ```bash
 python3 agent/cli.py llm-config
@@ -597,59 +457,11 @@ Run a real provider smoke only after credentials are configured:
 python3 agent/cli.py llm-smoke --prompt 'Return JSON only: {"ok": true}'
 ```
 
-### Traditional Benchmark Entry
-
-You can still run the benchmark engine directly. This is mainly for automation,
-CI, or advanced users who do not want the Agent chat flow.
-
-Configure the minimum runtime values in `config/user_config.sh`:
-
-```bash
-BLOCKCHAIN_NODE="solana"
-RPC_MODE="single"
-LOCAL_RPC_URL="http://localhost:8899"
-MAINNET_RPC_URL=""
-
-BLOCKCHAIN_PROCESS_NAMES=("agave-validator" "solana-validator" "validator")
-
-CLOUD_PROVIDER="gcp"
-CLOUD_REGION="us-central1"
-MACHINE_TYPE="c3-standard-22"
-LEDGER_DEVICE="sdb"
-DATA_VOL_TYPE="hyperdisk-extreme"
-DATA_VOL_MAX_IOPS="30000"
-DATA_VOL_MAX_THROUGHPUT="700"
-NETWORK_MAX_BANDWIDTH_GBPS=25
-```
-
-Run a quick VM or bare-metal benchmark:
-
-```bash
-./blockchain_node_benchmark.sh --quick
-```
-
-For fake-node closed-loop testing, prefer the Agent conversation in
-[Run A Local Fake-Node Benchmark](#run-a-local-fake-node-benchmark). Direct
-fake-node engine commands are documented in
-[Local Closed-Loop Testing with fake-node](docs/en/local-closed-loop-testing.md).
-
-For Kubernetes-hosted nodes, deploy the collector first:
-
-```bash
-deploy/k8s/validate.sh --preflight
-kubectl apply -f deploy/k8s/
-kubectl rollout status -n blockchain-bench ds/blockchain-bench-collector
-deploy/k8s/validate.sh --post-deploy
-```
-
-Then run the benchmark from your selected runner with the same
-`config/user_config.sh` settings.
-
 ## Integrations And Operations
 
 ### Enterprise Agent Platform Integration
 
-The project can be embedded into enterprise Agent platforms in two ways:
+The project can be embedded into enterprise Agent platforms in several ways:
 
 - **Terminal mode**: run `./bin/anychain-agent` in a controlled shell session.
 - **Programmatic mode**: call `python3 agent/cli.py` subcommands and exchange
@@ -688,10 +500,20 @@ python3 agent/cli.py knowledge-smoke --query "solana rpc methods" --chain solana
 Enterprise Agent platforms can inspect and call the tool catalog directly:
 
 ```bash
+python3 agent/cli.py --help
 python3 agent/cli.py tool-schema
 python3 agent/cli.py tool-call --name load_capabilities
 python3 agent/cli.py tool-call --name draft_request \
   --arguments '{"chain":"solana","goal":"smoke","rpc_mode":"single","use_fake_node":true,"qps_max":1,"source_prompt":"Create a Solana fake-node smoke benchmark at 1 QPS"}'
+```
+
+For deterministic CI that does not require a conversational terminal, use the
+JSON control-plane commands:
+
+```bash
+python3 agent/cli.py plan --request /tmp/request.json --output /tmp/plan.json --dry-run
+python3 agent/cli.py preflight --plan /tmp/plan.json
+python3 agent/cli.py submit --plan /tmp/plan.json --mock
 ```
 
 ### Reports And Artifacts
