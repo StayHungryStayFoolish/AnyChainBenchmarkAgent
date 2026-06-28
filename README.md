@@ -109,7 +109,7 @@ AGENTS.md
 README.md
 config/agent_config.sh
 agent/README.md
-docs/zh/anychain-agent-ai-work-gate.md
+docs/en/anychain-agent-ai-work-gate.md
 ```
 
 `AGENTS.md` is the short handoff guide for AI assistants. It explains how to
@@ -814,9 +814,8 @@ smoke.
 - [AI Assistant Operator Guide](AGENTS.md)
 - [Configuration Guide](config/README.md)
 - [Agent Control Plane](agent/README.md)
-- [ADK Agent Architecture](docs/zh/adk-agent-architecture.md)
-- [ADK Terminal Verification Plan](docs/zh/adk-terminal-verification-plan.md)
-- [AnyChain Agent AI Work Gate](docs/zh/anychain-agent-ai-work-gate.md)
+- [ADK Agent Architecture](docs/en/adk-agent-architecture.md)
+- [AnyChain Agent AI Work Gate](docs/en/anychain-agent-ai-work-gate.md)
 - [Full Framework Reference](docs/en/framework-reference.md)
 - [Framework Flow and Data Lifecycle](docs/en/framework-flow.md)
 - [Module Guide](docs/en/module-guide.md)

@@ -691,7 +691,6 @@ python3 agent/cli.py draft-chain-template \
 - [配置指南](config/README.md)
 - [Agent 控制平面](agent/README.md)
 - [ADK Agent 架构](docs/zh/adk-agent-architecture.md)
-- [ADK 真实终端验证方案](docs/zh/adk-terminal-verification-plan.md)
 - [AnyChain Agent AI 工作 Gate](docs/zh/anychain-agent-ai-work-gate.md)
 - [完整框架 Reference](docs/zh/framework-reference.md)
 - [框架流程与数据生命周期](docs/zh/framework-flow.md)
