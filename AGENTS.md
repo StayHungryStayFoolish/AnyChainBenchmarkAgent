@@ -70,6 +70,51 @@ environment.
    should inspect the environment, ask for missing values, run preflight/smoke,
    and request approval before execution.
 
+## Fast Path For Helping A User Operate The Agent
+
+After provider setup is complete, help the user use the Agent rather than
+teaching them every benchmark variable.
+
+1. Start with `./bin/anychain-agent`.
+2. Ask the user to run `doctor` or describe the benchmark goal directly.
+3. Let the Agent inspect the host, dependencies, cloud/deployment shape, disks,
+   network, existing jobs, and framework capabilities.
+4. For a local closed-loop test, guide the user toward fake-node first:
+
+   ```text
+   Prepare a Solana fake-node smoke benchmark at 1 QPS.
+   ```
+
+   The Agent should still confirm benchmark metadata such as RPC mode, workload,
+   disk/network baseline, and report context. Fake-node only removes the need
+   for a real `LOCAL_RPC_URL`.
+5. For a real node, ask for only the values discovery cannot safely infer:
+   chain, local RPC URL, mainnet/reference RPC URL when needed, node process
+   names, ledger/accounts disk mapping, volume baselines, network bandwidth,
+   RPC mode, method selection, and mixed weights.
+6. Tell the user that real benchmark execution must pass preflight, smoke, and
+   explicit approval. Long jobs run detached by default and can be resumed with
+   `status`, `jobs`, `logs`, or `resume`.
+7. After a run, help the user ask for evidence-backed analysis. The Agent should
+   cite report, CSV, log, runtime.env, and artifact-index paths.
+8. For unsupported chains or custom RPC methods, the Agent should generate a
+   conservative onboarding plan or draft template. It must not claim support
+   until templates, parameter samples, fixtures, validation, and fake-node smoke
+   pass.
+
+Useful user prompts:
+
+```text
+doctor
+What chains and RPC methods are supported?
+Prepare a Solana fake-node smoke benchmark at 1 QPS.
+Prepare a real-node benchmark for my Solana RPC endpoint.
+Show job status and logs.
+Analyze the latest report and cite the evidence files.
+How do I add a custom RPC method with three params?
+Generate an onboarding plan for a new jsonrpc-family chain.
+```
+
 ## Provider Configuration Examples
 
 Use `config/agent_config.local.sh` for real values.
@@ -154,6 +199,10 @@ research is unavailable unless a provider-specific integration is added later.
 - `docs/zh/how-to-add-chain.md`: adding chain and RPC support.
 - `docs/zh/local-closed-loop-testing.md`: fake-node closed-loop testing.
 - `docs/zh/secondary-development-guide.md`: secondary-development handoff.
+- `docs/en/github-pr-workflow.md` and `docs/zh/github-pr-workflow.md`:
+  maintainer workflow for creating PRs, waiting for checks, handling review
+  gates, and merging safely. This is for coding/maintenance work, not ordinary
+  user setup.
 
 ## Minimum Validation For AI-Generated Changes
 
