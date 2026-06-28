@@ -3,7 +3,7 @@
 This file is for AI assistants helping a user configure, run, validate, or
 extend AnyChain Benchmark Agent.
 
-If you are an AI coding agent modifying this repository, read `CLAUDE.md` and
+If you are an AI coding agent modifying this repository, read `AI_CODING_GUIDE.md` and
 `docs/zh/anychain-agent-ai-work-gate.md` first. If you are helping a user use
 the project without changing code, start with this file and the linked runtime
 docs.
@@ -34,8 +34,8 @@ environment.
    - Gemini API key
    - Gemini on Vertex AI with Google ADC, attached service account,
      service-account impersonation, or service-account JSON file
-   - Claude API key
-   - Claude on Vertex AI
+   - `claude` API key
+   - `claude` on Vertex AI
    - OpenAI API key
    - DeepSeek API key
 2. Write secrets and local provider choices to:
@@ -93,7 +93,7 @@ GOOGLE_CLOUD_PROJECT="<project-id>"
 GOOGLE_CLOUD_LOCATION="global"
 ```
 
-Claude API key:
+`claude` API key:
 
 ```bash
 LLM_PROVIDER="claude"
@@ -127,7 +127,7 @@ models and valid Gemini/Google authentication, and only in chain/RPC onboarding
 or custom-RPC research flows. It is evidence gathering, not permission to skip
 fixture recording, endpoint validation, template validation, or fake-node smoke.
 
-For Claude, OpenAI, DeepSeek, or Claude-on-Vertex modes, tell the user that web
+For `claude`, OpenAI, DeepSeek, or `claude`-on-Vertex modes, tell the user that web
 research is unavailable unless a provider-specific integration is added later.
 
 ## What Another AI Should Not Do

@@ -126,7 +126,7 @@ repository explicitly adds and verifies a provider-specific search integration.
 
 Before changing Agent code, read:
 
-1. `CLAUDE.md`
+1. `AI_CODING_GUIDE.md`
 2. `docs/zh/anychain-agent-ai-work-gate.md`
 3. `agent/README.md`
 

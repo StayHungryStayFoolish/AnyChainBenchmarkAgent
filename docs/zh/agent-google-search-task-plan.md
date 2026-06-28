@@ -5,7 +5,7 @@
 
 ## 执行约束
 
-- 本次任务必须遵循本地 `CLAUDE.md`：先读现有代码，定义假设和验收标准，保持最小改动，验证后再收口。
+- 本次任务必须遵循本地 `AI_CODING_GUIDE.md`：先读现有代码，定义假设和验收标准，保持最小改动，验证后再收口。
 - 不允许把业务意图识别移动到 terminal、runner bridge、shell wrapper 或正则/关键词列表。
 - 不允许通过用户话术关键词触发 unknown chain、custom RPC 或 benchmark onboarding。
 - ADK 和配置模型负责理解用户意图、选择 sub-agent、决定是否调用工具。
@@ -18,7 +18,7 @@
 
 ## 非目标
 
-- 不为 DeepSeek、OpenAI、Claude API Key、Claude on Vertex 默认启用 ADK `google_search`。
+- 不为 DeepSeek、OpenAI、`claude` API Key、`claude` on Vertex 默认启用 ADK `google_search`。
 - 不开发 provider-neutral 搜索 API。
 - 不在本地无 Gemini/ADC 环境时声称 live Google Search 已经通过。
 - 不让搜索结果绕过 endpoint、request/response sample、fixture recording、template validation 或 fake-node smoke。
@@ -32,7 +32,7 @@
 - `LLM_AUTH_MODE` 和 Gemini/Google 认证配置通过本地校验
 - 当前 ADK runtime 可以 import `google.adk.tools.google_search`
 
-Claude 即使使用 Google Cloud/Vertex/Agent Platform 认证，也不启用 ADK `google_search`。
+`claude` provider 即使使用 Google Cloud/Vertex/Agent Platform 认证，也不启用 ADK `google_search`。
 
 ## 业务流程边界
 

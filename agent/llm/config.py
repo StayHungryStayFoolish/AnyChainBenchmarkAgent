@@ -70,9 +70,9 @@ class LLMConfig:
             return errors
         if self.provider in {"gemini", "claude"}:
             if not self.google_project:
-                errors.append("GOOGLE_CLOUD_PROJECT is required for Gemini/Claude on Vertex")
+                errors.append("GOOGLE_CLOUD_PROJECT is required for Gemini/`claude` on Vertex")
             if not self.google_location:
-                errors.append("GOOGLE_CLOUD_LOCATION is required for Gemini/Claude on Vertex")
+                errors.append("GOOGLE_CLOUD_LOCATION is required for Gemini/`claude` on Vertex")
             if self.auth_mode == "service_account_impersonation" and not self.google_service_account_email:
                 errors.append("GOOGLE_SERVICE_ACCOUNT_EMAIL is required for service_account_impersonation")
             if self.auth_mode == "service_account_file" and not self.google_application_credentials:
@@ -86,7 +86,7 @@ class LLMConfig:
         """Return whether ADK google_search may be enabled for this config.
 
         ADK google_search is a Gemini Search Grounding tool. Google Cloud auth
-        alone is not enough: Claude on Vertex, DeepSeek, and OpenAI must not be
+        alone is not enough: `claude` on Vertex, DeepSeek, and OpenAI must not be
         advertised as google_search-capable.
         """
         if self.provider != "gemini":

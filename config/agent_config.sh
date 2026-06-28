@@ -13,7 +13,7 @@
 #   3. Configure that provider's auth variables below.
 #
 # gemini: Gemini API key or Gemini on Vertex AI.
-# claude: Anthropic API key or Claude partner models on Vertex AI.
+# claude: Anthropic API key or `claude` partner models on Vertex AI.
 # openai: OpenAI API.
 # deepseek: DeepSeek OpenAI-compatible API.
 LLM_PROVIDER="${LLM_PROVIDER:-openai}"
@@ -36,7 +36,7 @@ GOOGLE_CLOUD_PROJECT="${GOOGLE_CLOUD_PROJECT:-}"
 
 # Required when LLM_PROVIDER is gemini or claude and LLM_AUTH_MODE is not api_key.
 # Vertex AI location/region.
-# Examples: global for Gemini, global for some Claude partner models.
+# Examples: global for Gemini, global for some `claude` partner models.
 GOOGLE_CLOUD_LOCATION="${GOOGLE_CLOUD_LOCATION:-global}"
 
 # Required only when LLM_AUTH_MODE=service_account_impersonation.

@@ -29,7 +29,7 @@ Before changing Agent code, read the repository-level developer behavior
 contract:
 
 ```text
-../CLAUDE.md
+../AI_CODING_GUIDE.md
 ```
 
 Then read the project-specific Agent gate:
@@ -253,7 +253,7 @@ Supported provider modes:
 
 - `gemini`: Gemini API key, Google ADC, attached service account,
   service-account impersonation, or JSON key file.
-- `claude`: Anthropic API key or Claude on Vertex AI with Google auth.
+- `claude`: Anthropic API key or `claude` on Vertex AI with Google auth.
 - `openai`: OpenAI API key.
 - `deepseek`: DeepSeek API key through the OpenAI-compatible endpoint.
 
@@ -263,8 +263,8 @@ matching provider credential. For Vertex AI, also configure
 
 ADK `google_search` is intentionally Gemini-only. It is exposed only when
 `LLM_PROVIDER=gemini`, the model name is Gemini-family, Gemini/Google auth
-validates, and the installed ADK runtime can import `google_search`. Claude on
-Vertex, DeepSeek, OpenAI, and Claude API-key modes must report web research as
+validates, and the installed ADK runtime can import `google_search`. `claude` on
+Vertex, DeepSeek, OpenAI, and `claude` API-key modes must report web research as
 unavailable. The tool is mounted only on the Chain/RPC onboarding agent and is
 used as evidence gathering for unsupported chains or custom RPC methods, never
 as support approval.

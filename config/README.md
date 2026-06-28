@@ -84,7 +84,7 @@ service-account based authentication:
 | `LLM_MODEL` | Required for Agent chat | Model name, for example `gemini-3.1-pro`, `gemini-3.5-flash`, `claude-opus-4-8`, `gpt-5.5`, or `deepseek-v4-flash`. |
 | `LLM_AUTH_MODE` | Required for real providers | `api_key`, `google_adc`, `attached_service_account`, `service_account_impersonation`, or `service_account_file`. |
 | `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Required for Gemini API-key mode | Direct Gemini API key. |
-| `ANTHROPIC_API_KEY` | Required for Claude API-key mode | Direct Anthropic API key. |
+| `ANTHROPIC_API_KEY` | Required for `claude` API-key mode | Direct Anthropic API key. |
 | `OPENAI_API_KEY` | Required for OpenAI | API key for `LLM_PROVIDER=openai`. |
 | `DEEPSEEK_API_KEY` | Required for DeepSeek | API key for `LLM_PROVIDER=deepseek`. |
 | `GOOGLE_CLOUD_PROJECT` | Required for Google auth modes | Google Cloud project containing the Vertex AI endpoint. |

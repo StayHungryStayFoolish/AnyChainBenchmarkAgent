@@ -165,7 +165,7 @@ LLM_PROVIDER="gemini"
 LLM_MODEL="gemini-3.1-pro"
 LLM_AUTH_MODE="api_key"                   # api_key | google_adc | attached_service_account | service_account_impersonation | service_account_file
 GEMINI_API_KEY=""                         # Gemini API-key 模式必填，也可用 GOOGLE_API_KEY
-ANTHROPIC_API_KEY=""                      # Claude API-key 模式必填
+ANTHROPIC_API_KEY=""                      # `claude` API-key 模式必填
 OPENAI_API_KEY=""                         # OpenAI 必填
 DEEPSEEK_API_KEY=""                       # DeepSeek 必填
 GOOGLE_CLOUD_PROJECT=""                   # Google service-account 模式必填
@@ -178,7 +178,7 @@ GOOGLE_APPLICATION_CREDENTIALS=""         # 可选 JSON key fallback
 
 - Gemini API key：设置 `LLM_PROVIDER=gemini`、`LLM_AUTH_MODE=api_key`，并填写
   `GEMINI_API_KEY` 或 `GOOGLE_API_KEY`。
-- Claude API key：设置 `LLM_PROVIDER=claude`、`LLM_AUTH_MODE=api_key`，并填写
+- `claude` API key：设置 `LLM_PROVIDER=claude`、`LLM_AUTH_MODE=api_key`，并填写
   `ANTHROPIC_API_KEY`。
 - OpenAI API key：设置 `LLM_PROVIDER=openai`、`LLM_AUTH_MODE=api_key`，并填写
   `OPENAI_API_KEY`。
@@ -190,8 +190,8 @@ GOOGLE_APPLICATION_CREDENTIALS=""         # 可选 JSON key fallback
   `service_account_file`。
 
 Web research 受 provider 限制。只有当 Agent 使用 Gemini-family 模型，并且 Gemini /
-Google 认证有效时，ADK `google_search` 才会启用。Claude on Vertex、DeepSeek、
-OpenAI 和 Claude API-key 模式不会启用 ADK `google_search`；这些模式下，Agent 会使用
+Google 认证有效时，ADK `google_search` 才会启用。`claude` on Vertex、DeepSeek、
+OpenAI 和 `claude` API-key 模式不会启用 ADK `google_search`；这些模式下，Agent 会使用
 仓库事实、可选企业 KB 证据，或要求用户提供官方文档和 request/response 样本。
 
 Google Cloud CLI 只在本地 ADC 工作流中需要，例如 `LLM_AUTH_MODE=google_adc`，或者
@@ -410,7 +410,7 @@ LLM_AUTH_MODE="api_key"
 GEMINI_API_KEY="AIza..."
 ```
 
-Claude API key：
+`claude` API key：
 
 ```bash
 LLM_PROVIDER="claude"
@@ -419,7 +419,7 @@ LLM_AUTH_MODE="api_key"
 ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
-通过 Vertex AI 和 service-account impersonation 使用 Gemini 或 Claude：
+通过 Vertex AI 和 service-account impersonation 使用 Gemini 或 `claude`：
 
 ```bash
 LLM_PROVIDER="gemini"

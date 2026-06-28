@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AI Coding Guide
 
 This file defines how an AI coding agent should work in this repository.
 

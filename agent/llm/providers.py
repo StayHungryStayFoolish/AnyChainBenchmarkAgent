@@ -130,7 +130,7 @@ class GeminiAPIKeyProvider:
 
 
 class VertexClaudeProvider:
-    """Claude partner models on Vertex AI."""
+    """`claude` partner models on Vertex AI."""
 
     def __init__(self, config: LLMConfig):
         self.config = config
@@ -164,7 +164,7 @@ class VertexClaudeProvider:
 
 
 class AnthropicAPIKeyProvider:
-    """Claude provider using the direct Anthropic API."""
+    """`claude` provider using the direct Anthropic API."""
 
     def __init__(self, config: LLMConfig):
         self.config = config
@@ -172,7 +172,7 @@ class AnthropicAPIKeyProvider:
     def complete(self, request: LLMRequest) -> LLMResponse:
         api_key = self.config.anthropic_api_key
         if not api_key:
-            raise RuntimeError("ANTHROPIC_API_KEY is required for Claude API-key mode")
+            raise RuntimeError("ANTHROPIC_API_KEY is required for `claude` API-key mode")
         system, messages = _anthropic_messages(request.messages)
         payload: dict[str, Any] = {
             "model": self.config.model,

@@ -12,7 +12,7 @@ path, run the listed checks, and record evidence.
 
 Before testing or changing code, read:
 
-1. `CLAUDE.md`
+1. `AI_CODING_GUIDE.md`
 2. `docs/zh/anychain-agent-ai-work-gate.md`
 3. `agent/README.md`
 4. `tests/agent_live/README.md`

@@ -1,11 +1,11 @@
 # AnyChain Agent AI Work Gate
 
 This document is the project-specific gate for AI coding work on AnyChain
-Agent. It complements the repository-level `CLAUDE.md` behavior contract.
+Agent. It complements the repository-level `AI_CODING_GUIDE.md` behavior contract.
 
 Before changing Agent code, an AI coding agent must read:
 
-1. `CLAUDE.md`.
+1. `AI_CODING_GUIDE.md`.
 2. This gate document.
 3. `agent/README.md`.
 4. The exact files it plans to edit.

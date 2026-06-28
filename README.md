@@ -184,15 +184,15 @@ CI, Docker images, and non-Agent automation.
 Configure the persistent Agent settings in `config/agent_config.sh`. Put real
 secrets in `config/agent_config.local.sh`. Configure one real provider before
 starting a natural-language session. Direct API-key mode works for Gemini,
-Claude, OpenAI, and DeepSeek. Google service-account modes work for Gemini or
-Claude through Vertex AI.
+`claude`, OpenAI, and DeepSeek. Google service-account modes work for Gemini or
+`claude` through Vertex AI.
 
 ```bash
 LLM_PROVIDER="gemini"
 LLM_MODEL="gemini-3.1-pro"
 LLM_AUTH_MODE="api_key"                   # api_key | google_adc | attached_service_account | service_account_impersonation | service_account_file
 GEMINI_API_KEY=""                         # or GOOGLE_API_KEY, required for Gemini API-key mode
-ANTHROPIC_API_KEY=""                      # required for Claude API-key mode
+ANTHROPIC_API_KEY=""                      # required for `claude` API-key mode
 OPENAI_API_KEY=""                         # required for OpenAI
 DEEPSEEK_API_KEY=""                       # required for DeepSeek
 GOOGLE_CLOUD_PROJECT=""                   # required only for Google service-account modes
@@ -205,7 +205,7 @@ Choose one authentication path:
 
 - Gemini API key: set `LLM_PROVIDER=gemini`, `LLM_AUTH_MODE=api_key`, and
   `GEMINI_API_KEY` or `GOOGLE_API_KEY`.
-- Claude API key: set `LLM_PROVIDER=claude`, `LLM_AUTH_MODE=api_key`, and
+- `claude` API key: set `LLM_PROVIDER=claude`, `LLM_AUTH_MODE=api_key`, and
   `ANTHROPIC_API_KEY`.
 - OpenAI API key: set `LLM_PROVIDER=openai`, `LLM_AUTH_MODE=api_key`, and
   `OPENAI_API_KEY`.
@@ -218,7 +218,7 @@ Choose one authentication path:
 
 Web research is provider-limited. ADK `google_search` is enabled only when the
 Agent is running with a Gemini-family model and valid Gemini/Google
-authentication. Claude on Vertex, DeepSeek, OpenAI, and Claude API-key modes do
+authentication. `claude` on Vertex, DeepSeek, OpenAI, and `claude` API-key modes do
 not enable ADK `google_search`; in those modes the Agent uses repository facts
 and optional enterprise KB evidence, or asks you to provide official docs and
 request/response samples.
@@ -486,7 +486,7 @@ natural-language intent recognition and are not the product Agent runtime.
 Supported providers and auth modes:
 
 - `gemini`: Gemini API key, or Gemini on Vertex AI with Google auth.
-- `claude`: Anthropic API key, or Claude on Vertex AI with Google auth.
+- `claude`: Anthropic API key, or `claude` on Vertex AI with Google auth.
 - `openai`: OpenAI API key.
 - `deepseek`: DeepSeek API key through the OpenAI-compatible endpoint.
 
@@ -505,7 +505,7 @@ LLM_AUTH_MODE="api_key"
 GEMINI_API_KEY="AIza..."
 ```
 
-Claude with Anthropic API key:
+`claude` with Anthropic API key:
 
 ```bash
 LLM_PROVIDER="claude"
@@ -514,7 +514,7 @@ LLM_AUTH_MODE="api_key"
 ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
-Gemini or Claude on Vertex AI with service-account impersonation:
+Gemini or `claude` on Vertex AI with service-account impersonation:
 
 ```bash
 LLM_PROVIDER="gemini"
