@@ -36,7 +36,7 @@ class LLMConfig:
     model: str
     auth_mode: str = "api_key"
     google_project: str = ""
-    google_location: str = "us-central1"
+    google_location: str = "global"
     google_service_account_email: str = ""
     google_application_credentials: str = ""
     gemini_api_key: str = ""
@@ -141,7 +141,7 @@ def load_llm_config(env: Mapping[str, str] | None = None) -> LLMConfig:
         model=source.get("LLM_MODEL", default_model).strip(),
         auth_mode=auth_mode,
         google_project=google_project,
-        google_location=source.get("GOOGLE_CLOUD_LOCATION", "us-central1").strip(),
+        google_location=source.get("GOOGLE_CLOUD_LOCATION", "global").strip(),
         google_service_account_email=source.get("GOOGLE_SERVICE_ACCOUNT_EMAIL", "").strip(),
         google_application_credentials=source.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip(),
         gemini_api_key=source.get("GEMINI_API_KEY", source.get("GOOGLE_API_KEY", "")).strip(),

@@ -88,7 +88,7 @@ service-account based authentication:
 | `OPENAI_API_KEY` | Required for OpenAI | API key for `LLM_PROVIDER=openai`. |
 | `DEEPSEEK_API_KEY` | Required for DeepSeek | API key for `LLM_PROVIDER=deepseek`. |
 | `GOOGLE_CLOUD_PROJECT` | Required for Google auth modes | Google Cloud project containing the Vertex AI endpoint. |
-| `GOOGLE_CLOUD_LOCATION` | Required for Google auth modes | Vertex AI location, for example `us-central1` or `us-east5`. |
+| `GOOGLE_CLOUD_LOCATION` | Required for Google auth modes | Vertex AI location, usually `global` unless your model requires a regional endpoint. |
 | `GOOGLE_SERVICE_ACCOUNT_EMAIL` | Required for impersonation | Target service account email. This avoids downloading JSON keys when the current identity can impersonate it. |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Required for `service_account_file` | Local service-account JSON path. Prefer ADC or impersonation in enterprise environments. |
 

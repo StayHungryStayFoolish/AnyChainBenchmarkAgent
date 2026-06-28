@@ -24,15 +24,17 @@ The benchmark engine is the stable execution layer. The Agent routes
 natural-language requests through Google ADK and uses deterministic tools,
 validators, preflight checks, smoke tests, and approval gates before execution.
 
-## Report Preview
+## Overview
+
+### Report Preview
 
 Preview the generated benchmark report before running the framework:
 
 - [Sample English PDF report](docs/en/performance_report_en.pdf)
 
-## What It Does
+### What It Does
 
-### Agent Intelligence
+#### Agent Intelligence
 
 - Turn natural-language benchmark goals into structured, validated plans through
   Google ADK, not terminal keyword matching.
@@ -52,7 +54,7 @@ Preview the generated benchmark report before running the framework:
 - Generate onboarding plans and conservative chain-template drafts for new
   chains, RPC methods, and weighted workloads.
 
-### Benchmark Tools
+#### Benchmark Tools
 
 - Supports 36 chain templates across 6 adapter families.
 - Generates single or weighted mixed RPC workloads from `config/chains/*.json`.
@@ -65,7 +67,7 @@ Preview the generated benchmark report before running the framework:
 - Exposes JSON CLI tools, an OpenAI-compatible tool schema, and a stable
   `tool-call` entrypoint for enterprise Agent platforms.
 
-## How The Agent Works
+### How The Agent Works
 
 ```text
 prompt or request
@@ -91,11 +93,13 @@ The Agent is intentionally bounded:
 - It writes Agent-generated runtime config to job-local `runtime.env`, not to
   `config/user_config.sh`.
 
-## Configuration Paths
+## Get Started
+
+### Configuration Paths
 
 Choose one of two setup paths before editing benchmark variables.
 
-### AI-Assisted Setup
+#### AI-Assisted Setup
 
 If you want another AI assistant to configure or operate this project for you,
 give it these files first:
@@ -118,7 +122,7 @@ For code changes, the assistant must also read `AI_CODING_GUIDE.md` before
 editing files. For user-only setup, `AGENTS.md` plus this README is usually
 enough to get started.
 
-### Manual Setup
+#### Manual Setup
 
 If you prefer to configure the project yourself, continue with the
 configuration model below. Start with `config/agent_config.sh`, put real local
@@ -126,7 +130,7 @@ secrets in `config/agent_config.local.sh`, then launch `./bin/anychain-agent`.
 The Agent will inspect the benchmark environment and ask for missing benchmark
 values during the conversation.
 
-## Configuration Model
+### Configuration Model
 
 Most users only need one file before starting the Agent:
 
@@ -173,7 +177,7 @@ Agent-launched jobs default to `.agent/jobs`. Low-level
 `python3 agent/cli.py submit` uses the same location unless `--jobs-dir` is
 provided.
 
-## 5-Minute Quick Start
+### 5-Minute Quick Start
 
 This is the fastest way to use AnyChain Benchmark Agent from a terminal. The
 user-facing command is `./bin/anychain-agent`. Configure a model provider in
@@ -231,7 +235,7 @@ ANTHROPIC_API_KEY=""                      # required for `claude` API-key mode
 OPENAI_API_KEY=""                         # required for OpenAI
 DEEPSEEK_API_KEY=""                       # required for DeepSeek
 GOOGLE_CLOUD_PROJECT=""                   # required only for Google service-account modes
-GOOGLE_CLOUD_LOCATION="us-central1"       # Vertex AI location/region
+GOOGLE_CLOUD_LOCATION="global"           # Vertex AI location/region
 GOOGLE_SERVICE_ACCOUNT_EMAIL=""           # required for service_account_impersonation
 GOOGLE_APPLICATION_CREDENTIALS=""         # required only for service_account_file
 ```
@@ -394,7 +398,7 @@ Validate the offline Agent contract when you modify the project:
 python3 -m unittest tests.test_agent_runtime_contract -v
 ```
 
-## Entry Points
+### Entry Points
 
 Most users should start only one command:
 
@@ -409,7 +413,9 @@ Other entry points are for automation:
 - `./blockchain_node_benchmark.sh`: low-level execution engine. The Agent calls
   it after plan approval. Direct use expects configuration to already exist.
 
-## Run A Local Fake-Node Benchmark
+## Running Benchmarks
+
+### Run A Local Fake-Node Benchmark
 
 Use this when you want the Agent to exercise the benchmark flow without a real
 production node. Start `./bin/anychain-agent`, then type:
@@ -437,7 +443,7 @@ Run a real fake-node benchmark smoke in isolated output directories.
 Review the generated runbook and smoke result before asking the Agent to submit
 any real benchmark.
 
-## Run Against A Real Node
+### Run Against A Real Node
 
 Do not start by editing every benchmark variable by hand. Start the Agent, let
 it inspect the host, then answer only the missing values it cannot infer. The
@@ -490,7 +496,9 @@ blockchain-node-benchmark-result/current/logs/performance_latest.csv
 blockchain-node-benchmark-result/archives/<run-id>/test_summary.json
 ```
 
-## Required Values
+## Configuration Reference
+
+### Required Values
 
 The Agent checks three configuration layers:
 
@@ -507,7 +515,7 @@ Planning and preflight surface missing required values before real submission.
 Advanced settings remain available for operators who intentionally tune the
 framework.
 
-## LLM Providers
+### LLM Providers
 
 The official ADK runtime owns model execution. AnyChain reads
 `config/agent_config.sh` to resolve the model name and to run safe auth
@@ -556,7 +564,7 @@ LLM_PROVIDER="gemini"
 LLM_MODEL="gemini-3.1-pro"
 LLM_AUTH_MODE="service_account_impersonation"
 GOOGLE_CLOUD_PROJECT="your-project"
-GOOGLE_CLOUD_LOCATION="us-central1"
+GOOGLE_CLOUD_LOCATION="global"
 GOOGLE_SERVICE_ACCOUNT_EMAIL="benchmark-agent@your-project.iam.gserviceaccount.com"
 ```
 
@@ -589,7 +597,7 @@ Run a real provider smoke only after credentials are configured:
 python3 agent/cli.py llm-smoke --prompt 'Return JSON only: {"ok": true}'
 ```
 
-## Traditional Benchmark Entry
+### Traditional Benchmark Entry
 
 You can still run the benchmark engine directly. This is mainly for automation,
 CI, or advanced users who do not want the Agent chat flow.
@@ -637,7 +645,9 @@ deploy/k8s/validate.sh --post-deploy
 Then run the benchmark from your selected runner with the same
 `config/user_config.sh` settings.
 
-## Enterprise Agent Platform Integration
+## Integrations And Operations
+
+### Enterprise Agent Platform Integration
 
 The project can be embedded into enterprise Agent platforms in two ways:
 
@@ -684,7 +694,7 @@ python3 agent/cli.py tool-call --name draft_request \
   --arguments '{"chain":"solana","goal":"smoke","rpc_mode":"single","use_fake_node":true,"qps_max":1,"source_prompt":"Create a Solana fake-node smoke benchmark at 1 QPS"}'
 ```
 
-## Reports And Artifacts
+### Reports And Artifacts
 
 Current-run files are written under the runtime `current/` directory and durable
 outputs are archived after the run.
@@ -728,7 +738,7 @@ Optional job notifications are disabled by default. Set
 `AGENT_NOTIFY_WEBHOOK_URL` and `AGENT_NOTIFY_ON` in `config/agent_config.sh`
 when an enterprise Agent platform wants webhook events for long-running jobs.
 
-## Optional Prometheus/Grafana
+### Optional Prometheus/Grafana
 
 Prometheus/Grafana is disabled by default. Enable it in `config/user_config.sh`:
 
@@ -744,7 +754,9 @@ GRAFANA_PORT=3001
 Use `OBSERVABILITY_STACK_MODE=exporter` when you already have Prometheus and
 Grafana and only need this framework to expose a scrape endpoint.
 
-## Extending Chains Or RPC Methods
+## Extending The Framework
+
+### Extending Chains Or RPC Methods
 
 Use the Agent to inspect gaps before editing templates:
 
@@ -812,6 +824,7 @@ smoke.
 - [Local Closed-Loop Testing with fake-node](docs/en/local-closed-loop-testing.md)
 - [Secondary Development Guide](docs/en/secondary-development-guide.md)
 - [GitHub PR Gates and Branch Protection](docs/en/github-pr-gates.md)
+- [GitHub PR Workflow](docs/en/github-pr-workflow.md)
 - [Prometheus / Grafana Observability](deploy/observability/README.md)
 - [Kubernetes Collector](deploy/k8s/README.md)
 

@@ -8,6 +8,7 @@
 - [使用 fake-node 进行本地闭环测试](local-closed-loop-testing.md)
 - [二次开发指南](secondary-development-guide.md)
 - [GitHub PR Gate 与分支保护](github-pr-gates.md)
+- [GitHub PR 提交流程](github-pr-workflow.md)
 - [Agent 产品级验收与剩余任务](agent-product-acceptance.md)
 - [AnyChain ADK Agent 架构](adk-agent-architecture.md)
 - [ADK 真实终端验证方案](adk-terminal-verification-plan.md)

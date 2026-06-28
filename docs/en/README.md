@@ -7,6 +7,7 @@
 - [Local Closed-Loop Testing with fake-node](local-closed-loop-testing.md)
 - [Secondary Development Guide](secondary-development-guide.md)
 - [GitHub PR Gates and Branch Protection](github-pr-gates.md)
+- [GitHub PR Workflow](github-pr-workflow.md)
 
 Related docs:
 
