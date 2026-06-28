@@ -78,6 +78,38 @@ Agent 是有边界的：
 - Agent 生成的运行配置写入 job-local `runtime.env`，不会修改
   `config/user_config.sh`。
 
+## 配置方式
+
+在开始修改 benchmark 变量前，先选择一种配置方式。
+
+### AI 自动配置
+
+如果你希望让另一个 AI 帮你配置、运行或排查 AnyChain Benchmark Agent，请先把这些
+文件交给它阅读：
+
+```text
+AGENTS.md
+README_ZH.md
+config/agent_config.sh
+agent/README.md
+docs/zh/anychain-agent-ai-work-gate.md
+```
+
+`AGENTS.md` 是给 AI 助手的快速接手文档，里面说明了如何安全配置 provider
+凭据、真实密钥应该放在哪里、应该执行哪些验证命令，以及哪些 gate 不能绕过。
+真实 API key、ADC 设置、Vertex 设置和本地 provider 选择都应该写入
+`config/agent_config.local.sh`，该文件已被 git ignore。
+
+如果另一个 AI 需要修改代码，还必须先阅读 `AI_CODING_GUIDE.md`。如果只是帮助用户
+完成配置和启动，通常先读 `AGENTS.md` 和本 README 就足够开始。
+
+### 手动配置
+
+如果你希望自己配置，请继续阅读下面的配置模型。先从 `config/agent_config.sh`
+开始，把真实本地密钥写入 `config/agent_config.local.sh`，然后启动
+`./bin/anychain-agent`。Agent 会在对话中检查 benchmark 环境，并询问缺失的
+benchmark 变量。
+
 ## 配置模型
 
 大多数用户启动 Agent 前只需要关注一个文件：
