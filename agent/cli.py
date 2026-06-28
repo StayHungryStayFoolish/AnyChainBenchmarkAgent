@@ -13,9 +13,7 @@ from analyzers.history import compare_latest, list_history
 from analyzers.artifact_qa import answer_artifact_question
 from analyzers.bottleneck_rules import diagnose_artifacts
 from adk_app.app import status_payload as adk_status_payload
-from adk_app.agents.router import route_user_intent
 from adk_app.compat import adk_feature_report
-from adk_app.workflow.root_workflow import root_workflow_dry_run
 from adk_app.workflow.native_smoke import run_native_workflow_smoke
 from adk_app.evals.runner import run_offline_evals as run_adk_offline_evals
 from adk_app.runtime import run_adk_cli
@@ -112,14 +110,6 @@ def main(argv: list[str] | None = None) -> int:
     tool_call = sub.add_parser("tool-call", help="Execute one named Agent tool with JSON arguments")
     tool_call.add_argument("--name", required=True)
     tool_call.add_argument("--arguments", default="{}", help="JSON object or path to a JSON file")
-
-    route_intent = sub.add_parser("route-intent", help="Route one user utterance into the ADK workflow intent schema")
-    route_intent.add_argument("--text", required=True)
-    route_intent.add_argument("--language", default="en", choices=["zh", "en"])
-
-    workflow_dry_run = sub.add_parser("workflow-dry-run", help="Run the offline-safe ADK workflow contract for one utterance")
-    workflow_dry_run.add_argument("--text", required=True)
-    workflow_dry_run.add_argument("--language", default="en", choices=["zh", "en"])
 
     sub.add_parser("adk-native-smoke", help="Run a credential-free native google-adk Workflow smoke test")
 
@@ -295,12 +285,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "tool-call":
         return _emit(execute_tool(args.name, load_arguments(args.arguments)), None)
-
-    if args.command == "route-intent":
-        return _emit(route_user_intent(args.text, default_language=args.language), None)
-
-    if args.command == "workflow-dry-run":
-        return _emit(root_workflow_dry_run(args.text, language=args.language), None)
 
     if args.command == "adk-native-smoke":
         payload = run_native_workflow_smoke()

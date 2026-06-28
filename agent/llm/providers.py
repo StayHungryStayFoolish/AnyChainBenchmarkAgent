@@ -26,6 +26,33 @@ class OpenAIProvider:
         response = client.chat.completions.create(
             model=self.config.model,
             messages=_openai_messages(request.messages),
+            **_openai_completion_options(self.config.model, request),
+        )
+        text = response.choices[0].message.content or ""
+        return LLMResponse(
+            text=text,
+            model=self.config.model,
+            provider=self.config.provider,
+            raw=response.model_dump() if hasattr(response, "model_dump") else {},
+        )
+
+
+class DeepSeekProvider:
+    """DeepSeek provider through its OpenAI-compatible chat endpoint."""
+
+    def __init__(self, config: LLMConfig):
+        self.config = config
+
+    def complete(self, request: LLMRequest) -> LLMResponse:
+        try:
+            from openai import OpenAI
+        except ImportError as exc:  # pragma: no cover - optional dependency guard
+            raise RuntimeError("openai is required for LLM_PROVIDER=deepseek") from exc
+
+        client = OpenAI(api_key=self.config.deepseek_api_key or None, base_url="https://api.deepseek.com")
+        response = client.chat.completions.create(
+            model=self.config.model,
+            messages=_openai_messages(request.messages),
             temperature=request.temperature,
             max_tokens=request.max_tokens,
             tools=request.tools or None,
@@ -192,11 +219,25 @@ def provider_from_config(config: LLMConfig | None = None) -> LLMProvider:
         raise ValueError("; ".join(errors))
     if config.provider == "openai":
         return OpenAIProvider(config)
+    if config.provider == "deepseek":
+        return DeepSeekProvider(config)
     if config.provider == "gemini":
         return GeminiAPIKeyProvider(config) if config.auth_mode == "api_key" else VertexGeminiProvider(config)
     if config.provider == "claude":
         return AnthropicAPIKeyProvider(config) if config.auth_mode == "api_key" else VertexClaudeProvider(config)
     raise ValueError(f"unsupported LLM_PROVIDER: {config.provider}")
+
+
+def _openai_completion_options(model: str, request: LLMRequest) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "temperature": request.temperature,
+        "tools": request.tools or None,
+    }
+    if model.startswith("gpt-5"):
+        payload["max_completion_tokens"] = request.max_tokens
+    else:
+        payload["max_tokens"] = request.max_tokens
+    return payload
 
 
 def _openai_messages(messages: list[LLMMessage]) -> list[dict[str, str]]:

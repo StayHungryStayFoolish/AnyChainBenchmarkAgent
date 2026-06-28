@@ -49,6 +49,13 @@ def prepare_benchmark_run(
     duration_seconds: int | None = None,
     rpc_methods: list[str] | None = None,
     mixed_weights: dict[str, int] | None = None,
+    observability_enabled: bool | None = None,
+    observability_mode: str = "",
+    observability_auto_stop: bool | None = None,
+    exporter_port: str = "",
+    prometheus_port: str = "",
+    grafana_port: str = "",
+    confirmations: list[str] | None = None,
     output_dir: str = ".agent/prepared",
 ) -> dict[str, Any]:
     """Prepare a benchmark run without launching benchmark traffic.
@@ -94,6 +101,13 @@ def prepare_benchmark_run(
         duration_seconds=duration_seconds,
         rpc_methods=rpc_methods,
         mixed_weights=mixed_weights,
+        observability_enabled=observability_enabled,
+        observability_mode=observability_mode,
+        observability_auto_stop=observability_auto_stop,
+        exporter_port=exporter_port,
+        prometheus_port=prometheus_port,
+        grafana_port=grafana_port,
+        confirmations=confirmations,
     )
     request["discovery"] = discovery
     plan = _generate_plan(request, discovery=discovery)
@@ -166,6 +180,13 @@ def draft_benchmark_request(
     duration_seconds: int | None = None,
     rpc_methods: list[str] | None = None,
     mixed_weights: dict[str, int] | None = None,
+    observability_enabled: bool | None = None,
+    observability_mode: str = "",
+    observability_auto_stop: bool | None = None,
+    exporter_port: str = "",
+    prometheus_port: str = "",
+    grafana_port: str = "",
+    confirmations: list[str] | None = None,
 ) -> dict[str, Any]:
     """Draft a normalized AnyChain request from ADK-inferred structured fields.
 
@@ -205,6 +226,13 @@ def draft_benchmark_request(
         duration_seconds=duration_seconds,
         rpc_methods=rpc_methods,
         mixed_weights=mixed_weights,
+        observability_enabled=observability_enabled,
+        observability_mode=observability_mode,
+        observability_auto_stop=observability_auto_stop,
+        exporter_port=exporter_port,
+        prometheus_port=prometheus_port,
+        grafana_port=grafana_port,
+        confirmations=confirmations,
     )
     if discovered_context:
         request["discovery"] = discovered_context
@@ -347,22 +375,37 @@ def _structured_request(
     duration_seconds: int | None,
     rpc_methods: list[str] | None,
     mixed_weights: dict[str, int] | None,
+    observability_enabled: bool | None,
+    observability_mode: str,
+    observability_auto_stop: bool | None,
+    exporter_port: str,
+    prometheus_port: str,
+    grafana_port: str,
+    confirmations: list[str] | None,
 ) -> dict[str, Any]:
+    observability = {
+        "enabled": bool(observability_enabled) if observability_enabled is not None else False,
+        "mode": observability_mode if observability_mode in {"local", "exporter"} else "local",
+        "auto_stop": True if observability_auto_stop is None else bool(observability_auto_stop),
+    }
     request: dict[str, Any] = {
         "chain": chain,
         "goal": goal or "baseline",
         "rpc_mode": rpc_mode or "single",
-        "use_fake_node": bool(use_fake_node) if use_fake_node is not None else False,
         "deployment": {
             "type": deployment_type or "unknown",
             "provider": cloud_provider,
         },
-        "observability": {"enabled": False, "mode": "local"},
+        "observability": observability,
         "dependency_mode": "audit",
         "runner_mode": "detached",
         "bottleneck_focus": ["cpu", "memory", "disk", "network", "rpc_errors"],
         "source_prompt": source_prompt,
     }
+    if confirmations:
+        request["confirmations"] = list(confirmations)
+    if use_fake_node is not None:
+        request["use_fake_node"] = bool(use_fake_node)
     for key, value in {
         "local_rpc_url": target_rpc_url,
         "target_rpc_url": target_rpc_url,
@@ -382,6 +425,9 @@ def _structured_request(
         "accounts_vol_max_throughput": accounts_vol_max_throughput,
         "network_interface": network_interface,
         "network_max_bandwidth_gbps": network_max_bandwidth_gbps,
+        "exporter_port": exporter_port or "9108",
+        "prometheus_port": prometheus_port or "9091",
+        "grafana_port": grafana_port or "3001",
     }.items():
         if value:
             request[key] = value

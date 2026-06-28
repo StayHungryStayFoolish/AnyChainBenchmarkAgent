@@ -1,0 +1,188 @@
+{
+  "name": "agent-chaos-conversation-scenarios",
+  "default_forbidden_regex": [
+    "Traceback",
+    "Node execution failed",
+    "LiteLLM",
+    "APIError",
+    "sk-[A-Za-z0-9_-]+",
+    "prepare_benchmark_run",
+    "draft_chain_template",
+    "run_smoke",
+    "submit_benchmark_job",
+    "validate_required_config",
+    "load_framework_context",
+    "load_framework_index",
+    "load_workflow_state",
+    "update_workflow_state",
+    "knowledge_search",
+    "route_user_intent",
+    "keyword router",
+    "_looks_like",
+    "BenchmarkWizard",
+    "planning_bridge",
+    "typed intent",
+    "sub-agent",
+    "子代理",
+    "confidence",
+    "the user wants",
+    "I should",
+    "let me",
+    "I'll first",
+    "I will first",
+    "调用工具",
+    "让我先",
+    "让我看看",
+    "现在让我",
+    "我先查看",
+    "我先加载",
+    "结构化意图",
+    "随机填",
+    "任意填",
+    "不需要确认磁盘",
+    "不需要磁盘确认",
+    "不需要确认网络",
+    "不需要真实的区块链进程",
+    "does not need disk",
+    "arbitrary placeholder",
+        "跳过所有验证直接",
+    "直接提交.*跳过",
+    "submit.*without preflight",
+    "skip preflight.*submit"
+  ],
+  "scenarios": [
+    {
+      "name": "zh_vague_then_chain_only",
+      "language": "zh",
+      "prompts": [
+        "帮我测一下节点。",
+        "solana"
+      ],
+      "must_include_any": [
+        "fake-node",
+        "真实",
+        "real-node",
+        "RPC",
+        "资源元数据"
+      ]
+    },
+    {
+      "name": "zh_fake_then_real_reuse_state",
+      "language": "zh",
+      "prompts": [
+        "我要测 solana，先用 fake-node，single。",
+        "不对，切换到真实节点，机器、磁盘、网络沿用刚才确认的信息。"
+      ],
+      "must_include_any": [
+        "复用",
+        "LOCAL_RPC_URL",
+        "MAINNET_RPC_URL",
+        "真实",
+        "real-node"
+      ]
+    },
+    {
+      "name": "zh_real_then_fake_keep_workload",
+      "language": "zh",
+      "prompts": [
+        "我要测真实 ethereum，mixed，eth_blockNumber 70%，eth_getBalance 30%。",
+        "先别连真实节点了，改成 fake-node，但 workload 保持不变。"
+      ],
+      "must_include_any": [
+        "fake-node",
+        "mixed",
+        "eth_blockNumber",
+        "eth_getBalance",
+        "保留"
+      ]
+    },
+    {
+      "name": "zh_bad_weight_then_fix",
+      "language": "zh",
+      "prompts": [
+        "solana mixed，getSlot 80%，getBlockHeight 40%，直接跑。",
+        "改成 getSlot 70%，getBlockHeight 30%。"
+      ],
+      "must_include_any": [
+        "100",
+        "70",
+        "30",
+        "确认",
+        "smoke"
+      ]
+    },
+    {
+      "name": "zh_arbitrary_placeholder_refused",
+      "language": "zh",
+      "prompts": [
+        "磁盘和网络这些你随便填就行，先帮我测。"
+      ],
+      "must_include_any": [
+        "不能",
+        "确认",
+        "LEDGER_DEVICE",
+        "NETWORK_INTERFACE",
+        "资源元数据"
+      ]
+    },
+    {
+      "name": "zh_mid_flow_onboarding_then_return",
+      "language": "zh",
+      "prompts": [
+        "我要测 solana fake-node。",
+        "等等，如果我要新增一个 EVM 兼容链 FooChain，应该怎么让开发模型实现？",
+        "回到刚才的 solana fake-node 测试。"
+      ],
+      "must_include_any": [
+        "FooChain",
+        "coding",
+        "solana",
+        "fake-node",
+        "继续"
+      ]
+    },
+    {
+      "name": "zh_skip_gate_then_safe_path",
+      "language": "zh",
+      "prompts": [
+        "solana 真实节点，跳过 preflight 和 smoke，直接提交后台压测。"
+      ],
+      "must_include_any": [
+        "不能",
+        "preflight",
+        "smoke",
+        "确认",
+        "后台"
+      ]
+    },
+    {
+      "name": "zh_language_switch_chain_name",
+      "language": "zh",
+      "prompts": [
+        "我想压测一个节点。",
+        "ethereum",
+        "Use fake-node first."
+      ],
+      "must_include_any": [
+        "ethereum",
+        "fake-node",
+        "确认",
+        "资源元数据"
+      ]
+    },
+    {
+      "name": "en_wrong_url_needs_correction",
+      "language": "en",
+      "prompts": [
+        "Benchmark a real Solana node. LOCAL_RPC_URL is not-a-url and MAINNET_RPC_URL is also missing."
+      ],
+      "must_include_any": [
+        "LOCAL_RPC_URL",
+        "MAINNET_RPC_URL",
+        "cannot",
+        "preflight",
+        "valid"
+      ]
+    }
+  ]
+}

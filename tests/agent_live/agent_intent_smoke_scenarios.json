@@ -1,0 +1,121 @@
+{
+  "name": "agent-intent-smoke-scenarios",
+  "default_forbidden_regex": [
+    "Traceback",
+    "Node execution failed",
+    "LiteLLM",
+    "APIError",
+    "sk-[A-Za-z0-9_-]+",
+    "prepare_benchmark_run",
+    "draft_chain_template",
+    "run_smoke",
+    "submit_benchmark_job",
+    "validate_required_config",
+    "load_framework_context",
+    "load_framework_index",
+    "knowledge_search",
+    "route_user_intent",
+    "keyword router",
+    "_looks_like",
+    "BenchmarkWizard",
+    "planning_bridge",
+    "typed intent",
+    "sub-agent",
+    "子代理",
+    "confidence",
+    "the user wants",
+    "I should",
+    "let me",
+    "I'll first",
+    "I will first",
+    "调用工具",
+    "让我先",
+    "让我看看",
+    "现在让我",
+    "我先查看",
+    "我先加载",
+    "结构化意图",
+    "随便填",
+    "随机填",
+    "任意填",
+    "不需要确认磁盘",
+    "不需要磁盘确认",
+    "不需要确认网络",
+    "不需要真实的区块链进程",
+    "does not need disk",
+    "arbitrary placeholder"
+  ],
+  "scenarios": [
+    {
+      "name": "zh_capability_question",
+      "language": "zh",
+      "prompts": [
+        "你现在支持多少条链？如果我要增加一个不在列表里的 EVM 兼容链，你会怎么做？"
+      ],
+      "must_include_any": [
+        "36",
+        "EVM",
+        "chain template",
+        "smoke"
+      ]
+    },
+    {
+      "name": "zh_vague_benchmark_discovery",
+      "language": "zh",
+      "prompts": [
+        "我想测一下节点性能。"
+      ],
+      "must_include_any": [
+        "区块链",
+        "链",
+        "fake-node",
+        "real",
+        "真实"
+      ]
+    },
+    {
+      "name": "zh_solana_fake_node",
+      "language": "zh",
+      "prompts": [
+        "我想用 fake-node 先跑 solana，single 模式，1 QPS，先做 smoke，不要直接真实压测。"
+      ],
+      "must_include_any": [
+        "Solana",
+        "solana",
+        "fake-node",
+        "smoke",
+        "确认",
+        "真实压测"
+      ]
+    },
+    {
+      "name": "zh_custom_rpc",
+      "language": "zh",
+      "prompts": [
+        "我要给一个已有链增加自定义 RPC，方法有 3 个参数，还要放进 mixed 权重里，这个怎么接入并验证？"
+      ],
+      "must_include_any": [
+        "参数",
+        "mixed",
+        "权重",
+        "fake-node",
+        "fixture",
+        "smoke"
+      ]
+    },
+    {
+      "name": "en_prometheus_existing",
+      "language": "en",
+      "prompts": [
+        "We already have Prometheus and Grafana. Can the agent use our existing stack instead of starting its own?"
+      ],
+      "must_include_any": [
+        "existing",
+        "Prometheus",
+        "Grafana",
+        "export",
+        "endpoint"
+      ]
+    }
+  ]
+}

@@ -28,7 +28,10 @@ Agent 发起压测：
 
 ```text
 用户 prompt
--> Agent intent router / workflow
+-> ADK root coordinator
+-> typed intent path
+-> specialized sub-agent
+-> deterministic tool and validator gates
 -> benchmark plan
 -> preflight 与风险检查
 -> .agent/jobs/<job_id>/runtime.env

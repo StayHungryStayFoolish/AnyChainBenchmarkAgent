@@ -17,7 +17,7 @@ KEY_CODE_PATHS = [
     {
         "topic": "agent_terminal",
         "paths": ["bin/anychain-agent", "agent/terminal/repl.py", "agent/terminal/io.py"],
-        "purpose": "Human-facing Agent terminal, dependency bootstrap, language routing, and workflow state.",
+        "purpose": "Human-facing Agent terminal, dependency bootstrap, language routing, startup diagnostics, and ADK session bridge.",
     },
     {
         "topic": "environment_discovery",
@@ -25,9 +25,9 @@ KEY_CODE_PATHS = [
         "purpose": "Read-only cloud, deployment, CPU, memory, disk, network, and dependency inference.",
     },
     {
-        "topic": "benchmark_workflow",
-        "paths": ["agent/workflows/benchmark_wizard.py", "agent/workflows/planning_bridge.py"],
-        "purpose": "Interactive benchmark configuration, runtime.env preparation, preflight, and smoke gate.",
+        "topic": "benchmark_orchestration",
+        "paths": ["agent/adk_app/agents/domain.py", "agent/adk_app/instructions.py", "agent/validators", "agent/planners", "agent/runners"],
+        "purpose": "ADK multi-agent orchestration, deterministic validation gates, plan generation, runtime.env preparation, preflight, smoke, and jobs.",
     },
     {
         "topic": "chain_templates",

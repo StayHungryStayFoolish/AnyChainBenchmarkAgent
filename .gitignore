@@ -24,6 +24,7 @@ Thumbs.db
 # Local secrets and environment overrides
 .env
 .env.*
+config/agent_config.local.sh
 *.pem
 *.key
 

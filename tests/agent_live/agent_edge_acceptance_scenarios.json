@@ -1,0 +1,201 @@
+{
+  "name": "agent-edge-acceptance-scenarios",
+  "default_forbidden_regex": [
+    "Traceback",
+    "Node execution failed",
+    "LiteLLM",
+    "APIError",
+    "sk-[A-Za-z0-9_-]+",
+    "prepare_benchmark_run",
+    "draft_chain_template",
+    "run_smoke",
+    "submit_benchmark_job",
+    "validate_required_config",
+    "load_framework_context",
+    "load_framework_index",
+    "load_workflow_state",
+    "update_workflow_state",
+    "knowledge_search",
+    "route_user_intent",
+    "keyword router",
+    "_looks_like",
+    "BenchmarkWizard",
+    "planning_bridge",
+    "typed intent",
+    "sub-agent",
+    "子代理",
+    "confidence",
+    "the user wants",
+    "I should",
+    "let me",
+    "I'll first",
+    "I will first",
+    "调用工具",
+    "让我先",
+    "让我看看",
+    "现在让我",
+    "我先查看",
+    "我先加载",
+    "结构化意图",
+    "随便填",
+    "随机填",
+    "任意填",
+    "不需要确认磁盘",
+    "不需要磁盘确认",
+    "不需要确认网络",
+    "不需要真实的区块链进程",
+    "does not need disk",
+    "arbitrary placeholder",
+    "跳过所有验证直接",
+    "直接提交.*跳过",
+    "submit.*without preflight",
+    "skip preflight.*submit"
+  ],
+  "scenarios": [
+    {
+      "name": "zh_multidisk_requires_number_or_manual_override",
+      "language": "zh",
+      "prompts": [
+        "如果检测到三块盘：1 是系统盘，2 是 2T ledger，3 是 500G accounts，你应该怎么让我确认？"
+      ],
+      "must_include_any": [
+        "1",
+        "2",
+        "3",
+        "LEDGER_DEVICE",
+        "ACCOUNTS_DEVICE",
+        "手动输入"
+      ]
+    },
+    {
+      "name": "zh_go_back_wrong_disk_value",
+      "language": "zh",
+      "prompts": [
+        "我刚才把 LEDGER_DEVICE 选成 sdb 了，但这是错的，我要回退改成 sdc。"
+      ],
+      "must_include_any": [
+        "回退",
+        "LEDGER_DEVICE",
+        "sdc",
+        "重新",
+        "校验"
+      ]
+    },
+    {
+      "name": "zh_fake_node_still_requires_resource_metadata",
+      "language": "zh",
+      "prompts": [
+        "我只跑 fake-node，是不是就不用确认 user_config.sh 里的机器、磁盘、网络变量了？"
+      ],
+      "must_include_any": [
+        "仍然",
+        "资源元数据",
+        "LEDGER_DEVICE",
+        "NETWORK_INTERFACE",
+        "fake-node"
+      ]
+    },
+    {
+      "name": "zh_qps_profile_defaults_then_adjust_one_item",
+      "language": "zh",
+      "prompts": [
+        "我要测 solana，选择 standard 模式，但想先看默认的 initial qps、max qps、step 和 duration，然后只调整 max qps。"
+      ],
+      "must_include_any": [
+        "standard",
+        "initial",
+        "max",
+        "step",
+        "duration",
+        "调整"
+      ]
+    },
+    {
+      "name": "zh_prometheus_external_and_port_conflict",
+      "language": "zh",
+      "prompts": [
+        "我想接入公司已有 Prometheus/Grafana，但本地 9090 和 3000 端口也可能被占用，你应该怎么处理？"
+      ],
+      "must_include_any": [
+        "已有",
+        "Prometheus",
+        "Grafana",
+        "端口",
+        "exporter",
+        "确认"
+      ]
+    },
+    {
+      "name": "zh_log_follow_ctrlc_safe_exit",
+      "language": "zh",
+      "prompts": [
+        "后台压测时我想在终端实时看日志，如果日志里报错，我怎么退出日志显示并让你分析？Ctrl+C 会不会停掉压测？"
+      ],
+      "must_include_any": [
+        "follow",
+        "日志",
+        "Ctrl+C",
+        "不会停止",
+        "job",
+        "分析"
+      ]
+    },
+    {
+      "name": "zh_wrong_order_url_before_chain",
+      "language": "zh",
+      "prompts": [
+        "LOCAL_RPC_URL 是 http://10.0.0.5:8899，先帮我准备测试。"
+      ],
+      "must_include_any": [
+        "哪条链",
+        "chain",
+        "fake-node",
+        "real-node",
+        "RPC"
+      ]
+    },
+    {
+      "name": "zh_switch_chain_revalidates_workload",
+      "language": "zh",
+      "prompts": [
+        "先按 solana mixed，getSlot 70%，getBlockHeight 30%。等等，我想换成 ethereum。"
+      ],
+      "must_include_any": [
+        "ethereum",
+        "重新",
+        "RPC",
+        "权重",
+        "chain template"
+      ]
+    },
+    {
+      "name": "zh_custom_rpc_missing_samples_blocks_fixture",
+      "language": "zh",
+      "prompts": [
+        "我要给 solana 加一个自定义 rpc，但是我现在没有参数样本，也没有 response 示例，你能直接加到 fake-node 吗？"
+      ],
+      "must_include_any": [
+        "不能",
+        "参数",
+        "response",
+        "fixture",
+        "request"
+      ]
+    },
+    {
+      "name": "en_supported_chain_then_chinese_correction",
+      "language": "en",
+      "prompts": [
+        "Benchmark Solana with fake-node first.",
+        "不对，先不要执行，我要确认 mixed 权重和磁盘变量。"
+      ],
+      "must_include_any": [
+        "Solana",
+        "mixed",
+        "weights",
+        "disk",
+        "confirm"
+      ]
+    }
+  ]
+}

@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+import types
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,15 +33,15 @@ from adk_app.callbacks import before_tool_callback  # noqa: E402
 from adk_app.compat import adk_feature_report  # noqa: E402
 from adk_app.evals.runner import run_offline_evals as run_adk_offline_evals  # noqa: E402
 from adk_app.workflow.schemas import validate_intent_route  # noqa: E402
-from adk_app.workflow.root_workflow import root_workflow_dry_run  # noqa: E402
-from adk_app.agents.router import route_user_intent  # noqa: E402
+from adk_app.agents.domain import build_domain_agents  # noqa: E402
 from adk_app.instructions import ROOT_INSTRUCTION  # noqa: E402
-from adk_app.root_agent import resolve_adk_model  # noqa: E402
+from adk_app.root_agent import build_adk_model, resolve_adk_model  # noqa: E402
 from adk_app.runtime import run_adk_cli  # noqa: E402
 from adk_app.runner_bridge import runner_bridge_status  # noqa: E402
 from adk_app.state import load_startup_state as adk_load_startup_state  # noqa: E402
 from adk_app.state import preserved_state_for_adk  # noqa: E402
 from adk_app.tools.auth import inspect_llm_auth as adk_inspect_llm_auth  # noqa: E402
+from adk_app.tools.web_research import get_google_search_tools, web_research_status  # noqa: E402
 from adk_app.tools.registry import get_adk_tools  # noqa: E402
 from adk_app.tools.actions import install_dependencies as adk_install_dependencies  # noqa: E402
 from adk_app.tools.actions import _fake_node_smoke_plan  # noqa: E402
@@ -62,7 +63,6 @@ from adk_app.tools.read_only import list_rpc_methods as adk_list_rpc_methods  # 
 from adk_app.tools.read_only import list_supported_chains as adk_list_supported_chains  # noqa: E402
 from diagnostics.doctor import format_doctor_report, run_doctor  # noqa: E402
 from onboarding.chain_onboarding import generate_onboarding_package  # noqa: E402
-from onboarding.request_answers import answer_onboarding_request  # noqa: E402
 
 
 def run_agent(*args, env=None):
@@ -164,10 +164,17 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertEqual(plan["strategy"], "ramp")
             self.assertTrue(plan["use_fake_node"])
             self.assertEqual(plan["execution"]["runner_mode"], "detached")
-            self.assertEqual(plan["required_inputs"], [])
+            self.assertIn("ledger_device", plan["required_inputs"])
+            self.assertIn("data_vol_max_throughput", plan["required_inputs"])
+            self.assertIn("network_max_bandwidth_gbps", plan["required_inputs"])
+            self.assertNotIn("local_rpc_url", plan["required_inputs"])
             self.assertIn("--fake-node", plan["execution"]["command"])
             self.assertIn("STANDARD_INITIAL_QPS", plan["execution"]["environment"])
             self.assertNotIn("QUICK_INITIAL_QPS", plan["execution"]["environment"])
+            self.assertEqual(plan["advanced_defaults"]["qps"]["initial"], 2000)
+            self.assertEqual(plan["advanced_defaults"]["qps"]["max"], 50000)
+            self.assertEqual(plan["advanced_defaults"]["qps"]["step"], 500)
+            self.assertEqual(plan["advanced_defaults"]["qps"]["duration_seconds"], 600)
             self.assertIn("confidence", plan)
             self.assertIn("plan_execution", plan["approval_checkpoints"])
             self.assertTrue(plan["redaction_policy"]["enabled"])
@@ -176,7 +183,7 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertIn("risk", plan)
             self.assertIn(plan["risk"]["risk_level"], {"low", "medium", "high"})
             self.assertIn("configuration_checklist", plan)
-            self.assertFalse(plan["configuration_checklist"]["missing_blockers"])
+            self.assertIn("ledger_device", plan["configuration_checklist"]["missing_blockers"])
 
             risk = run_agent("risk-score", "--plan", str(plan_file))
             self.assertEqual(risk["risk_level"], plan["risk"]["risk_level"])
@@ -204,7 +211,8 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertEqual(validate_execution_plan(plan, approved=True), [])
 
             preflight = run_agent("preflight", "--plan", str(plan_file))
-            self.assertTrue(preflight["passed"])
+            self.assertFalse(preflight["passed"])
+            self.assertTrue(any("required_inputs_present" in item for item in preflight["blockers"]))
 
             job = run_agent("submit", "--plan", str(plan_file), "--jobs-dir", str(jobs_dir), "--mock")
             self.assertEqual(job["status"], "completed")
@@ -381,26 +389,20 @@ class AgentRuntimeContractTest(unittest.TestCase):
             comparison = run_agent("history", "--archives-dir", str(archives_dir), "--compare-latest")
             self.assertEqual(comparison["status"], "compared")
 
-            new_chain_gap = answer_onboarding_request("How do I add new chain foochain?")
-            self.assertIn("Onboarding package for foochain", new_chain_gap)
-            self.assertIn("Evidence policy", new_chain_gap)
-            self.assertIn("Coding handoff", new_chain_gap)
-            self.assertIn("official RPC docs", new_chain_gap)
-            self.assertIn("docs/en/secondary-development-guide.md", new_chain_gap)
+            onboarding_package = generate_onboarding_package(
+                "foochain",
+                methods=["foo_getBalance"],
+                adapter_family="jsonrpc",
+            )
+            self.assertEqual(onboarding_package["chain"], "foochain")
+            self.assertEqual(onboarding_package["adapter_family"], "jsonrpc")
+            self.assertIn(
+                "foo_getBalance",
+                [item["method"] for item in onboarding_package["workload_plugin"]["mixed_weighted"]],
+            )
+            self.assertIn("coding_brief", onboarding_package)
+            self.assertIn("quality_gate", onboarding_package)
 
-            kb_onboarding = answer_onboarding_request("How do I integrate our enterprise Knowledge Base?")
-            self.assertIn("Enterprise Knowledge Base onboarding plan", kb_onboarding)
-
-            platform_onboarding = answer_onboarding_request("How do we embed this into our internal Agent platform?")
-            self.assertIn("Enterprise Agent platform integration plan", platform_onboarding)
-            self.assertIn("tool-schema", platform_onboarding)
-            self.assertIn("tool-call", platform_onboarding)
-
-            protocol_onboarding = answer_onboarding_request("Generate a plan to add a new protocol family for FooVM")
-            self.assertIn("New protocol family onboarding plan", protocol_onboarding)
-
-            rpc_onboarding = answer_onboarding_request("Add custom RPC method foo_getBalance to chain foochain")
-            self.assertIn("foo_getBalance", rpc_onboarding)
             onboarding = run_agent(
                 "onboarding-plan",
                 "--chain",
@@ -454,6 +456,10 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertTrue(install_props["include_vegeta"]["default"])
             self.assertTrue(install_props["no_sudo"]["default"])
             self.assertFalse(install_props["include_gcloud"]["default"])
+            prepare_tool = next(tool for tool in schema["tools"] if tool["function"]["name"] == "prepare_benchmark_run")
+            draft_request_tool = next(tool for tool in schema["tools"] if tool["function"]["name"] == "draft_request")
+            self.assertIn("confirmations", prepare_tool["function"]["parameters"]["properties"])
+            self.assertIn("confirmations", draft_request_tool["function"]["parameters"]["properties"])
             for tool in schema["tools"]:
                 params = tool["function"]["parameters"]
                 self.assertEqual(params["type"], "object")
@@ -475,9 +481,24 @@ class AgentRuntimeContractTest(unittest.TestCase):
                     "rpc_mode": "single",
                     "use_fake_node": True,
                     "qps_max": 1,
+                    "confirmations": ["rpc_workload_confirmed", "rpc_param_samples_confirmed"],
                 }),
             )
             self.assertEqual(draft_tool["chain"], "solana")
+            self.assertIn("rpc_workload_confirmed", draft_tool["confirmations"])
+            unknown_target_draft = run_agent(
+                "tool-call",
+                "--name",
+                "draft_request",
+                "--arguments",
+                json.dumps({
+                    "source_prompt": "benchmark solana but target mode is not specified",
+                    "chain": "solana",
+                    "goal": "smoke",
+                    "rpc_mode": "single",
+                }),
+            )
+            self.assertNotIn("use_fake_node", unknown_target_draft)
             structured_draft_tool = run_agent(
                 "tool-call",
                 "--name",
@@ -545,9 +566,15 @@ class AgentRuntimeContractTest(unittest.TestCase):
                 check=True,
             )
             self.assertEqual(completed.returncode, 0)
-            self.assertIn("Selected fake-node", completed.stdout)
-            self.assertIn("CLOUD", completed.stdout)
+            self.assertIn("AnyChain Benchmark Agent started.", completed.stdout)
+            self.assertIn("ADK runtime:", completed.stdout)
+            self.assertTrue(
+                "ADK Runner is importable" in completed.stdout
+                or "Agent runtime dependency is missing: google-adk" in completed.stdout
+            )
+            self.assertIn("Environment inference draft", completed.stdout)
             self.assertNotIn("[user]", completed.stdout)
+            self.assertNotIn("Selected fake-node", completed.stdout)
             self.assertFalse(args_file.exists())
             self.assertFalse(stdin_file.exists())
 
@@ -557,7 +584,24 @@ class AgentRuntimeContractTest(unittest.TestCase):
     def test_agent_doctor_formats_readiness_report(self):
         old_env = os.environ.copy()
         try:
+            for key in (
+                "AGENT_CONFIG_LOCAL",
+                "LLM_PROVIDER",
+                "LLM_MODEL",
+                "LLM_AUTH_MODE",
+                "GEMINI_API_KEY",
+                "GOOGLE_API_KEY",
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "DEEPSEEK_API_KEY",
+                "GOOGLE_CLOUD_PROJECT",
+                "GOOGLE_CLOUD_LOCATION",
+                "GOOGLE_SERVICE_ACCOUNT_EMAIL",
+                "GOOGLE_APPLICATION_CREDENTIALS",
+            ):
+                os.environ.pop(key, None)
             os.environ.update({
+                "AGENT_CONFIG_LOCAL": "/dev/null",
                 "LLM_PROVIDER": "gemini",
                 "LLM_MODEL": "gemini-3.1-pro",
                 "LLM_AUTH_MODE": "google_adc",
@@ -645,6 +689,15 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertEqual(openai_key_config.validate(), [])
         self.assertEqual(provider_from_config(openai_key_config).__class__.__name__, "OpenAIProvider")
 
+        deepseek_key_config = load_llm_config({
+            "LLM_PROVIDER": "deepseek",
+            "LLM_MODEL": "deepseek-v4-flash",
+            "LLM_AUTH_MODE": "api_key",
+            "DEEPSEEK_API_KEY": "test-key",
+        })
+        self.assertEqual(deepseek_key_config.validate(), [])
+        self.assertEqual(provider_from_config(deepseek_key_config).__class__.__name__, "DeepSeekProvider")
+
         config = load_llm_config({
             "LLM_PROVIDER": "gemini",
             "LLM_MODEL": "gemini-3.1-pro",
@@ -702,17 +755,105 @@ class AgentRuntimeContractTest(unittest.TestCase):
         })
         self.assertIn("GOOGLE_SERVICE_ACCOUNT_EMAIL is required", "; ".join(missing_impersonation.validate()))
 
+    def test_google_search_is_gemini_only_and_requires_adk_tool(self):
+        deepseek_config = load_llm_config({
+            "LLM_PROVIDER": "deepseek",
+            "LLM_MODEL": "deepseek-v4-flash",
+            "LLM_AUTH_MODE": "api_key",
+            "DEEPSEEK_API_KEY": "test-key",
+        })
+        deepseek_status = web_research_status(deepseek_config)
+        self.assertFalse(deepseek_status.enabled)
+        self.assertEqual(deepseek_status.reason, "unavailable for current provider")
+
+        claude_vertex_config = load_llm_config({
+            "LLM_PROVIDER": "claude",
+            "LLM_MODEL": "claude-opus-4-8",
+            "LLM_AUTH_MODE": "google_adc",
+            "GOOGLE_CLOUD_PROJECT": "example-project",
+            "GOOGLE_CLOUD_LOCATION": "us-east5",
+        })
+        claude_status = web_research_status(claude_vertex_config)
+        self.assertFalse(claude_status.enabled)
+        self.assertEqual(claude_status.reason, "unavailable for current provider")
+
+        missing_gemini_config = load_llm_config({
+            "LLM_PROVIDER": "gemini",
+            "LLM_MODEL": "gemini-3.1-pro",
+            "LLM_AUTH_MODE": "api_key",
+        })
+        missing_status = web_research_status(missing_gemini_config)
+        self.assertFalse(missing_status.enabled)
+        self.assertEqual(missing_status.reason, "Gemini authentication is incomplete")
+
+        gemini_config = load_llm_config({
+            "LLM_PROVIDER": "gemini",
+            "LLM_MODEL": "gemini-3.1-pro",
+            "LLM_AUTH_MODE": "api_key",
+            "GEMINI_API_KEY": "test-key",
+        })
+        google_mod = types.ModuleType("google")
+        adk_mod = types.ModuleType("google.adk")
+        tools_mod = types.ModuleType("google.adk.tools")
+
+        def google_search():
+            return "search"
+
+        tools_mod.google_search = google_search
+        with patch.dict(sys.modules, {"google": google_mod, "google.adk": adk_mod, "google.adk.tools": tools_mod}):
+            gemini_status = web_research_status(gemini_config)
+            self.assertTrue(gemini_status.enabled)
+            self.assertEqual(gemini_status.reason, "enabled via ADK google_search")
+            self.assertEqual(get_google_search_tools(gemini_config), [google_search])
+
+    def test_google_search_tool_is_only_added_to_onboarding_agent(self):
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                self.name = kwargs["name"]
+                self.tools = kwargs.get("tools", [])
+
+        with patch("adk_app.agents.domain.get_google_search_tools", return_value=["google_search_tool"]):
+            agents = build_domain_agents(FakeAgent, "gemini-3.1-pro")
+
+        tool_map = {agent.name: agent.tools for agent in agents}
+        self.assertIn("google_search_tool", tool_map["chain_rpc_onboarding_agent"])
+        for name, tools in tool_map.items():
+            if name != "chain_rpc_onboarding_agent":
+                self.assertNotIn("google_search_tool", tools)
+
     def test_adk_model_resolution_uses_configured_real_model(self):
         old_env = os.environ.copy()
         try:
             os.environ.clear()
             os.environ.update({
+                "AGENT_CONFIG_LOCAL": "/dev/null",
                 "LLM_PROVIDER": "gemini",
                 "LLM_MODEL": "gemini-3.5-flash",
                 "LLM_AUTH_MODE": "api_key",
                 "GEMINI_API_KEY": "test-key",
             })
             self.assertEqual(resolve_adk_model(), "gemini-3.5-flash")
+        finally:
+            os.environ.clear()
+            os.environ.update(old_env)
+
+    def test_adk_model_uses_litellm_for_deepseek(self):
+        old_env = os.environ.copy()
+        try:
+            os.environ.clear()
+            os.environ.update({
+                "AGENT_CONFIG_LOCAL": "/dev/null",
+                "LLM_PROVIDER": "deepseek",
+                "LLM_MODEL": "deepseek-v4-flash",
+                "LLM_AUTH_MODE": "api_key",
+                "DEEPSEEK_API_KEY": "test-key",
+            })
+            try:
+                model = build_adk_model()
+            except RuntimeError as exc:
+                self.skipTest(str(exc))
+            self.assertEqual(model.__class__.__name__, "LiteLlm")
+            self.assertIn("deepseek-v4-flash", str(model))
         finally:
             os.environ.clear()
             os.environ.update(old_env)
@@ -728,9 +869,10 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertIn("needs_review", ROOT_INSTRUCTION)
         self.assertIn("fake-node fixtures", ROOT_INSTRUCTION)
         self.assertIn("Use a structured router only for intent classification", ROOT_INSTRUCTION)
-        self.assertIn("prepare_benchmark_run", ROOT_INSTRUCTION)
-        self.assertIn("run_fake_node_smoke_benchmark", ROOT_INSTRUCTION)
+        self.assertIn("prepare a run plan", ROOT_INSTRUCTION)
+        self.assertIn("run fake-node validation", ROOT_INSTRUCTION)
         self.assertIn("audit_dependencies", ROOT_INSTRUCTION)
+        self.assertIn("Never mention internal tool names", ROOT_INSTRUCTION)
         tool_names = {tool.__name__ for tool in get_adk_tools(include_actions=True)}
         self.assertIn("prepare_benchmark_run", tool_names)
         self.assertIn("draft_benchmark_request", tool_names)
@@ -824,36 +966,31 @@ class AgentRuntimeContractTest(unittest.TestCase):
         else:
             self.fail(payload.get("error", "native ADK workflow smoke failed"))
 
-    def test_router_outputs_valid_workflow_intent_schema(self):
-        route = route_user_intent("请用 fake-node 测试 solana mixed getSlot=70 getBlockHeight=30", default_language="zh")
-        self.assertEqual(route["intent"], "START_BENCHMARK")
-        self.assertEqual(route["language"], "zh")
-        self.assertEqual(route["entities"]["chain"], "solana")
-        self.assertEqual(route["entities"]["target"], "fake-node")
+    def test_typed_intent_schema_is_validated_without_offline_router(self):
+        route = {
+            "intent": "START_BENCHMARK",
+            "confidence": 0.9,
+            "language": "zh",
+            "entities": {
+                "chain": "solana",
+                "rpc_methods": ["getSlot", "getBlockHeight"],
+                "rpc_mode": "mixed",
+                "target": "fake-node",
+                "job_id": "",
+            },
+            "missing_clarifications": [],
+        }
         self.assertEqual(validate_intent_route(route), [])
-
-        real_node_route = route_user_intent("我想测试真实 solana 节点", default_language="zh")
-        self.assertEqual(real_node_route["intent"], "START_BENCHMARK")
-        self.assertEqual(real_node_route["entities"]["target"], "real-node")
-        self.assertNotIn("target", real_node_route["missing_clarifications"])
-
-        onboarding = run_agent("route-intent", "--text", "Add custom RPC method foo_getBalance to chain foochain")
-        self.assertEqual(onboarding["intent"], "ONBOARD_CHAIN_RPC")
-        self.assertEqual(validate_intent_route(onboarding), [])
-
-    def test_root_workflow_dry_run_emits_workflow_events(self):
-        payload = root_workflow_dry_run("请用 fake-node 测试 solana", language="zh")
-        event_types = [event["event_type"] for event in payload["events"]]
-        self.assertEqual(event_types[:4], ["startup_doctor", "framework_context_loaded", "session_resume", "intent_route"])
-        self.assertIn("benchmark_workflow_selected", event_types)
-        self.assertEqual(payload["status"], "ok")
-        context_event = payload["events"][1]
-        self.assertEqual(context_event["data"]["capability_summary"]["chain_count"], 36)
-        self.assertFalse(context_event["data"]["context_policy"]["load_full_docs_by_default"])
-
-        cli_payload = run_agent("workflow-dry-run", "--text", "Add custom RPC method foo_getBalance to chain foochain")
-        cli_events = [event["event_type"] for event in cli_payload["events"]]
-        self.assertIn("onboarding_workflow_selected", cli_events)
+        help_text = subprocess.run(
+            [sys.executable, str(AGENT), "--help"],
+            cwd=REPO,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        ).stdout
+        self.assertNotIn("route-intent", help_text)
+        self.assertNotIn("workflow-dry-run", help_text)
 
     def test_adk_read_only_tool_wrappers_are_structured(self):
         tools = get_adk_tools(include_actions=False)
@@ -953,6 +1090,19 @@ class AgentRuntimeContractTest(unittest.TestCase):
             )
             self.assertEqual(request["status"], "ok")
             self.assertEqual(request["data"]["chain"], "solana")
+
+            target_unknown = adk_draft_benchmark_request(
+                source_prompt="帮我测一下 solana 节点性能",
+                chain="solana",
+                goal="smoke",
+                rpc_mode="single",
+            )
+            self.assertNotIn("use_fake_node", target_unknown["data"])
+            target_unknown_plan = adk_generate_benchmark_plan(target_unknown["data"])["data"]
+            self.assertIsNone(target_unknown_plan["use_fake_node"])
+            self.assertIn("use_fake_node", target_unknown_plan["required_inputs"])
+            self.assertEqual(target_unknown_plan["required_inputs"][0], "use_fake_node")
+            self.assertNotIn("local_rpc_url", target_unknown_plan["required_inputs"])
 
             structured_request = adk_draft_benchmark_request(
                 source_prompt="benchmark my node",
@@ -1054,11 +1204,62 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertEqual(runtime_env["NETWORK_INTERFACE"], "eth0")
             self.assertEqual(runtime_env["BLOCKCHAIN_PROCESS_NAMES_STR"], "reth ethereum")
 
-            plan_payload = adk_generate_benchmark_plan(request["data"])
+            incomplete_plan_payload = adk_generate_benchmark_plan(request["data"])
+            self.assertEqual(incomplete_plan_payload["status"], "ok")
+            incomplete_plan = incomplete_plan_payload["data"]
+            self.assertEqual(incomplete_plan["chain"], "solana")
+            self.assertTrue(incomplete_plan["use_fake_node"])
+            self.assertIn("rpc_workload_confirmed", incomplete_plan["required_inputs"])
+            self.assertIn("rpc_param_samples_confirmed", incomplete_plan["required_inputs"])
+            self.assertIn("ledger_device", incomplete_plan["required_inputs"])
+            self.assertNotIn("local_rpc_url", incomplete_plan["required_inputs"])
+
+            incomplete_preflight = adk_run_preflight(incomplete_plan)
+            self.assertEqual(incomplete_preflight["status"], "blocked")
+            self.assertFalse(incomplete_preflight["data"]["passed"])
+
+            full_fake_request = adk_draft_benchmark_request(
+                source_prompt="Create a Solana fake-node smoke benchmark at 1 QPS with confirmed environment",
+                chain="solana",
+                goal="smoke",
+                rpc_mode="single",
+                use_fake_node=True,
+                deployment_type="vm",
+                cloud_provider="gcp",
+                cloud_region="us-central1",
+                cloud_zone="us-central1-a",
+                machine_type="c3-standard-22",
+                blockchain_process_names=["agave-validator"],
+                ledger_device="sdb",
+                data_vol_type="hyperdisk-extreme",
+                data_vol_size="2000",
+                data_vol_max_iops="30000",
+                data_vol_max_throughput="700",
+                network_interface="eth0",
+                network_max_bandwidth_gbps="25",
+                qps_max=1,
+                confirmations=[
+                    "benchmark_mode_confirmed",
+                    "qps_profile_confirmed",
+                    "observability_choice_confirmed",
+                    "chain_template_reviewed",
+                    "rpc_workload_confirmed",
+                    "rpc_param_samples_confirmed",
+                ],
+            )
+            fake_disk_request = dict(full_fake_request["data"])
+            fake_disk_plan = adk_generate_benchmark_plan(fake_disk_request, discovery=disk_discovery)["data"]
+            fake_disk_question = next(
+                item for item in fake_disk_plan["required_questions"]
+                if item["id"] == "disk_inventory_confirmation"
+            )
+            self.assertEqual(fake_disk_question["proposed_ledger_device"], "sdb")
+            self.assertEqual({item["name"] for item in fake_disk_question["candidates"]}, {"sda", "sdb", "sdc"})
+            plan_payload = adk_generate_benchmark_plan(full_fake_request["data"])
             self.assertEqual(plan_payload["status"], "ok")
             plan = plan_payload["data"]
-            self.assertEqual(plan["chain"], "solana")
-            self.assertTrue(plan["use_fake_node"])
+            self.assertEqual(plan["required_inputs"], [])
+            self.assertNotIn("local_rpc_url", plan["configuration_checklist"]["missing_blockers"])
 
             preflight = adk_run_preflight(plan)
             self.assertEqual(preflight["status"], "ok")
@@ -1095,6 +1296,10 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertIn("--fake-node", isolated_plan["execution"]["command"])
             self.assertIn(str(tmp_path / "jobs" / "fake_node_smoke"), isolated_env["BLOCKCHAIN_BENCHMARK_DATA_DIR"])
             self.assertIn(str(tmp_path / "jobs" / "fake_node_smoke"), isolated_env["MEMORY_SHARE_DIR"])
+            self.assertEqual(isolated_env["QUICK_INITIAL_QPS"], "1")
+            self.assertEqual(isolated_env["QUICK_MAX_QPS"], "1")
+            self.assertEqual(isolated_env["QUICK_QPS_STEP"], "1")
+            self.assertEqual(isolated_env["QUICK_DURATION"], "10")
             self.assertNotIn("local_rpc_url", isolated_plan.get("required_inputs", []))
             self.assertNotIn("local_rpc_url", isolated_plan.get("configuration_checklist", {}).get("missing_blockers", []))
 
@@ -1115,7 +1320,7 @@ class AgentRuntimeContractTest(unittest.TestCase):
         payload = run_adk_offline_evals()
         self.assertEqual(payload["status"], "passed")
         self.assertEqual(payload["case_count"], payload["passed_count"])
-        self.assertIn("structured router schema", payload["note"])
+        self.assertIn("Natural-language routing requires", payload["note"])
 
     def test_adk_auth_diagnostics_are_safe_and_actionable(self):
         old_env = os.environ.copy()
@@ -1136,6 +1341,7 @@ class AgentRuntimeContractTest(unittest.TestCase):
             ):
                 os.environ.pop(key, None)
             os.environ.update({
+                "AGENT_CONFIG_LOCAL": "/dev/null",
                 "LLM_PROVIDER": "gemini",
                 "LLM_MODEL": "gemini-3.1-pro",
                 "LLM_AUTH_MODE": "google_adc",

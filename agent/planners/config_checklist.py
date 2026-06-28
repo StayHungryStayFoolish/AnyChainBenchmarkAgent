@@ -5,8 +5,11 @@ from __future__ import annotations
 from typing import Any
 
 
-REAL_NODE_REQUIRED = {
+ENDPOINT_REQUIRED = {
     "local_rpc_url": "Local RPC URL for the blockchain node under test.",
+}
+
+RUNTIME_BASELINE_REQUIRED = {
     "blockchain_process_names": "Process names or command keywords used for node resource attribution.",
     "ledger_device": "Ledger/data disk device used for disk charts and bottleneck attribution.",
     "data_vol_type": "Ledger/data disk type used for report metadata and baseline interpretation.",
@@ -19,7 +22,14 @@ REAL_NODE_REQUIRED = {
 
 COMMON_REQUIRED = {
     "chain": "Chain template name, for example solana or ethereum.",
+    "use_fake_node": "Choose fake-node closed-loop testing or real-node testing.",
     "rpc_mode": "single or mixed RPC workload mode.",
+    "benchmark_mode_confirmed": "Confirm benchmark mode: quick, standard, or intensive.",
+    "qps_profile_confirmed": "Confirm QPS defaults for the selected mode, including initial QPS, max QPS, step, and duration.",
+    "observability_choice_confirmed": "Confirm whether to disable observability, start local Prometheus/Grafana, or expose only the exporter for an existing stack.",
+    "chain_template_reviewed": "Review the selected chain template runtime endpoint variables, sample variables, and default RPC workload.",
+    "rpc_workload_confirmed": "Confirm the selected single/mixed RPC methods and weights.",
+    "rpc_param_samples_confirmed": "Confirm TARGET_* parameter samples for the selected RPC methods.",
 }
 
 ENVIRONMENT_REVIEW = {
@@ -53,14 +63,18 @@ ADVANCED_DEFAULTS = {
 
 def build_configuration_checklist(request: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
     """Return user-facing checklist grouped by Agent, benchmark, and advanced layers."""
-    use_fake_node = bool(plan.get("use_fake_node"))
+    use_fake_node = plan.get("use_fake_node")
     request_values = _flatten_request_values(request, plan)
 
     benchmark_items = []
     for key, description in COMMON_REQUIRED.items():
+        benchmark_items.append(_item(key, description, _is_present(key, request_values.get(key)), "blocker"))
+    for key, description in RUNTIME_BASELINE_REQUIRED.items():
         benchmark_items.append(_item(key, description, bool(request_values.get(key)), "blocker"))
-    if not use_fake_node:
-        for key, description in REAL_NODE_REQUIRED.items():
+    if request_values.get("rpc_mode") == "mixed":
+        benchmark_items.append(_item("mixed_weights_confirmed", "Confirm mixed RPC method weights total 100.", bool(request_values.get("mixed_weights_confirmed")), "blocker"))
+    if use_fake_node is False:
+        for key, description in ENDPOINT_REQUIRED.items():
             benchmark_items.append(_item(key, description, bool(request_values.get(key)), "blocker"))
     environment_items = [
         _item(key, description, bool(request_values.get(key)), "confirm")
@@ -110,7 +124,15 @@ def _flatten_request_values(request: dict[str, Any], plan: dict[str, Any]) -> di
     execution_env = plan.get("execution", {}).get("environment", {})
     return {
         "chain": plan.get("chain") or request.get("chain"),
+        "use_fake_node": plan.get("use_fake_node") if plan.get("use_fake_node") is not None else request.get("use_fake_node"),
         "rpc_mode": plan.get("rpc_mode") or request.get("rpc_mode"),
+        "rpc_workload_confirmed": "rpc_workload_confirmed" in _confirmations(request, plan),
+        "rpc_param_samples_confirmed": "rpc_param_samples_confirmed" in _confirmations(request, plan),
+        "mixed_weights_confirmed": "mixed_weights_confirmed" in _confirmations(request, plan),
+        "benchmark_mode_confirmed": "benchmark_mode_confirmed" in _confirmations(request, plan),
+        "qps_profile_confirmed": "qps_profile_confirmed" in _confirmations(request, plan),
+        "observability_choice_confirmed": "observability_choice_confirmed" in _confirmations(request, plan),
+        "chain_template_reviewed": "chain_template_reviewed" in _confirmations(request, plan),
         "local_rpc_url": request.get("local_rpc_url") or execution_env.get("LOCAL_RPC_URL"),
         "blockchain_process_names": (
             request.get("blockchain_process_names")
@@ -149,6 +171,7 @@ def _chain_items(plan: dict[str, Any]) -> list[dict[str, Any]]:
     weight_total = sum(int(item.get("weight", 0) or 0) for item in weighted)
     return [
         _item("chain_template_exists", "Selected config/chains/<chain>.json exists.", bool(requirements.get("exists")), "blocker"),
+        _item("chain_template_reviewed", "Review endpoint variables, TARGET_* sample variables, and method defaults from the selected chain template.", True, "confirm"),
         _item("rpc_single_method_confirmation", f"Confirm single RPC method: {requirements.get('single_method') or '<missing>'}.", bool(requirements.get("single_method")), "confirm"),
         _item("rpc_mixed_weighted_confirmation", f"Confirm mixed RPC methods and weights; current total is {weight_total}.", bool(weighted), "confirm"),
         _item("custom_rpc_method_review", "Ask whether the user wants to add custom RPC methods before execution.", True, "confirm"),
@@ -166,8 +189,23 @@ def _item(item_id: str, description: str, present: bool, severity: str) -> dict[
     }
 
 
-def _summary(use_fake_node: bool, missing_blockers: list[str]) -> str:
-    mode = "fake-node" if use_fake_node else "real-node"
+def _is_present(key: str, value: Any) -> bool:
+    if key == "use_fake_node":
+        return isinstance(value, bool)
+    return bool(value)
+
+
+def _confirmations(request: dict[str, Any], plan: dict[str, Any]) -> set[str]:
+    return set(request.get("confirmations", []) or plan.get("confirmed_inputs", []) or [])
+
+
+def _summary(use_fake_node: bool | None, missing_blockers: list[str]) -> str:
+    if use_fake_node is True:
+        mode = "fake-node"
+    elif use_fake_node is False:
+        mode = "real-node"
+    else:
+        mode = "unconfirmed target-mode"
     if not missing_blockers:
         return f"{mode} configuration has no blocking checklist gaps."
     return f"{mode} configuration is missing: {', '.join(missing_blockers)}"

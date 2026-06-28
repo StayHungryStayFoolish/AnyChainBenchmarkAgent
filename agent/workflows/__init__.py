@@ -1,1 +1,1 @@
-"""Workflow state machines for AnyChain Agent product flows."""
+"""Shared benchmark requirement matrices used by Agent validators."""

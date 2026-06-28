@@ -138,8 +138,16 @@ PY
 
 install_adk() {
     local python="$1" venv_dir="$2"
-    if [[ ! -d "$venv_dir" ]]; then
+    if [[ ! -x "$venv_dir/bin/python" ]]; then
+        if [[ -e "$venv_dir" ]]; then
+            warn "Removing incomplete ADK venv at $venv_dir"
+            rm -rf "$venv_dir"
+        fi
         "$python" -m venv "$venv_dir"
+    fi
+    if [[ ! -x "$venv_dir/bin/python" ]]; then
+        err "Python venv creation failed: $venv_dir/bin/python was not created"
+        return 1
     fi
     "$venv_dir/bin/python" -m pip install --upgrade pip
     "$venv_dir/bin/python" -m pip install -r "$REPO_ROOT/requirements-adk.txt"

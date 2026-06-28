@@ -7,4 +7,6 @@
 # for ADK runtime testing and production Agent usage.
 
 google-adk
+litellm
+openai
 prompt-toolkit

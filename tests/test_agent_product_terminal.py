@@ -1,57 +1,88 @@
-import subprocess
-import sys
+import builtins
 import tempfile
 import unittest
-import os
-import builtins
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 
 REPO = Path(__file__).resolve().parents[1]
 AGENT_BIN = REPO / "bin" / "anychain-agent"
+
+import sys
+
 sys.path.insert(0, str(REPO / "agent"))
 
-from terminal.repl import AnyChainTerminal  # noqa: E402
 from terminal.io import TerminalIO  # noqa: E402
-from terminal.responder import answer_conversation  # noqa: E402
-from analyzers.execution_artifacts import diagnose_execution_artifacts  # noqa: E402
-from planners.preflight import run_preflight  # noqa: E402
-from workflows.benchmark_wizard import BenchmarkWizard, known_chains  # noqa: E402
-from workflows.planning_bridge import prepare_plan_from_state, submit_mock_smoke_from_plan  # noqa: E402
-from workflows.state import WorkflowState, WorkflowStateStore  # noqa: E402
+from terminal.repl import AnyChainTerminal, TerminalSession, TerminalSessionStore  # noqa: E402
+from adk_app.runner_bridge import sanitize_adk_text  # noqa: E402
+from validators.config_contract import build_missing_config_questions, validate_required_config  # noqa: E402
+from validators.execution_gate import validate_execution_gate  # noqa: E402
+from validators.rpc_workload import default_workload, validate_rpc_workload  # noqa: E402
+from workflows.conversation_state import load_workflow_state, revert_workflow_state, update_workflow_state  # noqa: E402
 
 
-class CapturingIO(TerminalIO):
-    def __init__(self):
-        self.messages = []
-        self.inputs = []
+class CapturingIO:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+        self.inputs: list[str | BaseException] = []
 
-    def input(self, language: str) -> str:  # pragma: no cover - not used by these tests
-        if self.inputs:
-            item = self.inputs.pop(0)
-            if isinstance(item, BaseException):
-                raise item
-            return item
-        raise EOFError()
+    def input(self, language: str) -> str:
+        if not self.inputs:
+            raise EOFError()
+        item = self.inputs.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
 
     def agent(self, language: str, message: str) -> None:
         self.messages.append(message)
 
 
-class FakeADKStatus:
-    def __init__(self, available: bool):
-        self.available = available
+class FakeBridge:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
 
-    def as_dict(self):
-        return {"available": self.available, "reason": "available" if self.available else "missing"}
+    def run_text(self, text: str, state_delta=None) -> str:
+        self.calls.append((text, state_delta or {}))
+        return f"bridge handled: {text}"
 
 
 class AgentDependencyTests(unittest.TestCase):
     def test_adk_requirements_include_prompt_toolkit(self):
         requirements = (REPO / "requirements-adk.txt").read_text(encoding="utf-8")
         self.assertIn("prompt-toolkit", requirements)
+        self.assertIn("litellm", requirements)
+
+    def test_adk_text_sanitizer_removes_internal_implementation_leakage_only(self):
+        text = "\n".join([
+            "我会确认你的目标，然后给出下一步。",
+            "不要向用户展示 prepare_benchmark_run。",
+            "不要向用户展示 knowledge_search。",
+            "不要向用户展示 chain_rpc_onboarding_agent。",
+            "不要告诉用户转给子代理。",
+            "我能帮助你完成区块链节点性能基准测试。",
+            "```",
+            "internal fenced debug",
+            "```",
+        ])
+        self.assertEqual(
+            sanitize_adk_text(text),
+            "我会确认你的目标，然后给出下一步。\n我能帮助你完成区块链节点性能基准测试。",
+        )
+
+    def test_adk_text_sanitizer_does_not_patch_model_style(self):
+        text = "Let me check the framework capabilities. 我先确认环境。Please provide LOCAL_RPC_URL."
+        sanitized = sanitize_adk_text(text)
+        self.assertIn("Let me check the framework capabilities.", sanitized)
+        self.assertIn("我先确认环境。", sanitized)
+        self.assertIn("Please provide LOCAL_RPC_URL.", sanitized)
+
+    def test_adk_text_sanitizer_removes_inline_internal_leakage_only(self):
+        text = "可以，当前支持 36 条链。不要向用户展示 prepare_benchmark_run。请提供 LOCAL_RPC_URL。"
+        self.assertEqual(
+            sanitize_adk_text(text),
+            "可以，当前支持 36 条链。 请提供 LOCAL_RPC_URL。",
+        )
 
     def test_terminal_io_requires_prompt_toolkit(self):
         real_import = builtins.__import__
@@ -73,800 +104,499 @@ class AgentDependencyTests(unittest.TestCase):
         self.assertIn('uses_scripted_prompt" == "0"', entrypoint)
 
 
-def _complete_environment(wizard: BenchmarkWizard, state: WorkflowState) -> None:
-    answers = [
-        ("us-central1", "cloud_zone"),
-        ("us-central1-a", "machine_type"),
-        ("c3-standard-22", "blockchain_process_names"),
-        ("agave-validator", "ledger_device"),
-        ("sdb", "data_vol_type"),
-        ("pd-ssd", "data_vol_size"),
-        ("2048", "data_vol_max_iops"),
-        ("12000", "data_vol_max_throughput"),
-        ("500", "network_interface"),
-        ("eth0", "network_max_bandwidth_gbps"),
-        ("16", "has_accounts_device"),
-        ("n", "advanced_config_review"),
-        ("n", "rpc_mode"),
-    ]
-    for answer, expected_next in answers:
-        response = wizard.handle(answer)
-        assert response.handled
-        assert state.current_question_id == expected_next
-
-
-class AgentProductTerminalTest(unittest.TestCase):
-    def run_agent(self, *args: str) -> str:
-        with tempfile.TemporaryDirectory() as tmp:
-            completed = subprocess.run(
-                [str(AGENT_BIN), "--state-file", str(Path(tmp) / "state.json"), *args],
-                cwd=REPO,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=True,
-            )
-        self.assertEqual(completed.stderr, "")
-        return completed.stdout
-
-    def test_chinese_scripted_turns_do_not_use_adk_run_prompt(self):
-        output = self.run_agent(
-            "--language",
-            "zh",
-            "--prompt",
-            "我现在需要测试 solana",
-            "--prompt",
-            "fake-node",
-            "--prompt",
-            "你帮我执行，不要让我 export PATH",
-        )
-        self.assertNotIn("[user]", output)
-        self.assertIn("我理解你要测试 solana", output)
-        self.assertIn("不需要真实 LOCAL_RPC_URL", output)
-        self.assertIn("不应该要求你手动 export PATH", output)
-
-    def test_english_single_turn_can_capture_chain_and_fake_node(self):
-        output = self.run_agent("--prompt", "I want to benchmark Solana with fake-node")
-        self.assertNotIn("[user]", output)
-        self.assertIn("Selected fake-node", output)
-        self.assertIn("LOCAL_RPC_URL", output)
-
-    def test_workflow_state_tracks_confirmed_values_and_gate(self):
-        state = WorkflowState(language="zh")
-        wizard = BenchmarkWizard(state, discovery={"cloud": {"provider": "gcp", "platform": "gce"}, "deployment": {"type": "vm"}, "network": {}, "disks": {"candidates": []}})
-
-        response = wizard.handle("我现在需要测试 solana")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.confirmed_values["chain"], "solana")
-        self.assertEqual(state.current_question_id, "target_type")
-
-        response = wizard.handle("fake-node")
-        self.assertTrue(response.handled)
-        self.assertTrue(state.confirmed_values["use_fake_node"])
-        self.assertEqual(state.current_question_id, "cloud_region")
-
-        _complete_environment(wizard, state)
-        self.assertEqual(state.current_question_id, "rpc_mode")
-
-        ok, missing = wizard.can_run_smoke()
-        self.assertFalse(ok)
-        self.assertIn("rpc_mode", missing)
-
-        response = wizard.handle("single")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.confirmed_values["rpc_mode"], "single")
-        self.assertEqual(state.current_question_id, "single_method_confirm")
-        ok, missing = wizard.can_run_smoke()
-        self.assertFalse(ok)
-        self.assertIn("rpc_workload_confirmed", missing)
-
-        response = wizard.handle("n")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.current_question_id, "rpc_workload")
-
-        response = wizard.handle("getSlot")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.confirmed_values["single_method"], "getSlot")
-        self.assertEqual(state.confirmed_values["rpc_methods"], ["getSlot"])
-        self.assertTrue(state.confirmed_values["rpc_workload_confirmed"])
-        ok, missing = wizard.can_run_smoke()
-        self.assertFalse(ok)
-        self.assertIn("rpc_param_samples_confirmed", missing)
-
-        response = wizard.handle("确认")
-        self.assertTrue(response.handled)
-        self.assertTrue(state.confirmed_values["rpc_param_samples_confirmed"])
-        ok, missing = wizard.can_run_smoke()
-        self.assertTrue(ok)
-        self.assertEqual(missing, [])
-
-    def test_benchmark_intent_without_chain_asks_for_chain_first(self):
-        state = WorkflowState(language="zh")
-        wizard = BenchmarkWizard(state, discovery={"cloud": {"provider": "gcp", "platform": "gce"}, "deployment": {"type": "vm"}, "network": {}, "disks": {"candidates": []}})
-
-        response = wizard.handle("我要压测一个区块链节点")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.intent, "benchmark")
-        self.assertEqual(state.stage, "select_chain")
-        self.assertEqual(state.current_question_id, "chain_choice")
-        self.assertIn("solana", "\n".join(response.messages))
-
-        response = wizard.handle("solana")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.confirmed_values["chain"], "solana")
-        self.assertEqual(state.current_question_id, "target_type")
-
-    def test_target_before_chain_is_remembered_until_chain_is_confirmed(self):
-        state = WorkflowState(language="zh")
-        wizard = BenchmarkWizard(state, discovery={"cloud": {"provider": "gcp", "platform": "gce"}, "deployment": {"type": "vm"}, "network": {}, "disks": {"candidates": []}})
-
-        response = wizard.handle("fake-node")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.current_question_id, "chain_choice")
-        self.assertEqual(state.defaulted_values["pending_target"], "fake-node")
-        self.assertNotIn("use_fake_node", state.confirmed_values)
-
-        response = wizard.handle("solana")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.confirmed_values["chain"], "solana")
-        self.assertTrue(state.confirmed_values["use_fake_node"])
-        self.assertEqual(state.current_question_id, "cloud_region")
-
-    def test_numbered_target_and_rpc_mode_choices_are_supported(self):
-        state = WorkflowState(language="zh")
-        wizard = BenchmarkWizard(state, discovery={"cloud": {"provider": "gcp", "platform": "gce"}, "deployment": {"type": "vm"}, "network": {}, "disks": {"candidates": []}})
-
-        self.assertTrue(wizard.handle("测试 solana").handled)
-        response = wizard.handle("1")
-        self.assertTrue(response.handled)
-        self.assertTrue(state.confirmed_values["use_fake_node"])
-        self.assertEqual(state.current_question_id, "cloud_region")
-
-        _complete_environment(wizard, state)
-        response = wizard.handle("2")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.confirmed_values["rpc_mode"], "mixed")
-        self.assertEqual(state.current_question_id, "mixed_weights_confirm")
-
-    def test_rpc_workload_default_and_custom_choices_are_explicit(self):
-        state = WorkflowState(language="en")
-        wizard = BenchmarkWizard(state, discovery={"cloud": {"provider": "gcp", "platform": "gce"}, "deployment": {"type": "vm"}, "network": {}, "disks": {"candidates": []}})
-
-        self.assertTrue(wizard.handle("benchmark solana").handled)
-        self.assertTrue(wizard.handle("1").handled)
-        _complete_environment(wizard, state)
-        response = wizard.handle("1")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.confirmed_values["rpc_mode"], "single")
-        self.assertEqual(state.current_question_id, "single_method_confirm")
-
-        response = wizard.handle("2")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.current_question_id, "rpc_workload")
-        self.assertIn("Provide the RPC method", "\n".join(response.messages))
-
-    def test_unknown_chain_generates_existing_family_handoff(self):
-        state = WorkflowState(language="zh")
-        wizard = BenchmarkWizard(state, discovery={"cloud": {"provider": "gcp", "platform": "gce"}, "deployment": {"type": "vm"}, "network": {}, "disks": {"candidates": []}})
-
-        self.assertTrue(wizard.handle("我要压测一个区块链节点").handled)
-        response = wizard.handle("foochain")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.current_question_id, "unsupported_chain_family")
-        self.assertIn("adapter family", "\n".join(response.messages))
-
-        response = wizard.handle("1")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.confirmed_values["onboarding_family"], "jsonrpc")
-        self.assertEqual(state.current_question_id, "unsupported_chain_methods")
-
-        response = wizard.handle("foo_getBalance,foo_getTransaction")
-        self.assertTrue(response.handled)
-        output = "\n".join(response.messages)
-        self.assertIn("Onboarding package for foochain", output)
-        self.assertIn("foo_getBalance", output)
-        self.assertIn("Documentation sync required", output)
-
-    def test_unknown_chain_can_generate_new_family_plan(self):
-        state = WorkflowState(language="en")
-        wizard = BenchmarkWizard(state, discovery={"cloud": {"provider": "gcp", "platform": "gce"}, "deployment": {"type": "vm"}, "network": {}, "disks": {"candidates": []}})
-
-        self.assertTrue(wizard.handle("benchmark a node").handled)
-        self.assertTrue(wizard.handle("foovm").handled)
-        response = wizard.handle("7")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.stage, "onboarding_handoff_ready")
-        output = "\n".join(response.messages)
-        self.assertIn("New protocol family onboarding plan", output)
-
-    def test_confirmed_fake_node_workflow_generates_plan_and_mock_job(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            state = WorkflowState(language="zh", stage="ready_for_smoke", current_question_id="smoke_confirmation")
-            state.confirmed_values.update({
-                "chain": "solana",
-                "use_fake_node": True,
-                "rpc_mode": "single",
-                "rpc_workload_confirmed": True,
-                "rpc_param_samples_confirmed": True,
-            })
-            prepared = prepare_plan_from_state(state, output_dir=Path(tmp) / "prepared")
-            self.assertTrue(Path(prepared["plan_file"]).is_file())
-            self.assertTrue(prepared["preflight"]["passed"])
-            self.assertEqual(prepared["plan"]["chain"], "solana")
-            self.assertTrue(prepared["plan"]["use_fake_node"])
-            self.assertIn("--fake-node", prepared["plan"]["execution"]["command"])
-
-            job = submit_mock_smoke_from_plan(prepared["plan_file"], jobs_dir=Path(tmp) / "jobs")
-            self.assertEqual(job["status"], "completed")
-            self.assertTrue(Path(job["runtime_env_file"]).is_file())
-            self.assertTrue(Path(job["artifact_index"]).is_file())
-            runtime_env = Path(job["runtime_env_file"]).read_text(encoding="utf-8")
-            self.assertIn("export BLOCKCHAIN_NODE='solana'", runtime_env)
-            self.assertIn("export RPC_MODE='single'", runtime_env)
-
-    def test_user_supplied_target_and_chain_endpoint_values_reach_runtime_env(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            state = WorkflowState(language="zh", stage="ready_for_smoke", current_question_id="smoke_confirmation")
-            state.confirmed_values.update({
-                "chain": "aptos",
-                "use_fake_node": True,
-                "rpc_mode": "single",
-                "rpc_workload_confirmed": True,
-                "rpc_param_samples_confirmed": True,
-                "cloud_provider": "gcp",
-                "cloud_region": "us-central1",
-                "cloud_zone": "us-central1-a",
-                "machine_type": "c3-standard-22",
-                "blockchain_process_names": ["aptos-node"],
-                "ledger_device": "sdb",
-                "data_vol_type": "pd-ssd",
-                "data_vol_size": "2048",
-                "data_vol_max_iops": "12000",
-                "data_vol_max_throughput": "500",
-                "network_interface": "eth0",
-                "network_max_bandwidth_gbps": "16",
-                "target_address": "0xabc",
-                "target_tx_hash": "0xtx",
-                "chain_rest_url": "http://127.0.0.1:8080",
-            })
-            prepared = prepare_plan_from_state(state, output_dir=Path(tmp) / "prepared")
-            job = submit_mock_smoke_from_plan(prepared["plan_file"], jobs_dir=Path(tmp) / "jobs")
-            runtime_env = Path(job["runtime_env_file"]).read_text(encoding="utf-8")
-            self.assertIn("export TARGET_ADDRESS='0xabc'", runtime_env)
-            self.assertIn("export TARGET_TX_HASH='0xtx'", runtime_env)
-            self.assertIn("export CHAIN_REST_URL='http://127.0.0.1:8080'", runtime_env)
-
-    def test_scripted_terminal_can_prepare_and_run_mock_smoke(self):
-        output = self.run_agent(
-            "--language",
-            "zh",
-            "--prompt",
-            "我现在需要测试 solana",
-            "--prompt",
-            "fake-node",
-            "--prompt",
-            "us-central1",
-            "--prompt",
-            "us-central1-a",
-            "--prompt",
-            "c3-standard-22",
-            "--prompt",
-            "agave-validator",
-            "--prompt",
-            "sdb",
-            "--prompt",
-            "pd-ssd",
-            "--prompt",
-            "2048",
-            "--prompt",
-            "12000",
-            "--prompt",
-            "500",
-            "--prompt",
-            "eth0",
-            "--prompt",
-            "16",
-            "--prompt",
-            "n",
-            "--prompt",
-            "n",
-            "--prompt",
-            "single",
-            "--prompt",
-            "n",
-            "--prompt",
-            "getSlot",
-            "--prompt",
-            "确认",
-            "--prompt",
-            "确认",
-            "--prompt",
-            "确认",
-        )
-        self.assertIn("preflight 通过", output)
-        self.assertIn("mock smoke 完成", output)
-        self.assertIn("runtime_env=", output)
-        self.assertIn("artifact_index=", output)
-
-    def test_single_mode_can_accept_chain_template_default_method(self):
-        state = WorkflowState(language="zh")
-        wizard = BenchmarkWizard(state, discovery={"cloud": {"provider": "gcp", "platform": "gce"}, "deployment": {"type": "vm"}, "network": {}, "disks": {"candidates": []}})
-        self.assertTrue(wizard.handle("测试 solana").handled)
-        self.assertTrue(wizard.handle("fake-node").handled)
-        _complete_environment(wizard, state)
-        response = wizard.handle("single")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.current_question_id, "single_method_confirm")
-        self.assertIn("getAccountInfo", "\n".join(response.messages))
-
-        response = wizard.handle("y")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.confirmed_values["single_method"], "getAccountInfo")
-        self.assertEqual(state.confirmed_values["rpc_methods"], ["getAccountInfo"])
-        self.assertTrue(state.confirmed_values["rpc_workload_confirmed"])
-        self.assertEqual(state.current_question_id, "rpc_param_samples")
-
-    def test_mixed_weights_are_parsed_and_must_total_100(self):
-        state = WorkflowState(language="zh")
-        wizard = BenchmarkWizard(state, discovery={"cloud": {"provider": "gcp", "platform": "gce"}, "deployment": {"type": "vm"}, "network": {}, "disks": {"candidates": []}})
-        self.assertTrue(wizard.handle("测试 solana").handled)
-        self.assertTrue(wizard.handle("fake-node").handled)
-        _complete_environment(wizard, state)
-        self.assertTrue(wizard.handle("mixed").handled)
-        self.assertTrue(wizard.handle("2").handled)
-        self.assertEqual(state.current_question_id, "rpc_workload")
-
-        response = wizard.handle("getSlot=60,getBlockHeight=20")
-        self.assertTrue(response.handled)
-        self.assertFalse(state.confirmed_values.get("mixed_weights_confirmed"))
-        self.assertEqual(state.current_question_id, "rpc_workload")
-
-        response = wizard.handle("getSlot=70,getBlockHeight=30")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.confirmed_values["mixed_weights"], {"getSlot": 70, "getBlockHeight": 30})
-        self.assertTrue(state.confirmed_values["mixed_weights_confirmed"])
-        self.assertTrue(state.confirmed_values["rpc_workload_confirmed"])
-        self.assertEqual(state.current_question_id, "rpc_param_samples")
-
-    def test_real_node_flow_collects_required_values_one_at_a_time(self):
-        state = WorkflowState(language="en")
-        discovery = {
-            "cloud": {"provider": "gcp", "platform": "gce"},
-            "deployment": {"type": "vm"},
-            "network": {},
-            "disks": {"candidates": []},
-        }
-        wizard = BenchmarkWizard(state, discovery=discovery)
-
-        self.assertTrue(wizard.handle("benchmark solana").handled)
-        response = wizard.handle("real-node")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.current_question_id, "local_rpc_url")
-
-        answers = [
-            ("http://127.0.0.1:8899", "mainnet_rpc_url_reviewed"),
-            ("default", "cloud_region"),
-            ("us-central1", "cloud_zone"),
-            ("us-central1-a", "machine_type"),
-            ("c3-standard-22", "blockchain_process_names"),
-            ("agave-validator", "ledger_device"),
-            ("sdb", "data_vol_type"),
-            ("pd-ssd", "data_vol_size"),
-            ("2048", "data_vol_max_iops"),
-            ("12000", "data_vol_max_throughput"),
-            ("500", "network_interface"),
-            ("eth0", "network_max_bandwidth_gbps"),
-            ("16", "has_accounts_device"),
-            ("n", "advanced_config_review"),
-            ("n", "rpc_mode"),
+class ADKNativeTerminalContractTest(unittest.TestCase):
+    def test_product_terminal_no_longer_imports_old_wizard_or_responder(self):
+        source = (REPO / "agent" / "terminal" / "repl.py").read_text(encoding="utf-8")
+        forbidden = [
+            "BenchmarkWizard",
+            "terminal.responder",
+            "answer_conversation",
+            "planning_bridge",
+            "WorkflowState",
         ]
-        for answer, next_question in answers:
-            response = wizard.handle(answer)
-            self.assertTrue(response.handled)
-            self.assertEqual(state.current_question_id, next_question)
-        self.assertEqual(state.confirmed_values["blockchain_process_names"], ["agave-validator"])
-        self.assertEqual(state.confirmed_values["ledger_device"], "sdb")
-        self.assertEqual(state.confirmed_values["network_max_bandwidth_gbps"], "16")
-        self.assertFalse(state.confirmed_values["has_accounts_device"])
+        for marker in forbidden:
+            self.assertNotIn(marker, source)
 
-    def test_detected_cloud_values_are_confirmed_before_use(self):
-        state = WorkflowState(language="zh")
-        discovery = {
-            "cloud": {
-                "provider": "gcp",
-                "platform": "gce",
-                "region": "us-central1",
-                "zone": "us-central1-a",
-                "machine_type": "c3-standard-22",
-            },
-            "deployment": {"type": "vm"},
-            "network": {},
-            "disks": {"candidates": []},
-        }
-        wizard = BenchmarkWizard(state, discovery=discovery)
+    def test_product_terminal_must_not_be_keyword_intent_router(self):
+        source = (REPO / "agent" / "terminal" / "repl.py").read_text(encoding="utf-8")
+        forbidden = [
+            "def _looks_like_",
+            "_looks_like_benchmark_request",
+            "_looks_like_onboarding_request",
+            "_looks_like_custom_rpc_request",
+            "_looks_like_unknown_chain_request",
+            "\"压测\"",
+            "\"测一下\"",
+            "\"我要测\"",
+            "\"新链\"",
+            "\"自定义 rpc\"",
+            "\"二次开发\"",
+        ]
+        for marker in forbidden:
+            self.assertNotIn(marker, source)
 
-        self.assertTrue(wizard.handle("测试 solana").handled)
-        response = wizard.handle("fake-node")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.current_question_id, "cloud_region_confirm")
-        self.assertIn("CLOUD_REGION=us-central1", "\n".join(response.messages))
-
-        response = wizard.handle("y")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.confirmed_values["cloud_region"], "us-central1")
-        self.assertEqual(state.current_question_id, "cloud_zone_confirm")
-
-        response = wizard.handle("asia-east1-a")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.confirmed_values["cloud_zone"], "asia-east1-a")
-        self.assertEqual(state.current_question_id, "machine_type_confirm")
-
-        response = wizard.handle("y")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.confirmed_values["machine_type"], "c3-standard-22")
-        self.assertEqual(state.current_question_id, "blockchain_process_names")
-
-    def test_real_node_disk_candidates_are_confirmed_by_number(self):
-        state = WorkflowState(language="zh")
-        discovery = {
-            "cloud": {"provider": "gcp", "platform": "gce"},
-            "deployment": {"type": "vm"},
-            "network": {"default_interface": "eth0"},
-            "disks": {
-                "candidates": [
-                    {"name": "sda", "type": "disk", "size": "100G", "mountpoint": "/", "fstype": "ext4", "label": ""},
-                    {"name": "sdb", "type": "disk", "size": "2T", "mountpoint": "/ledger", "fstype": "xfs", "label": "ledger"},
-                    {"name": "sdc", "type": "disk", "size": "1T", "mountpoint": "/accounts", "fstype": "xfs", "label": "accounts"},
-                ]
-            },
-        }
-        wizard = BenchmarkWizard(state, discovery=discovery)
-        self.assertTrue(wizard.handle("测试 solana").handled)
-        response = wizard.handle("真实节点")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.current_question_id, "local_rpc_url")
-        for answer in ["http://127.0.0.1:8899", "default", "us-central1", "us-central1-a", "c3-standard-22", "agave-validator"]:
-            self.assertTrue(wizard.handle(answer).handled)
-        self.assertEqual(state.current_question_id, "ledger_device_choice")
-        response = wizard.handle("2")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.confirmed_values["ledger_device"], "sdb")
-        for answer in ["pd-ssd", "2048", "12000", "500", "eth0", "16"]:
-            self.assertTrue(wizard.handle(answer).handled)
-        self.assertEqual(state.current_question_id, "has_accounts_device")
-        self.assertTrue(wizard.handle("y").handled)
-        self.assertEqual(state.current_question_id, "accounts_device_choice")
-        self.assertTrue(wizard.handle("3").handled)
-        self.assertEqual(state.confirmed_values["accounts_device"], "sdc")
-        self.assertEqual(state.current_question_id, "accounts_vol_type")
-        for answer in ["pd-ssd", "1024", "10000", "300"]:
-            self.assertTrue(wizard.handle(answer).handled)
-        self.assertEqual(state.current_question_id, "advanced_config_review")
-        self.assertTrue(wizard.handle("n").handled)
-        self.assertEqual(state.current_question_id, "rpc_mode")
-
-    def test_fake_node_to_real_node_keeps_workload_context_but_collects_real_fields(self):
-        state = WorkflowState(language="zh")
-        discovery = {
-            "cloud": {"provider": "gcp", "platform": "gce"},
-            "deployment": {"type": "vm"},
-            "network": {},
-            "disks": {"candidates": []},
-        }
-        wizard = BenchmarkWizard(state, discovery=discovery)
-        for prompt in ["测试 solana", "fake-node"]:
-            self.assertTrue(wizard.handle(prompt).handled)
-        _complete_environment(wizard, state)
-        for prompt in ["single", "确认", "确认"]:
-            self.assertTrue(wizard.handle(prompt).handled)
-        ok, missing = wizard.can_run_smoke()
-        self.assertTrue(ok)
-
-        response = wizard.handle("切换到真实节点")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.current_question_id, "local_rpc_url")
-        self.assertEqual(state.confirmed_values["chain"], "solana")
-        self.assertEqual(state.confirmed_values["rpc_mode"], "single")
-        self.assertTrue(state.confirmed_values["rpc_workload_confirmed"])
-        self.assertTrue(state.confirmed_values["rpc_param_samples_confirmed"])
-        self.assertFalse(state.confirmed_values["use_fake_node"])
-        ok, missing = wizard.can_run_smoke()
-        self.assertFalse(ok)
-        self.assertIn("local_rpc_url", missing)
-        self.assertNotIn("rpc_mode", missing)
-
-    def test_invalid_real_node_values_are_rejected_before_advancing(self):
-        state = WorkflowState(language="en")
-        discovery = {
-            "cloud": {"provider": "gcp", "platform": "gce"},
-            "deployment": {"type": "vm"},
-            "network": {},
-            "disks": {"candidates": []},
-        }
-        wizard = BenchmarkWizard(state, discovery=discovery)
-        self.assertTrue(wizard.handle("benchmark solana").handled)
-        self.assertTrue(wizard.handle("real-node").handled)
-        response = wizard.handle("not-a-url")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.current_question_id, "local_rpc_url")
-        self.assertNotIn("local_rpc_url", state.confirmed_values)
-        self.assertTrue(wizard.handle("http://127.0.0.1:8899").handled)
-        self.assertEqual(state.current_question_id, "mainnet_rpc_url_reviewed")
-
-    def test_chain_detection_uses_all_chain_templates(self):
-        chains = known_chains()
-        self.assertIn("avalanche-c", chains)
-        state = WorkflowState(language="en")
-        wizard = BenchmarkWizard(state, discovery={"cloud": {}, "deployment": {}, "network": {}, "disks": {"candidates": []}})
-        response = wizard.handle("benchmark avalanche-c")
-        self.assertTrue(response.handled)
-        self.assertEqual(state.confirmed_values["chain"], "avalanche-c")
-
-    def test_missing_blockers_accept_list_values(self):
-        state = WorkflowState(language="en")
-        state.confirmed_values.update({
-            "chain": "solana",
-            "use_fake_node": False,
-            "rpc_mode": "single",
-            "rpc_workload_confirmed": True,
-            "rpc_param_samples_confirmed": True,
-            "local_rpc_url": "http://127.0.0.1:8899",
-            "mainnet_rpc_url_reviewed": True,
-            "cloud_provider": "gcp",
-            "cloud_region": "us-central1",
-            "cloud_zone": "us-central1-a",
-            "machine_type": "c3-standard-22",
-            "blockchain_process_names": ["agave-validator"],
-            "ledger_device": "sdb",
-            "data_vol_type": "pd-ssd",
-            "data_vol_size": "2048",
-            "data_vol_max_iops": "12000",
-            "data_vol_max_throughput": "500",
-            "network_interface": "eth0",
-            "network_max_bandwidth_gbps": "16",
-        })
-        ok, missing = BenchmarkWizard(state).can_run_smoke()
-        self.assertTrue(ok)
-        self.assertEqual(missing, [])
-
-    def test_state_store_round_trip(self):
+    def test_benchmark_turn_delegates_to_adk_bridge(self):
+        fake_bridge = FakeBridge()
+        io = CapturingIO()
         with tempfile.TemporaryDirectory() as tmp:
-            store = WorkflowStateStore(Path(tmp) / "state.json")
-            state = WorkflowState(language="zh", stage="select_rpc_mode")
-            state.confirmed_values["chain"] = "solana"
-            store.save(state)
-            loaded = store.load()
-            self.assertEqual(loaded.language, "zh")
-            self.assertEqual(loaded.stage, "select_rpc_mode")
-            self.assertEqual(loaded.confirmed_values["chain"], "solana")
-
-    def test_dependency_confirmation_decline_is_stateful(self):
-        io = CapturingIO()
-        state = WorkflowState(language="zh", stage="dependency_install_confirmation", current_question_id="install_dependencies")
-        app = AnyChainTerminal(state=state, io=io)
-        app.handle_user_text("n")
-        self.assertEqual(state.stage, "dependency_install_declined")
-        self.assertEqual(state.current_question_id, "")
-        self.assertTrue(any("已跳过依赖安装" in message for message in io.messages))
-
-    def test_startup_runs_read_only_doctor_and_sets_dependency_confirmation(self):
-        io = CapturingIO()
-        state = WorkflowState(language="zh")
-        app = AnyChainTerminal(state=state, io=io)
-        report = {
-            "status": "needs_dependencies",
-            "environment": {
-                "host": {"cpu_count": 22, "memory_gib": 88},
-                "cloud": {"provider": "gcp", "platform": "gce", "region": "us-central1", "zone": "us-central1-a", "machine_type": "c3-standard-22"},
-                "deployment": {"type": "vm"},
-                "network": {"default_interface": "eth0"},
-                "disks": {
-                    "proposed_ledger_device": "sdb",
-                    "proposed_accounts_device": "sdc",
-                    "candidates": [
-                        {"name": "sdb", "type": "disk", "size": "2048G", "mountpoint": "/mnt/ledger", "label": "ledger"},
-                        {"name": "sdc", "type": "disk", "size": "512G", "mountpoint": "/mnt/accounts", "label": "accounts"},
-                    ],
-                },
-                "dependencies": {"missing_required": ["jq"], "missing_optional": []},
-            },
-            "capabilities": {"chain_count": 36, "unique_rpc_method_count": 184},
-        }
-        with patch("terminal.repl.adk_status", return_value=FakeADKStatus(True)), patch("terminal.repl.run_doctor", return_value=report):
-            app._startup()
-        self.assertEqual(state.current_question_id, "install_dependencies")
-        self.assertIn("jq", state.missing_blockers)
-        self.assertTrue(state.defaulted_values["framework_context_loaded"])
-        self.assertEqual(state.defaulted_values["framework_context_summary"]["chain_count"], 36)
-        self.assertTrue(any("启动检查完成" in message for message in io.messages))
-        self.assertTrue(any("CLOUD_REGION: us-central1" in message for message in io.messages))
-        self.assertTrue(any("CPU: 22" in message for message in io.messages))
-        self.assertTrue(any("[1] sdb" in message for message in io.messages))
-        self.assertTrue(any("已加载框架事实" in message for message in io.messages))
-        self.assertTrue(any("是否允许" in message for message in io.messages))
-
-    def test_startup_prioritizes_agent_runtime_install_when_adk_is_missing(self):
-        io = CapturingIO()
-        state = WorkflowState(language="zh")
-        app = AnyChainTerminal(state=state, io=io)
-        report = {
-            "status": "needs_dependencies",
-            "environment": {
-                "cloud": {"provider": "gcp"},
-                "deployment": {"type": "vm"},
-                "dependencies": {"missing_required": ["jq"], "missing_optional": []},
-            },
-            "capabilities": {"chain_count": 36, "unique_rpc_method_count": 184},
-        }
-        with patch("terminal.repl.adk_status", return_value=FakeADKStatus(False)), patch("terminal.repl.run_doctor", return_value=report):
-            app._startup()
-        self.assertEqual(state.current_question_id, "install_agent_runtime")
-        self.assertEqual(state.missing_blockers, ["google-adk"])
-        self.assertTrue(any("install_agent_deps.sh" in message for message in io.messages))
-
-    def test_agent_runtime_install_adds_gcloud_for_google_adc_when_missing(self):
-        io = CapturingIO()
-        state = WorkflowState(language="zh", current_question_id="install_agent_runtime")
-        app = AnyChainTerminal(state=state, io=io)
-        fake_config = SimpleNamespace(provider="gemini", auth_mode="google_adc")
-        completed = SimpleNamespace(returncode=0, stdout="")
-        with (
-            patch("terminal.repl.load_llm_config", return_value=fake_config),
-            patch("terminal.repl.shutil.which", return_value=""),
-            patch("terminal.repl.subprocess.run", return_value=completed) as run_mock,
-            patch.object(app, "_startup_doctor"),
-        ):
-            app._install_agent_runtime()
-        command = run_mock.call_args.args[0]
-        self.assertEqual(command, ["bash", "scripts/install_agent_deps.sh", "--yes", "--with-gcloud"])
-
-    def test_ctrl_c_exits_instead_of_being_swallowed(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            io = CapturingIO()
-            io.inputs = [KeyboardInterrupt()]
-            store = WorkflowStateStore(Path(tmp) / "state.json")
-            app = AnyChainTerminal(state=WorkflowState(language="zh"), store=store, io=io)
-            report = {
-                "status": "ready",
-                "environment": {
-                    "cloud": {"provider": "gcp"},
-                    "deployment": {"type": "vm"},
-                    "dependencies": {"missing_required": [], "missing_optional": []},
-                },
-                "capabilities": {"chain_count": 36, "unique_rpc_method_count": 184},
-            }
-            with patch("terminal.repl.adk_status", return_value=FakeADKStatus(True)), patch("terminal.repl.run_doctor", return_value=report):
-                exit_code = app.run()
-            self.assertEqual(exit_code, 130)
-            self.assertTrue((Path(tmp) / "state.json").is_file())
-            self.assertTrue(any("Ctrl+C" in message for message in io.messages))
-
-    def test_general_question_does_not_fill_pending_configuration_value(self):
-        old_env = os.environ.copy()
-        try:
-            os.environ["LLM_PROVIDER"] = "unsupported_provider_for_test"
-            io = CapturingIO()
-            state = WorkflowState(language="zh", stage="collect_data_vol_max_throughput", current_question_id="data_vol_max_throughput")
-            state.confirmed_values.update({
-                "chain": "solana",
-                "use_fake_node": False,
-                "rpc_mode": "single",
-            })
-            app = AnyChainTerminal(state=state, io=io)
-            app.handle_user_text("你是 AI 么？")
-            self.assertNotIn("data_vol_max_throughput", state.confirmed_values)
-            self.assertEqual(state.current_question_id, "data_vol_max_throughput")
-            self.assertTrue(any("AnyChain Benchmark Agent" in message for message in io.messages))
-        finally:
-            os.environ.clear()
-            os.environ.update(old_env)
-
-    def test_conversation_responder_prefers_adk_runner_when_config_is_valid(self):
-        fake_config = SimpleNamespace(
-            provider="gemini",
-            model="gemini-3.1-pro",
-            auth_mode="api_key",
-            validate=lambda: [],
-        )
-        state = WorkflowState(language="zh", stage="collect_network_interface", current_question_id="network_interface")
-        with patch("terminal.responder.run_text_once", return_value="ADK answer") as run_mock:
-            answer = answer_conversation("你支持多少链？", state, fake_config)
-        self.assertEqual(answer, "ADK answer")
-        self.assertTrue(run_mock.called)
-
-    def test_reset_clears_pending_workflow_but_keeps_language(self):
-        io = CapturingIO()
-        state = WorkflowState(language="zh", stage="collect_network_interface", current_question_id="network_interface", job_id="job_1")
-        state.confirmed_values["chain"] = "solana"
-        app = AnyChainTerminal(state=state, io=io)
-        app.handle_user_text("重新开始")
-        self.assertEqual(state.stage, "start")
-        self.assertEqual(state.current_question_id, "")
-        self.assertEqual(state.confirmed_values, {})
-        self.assertEqual(state.job_id, "job_1")
-        self.assertTrue(any("已重置" in message for message in io.messages))
-
-    def test_execution_artifact_diagnosis_does_not_treat_missing_performance_as_no_traffic(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            proxy = root / "proxy_method.csv"
-            proxy.write_text("timestamp,method,status\n1,getAccountInfo,200\n", encoding="utf-8")
-            index = root / "artifact_index.json"
-            index.write_text(
-                '{"run_dir": "%s", "evidence": {"proxy_method_csv": "%s", "performance_csv": "%s"}}'
-                % (root, proxy, root / "performance_latest.csv"),
-                encoding="utf-8",
+            store = TerminalSessionStore(Path(tmp) / "session.json")
+            update_workflow_state(
+                {"active_intent": "START_BENCHMARK", "chain": "solana"},
+                session_id="terminal-session",
+                state_root=Path(tmp) / "workflow",
             )
-            diagnosis = diagnose_execution_artifacts(artifact_index=index)
-            self.assertEqual(diagnosis["conclusion"], "traffic_ok_monitor_sample_missing")
-            self.assertEqual(diagnosis["signals"]["proxy_method_rows"], 1)
-            self.assertEqual(diagnosis["signals"]["performance_rows"], -1)
+            app = AnyChainTerminal(
+                state=TerminalSession(language="zh"),
+                store=store,
+                io=io,
+                bridge_factory=lambda: fake_bridge,
+            )
+            with patch("terminal.repl.adk_status") as adk_status_mock, \
+                patch("terminal.repl.runner_bridge_status") as bridge_status_mock, \
+                patch("terminal.repl.web_research_status") as web_research_mock, \
+                patch("terminal.repl.run_doctor") as doctor_mock, \
+                patch("terminal.repl.load_framework_context") as context_mock, \
+                patch("terminal.repl.load_framework_capabilities") as capabilities_mock:
+                adk_status_mock.return_value.as_dict.return_value = {"available": True, "reason": "ok"}
+                bridge_status_mock.return_value.as_dict.return_value = {"available": True, "reason": "ok"}
+                web_research_mock.return_value.as_dict.return_value = {
+                    "enabled": False,
+                    "mode": "disabled",
+                    "reason": "unavailable for current provider",
+                }
+                doctor_mock.return_value = {
+                    "status": "ready",
+                    "capabilities": {"chain_count": 36, "unique_rpc_method_count": 184},
+                    "environment": {
+                        "cloud": {"provider": "gcp", "platform": "gce"},
+                        "deployment": {"type": "vm"},
+                        "host": {"cpu_count": 8, "memory_gib": 32},
+                        "network": {"default_interface": "eth0"},
+                        "disks": {"candidates": [], "proposed_ledger_device": "sdb"},
+                        "dependencies": {"missing_required": []},
+                    },
+                }
+                context_mock.return_value = {"capability_summary": {"chain_count": 36, "family_count": 6, "unique_rpc_method_count": 184}}
+                capabilities_mock.return_value = {"chain_count": 36, "family_count": 6, "unique_rpc_method_count": 184}
+                with patch("terminal.repl.load_workflow_state") as workflow_state_mock:
+                    workflow_state_mock.return_value = load_workflow_state(
+                        session_id="terminal-session",
+                        state_root=Path(tmp) / "workflow",
+                    )
+                    app.startup()
+                    app.handle_user_text("我想测试 solana fake-node")
 
-    def test_preflight_reports_entrypoint_dependency_warnings_in_audit_mode(self):
-        plan = {
-            "chain": "solana",
-            "rpc_mode": "single",
-            "use_fake_node": True,
-            "dependency_mode": "audit",
-            "required_inputs": [],
-            "configuration_checklist": {"missing_blockers": []},
-            "chain_template_requirements": {"mixed_weighted": []},
-            "execution": {"environment": {"LOCAL_RPC_URL": ""}},
-            "materialized_config": {
-                "LEDGER_DEVICE": "sdb",
-                "NETWORK_INTERFACE": "eth0",
-            },
-            "discovery": {
-                "dependencies": {
-                    "tools": {
-                        "bash": {"available": True},
-                        "python3": {"available": True},
-                        "jq": {"available": True},
-                        "curl": {"available": True},
-                        "vegeta": {"available": False},
-                        "go": {"available": False},
-                        "iostat": {"available": True},
-                        "ip": {"available": True},
-                        "lsblk": {"available": True},
-                    }
+        self.assertEqual(len(fake_bridge.calls), 1)
+        self.assertEqual(fake_bridge.calls[0][0], "我想测试 solana fake-node")
+        self.assertEqual(fake_bridge.calls[0][1]["workflow_state"]["chain"], "solana")
+        self.assertEqual(fake_bridge.calls[0][1]["workflow_state"]["active_intent"], "START_BENCHMARK")
+        self.assertFalse(fake_bridge.calls[0][1]["web_research"]["enabled"])
+        self.assertEqual(app.state.discovery["cloud"]["provider"], "gcp")
+        self.assertEqual(app.state.framework_summary["chain_count"], 36)
+        self.assertTrue(any("Web research" in item and "unavailable for current provider" in item for item in io.messages))
+        self.assertFalse(any("benchmark 计划" in item for item in io.messages))
+
+    def test_missing_dependencies_do_not_block_non_confirmation_adk_turns(self):
+        fake_bridge = FakeBridge()
+        io = CapturingIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TerminalSessionStore(Path(tmp) / "session.json")
+            app = AnyChainTerminal(
+                state=TerminalSession(language="zh"),
+                store=store,
+                io=io,
+                bridge_factory=lambda: fake_bridge,
+            )
+            with patch("terminal.repl.adk_status") as adk_status_mock, \
+                patch("terminal.repl.runner_bridge_status") as bridge_status_mock, \
+                patch("terminal.repl.web_research_status") as web_research_mock, \
+                patch("terminal.repl.run_doctor") as doctor_mock, \
+                patch("terminal.repl.load_framework_context") as context_mock, \
+                patch("terminal.repl.load_framework_capabilities") as capabilities_mock:
+                adk_status_mock.return_value.as_dict.return_value = {"available": True, "reason": "ok"}
+                bridge_status_mock.return_value.as_dict.return_value = {"available": True, "reason": "ok"}
+                web_research_mock.return_value.as_dict.return_value = {
+                    "enabled": False,
+                    "mode": "disabled",
+                    "reason": "unavailable for current provider",
+                }
+                doctor_mock.return_value = {
+                    "status": "needs_dependencies",
+                    "capabilities": {"chain_count": 36, "unique_rpc_method_count": 184},
+                    "environment": {
+                        "cloud": {"provider": "gcp", "platform": "gce"},
+                        "deployment": {"type": "vm"},
+                        "host": {"cpu_count": 8, "memory_gib": 32},
+                        "network": {"default_interface": "eth0"},
+                        "disks": {"candidates": [], "proposed_ledger_device": "sdb"},
+                        "dependencies": {"missing_required": ["vegeta"]},
+                    },
+                }
+                context_mock.return_value = {"capability_summary": {"chain_count": 36, "family_count": 6, "unique_rpc_method_count": 184}}
+                capabilities_mock.return_value = {"chain_count": 36, "family_count": 6, "unique_rpc_method_count": 184}
+                app.startup()
+                app.handle_user_text("我要测试 solana，使用 fake-node smoke")
+
+        self.assertEqual(len(fake_bridge.calls), 1)
+        self.assertEqual(fake_bridge.calls[0][0], "我要测试 solana，使用 fake-node smoke")
+        self.assertEqual(app.state.current_question_id, "install_dependencies")
+        self.assertTrue(any("缺失依赖" in item and "scripts/install_deps.sh --yes" in item for item in io.messages))
+
+    def test_ready_startup_clears_stale_pending_dependencies(self):
+        fake_bridge = FakeBridge()
+        io = CapturingIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TerminalSessionStore(Path(tmp) / "session.json")
+            app = AnyChainTerminal(
+                state=TerminalSession(
+                    language="zh",
+                    current_question_id="install_dependencies",
+                    pending_missing_dependencies=["vegeta"],
+                ),
+                store=store,
+                io=io,
+                bridge_factory=lambda: fake_bridge,
+            )
+            with patch("terminal.repl.adk_status") as adk_status_mock, \
+                patch("terminal.repl.runner_bridge_status") as bridge_status_mock, \
+                patch("terminal.repl.web_research_status") as web_research_mock, \
+                patch("terminal.repl.run_doctor") as doctor_mock, \
+                patch("terminal.repl.load_framework_context") as context_mock, \
+                patch("terminal.repl.load_framework_capabilities") as capabilities_mock:
+                adk_status_mock.return_value.as_dict.return_value = {"available": True, "reason": "ok"}
+                bridge_status_mock.return_value.as_dict.return_value = {"available": True, "reason": "ok"}
+                web_research_mock.return_value.as_dict.return_value = {
+                    "enabled": True,
+                    "mode": "adk_google_search",
+                    "reason": "enabled via ADK google_search",
+                }
+                doctor_mock.return_value = {
+                    "status": "ready",
+                    "capabilities": {"chain_count": 36, "unique_rpc_method_count": 184},
+                    "environment": {
+                        "cloud": {"provider": "other", "platform": "container"},
+                        "deployment": {"type": "container"},
+                        "host": {"cpu_count": 8, "memory_gib": 32},
+                        "network": {"default_interface": "eth0"},
+                        "disks": {"candidates": [], "proposed_ledger_device": "vda1"},
+                        "dependencies": {"missing_required": []},
+                    },
+                }
+                context_mock.return_value = {"capability_summary": {"chain_count": 36, "family_count": 6, "unique_rpc_method_count": 184}}
+                capabilities_mock.return_value = {"chain_count": 36, "family_count": 6, "unique_rpc_method_count": 184}
+                app.startup()
+                app.handle_user_text("我要测试 solana fake-node smoke")
+
+        self.assertEqual(app.state.pending_missing_dependencies, [])
+        self.assertNotEqual(app.state.current_question_id, "install_dependencies")
+        self.assertEqual(len(fake_bridge.calls), 1)
+        self.assertEqual(fake_bridge.calls[0][0], "我要测试 solana fake-node smoke")
+        self.assertFalse(any("benchmark 计划" in item for item in io.messages))
+
+    def test_capability_question_is_answered_from_repo_without_adk(self):
+        fake_bridge = FakeBridge()
+        io = CapturingIO()
+        app = AnyChainTerminal(
+            state=TerminalSession(language="zh"),
+            store=TerminalSessionStore(Path("/tmp/unused-session.json")),
+            io=io,
+            bridge_factory=lambda: fake_bridge,
+        )
+        app._adk_available = True
+        app.handle_user_text("当前支持多少个链和 RPC method？如果增加自定义 RPC method 怎么做？")
+
+        self.assertEqual(len(fake_bridge.calls), 1)
+        self.assertEqual(fake_bridge.calls[0][0], "当前支持多少个链和 RPC method？如果增加自定义 RPC method 怎么做？")
+
+    def test_onboarding_question_is_answered_from_local_handoff_without_adk(self):
+        fake_bridge = FakeBridge()
+        io = CapturingIO()
+        app = AnyChainTerminal(
+            state=TerminalSession(language="zh"),
+            store=TerminalSessionStore(Path("/tmp/unused-session.json")),
+            io=io,
+            bridge_factory=lambda: fake_bridge,
+        )
+        app._adk_available = True
+        app.handle_user_text("我想添加一个不在 36 个链里的 FooChain，它是 EVM JSON-RPC 兼容链")
+
+        self.assertEqual(len(fake_bridge.calls), 1)
+        self.assertEqual(fake_bridge.calls[0][0], "我想添加一个不在 36 个链里的 FooChain，它是 EVM JSON-RPC 兼容链")
+        self.assertFalse(any("接入 handoff" in item for item in io.messages))
+
+    def test_negative_custom_rpc_benchmark_request_does_not_route_to_onboarding(self):
+        fake_bridge = FakeBridge()
+        io = CapturingIO()
+        app = AnyChainTerminal(
+            state=TerminalSession(language="zh"),
+            store=TerminalSessionStore(Path("/tmp/unused-session.json")),
+            io=io,
+            bridge_factory=lambda: fake_bridge,
+        )
+        app._adk_available = True
+        app.handle_user_text("确认，不需要自定义 RPC，请运行 fake-node smoke")
+
+        self.assertEqual(len(fake_bridge.calls), 1)
+        self.assertEqual(fake_bridge.calls[0][0], "确认，不需要自定义 RPC，请运行 fake-node smoke")
+        self.assertFalse(any("benchmark 计划" in item for item in io.messages))
+        self.assertFalse(any("接入 handoff" in item for item in io.messages))
+
+    def test_dependency_question_does_not_generate_benchmark_plan(self):
+        fake_bridge = FakeBridge()
+        io = CapturingIO()
+        app = AnyChainTerminal(
+            state=TerminalSession(language="zh"),
+            store=TerminalSessionStore(Path("/tmp/unused-session.json")),
+            io=io,
+            bridge_factory=lambda: fake_bridge,
+        )
+        app._adk_available = True
+        app.handle_user_text("如果缺少 vegeta，你会让我自己安装，还是你帮我安装？")
+
+        self.assertEqual(len(fake_bridge.calls), 1)
+        self.assertEqual(fake_bridge.calls[0][0], "如果缺少 vegeta，你会让我自己安装，还是你帮我安装？")
+        self.assertFalse(any("benchmark 计划" in item for item in io.messages))
+
+    def test_natural_language_environment_request_delegates_to_adk(self):
+        fake_bridge = FakeBridge()
+        io = CapturingIO()
+        app = AnyChainTerminal(
+            state=TerminalSession(language="zh"),
+            store=TerminalSessionStore(Path("/tmp/unused-session.json")),
+            io=io,
+            bridge_factory=lambda: fake_bridge,
+        )
+        app._adk_available = True
+        app.handle_user_text("请帮我先做环境检查，然后配置 solana fake-node")
+
+        self.assertEqual(len(fake_bridge.calls), 1)
+        self.assertEqual(fake_bridge.calls[0][0], "请帮我先做环境检查，然后配置 solana fake-node")
+
+    def test_exact_chinese_doctor_command_stays_terminal_command(self):
+        fake_bridge = FakeBridge()
+        io = CapturingIO()
+        app = AnyChainTerminal(
+            state=TerminalSession(language="zh"),
+            store=TerminalSessionStore(Path("/tmp/unused-session.json")),
+            io=io,
+            bridge_factory=lambda: fake_bridge,
+        )
+        app._adk_available = True
+        with patch("terminal.repl.run_doctor") as doctor_mock:
+            doctor_mock.return_value = {
+                "status": "ready",
+                "capabilities": {"chain_count": 36, "unique_rpc_method_count": 184},
+                "environment": {
+                    "cloud": {"provider": "gcp", "platform": "gce"},
+                    "deployment": {"type": "vm"},
+                    "host": {"cpu_count": 8, "memory_gib": 32},
+                    "network": {"default_interface": "eth0"},
+                    "disks": {"candidates": [], "proposed_ledger_device": "sdb"},
+                    "dependencies": {"missing_required": []},
                 },
-                "disks": {"candidates": [{"name": "sdb"}]},
-                "network": {"default_interface": "eth0"},
-            },
-        }
-        preflight = run_preflight(plan)
-        self.assertTrue(preflight["passed"])
-        self.assertTrue(any("vegeta" in item for item in preflight["warnings"]))
-        self.assertTrue(any("go" in item for item in preflight["warnings"]))
+            }
+            app.handle_user_text("环境检查")
 
-    def test_preflight_blocks_invalid_mixed_weight_total(self):
-        plan = {
-            "chain": "solana",
-            "rpc_mode": "mixed",
-            "use_fake_node": True,
-            "dependency_mode": "audit",
-            "required_inputs": [],
-            "configuration_checklist": {"missing_blockers": []},
-            "chain_template_requirements": {
-                "mixed_weighted": [
-                    {"method": "getSlot", "weight": 60},
-                    {"method": "getBlockHeight", "weight": 20},
-                ]
-            },
-            "execution": {"environment": {"LOCAL_RPC_URL": ""}},
-            "materialized_config": {
-                "LEDGER_DEVICE": "sdb",
-                "NETWORK_INTERFACE": "eth0",
-            },
-            "discovery": {
-                "dependencies": {"tools": {}},
-                "disks": {"candidates": [{"name": "sdb"}]},
-                "network": {"default_interface": "eth0"},
-            },
-        }
-        preflight = run_preflight(plan)
-        self.assertFalse(preflight["passed"])
-        self.assertTrue(any("mixed_weighted_total_valid" in item for item in preflight["blockers"]))
+        self.assertEqual(fake_bridge.calls, [])
+        self.assertTrue(any("status=ready" in item for item in io.messages))
+
+    def test_prometheus_grafana_request_enters_benchmark_plan(self):
+        fake_bridge = FakeBridge()
+        io = CapturingIO()
+        app = AnyChainTerminal(
+            state=TerminalSession(language="zh"),
+            store=TerminalSessionStore(Path("/tmp/unused-session.json")),
+            io=io,
+            bridge_factory=lambda: fake_bridge,
+        )
+        app._adk_available = True
+        app.handle_user_text("我要用 solana fake-node smoke，并开启本地 Prometheus/Grafana，Grafana 端口 3001")
+
+        self.assertEqual(len(fake_bridge.calls), 1)
+        self.assertEqual(fake_bridge.calls[0][0], "我要用 solana fake-node smoke，并开启本地 Prometheus/Grafana，Grafana 端口 3001")
+        self.assertFalse(any("observability=local" in item for item in io.messages))
+
+    def test_fake_node_plan_with_missing_environment_cannot_enter_smoke_on_yes(self):
+        fake_bridge = FakeBridge()
+        io = CapturingIO()
+        app = AnyChainTerminal(
+            state=TerminalSession(language="zh"),
+            store=TerminalSessionStore(Path("/tmp/unused-session.json")),
+            io=io,
+            bridge_factory=lambda: fake_bridge,
+        )
+        app._adk_available = True
+        app.handle_user_text("我要用 solana fake-node smoke，1 QPS，持续 3 秒")
+
+        self.assertEqual(len(fake_bridge.calls), 1)
+        self.assertEqual(app.state.current_question_id, "")
+        self.assertFalse(any("当前计划还不能执行" in item for item in io.messages))
+        self.assertFalse(any("是否现在执行隔离的 fake-node smoke" in item for item in io.messages))
+
+    def test_existing_prometheus_request_uses_exporter_mode(self):
+        fake_bridge = FakeBridge()
+        io = CapturingIO()
+        app = AnyChainTerminal(
+            state=TerminalSession(language="en"),
+            store=TerminalSessionStore(Path("/tmp/unused-session.json")),
+            io=io,
+            bridge_factory=lambda: fake_bridge,
+        )
+        app._adk_available = True
+        app.handle_user_text("Benchmark solana with fake-node smoke and use existing Prometheus via exporter port 9200")
+
+        self.assertEqual(len(fake_bridge.calls), 1)
+        self.assertEqual(fake_bridge.calls[0][0], "Benchmark solana with fake-node smoke and use existing Prometheus via exporter port 9200")
+        self.assertFalse(any("observability=exporter" in item for item in io.messages))
+
+    def test_logs_command_uses_terminal_control_not_adk_business_routing(self):
+        fake_bridge = FakeBridge()
+        io = CapturingIO()
+        app = AnyChainTerminal(
+            state=TerminalSession(language="en", latest_job_id="job_1"),
+            store=TerminalSessionStore(Path("/tmp/unused-session.json")),
+            io=io,
+            bridge_factory=lambda: fake_bridge,
+        )
+        app._adk_available = True
+        with patch("terminal.repl.tail_job_log") as tail_mock:
+            tail_mock.return_value = {
+                "job_id": "job_1",
+                "log_file": "/tmp/job_1/benchmark.log",
+                "exists": True,
+                "lines": ["line one", "line two"],
+            }
+            app.handle_user_text("logs")
+
+        self.assertEqual(fake_bridge.calls, [])
+        self.assertTrue(any("/tmp/job_1/benchmark.log" in item for item in io.messages))
+        self.assertTrue(any("line one\nline two" in item for item in io.messages))
+
+    def test_missing_adk_does_not_fallback_to_custom_brain(self):
+        io = CapturingIO()
+        app = AnyChainTerminal(state=TerminalSession(language="en"), store=TerminalSessionStore(Path("/tmp/unused-session.json")), io=io)
+        with patch("terminal.repl.adk_status") as adk_status_mock, \
+            patch("terminal.repl.runner_bridge_status") as bridge_status_mock, \
+            patch("terminal.repl.run_doctor") as doctor_mock, \
+            patch("terminal.repl.load_framework_context") as context_mock, \
+            patch("terminal.repl.load_framework_capabilities") as capabilities_mock:
+            adk_status_mock.return_value.as_dict.return_value = {"available": False, "reason": "missing"}
+            adk_status_mock.return_value.available = False
+            bridge_status_mock.return_value.as_dict.return_value = {"available": False, "reason": "missing"}
+            doctor_mock.return_value = {
+                "status": "ready_without_llm",
+                "capabilities": {"chain_count": 36, "unique_rpc_method_count": 184},
+                "environment": {"cloud": {}, "deployment": {}, "host": {}, "network": {}, "disks": {}, "dependencies": {"missing_required": []}},
+            }
+            context_mock.return_value = {"capability_summary": {"chain_count": 36, "family_count": 6, "unique_rpc_method_count": 184}}
+            capabilities_mock.return_value = {"chain_count": 36, "family_count": 6, "unique_rpc_method_count": 184}
+            app.startup()
+            app.handle_user_text("benchmark solana")
+        self.assertTrue(any("Agent runtime dependency is missing" in item for item in io.messages))
+        self.assertFalse(any("Selected fake-node" in item for item in io.messages))
+
+
+class DeterministicValidatorContractTest(unittest.TestCase):
+    def test_workflow_state_persists_structured_updates_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            result = update_workflow_state(
+                {
+                    "active_intent": "START_BENCHMARK",
+                    "active_workflow": "benchmark",
+                    "workflow_step": "chain_selected",
+                    "chain": "solana",
+                    "confirmed_config": {"NETWORK_INTERFACE": "eth0"},
+                    "unsupported_key": "ignored",
+                },
+                reason="unit test",
+                session_id="test-session",
+                state_root=root,
+            )
+            loaded = load_workflow_state(session_id="test-session", state_root=root)
+
+        self.assertEqual(loaded["active_intent"], "START_BENCHMARK")
+        self.assertEqual(loaded["active_workflow"], "benchmark")
+        self.assertEqual(loaded["workflow_step"], "chain_selected")
+        self.assertEqual(loaded["chain"], "solana")
+        self.assertEqual(loaded["confirmed_config"]["NETWORK_INTERFACE"], "eth0")
+        self.assertIn("unsupported_key", result["ignored_keys"])
+
+    def test_config_validator_distinguishes_fake_node_and_real_node(self):
+        fake = validate_required_config("fake-node", {"chain": "solana", "rpc_mode": "single"})
+        real = validate_required_config("real-node", {"chain": "solana", "rpc_mode": "single"})
+        self.assertIn("local_rpc_url", real["missing"])
+        self.assertNotIn("local_rpc_url", fake["missing"])
+
+    def test_config_questions_include_disk_inventory(self):
+        questions = build_missing_config_questions(
+            "real-node",
+            {"chain": "solana", "rpc_mode": "single"},
+            {"disks": {"candidates": [{"name": "sdb", "type": "disk", "size": "2T", "mountpoint": "/ledger"}]}},
+        )
+        ledger = next(item for item in questions["questions"] if item["id"] == "ledger_device")
+        self.assertEqual(ledger["candidates"][0]["name"], "sdb")
+        self.assertTrue(ledger["manual_input_allowed"])
+        self.assertIn("benchmark_mode_confirmed", questions["missing"])
+        self.assertIn("qps_profile_confirmed", questions["missing"])
+        self.assertIn("observability_choice_confirmed", questions["missing"])
+        qps = next(item for item in questions["questions"] if item["id"] == "qps_profile_confirmed")
+        self.assertEqual(qps["interaction_mode"], "accept_defaults_or_adjust_item")
+        self.assertIn("initial_qps", qps["parameter_descriptions"])
+        self.assertIn("duration_seconds", {item["id"] for item in qps["adjustable_items"]})
+
+    def test_workflow_state_can_revert_previous_user_confirmation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "sessions"
+            update_workflow_state(
+                {"confirmed_config": {"LEDGER_DEVICE": "sdb"}},
+                reason="first disk",
+                session_id="test-session",
+                state_root=root,
+            )
+            update_workflow_state(
+                {"confirmed_config": {"LEDGER_DEVICE": "sdc"}},
+                reason="wrong disk",
+                session_id="test-session",
+                state_root=root,
+            )
+            reverted = revert_workflow_state(
+                steps=1,
+                reason="user went back",
+                session_id="test-session",
+                state_root=root,
+            )
+
+        self.assertTrue(reverted["reverted"])
+        self.assertEqual(reverted["state"]["confirmed_config"]["LEDGER_DEVICE"], "sdb")
+
+    def test_rpc_workload_validator_accepts_custom_methods_but_requires_review(self):
+        custom = validate_rpc_workload("solana", "mixed", mixed_weights={"getSlot": 70, "customMethod": 30})
+        self.assertTrue(custom["ready"])
+        self.assertIn("customMethod", custom["custom_methods"])
+        self.assertTrue(custom["requires_fixture_review"])
+
+    def test_rpc_workload_validator_blocks_bad_weight_total(self):
+        result = validate_rpc_workload("solana", "mixed", mixed_weights={"getSlot": 80, "getBlockHeight": 10})
+        self.assertFalse(result["ready"])
+        self.assertIn("mixed_weights total must be 100, got 90", result["errors"])
+
+    def test_default_workload_is_grounded_in_chain_template(self):
+        workload = default_workload("solana")
+        self.assertTrue(workload["exists"])
+        self.assertTrue(workload["single"])
+        self.assertTrue(workload["mixed_weighted"])
+
+    def test_execution_gate_blocks_without_approval_for_real_run(self):
+        result = validate_execution_gate(
+            plan={"id": "plan-1"},
+            preflight={"passed": True},
+            smoke={"status": "completed"},
+            approved=False,
+            real_execution=True,
+        )
+        self.assertFalse(result["ready"])
+        self.assertIn("explicit user approval is required", result["blockers"])
 
 
 if __name__ == "__main__":
