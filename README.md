@@ -91,6 +91,41 @@ The Agent is intentionally bounded:
 - It writes Agent-generated runtime config to job-local `runtime.env`, not to
   `config/user_config.sh`.
 
+## Configuration Paths
+
+Choose one of two setup paths before editing benchmark variables.
+
+### AI-Assisted Setup
+
+If you want another AI assistant to configure or operate this project for you,
+give it these files first:
+
+```text
+AGENTS.md
+README.md
+config/agent_config.sh
+agent/README.md
+docs/zh/anychain-agent-ai-work-gate.md
+```
+
+`AGENTS.md` is the short handoff guide for AI assistants. It explains how to
+configure provider credentials safely, where local secrets belong, which
+commands validate the Agent, and what an assistant must not bypass. Real API
+keys, ADC settings, Vertex settings, and other local provider choices should go
+into `config/agent_config.local.sh`, which is gitignored.
+
+For code changes, the assistant must also read `AI_CODING_GUIDE.md` before
+editing files. For user-only setup, `AGENTS.md` plus this README is usually
+enough to get started.
+
+### Manual Setup
+
+If you prefer to configure the project yourself, continue with the
+configuration model below. Start with `config/agent_config.sh`, put real local
+secrets in `config/agent_config.local.sh`, then launch `./bin/anychain-agent`.
+The Agent will inspect the benchmark environment and ask for missing benchmark
+values during the conversation.
+
 ## Configuration Model
 
 Most users only need one file before starting the Agent:
