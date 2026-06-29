@@ -24,7 +24,7 @@ from knowledge.framework_context import load_framework_context, render_framework
 from llm import config as llm_config_module  # noqa: E402
 from llm.config import load_llm_config  # noqa: E402
 from llm.google_auth import credential_plan  # noqa: E402
-from llm.providers import provider_from_config  # noqa: E402
+from llm.providers import _vertex_openai_base_url, provider_from_config  # noqa: E402
 from runners.materialize import build_runtime_env  # noqa: E402
 from runners.guardrails import validate_execution_plan  # noqa: E402
 from runners.job_manager import get_job, submit_job  # noqa: E402
@@ -736,6 +736,29 @@ class AgentRuntimeContractTest(unittest.TestCase):
             })
         self.assertEqual(adc_config.google_project, "adc-quota-project")
         self.assertEqual(adc_config.validate(), [])
+
+        global_vertex_config = load_llm_config({
+            "LLM_PROVIDER": "gemini",
+            "LLM_MODEL": "gemini-3.1-pro-preview",
+            "LLM_AUTH_MODE": "google_adc",
+            "GOOGLE_CLOUD_PROJECT": "example-project",
+            "GOOGLE_CLOUD_LOCATION": "global",
+        })
+        self.assertEqual(
+            _vertex_openai_base_url(global_vertex_config),
+            "https://aiplatform.googleapis.com/v1/projects/example-project/locations/global/endpoints/openapi",
+        )
+        regional_vertex_config = load_llm_config({
+            "LLM_PROVIDER": "gemini",
+            "LLM_MODEL": "gemini-3.1-pro-preview",
+            "LLM_AUTH_MODE": "google_adc",
+            "GOOGLE_CLOUD_PROJECT": "example-project",
+            "GOOGLE_CLOUD_LOCATION": "us-central1",
+        })
+        self.assertEqual(
+            _vertex_openai_base_url(regional_vertex_config),
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/example-project/locations/us-central1/endpoints/openapi",
+        )
 
         json_key_config = load_llm_config({
             "LLM_PROVIDER": "gemini",

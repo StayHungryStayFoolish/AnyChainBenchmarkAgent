@@ -79,10 +79,7 @@ class VertexGeminiProvider:
             raise RuntimeError("openai is required for Gemini on Vertex OpenAI-compatible calls") from exc
 
         token = get_google_access_token(self.config)
-        base_url = (
-            f"https://{self.config.google_location}-aiplatform.googleapis.com/v1/"
-            f"projects/{self.config.google_project}/locations/{self.config.google_location}/endpoints/openapi"
-        )
+        base_url = _vertex_openai_base_url(self.config)
         client = OpenAI(api_key=token, base_url=base_url)
         response = client.chat.completions.create(
             model=f"google/{self.config.model}",
@@ -98,6 +95,24 @@ class VertexGeminiProvider:
             provider=self.config.provider,
             raw=response.model_dump() if hasattr(response, "model_dump") else {},
         )
+
+
+def _vertex_aiplatform_host(location: str) -> str:
+    """Return the Vertex AI API host for a location.
+
+    Regional endpoints use `<region>-aiplatform.googleapis.com`, but the
+    special `global` location uses `aiplatform.googleapis.com`.
+    """
+    normalized = location.strip().lower()
+    return "aiplatform.googleapis.com" if normalized == "global" else f"{normalized}-aiplatform.googleapis.com"
+
+
+def _vertex_openai_base_url(config: LLMConfig) -> str:
+    location = config.google_location.strip()
+    return (
+        f"https://{_vertex_aiplatform_host(location)}/v1/"
+        f"projects/{config.google_project}/locations/{location}/endpoints/openapi"
+    )
 
 
 class GeminiAPIKeyProvider:
