@@ -227,6 +227,18 @@ bash scripts/install_agent_deps.sh --yes --with-gcloud
 gcloud auth application-default login
 ```
 
+部分 Google/Agent Platform 托管环境不会要求你直接执行标准本地登录命令，而是会提供
+一个 ADC bootstrap 脚本 URL。如果你的环境提供了这个 URL，需要先执行该 bootstrap
+授权脚本，再启动 Agent，例如：
+
+```bash
+bash <(curl -sSL https://storage.googleapis.com/cloud-samples-data/adc/setup_adc.sh)
+```
+
+该流程会完成环境授权，并写入 Application Default Credentials，通常位于
+`~/.config/gcloud/application_default_credentials.json`。使用
+`LLM_AUTH_MODE=google_adc` 前，Agent 的 `doctor` 步骤应该确认 ADC 已经存在。
+
 如果 Agent 运行在已经绑定 service account 的 GCE/GKE/Cloud Run 上，并且该身份已经有
 Vertex AI 权限，运行时认证不要求安装 `gcloud`。
 

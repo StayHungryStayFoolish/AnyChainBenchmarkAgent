@@ -252,6 +252,20 @@ is used:
 gcloud auth application-default login
 ```
 
+Some managed Google/Agent Platform environments provide an ADC bootstrap script
+instead of asking you to run the standard local login command directly. If your
+environment gives you that bootstrap URL, run it before starting the Agent, for
+example:
+
+```bash
+bash <(curl -sSL https://storage.googleapis.com/cloud-samples-data/adc/setup_adc.sh)
+```
+
+That flow authorizes the environment and writes Application Default Credentials,
+usually under `~/.config/gcloud/application_default_credentials.json`. The
+Agent's `doctor` step should verify that ADC is present before using
+`LLM_AUTH_MODE=google_adc`.
+
 On GCE/GKE/Cloud Run with an attached service account, `gcloud` is not required
 for runtime auth if the workload identity already has Vertex AI access.
 
