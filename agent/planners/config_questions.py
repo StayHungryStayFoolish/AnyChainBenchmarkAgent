@@ -7,6 +7,8 @@ from typing import Any
 
 def required_questions(plan: dict[str, Any]) -> list[dict[str, Any]]:
     questions: list[dict[str, Any]] = []
+    if _is_sync_observe_plan(plan):
+        return _dedupe_questions(_sync_observe_questions(plan))
 
     for item in plan.get("required_inputs", []):
         if item in _SPECIALIZED_REQUIRED_QUESTIONS:
@@ -276,8 +278,62 @@ def _required_prompt(item: str) -> str:
         "qps_profile_confirmed": "Confirm INITIAL_QPS, MAX_QPS, QPS_STEP, and DURATION for the selected mode.",
         "observability_choice_confirmed": "Choose disabled, local Prometheus/Grafana, or exporter-only observability mode.",
         "chain_template_reviewed": "Review selected chain template endpoints, TARGET_* sample variables, and default workload.",
+        "sync_observe_stop_condition": "Choose how sync-observe should stop: run until stopped, fixed duration, or until synced.",
+        "node_prometheus_metrics_url": "Provide the node Prometheus metrics endpoint if available, or leave it unset.",
+        "node_process_identity": "Provide the node process PID or command-line fragments for CPU/thread attribution.",
     }
     return prompts.get(item, f"Provide required value: {item}")
+
+
+def _is_sync_observe_plan(plan: dict[str, Any]) -> bool:
+    value = plan.get("workflow_type") or plan.get("run_mode") or plan.get("mode")
+    return str(value or "").strip().lower().replace("-", "_") in {"sync_observe", "sync", "observe_sync"}
+
+
+def _sync_observe_questions(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    confirmed = set(plan.get("confirmed_inputs", []))
+    questions: list[dict[str, Any]] = []
+    if "sync_observe_stop_condition" not in confirmed:
+        questions.append(_with_manual_input({
+            "id": "sync_observe_stop_condition",
+            "category": "sync_observe",
+            "severity": "blocker",
+            "prompt": (
+                "Choose sync-observe stop condition. This mode observes node sync/resource behavior "
+                "without RPC workload, proxy, Vegeta, or QPS profile."
+            ),
+            "candidates": [
+                {"id": "until_stopped", "description": "Run until the user stops it; default for long sync observation."},
+                {"id": "duration", "description": "Run for a fixed duration in seconds."},
+                {"id": "until_synced", "description": "Run until the chain sync-health model reports synced."},
+            ],
+        }))
+    if "node_prometheus_metrics_url" not in confirmed:
+        questions.append(_with_manual_input({
+            "id": "node_prometheus_metrics_url",
+            "category": "sync_observe",
+            "severity": "confirm",
+            "prompt": (
+                "Confirm whether the node exposes a Prometheus metrics endpoint for MGas/s or "
+                "client-native execution metrics. If unavailable, reports still show block height, CPU, disk, and network."
+            ),
+            "manual_input_hint": "Enter a metrics URL such as http://127.0.0.1:6060/debug/metrics/prometheus, or reply N if unavailable.",
+        }))
+    if "node_process_identity" not in confirmed:
+        questions.append(_with_manual_input({
+            "id": "node_process_identity",
+            "category": "sync_observe",
+            "severity": "blocker",
+            "prompt": "Confirm the node process PID or process-name/command-line fragment for CPU and thread attribution.",
+        }))
+    if "mainnet_rpc_url_reviewed" not in confirmed:
+        questions.append(_with_manual_input({
+            "id": "mainnet_rpc_url_reviewed",
+            "category": "sync_observe",
+            "severity": "blocker",
+            "prompt": "Confirm MAINNET_RPC_URL or the chain-template sync-health behavior used for target-height comparison.",
+        }))
+    return questions
 
 
 _SPECIALIZED_REQUIRED_QUESTIONS = {

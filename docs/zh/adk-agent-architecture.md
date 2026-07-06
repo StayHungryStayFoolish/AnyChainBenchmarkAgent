@@ -122,6 +122,25 @@ ADK `google_search` is intentionally narrow:
 Other model providers must report web research as unavailable unless the
 repository explicitly adds and verifies a provider-specific search integration.
 
+## Sync-Observe 边界
+
+`sync-observe` 是节点同步/资源观察的一等 workflow，不属于 RPC workload 路径。
+当用户希望观察节点追高速度、MGas/s、节点进程 CPU/线程热点、磁盘 latency/iowait
+或网络行为，并且不希望发送 benchmark RPC 流量时，ADK 应该路由到
+sync-observe workflow。
+
+该 workflow 需要确认：
+
+- chain 和 sync-health/reference 行为；
+- 资源元数据，包括磁盘和网络 baseline；
+- 用于 CPU/线程归因的节点进程身份；
+- 可选的 `NODE_PROMETHEUS_METRICS_URL`，用于 MGas/s 或客户端原生 execution
+  metrics；
+- 停止条件：用户停止、固定 duration，或 until synced。
+
+除非用户明确切换回 RPC benchmark，否则该 workflow 不应询问 RPC mode、自定义 RPC
+workload、mixed weights、Vegeta 或 QPS profile。
+
 ## Development Gates
 
 Before changing Agent code, read:

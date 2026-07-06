@@ -7,6 +7,13 @@ AnyChain Benchmark Agent: from the entry command, through RPC workload
 generation and monitoring, to HTML reports, archives, and the optional
 Prometheus/Grafana data stream.
 
+The normal `--quick`, `--standard`, and `--intensive` modes are RPC benchmark
+flows. The `--sync-observe` mode is a separate observation flow: it watches
+sync progress and resource behavior without generating RPC benchmark load,
+without RPC proxy traffic, without Vegeta targets, and without QPS ramping.
+It also does not require `vegeta_results` artifacts for report success; reports
+come from monitoring, sync-health, node execution, disk, CPU, and network data.
+
 It is intentionally based on the current code path rather than older design
 notes. The key entry points are:
 
@@ -54,6 +61,42 @@ flowchart TD
 The runtime is built around file contracts. Collectors write timestamped CSV and
 JSON artifacts. Analysis and reporting consume those artifacts by path, not by
 calling collectors directly.
+
+## Sync-Observe Runtime Flow
+
+`--sync-observe` is used when the user wants to understand catch-up speed,
+MGas/s when node metrics expose it, node process CPU/thread hotspots, disk
+latency/iowait context, and network behavior during sync. It reuses monitoring,
+analysis, report generation, and archiving, but intentionally skips the RPC
+workload path.
+
+```mermaid
+flowchart TD
+    User["User runs --sync-observe"] --> Config["Load config layers and chain sync-health model"]
+    Config --> Clean["Prepare clean runtime state"]
+    Clean --> Monitor["Start monitoring coordinator"]
+    Monitor --> Observe["Observe until stopped, duration expires, or node is synced"]
+    Observe --> Analysis["Run offline analysis"]
+    Analysis --> Report["Generate HTML reports and sync execution chart"]
+    Report --> Archive["Archive current run"]
+    Archive --> Cleanup["Stop monitors and cleanup runtime state"]
+
+    Monitor --> PerfCSV["performance_session.csv<br/>system, disk, network, node execution"]
+    Monitor --> HeightCSV["block_height_monitor_session.csv<br/>sync-health and height progress"]
+    PerfCSV --> Analysis
+    HeightCSV --> Analysis
+```
+
+Required inputs for this path are chain/sync-health behavior, resource
+metadata, node process identity, and a stop condition. `NODE_PROMETHEUS_METRICS_URL`
+is optional; if the client does not expose MGas/s or gas-used metrics, the
+report shows `execution_metric_status` and leaves MGas/s as unavailable or zero
+according to the source metric.
+
+Sync-observe does not record fake-node fixtures. A node may first download a
+peer snapshot and then catch up from that snapshot height; the framework
+observes that behavior with endpoint/sync-health sanity checks rather than
+recording RPC request/response fixtures.
 
 ## Step 1: Configuration Loading
 

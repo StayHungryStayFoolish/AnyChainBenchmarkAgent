@@ -18,6 +18,20 @@ WORKLOAD_CONFIRMATION_KEYS = frozenset({
     "mixed_weights_confirmed",
 })
 
+SYNC_OBSERVE_BLOCKERS = (
+    "chain",
+    "sync_observe_stop_condition",
+    "ledger_device",
+    "data_vol_type",
+    "data_vol_size",
+    "data_vol_max_iops",
+    "data_vol_max_throughput",
+    "network_interface",
+    "network_max_bandwidth_gbps",
+    "node_process_identity",
+    "mainnet_rpc_url_reviewed",
+)
+
 ENV_TO_KEY = {
     "BLOCKCHAIN_NODE": "chain",
     "RPC_MODE": "rpc_mode",
@@ -46,6 +60,17 @@ ENV_TO_KEY = {
 def validate_required_config(target_mode: str | None, confirmed_config: dict[str, Any]) -> dict[str, Any]:
     """Return required-config status for fake-node or real-node benchmarks."""
     values = _canonical_values(confirmed_config)
+    if _is_sync_observe(values):
+        missing = [key for key in SYNC_OBSERVE_BLOCKERS if key not in values or _is_missing_value(values.get(key))]
+        return {
+            "target_mode": "sync-observe",
+            "ready": not missing,
+            "missing": missing,
+            "required_groups": {
+                "sync_observe": list(SYNC_OBSERVE_BLOCKERS),
+                "environment": list(ENVIRONMENT_BLOCKERS),
+            },
+        }
     if target_mode == "fake-node":
         values["use_fake_node"] = True
     elif target_mode == "real-node":
@@ -72,6 +97,8 @@ def build_missing_config_questions(
 ) -> dict[str, Any]:
     """Build user questions for missing or ambiguous config values."""
     values = _canonical_values(confirmed_config)
+    if _is_sync_observe(values):
+        return _build_sync_observe_missing_questions(values, discovery or {}, preferred_group=preferred_group)
     if target_mode == "fake-node":
         values["use_fake_node"] = True
     elif target_mode == "real-node":
@@ -159,7 +186,55 @@ def _canonical_values(confirmed_config: dict[str, Any]) -> dict[str, Any]:
         elif target == "real-node":
             values["use_fake_node"] = False
     _apply_fake_node_defaults(values)
+    if "NODE_PROMETHEUS_METRICS_URL" in values and "node_prometheus_metrics_url" not in values:
+        values["node_prometheus_metrics_url"] = values["NODE_PROMETHEUS_METRICS_URL"]
+    if "NODE_PROCESS_PID" in values and "node_process_identity" not in values:
+        values["node_process_identity"] = values["NODE_PROCESS_PID"]
+    if "BLOCKCHAIN_PROCESS_NAMES" in values and "node_process_identity" not in values:
+        values["node_process_identity"] = values["BLOCKCHAIN_PROCESS_NAMES"]
+    if "SYNC_OBSERVE_STOP_CONDITION" in values and "sync_observe_stop_condition" not in values:
+        values["sync_observe_stop_condition"] = values["SYNC_OBSERVE_STOP_CONDITION"]
     return values
+
+
+def _is_sync_observe(values: dict[str, Any]) -> bool:
+    value = values.get("workflow_type") or values.get("run_mode") or values.get("mode")
+    return str(value or "").strip().lower().replace("-", "_") in {"sync_observe", "sync", "observe_sync"}
+
+
+def _build_sync_observe_missing_questions(
+    values: dict[str, Any],
+    discovery: dict[str, Any],
+    preferred_group: str | None = None,
+) -> dict[str, Any]:
+    missing = [key for key in SYNC_OBSERVE_BLOCKERS if key not in values or _is_missing_value(values.get(key))]
+    disks = discovery.get("disks", {}) if isinstance(discovery.get("disks"), dict) else {}
+    candidates = _disk_candidates(disks)
+    questions = [
+        _typed_question({
+            "id": key,
+            "severity": "blocker",
+            "prompt": _prompt_for_key(key),
+            "manual_input_allowed": True,
+            "allow_manual_input": True,
+        })
+        for key in missing
+    ]
+    next_question = {}
+    preferred_keys = _question_keys_for_group(preferred_group)
+    for key in preferred_keys:
+        if key in missing:
+            next_question = _question_for_next_key(key, values, discovery, candidates)
+            break
+    if not next_question and missing:
+        next_question = _question_for_next_key(missing[0], values, discovery, candidates)
+    return {
+        "ready": not missing,
+        "missing": missing,
+        "questions": questions,
+        "next_question": next_question,
+        "disk_candidates": candidates,
+    }
 
 
 def _apply_fake_node_defaults(values: dict[str, Any]) -> None:
@@ -364,6 +439,39 @@ def _question_for_next_key(
                 },
             ],
         })
+    if key == "sync_observe_stop_condition":
+        return _typed_question({
+            "id": "sync_observe_stop_condition",
+            "kind": "numbered_choice",
+            "field": "sync_observe_stop_condition",
+            "prompt": "Choose sync-observe stop condition: 1 until stopped, 2 fixed duration, or 3 until synced.",
+            "options": [
+                {
+                    "id": "1",
+                    "value": "until_stopped",
+                    "label": "until stopped",
+                    "state_patch": {
+                        "confirmed_config": {"sync_observe_stop_condition": "until_stopped"},
+                    },
+                },
+                {
+                    "id": "2",
+                    "value": "duration",
+                    "label": "fixed duration",
+                    "state_patch": {
+                        "confirmed_config": {"sync_observe_stop_condition": "duration"},
+                    },
+                },
+                {
+                    "id": "3",
+                    "value": "until_synced",
+                    "label": "until synced",
+                    "state_patch": {
+                        "confirmed_config": {"sync_observe_stop_condition": "until_synced"},
+                    },
+                },
+            ],
+        })
     return _typed_question({
         "id": key,
         "kind": _expected_answer_for(key),
@@ -539,6 +647,9 @@ def _prompt_for_key(key: str) -> str:
         "accounts_vol_max_throughput": "Confirm ACCOUNTS_VOL_MAX_THROUGHPUT in MiB/s for the accounts/state disk.",
         "network_interface": "Confirm the network interface used by the node.",
         "network_max_bandwidth_gbps": "Confirm NETWORK_MAX_BANDWIDTH_GBPS for saturation analysis.",
+        "sync_observe_stop_condition": "Choose sync-observe stop condition: run until stopped, fixed duration, or until synced.",
+        "node_prometheus_metrics_url": "Confirm NODE_PROMETHEUS_METRICS_URL if the node exposes Prometheus metrics, or leave it unavailable.",
+        "node_process_identity": "Confirm the node PID or process-name/command-line fragment for CPU/thread attribution.",
     }
     return prompts.get(key, f"Provide required value: {key}")
 

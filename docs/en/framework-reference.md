@@ -180,7 +180,36 @@ QPS_COOLDOWN=0 \
 ./blockchain_node_benchmark.sh --quick --single --fake-node
 ```
 
-See [Local closed-loop testing with fake-node](./docs/en/local-closed-loop-testing.md).
+See [Local closed-loop testing with fake-node](local-closed-loop-testing.md).
+
+### 3D. Observe Node Sync Without RPC Load
+
+Use `sync-observe` when the goal is to observe a node while it is catching up
+or syncing, rather than to generate RPC benchmark traffic. This mode skips RPC
+workload generation, RPC proxy traffic, Vegeta, and QPS ramping. It still runs
+the monitoring/report/archive path.
+
+```bash
+BLOCKCHAIN_NODE=bsc \
+LOCAL_RPC_URL=http://127.0.0.1:8545 \
+MAINNET_RPC_URL=https://bsc-dataseed.binance.org \
+NODE_PROMETHEUS_METRICS_URL=http://127.0.0.1:6060/debug/metrics/prometheus \
+BLOCKCHAIN_PROCESS_NAMES=bsc \
+./blockchain_node_benchmark.sh --sync-observe --duration 300
+```
+
+Stop options:
+
+- no stop flag: run until the user stops the process;
+- `--duration <seconds>`: run for a fixed observation window;
+- `--until-synced`: stop when the selected chain sync-health model reports the
+  node is synced.
+
+Reports include block-height progress, MGas/s when exposed by node metrics,
+node process CPU/thread hotspot signals, system CPU iowait, disk latency and
+queue depth, disk throughput/IOPS/utilization, and network RX/TX. If a client
+does not expose MGas/s, the report records the metric source/status so zero or
+missing values can be distinguished from framework data loss.
 
 ### 4. Find the Report
 

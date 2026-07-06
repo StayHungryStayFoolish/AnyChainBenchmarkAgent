@@ -63,6 +63,9 @@ tool orchestration；确定性工具和 validator 负责最终执行门禁。
   request/response 证据、fixture 录制和 smoke 后，才视为可用支持。
 - 记录每个 method 的状态、成功/失败次数和 P50/P90/P99 延迟。
 - 监控 CPU、内存、磁盘、网络、cgroup、同步健康和监控系统自身开销。
+- 提供 `sync-observe` 模式，用于观察节点追高/同步过程，不生成 RPC 压测流量、
+  不启动 proxy/Vegeta/QPS ramp。报告会展示区块高度进展、客户端 metrics 暴露时的
+  MGas/s、节点进程 CPU/线程热点、磁盘 latency/iowait 背景和网络吞吐。
 - 生成 HTML 报告并归档每次运行。
 - 通过只读 exporter 可选接入 Prometheus/Grafana。
 - 提供 JSON CLI tools、OpenAI-compatible tool schema 和稳定的 `tool-call`
@@ -312,6 +315,10 @@ Agent> ...逐项确认 host、磁盘、网络、RPC mode、workload 和可选 ob
 
 User> 使用 mixed，getSlot 70%，getBlockHeight 30%。
 Agent> ...生成 benchmark plan，执行 preflight，然后在 smoke 和正式 benchmark 前再次确认...
+
+User> 观察 BSC 节点同步，不要发 RPC 压测流量。
+Agent> ...进入 sync-observe，确认 sync-health 参考、节点进程、可选 metrics endpoint、
+       磁盘/网络元数据和停止条件...
 ```
 
 在新环境中建议先输入 `doctor`。它会以只读方式检查 cloud/deployment 识别结果、

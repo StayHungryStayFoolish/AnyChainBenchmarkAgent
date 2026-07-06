@@ -60,6 +60,22 @@ def load_framework_capabilities(root: str | Path = REPO_ROOT) -> dict[str, Any]:
             "proxy_extraction for per-method attribution",
             "tools/fake-node/fixtures/<chain>/ for local closed-loop responses",
         ],
+        "run_modes": [
+            {
+                "id": "rpc_benchmark",
+                "entrypoint": "./blockchain_node_benchmark.sh --quick|--standard|--intensive",
+                "purpose": "Generate RPC workload, run Vegeta through the RPC proxy, monitor resources, analyze per-method latency/errors, and archive reports.",
+                "requires": ["chain", "target mode", "RPC mode", "workload", "QPS profile", "resource metadata"],
+            },
+            {
+                "id": "sync_observe",
+                "entrypoint": "./blockchain_node_benchmark.sh --sync-observe",
+                "purpose": "Observe node sync progress and runtime resources without RPC workload, proxy, Vegeta, or QPS ramp.",
+                "stop_conditions": ["until stopped", "fixed duration", "until synced"],
+                "requires": ["chain", "sync-health target/reference decision", "resource metadata", "node process identity"],
+                "optional": ["NODE_PROMETHEUS_METRICS_URL for MGas/s or client-native execution metrics"],
+            },
+        ],
     }
 
 

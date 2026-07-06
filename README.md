@@ -77,6 +77,10 @@ Preview the generated benchmark report before running the framework:
   before treating them as supported.
 - Records per-method status, success/failure counts, and P50/P90/P99 latency.
 - Monitors CPU, memory, disk, network, cgroup, sync health, and monitor overhead.
+- Provides `sync-observe` mode for node catch-up observation without RPC load,
+  proxy traffic, Vegeta, or QPS ramp. Reports include block-height progress,
+  MGas/s when client metrics expose it, node process CPU/thread hotspots, disk
+  latency/iowait context, and network throughput.
 - Produces HTML reports and archives every run.
 - Provides optional Prometheus/Grafana telemetry through a read-only exporter.
 - Exposes JSON CLI tools, an OpenAI-compatible tool schema, and a stable
@@ -347,6 +351,10 @@ Agent> ...confirms host, disk, network, RPC mode, workload, and optional
 User> Use mixed workload with getSlot 70% and getBlockHeight 30%.
 Agent> ...generates a benchmark plan, runs preflight, then asks before smoke
        and again before launching the benchmark...
+
+User> Observe my BSC node while it is syncing. Do not send RPC benchmark load.
+Agent> ...routes to sync-observe, confirms sync-health reference, node process,
+       optional metrics endpoint, disk/network metadata, and stop condition...
 ```
 
 Use a readiness check first on a new host. The Agent has a read-only doctor tool

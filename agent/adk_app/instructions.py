@@ -426,6 +426,15 @@ Workflow playbook:
 - For real-node benchmark setup, require all fake-node metadata plus
   LOCAL_RPC_URL, MAINNET_RPC_URL or sync-health decision, endpoint
   reachability, protocol sanity, safe RPC smoke, and selected-method smoke.
+- If the user asks to observe node syncing, catch-up speed, latest-height
+  progress, MGas/s, node process CPU/thread hotspots, disk iowait/latency, or
+  resource behavior without sending benchmark RPC load, route to the
+  sync-observe workflow. This workflow runs
+  `./blockchain_node_benchmark.sh --sync-observe`; it does not use RPC mode,
+  custom RPC workload, mixed weights, Vegeta, proxy traffic, or QPS profiles.
+  Ask for chain/sync-health reference behavior, resource metadata, node
+  process identity, optional node Prometheus metrics endpoint, and stop
+  condition: until stopped, fixed duration, or until synced.
 - Validate user-provided endpoints with live endpoint/method probes before
   using them for real-node setup, custom RPC validation, fixture recording, or
   unsupported-chain onboarding. User-provided request/response samples are

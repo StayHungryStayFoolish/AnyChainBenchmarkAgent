@@ -59,6 +59,7 @@
   "blockchain_node_resource_usage": "Blockchain node resource usage",
   "blockchain_node_specific_analysis": "Blockchain Node Specific Analysis",
   "blockchain_node_sync_analysis": "Blockchain Node Sync Analysis",
+  "node_sync_execution_analysis": "Node Sync Execution Analysis",
   "blockchain_node_type": "Blockchain Node Type",
   "blockchain_related_processes": "Blockchain-related processes resource proportion",
   "blockchain_resource_analysis": "Blockchain node resource consumption analysis:",

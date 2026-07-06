@@ -32,6 +32,24 @@ COMMON_REQUIRED = {
     "rpc_param_samples_confirmed": "Confirm TARGET_* parameter samples for the selected RPC methods.",
 }
 
+SYNC_OBSERVE_REQUIRED = {
+    "chain": "Chain template name used for sync-health interpretation.",
+    "sync_observe_stop_condition": "Confirm sync-observe stop condition: run until stopped, fixed duration, or until synced.",
+    "ledger_device": "Ledger/data disk device used for sync-resource charts and bottleneck attribution.",
+    "data_vol_type": "Ledger/data disk type used for report metadata and baseline interpretation.",
+    "data_vol_size": "Ledger/data disk size in GiB.",
+    "data_vol_max_iops": "Provisioned data disk IOPS baseline.",
+    "data_vol_max_throughput": "Provisioned data disk throughput baseline in MiB/s.",
+    "network_interface": "Network interface used by the node.",
+    "network_max_bandwidth_gbps": "Instance or pod network bandwidth baseline in Gbps.",
+    "node_process_identity": "Node process PID or command-line fragment for node CPU/thread attribution.",
+    "mainnet_rpc_url_reviewed": "Confirm MAINNET_RPC_URL or selected chain-template sync-health behavior for target-height comparison.",
+}
+
+SYNC_OBSERVE_OPTIONAL = {
+    "node_prometheus_metrics_url": "Optional node Prometheus metrics endpoint for MGas/s and client-native execution metrics.",
+}
+
 ENVIRONMENT_REVIEW = {
     "cloud_provider": "Detected cloud provider: gcp, aws, azure, or other.",
     "deployment_platform": "Detected runtime platform: GCE, EC2, GKE, EKS, self-hosted Kubernetes, Docker/container, or VM.",
@@ -65,17 +83,24 @@ def build_configuration_checklist(request: dict[str, Any], plan: dict[str, Any])
     """Return user-facing checklist grouped by Agent, benchmark, and advanced layers."""
     use_fake_node = plan.get("use_fake_node")
     request_values = _flatten_request_values(request, plan)
+    workload_type = _workload_type(request, plan)
 
     benchmark_items = []
-    for key, description in COMMON_REQUIRED.items():
-        benchmark_items.append(_item(key, description, _is_present(key, request_values.get(key)), "blocker"))
-    for key, description in RUNTIME_BASELINE_REQUIRED.items():
-        benchmark_items.append(_item(key, description, bool(request_values.get(key)), "blocker"))
-    if request_values.get("rpc_mode") == "mixed":
-        benchmark_items.append(_item("mixed_weights_confirmed", "Confirm mixed RPC method weights total 100.", bool(request_values.get("mixed_weights_confirmed")), "blocker"))
-    if use_fake_node is False:
-        for key, description in ENDPOINT_REQUIRED.items():
+    if workload_type == "sync_observe":
+        for key, description in SYNC_OBSERVE_REQUIRED.items():
+            benchmark_items.append(_item(key, description, _is_present(key, request_values.get(key)), "blocker"))
+        for key, description in SYNC_OBSERVE_OPTIONAL.items():
+            benchmark_items.append(_item(key, description, bool(request_values.get(key)), "info"))
+    else:
+        for key, description in COMMON_REQUIRED.items():
+            benchmark_items.append(_item(key, description, _is_present(key, request_values.get(key)), "blocker"))
+        for key, description in RUNTIME_BASELINE_REQUIRED.items():
             benchmark_items.append(_item(key, description, bool(request_values.get(key)), "blocker"))
+        if request_values.get("rpc_mode") == "mixed":
+            benchmark_items.append(_item("mixed_weights_confirmed", "Confirm mixed RPC method weights total 100.", bool(request_values.get("mixed_weights_confirmed")), "blocker"))
+        if use_fake_node is False:
+            for key, description in ENDPOINT_REQUIRED.items():
+                benchmark_items.append(_item(key, description, bool(request_values.get(key)), "blocker"))
     environment_items = [
         _item(key, description, bool(request_values.get(key)), "confirm")
         for key, description in ENVIRONMENT_REVIEW.items()
@@ -111,7 +136,7 @@ def build_configuration_checklist(request: dict[str, Any], plan: dict[str, Any])
         "chain_template": chain_items,
         "advanced": advanced_items,
         "missing_blockers": missing_blockers,
-        "summary": _summary(use_fake_node, missing_blockers),
+        "summary": _summary(use_fake_node, missing_blockers, workload_type),
     }
 
 
@@ -160,6 +185,16 @@ def _flatten_request_values(request: dict[str, Any], plan: dict[str, Any]) -> di
         "accounts_vol_max_throughput": request.get("accounts_vol_max_throughput") or materialized.get("ACCOUNTS_VOL_MAX_THROUGHPUT"),
         "network_interface": request.get("network_interface") or materialized.get("NETWORK_INTERFACE"),
         "network_max_bandwidth_gbps": request.get("network_max_bandwidth_gbps") or materialized.get("NETWORK_MAX_BANDWIDTH_GBPS"),
+        "sync_observe_stop_condition": request.get("sync_observe_stop_condition") or materialized.get("SYNC_OBSERVE_STOP_CONDITION"),
+        "node_prometheus_metrics_url": request.get("node_prometheus_metrics_url") or materialized.get("NODE_PROMETHEUS_METRICS_URL"),
+        "node_process_identity": (
+            request.get("node_process_pid")
+            or request.get("blockchain_process_names")
+            or request.get("process_names")
+            or materialized.get("NODE_PROCESS_PID")
+            or materialized.get("BLOCKCHAIN_PROCESS_NAMES_STR")
+        ),
+        "mainnet_rpc_url_reviewed": request.get("mainnet_rpc_url_reviewed") or materialized.get("MAINNET_RPC_URL"),
     }
 
 
@@ -199,7 +234,17 @@ def _confirmations(request: dict[str, Any], plan: dict[str, Any]) -> set[str]:
     return set(request.get("confirmations", []) or plan.get("confirmed_inputs", []) or [])
 
 
-def _summary(use_fake_node: bool | None, missing_blockers: list[str]) -> str:
+def _workload_type(request: dict[str, Any], plan: dict[str, Any]) -> str:
+    value = plan.get("workflow_type") or plan.get("run_mode") or request.get("workflow_type") or request.get("run_mode")
+    text = str(value or "").strip().lower().replace("-", "_")
+    return "sync_observe" if text in {"sync_observe", "sync", "observe_sync"} else "rpc_benchmark"
+
+
+def _summary(use_fake_node: bool | None, missing_blockers: list[str], workload_type: str = "rpc_benchmark") -> str:
+    if workload_type == "sync_observe":
+        if not missing_blockers:
+            return "sync-observe configuration has no blocking checklist gaps."
+        return f"sync-observe configuration is missing: {', '.join(missing_blockers)}"
     if use_fake_node is True:
         mode = "fake-node"
     elif use_fake_node is False:

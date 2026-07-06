@@ -6,6 +6,12 @@
 RPC workload 生成、监控采集，到 HTML 报告、归档和可选 Prometheus/Grafana
 数据流。
 
+普通的 `--quick`、`--standard`、`--intensive` 是 RPC benchmark 流程。
+`--sync-observe` 是独立的同步观察流程：它观察节点追高/同步和资源行为，
+不生成 RPC 压测流量、不走 RPC proxy、不生成 Vegeta targets，也不执行 QPS ramp。
+它也不要求 `vegeta_results` 产物作为报告成功条件；报告来自 monitoring、
+sync-health、node execution、disk、CPU 和 network 数据。
+
 关键入口：
 
 - `blockchain_node_benchmark.sh`
@@ -51,6 +57,37 @@ flowchart TD
 
 框架以文件契约为核心。collector 写入带时间戳的 CSV/JSON，analysis 和 report
 按路径消费这些文件，而不是直接调用 collector。
+
+## Sync-Observe 运行流程
+
+`--sync-observe` 用于观察节点追高速度、客户端 metrics 暴露时的 MGas/s、
+节点进程 CPU/线程热点、磁盘 latency/iowait 背景和网络行为。它复用 monitoring、
+analysis、report 和 archive，但会有意跳过 RPC workload 路径。
+
+```mermaid
+flowchart TD
+    User["用户运行 --sync-observe"] --> Config["加载配置层和 chain sync-health 模型"]
+    Config --> Clean["准备干净运行状态"]
+    Clean --> Monitor["启动 monitoring coordinator"]
+    Monitor --> Observe["观察直到用户停止、duration 到期或节点同步完成"]
+    Observe --> Analysis["执行离线分析"]
+    Analysis --> Report["生成 HTML 报告和 sync execution 图表"]
+    Report --> Archive["归档当前运行"]
+    Archive --> Cleanup["停止 monitors 并清理运行态"]
+
+    Monitor --> PerfCSV["performance_session.csv<br/>system、disk、network、node execution"]
+    Monitor --> HeightCSV["block_height_monitor_session.csv<br/>sync-health 和高度进展"]
+    PerfCSV --> Analysis
+    HeightCSV --> Analysis
+```
+
+该路径需要确认 chain/sync-health 行为、资源元数据、节点进程身份和停止条件。
+`NODE_PROMETHEUS_METRICS_URL` 是可选项；如果客户端没有暴露 MGas/s 或 gas-used
+指标，报告会展示 `execution_metric_status`，并根据源指标将 MGas/s 标为不可用或 0。
+
+Sync-observe 不录制 fake-node fixtures。节点可能先下载 peer snapshot，然后从
+snapshot 高度继续追块；框架通过 endpoint/sync-health 真实性校验观察这个行为，
+而不是录制 RPC request/response fixtures。
 
 ## 文件契约与生命周期
 

@@ -93,6 +93,11 @@ generate_test_summary() {
     local end_time="$5"
     local initial_qps qps_step duration_per_level
     case "$benchmark_mode" in
+        sync_observe)
+            initial_qps="0"
+            qps_step="0"
+            duration_per_level="0"
+            ;;
         quick)
             initial_qps="${QUICK_INITIAL_QPS:-1000}"
             qps_step="${QUICK_QPS_STEP:-500}"
@@ -118,6 +123,38 @@ generate_test_summary() {
     
     local archive_path="${ARCHIVES_DIR}/${run_id}"
     local summary_file="${archive_path}/test_summary.json"
+
+    if [[ "$benchmark_mode" == "sync_observe" && ( -z "$start_time" || -z "$end_time" ) ]]; then
+        local performance_csv="${archive_path}/logs/performance_latest.csv"
+        if [[ -f "$performance_csv" ]]; then
+            local inferred_times
+            inferred_times=$(awk -F',' '
+                NR == 1 {
+                    for (i = 1; i <= NF; i++) {
+                        if ($i == "timestamp") {
+                            ts_col = i
+                        }
+                    }
+                    next
+                }
+                ts_col && $ts_col != "" {
+                    if (start == "") {
+                        start = $ts_col
+                    }
+                    end = $ts_col
+                }
+                END {
+                    if (start != "" || end != "") {
+                        printf "%s|%s", start, end
+                    }
+                }
+            ' "$performance_csv")
+            if [[ -n "$inferred_times" ]]; then
+                [[ -z "$start_time" ]] && start_time="${inferred_times%%|*}"
+                [[ -z "$end_time" ]] && end_time="${inferred_times##*|}"
+            fi
+        fi
+    fi
     
     # Calculate test duration
     local duration_minutes=0
@@ -484,7 +521,7 @@ Usage:
 Operations:
   --archive                    Archive current test data
     --benchmark-mode <mode>    Benchmark mode (required)
-                              Supported: quick, standard, intensive
+                              Supported: quick, standard, intensive, sync_observe
     --max-qps <qps>           Maximum successful QPS (required, positive integer)
     --start-time <time>       Test start time (optional)
                               Format: 'YYYY-MM-DD HH:MM:SS'
@@ -551,12 +588,12 @@ main() {
                     --benchmark-mode) 
                         if [[ -z "$2" ]]; then
                             echo "❌ Error: --benchmark-mode parameter value cannot be empty"
-                            echo "💡 Supported modes: quick, standard, intensive"
+                            echo "💡 Supported modes: quick, standard, intensive, sync_observe"
                             exit 1
                         fi
-                        if [[ "$2" != "quick" && "$2" != "standard" && "$2" != "intensive" ]]; then
+                        if [[ "$2" != "quick" && "$2" != "standard" && "$2" != "intensive" && "$2" != "sync_observe" ]]; then
                             echo "❌ Error: Invalid benchmark mode '$2'"
-                            echo "💡 Supported modes: quick, standard, intensive"
+                            echo "💡 Supported modes: quick, standard, intensive, sync_observe"
                             exit 1
                         fi
                         mode="$2"; shift 2 ;;
@@ -566,8 +603,8 @@ main() {
                             echo "💡 Example: --max-qps 2500"
                             exit 1
                         fi
-                        if ! [[ "$2" =~ ^[0-9]+$ ]] || [[ "$2" -eq 0 ]]; then
-                            echo "❌ Error: --max-qps must be a positive integer, current value: '$2'"
+                        if ! [[ "$2" =~ ^[0-9]+$ ]] || { [[ "$2" -eq 0 ]] && [[ "$mode" != "sync_observe" ]]; }; then
+                            echo "❌ Error: --max-qps must be a positive integer (or 0 for sync_observe), current value: '$2'"
                             echo "💡 Example: --max-qps 2500"
                             exit 1
                         fi
@@ -593,7 +630,7 @@ main() {
                         echo "❌ Error: Unknown parameter '$1'"
                         echo ""
                         echo "💡 Supported parameters:"
-                        echo "   --benchmark-mode <mode>  Benchmark mode (quick/standard/intensive)"
+                        echo "   --benchmark-mode <mode>  Benchmark mode (quick/standard/intensive/sync_observe)"
                         echo "   --max-qps <qps>         Maximum successful QPS (positive integer)"
                         echo "   --start-time <time>     Test start time"
                         echo "   --end-time <time>       Test end time"

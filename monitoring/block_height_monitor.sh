@@ -406,6 +406,20 @@ stop_monitor() {
     echo "Block height monitor cleanup completed"
 }
 
+# Update data loss statistics
+update_data_loss_stats() {
+    # Create unified data loss statistics JSON
+    local stats_json="{
+        \"data_loss_count\": $DATA_LOSS_COUNT,
+        \"data_loss_periods\": $DATA_LOSS_PERIODS,
+        \"total_duration\": $DATA_LOSS_TOTAL_DURATION,
+        \"last_updated\": \"$(date +"%Y-%m-%d %H:%M:%S")\"
+    }"
+
+    # Write to shared file
+    echo "$stats_json" > "${MEMORY_SHARE_DIR}/data_loss_stats.json"
+}
+
 # Start monitoring
 start_monitoring() {
     echo "Starting Block Height monitor..."
@@ -474,16 +488,3 @@ main() {
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     main "$@"
 fi
-# Update data loss statistics
-update_data_loss_stats() {
-    # Create unified data loss statistics JSON
-    local stats_json="{
-        \"data_loss_count\": $DATA_LOSS_COUNT,
-        \"data_loss_periods\": $DATA_LOSS_PERIODS,
-        \"total_duration\": $DATA_LOSS_TOTAL_DURATION,
-        \"last_updated\": \"$(date +"%Y-%m-%d %H:%M:%S")\"
-    }"
-    
-    # Write to shared file
-    echo "$stats_json" > "${MEMORY_SHARE_DIR}/data_loss_stats.json"
-}

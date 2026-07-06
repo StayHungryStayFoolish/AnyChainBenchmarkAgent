@@ -166,7 +166,33 @@ QPS_COOLDOWN=0 \
 ./blockchain_node_benchmark.sh --quick --single --fake-node
 ```
 
-见：[使用 fake-node 进行本地闭环测试](./docs/zh/local-closed-loop-testing.md)。
+见：[使用 fake-node 进行本地闭环测试](local-closed-loop-testing.md)。
+
+### 3D. 不发送 RPC 压测流量，只观察节点同步
+
+当目标是观察节点追高/同步过程，而不是生成 RPC benchmark 流量时，使用
+`sync-observe`。该模式跳过 RPC workload 生成、RPC proxy 流量、Vegeta 和 QPS ramp，
+但仍会执行 monitoring、report 和 archive 路径。
+
+```bash
+BLOCKCHAIN_NODE=bsc \
+LOCAL_RPC_URL=http://127.0.0.1:8545 \
+MAINNET_RPC_URL=https://bsc-dataseed.binance.org \
+NODE_PROMETHEUS_METRICS_URL=http://127.0.0.1:6060/debug/metrics/prometheus \
+BLOCKCHAIN_PROCESS_NAMES=bsc \
+./blockchain_node_benchmark.sh --sync-observe --duration 300
+```
+
+停止方式：
+
+- 不传停止参数：一直运行，直到用户停止进程；
+- `--duration <seconds>`：运行固定观察窗口；
+- `--until-synced`：当所选 chain sync-health 模型判断节点已同步时停止。
+
+报告会展示区块高度进展、节点 metrics 暴露时的 MGas/s、节点进程 CPU/线程热点、
+系统 CPU iowait、磁盘 latency 与 queue depth、磁盘吞吐/IOPS/utilization，以及网络
+RX/TX。如果客户端没有暴露 MGas/s，报告会记录指标来源和状态，便于区分真实 0、
+指标不可用和框架数据丢失。
 
 ### 4. 查看报告
 

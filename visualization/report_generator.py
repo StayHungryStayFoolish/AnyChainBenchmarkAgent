@@ -292,6 +292,271 @@ class ReportGenerator:
         </div>
         """
 
+    def _stat_triplet(self, df, column, decimal=2):
+        stats = self._metric_stats(df, column)
+        return self._format_metric_stats(stats, decimal)
+
+    def _first_last_delta(self, df, column):
+        values = self._numeric_series(df, column)
+        if values.empty:
+            return ('N/A', 'N/A', 'N/A')
+        first = values.iloc[0]
+        last = values.iloc[-1]
+        return (
+            self._format_stat_value(first, 0),
+            self._format_stat_value(last, 0),
+            self._format_stat_value(last - first, 0),
+        )
+
+    def _generate_sync_execution_chart(self, df):
+        """Generate a time-aligned sync execution timeline chart."""
+        if df is None or df.empty or 'timestamp' not in df.columns:
+            return None
+        try:
+            chart_df = df.copy()
+            chart_df['timestamp'] = pd.to_datetime(chart_df['timestamp'], errors='coerce')
+            chart_df = chart_df.dropna(subset=['timestamp'])
+            if chart_df.empty:
+                return None
+
+            def numeric(col):
+                if col not in chart_df.columns:
+                    return pd.Series([np.nan] * len(chart_df), index=chart_df.index)
+                return pd.to_numeric(chart_df[col], errors='coerce').replace([np.inf, -np.inf], np.nan)
+
+            data_await_cols = [col for col in chart_df.columns if col.startswith('data_') and col.endswith('_avg_await')]
+            data_r_await_cols = [col for col in chart_df.columns if col.startswith('data_') and col.endswith('_r_await')]
+            data_w_await_cols = [col for col in chart_df.columns if col.startswith('data_') and col.endswith('_w_await')]
+            data_aqu_cols = [col for col in chart_df.columns if col.startswith('data_') and col.endswith('_aqu_sz')]
+            data_util_cols = [col for col in chart_df.columns if col.startswith('data_') and col.endswith('_util')]
+            data_iops_cols = [col for col in chart_df.columns if col.startswith('data_') and col.endswith('_total_iops')]
+            data_tput_cols = [col for col in chart_df.columns if col.startswith('data_') and col.endswith('_total_throughput_mibs')]
+            data_await_col = data_await_cols[0] if data_await_cols else None
+            data_r_await_col = data_r_await_cols[0] if data_r_await_cols else None
+            data_w_await_col = data_w_await_cols[0] if data_w_await_cols else None
+            data_aqu_col = data_aqu_cols[0] if data_aqu_cols else None
+            data_util_col = data_util_cols[0] if data_util_cols else None
+            data_iops_col = data_iops_cols[0] if data_iops_cols else None
+            data_tput_col = data_tput_cols[0] if data_tput_cols else None
+
+            fig, axes = plt.subplots(7, 1, figsize=(16, 21), sharex=True)
+            fig.suptitle('Node Sync Execution Timeline', fontsize=16, fontweight='bold')
+
+            local_height = numeric('local_block_height')
+            if local_height.notna().any():
+                axes[0].plot(chart_df['timestamp'], local_height, color='#2563eb', linewidth=2, label='Local block height')
+                axes[0].legend(loc='upper left')
+            else:
+                axes[0].text(0.5, 0.5, 'Block height unavailable', ha='center', va='center', transform=axes[0].transAxes)
+            axes[0].set_ylabel('Height')
+            axes[0].grid(True, alpha=0.3)
+
+            mgas = numeric('execution_mgas_per_sec')
+            if mgas.notna().any() and float(mgas.fillna(0).max()) > 0:
+                axes[1].plot(chart_df['timestamp'], mgas, color='#16a34a', linewidth=2, label='MGas/s')
+                axes[1].legend(loc='upper left')
+            else:
+                status = chart_df['execution_metric_status'].dropna().iloc[-1] if 'execution_metric_status' in chart_df.columns and not chart_df['execution_metric_status'].dropna().empty else 'unavailable'
+                axes[1].text(0.5, 0.5, f'MGas/s unavailable ({status})', ha='center', va='center', transform=axes[1].transAxes)
+            axes[1].set_ylabel('MGas/s')
+            axes[1].grid(True, alpha=0.3)
+
+            cpu = numeric('node_process_cpu_pct')
+            hot_core = numeric('node_hottest_core_cpu_pct')
+            cpu_iowait = numeric('cpu_iowait')
+            if cpu.notna().any():
+                axes[2].plot(chart_df['timestamp'], cpu, color='#dc2626', linewidth=2, label='Node process CPU')
+            if hot_core.notna().any():
+                axes[2].plot(chart_df['timestamp'], hot_core, color='#f97316', linewidth=2, label='Hottest core CPU')
+            if cpu_iowait.notna().any():
+                axes[2].plot(chart_df['timestamp'], cpu_iowait, color='#64748b', linewidth=2, linestyle='--', label='System CPU iowait')
+            if cpu.notna().any() or hot_core.notna().any() or cpu_iowait.notna().any():
+                axes[2].legend(loc='upper left')
+            else:
+                axes[2].text(0.5, 0.5, 'Node CPU hotspot unavailable', ha='center', va='center', transform=axes[2].transAxes)
+            axes[2].set_ylabel('CPU %')
+            axes[2].grid(True, alpha=0.3)
+
+            latency_plotted = False
+            if data_await_col and numeric(data_await_col).notna().any():
+                axes[3].plot(chart_df['timestamp'], numeric(data_await_col), color='#7c3aed', linewidth=2, label='avg await')
+                latency_plotted = True
+            if data_r_await_col and numeric(data_r_await_col).notna().any():
+                axes[3].plot(chart_df['timestamp'], numeric(data_r_await_col), color='#2563eb', linewidth=1.8, label='read await')
+                latency_plotted = True
+            if data_w_await_col and numeric(data_w_await_col).notna().any():
+                axes[3].plot(chart_df['timestamp'], numeric(data_w_await_col), color='#dc2626', linewidth=1.8, label='write await')
+                latency_plotted = True
+            queue_axis = None
+            if data_aqu_col and numeric(data_aqu_col).notna().any():
+                queue_axis = axes[3].twinx()
+                queue_axis.plot(chart_df['timestamp'], numeric(data_aqu_col), color='#f59e0b', linewidth=1.6, linestyle='--', label='aqu-sz')
+                queue_axis.set_ylabel('Queue depth')
+                latency_plotted = True
+            if latency_plotted:
+                lines, labels = axes[3].get_legend_handles_labels()
+                if queue_axis is not None:
+                    q_lines, q_labels = queue_axis.get_legend_handles_labels()
+                    lines += q_lines
+                    labels += q_labels
+                axes[3].legend(lines, labels, loc='upper left')
+            else:
+                axes[3].text(0.5, 0.5, 'DATA latency/queue metrics unavailable', ha='center', va='center', transform=axes[3].transAxes)
+            axes[3].set_ylabel('Latency ms')
+            axes[3].grid(True, alpha=0.3)
+
+            io_axis = None
+            io_plotted = False
+            if data_iops_col and numeric(data_iops_col).notna().any():
+                axes[4].plot(chart_df['timestamp'], numeric(data_iops_col), color='#0f766e', linewidth=2, label='DATA IOPS')
+                io_plotted = True
+            if data_tput_col and numeric(data_tput_col).notna().any():
+                io_axis = axes[4].twinx()
+                io_axis.plot(chart_df['timestamp'], numeric(data_tput_col), color='#9333ea', linewidth=2, label='DATA throughput')
+                io_axis.set_ylabel('MiB/s')
+                io_plotted = True
+            if io_plotted:
+                lines, labels = axes[4].get_legend_handles_labels()
+                if io_axis is not None:
+                    t_lines, t_labels = io_axis.get_legend_handles_labels()
+                    lines += t_lines
+                    labels += t_labels
+                axes[4].legend(lines, labels, loc='upper left')
+            else:
+                axes[4].text(0.5, 0.5, 'DATA IOPS/throughput unavailable', ha='center', va='center', transform=axes[4].transAxes)
+            axes[4].set_ylabel('IOPS')
+            axes[4].grid(True, alpha=0.3)
+
+            if data_util_col and numeric(data_util_col).notna().any():
+                axes[5].plot(chart_df['timestamp'], numeric(data_util_col), color='#0891b2', linewidth=2, label='DATA util')
+                axes[5].legend(loc='upper left')
+            else:
+                axes[5].text(0.5, 0.5, 'DATA util unavailable', ha='center', va='center', transform=axes[5].transAxes)
+            axes[5].set_ylabel('Util %')
+            axes[5].grid(True, alpha=0.3)
+
+            rx = numeric('net_rx_mbps')
+            tx = numeric('net_tx_mbps')
+            if rx.notna().any():
+                axes[6].plot(chart_df['timestamp'], rx, color='#0f766e', linewidth=2, label='RX Mbps')
+            if tx.notna().any():
+                axes[6].plot(chart_df['timestamp'], tx, color='#9333ea', linewidth=2, label='TX Mbps')
+            if rx.notna().any() or tx.notna().any():
+                axes[6].legend(loc='upper left')
+            else:
+                axes[6].text(0.5, 0.5, 'Network metrics unavailable', ha='center', va='center', transform=axes[6].transAxes)
+            axes[6].set_ylabel('Mbps')
+            axes[6].grid(True, alpha=0.3)
+            format_time_axis(axes[6], chart_df['timestamp'])
+
+            plt.tight_layout(rect=[0, 0, 1, 0.97])
+            chart_file = os.path.join(self.output_dir, 'sync_execution_timeline.png')
+            plt.savefig(chart_file, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+            plt.close(fig)
+            return os.path.basename(chart_file)
+        except Exception as exc:
+            print(f"⚠️ Sync execution chart generation failed: {exc}")
+            return None
+
+    def _generate_sync_execution_section(self, df):
+        """Generate sync execution throughput, CPU hotspot, disk, and network summary."""
+        try:
+            if df is None or df.empty or not self._is_sync_execution_report(df):
+                return ""
+
+            start_time = df['timestamp'].iloc[0] if 'timestamp' in df.columns and len(df) else 'N/A'
+            end_time = df['timestamp'].iloc[-1] if 'timestamp' in df.columns and len(df) else 'N/A'
+            height_start, height_end, height_delta = self._first_last_delta(df, 'local_block_height')
+            mgas_min, mgas_avg, mgas_max = self._stat_triplet(df, 'execution_mgas_per_sec', 2)
+            cpu_min, cpu_avg, cpu_max = self._stat_triplet(df, 'node_process_cpu_pct', 1)
+            thread_min, thread_avg, thread_max = self._stat_triplet(df, 'node_hottest_thread_cpu_pct', 1)
+            core_min, core_avg, core_max = self._stat_triplet(df, 'node_hottest_core_cpu_pct', 1)
+            iowait_min, iowait_avg, iowait_max = self._stat_triplet(df, 'cpu_iowait', 1)
+            net_rx_min, net_rx_avg, net_rx_max = self._stat_triplet(df, 'net_rx_mbps', 2)
+            net_tx_min, net_tx_avg, net_tx_max = self._stat_triplet(df, 'net_tx_mbps', 2)
+
+            data_await_cols = [col for col in df.columns if col.startswith('data_') and col.endswith('_avg_await')]
+            data_r_await_cols = [col for col in df.columns if col.startswith('data_') and col.endswith('_r_await')]
+            data_w_await_cols = [col for col in df.columns if col.startswith('data_') and col.endswith('_w_await')]
+            data_aqu_cols = [col for col in df.columns if col.startswith('data_') and col.endswith('_aqu_sz')]
+            data_util_cols = [col for col in df.columns if col.startswith('data_') and col.endswith('_util')]
+            data_iops_cols = [col for col in df.columns if col.startswith('data_') and col.endswith('_total_iops')]
+            data_tput_cols = [col for col in df.columns if col.startswith('data_') and col.endswith('_total_throughput_mibs')]
+            await_min, await_avg, await_max = self._stat_triplet(df, data_await_cols[0], 2) if data_await_cols else ('N/A', 'N/A', 'N/A')
+            r_await_min, r_await_avg, r_await_max = self._stat_triplet(df, data_r_await_cols[0], 2) if data_r_await_cols else ('N/A', 'N/A', 'N/A')
+            w_await_min, w_await_avg, w_await_max = self._stat_triplet(df, data_w_await_cols[0], 2) if data_w_await_cols else ('N/A', 'N/A', 'N/A')
+            aqu_min, aqu_avg, aqu_max = self._stat_triplet(df, data_aqu_cols[0], 2) if data_aqu_cols else ('N/A', 'N/A', 'N/A')
+            util_min, util_avg, util_max = self._stat_triplet(df, data_util_cols[0], 1) if data_util_cols else ('N/A', 'N/A', 'N/A')
+            iops_min, iops_avg, iops_max = self._stat_triplet(df, data_iops_cols[0], 0) if data_iops_cols else ('N/A', 'N/A', 'N/A')
+            tput_min, tput_avg, tput_max = self._stat_triplet(df, data_tput_cols[0], 2) if data_tput_cols else ('N/A', 'N/A', 'N/A')
+
+            metric_source = df['execution_metric_source'].dropna().iloc[-1] if 'execution_metric_source' in df.columns and not df['execution_metric_source'].dropna().empty else 'unavailable'
+            metric_status = df['execution_metric_status'].dropna().iloc[-1] if 'execution_metric_status' in df.columns and not df['execution_metric_status'].dropna().empty else 'unavailable'
+            if metric_status != 'available':
+                mgas_min, mgas_avg, mgas_max = ('N/A', 'N/A', 'N/A')
+            node_cpu_status = df['node_cpu_status'].dropna().iloc[-1] if 'node_cpu_status' in df.columns and not df['node_cpu_status'].dropna().empty else 'unavailable'
+            hottest_thread_name = df['node_hottest_thread_name'].dropna().iloc[-1] if 'node_hottest_thread_name' in df.columns and not df['node_hottest_thread_name'].dropna().empty else 'N/A'
+
+            chart_src = self._generate_sync_execution_chart(df)
+            chart_html = ""
+            if chart_src:
+                chart_html = f"""
+                <div class="chart-container">
+                    <img src="{html.escape(chart_src)}" alt="Node Sync Execution Timeline" class="chart-image">
+                </div>
+                """
+
+            return f"""
+            <div class="section sync-execution-section">
+                <h2>{self.t['node_sync_execution_analysis']}</h2>
+                <p>This section aligns block height, execution throughput, CPU hotspot, disk, and network metrics on the same benchmark window.</p>
+                <table class="report-table summary-table">
+                    <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+                    <tbody>
+                        <tr><td>Time range</td><td>{html.escape(str(start_time))} → {html.escape(str(end_time))}</td></tr>
+                        <tr><td>Local block height</td><td>{height_start} → {height_end} (delta {height_delta})</td></tr>
+                        <tr><td>MGas/s min / avg / peak</td><td>{mgas_min} / {mgas_avg} / {mgas_max}</td></tr>
+                        <tr><td>MGas metric source / status</td><td>{html.escape(str(metric_source))} / {html.escape(str(metric_status))}</td></tr>
+                        <tr><td>Node process CPU min / avg / peak</td><td>{cpu_min}% / {cpu_avg}% / {cpu_max}% ({html.escape(str(node_cpu_status))})</td></tr>
+                        <tr><td>Hottest thread avg / peak</td><td>{thread_avg}% / {thread_max}% ({html.escape(str(hottest_thread_name))})</td></tr>
+                        <tr><td>Hottest core avg / peak</td><td>{core_avg}% / {core_max}%</td></tr>
+                        <tr><td>System CPU iowait min / avg / peak</td><td>{iowait_min}% / {iowait_avg}% / {iowait_max}%</td></tr>
+                        <tr><td>DATA avg await min / avg / peak</td><td>{await_min} / {await_avg} / {await_max} ms</td></tr>
+                        <tr><td>DATA read await avg / peak</td><td>{r_await_avg} / {r_await_max} ms</td></tr>
+                        <tr><td>DATA write await avg / peak</td><td>{w_await_avg} / {w_await_max} ms</td></tr>
+                        <tr><td>DATA queue depth avg / peak</td><td>{aqu_avg} / {aqu_max}</td></tr>
+                        <tr><td>DATA util avg / peak</td><td>{util_avg}% / {util_max}%</td></tr>
+                        <tr><td>DATA IOPS avg / peak</td><td>{iops_avg} / {iops_max}</td></tr>
+                        <tr><td>DATA throughput avg / peak</td><td>{tput_avg} / {tput_max} MiB/s</td></tr>
+                        <tr><td>Network RX avg / TX avg</td><td>{net_rx_avg} Mbps / {net_tx_avg} Mbps</td></tr>
+                    </tbody>
+                </table>
+                {chart_html}
+            </div>
+            """
+        except Exception as exc:
+            return f"<div class='error'>Sync execution section generation failed: {html.escape(str(exc))}</div>"
+
+    def _is_sync_execution_report(self, df):
+        """Return whether sync-observe execution metrics should be shown."""
+        env_mode = str(os.getenv('SYNC_OBSERVE_MODE') or '').strip().lower()
+        if env_mode in {'1', 'true', 'yes'}:
+            return True
+        run_mode = str(os.getenv('BENCHMARK_MODE') or os.getenv('RUN_MODE') or '').strip().lower().replace('-', '_')
+        if run_mode in {'sync_observe', 'sync', 'observe_sync'}:
+            return True
+        if df is None or df.empty:
+            return False
+        if 'execution_mgas_per_sec' in df.columns:
+            mgas = pd.to_numeric(df['execution_mgas_per_sec'], errors='coerce').replace([np.inf, -np.inf], np.nan)
+            if mgas.notna().any() and float(mgas.fillna(0).max()) > 0:
+                return True
+        if 'execution_metric_status' in df.columns:
+            statuses = {str(item).strip().lower() for item in df['execution_metric_status'].dropna().tolist()}
+            if 'available' in statuses:
+                return True
+        return False
+
     def _add_section_id(self, section_html, section_id):
         """Attach a stable id to the first top-level section div."""
         if not section_html or not str(section_html).strip():
@@ -2984,6 +3249,7 @@ class ReportGenerator:
             performance_summary = self._generate_performance_summary(df)
             environment_summary = self._generate_environment_summary_section(df)
             data_quality_summary = self._generate_data_quality_section(df)
+            sync_execution_section = self._generate_sync_execution_section(df)
 
             # Generate bottleneck information display (if available)
             bottleneck_section = self._generate_bottleneck_section()
@@ -3011,6 +3277,7 @@ class ReportGenerator:
                 ('performance-summary', self.t['performance_summary'], performance_summary),
                 ('configuration', self.t['config_status_check'], config_status_section),
                 ('sync-health', self.t['blockchain_node_sync_analysis'], block_height_analysis),
+                ('sync-execution', self.t['node_sync_execution_analysis'], sync_execution_section),
                 ('disk-analysis', self.t['disk_performance_analysis'], disk_analysis_section),
                 ('charts', self.t['performance_analysis_charts'], charts_section),
                 ('monitoring-overhead', self.t['monitoring_overhead_comprehensive_analysis'], monitoring_overhead_analysis),

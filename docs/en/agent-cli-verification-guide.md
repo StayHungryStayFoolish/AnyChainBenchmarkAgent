@@ -261,6 +261,26 @@ Expected:
 - Agent asks whether to use default chain-template methods or add custom RPC
   methods.
 
+### 5A. Sync-Observe Without RPC Load
+
+Prompt:
+
+```text
+Observe my BSC node while it is syncing. Do not send RPC benchmark load.
+```
+
+Expected:
+
+- Agent routes to sync-observe, not quick/standard/intensive RPC benchmark;
+- Agent does not ask for RPC mode, mixed weights, custom RPC methods, Vegeta,
+  or QPS profile;
+- Agent confirms chain/sync-health reference behavior, node process identity,
+  optional node Prometheus metrics endpoint, disk/network metadata, and stop
+  condition: until stopped, fixed duration, or until synced;
+- generated report paths include sync/resource charts. MGas/s may be zero or
+  unavailable if the node metrics endpoint exposes no usable gas metric, but
+  the report must preserve metric source/status evidence.
+
 ### 6. Multi-Disk And Optional Accounts Disk
 
 If the host has multiple disks, verify that the Agent shows numbered disk

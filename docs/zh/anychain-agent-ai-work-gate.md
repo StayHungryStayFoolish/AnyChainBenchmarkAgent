@@ -85,6 +85,7 @@ revert workflow state, re-run validators, and ask the next blocking question.
 Before smoke or real benchmark execution, validators must confirm:
 
 - target mode: fake-node or real-node;
+- workflow type: RPC benchmark or sync-observe;
 - chain and chain template requirements;
 - RPC mode: single or mixed;
 - custom RPC method definitions, parameter samples, fixtures, and weights when
@@ -106,6 +107,33 @@ Smoke is a complete closed-loop benchmark execution. It is not a mock and not a
 partial check. Quick smoke should use very small QPS settings and short
 duration, but it must still exercise traffic generation, fake-node or endpoint
 handling, proxy, monitoring, reports, archive creation, and artifact discovery.
+
+`sync-observe` 是独立 workflow type，不是 quick/standard/intensive profile。
+它用于观察节点同步和资源行为，不生成 RPC workload、不走 proxy traffic、不使用
+Vegeta，也不执行 QPS ramp。它的 validator 必须确认 chain 和 sync-health/reference
+行为、资源元数据、节点进程身份、可选节点 Prometheus metrics endpoint，以及停止条件：
+用户停止、固定 duration，或 until synced。除非用户切换回 RPC benchmark workflow，
+否则不得询问 RPC mode、自定义 RPC method、mixed weights 或 QPS profile。
+
+这也意味着 `sync-observe` 不应进入任何 Vegeta 相关运行路径：不生成 Vegeta
+targets，不为 workload traffic 启动 RPC proxy，不运行 QPS executor，也不要求
+`vegeta_results` 产物作为报告成功条件。Sync-observe 报告应来自 monitoring、
+sync-health、node execution、disk、CPU 和 network 数据。
+
+`sync-observe` 不需要 fake-node fixture 录制。真实节点可能先从 peer 下载快照，
+然后从快照高度继续追块；Agent 应该观察这个真实同步行为，而不是把它录制成 RPC
+fixtures。当用户提供本地节点 endpoint 或 public reference endpoint 用于同步观察时，
+只复用现有 endpoint/sync-health 真实性校验，证明 endpoint 可访问并且能够暴露高度或
+同步状态。除非用户明确切回 RPC benchmark 或 custom-RPC onboarding，否则不得进入
+custom RPC fixture recording、target sample collection 或 workload schema validation。
+
+用户可以在任意 benchmark setup group 中请求切换到 `sync-observe`，包括
+chain/endpoint、workload、自定义 RPC、mixed weights、QPS、observability、
+preflight 或 report follow-up。Agent 必须暂停当前 group，将 workflow type 切换为
+`sync_observe`，保留可复用的环境、资源和链状态，失效 RPC-only state，并且只询问
+sync-observe blockers。如果用户随后切回 RPC benchmark，Agent 必须重新询问 RPC
+workload 和 QPS gates，不能复用已经失效的状态。Harness acceptance 必须证明
+`--sync-observe` 命令路径不会调用 proxy、Vegeta 或 RPC target generation。
 
 ## Configuration Group Workflow Standard
 
@@ -147,14 +175,18 @@ order:
 10. QPS profile group: quick, standard, or intensive profile; explain defaults
     first; ask whether to keep defaults; if not, collect initial QPS, max QPS,
     QPS step, duration, and relevant cooldown/warmup fields.
-11. Observability group: disabled, local Prometheus/Grafana, or exporter-only;
+11. Sync-observe group：仅当用户希望在不发送 RPC benchmark load 的情况下观察节点
+    同步/资源行为时进入。确认 sync-health/reference 行为、节点进程身份、可选
+    `NODE_PROMETHEUS_METRICS_URL` 和停止条件。该 workflow 激活时跳过 workload
+    和 QPS groups。
+12. Observability group: disabled, local Prometheus/Grafana, or exporter-only;
     then ports, auto-stop behavior, scrape endpoint guidance, and port checks.
-12. Advanced tuning group: optional account discovery settings, monitoring
+13. Advanced tuning group: optional account discovery settings, monitoring
     intervals, disk monitor rate, internal bottleneck thresholds, success-rate
     threshold, latency threshold, and other `internal_config.sh` values. The
     Agent must explain these before asking whether the user wants to change
     them.
-13. Preflight, smoke, and execution approval group: validate config, run
+14. Preflight, smoke, and execution approval group: validate config, run
     preflight, run complete closed-loop smoke, show evidence, and ask for
     approval before the real benchmark job.
 

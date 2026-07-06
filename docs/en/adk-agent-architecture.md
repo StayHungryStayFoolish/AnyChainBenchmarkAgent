@@ -122,6 +122,26 @@ ADK `google_search` is intentionally narrow:
 Other model providers must report web research as unavailable unless the
 repository explicitly adds and verifies a provider-specific search integration.
 
+## Sync-Observe Boundary
+
+`sync-observe` is a first-class workflow for node sync/resource observation. It
+does not belong to the RPC workload path. When the user asks to watch node
+catch-up speed, MGas/s, node process CPU/thread hotspots, disk latency/iowait,
+or network behavior without sending benchmark RPC load, ADK should route to the
+sync-observe workflow.
+
+The workflow confirms:
+
+- chain and sync-health/reference behavior;
+- resource metadata, including disk and network baselines;
+- node process identity for CPU/thread attribution;
+- optional `NODE_PROMETHEUS_METRICS_URL` for MGas/s or client-native execution
+  metrics;
+- stop condition: until stopped, fixed duration, or until synced.
+
+It must not ask for RPC mode, custom RPC workload, mixed weights, Vegeta, or
+QPS profile unless the user explicitly switches to an RPC benchmark.
+
 ## Development Gates
 
 Before changing Agent code, read:

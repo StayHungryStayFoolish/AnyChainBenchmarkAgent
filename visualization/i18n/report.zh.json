@@ -59,6 +59,7 @@
   "blockchain_node_resource_usage": "区块链节点资源使用",
   "blockchain_node_specific_analysis": "Blockchain Node 特定分析",
   "blockchain_node_sync_analysis": "区块链节点同步分析",
+  "node_sync_execution_analysis": "节点同步执行分析",
   "blockchain_node_type": "区块链节点类型",
   "blockchain_related_processes": "区块链相关进程的资源占比",
   "blockchain_resource_analysis": "区块链节点资源消耗分析:",

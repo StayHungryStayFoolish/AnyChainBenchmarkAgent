@@ -248,6 +248,7 @@ revert workflow state, re-run validators, and ask the next blocking question.
 Before smoke or real benchmark execution, validators must confirm:
 
 - target mode: fake-node or real-node;
+- workflow type: RPC benchmark or sync-observe;
 - chain and chain template requirements;
 - RPC mode: single or mixed;
 - custom RPC method definitions, parameter samples, fixtures, and weights when
@@ -269,6 +270,41 @@ Smoke is a complete closed-loop benchmark execution. It is not a mock and not a
 partial check. Quick smoke should use very small QPS settings and short
 duration, but it must still exercise traffic generation, fake-node or endpoint
 handling, proxy, monitoring, reports, archive creation, and artifact discovery.
+
+`sync-observe` is a separate workflow type, not a quick/standard/intensive
+profile. It observes node sync and resource behavior without RPC workload,
+proxy traffic, Vegeta, or QPS ramp. Its validators must confirm chain and
+sync-health/reference behavior, resource metadata, node process identity,
+optional node Prometheus metrics endpoint, and stop condition: until stopped,
+fixed duration, or until synced. It must not ask for RPC mode, custom RPC
+method, mixed weights, or QPS profile unless the user switches back to an RPC
+benchmark workflow.
+
+This means no Vegeta-related runtime path is expected in `sync-observe`: do
+not generate Vegeta targets, do not start the RPC proxy for workload traffic,
+do not run the QPS executor, and do not require `vegeta_results` artifacts for
+report success. Sync-observe reports are generated from monitoring, sync-health,
+node execution, disk, CPU, and network data.
+
+`sync-observe` does not require fake-node fixture recording. A real node may
+start from a downloaded peer snapshot and then catch up from that snapshot
+height; the Agent should observe that real sync behavior rather than record it
+as RPC fixtures. When the user provides a local node endpoint or public
+reference endpoint for sync observation, reuse the existing endpoint/sync-health
+sanity checks to prove the endpoint is reachable and can expose height or sync
+state. Do not enter custom-RPC fixture recording, target sample collection, or
+workload schema validation unless the user explicitly switches back to RPC
+benchmark/custom-RPC onboarding.
+
+Users may request `sync-observe` from any benchmark setup group, including
+chain/endpoint, workload, custom RPC, mixed weights, QPS, observability,
+preflight, or report follow-up. The Agent must pause the current group, switch
+the workflow type to `sync_observe`, preserve reusable environment/resource/
+chain state, invalidate RPC-only state, and ask only sync-observe blockers. If
+the user later switches back to an RPC benchmark, the Agent must re-ask RPC
+workload and QPS gates instead of reusing invalidated state. Harness acceptance
+must prove the `--sync-observe` command path does not invoke proxy, Vegeta, or
+RPC target generation.
 
 ## Configuration Group Workflow Standard
 
@@ -310,14 +346,19 @@ order:
 10. QPS profile group: quick, standard, or intensive profile; explain defaults
     first; ask whether to keep defaults; if not, collect initial QPS, max QPS,
     QPS step, duration, and relevant cooldown/warmup fields.
-11. Observability group: disabled, local Prometheus/Grafana, or exporter-only;
+11. Sync-observe group: only when the user wants to observe node sync/resource
+    behavior without RPC benchmark load. Confirm sync-health/reference
+    behavior, node process identity, optional `NODE_PROMETHEUS_METRICS_URL`,
+    and stop condition. Skip workload and QPS groups while this workflow is
+    active.
+12. Observability group: disabled, local Prometheus/Grafana, or exporter-only;
     then ports, auto-stop behavior, scrape endpoint guidance, and port checks.
-12. Advanced tuning group: optional account discovery settings, monitoring
+13. Advanced tuning group: optional account discovery settings, monitoring
     intervals, disk monitor rate, internal bottleneck thresholds, success-rate
     threshold, latency threshold, and other `internal_config.sh` values. The
     Agent must explain these before asking whether the user wants to change
     them.
-13. Preflight, smoke, and execution approval group: validate config, run
+14. Preflight, smoke, and execution approval group: validate config, run
     preflight, run complete closed-loop smoke, show evidence, and ask for
     approval before the real benchmark job.
 

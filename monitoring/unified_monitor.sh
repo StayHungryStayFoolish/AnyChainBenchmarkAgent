@@ -51,6 +51,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/cloud_provider_resolver.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/ena_data_normalizer.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/sample_count_tracker.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/cgroup_collector_wrapper.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib/node_execution_collector_wrapper.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/system_collectors.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/process_collectors.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/lib/monitoring_overhead.sh"
@@ -143,6 +144,8 @@ generate_csv_header() {
         block_height_header="local_block_height,mainnet_block_height,block_height_diff,local_health,mainnet_health,data_loss,sync_mode,sync_status,lag_value,lag_unit,freshness_gap_seconds,probe_error"
     fi
     local qps_header="current_qps,rpc_latency_ms,qps_data_available"
+    local execution_header=$(get_execution_header)
+    local node_cpu_header=$(get_node_cpu_header)
     local cgroup_header=$(get_cgroup_header)
 
     # Configuration-driven ENA header generation
@@ -150,9 +153,9 @@ generate_csv_header() {
     # readers access columns by name, so appending this column is safe.
     if [[ "$ENA_MONITOR_ENABLED" == "true" ]]; then
         local ena_header=$(build_ena_header)
-        echo "$basic_header,$device_header,$network_header,$ena_header,$overhead_header,$block_height_header,$qps_header,$cgroup_header,cloud_provider"
+        echo "$basic_header,$device_header,$network_header,$ena_header,$overhead_header,$block_height_header,$qps_header,$execution_header,$node_cpu_header,$cgroup_header,cloud_provider"
     else
-        echo "$basic_header,$device_header,$network_header,$overhead_header,$block_height_header,$qps_header,$cgroup_header,cloud_provider"
+        echo "$basic_header,$device_header,$network_header,$overhead_header,$block_height_header,$qps_header,$execution_header,$node_cpu_header,$cgroup_header,cloud_provider"
     fi
 }
 
@@ -175,6 +178,12 @@ log_performance_data() {
     IFS=',' read -r current_qps rpc_latency_ms qps_data_available < <(
         get_qps_runtime_fields "${TMP_DIR}/qps_test_status" "${VEGETA_RESULTS_DIR}"
     )
+
+    local execution_data
+    execution_data=$(get_execution_data)
+
+    local node_cpu_data
+    node_cpu_data=$(get_node_cpu_data)
 
     # Get block height / sync-health data (if block_height monitoring is enabled)
     local block_height_data
@@ -214,6 +223,8 @@ log_performance_data() {
         "$current_qps" \
         "$rpc_latency_ms" \
         "$qps_data_available" \
+        "$execution_data" \
+        "$node_cpu_data" \
         "$cgroup_data" \
         "$cloud_provider_val")
     
