@@ -245,6 +245,9 @@ load_mixed_weighted_methods() {
         if ! [[ "$weight" =~ ^[0-9]+$ ]]; then
             weight=1
         fi
+        # Vegeta targets cannot represent "configured but never selected".
+        # A configured mixed method must have at least one weighted slot; remove
+        # the method from mixed_weighted to disable it.
         if (( weight < 1 )); then
             weight=1
         fi

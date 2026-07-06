@@ -151,13 +151,24 @@ def required_questions(plan: dict[str, Any]) -> list[dict[str, Any]]:
     checklist = plan.get("configuration_checklist", {})
     for item in checklist.get("environment", []):
         if item.get("id") not in confirmed:
-            questions.append(_with_manual_input({
+            question = {
                 "id": item["id"],
                 "category": "environment",
                 "severity": "confirm",
                 "prompt": f"Confirm {item['description']}",
                 "current_value": _current_value(plan, item["id"]),
-            }))
+            }
+            if item["id"] == "deployment_platform":
+                question["candidates"] = [
+                    {"id": "gce", "description": "Google Compute Engine VM"},
+                    {"id": "ec2", "description": "Amazon EC2 VM"},
+                    {"id": "gke", "description": "Google Kubernetes Engine"},
+                    {"id": "eks", "description": "Amazon Elastic Kubernetes Service"},
+                    {"id": "self-hosted-k8s", "description": "Self-hosted Kubernetes cluster"},
+                    {"id": "container", "description": "Container or Docker runtime outside a Kubernetes cluster"},
+                    {"id": "vm", "description": "Generic virtual machine or bare-metal host"},
+                ]
+            questions.append(_with_manual_input(question))
 
     accounts_items = checklist.get("accounts_optional", [])
     if accounts_items and "has_accounts_device" not in confirmed:
@@ -183,45 +194,11 @@ def required_questions(plan: dict[str, Any]) -> list[dict[str, Any]]:
 
     chain_requirements = plan.get("chain_template_requirements", {})
     if chain_requirements.get("exists"):
-        if "chain_template_reviewed" not in confirmed:
-            questions.append(_with_manual_input({
-                "id": "chain_template_reviewed",
-                "category": "workload",
-                "severity": "blocker",
-                "prompt": (
-                    "Review the selected chain template endpoint overrides, TARGET_* sample variables, "
-                    "default single/mixed workload, and custom RPC extension points."
-                ),
-                "runtime_endpoint_variables": chain_requirements.get("runtime_endpoint_variables", []),
-                "runtime_sample_variables": chain_requirements.get("runtime_sample_variables", []),
-                "single": chain_requirements.get("single_method"),
-                "mixed_weighted": chain_requirements.get("mixed_weighted", []),
-            }))
-        if "rpc_workload_confirmation" not in confirmed:
-            questions.append(_with_manual_input({
-                "id": "rpc_workload_confirmation",
-                "category": "workload",
-                "severity": "confirm",
-                "prompt": "Confirm the RPC methods and weights to test from the selected chain template.",
-                "single": chain_requirements.get("single_method"),
-                "mixed_weighted": chain_requirements.get("mixed_weighted", []),
-            }))
-        if "custom_rpc_method_review" not in confirmed:
-            questions.append(_with_manual_input({
-                "id": "custom_rpc_method_review",
-                "category": "workload",
-                "severity": "confirm",
-                "prompt": (
-                    "Ask whether the user wants to add custom RPC methods before execution. "
-                    "If yes, collect method name, parameter shape, sample TARGET_* values, "
-                    "single/mixed inclusion, mixed weight, and fake-node fixture expectations."
-                ),
-                "extension_fields": chain_requirements.get("custom_rpc_extension_fields", []),
-                "param_formats": chain_requirements.get("param_formats", {}),
-                "param_spec_methods": chain_requirements.get("param_spec_methods", []),
-            }))
+        workload_menu_needed = _workload_menu_required(confirmed)
+        if workload_menu_needed:
+            questions.append(_workload_customization_question(chain_requirements))
         sample_vars = chain_requirements.get("runtime_sample_variables", [])
-        if sample_vars and "rpc_param_samples_confirmation" not in confirmed:
+        if sample_vars and not workload_menu_needed and "rpc_param_samples_confirmation" not in confirmed:
             questions.append(_with_manual_input({
                 "id": "rpc_param_samples_confirmation",
                 "category": "workload",
@@ -286,7 +263,7 @@ def _required_prompt(item: str) -> str:
         "chain": "Which blockchain node should be tested?",
         "local_rpc_url": "Provide the local RPC endpoint, or choose fake-node for closed-loop testing.",
         "use_fake_node": "Choose fake-node closed-loop testing or real-node testing.",
-        "blockchain_process_names": "Provide blockchain node process names or command keywords for resource attribution.",
+        "blockchain_process_names": "Provide blockchain node process names or command-line fragments for resource attribution.",
         "ledger_device": "Confirm the ledger/data disk device used by the node.",
         "data_vol_type": "Provide the ledger/data disk type.",
         "data_vol_size": "Provide the ledger/data disk size in GiB.",
@@ -311,14 +288,139 @@ _SPECIALIZED_REQUIRED_QUESTIONS = {
 }
 
 
+_WORKLOAD_MENU_CONFIRMATIONS = {
+    "chain_template_reviewed",
+    "rpc_workload_confirmation",
+    "rpc_workload_confirmed",
+    "custom_rpc_method_review",
+}
+
+
+def _workload_menu_required(confirmed: set[str]) -> bool:
+    return not _WORKLOAD_MENU_CONFIRMATIONS.issubset(confirmed)
+
+
+def _workload_customization_question(chain_requirements: dict[str, Any]) -> dict[str, Any]:
+    return _with_manual_input({
+        "id": "workload_customization_choice",
+        "category": "workload",
+        "severity": "blocker",
+        "prompt": (
+            "Review the selected chain template defaults and choose one workload path: "
+            "continue with defaults, add a custom RPC method, adjust mixed weights, or change chain/mode."
+        ),
+        "runtime_endpoint_variables": chain_requirements.get("runtime_endpoint_variables", []),
+        "runtime_sample_variables": chain_requirements.get("runtime_sample_variables", []),
+        "single": chain_requirements.get("single_method"),
+        "mixed_weighted": chain_requirements.get("mixed_weighted", []),
+        "extension_fields": chain_requirements.get("custom_rpc_extension_fields", []),
+        "param_formats": chain_requirements.get("param_formats", {}),
+        "param_spec_methods": chain_requirements.get("param_spec_methods", []),
+        "options": [
+            {
+                "id": "1",
+                "value": "use_defaults",
+                "label": "Continue with chain template defaults",
+                "state_patch": {
+                    "confirmed_config": {
+                        "chain_template_reviewed": True,
+                        "rpc_workload_confirmed": True,
+                        "rpc_workload_confirmation": True,
+                        "rpc_param_samples_confirmed": True,
+                        "rpc_param_samples_confirmation": True,
+                        "custom_rpc_method_review": True,
+                    }
+                },
+            },
+            {"id": "2", "value": "add_custom_rpc", "label": "Add a custom RPC method"},
+            {"id": "3", "value": "adjust_weights", "label": "Adjust mixed weights"},
+            {"id": "4", "value": "change_chain_or_mode", "label": "Change chain or target mode"},
+        ],
+        "workflow_step": "workload_customization_choice",
+        "branch": "rpc_workload",
+    })
+
+
 def _with_manual_input(question: dict[str, Any]) -> dict[str, Any]:
     enriched = dict(question)
     enriched["manual_input_allowed"] = True
+    enriched["allow_manual_input"] = True
+    enriched.setdefault("expected_answer", _expected_answer_for(enriched))
+    enriched.setdefault("field", _field_for(enriched["id"]))
+    enriched.setdefault("branch", "benchmark_setup")
+    enriched.setdefault("workflow_step", enriched["id"])
+    enriched.setdefault("validation_tool", "validate_required_config")
+    if "candidates" in enriched and "options" not in enriched:
+        enriched["options"] = _options_from_candidates(enriched.get("candidates", []))
+    enriched.setdefault(
+        "next_on_yes",
+        {"workflow_step": f"{enriched['id']}:confirmed", "tool": "validate_required_config"},
+    )
+    enriched.setdefault(
+        "next_on_no",
+        {"workflow_step": f"{enriched['id']}:manual_input", "tool": "build_missing_config_questions"},
+    )
+    enriched.setdefault(
+        "next_on_manual",
+        {"workflow_step": f"{enriched['id']}:manual_value", "tool": "validate_required_config"},
+    )
     enriched.setdefault(
         "manual_input_hint",
         "The user may reply with a listed number/id or provide a custom value.",
     )
     return enriched
+
+
+def _expected_answer_for(question: dict[str, Any]) -> str:
+    qid = str(question.get("id", ""))
+    if qid in {"benchmark_mode_confirmed", "observability_choice_confirmed", "disk_inventory_confirmation", "has_accounts_device", "workload_customization_choice"}:
+        return "numbered_choice"
+    if qid in {"ledger_device_confirmation", "ledger_device", "accounts_device"}:
+        return "device"
+    if qid in {"local_rpc_url", "mainnet_rpc_url", "target_rpc_url"}:
+        return "url"
+    if qid in {"mixed_weights_confirmation", "rpc_workload_confirmation"}:
+        return "multi_select"
+    if qid.endswith("_confirmed") or qid.endswith("_confirmation") or qid.endswith("_review"):
+        return "yes_no"
+    return "manual_value"
+
+
+def _field_for(question_id: str) -> str:
+    mapping = {
+        "ledger_device_confirmation": "LEDGER_DEVICE",
+        "disk_inventory_confirmation": "LEDGER_DEVICE",
+        "has_accounts_device": "ACCOUNTS_DEVICE",
+        "benchmark_mode_confirmed": "BENCHMARK_MODE",
+        "qps_profile_confirmed": "QPS_PROFILE",
+        "observability_choice_confirmed": "OBSERVABILITY_STACK_MODE",
+        "chain_template_reviewed": "CHAIN_TEMPLATE",
+        "workload_customization_choice": "RPC_WORKLOAD",
+        "rpc_workload_confirmation": "RPC_WORKLOAD",
+        "mixed_weights_confirmation": "MIXED_WEIGHTS",
+        "rpc_param_samples_confirmation": "TARGET_SAMPLES",
+        "chain_endpoint_overrides_confirmation": "CHAIN_ENDPOINT_OVERRIDES",
+        "advanced_config_review": "ADVANCED_CONFIG",
+    }
+    return mapping.get(question_id, question_id.upper())
+
+
+def _options_from_candidates(candidates: Any) -> list[dict[str, Any]]:
+    options: list[dict[str, Any]] = []
+    if not isinstance(candidates, list):
+        return options
+    for index, item in enumerate(candidates, start=1):
+        if isinstance(item, dict):
+            value = item.get("id") or item.get("name") or item.get("value") or str(index)
+            label = item.get("description") or item.get("label") or value
+            option = dict(item)
+            option["id"] = str(index)
+            option["value"] = value
+            option["label"] = str(label)
+            options.append(option)
+        else:
+            options.append({"id": str(index), "value": str(item), "label": str(item)})
+    return options
 
 
 def _current_value(plan: dict[str, Any], item_id: str) -> Any:

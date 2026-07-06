@@ -130,17 +130,19 @@ PY
 adk_ready() {
     local venv_dir="$1"
     [[ -x "$venv_dir/bin/python" ]] || return 1
+    python_is_310 "$venv_dir/bin/python" || return 1
     [[ -x "$venv_dir/bin/adk" ]] || return 1
     "$venv_dir/bin/python" - <<'PY' >/dev/null 2>&1
 import google.adk
+import prompt_toolkit
 PY
 }
 
 install_adk() {
     local python="$1" venv_dir="$2"
-    if [[ ! -x "$venv_dir/bin/python" ]]; then
+    if [[ ! -x "$venv_dir/bin/python" ]] || ! python_is_310 "$venv_dir/bin/python"; then
         if [[ -e "$venv_dir" ]]; then
-            warn "Removing incomplete ADK venv at $venv_dir"
+            warn "Removing incomplete or unsupported ADK venv at $venv_dir"
             rm -rf "$venv_dir"
         fi
         "$python" -m venv "$venv_dir"

@@ -10,7 +10,7 @@ ENDPOINT_REQUIRED = {
 }
 
 RUNTIME_BASELINE_REQUIRED = {
-    "blockchain_process_names": "Process names or command keywords used for node resource attribution.",
+    "blockchain_process_names": "Process names or command-line fragments used for node resource attribution.",
     "ledger_device": "Ledger/data disk device used for disk charts and bottleneck attribution.",
     "data_vol_type": "Ledger/data disk type used for report metadata and baseline interpretation.",
     "data_vol_size": "Ledger/data disk size in GiB.",
@@ -34,7 +34,7 @@ COMMON_REQUIRED = {
 
 ENVIRONMENT_REVIEW = {
     "cloud_provider": "Detected cloud provider: gcp, aws, azure, or other.",
-    "deployment_platform": "Detected runtime platform: gce, ec2, gke, eks, k8s, container, or vm.",
+    "deployment_platform": "Detected runtime platform: GCE, EC2, GKE, EKS, self-hosted Kubernetes, Docker/container, or VM.",
     "cloud_region": "Cloud region for report metadata.",
     "cloud_zone": "Cloud zone when available.",
     "machine_type": "Machine or instance type for report metadata.",

@@ -3,10 +3,22 @@
 This file is for AI assistants helping a user configure, run, validate, or
 extend AnyChain Benchmark Agent.
 
-If you are an AI coding agent modifying this repository, read `AI_CODING_GUIDE.md` and
-`docs/en/anychain-agent-ai-work-gate.md` first. If you are helping a user use
-the project without changing code, start with this file and the linked runtime
-docs.
+If you are an AI coding agent modifying this repository, read
+`AI_CODING_GUIDE.md` and `docs/en/anychain-agent-ai-work-gate.md` first.
+
+For Agent workflow, prompt, terminal, validation, runner, fake-node smoke, or
+benchmark execution changes, do not edit code until the current task/design
+document is present, accurate, and reviewed. If the document is missing,
+outdated, or vague, update the document first. Do not rely on ad hoc patches,
+fallback logic, phrase repair, duplicate state, or local if/else fixes to make
+one transcript pass.
+
+For Agent workflow, prompt, terminal, validation, runner, Harness, or benchmark
+execution changes, also read the current reviewed task/design document before
+touching code. If the user or current branch provides a separate task/design
+document, read and reconcile it before editing code. If you are helping a user
+use the project without changing code, start with this file and the linked
+runtime docs.
 
 ## What This Project Is
 
@@ -187,6 +199,13 @@ research is unavailable unless a provider-specific integration is added later.
   samples, fixtures, validation, and smoke tests pass.
 - Do not implement natural-language intent handling with keyword lists, fuzzy
   matching, or regex routing in terminal code.
+- Do not preserve old Agent code merely because it is imported. Before Agent
+  workflow repair, audit legacy custom-Agent code and remove obsolete wizard,
+  fallback, mock-agent, phrase-repair, duplicate-state, and terminal
+  business-routing paths. If useful deterministic behavior exists, migrate that
+  behavior into the correct planner, validator, runner, analyzer, onboarding,
+  knowledge, or ADK-tool module. Do not keep legacy product logic by
+  "isolating" it.
 
 ## Documents To Read For Deeper Work
 
@@ -229,5 +248,8 @@ python3 agent/cli.py adk-eval
 git diff --check
 ```
 
-When model-facing behavior changes and credentials are available, also run the
-live matrices in `tests/agent_live/`.
+When Agent workflow, prompt, or terminal behavior changes, the product
+acceptance gate must include a real CLI Harness with deterministic assertions
+for transcript, workflow state, config, and artifacts. Lower-level PTY/live
+scripts may support that Harness, but they are not sufficient as the final
+product gate.

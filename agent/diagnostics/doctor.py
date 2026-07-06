@@ -39,6 +39,7 @@ def run_doctor(discovery: dict[str, Any] | None = None) -> dict[str, Any]:
         "environment": {
             "cloud": environment.get("cloud", {}),
             "deployment": environment.get("deployment", {}),
+            "host": environment.get("host", {}),
             "network": environment.get("network", {}),
             "disks": environment.get("disks", {}),
             "dependencies": {

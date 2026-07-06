@@ -59,6 +59,8 @@ tool orchestration；确定性工具和 validator 负责最终执行门禁。
 - 从 `config/chains/*.json` 生成 single 或 weighted mixed RPC workload。
 - 通过 `rpc_methods`、`param_formats`、可选 `param_spec`、REST path 绑定和
   fake-node fixture 支持自定义 RPC method。
+- 对自定义 RPC method 和已有 family 的新增链，必须通过 live endpoint probe、
+  request/response 证据、fixture 录制和 smoke 后，才视为可用支持。
 - 记录每个 method 的状态、成功/失败次数和 P50/P90/P99 延迟。
 - 监控 CPU、内存、磁盘、网络、cgroup、同步健康和监控系统自身开销。
 - 生成 HTML 报告并归档每次运行。
@@ -88,6 +90,8 @@ Agent 是有边界的：
 - 只基于本地 docs 和当前仓库状态回答框架问题。
 - 从当前文件读取 chain/RPC/fake-node 能力，不依赖模型记忆。
 - 对未支持链或 RPC method 生成 onboarding plan。
+- 将 provider 文档、web research 和用户提供的样本视为证据，而不是支持完成证明。
+  endpoint validation、fixture 录制和 smoke 才决定新增链或自定义 method 是否可用。
 - 只有经过 approval 后才运行 allowlisted benchmark command。
 - Agent 生成的运行配置写入 job-local `runtime.env`，不会修改
   `config/user_config.sh`。
@@ -473,7 +477,8 @@ python3 agent/cli.py tool-schema
 python3 agent/cli.py tool-call --name load_capabilities
 python3 agent/cli.py plan --request /tmp/request.json --output /tmp/plan.json --dry-run
 python3 agent/cli.py preflight --plan /tmp/plan.json
-python3 agent/cli.py submit --plan /tmp/plan.json --mock
+python3 agent/cli.py tool-call --name run_fake_node_smoke_benchmark \
+  --arguments '{"plan_file":"/tmp/plan.json","approved":true}'
 ```
 
 ### 报告与 Artifact
@@ -558,6 +563,21 @@ python3 agent/cli.py draft-chain-template \
 ```
 
 草案会标记为 `needs_review`，不会自动安装到 `config/chains`。
+
+### 自定义 RPC 与已有 Family 的新增链
+
+已有链可以添加自定义 RPC method，但请求结构必须能被 `param_formats`、
+`_meta.rest_paths` 或 `param_spec` 表达。Agent 在执行前必须验证用户提供的
+endpoint 和 method payload。用户提供的 request/response 样本可以帮助起草 workload，
+但只有同一个 method 在可访问 endpoint 上验证成功，并且 fixture 通过 fake-node smoke
+之后，才算真正可用。
+
+如果一个未配置的新链看起来属于现有 adapter family，chain template 只是起点，
+不是支持完成证明。onboarding 流程仍然必须完成协议分类、可访问 endpoint 的安全
+method probe、请求参数与 workload 权重定义、fixture 录制、preflight 和 fake-node smoke。
+例如 Flow EVM 这类 EVM-compatible endpoint 通常可以走 JSON-RPC family；但即使同属某个
+provider，像 Greenfield billing REST API 这类不是 BSC/EVM JSON-RPC 的 API 产品，也不能
+未经验证就当成 BSC/EVM RPC 支持。
 
 对于未支持链，Agent 会生成 onboarding plan，而不是自动修改代码。通常流程是：
 

@@ -7,10 +7,68 @@ Before changing Agent code, an AI coding agent must read:
 
 1. `AI_CODING_GUIDE.md`.
 2. This gate document.
-3. `agent/README.md`.
-4. The exact files it plans to edit.
+3. `docs/en/adk-agent-architecture.md`.
+4. `agent/README.md`.
+5. The current reviewed task/design document for the Agent change.
+6. The exact files it plans to edit.
 
 If these rules conflict with an implementation shortcut, the rules win.
+
+## Documentation Gate Before Agent Code
+
+Do not change Agent workflow code until the task is documented.
+
+For any change that affects Agent behavior, ADK prompts, sub-agent routing,
+decision tree branches, terminal interaction, workflow state, benchmark
+execution, validators, runner lifecycle, fake-node smoke, endpoint validation,
+or onboarding:
+
+1. Read `AI_CODING_GUIDE.md`, this file,
+   `docs/en/adk-agent-architecture.md`, and the current reviewed task/design
+   document for the Agent change.
+2. Confirm the task document names the root problem, exact scope, files to
+   inspect, files that must not be changed, expected user-facing behavior,
+   validation commands, and acceptance evidence.
+3. If the document is missing, stale, vague, or inconsistent with code, update
+   the document first and review it before touching code.
+4. Only then modify code, and keep each code change traceable to the documented
+   task.
+
+Forbidden shortcuts:
+
+- patching one terminal transcript without updating the decision tree or task
+  document;
+- adding local if/else, regex, fuzzy matching, phrase cleanup, or fallback
+  behavior to hide a weak Agent workflow;
+- creating new helper files before proving the existing architecture needs
+  them;
+- keeping old code by renaming or isolating it when the design requires
+  deletion or migration;
+- claiming a phase is complete without running the documented gates.
+
+If a test or live CLI run exposes a new failure, stop and classify it in the
+task document before coding the fix. The fix must address the root cause in
+ADK workflow, typed state, deterministic tools, validators, or terminal I/O
+boundaries, not just the exact wording of the failed prompt.
+
+The classification must also state why a local patch is not the right product
+fix. If the selected implementation uses a local patch anyway, the task
+document must explicitly justify the tradeoff, define its removal condition,
+and add Harness coverage so it cannot become hidden technical debt. Otherwise,
+do not write the patch.
+
+Passing one transcript is not enough. The proposed fix must preserve the
+decision tree, typed `pending_question` contract, validator sequence, user
+correction path, and benchmark execution gates across neighboring branches.
+
+For configuration dialogue failures, classification must identify whether the
+problem is:
+
+- missing or stale `pending_question`;
+- a visible multi-question prompt;
+- a missing deterministic next-question transition;
+- smoke-only values leaking into full benchmark configuration;
+- terminal code attempting to compensate for a missing workflow transition.
 
 ## Non-Negotiable Product Boundary
 
@@ -29,6 +87,36 @@ ADK and the configured model own natural-language understanding, planning,
 question selection, and iteration. Repository tools own deterministic checks,
 configuration materialization, benchmark execution, evidence collection, and
 artifact-backed analysis.
+
+## Decision Tree And Y/N Contract
+
+The complete workflow map and product Harness plan must be present in the
+current reviewed task/design document for the Agent change. Do not make Agent
+workflow changes from this short checklist alone.
+
+Every yes/no answer must be tied to one active pending question. The Agent must
+not ask a yes/no question unless the accepted and declined paths are explicit.
+
+Required behavior:
+
+- If there is no pending question, a bare `Y`, `N`, `yes`, or `no` is not a
+  valid business decision. Ask what the user wants to confirm.
+- If the pending question is dependency installation, `Y` installs dependencies
+  through the Agent tool and `N` declines installation.
+- If the pending question is target mode, `fake-node`, `real-node`, or a
+  numbered/manual choice advances that target-mode path.
+- If the pending question is a disk choice, a number selects the listed disk and
+  a manual value overrides the inferred value.
+- If the pending question is quick assumed fake-node smoke, `Y` must submit the
+  detached smoke job without asking another confirmation for the same action.
+- If the user changes their mind, says a previous answer was wrong, or asks to
+  go back, update or revert workflow state and re-run validators before
+  continuing.
+
+After a detached job is submitted, the Agent should provide `job_id`, run
+directory, `benchmark.log`, and the commands/options for `status`, `logs`, and
+`follow`. It must not ask an unregistered yes/no question such as "view logs
+now?" unless that pending action is stored in workflow state.
 
 ## Forbidden Patterns
 
@@ -49,6 +137,81 @@ Do not add or reintroduce:
 
 Stable terminal commands such as `help`, `doctor`, `jobs`, `status`, `logs`,
 `follow`, and `exit` are allowed. Business requests must go through ADK.
+
+## Legacy-Code Pollution Gate
+
+Before repairing Agent workflow behavior, audit the existing `agent/` code for
+old custom-Agent logic. Do not preserve code merely because it is currently
+imported.
+
+Allowed retained code must fit one of these roles:
+
+- ADK runtime and sub-agent construction;
+- ADK function-tool wrappers;
+- deterministic AnyChain planners, validators, runners, analyzers, discovery,
+  onboarding, or knowledge providers;
+- terminal I/O, exact shell commands, Ctrl+C/log-follow handling, dependency
+  consent, and user-visible progress;
+- developer utilities and tests that are clearly outside the product runtime.
+
+Remove or migrate:
+
+- old non-ADK benchmark wizards;
+- fallback custom brains or mock agents;
+- terminal keyword/fuzzy/regex business routing;
+- phrase-repair loops that try to hide bad planning;
+- duplicate workflow state machines;
+- lifecycle-only mock smoke paths presented as user-facing smoke;
+- dead files kept only because old imports reference them.
+
+If useful deterministic behavior exists inside obsolete code, move that
+behavior to the correct planner, validator, runner, analyzer, onboarding, or
+ADK tool wrapper. The old conversational wrapper should not remain.
+
+The Agent is not product-ready while legacy code can bypass ADK-owned intent,
+typed pending questions, deterministic validators, preflight, smoke, or user
+approval gates.
+
+The current high-risk areas that must be reviewed before more Agent code
+repair are:
+
+- `agent/adk_app/terminal_presenter.py` and
+  `agent/adk_app/terminal_contract.py`: must not exist. Broad LLM rewrite,
+  regex phrase-repair, and standalone terminal prompt wrapper behavior belong
+  nowhere in the product path. Product behavior should be fixed in ADK prompts,
+  typed state, tools, callbacks, and validators.
+- `agent/terminal/repl.py`: may keep exact terminal controls and safe I/O, but
+  must not contain benchmark-domain intent routing or field extraction.
+- `agent/workflows/conversation_state.py`: must become strong enough to carry
+  the decision tree's typed pending questions and branch transitions. A generic
+  prompt/id field is not sufficient for product-grade Y/N, numbered-choice,
+  manual-value, URL, disk, and rollback behavior.
+- `agent/adk_app/workflow/schemas.py`: must not stay limited to a thin intent
+  enum if workflow transitions depend on richer structured state.
+- `agent/tools/schema.py`, `agent/tools/executor.py`, and
+  `agent/runners/job_manager.py`: any `mock` lifecycle support must be removed
+  from the product Agent execution path. If it remains for developer or
+  enterprise-platform tests, it must be explicitly named as non-product test
+  support and unreachable from normal terminal benchmark flows. User-facing
+  smoke must be complete traffic, proxy, monitoring, report, archive, and
+  artifact discovery.
+- `agent/adk_app/workflow/native_smoke.py` and `agent/adk_app/evals/runner.py`:
+  developer contract tests only. They cannot be used as product acceptance for
+  terminal multi-turn behavior.
+
+Preserve deterministic domain tools unless a concrete replacement exists:
+`agent/discovery`, `agent/diagnostics`, `agent/planners`, `agent/validators`,
+`agent/runners`, `agent/analyzers`, `agent/onboarding`, and `agent/knowledge`
+are the benchmark engine's domain surface. The repair task is to wire them into
+ADK correctly, not to replace them with model prose.
+
+Do not use "isolate legacy code" as a cleanup outcome. Isolation is acceptable
+for Python environments, smoke output directories, generated job artifacts, or
+test fixtures. It is not acceptable as a way to keep old conversational logic,
+fallback brains, phrase-repair loops, keyword routing, or duplicate state
+machines in the source tree. Legacy product logic must be deleted, or its
+useful deterministic behavior must be migrated into the correct domain module
+with tests.
 
 ## Required Agent Behavior
 
@@ -102,17 +265,288 @@ Before smoke or real benchmark execution, validators must confirm:
 Smoke tests must use isolated runtime files and must not pollute the final
 benchmark job configuration or result archive.
 
+Smoke is a complete closed-loop benchmark execution. It is not a mock and not a
+partial check. Quick smoke should use very small QPS settings and short
+duration, but it must still exercise traffic generation, fake-node or endpoint
+handling, proxy, monitoring, reports, archive creation, and artifact discovery.
+
+## Configuration Group Workflow Standard
+
+The Agent configuration flow is not a fixed one-way wizard. It is a set of
+configuration groups with a default order, global natural-language routing, and
+validator-driven recovery. Users may jump between groups, correct earlier
+answers, change target chain or mode, paste evidence, or ask questions at any
+time. The Agent must route the turn to the right group, preserve valid state,
+invalidate affected state, and then return to the next blocking group in the
+default order.
+
+The default order should match user mental model and manual configuration
+order:
+
+1. Provider and deployment group: cloud provider, region, zone, machine type,
+   VM vs Kubernetes/container, and platform such as GCE, EC2, GKE, EKS, or
+   self-hosted Kubernetes.
+2. Hardware group: CPU and memory discovery, network inventory, disk inventory,
+   and resource metadata.
+3. Ledger disk group: `LEDGER_DEVICE`, `DATA_VOL_TYPE`, `DATA_VOL_SIZE`,
+   `DATA_VOL_MAX_IOPS`, and `DATA_VOL_MAX_THROUGHPUT`.
+4. Accounts disk group: ask whether a separate accounts/state disk exists; if
+   yes, collect `ACCOUNTS_DEVICE`, `ACCOUNTS_VOL_TYPE`, `ACCOUNTS_VOL_SIZE`,
+   `ACCOUNTS_VOL_MAX_IOPS`, and `ACCOUNTS_VOL_MAX_THROUGHPUT`.
+5. Network group: `NETWORK_INTERFACE`, selected from detected interfaces when
+   there is more than one candidate, and `NETWORK_MAX_BANDWIDTH_GBPS`.
+6. Chain and endpoint group: `BLOCKCHAIN_NODE`, target mode, `LOCAL_RPC_URL`,
+   `MAINNET_RPC_URL` or template sync-health behavior, and
+   `BLOCKCHAIN_PROCESS_NAMES` for real-node monitoring.
+7. Chain auxiliary endpoint group: chain-template-driven optional overrides
+   such as `CHAIN_REST_URL`, `CHAIN_INDEXER_URL`, `CHAIN_SIDECAR_URL`,
+   `CHAIN_EVM_RPC_URL`, `CHAIN_JSON_RPC_URL`, `CHAIN_MIRROR_URL`, and
+   `RPC_API_KEY`.
+8. Workload group: `RPC_MODE`, default workload selection, custom RPC methods,
+   mixed weights, runtime chain template override, endpoint validation,
+   fixtures, and workload validation.
+9. Target sample and fixture group: only the `TARGET_*` values required by the
+   selected chain template, methods, adapter family, and custom RPC schema.
+10. QPS profile group: quick, standard, or intensive profile; explain defaults
+    first; ask whether to keep defaults; if not, collect initial QPS, max QPS,
+    QPS step, duration, and relevant cooldown/warmup fields.
+11. Observability group: disabled, local Prometheus/Grafana, or exporter-only;
+    then ports, auto-stop behavior, scrape endpoint guidance, and port checks.
+12. Advanced tuning group: optional account discovery settings, monitoring
+    intervals, disk monitor rate, internal bottleneck thresholds, success-rate
+    threshold, latency threshold, and other `internal_config.sh` values. The
+    Agent must explain these before asking whether the user wants to change
+    them.
+13. Preflight, smoke, and execution approval group: validate config, run
+    preflight, run complete closed-loop smoke, show evidence, and ask for
+    approval before the real benchmark job.
+
+Each group must define:
+
+- required fields and optional fields;
+- inferred values and their evidence;
+- manual override paths for every inferred value;
+- invalidation rules when an upstream value changes;
+- validators and evidence that mark the group complete;
+- the next blocking group when complete;
+- advanced settings, if any, and how to explain them before asking whether to
+  adjust them.
+
+The Agent must maintain group-level state, not only a single
+`pending_question`. State must track the active group, group progress,
+confirmed fields, invalidated fields, evidence, and interruption stack. If the
+user jumps from one group to another, the previous group is paused, the target
+group runs, validators recompute the next blocking group, and the Agent returns
+to the default order unless the user explicitly requests another jump.
+
+Group interruption examples that must be supported:
+
+- user changes chain while answering disk, QPS, endpoint, observability, or
+  final approval questions;
+- user changes target mode from fake-node to real-node after resource metadata
+  is already confirmed;
+- user adds custom RPC methods after accepting the default workload;
+- user changes QPS profile after selecting a benchmark mode;
+- user says a previous disk, network, endpoint, region, or workload answer was
+  wrong;
+- user returns from unsupported-chain Case 3 to a supported chain, Case 1, or
+  Case 2 path.
+
+Invalidation must be precise:
+
+- changing chain invalidates chain endpoints, RPC mode, workload methods,
+  weights, target samples, fixtures, endpoint evidence, and runtime chain
+  template overrides, but should keep cloud, hardware, disk, network, and
+  observability answers unless the user asks to change them;
+- changing target mode invalidates endpoint and process-name requirements that
+  differ between fake-node and real-node;
+- changing `LEDGER_DEVICE` invalidates data disk size, IOPS, and throughput;
+- changing `ACCOUNTS_DEVICE` invalidates accounts disk size, IOPS, and
+  throughput;
+- changing benchmark mode invalidates the selected QPS profile confirmation;
+- changing custom RPC methods invalidates method params, weights, fixture
+  evidence, and workload validation.
+
+Harness and live CLI tests must cover group jumps, rollback, invalidation, and
+return-to-default-order behavior. Passing a linear happy path is not enough.
+
 ## Onboarding And Knowledge Boundary
 
-For a chain outside the supported templates, ADK must first determine whether
-it belongs to an existing adapter family. If framework knowledge is insufficient,
-ask the user for official RPC documentation, endpoint information, method
-examples, request/response samples, and fixture evidence.
+For a chain outside the supported templates, ADK must not jump directly to
+adapter-family selection, endpoint collection, or development handoff. It must
+first resolve whether the chain identity appears to exist, then confirm the
+protocol/adapter family. If framework knowledge is insufficient, ask the user
+for official chain documentation, protocol/RPC documentation, endpoint
+information, method examples, request/response samples, and fixture evidence.
 
 When Gemini plus Google authentication is configured, ADK may use
 `google_search` only in onboarding and custom-RPC research flows. Search results
 are evidence, not authority to skip validation. Official documentation should
 be preferred over blogs or forums.
+
+## Chain And RPC Onboarding Cases
+
+Agent workflow, prompts, tools, and Harness tests must distinguish these three
+cases. They share validation principles, but they do not have the same product
+outcome.
+
+### Case 1: Supported Chain With Custom RPC Methods
+
+This case applies when the chain is one of the 36 committed chain templates, or
+an exact known alias for one of them, and the user wants to add, replace, or
+reweight RPC methods for the current job.
+
+The Agent must ask the user for:
+
+- whether the custom method is added to the default workload or replaces the
+  default workload;
+- the RPC mode: `single` or `mixed`;
+- method name;
+- params sample, including empty params when the method has no params;
+- reachable endpoint for live validation;
+- request sample when the user has one;
+- response sample when the user has one;
+- desired workload weights for every method that remains active.
+
+The Agent must do the following before execution:
+
+1. Keep the canonical `config/chains/<chain>.json` unchanged.
+2. Create or update a job-local runtime chain template override for the custom
+   workload.
+3. Probe the endpoint with the proposed method and params. User-provided
+   request/response samples are evidence to verify, not facts to trust.
+4. Confirm the method shape can be represented by the current chain template
+   schema: `param_formats`, `_meta.rest_paths`, or `param_spec`.
+5. If schema support is missing, stop and produce a coding handoff. Do not hide
+   schema failures behind generic benchmark errors.
+6. Record or generate method-specific fixture evidence for every active custom
+   method.
+7. Validate workload weights. Mixed workload weights must sum to 100%. If the
+   user fully replaces the default workload, remove default methods from the
+   runtime override so target generation cannot send unwanted default requests.
+8. Run preflight and fake-node smoke before treating the custom method as usable
+   for the job.
+
+If any validation step fails, the Agent must show the failure reason, endpoint
+or fixture evidence path when available, and the next corrective action. It must
+not continue to benchmark execution with unverified custom RPC methods.
+
+### Case 2: New Chain In An Existing Adapter Family
+
+This case applies when the chain is not one of the 36 committed templates, the
+user has confirmed the intended chain identity, and the protocol appears to fit
+an existing adapter family.
+
+The Agent must complete two gates before Case 2 begins:
+
+1. Chain existence/identity gate: use the configured LLM with repository facts
+   and current workflow state to decide whether the candidate appears to exist,
+   is likely a typo for a supported chain, is unknown, or needs user-provided
+   evidence. With Gemini plus Google authentication, use ADK `google_search` on
+   official sources before asking the user to confirm the chain identity.
+2. Protocol-family gate: only after the chain identity is confirmed, infer the
+   adapter family from repository facts, official docs, user-provided samples,
+   and search evidence when available. Ask the user to confirm the proposed
+   family or type the correct family. If no existing family can be confirmed,
+   route to Case 3.
+
+If the user confirms an existing family, the Agent must require a reachable
+endpoint, validate safe RPC methods against it, verify method schema support,
+record fixtures, and pass fake-node smoke. Only after those gates pass may the
+Agent continue into the normal resource, workload, observability, preflight, and
+execution flow. The chain remains job-local until separately reviewed and
+committed.
+
+### Case 3: New Chain Outside Existing Adapter Families
+
+This case applies when the user has confirmed the intended chain identity and
+the Agent cannot confirm that the chain fits an existing adapter family.
+
+The Agent must not continue benchmark setup. With Gemini `google_search`, it
+should gather official docs first after chain identity is confirmed. Without
+web research, it must ask the user for official protocol docs, RPC docs,
+endpoint docs, request examples, and response examples. The output is a
+secondary-development handoff for another coding AI or engineer, including
+adapter boundaries, files to edit, schema requirements, fixture requirements,
+smoke and coverage gates, documentation updates, and PR expectations.
+
+## Unknown Chain Decision Standard
+
+This section is the product standard for any user input that names a chain or
+chain-like target that is not an exact supported template name or exact known
+alias for one of the 36 committed chain templates. It applies at every point in
+the conversation, including while the Agent is waiting for disk, QPS, endpoint,
+RPC method, observability, or final approval answers.
+
+The Agent must not silently map an unknown chain-like value to a supported chain
+through prefix matching, fuzzy matching, or provider-name assumptions. It must
+route the turn into a two-step chain identity workflow and follow this sequence:
+
+1. Identify the proposed chain name from the user's text without destroying the
+   user's original wording. Do not shorten multi-token names to a supported
+   prefix, and do not treat partial tokens as supported aliases.
+2. Resolve chain existence/identity first. Use the configured LLM with
+   repository context and current workflow state. If Gemini plus Google
+   authentication is available, use ADK `google_search` against official
+   sources before asking the user to confirm whether the chain exists, whether
+   it is a supported-chain typo, or whether more docs/evidence are needed.
+   Do not write the active `chain`, ask for endpoint, or enter Case 2/3 until
+   the user confirms the intended chain identity.
+3. Resolve protocol family second. Only after chain identity is confirmed,
+   determine whether the chain appears to belong to an existing adapter family.
+   If Gemini plus Google authentication is available, use ADK `google_search`
+   to look for official RPC documentation, official endpoint examples, and
+   official request/response examples before proposing the family. If web
+   research is unavailable, the model may use repository context and model
+   knowledge, but must tell the user when protocol family evidence is
+   uncertain.
+4. Ask the user to confirm the proposed protocol family. If the model cannot
+   determine the family, ask the user for the protocol family or for official
+   documentation.
+5. If the family is supported, require a reachable `LOCAL_RPC_URL` or public RPC
+   endpoint. Probe the endpoint before trusting it. User-provided endpoints,
+   request samples, response samples, and method documentation are evidence to
+   verify, not facts to accept blindly.
+6. For each user-selected RPC method, validate the live request against the
+   endpoint, confirm the parameter schema can be expressed by the current chain
+   template schema (`param_formats`, `_meta.rest_paths`, or `param_spec`), and
+   record or generate method-specific fixture evidence. If request/response
+   samples conflict with live endpoint behavior or official docs, stop and ask
+   the user to correct the evidence.
+7. If fixture recording, template validation, or fake-node smoke passes, the
+   Agent may continue into the normal benchmark configuration flow and ask the
+   remaining resource, workload, observability, preflight, and execution
+   questions. The newly supported chain remains job-local until explicitly
+   reviewed and committed.
+8. If smoke fails, report the failure reason, evidence paths, and likely
+   category. If the failure appears to be framework code or schema support, give
+   the user a handoff that another coding AI can use to fix the framework. Do
+   not hide the failure or continue to a real benchmark.
+9. If the family is unsupported, do not run benchmark setup. If Gemini
+   `google_search` is available, gather official docs first. Otherwise ask the
+   user for official docs, endpoint docs, protocol docs, and RPC samples. Then
+   generate a secondary-development handoff with files to edit, adapter-family
+   boundaries, schema requirements, fixture requirements, smoke/coverage gates,
+   documentation updates, and PR expectations.
+
+For custom RPC methods on either an existing chain or an onboarded
+existing-family chain, the same endpoint-validation rule applies. The Agent must
+validate the method against a reachable endpoint, verify params and response
+shape, record method-specific fixtures, and ensure workload weights sum to
+100%. If the user fully replaces the default workload with custom methods, the
+runtime chain template override must remove default methods so target generation
+does not send unwanted default RPC requests.
+
+Acceptance tests for this standard must include:
+
+- unknown chain entered at the chain-selection step;
+- unknown chain entered while another pending question is active;
+- ambiguous chain/provider names such as a provider API that is not the same
+  protocol as the familiar chain brand;
+- an existing-family chain with a valid endpoint and safe method probe;
+- an existing-family chain with a bad endpoint or conflicting samples;
+- an unsupported-family chain that produces a secondary-development handoff;
+- custom RPC methods with request/response evidence and invalid/valid weights.
 
 When generating a secondary-development plan, the Agent must include:
 
@@ -123,6 +557,39 @@ When generating a secondary-development plan, the Agent must include:
 - smoke and coverage checks;
 - documentation updates required to keep the Agent knowledge current;
 - PR and CI expectations.
+
+## Error, Evidence, And Report Analysis Boundary
+
+The Agent must support diagnostic and analysis conversations as first-class
+workflow groups, not as loose chat.
+
+When the user pastes errors, logs, stack traces, validator output, endpoint
+probe output, benchmark output, or unfamiliar terminal text:
+
+- treat the pasted content as evidence, not as a configuration-field answer;
+- pause the current configuration group;
+- read referenced local files when paths are available;
+- combine the evidence with framework facts, runtime state, relevant docs, and
+  generated artifacts before model analysis;
+- return likely root cause, evidence path or summary, category, next action,
+  and whether the paused group can continue;
+- never stuff pasted logs into fields such as `CLOUD_REGION`, `LEDGER_DEVICE`,
+  RPC params, or endpoint URLs unless the user explicitly identifies that line
+  as the value.
+
+When the user asks about reports, charts, CSVs, bottlenecks, per-method
+attribution, latency, success rate, or N/A data:
+
+- resolve the requested or latest job;
+- read structured artifacts such as `test_summary.json`,
+  `performance_latest.csv`, per-method CSVs, sync-health CSVs, and report
+  paths before model analysis;
+- distinguish fake-node smoke evidence from real-node performance evidence;
+- cite artifact paths used for the conclusion;
+- explain missing, zero, or N/A data as data-collection or scenario evidence
+  when that is what the artifacts show;
+- preserve the report context for follow-up questions until the user switches
+  job or starts a new benchmark.
 
 ## Documentation Boundary
 

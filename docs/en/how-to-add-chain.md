@@ -139,9 +139,37 @@ When changing `mixed_weighted`:
 7. Add the fake-node family YAML mapping under `tools/fake-node/configs/`.
 8. Record the method's own fixture and run coverage/runtime probes.
 
+`weight` must be a positive integer. The target generator treats a missing,
+invalid, or zero weight as `1` so a configured method is still exercised during
+mixed-mode smoke and benchmark runs. To disable a method, remove it from
+`mixed_weighted`; do not set `weight` to `0`.
+
 Do not add a method only because it is listed in official docs. Add it when the
 framework can build a valid request, record a real response, replay it through
 fake-node, and include it in the proxy/HTML attribution path.
+
+Custom RPC support is job-local until validation is complete. The Agent may
+draft a workload override for a single benchmark job, but it must not mutate
+`config/chains/*.json` just because a user asked for a custom method. Promote a
+method into the canonical chain template only after endpoint validation,
+fixture recording, fake-node coverage, smoke, and documentation updates all
+pass.
+
+For existing-chain custom methods, a method name is not enough. Collect and
+validate:
+
+1. A reachable endpoint for the chain or API product.
+2. The exact method or route.
+3. The full request shape, including params, body, path variables, query
+   values, and required headers when applicable.
+4. Real sample values for every `TARGET_*` placeholder.
+5. A successful response and, when useful, a representative error response.
+6. The desired single/mixed workload participation and mixed weight.
+7. A fake-node fixture that replays the verified response.
+
+If the user wants a method weight of `0`, remove that method from
+`mixed_weighted` instead. A configured zero weight is normalized by the target
+generator and the method can still be exercised.
 
 ### 4. Configure Parameter Formats
 
@@ -281,6 +309,14 @@ Notes:
 - REST chains often require chain-specific samples such as `asset_id`, `token_id`, `validator_address`, or `denom`.
 
 If the sample is not real, fixture recording may produce 400/404/empty responses, and fake-node will not simulate production behavior.
+
+Endpoint validation is mandatory for new chains and custom methods. User
+request/response samples are useful evidence, but they are not trusted as truth
+until the framework probes the supplied endpoint and observes the same behavior.
+If the endpoint belongs to a platform API with different protocol semantics,
+do not assume it is compatible with the chain's usual RPC family. For example,
+an EVM endpoint can follow the JSON-RPC path, while a provider's billing or
+management REST API may need the REST adapter or a new adapter family.
 
 ### 6. Configure REST Paths or Sidecar Paths
 

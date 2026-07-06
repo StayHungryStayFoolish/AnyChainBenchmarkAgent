@@ -38,7 +38,6 @@ def run_offline_evals() -> dict[str, Any]:
         "generate_benchmark_plan",
         "run_preflight",
         "render_runbook",
-        "run_smoke",
         "run_fake_node_smoke_benchmark",
         "submit_benchmark_job",
         "install_dependencies",
@@ -53,6 +52,7 @@ def run_offline_evals() -> dict[str, Any]:
         "load_default_workload",
         "validate_chain_template",
         "validate_execution_gate",
+        "validate_rpc_endpoint",
         "build_onboarding_handoff",
     }
 

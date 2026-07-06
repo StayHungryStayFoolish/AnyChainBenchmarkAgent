@@ -24,9 +24,10 @@ from knowledge.framework_context import load_framework_context, render_framework
 from llm import config as llm_config_module  # noqa: E402
 from llm.config import load_llm_config  # noqa: E402
 from llm.google_auth import credential_plan  # noqa: E402
-from llm.providers import _vertex_openai_base_url, provider_from_config  # noqa: E402
-from runners.materialize import build_runtime_env  # noqa: E402
-from runners.guardrails import validate_execution_plan  # noqa: E402
+from llm.providers import _vertex_openai_base_url, _vertex_raw_predict_url, provider_from_config  # noqa: E402
+from planners.strategy_planner import generate_plan  # noqa: E402
+from runners.materialize import build_runtime_env, materialize_runtime_env  # noqa: E402
+from runners.guardrails import build_benchmark_command, validate_execution_plan  # noqa: E402
 from runners.job_manager import get_job, submit_job  # noqa: E402
 from adk_app.app import status_payload as adk_status_payload  # noqa: E402
 from adk_app.callbacks import before_tool_callback  # noqa: E402
@@ -46,7 +47,6 @@ from adk_app.tools.registry import get_adk_tools  # noqa: E402
 from adk_app.tools.actions import install_dependencies as adk_install_dependencies  # noqa: E402
 from adk_app.tools.actions import _fake_node_smoke_plan  # noqa: E402
 from adk_app.tools.actions import run_fake_node_smoke_benchmark as adk_run_fake_node_smoke_benchmark  # noqa: E402
-from adk_app.tools.actions import run_smoke as adk_run_smoke  # noqa: E402
 from adk_app.tools.actions import submit_benchmark_job as adk_submit_benchmark_job  # noqa: E402
 from adk_app.tools.enterprise import enterprise_integration_manifest  # noqa: E402
 from adk_app.tools.planning import draft_benchmark_request as adk_draft_benchmark_request  # noqa: E402
@@ -54,6 +54,8 @@ from adk_app.tools.planning import generate_benchmark_plan as adk_generate_bench
 from adk_app.tools.planning import prepare_benchmark_run as adk_prepare_benchmark_run  # noqa: E402
 from adk_app.tools.planning import render_runbook as adk_render_runbook  # noqa: E402
 from adk_app.tools.planning import run_preflight as adk_run_preflight  # noqa: E402
+from adk_app.tools.validators import validate_fake_node_fixture_coverage as adk_validate_fake_node_fixture_coverage  # noqa: E402
+from adk_app.tools.validators import validate_rpc_endpoint as adk_validate_rpc_endpoint  # noqa: E402
 from adk_app.tools.read_only import audit_dependencies as adk_audit_dependencies  # noqa: E402
 from adk_app.tools.read_only import load_execution_contract as adk_load_execution_contract  # noqa: E402
 from adk_app.tools.read_only import load_framework_context as adk_load_framework_context  # noqa: E402
@@ -62,7 +64,10 @@ from adk_app.tools.read_only import load_framework_capabilities as adk_load_fram
 from adk_app.tools.read_only import list_rpc_methods as adk_list_rpc_methods  # noqa: E402
 from adk_app.tools.read_only import list_supported_chains as adk_list_supported_chains  # noqa: E402
 from diagnostics.doctor import format_doctor_report, run_doctor  # noqa: E402
+from analyzers.bottleneck_rules import diagnose_artifacts  # noqa: E402
 from onboarding.chain_onboarding import generate_onboarding_package  # noqa: E402
+from validators.execution_gate import validate_execution_gate  # noqa: E402
+from utils.redaction import redact  # noqa: E402
 
 
 def run_agent(*args, env=None):
@@ -82,6 +87,20 @@ def run_agent(*args, env=None):
 
 
 class AgentRuntimeContractTest(unittest.TestCase):
+    def _write_fake_bash(self, tmp_path: Path) -> Path:
+        fake_bash = tmp_path / "bash5"
+        fake_bash.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = \"--version\" ]; then\n"
+            "  echo 'GNU bash, version 5.2.0(1)-release'\n"
+            "  exit 0\n"
+            "fi\n"
+            "exec /bin/sh \"$@\"\n",
+            encoding="utf-8",
+        )
+        fake_bash.chmod(0o755)
+        return fake_bash
+
     def test_read_only_discovery_with_injected_commands(self):
         def fake_runner(command, timeout):
             joined = " ".join(command)
@@ -114,7 +133,18 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertEqual(discovery["disks"]["proposed_ledger_device"], "sdb")
         self.assertEqual(discovery["dependencies"]["mode"], "audit")
 
-    def test_prompt_to_plan_preflight_and_mock_job(self):
+    def test_read_only_discovery_fixture_for_live_matrix(self):
+        fixture = REPO / "tests" / "fixtures" / "agent_discovery_gcp_multidisk.json"
+        with patch.dict(os.environ, {"ANYCHAIN_AGENT_DISCOVERY_FIXTURE": str(fixture)}):
+            discovery = discover_environment()
+        self.assertEqual(discovery["source"], "agent.discovery.fixture")
+        self.assertEqual(discovery["cloud"]["provider"], "gcp")
+        self.assertEqual(discovery["cloud"]["platform"], "gce")
+        self.assertEqual(discovery["network"]["default_interface"], "ens4")
+        self.assertIn("sdb", discovery["disks"]["ambiguous_candidates"])
+        self.assertEqual(discovery["disks"]["proposed_accounts_device"], "sdc")
+
+    def test_prompt_to_plan_preflight_and_developer_lifecycle_job(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             request_file = tmp_path / "request.json"
@@ -208,13 +238,25 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertTrue(validation["valid"])
 
             self.assertTrue(validate_execution_plan(plan, approved=False))
-            self.assertEqual(validate_execution_plan(plan, approved=True), [])
+            fake_bash = self._write_fake_bash(tmp_path)
+            old_bash = os.environ.get("ANYCHAIN_BASH")
+            os.environ["ANYCHAIN_BASH"] = str(fake_bash)
+            try:
+                self.assertEqual(validate_execution_plan(plan, approved=True), [])
+            finally:
+                if old_bash is None:
+                    os.environ.pop("ANYCHAIN_BASH", None)
+                else:
+                    os.environ["ANYCHAIN_BASH"] = old_bash
 
             preflight = run_agent("preflight", "--plan", str(plan_file))
             self.assertFalse(preflight["passed"])
             self.assertTrue(any("required_inputs_present" in item for item in preflight["blockers"]))
 
-            job = run_agent("submit", "--plan", str(plan_file), "--jobs-dir", str(jobs_dir), "--mock")
+            # Developer-only lifecycle path: this verifies job metadata and
+            # artifact indexing without presenting mock execution as product
+            # smoke validation.
+            job = run_agent("submit", "--plan", str(plan_file), "--jobs-dir", str(jobs_dir), "--dev-lifecycle-mock")
             self.assertEqual(job["status"], "completed")
             self.assertTrue(Path(job["artifact_index"]).is_file())
             self.assertTrue(Path(job["runtime_env_file"]).is_file())
@@ -313,6 +355,37 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertIn("disk_latency", categories)
             self.assertIn("rpc_errors", categories)
 
+            plan_file_for_filter = tmp_path / "bsc_plan.json"
+            plan_file_for_filter.write_text(json.dumps({
+                "rpc_mode": "single",
+                "workload": {"single": "eth_getBalance"},
+            }), encoding="utf-8")
+            probe_csv = tmp_path / "proxy_method_with_probe.csv"
+            probe_csv.write_text(
+                "timestamp,method,status,latency_ms\n"
+                "1,eth_getBalance,200,20\n"
+                "2,getHealth,404,2\n",
+                encoding="utf-8",
+            )
+            probe_index = tmp_path / "probe_index.json"
+            probe_index.write_text(json.dumps({
+                "evidence": {
+                    "performance_csv": "",
+                    "proxy_method_csv": str(probe_csv),
+                    "sync_health_csv": "",
+                }
+            }), encoding="utf-8")
+            filtered = diagnose_artifacts(
+                job={"plan_file": str(plan_file_for_filter)},
+                artifact_index=str(probe_index),
+            )
+            filtered_methods = {
+                finding.get("evidence", {}).get("method")
+                for finding in filtered["findings"]
+                if finding.get("category") == "rpc_errors"
+            }
+            self.assertNotIn("getHealth", filtered_methods)
+
             clean_csv = tmp_path / "clean_performance.csv"
             clean_csv.write_text(
                 "timestamp,cpu_usage,cpu_iowait,data_vda_avg_await,data_vda_util,cgroup_cpu_usage_usec\n"
@@ -333,6 +406,193 @@ class AgentRuntimeContractTest(unittest.TestCase):
                 "cpu",
                 {finding["category"] for finding in clean_diagnostics["findings"]},
             )
+
+            class ProbeHandler(BaseHTTPRequestHandler):
+                def do_GET(self):  # noqa: N802
+                    self._send()
+
+                def do_POST(self):  # noqa: N802
+                    _ = self.rfile.read(int(self.headers.get("Content-Length", "0") or "0"))
+                    self._send()
+
+                def log_message(self, *_args):
+                    return
+
+                def _send(self):
+                    body = b'{"jsonrpc":"2.0","result":123,"id":1}'
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+            server = HTTPServer(("127.0.0.1", 0), ProbeHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                endpoint_probe = adk_validate_rpc_endpoint(
+                    "solana",
+                    f"http://127.0.0.1:{server.server_port}",
+                    methods=["getSlot"],
+                    address="11111111111111111111111111111111",
+                    timeout=1,
+                )
+                self.assertEqual(endpoint_probe["status"], "ok")
+                self.assertTrue(endpoint_probe["data"]["ready"])
+                self.assertEqual(endpoint_probe["data"]["status"], "ok")
+                self.assertEqual(endpoint_probe["data"]["http_status"], 200)
+                self.assertTrue(endpoint_probe["data"]["response_shape_hash"])
+                self.assertTrue((REPO / endpoint_probe["data"]["evidence_file"]).is_file())
+                self.assertTrue(any(item["name"] == "method_probe:getSlot" for item in endpoint_probe["data"]["checks"]))
+            finally:
+                server.shutdown()
+                thread.join(timeout=1)
+                server.server_close()
+
+            bad_endpoint_probe = adk_validate_rpc_endpoint("solana", "not-a-url")
+            self.assertEqual(bad_endpoint_probe["status"], "blocked")
+            self.assertEqual(bad_endpoint_probe["data"]["status"], "needs_endpoint")
+            self.assertTrue((REPO / bad_endpoint_probe["data"]["evidence_file"]).is_file())
+            self.assertIn("endpoint must be", " ".join(bad_endpoint_probe["warnings"]))
+
+            class JsonRpcProbeHandler(BaseHTTPRequestHandler):
+                def do_POST(self):  # noqa: N802
+                    raw = self.rfile.read(int(self.headers.get("Content-Length", "0") or "0"))
+                    request = json.loads(raw.decode("utf-8"))
+                    method = request.get("method")
+                    result = "0x221" if method == "eth_chainId" else "0x123"
+                    body = json.dumps({"jsonrpc": "2.0", "result": result, "id": request.get("id", 1)}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, *_args):
+                    return
+
+            generic_server = HTTPServer(("127.0.0.1", 0), JsonRpcProbeHandler)
+            generic_thread = threading.Thread(target=generic_server.serve_forever, daemon=True)
+            generic_thread.start()
+            try:
+                flow_probe = adk_validate_rpc_endpoint(
+                    "flow",
+                    f"http://127.0.0.1:{generic_server.server_port}/token-like-value-12345678901234567890",
+                    methods=["eth_blockNumber", "eth_chainId"],
+                    adapter_family="jsonrpc",
+                    timeout=1,
+                )
+                self.assertEqual(flow_probe["status"], "ok")
+                self.assertTrue(flow_probe["data"]["ready"])
+                self.assertEqual(flow_probe["data"]["transport"], "jsonrpc")
+                self.assertTrue(any(item["name"] == "method_probe:eth_blockNumber" for item in flow_probe["data"]["checks"]))
+                evidence = (REPO / flow_probe["data"]["evidence_file"]).read_text(encoding="utf-8")
+                self.assertNotIn("token-like-value-12345678901234567890", evidence)
+                self.assertIn("***REDACTED***", evidence)
+            finally:
+                generic_server.shutdown()
+                generic_thread.join(timeout=1)
+                generic_server.server_close()
+
+            self.assertEqual(
+                redact("https://example.invalid/path/abcdef0123456789abcdef0123456789/"),
+                "https://example.invalid/path/***REDACTED***/",
+            )
+            self.assertEqual(redact("getTokenAccountBalance: 20"), "getTokenAccountBalance: 20")
+            self.assertEqual(redact("API_TOKEN: abc123"), "API_TOKEN: ***REDACTED***")
+
+            seen_jsonrpc_requests: list[dict] = []
+
+            class CustomJsonRpcHandler(BaseHTTPRequestHandler):
+                def do_POST(self):  # noqa: N802
+                    raw = self.rfile.read(int(self.headers.get("Content-Length", "0") or "0"))
+                    request = json.loads(raw.decode("utf-8"))
+                    seen_jsonrpc_requests.append(request)
+                    if request.get("method") == "eth_chainId":
+                        body = json.dumps({"jsonrpc": "2.0", "result": "0x61", "id": request.get("id", 1)}).encode("utf-8")
+                        self.send_response(200)
+                    elif request.get("method") == "eth_feeHistory" and request.get("params") == ["0x4", "latest", []]:
+                        body = json.dumps({"jsonrpc": "2.0", "result": {"baseFeePerGas": ["0x1"]}, "id": request.get("id", 1)}).encode("utf-8")
+                        self.send_response(200)
+                    else:
+                        body = json.dumps({"jsonrpc": "2.0", "error": {"code": -32602, "message": "bad params"}, "id": request.get("id", 1)}).encode("utf-8")
+                        self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, *_args):
+                    return
+
+            custom_server = HTTPServer(("127.0.0.1", 0), CustomJsonRpcHandler)
+            custom_thread = threading.Thread(target=custom_server.serve_forever, daemon=True)
+            custom_thread.start()
+            try:
+                custom_probe = adk_validate_rpc_endpoint(
+                    "bsc",
+                    f"http://127.0.0.1:{custom_server.server_port}",
+                    methods=["eth_feeHistory"],
+                    adapter_family="jsonrpc",
+                    method_params={"eth_feeHistory": ["0x4", "latest", []]},
+                    timeout=1,
+                )
+                self.assertEqual(custom_probe["status"], "ok")
+                self.assertTrue(custom_probe["data"]["ready"])
+                self.assertTrue(any(item["name"] == "method_probe:eth_feeHistory" for item in custom_probe["data"]["checks"]))
+                self.assertTrue(any(item.get("method") == "eth_feeHistory" and item.get("params") == ["0x4", "latest", []] for item in seen_jsonrpc_requests))
+            finally:
+                custom_server.shutdown()
+                custom_thread.join(timeout=1)
+                custom_server.server_close()
+
+            class InvalidJsonRpcHandler(BaseHTTPRequestHandler):
+                def do_POST(self):  # noqa: N802
+                    _ = self.rfile.read(int(self.headers.get("Content-Length", "0") or "0"))
+                    body = b'{"code":404,"message":"invalid method"}'
+                    self.send_response(404)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, *_args):
+                    return
+
+            invalid_server = HTTPServer(("127.0.0.1", 0), InvalidJsonRpcHandler)
+            invalid_thread = threading.Thread(target=invalid_server.serve_forever, daemon=True)
+            invalid_thread.start()
+            try:
+                invalid_probe = adk_validate_rpc_endpoint(
+                    "bsc",
+                    f"http://127.0.0.1:{invalid_server.server_port}",
+                    methods=["eth_blockNumber", "eth_chainId"],
+                    adapter_family="jsonrpc",
+                    timeout=1,
+                )
+                self.assertEqual(invalid_probe["status"], "blocked")
+                self.assertFalse(invalid_probe["data"]["ready"])
+                self.assertTrue(any("invalid method" in item for item in invalid_probe["warnings"]))
+            finally:
+                invalid_server.shutdown()
+                invalid_thread.join(timeout=1)
+                invalid_server.server_close()
+
+            fake_completed = SimpleNamespace(
+                returncode=1,
+                stdout=json.dumps({
+                    "total": 2,
+                    "statuses": {"ok": 1, "missing-fixture": 1},
+                    "rows": [],
+                }),
+                stderr="",
+            )
+            with patch("adk_app.tools.validators.subprocess.run", return_value=fake_completed) as run_mock:
+                fixture_gate = adk_validate_fake_node_fixture_coverage("solana", strict=True)
+            self.assertEqual(fixture_gate["status"], "blocked")
+            self.assertIn("missing-fixture: 1", fixture_gate["warnings"])
+            self.assertIn("check_fixture_coverage.py", " ".join(run_mock.call_args[0][0]))
+            self.assertIn("--strict", run_mock.call_args[0][0])
 
             runbook_file = tmp_path / "runbook.md"
             completed = subprocess.run(
@@ -456,6 +716,8 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertTrue(install_props["include_vegeta"]["default"])
             self.assertTrue(install_props["no_sudo"]["default"])
             self.assertFalse(install_props["include_gcloud"]["default"])
+            submit_tool = next(tool for tool in schema["tools"] if tool["function"]["name"] == "submit_job")
+            self.assertNotIn("mock", submit_tool["function"]["parameters"]["properties"])
             prepare_tool = next(tool for tool in schema["tools"] if tool["function"]["name"] == "prepare_benchmark_run")
             draft_request_tool = next(tool for tool in schema["tools"] if tool["function"]["name"] == "draft_request")
             self.assertIn("confirmations", prepare_tool["function"]["parameters"]["properties"])
@@ -611,6 +873,7 @@ class AgentRuntimeContractTest(unittest.TestCase):
             report = run_doctor({
                 "cloud": {"provider": "gcp", "platform": "gce", "confidence": 0.8},
                 "deployment": {"type": "vm"},
+                "host": {"cpu_count": 24, "memory_gib": 98.0},
                 "network": {"default_interface": "eth0"},
                 "disks": {"ambiguous_candidates": ["sdb", "sdc"]},
                 "dependencies": {
@@ -620,6 +883,8 @@ class AgentRuntimeContractTest(unittest.TestCase):
                 "warnings": ["Multiple plausible data disks were found; confirm ledger/accounts devices."],
             })
             self.assertEqual(report["status"], "needs_dependencies")
+            self.assertEqual(report["environment"]["host"]["cpu_count"], 24)
+            self.assertEqual(report["environment"]["host"]["memory_gib"], 98.0)
             self.assertEqual(report["environment"]["dependencies"]["missing_required"], ["vegeta"])
             self.assertEqual(report["google_auth"]["auth_mode"], "google_adc")
             self.assertIn("gcloud_available", report["google_auth"])
@@ -630,6 +895,64 @@ class AgentRuntimeContractTest(unittest.TestCase):
         finally:
             os.environ.clear()
             os.environ.update(old_env)
+
+    def test_assumed_smoke_values_are_marked_and_block_real_execution(self):
+        discovery = {
+            "source": "unit-test",
+            "cloud": {"provider": "other"},
+            "deployment": {"type": "container"},
+            "network": {"default_interface": "eth0"},
+            "disks": {
+                "candidates": [
+                    {"name": "vda", "type": "disk", "size": "100G"},
+                    {"name": "vdb", "type": "disk", "size": "200G"},
+                ],
+            },
+            "dependencies": {"tools": {}},
+        }
+        plan = generate_plan({
+            "chain": "solana",
+            "goal": "smoke",
+            "benchmark_mode": "quick",
+            "rpc_mode": "single",
+            "use_fake_node": True,
+            "assumed_for_smoke": True,
+            "assumed_values": {"LEDGER_DEVICE": "mock-ledger"},
+            "confirmations": [
+                "benchmark_mode_confirmed",
+                "qps_profile_confirmed",
+                "observability_choice_confirmed",
+                "chain_template_reviewed",
+                "rpc_workload_confirmed",
+                "rpc_param_samples_confirmed",
+            ],
+            "ledger_device": "mock-ledger",
+            "data_vol_type": "ssd",
+            "data_vol_size": "100",
+            "data_vol_max_iops": "3000",
+            "data_vol_max_throughput": "125",
+            "network_interface": "lo",
+            "network_max_bandwidth_gbps": "1",
+            "cloud_region": "global",
+            "cloud_zone": "global",
+            "machine_type": "assumed-smoke",
+            "blockchain_process_names": ["fake-node"],
+        }, discovery=discovery)
+        self.assertTrue(plan["assumed_for_smoke"])
+        self.assertEqual(plan["assumed_values"]["LEDGER_DEVICE"], "mock-ledger")
+        preflight = adk_run_preflight(plan)
+        self.assertEqual(preflight["status"], "ok")
+        self.assertTrue(preflight["data"]["passed"])
+        self.assertTrue(any("assumed_for_smoke" in item for item in preflight["warnings"]))
+        gate = validate_execution_gate(
+            plan,
+            preflight={"passed": True},
+            smoke={"status": "completed"},
+            approved=True,
+            real_execution=True,
+        )
+        self.assertFalse(gate["ready"])
+        self.assertIn("assumed smoke-only values cannot be used for real benchmark execution", gate["blockers"])
 
     def test_adk_runner_bridge_is_explicit_not_fallback(self):
         status = runner_bridge_status().as_dict()
@@ -758,6 +1081,14 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertEqual(
             _vertex_openai_base_url(regional_vertex_config),
             "https://us-central1-aiplatform.googleapis.com/v1/projects/example-project/locations/us-central1/endpoints/openapi",
+        )
+        self.assertEqual(
+            _vertex_raw_predict_url(global_vertex_config, "anthropic", "partner-model"),
+            "https://aiplatform.googleapis.com/v1/projects/example-project/locations/global/publishers/anthropic/models/partner-model:rawPredict",
+        )
+        self.assertEqual(
+            _vertex_raw_predict_url(regional_vertex_config, "anthropic", "partner-model"),
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/example-project/locations/us-central1/publishers/anthropic/models/partner-model:rawPredict",
         )
 
         json_key_config = load_llm_config({
@@ -900,7 +1231,7 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertIn("prepare_benchmark_run", tool_names)
         self.assertIn("draft_benchmark_request", tool_names)
         self.assertIn("generate_benchmark_plan", tool_names)
-        self.assertIn("run_smoke", tool_names)
+        self.assertNotIn("run_smoke", tool_names)
         self.assertIn("run_fake_node_smoke_benchmark", tool_names)
         self.assertIn("install_dependencies", tool_names)
         self.assertIn("submit_benchmark_job", tool_names)
@@ -1018,6 +1349,7 @@ class AgentRuntimeContractTest(unittest.TestCase):
     def test_adk_read_only_tool_wrappers_are_structured(self):
         tools = get_adk_tools(include_actions=False)
         tool_names = {tool.__name__ for tool in tools}
+        self.assertIn("answer_pending_question", tool_names)
         self.assertIn("discover_environment", tool_names)
         self.assertIn("run_doctor", tool_names)
         self.assertIn("audit_dependencies", tool_names)
@@ -1029,7 +1361,7 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertNotIn("submit_benchmark_job", tool_names)
 
         root_tool_names = {tool.__name__ for tool in get_adk_tools(include_actions=True)}
-        self.assertIn("run_smoke", root_tool_names)
+        self.assertNotIn("run_smoke", root_tool_names)
         self.assertIn("run_fake_node_smoke_benchmark", root_tool_names)
         self.assertIn("submit_benchmark_job", root_tool_names)
 
@@ -1179,6 +1511,16 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertNotIn("local_rpc_url", real_node_plan["required_inputs"])
             full_real_plan = adk_generate_benchmark_plan(structured_request["data"])["data"]
             materialized = full_real_plan["materialized_config"]
+            self.assertIn("chain_config_override", full_real_plan)
+            override_rpc = full_real_plan["chain_config_override"]["rpc_methods"]
+            self.assertEqual(
+                override_rpc["mixed_weighted"],
+                [
+                    {"method": "eth_blockNumber", "weight": 70},
+                    {"method": "eth_getBalance", "weight": 30},
+                ],
+            )
+            self.assertEqual(override_rpc["mixed"], "eth_blockNumber,eth_getBalance")
             self.assertEqual(materialized["CLOUD_REGION"], "us-central1")
             self.assertEqual(materialized["MACHINE_TYPE"], "c3-standard-22")
             self.assertEqual(materialized["BLOCKCHAIN_PROCESS_NAMES_STR"], "reth ethereum")
@@ -1192,10 +1534,28 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertIn("custom_rpc_extension_fields", full_real_plan["chain_template_requirements"])
             self.assertIn("param_spec", full_real_plan["chain_template_requirements"]["custom_rpc_extension_fields"])
             question_ids = {item["id"] for item in full_real_plan["required_questions"]}
-            self.assertIn("rpc_workload_confirmation", question_ids)
-            self.assertIn("custom_rpc_method_review", question_ids)
-            self.assertIn("rpc_param_samples_confirmation", question_ids)
+            self.assertIn("workload_customization_choice", question_ids)
+            self.assertNotIn("rpc_workload_confirmation", question_ids)
+            self.assertNotIn("custom_rpc_method_review", question_ids)
+            self.assertNotIn("rpc_param_samples_confirmation", question_ids)
+            workload_question = next(
+                item for item in full_real_plan["required_questions"]
+                if item["id"] == "workload_customization_choice"
+            )
+            self.assertEqual(workload_question["expected_answer"], "numbered_choice")
+            self.assertEqual(
+                {option["value"] for option in workload_question["options"]},
+                {"use_defaults", "add_custom_rpc", "adjust_weights", "change_chain_or_mode"},
+            )
             self.assertIn("advanced_config_review", question_ids)
+            deployment_question = next(
+                item for item in full_real_plan["required_questions"]
+                if item["id"] == "deployment_platform"
+            )
+            deployment_values = {item["value"] for item in deployment_question["options"]}
+            self.assertIn("gke", deployment_values)
+            self.assertIn("eks", deployment_values)
+            self.assertIn("self-hosted-k8s", deployment_values)
             disk_discovery = {
                 "source": "test",
                 "deployment": {"type": "vm"},
@@ -1226,6 +1586,14 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertEqual(runtime_env["ACCOUNTS_VOL_TYPE"], "hyperdisk-balanced")
             self.assertEqual(runtime_env["NETWORK_INTERFACE"], "eth0")
             self.assertEqual(runtime_env["BLOCKCHAIN_PROCESS_NAMES_STR"], "reth ethereum")
+            override_dir = Path(tmp) / "override_job"
+            runtime_env_file = Path(materialize_runtime_env(full_real_plan, override_dir))
+            written_env = runtime_env_file.read_text(encoding="utf-8")
+            self.assertIn("export CHAIN_CONFIG_OVERRIDE_FILE=", written_env)
+            override_file = override_dir / "chain_template.override.json"
+            self.assertTrue(override_file.is_file())
+            written_override = json.loads(override_file.read_text(encoding="utf-8"))
+            self.assertEqual(written_override["rpc_methods"]["mixed_weighted"], override_rpc["mixed_weighted"])
 
             incomplete_plan_payload = adk_generate_benchmark_plan(request["data"])
             self.assertEqual(incomplete_plan_payload["status"], "ok")
@@ -1296,15 +1664,6 @@ class AgentRuntimeContractTest(unittest.TestCase):
 
             plan_file = tmp_path / "plan.json"
             plan_file.write_text(json.dumps(plan), encoding="utf-8")
-            smoke_without_approval = adk_run_smoke(str(plan_file), jobs_dir=str(tmp_path / "jobs"), approved=False)
-            self.assertEqual(smoke_without_approval["status"], "needs_confirmation")
-            self.assertTrue(smoke_without_approval["requires_user_confirmation"])
-
-            smoke = adk_run_smoke(str(plan_file), jobs_dir=str(tmp_path / "jobs"), approved=True)
-            self.assertEqual(smoke["status"], "ok")
-            self.assertEqual(smoke["data"]["job"]["status"], "completed")
-            self.assertTrue(smoke["evidence_paths"])
-
             fake_node_without_approval = adk_run_fake_node_smoke_benchmark(
                 str(plan_file),
                 jobs_dir=str(tmp_path / "jobs"),
@@ -1315,7 +1674,9 @@ class AgentRuntimeContractTest(unittest.TestCase):
             isolated_plan = _fake_node_smoke_plan(plan_file, tmp_path / "jobs" / "fake_node_smoke")
             isolated_env = isolated_plan["execution"]["environment"]
             self.assertTrue(isolated_plan["use_fake_node"])
-            self.assertEqual(isolated_plan["execution"]["runner_mode"], "foreground")
+            self.assertEqual(isolated_plan["benchmark_mode"], "quick")
+            self.assertEqual(isolated_plan["advanced_defaults"]["qps"]["duration_seconds"], 10)
+            self.assertEqual(isolated_plan["execution"]["runner_mode"], "detached")
             self.assertIn("--fake-node", isolated_plan["execution"]["command"])
             self.assertIn(str(tmp_path / "jobs" / "fake_node_smoke"), isolated_env["BLOCKCHAIN_BENCHMARK_DATA_DIR"])
             self.assertIn(str(tmp_path / "jobs" / "fake_node_smoke"), isolated_env["MEMORY_SHARE_DIR"])
@@ -1409,13 +1770,12 @@ class AgentRuntimeContractTest(unittest.TestCase):
             plan_file = tmp_path / "plan.json"
             plan_file.write_text(json.dumps(plan), encoding="utf-8")
             jobs_dir = tmp_path / "jobs"
-            smoke = adk_run_smoke(str(plan_file), jobs_dir=str(jobs_dir), approved=True)
-            job = smoke["data"]["job"]
+            job = submit_job(plan_file, jobs_dir=jobs_dir, mock=True, approved=True)
 
             state = adk_load_startup_state(jobs_dir=jobs_dir)
             self.assertTrue(state["resume_available"])
             self.assertEqual(state["latest_job"]["job_id"], job["job_id"])
-            self.assertIn("analyze latest job", state["next_actions"])
+            self.assertIn("ask: analyze latest job", state["next_actions"])
 
             preserved = preserved_state_for_adk(state)
             self.assertEqual(preserved["job_id"], job["job_id"])
@@ -1589,6 +1949,7 @@ class AgentRuntimeContractTest(unittest.TestCase):
     def test_agent_runtime_env_overrides_parent_environment(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
+            fake_bash = self._write_fake_bash(tmp_path)
             output_file = tmp_path / "runtime_value.txt"
             runner = tmp_path / "blockchain_node_benchmark.sh"
             runner.write_text(
@@ -1614,7 +1975,9 @@ class AgentRuntimeContractTest(unittest.TestCase):
                 "artifacts": {},
             }), encoding="utf-8")
             old_value = os.environ.get("BLOCKCHAIN_NODE")
+            old_bash = os.environ.get("ANYCHAIN_BASH")
             os.environ["BLOCKCHAIN_NODE"] = "ethereum"
+            os.environ["ANYCHAIN_BASH"] = str(fake_bash)
             try:
                 job = submit_job(plan_file, jobs_dir=tmp_path / "jobs", approved=True)
             finally:
@@ -1622,6 +1985,10 @@ class AgentRuntimeContractTest(unittest.TestCase):
                     os.environ.pop("BLOCKCHAIN_NODE", None)
                 else:
                     os.environ["BLOCKCHAIN_NODE"] = old_value
+                if old_bash is None:
+                    os.environ.pop("ANYCHAIN_BASH", None)
+                else:
+                    os.environ["ANYCHAIN_BASH"] = old_bash
             self.assertEqual(job["status"], "completed")
             self.assertEqual(output_file.read_text(encoding="utf-8").strip(), "solana")
             runtime_env = Path(job["runtime_env_file"]).read_text(encoding="utf-8")
@@ -1630,6 +1997,7 @@ class AgentRuntimeContractTest(unittest.TestCase):
     def test_detached_real_job_continues_after_submit_returns(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
+            fake_bash = self._write_fake_bash(tmp_path)
             output_file = tmp_path / "detached_value.txt"
             runner = tmp_path / "blockchain_node_benchmark.sh"
             runner.write_text(
@@ -1656,7 +2024,15 @@ class AgentRuntimeContractTest(unittest.TestCase):
                 "materialized_config": {},
                 "artifacts": {},
             }), encoding="utf-8")
-            job = submit_job(plan_file, jobs_dir=tmp_path / "jobs", approved=True)
+            old_bash = os.environ.get("ANYCHAIN_BASH")
+            os.environ["ANYCHAIN_BASH"] = str(fake_bash)
+            try:
+                job = submit_job(plan_file, jobs_dir=tmp_path / "jobs", approved=True)
+            finally:
+                if old_bash is None:
+                    os.environ.pop("ANYCHAIN_BASH", None)
+                else:
+                    os.environ["ANYCHAIN_BASH"] = old_bash
             self.assertEqual(job["status"], "running")
             self.assertEqual(job["runner_mode"], "detached")
             self.assertGreater(job["worker_pid"], 0)
@@ -1672,6 +2048,30 @@ class AgentRuntimeContractTest(unittest.TestCase):
             self.assertEqual(completed["status"], "completed")
             self.assertEqual(output_file.read_text(encoding="utf-8").strip(), "solana")
             self.assertTrue(Path(completed["artifact_index"]).is_file())
+
+    def test_benchmark_command_uses_compatible_bash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fake_bash = self._write_fake_bash(tmp_path)
+            old_bash = os.environ.get("ANYCHAIN_BASH")
+            os.environ["ANYCHAIN_BASH"] = str(fake_bash)
+            try:
+                command = build_benchmark_command(["./blockchain_node_benchmark.sh", "--quick"])
+            finally:
+                if old_bash is None:
+                    os.environ.pop("ANYCHAIN_BASH", None)
+                else:
+                    os.environ["ANYCHAIN_BASH"] = old_bash
+            self.assertEqual(command[:2], [str(fake_bash), "./blockchain_node_benchmark.sh"])
+
+    def test_benchmark_plan_blocks_without_compatible_bash(self):
+        plan = {
+            "execution": {"command": ["./blockchain_node_benchmark.sh", "--quick"]},
+            "approval_checkpoints": [],
+        }
+        with patch("runners.guardrails.find_compatible_bash", return_value=""):
+            errors = validate_execution_plan(plan, approved=True)
+        self.assertTrue(any("Bash 4+" in error for error in errors))
 
     def test_dynamic_framework_capabilities_are_loaded_from_current_templates(self):
         capabilities = load_framework_capabilities()

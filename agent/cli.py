@@ -123,7 +123,11 @@ def main(argv: list[str] | None = None) -> int:
     submit = sub.add_parser("submit", help="Submit a benchmark job")
     submit.add_argument("--plan", required=True)
     submit.add_argument("--jobs-dir")
-    submit.add_argument("--mock", action="store_true", help="Complete a lifecycle-only mock job")
+    submit.add_argument(
+        "--dev-lifecycle-mock",
+        action="store_true",
+        help="Developer-only: complete a lifecycle metadata job without benchmark execution",
+    )
     submit.add_argument("--approved", action="store_true", help="Confirm approval checkpoints for real execution")
 
     status = sub.add_parser("status", help="Show job status")
@@ -156,11 +160,11 @@ def main(argv: list[str] | None = None) -> int:
     runbook.add_argument("--plan", required=True)
     runbook.add_argument("--output")
 
-    chat = sub.add_parser("chat", help="Run the official ADK CLI for the AnyChain agent")
-    chat.add_argument("--prompt", help="Send one prompt to the ADK CLI through stdin, then exit")
-    chat.add_argument("--agent-dir", default=None)
-    chat.add_argument("--adk-bin", default="adk")
-    chat.add_argument("adk_arg", nargs=argparse.REMAINDER)
+    adk_run = sub.add_parser("adk-run", help="Developer diagnostic: run the official ADK CLI")
+    adk_run.add_argument("--prompt", help="Send one prompt to the ADK CLI through stdin, then exit")
+    adk_run.add_argument("--agent-dir", default=None)
+    adk_run.add_argument("--adk-bin", default="adk")
+    adk_run.add_argument("adk_arg", nargs=argparse.REMAINDER)
 
     adk_status_cmd = sub.add_parser("adk-status", help="Show optional ADK runtime availability")
     adk_status_cmd.add_argument("--output")
@@ -301,9 +305,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "submit":
         if args.jobs_dir:
-            payload = submit_job(args.plan, jobs_dir=args.jobs_dir, mock=args.mock, approved=args.approved)
+            payload = submit_job(args.plan, jobs_dir=args.jobs_dir, mock=args.dev_lifecycle_mock, approved=args.approved)
         else:
-            payload = submit_job(args.plan, mock=args.mock, approved=args.approved)
+            payload = submit_job(args.plan, mock=args.dev_lifecycle_mock, approved=args.approved)
         return _emit(payload, None)
 
     if args.command == "status":
@@ -336,7 +340,7 @@ def main(argv: list[str] | None = None) -> int:
         print(text, end="")
         return 0
 
-    if args.command == "chat":
+    if args.command == "adk-run":
         runtime_args: list[str] = []
         if args.prompt:
             runtime_args.extend(["--prompt", args.prompt])

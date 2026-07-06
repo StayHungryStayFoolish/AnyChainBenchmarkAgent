@@ -22,6 +22,8 @@ def validate_rpc_workload(
     supported_methods = set(chain_data.get("methods", [])) if chain_data else set()
     errors = []
     warnings = []
+    if not chain_data:
+        errors.append(f"chain template not found: {chain}")
     if rpc_mode not in {"single", "mixed"}:
         errors.append("rpc_mode must be single or mixed")
     if rpc_mode == "single" and len(methods) > 1:
@@ -37,7 +39,10 @@ def validate_rpc_workload(
         errors.append("at least one RPC method is required")
     custom_methods = [method for method in methods if supported_methods and method not in supported_methods]
     if custom_methods:
-        warnings.append("custom RPC methods require param contract, fake-node fixture, and proxy attribution validation")
+        errors.append(
+            "custom RPC methods require validated endpoint, method samples, fake-node fixture, coverage, runtime probe, and smoke before execution"
+        )
+        warnings.append("custom RPC methods remain needs_review until endpoint, fixture, and smoke gates pass")
     return {
         "chain": chain,
         "rpc_mode": rpc_mode,

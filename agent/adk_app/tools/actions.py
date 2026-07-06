@@ -13,22 +13,6 @@ from planners.strategy_planner import write_json
 from .read_only import _tool_result
 
 
-def run_smoke(plan_file: str, jobs_dir: str = ".agent/jobs", approved: bool = False) -> dict[str, Any]:
-    """Run a lifecycle-only mock smoke job after user confirmation."""
-    if not approved:
-        return _confirmation_required(
-            action="run_smoke",
-            summary="Run a mock smoke job to validate lifecycle and artifacts before real execution.",
-            next_actions=["ask user for yes/no confirmation"],
-        )
-    job = _submit_job(plan_file, jobs_dir=jobs_dir, mock=True, approved=True)
-    return _tool_result(
-        data={"job": job},
-        evidence_paths=[job.get("runtime_env_file", ""), job.get("artifact_index", "")],
-        next_actions=["analyze_artifacts", "ask approval for real benchmark"],
-    )
-
-
 def run_fake_node_smoke_benchmark(
     plan_file: str,
     jobs_dir: str = ".agent/jobs",
@@ -36,9 +20,9 @@ def run_fake_node_smoke_benchmark(
 ) -> dict[str, Any]:
     """Run the real benchmark engine in quick fake-node mode after approval.
 
-    This is different from ``run_smoke``. It executes the benchmark entry
-    script with ``--quick --fake-node`` and injects job-local output directories
-    so smoke data does not overwrite the user's normal benchmark result tree.
+    It executes the benchmark entry script with ``--quick --fake-node`` and
+    injects job-local output directories so smoke data does not overwrite the
+    user's normal benchmark result tree.
     """
     if not approved:
         return _confirmation_required(
@@ -56,7 +40,7 @@ def run_fake_node_smoke_benchmark(
         )
 
     repo = Path(__file__).resolve().parents[3]
-    smoke_root = Path(jobs_dir) / "fake_node_smoke"
+    smoke_root = Path(jobs_dir) / "fake_node_smoke" / f"{plan_path.stem}_{plan_path.stat().st_mtime_ns}"
     if not smoke_root.is_absolute():
         smoke_root = repo / smoke_root
     smoke_root.mkdir(parents=True, exist_ok=True)
@@ -65,17 +49,106 @@ def run_fake_node_smoke_benchmark(
     write_json(smoke_plan_file, smoke_plan)
 
     job = _submit_job(smoke_plan_file, jobs_dir=jobs_dir, mock=False, approved=True)
+    benchmark_log = str(Path(job.get("run_dir", "")) / "benchmark.log") if job.get("run_dir") else ""
     evidence = [
         job.get("runtime_env_file", ""),
         job.get("artifact_index", ""),
+        benchmark_log,
         str(smoke_root / "benchmark-data"),
     ]
     return _tool_result(
         status="ok" if job.get("status") in {"completed", "running"} else "failed",
-        data={"job": job, "smoke_plan_file": str(smoke_plan_file), "isolated_output_root": str(smoke_root)},
+        data={
+            "job": job,
+            "smoke_plan_file": str(smoke_plan_file),
+            "isolated_output_root": str(smoke_root),
+            "terminal_commands": _job_terminal_commands(job),
+        },
         evidence_paths=evidence,
         warnings=[job.get("error", "")] if job.get("error") else [],
-        next_actions=["job_status", "tail_job_log", "analyze_artifacts", "ask approval for submit_benchmark_job"],
+        next_actions=_job_user_next_actions(job),
+    )
+
+
+def run_quick_assumed_fake_node_smoke(
+    source_prompt: str = "",
+    chain: str = "solana",
+    rpc_mode: str = "single",
+    jobs_dir: str = ".agent/jobs",
+    approved: bool = False,
+) -> dict[str, Any]:
+    """Run the approved quick fake-node smoke path with smoke-only assumptions.
+
+    This tool exists to keep the common "just verify the Agent/framework can
+    run" path deterministic. It does not create real benchmark approval and the
+    generated plan is marked ``assumed_for_smoke`` so execution gates block it
+    from being promoted to real-node testing.
+    """
+    if not approved:
+        return _confirmation_required(
+            action="run_quick_assumed_fake_node_smoke",
+            summary="Run quick fake-node smoke with explicit smoke-only assumed values.",
+            next_actions=["ask user for explicit yes/no confirmation"],
+        )
+
+    from .planning import prepare_benchmark_run
+
+    prepared = prepare_benchmark_run(
+        source_prompt=source_prompt,
+        chain=(chain or "solana").strip().lower(),
+        goal="smoke",
+        rpc_mode=(rpc_mode or "single").strip().lower(),
+        use_fake_node=True,
+        confirmations=[
+            "benchmark_mode_confirmed",
+            "qps_profile_confirmed",
+            "observability_choice_confirmed",
+            "chain_template_reviewed",
+            "rpc_workload_confirmed",
+            "rpc_workload_confirmation",
+            "rpc_param_samples_confirmed",
+            "rpc_param_samples_confirmation",
+            "custom_rpc_method_review",
+            "advanced_config_review",
+            "disk_inventory_confirmation",
+            "ledger_device_confirmation",
+            "has_accounts_device",
+        ],
+        assumed_for_smoke=True,
+    )
+    data = prepared.get("data", {})
+    preflight = data.get("preflight", {})
+    if not preflight.get("passed"):
+        return _tool_result(
+            status="blocked",
+            data={
+                "prepared": data,
+                "preflight": preflight,
+            },
+            evidence_paths=prepared.get("evidence_paths", []),
+            warnings=prepared.get("warnings", []) + preflight.get("blockers", []),
+            next_actions=["report exact preflight blockers", "ask user for missing values"],
+        )
+
+    smoke = run_fake_node_smoke_benchmark(
+        str(data.get("plan_file", "")),
+        jobs_dir=jobs_dir,
+        approved=True,
+    )
+    merged_evidence = []
+    merged_evidence.extend(prepared.get("evidence_paths", []))
+    merged_evidence.extend(smoke.get("evidence_paths", []))
+    return _tool_result(
+        status=smoke.get("status", "ok"),
+        data={
+            "prepared": data,
+            "smoke": smoke.get("data", {}),
+            "assumed_for_smoke": True,
+            "terminal_commands": _job_terminal_commands(_nested_job(smoke)),
+        },
+        evidence_paths=[item for item in merged_evidence if item],
+        warnings=prepared.get("warnings", []) + smoke.get("warnings", []),
+        next_actions=_job_user_next_actions(_nested_job(smoke)),
     )
 
 
@@ -104,9 +177,11 @@ def submit_benchmark_job(
     _ = detached
     job = _submit_job(plan_file, jobs_dir=jobs_dir, mock=False, approved=True)
     return _tool_result(
-        data={"job": job},
+        status="ok" if job.get("status") in {"completed", "running"} else "failed",
+        data={"job": job, "terminal_commands": _job_terminal_commands(job)},
         evidence_paths=[job.get("runtime_env_file", ""), job.get("artifact_index", "")],
-        next_actions=["job_status", "tail_job_log", "analyze_artifacts"],
+        warnings=[job.get("error", "")] if job.get("error") else [],
+        next_actions=_job_user_next_actions(job),
     )
 
 
@@ -221,7 +296,14 @@ def stop_job(job_id: str, jobs_dir: str = ".agent/jobs", approved: bool = False)
 
 def get_action_tools() -> list:
     """Return confirmation-gated action ADK tool callables."""
-    return [run_smoke, run_fake_node_smoke_benchmark, submit_benchmark_job, install_dependencies, resume_job, stop_job]
+    return [
+        run_fake_node_smoke_benchmark,
+        run_quick_assumed_fake_node_smoke,
+        submit_benchmark_job,
+        install_dependencies,
+        resume_job,
+        stop_job,
+    ]
 
 
 def _confirmation_required(action: str, summary: str, next_actions: list[str]) -> dict[str, Any]:
@@ -233,6 +315,37 @@ def _confirmation_required(action: str, summary: str, next_actions: list[str]) -
         "next_actions": next_actions,
         "requires_user_confirmation": True,
     }
+
+
+def _nested_job(tool_result: dict[str, Any]) -> dict[str, Any]:
+    data = tool_result.get("data", {}) if isinstance(tool_result, dict) else {}
+    if isinstance(data, dict):
+        job = data.get("job")
+        if isinstance(job, dict):
+            return job
+    return {}
+
+
+def _job_terminal_commands(job: dict[str, Any]) -> dict[str, str]:
+    job_id = str(job.get("job_id", "") or "").strip()
+    if not job_id:
+        return {"status": "status", "logs": "logs", "follow": "follow", "analyze": "analyze latest job"}
+    return {
+        "status": f"status {job_id}",
+        "logs": f"logs {job_id}",
+        "follow": f"follow {job_id}",
+        "analyze": "analyze latest job",
+    }
+
+
+def _job_user_next_actions(job: dict[str, Any]) -> list[str]:
+    commands = _job_terminal_commands(job)
+    return [
+        f"check status with `{commands['status']}`",
+        f"show recent logs with `{commands['logs']}`",
+        f"stream logs with `{commands['follow']}`",
+        f"after completion, ask `{commands['analyze']}`",
+    ]
 
 
 def _fake_node_smoke_plan(plan_file: Path, smoke_root: Path) -> dict[str, Any]:
@@ -247,6 +360,7 @@ def _fake_node_smoke_plan(plan_file: Path, smoke_root: Path) -> dict[str, Any]:
     plan["plan_id"] = f"{plan.get('plan_id', 'plan')}_fake_node_smoke"
     plan["strategy"] = "smoke"
     plan["goal"] = "smoke"
+    plan["benchmark_mode"] = "quick"
     plan["use_fake_node"] = True
     plan["required_inputs"] = [
         item for item in plan.get("required_inputs", [])
@@ -275,17 +389,33 @@ def _fake_node_smoke_plan(plan_file: Path, smoke_root: Path) -> dict[str, Any]:
         "QUICK_MAX_QPS": "1",
         "QUICK_QPS_STEP": "1",
         "QUICK_DURATION": "10",
+        "QPS_WARMUP_DURATION": "0",
+        "QPS_COOLDOWN": "0",
         "BLOCKCHAIN_BENCHMARK_DATA_DIR": str(smoke_output_root),
         "MEMORY_SHARE_DIR": str(smoke_memory_dir),
     })
     execution.update({
         "command": command,
         "environment": env,
-        "runner_mode": "foreground",
+        # Agent turns must not block on even a quick benchmark. Submit the
+        # smoke run as a detached job, then let the terminal expose status/log
+        # follow commands while the benchmark engine writes artifacts.
+        "runner_mode": "detached",
     })
     plan["execution"] = execution
+    advanced_defaults = dict(plan.get("advanced_defaults", {}))
+    advanced_defaults["qps"] = {
+        "initial": 1,
+        "max": 1,
+        "step": 1,
+        "duration_seconds": 10,
+    }
+    plan["advanced_defaults"] = advanced_defaults
     materialized = dict(plan.get("materialized_config", {}))
     materialized.update({
+        "BLOCKCHAIN_NODE": env.get("BLOCKCHAIN_NODE", ""),
+        "RPC_MODE": env.get("RPC_MODE", "single"),
+        "BLOCKCHAIN_PROCESS_NAMES_STR": materialized.get("BLOCKCHAIN_PROCESS_NAMES_STR") or "fake-node",
         "BLOCKCHAIN_BENCHMARK_DATA_DIR": str(smoke_output_root),
         "MEMORY_SHARE_DIR": str(smoke_memory_dir),
     })

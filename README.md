@@ -72,6 +72,9 @@ Preview the generated benchmark report before running the framework:
 - Generates single or weighted mixed RPC workloads from `config/chains/*.json`.
 - Supports custom RPC methods through `rpc_methods`, `param_formats`, optional
   `param_spec`, REST path bindings, and fake-node fixtures.
+- Validates custom RPC methods and existing-family chain onboarding with live
+  endpoint probes, request/response evidence, fixture recording, and smoke
+  before treating them as supported.
 - Records per-method status, success/failure counts, and P50/P90/P99 latency.
 - Monitors CPU, memory, disk, network, cgroup, sync health, and monitor overhead.
 - Produces HTML reports and archives every run.
@@ -101,6 +104,9 @@ The Agent is intentionally bounded:
 - It answers framework questions from local docs and live repository state.
 - It reads chain/RPC/fake-node capabilities from current files, not model memory.
 - It produces onboarding plans for unsupported chains or RPC methods.
+- It treats provider docs, web research, and user samples as evidence, not
+  support approval. Endpoint validation, fixture recording, and smoke still
+  decide whether a new chain or custom method is usable.
 - It runs only allowlisted benchmark commands after approval.
 - It writes Agent-generated runtime config to job-local `runtime.env`, not to
   `config/user_config.sh`.
@@ -527,7 +533,8 @@ JSON control-plane commands:
 ```bash
 python3 agent/cli.py plan --request /tmp/request.json --output /tmp/plan.json --dry-run
 python3 agent/cli.py preflight --plan /tmp/plan.json
-python3 agent/cli.py submit --plan /tmp/plan.json --mock
+python3 agent/cli.py tool-call --name run_fake_node_smoke_benchmark \
+  --arguments '{"plan_file":"/tmp/plan.json","approved":true}'
 ```
 
 ### Reports And Artifacts
@@ -626,6 +633,24 @@ python3 agent/cli.py draft-chain-template \
 
 The draft is marked `needs_review`; it is not automatically installed into
 `config/chains`.
+
+### Custom RPC And Existing-Family Chains
+
+Existing chains can use custom RPC methods when the request shape is expressible
+by `param_formats`, `_meta.rest_paths`, or `param_spec`. The Agent must validate
+the user-provided endpoint and method payload before execution. User-provided
+request/response samples help draft the workload, but they are not trusted until
+the same method succeeds against a reachable endpoint and the resulting fixture
+passes fake-node smoke.
+
+For a new chain that appears to belong to an existing adapter family, a chain
+template is the starting point, not the proof of support. The onboarding flow
+must still classify the protocol, validate at least one safe method against a
+reachable endpoint, define request params and workload weights, record fixtures,
+and pass preflight plus fake-node smoke. EVM-compatible endpoints such as Flow
+EVM can usually follow the JSON-RPC family path. API products that share a
+provider but not the protocol, such as a Greenfield billing REST API, must not
+be treated as BSC/EVM JSON-RPC without validation.
 
 For unsupported chains, the Agent returns an onboarding plan instead of editing
 code automatically. The usual path is:

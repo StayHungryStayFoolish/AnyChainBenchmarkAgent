@@ -51,12 +51,15 @@ def _latest_job_state(jobs_dir: str | Path) -> dict[str, Any]:
 
 def _startup_next_actions(latest_job: dict[str, Any]) -> list[str]:
     if not latest_job:
-        return ["ask for benchmark goal", "run environment discovery"]
+        return ["describe benchmark goal", "confirm environment inference"]
+    job_id = str(latest_job.get("job_id", "") or "").strip()
     status = latest_job.get("status", "unknown")
+    logs = f"logs {job_id}" if job_id else "logs"
+    follow = f"follow {job_id}" if job_id else "follow"
     if status == "running":
-        return ["show job status", "tail job logs", "wait for completion"]
+        return ["status", logs, follow]
     if status == "completed":
-        return ["analyze latest job", "show report evidence", "start a new benchmark"]
+        return ["ask: analyze latest job", "ask: show report evidence", "start a new benchmark"]
     if status == "failed":
-        return ["tail job logs", "inspect runtime.env", "generate retry plan"]
-    return ["show job status", "ask user for next action"]
+        return [logs, "inspect runtime.env", "ask: generate retry plan"]
+    return ["status", "ask for next action"]

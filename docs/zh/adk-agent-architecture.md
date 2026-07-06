@@ -38,7 +38,7 @@ flowchart TD
   TOOLS --> SEARCH["Gemini-only google_search<br/>onboarding/custom RPC evidence"]
 
   VAL --> PRE["Preflight"]
-  PRE --> SMOKE["Fake-node smoke or lifecycle smoke"]
+  PRE --> SMOKE["隔离 fake-node smoke"]
   SMOKE --> APPROVE["User approval callback"]
   APPROVE --> BENCH["Benchmark engine<br/>blockchain_node_benchmark.sh"]
   BENCH --> PROXY["Proxy and per-method attribution"]
@@ -139,4 +139,7 @@ python3 agent/cli.py adk-eval
 git diff --check
 ```
 
-For model-facing behavior, run the live matrices in `tests/agent_live/`.
+For model-facing behavior, run the current product Harness defined by the
+reviewed task/design document. Lower-level live/PTY scripts can be provider
+drivers or developer helpers, but product readiness requires realistic CLI
+scenarios and deterministic assertions.

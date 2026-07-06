@@ -11,9 +11,10 @@
 - [GitHub PR Gates and Branch Protection](github-pr-gates.md)
 - [GitHub PR Workflow](github-pr-workflow.md)
 
-The English and Chinese docs intentionally keep the same long-lived content
-areas. Temporary task plans, debugging transcripts, and one-off implementation
-plans should not be committed as public docs.
+The English and Chinese docs intentionally keep the same long-lived user-facing
+content areas. AI-facing gate documents may be English-only when they are meant
+for coding agents and maintainers. Temporary task plans, debugging transcripts,
+and one-off implementation plans should not be committed as public docs.
 
 Related docs:
 

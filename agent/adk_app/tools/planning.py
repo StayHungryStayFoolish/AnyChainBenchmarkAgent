@@ -13,6 +13,7 @@ from planners.preflight import run_preflight as _run_preflight
 from planners.strategy_planner import generate_plan as _generate_plan
 from planners.strategy_planner import write_json
 from runners.runbook import render_runbook as _render_runbook
+from validators.config_contract import build_missing_config_questions as _build_missing_config_questions
 
 from .read_only import _tool_result
 
@@ -56,6 +57,8 @@ def prepare_benchmark_run(
     prometheus_port: str = "",
     grafana_port: str = "",
     confirmations: list[str] | None = None,
+    assumed_values: dict | None = None,
+    assumed_for_smoke: bool = False,
     output_dir: str = ".agent/prepared",
 ) -> dict[str, Any]:
     """Prepare a benchmark run without launching benchmark traffic.
@@ -108,11 +111,18 @@ def prepare_benchmark_run(
         prometheus_port=prometheus_port,
         grafana_port=grafana_port,
         confirmations=confirmations,
+        assumed_values=assumed_values,
+        assumed_for_smoke=assumed_for_smoke,
     )
     request["discovery"] = discovery
     plan = _generate_plan(request, discovery=discovery)
     preflight = _run_preflight(plan)
     runbook = _render_runbook(plan)
+    config_questions = _build_missing_config_questions(
+        _target_mode_for_plan(plan),
+        _confirmed_values_from_plan(request, plan),
+        discovery,
+    )
 
     prepared_dir = Path(output_dir)
     prepared_dir.mkdir(parents=True, exist_ok=True)
@@ -131,6 +141,8 @@ def prepare_benchmark_run(
         "inferred_values": _inferred_values(plan),
         "missing_required": plan.get("required_inputs", []),
         "questions": plan.get("required_questions", []),
+        "next_question": config_questions.get("next_question", {}),
+        "configuration_questions": config_questions,
         "requires_confirmation": plan.get("requires_confirmation", []),
         "approval_checkpoints": plan.get("approval_checkpoints", []),
     }
@@ -187,6 +199,8 @@ def draft_benchmark_request(
     prometheus_port: str = "",
     grafana_port: str = "",
     confirmations: list[str] | None = None,
+    assumed_values: dict | None = None,
+    assumed_for_smoke: bool = False,
 ) -> dict[str, Any]:
     """Draft a normalized AnyChain request from ADK-inferred structured fields.
 
@@ -233,6 +247,8 @@ def draft_benchmark_request(
         prometheus_port=prometheus_port,
         grafana_port=grafana_port,
         confirmations=confirmations,
+        assumed_values=assumed_values,
+        assumed_for_smoke=assumed_for_smoke,
     )
     if discovered_context:
         request["discovery"] = discovered_context
@@ -271,16 +287,16 @@ def validate_benchmark_plan(plan: dict) -> dict[str, Any]:
 def run_preflight(plan: dict) -> dict[str, Any]:
     """Validate a generated benchmark plan before any smoke or real benchmark.
 
-    Always call this before run_smoke or submit_benchmark_job. If blockers are
-    returned, explain them and ask the user for missing configuration instead of
-    launching work.
+    Always call this before fake-node smoke or real benchmark submission. If
+    blockers are returned, explain them and ask the user for missing
+    configuration instead of launching work.
     """
     preflight = _run_preflight(plan)
     return _tool_result(
         status="ok" if preflight.get("passed") else "blocked",
         data=preflight,
         warnings=preflight.get("warnings", []) + preflight.get("blockers", []),
-        next_actions=["run_smoke", "ask_missing_required_values"] if preflight.get("passed") else ["fix blockers"],
+        next_actions=["run_fake_node_smoke_benchmark", "ask_missing_required_values"] if preflight.get("passed") else ["fix blockers"],
     )
 
 
@@ -382,7 +398,59 @@ def _structured_request(
     prometheus_port: str,
     grafana_port: str,
     confirmations: list[str] | None,
+    assumed_values: dict | None,
+    assumed_for_smoke: bool,
 ) -> dict[str, Any]:
+    if assumed_for_smoke:
+        (
+            goal,
+            rpc_mode,
+            use_fake_node,
+            blockchain_process_names,
+            ledger_device,
+            accounts_device,
+            data_vol_type,
+            data_vol_size,
+            data_vol_max_iops,
+            data_vol_max_throughput,
+            accounts_vol_type,
+            accounts_vol_size,
+            accounts_vol_max_iops,
+            accounts_vol_max_throughput,
+            network_interface,
+            network_max_bandwidth_gbps,
+            qps_initial,
+            qps_max,
+            qps_step,
+            duration_seconds,
+            observability_enabled,
+            confirmations,
+            assumed_values,
+        ) = _apply_assumed_smoke_defaults(
+            goal=goal,
+            rpc_mode=rpc_mode,
+            use_fake_node=use_fake_node,
+            blockchain_process_names=blockchain_process_names,
+            ledger_device=ledger_device,
+            accounts_device=accounts_device,
+            data_vol_type=data_vol_type,
+            data_vol_size=data_vol_size,
+            data_vol_max_iops=data_vol_max_iops,
+            data_vol_max_throughput=data_vol_max_throughput,
+            accounts_vol_type=accounts_vol_type,
+            accounts_vol_size=accounts_vol_size,
+            accounts_vol_max_iops=accounts_vol_max_iops,
+            accounts_vol_max_throughput=accounts_vol_max_throughput,
+            network_interface=network_interface,
+            network_max_bandwidth_gbps=network_max_bandwidth_gbps,
+            qps_initial=qps_initial,
+            qps_max=qps_max,
+            qps_step=qps_step,
+            duration_seconds=duration_seconds,
+            observability_enabled=observability_enabled,
+            confirmations=confirmations,
+            assumed_values=assumed_values,
+        )
     observability = {
         "enabled": bool(observability_enabled) if observability_enabled is not None else False,
         "mode": observability_mode if observability_mode in {"local", "exporter"} else "local",
@@ -404,6 +472,9 @@ def _structured_request(
     }
     if confirmations:
         request["confirmations"] = list(confirmations)
+    if assumed_for_smoke:
+        request["assumed_for_smoke"] = True
+        request["assumed_values"] = dict(assumed_values or {})
     if use_fake_node is not None:
         request["use_fake_node"] = bool(use_fake_node)
     for key, value in {
@@ -454,6 +525,139 @@ def _structured_request(
     return request
 
 
+def _apply_assumed_smoke_defaults(
+    *,
+    goal: str,
+    rpc_mode: str,
+    use_fake_node: bool | None,
+    blockchain_process_names: list[str] | None,
+    ledger_device: str,
+    accounts_device: str,
+    data_vol_type: str,
+    data_vol_size: str,
+    data_vol_max_iops: str,
+    data_vol_max_throughput: str,
+    accounts_vol_type: str,
+    accounts_vol_size: str,
+    accounts_vol_max_iops: str,
+    accounts_vol_max_throughput: str,
+    network_interface: str,
+    network_max_bandwidth_gbps: str,
+    qps_initial: int | None,
+    qps_max: int | None,
+    qps_step: int | None,
+    duration_seconds: int | None,
+    observability_enabled: bool | None,
+    confirmations: list[str] | None,
+    assumed_values: dict | None,
+) -> tuple[
+    str,
+    str,
+    bool,
+    list[str],
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    int,
+    int,
+    int,
+    int,
+    bool,
+    list[str],
+    dict,
+]:
+    """Materialize safe smoke-only defaults after explicit user approval.
+
+    This is intentionally deterministic. The LLM may infer that the user wants
+    a quick framework check with assumed values, but the benchmark toolchain
+    owns which assumptions are safe and how they are marked. These values must
+    never be promoted into a real-node benchmark because execution_gate blocks
+    plans with ``assumed_for_smoke``.
+    """
+    merged_confirmations = set(confirmations or [])
+    merged_confirmations.update(
+        {
+            "benchmark_mode_confirmed",
+            "qps_profile_confirmed",
+            "observability_choice_confirmed",
+            "chain_template_reviewed",
+            "rpc_workload_confirmed",
+            "rpc_workload_confirmation",
+            "rpc_param_samples_confirmed",
+            "rpc_param_samples_confirmation",
+            "custom_rpc_method_review",
+            "advanced_config_review",
+            "disk_inventory_confirmation",
+            "ledger_device_confirmation",
+            "has_accounts_device",
+            "blockchain_process_names",
+            "accounts_device",
+            "accounts_vol_type",
+            "accounts_vol_size",
+            "accounts_vol_max_iops",
+            "accounts_vol_max_throughput",
+            "data_vol_type",
+            "data_vol_size",
+            "data_vol_max_iops",
+            "data_vol_max_throughput",
+            "network_max_bandwidth_gbps",
+            "network_interface",
+        }
+    )
+    values = dict(assumed_values or {})
+
+    def pick(key: str, current: str, default: str) -> str:
+        value = current or str(values.get(key, "")) or default
+        values[key] = value
+        return value
+
+    process_names = list(blockchain_process_names or values.get("blockchain_process_names") or [])
+    if not process_names:
+        process_names = ["fake-node"]
+    values["blockchain_process_names"] = process_names
+    selected_accounts_device = pick("accounts_device", accounts_device, "") if (accounts_device or values.get("accounts_device")) else ""
+    if selected_accounts_device:
+        accounts_vol_type = pick("accounts_vol_type", accounts_vol_type, "assumed-smoke-accounts-disk")
+        accounts_vol_size = pick("accounts_vol_size", accounts_vol_size, "100")
+        accounts_vol_max_iops = pick("accounts_vol_max_iops", accounts_vol_max_iops, "3000")
+        accounts_vol_max_throughput = pick("accounts_vol_max_throughput", accounts_vol_max_throughput, "125")
+
+    return (
+        "smoke",
+        rpc_mode or "single",
+        True if use_fake_node is None else bool(use_fake_node),
+        process_names,
+        pick("ledger_device", ledger_device, "assumed-smoke-ledger"),
+        selected_accounts_device,
+        pick("data_vol_type", data_vol_type, "assumed-smoke-disk"),
+        pick("data_vol_size", data_vol_size, "100"),
+        pick("data_vol_max_iops", data_vol_max_iops, "3000"),
+        pick("data_vol_max_throughput", data_vol_max_throughput, "125"),
+        accounts_vol_type,
+        accounts_vol_size,
+        accounts_vol_max_iops,
+        accounts_vol_max_throughput,
+        pick("network_interface", network_interface, "assumed-smoke-net0"),
+        pick("network_max_bandwidth_gbps", network_max_bandwidth_gbps, "10"),
+        int(qps_initial or values.get("qps_initial") or 1),
+        int(qps_max or values.get("qps_max") or 1),
+        int(qps_step or values.get("qps_step") or 1),
+        int(duration_seconds or values.get("duration_seconds") or 10),
+        False if observability_enabled is None else bool(observability_enabled),
+        sorted(merged_confirmations),
+        values,
+    )
+
+
 def _inferred_values(plan: dict[str, Any]) -> dict[str, Any]:
     env = plan.get("execution", {}).get("environment", {})
     materialized = plan.get("materialized_config", {})
@@ -493,4 +697,31 @@ def _prepare_next_actions(plan: dict[str, Any], preflight: dict[str, Any]) -> li
         return ["ask user to confirm inferred values", "rerun prepare_benchmark_run with confirmations"]
     if not preflight.get("passed"):
         return ["fix preflight blockers", "rerun prepare_benchmark_run"]
-    return ["ask approval for run_smoke", "ask approval for run_fake_node_smoke_benchmark", "ask approval for submit_benchmark_job"]
+    return ["ask approval for run_fake_node_smoke_benchmark", "ask approval for submit_benchmark_job"]
+
+
+def _target_mode_for_plan(plan: dict[str, Any]) -> str:
+    if plan.get("use_fake_node") is True:
+        return "fake-node"
+    if plan.get("use_fake_node") is False:
+        return "real-node"
+    return ""
+
+
+def _confirmed_values_from_plan(request: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+    values = _inferred_values(plan)
+    values["chain"] = plan.get("chain") or request.get("chain")
+    values["rpc_mode"] = plan.get("rpc_mode") or request.get("rpc_mode")
+    if plan.get("use_fake_node") is True:
+        values["use_fake_node"] = True
+    elif plan.get("use_fake_node") is False:
+        values["use_fake_node"] = False
+    for item in list(request.get("confirmations") or plan.get("confirmed_inputs") or []):
+        values[str(item)] = True
+    qps = request.get("qps") or {}
+    if qps and all(key in qps for key in ("initial", "max", "step", "duration_seconds")):
+        values.setdefault("qps_profile_confirmed", True)
+    observability = request.get("observability") or {}
+    if observability.get("mode"):
+        values.setdefault("OBSERVABILITY_STACK_MODE", observability.get("mode"))
+    return values

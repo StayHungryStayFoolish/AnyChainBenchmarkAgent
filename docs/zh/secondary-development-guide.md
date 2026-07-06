@@ -220,7 +220,7 @@ python3 tools/fake-node/runtime_probe_block_height.py --chain <chain>
 ./bin/anychain-agent
 ```
 
-然后让 Agent 为该链创建 fake-node smoke benchmark，执行 preflight，运行 mock job，并分析生成的 archive。
+然后让 Agent 为该链创建 fake-node smoke benchmark，执行 preflight，运行隔离的 fake-node smoke job，并分析生成的 archive。
 
 PR 要求：
 

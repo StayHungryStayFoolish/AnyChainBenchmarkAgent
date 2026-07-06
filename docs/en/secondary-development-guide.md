@@ -239,7 +239,8 @@ Closed-loop check:
 ```
 
 Then ask the Agent to create a fake-node smoke benchmark for the new chain,
-run preflight, run the mock job, and analyze the generated archive.
+run preflight, run an isolated fake-node smoke job, and analyze the generated
+archive.
 
 PR expectations:
 

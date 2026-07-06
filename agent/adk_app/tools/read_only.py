@@ -239,7 +239,7 @@ def latest_job(jobs_dir: str = ".agent/jobs") -> dict[str, Any]:
     jobs = list_jobs(jobs_dir=jobs_dir, limit=1)
     if not jobs:
         return _tool_result(status="not_found", data={"jobs": []}, next_actions=["create benchmark plan"])
-    return _tool_result(data={"job": jobs[0]}, next_actions=["job_status", "tail_job_log", "analyze_artifacts"])
+    return _tool_result(data={"job": jobs[0]}, next_actions=_job_user_next_actions(jobs[0]))
 
 
 def job_status(job_id: str, jobs_dir: str = ".agent/jobs") -> dict[str, Any]:
@@ -248,7 +248,7 @@ def job_status(job_id: str, jobs_dir: str = ".agent/jobs") -> dict[str, Any]:
     return _tool_result(
         data={"job": job, "resume": resume_job(job_id, jobs_dir=jobs_dir)},
         evidence_paths=_job_evidence_paths(job),
-        next_actions=["tail_job_log", "analyze_artifacts", "resume_job"],
+        next_actions=_job_user_next_actions(job),
     )
 
 
@@ -258,7 +258,7 @@ def tail_job_log(job_id: str, jobs_dir: str = ".agent/jobs", lines: int = 80) ->
     return _tool_result(
         data=payload,
         evidence_paths=[payload["log_file"]] if payload.get("log_file") else [],
-        next_actions=["job_status", "analyze_artifacts"],
+        next_actions=_job_user_next_actions({"job_id": job_id}),
     )
 
 
@@ -373,3 +373,25 @@ def _repo_root() -> str:
     from pathlib import Path
 
     return str(Path(__file__).resolve().parents[3])
+
+
+def _job_terminal_commands(job: dict[str, Any]) -> dict[str, str]:
+    job_id = str(job.get("job_id", "") or "").strip()
+    if not job_id:
+        return {"status": "status", "logs": "logs", "follow": "follow", "analyze": "analyze latest job"}
+    return {
+        "status": f"status {job_id}",
+        "logs": f"logs {job_id}",
+        "follow": f"follow {job_id}",
+        "analyze": "analyze latest job",
+    }
+
+
+def _job_user_next_actions(job: dict[str, Any]) -> list[str]:
+    commands = _job_terminal_commands(job)
+    return [
+        f"check status with `{commands['status']}`",
+        f"show recent logs with `{commands['logs']}`",
+        f"stream logs with `{commands['follow']}`",
+        f"after completion, ask `{commands['analyze']}`",
+    ]

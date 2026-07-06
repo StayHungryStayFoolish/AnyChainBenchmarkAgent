@@ -2,8 +2,8 @@
 
 The module follows the official ADK convention of exposing ``root_agent``.
 When ``google-adk`` is not installed, ``root_agent`` is ``None``. Offline tests
-must use the ADK eval scaffold, not the old custom chat loop as a product
-compatibility path.
+must use the ADK eval scaffold or deterministic tool tests, not a second
+product conversation runtime.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import inspect
 
 from llm.config import load_llm_config
 
+from .callbacks import after_model_callback
 from .callbacks import before_tool_callback
 from .agents.domain import build_domain_agents
 from .instructions import ROOT_INSTRUCTION
@@ -60,6 +61,8 @@ def build_root_agent(model: str | None = None, tools: list | None = None):
         kwargs["sub_agents"] = build_domain_agents(Agent, adk_model)
     if _agent_accepts("before_tool_callback"):
         kwargs["before_tool_callback"] = before_tool_callback
+    if _agent_accepts("after_model_callback"):
+        kwargs["after_model_callback"] = after_model_callback
     return Agent(**kwargs)
 
 

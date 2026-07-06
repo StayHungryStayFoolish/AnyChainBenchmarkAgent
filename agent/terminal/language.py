@@ -6,12 +6,24 @@ import re
 
 
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")
+_ASCII_ALPHA_RE = re.compile(r"[A-Za-z]")
+_SINGLE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:/+-]+[,，;；]?$")
 
 
 def detect_language(text: str, default: str = "en") -> str:
     """Return the preferred response language for a user turn."""
-    if _CJK_RE.search(text or ""):
+    raw = text or ""
+    stripped = raw.strip().lower()
+    if stripped in {"y", "n", "yes", "no", "back", "previous", "undo"}:
+        return default if default in {"zh", "en"} else "en"
+    if stripped in {"hi", "hello", "hey"}:
+        return "en"
+    if _CJK_RE.search(raw):
         return "zh"
+    if default == "zh" and _SINGLE_TOKEN_RE.fullmatch(raw.strip()):
+        return "zh"
+    if _ASCII_ALPHA_RE.search(raw):
+        return "en"
     if default in {"zh", "en"}:
         return default
     return "en"
@@ -58,10 +70,18 @@ _ZH = {
     "log_missing": "日志文件尚未生成。job 可能刚启动，稍后可再次输入 logs 或 follow。",
     "log_empty": "日志文件当前为空。",
     "follow_start": "开始跟踪 job={job_id} 日志：{path}\n按 Ctrl+C 只会退出日志跟踪，不会停止 benchmark，也不会退出 Agent。",
-    "follow_stopped": "已退出日志跟踪。benchmark 如果仍在运行会继续执行。你可以复制日志片段到 User> 让我分析。日志路径：{path}",
+    "follow_stopped": "已退出日志跟踪。benchmark 如果仍在运行会继续执行。你可以把日志片段复制到 User>，Agent 会按 evidence 分析。日志路径：{path}",
     "follow_done": "日志跟踪结束，job 状态：{status}",
     "unknown": "ADK 没有返回可显示内容。你可以继续描述测试目标，或输入 doctor/status/jobs 查看确定性状态。",
     "adk_runtime_error": "底层模型调用暂时失败，我不会展示内部错误。这个自然语言请求尚未完成；请重试，或输入 doctor/status/jobs 查看确定性状态。",
+    "llm_billing_error": "底层模型服务返回余额或配额不足。自然语言 Agent 能力暂时不可用；请补充模型账户余额/配额后重试。doctor/status/jobs 这些确定性命令仍可使用。",
+    "thinking": "[thinking] 正在处理当前请求。如果超过 15 秒，你可以按 Ctrl+C 取消本轮，不会退出 Agent。",
+    "turn_cancelled": "已取消当前这一轮。Agent 会话仍在，你可以继续输入。",
+    "pasted_evidence_detected": "检测到你粘贴的是日志、旧对话或错误信息。我会把它当作 evidence 分析，不会直接写入 benchmark 配置。",
+    "pasted_evidence_buffered": "已记录粘贴的日志/旧对话片段。你可以继续粘贴，或直接输入要分析的问题。",
+    "pending_answer_blocked": "这条回复没有通过当前问题的校验：{blockers}",
+    "pending_answer_recorded": "已记录该回复。你可以继续描述下一步目标。",
+    "unbound_structural_answer": "当前没有待确认的问题，这个短回复无法绑定到任何决策。请直接说明你的目标，例如：测试 solana fake-node quick、查看 job 状态、或分析最近报告。",
     "framework_context_loaded": "已加载框架事实：{chains} chains，{families} adapter families，{methods} RPC methods，fake-node fixtures={fixtures}。",
     "ctrl_c_exit": "收到 Ctrl+C，正在退出 AnyChain Benchmark Agent。",
     "adk_missing_hint": "注意：google-adk 当前不可用。请允许 Agent 安装隔离运行时，或先运行 bash scripts/install_agent_deps.sh --yes。",
@@ -105,7 +125,15 @@ _EN = {
     "follow_stopped": "Stopped log-follow mode. The benchmark continues if it is still running. Paste any log snippet at User> for analysis. Log path: {path}",
     "follow_done": "Log follow finished; job status: {status}",
     "unknown": "ADK did not return displayable text. You can continue describing the benchmark goal, or type doctor/status/jobs for deterministic state.",
-    "adk_runtime_error": "The underlying model call failed temporarily. I will not show internal errors. This natural-language request was not completed; retry, or type doctor/status/jobs for deterministic state.",
+    "adk_runtime_error": "The underlying model call failed temporarily. Internal errors are hidden. This natural-language request was not completed; retry, or type doctor/status/jobs for deterministic state.",
+    "llm_billing_error": "The underlying model provider reported insufficient balance or quota. Natural-language Agent capability is unavailable until the model account is funded or quota is restored. Deterministic commands such as doctor/status/jobs still work.",
+    "thinking": "[thinking] Processing the current request. If this takes more than 15 seconds, press Ctrl+C to cancel this turn without exiting the Agent.",
+    "turn_cancelled": "Cancelled the current turn. The Agent session is still active; you can continue.",
+    "pasted_evidence_detected": "Detected pasted logs, transcript, or error evidence. Treating it as evidence; it will not be written directly into benchmark configuration.",
+    "pasted_evidence_buffered": "Buffered pasted log/transcript evidence. Continue pasting, or type the question you want me to analyze.",
+    "pending_answer_blocked": "This reply did not pass validation for the current question: {blockers}",
+    "pending_answer_recorded": "Recorded that reply. You can continue with the next goal.",
+    "unbound_structural_answer": "There is no active question to confirm, so this short reply cannot be bound to a decision. State the goal directly, for example: benchmark solana fake-node quick, check job status, or analyze the latest report.",
     "framework_context_loaded": "Loaded framework facts: {chains} chains, {families} adapter families, {methods} RPC methods, fake-node fixtures={fixtures}.",
     "ctrl_c_exit": "Received Ctrl+C; exiting AnyChain Benchmark Agent.",
     "adk_missing_hint": "Note: google-adk is not available. Allow the Agent to install the isolated runtime, or run bash scripts/install_agent_deps.sh --yes first.",

@@ -59,6 +59,8 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
     use_fake_node = request.get("use_fake_node") if isinstance(request.get("use_fake_node"), bool) else None
     qps = {**DEFAULT_QPS[strategy], **request.get("qps", {})}
     confirmations = set(request.get("confirmations", []))
+    assumed_values = dict(request.get("assumed_values") or {})
+    assumed_for_smoke = bool(request.get("assumed_for_smoke"))
     runner_mode = request.get("runner_mode", "detached")
     if runner_mode not in {"detached", "foreground"}:
         runner_mode = "detached"
@@ -191,6 +193,8 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
         },
         "bottleneck_focus": request.get("bottleneck_focus", []),
         "confirmed_inputs": sorted(confirmations),
+        "assumed_for_smoke": assumed_for_smoke,
+        "assumed_values": assumed_values,
         "materialized_config": materialized_config,
         "chain_template_requirements": inspect_chain_template(chain),
         "required_inputs": required_inputs,
@@ -219,6 +223,10 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
             "performance_latest_csv": "current/logs/performance_latest.csv",
         },
     }
+    chain_override = _chain_config_override(chain, request)
+    if chain_override:
+        plan["chain_config_override"] = chain_override
+        plan["artifacts"]["chain_config_override_file"] = "<job_run_dir>/chain_template.override.json"
     checklist = build_configuration_checklist(request, plan)
     plan["configuration_checklist"] = checklist
     combined_required = _ordered_required_inputs(set(plan["required_inputs"]) | set(missing_required_from_checklist(checklist)))
@@ -307,6 +315,43 @@ def _config_snapshot(chain: str) -> dict[str, list[dict[str, str | float]]]:
             "mtime": stat.st_mtime,
         })
     return {"files": snapshots}
+
+
+def _chain_config_override(chain: str, request: dict[str, Any]) -> dict[str, Any]:
+    """Return a job-local chain template override when workload changed.
+
+    The benchmark engine reads workloads from CHAIN_CONFIG. Agent-only plan
+    fields are therefore not enough: if the user confirms mixed weights or a
+    single-method override, this function materializes that workload into the
+    same chain-template shape consumed by config_loader.sh and target_generator.sh.
+    """
+    if not chain:
+        return {}
+    chain_file = REPO_ROOT / "config" / "chains" / f"{chain}.json"
+    if not chain_file.is_file():
+        return {}
+    mixed_weighted = request.get("mixed_weighted")
+    rpc_methods = request.get("rpc_methods")
+    if not mixed_weighted and not rpc_methods:
+        return {}
+
+    data = load_json(chain_file)
+    rpc = dict(data.get("rpc_methods") or {})
+    if mixed_weighted:
+        rows = [
+            {"method": str(item.get("method", "")).strip(), "weight": int(item.get("weight", 0) or 0)}
+            for item in mixed_weighted
+            if isinstance(item, dict) and str(item.get("method", "")).strip()
+        ]
+        if rows:
+            rpc["mixed_weighted"] = rows
+            rpc["mixed"] = ",".join(item["method"] for item in rows)
+    if rpc_methods:
+        methods = [str(method).strip() for method in rpc_methods if str(method).strip()]
+        if methods and (request.get("rpc_mode") or "single") == "single":
+            rpc["single"] = methods[0]
+    data["rpc_methods"] = rpc
+    return data
 
 
 def _ordered_required_inputs(items: set[str]) -> list[str]:

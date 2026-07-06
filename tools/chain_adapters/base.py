@@ -17,6 +17,7 @@ Vegeta target schema (https://github.com/tsenart/vegeta):
 from __future__ import annotations
 import base64
 import json
+import os
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Optional
@@ -24,6 +25,49 @@ from typing import Optional
 # Repo root: tools/chain_adapters/base.py → ../../
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _CHAINS_DIR = _REPO_ROOT / "config" / "chains"
+
+
+def load_chain_template(chain_name: str) -> dict:
+    """Load the active chain template for target construction.
+
+    Agent jobs may pass a job-local chain template through
+    CHAIN_CONFIG_OVERRIDE_FILE/CHAIN_CONFIG. Merge that template over the
+    canonical file so runtime workload/param_spec changes affect the exact
+    Vegeta targets generated for the job without mutating config/chains.
+    """
+    chain_name = str(chain_name or "").lower()
+    canonical = _load_json_file(_CHAINS_DIR / f"{chain_name}.json")
+    active = _load_active_override()
+    if active:
+        merged = dict(canonical)
+        merged.update(active)
+        return merged
+    return canonical
+
+
+def _load_active_override() -> dict:
+    override_file = os.environ.get("CHAIN_CONFIG_OVERRIDE_FILE", "").strip()
+    if override_file:
+        override = _load_json_file(Path(override_file))
+        if override:
+            return override
+    raw_config = os.environ.get("CHAIN_CONFIG", "").strip()
+    if raw_config and raw_config != "null":
+        try:
+            value = json.loads(raw_config)
+        except json.JSONDecodeError:
+            value = {}
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _load_json_file(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    with open(path) as f:
+        value = json.load(f)
+    return value if isinstance(value, dict) else {}
 
 
 class ChainAdapter(ABC):
@@ -123,10 +167,9 @@ def register(family: str):
 def get_adapter(chain_name: str) -> ChainAdapter:
     """Load chain template, look up _meta.adapter_family, return adapter instance."""
     chain_file = _CHAINS_DIR / f"{chain_name}.json"
-    if not chain_file.exists():
+    tpl = load_chain_template(chain_name)
+    if not tpl:
         raise FileNotFoundError(f"Chain template not found: {chain_file}")
-    with open(chain_file) as f:
-        tpl = json.load(f)
     family = tpl.get("_meta", {}).get("adapter_family")
     if not family:
         raise ValueError(

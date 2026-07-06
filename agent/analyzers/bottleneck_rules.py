@@ -15,10 +15,11 @@ def diagnose_artifacts(job: dict[str, Any] | None = None, artifact_index: str | 
     performance = _read_numeric_csv(evidence.get("performance_csv", ""))
     proxy = _read_csv(evidence.get("proxy_method_csv", ""))
     sync = _read_csv(evidence.get("sync_health_csv", ""))
+    workload_methods = _workload_methods_from_job(job)
 
     findings: list[dict[str, Any]] = []
     findings.extend(_diagnose_system(performance))
-    findings.extend(_diagnose_proxy(proxy))
+    findings.extend(_diagnose_proxy(proxy, workload_methods=workload_methods))
     findings.extend(_diagnose_sync(sync))
 
     if not findings:
@@ -109,13 +110,15 @@ def _diagnose_system(table: dict[str, Any]) -> list[dict[str, Any]]:
     return findings
 
 
-def _diagnose_proxy(table: dict[str, Any]) -> list[dict[str, Any]]:
+def _diagnose_proxy(table: dict[str, Any], workload_methods: set[str] | None = None) -> list[dict[str, Any]]:
     rows = table["rows"]
     if not rows:
         return []
     method_stats: dict[str, dict[str, float]] = {}
     for row in rows:
         method = str(row.get("method") or row.get("method_name") or row.get("rpc_method") or "unknown")
+        if workload_methods and method not in workload_methods:
+            continue
         status_text = str(row.get("status") or row.get("status_code") or row.get("success") or "").lower()
         latency = _to_float(row.get("latency_ms") or row.get("duration_ms") or row.get("p99_ms") or row.get("latency"))
         stats = method_stats.setdefault(method, {"total": 0, "fail": 0, "latency_sum": 0, "latency_count": 0})
@@ -148,6 +151,37 @@ def _diagnose_proxy(table: dict[str, Any]) -> list[dict[str, Any]]:
                 latency_ms_avg=round(latency_avg, 2),
             ))
     return findings
+
+
+def _workload_methods_from_job(job: dict[str, Any] | None) -> set[str]:
+    if not job:
+        return set()
+    plan_file = str(job.get("plan_file") or "")
+    if not plan_file or not Path(plan_file).is_file():
+        return set()
+    try:
+        plan = json.loads(Path(plan_file).read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+    rpc_mode = str(plan.get("rpc_mode") or "").strip().lower()
+    workload = plan.get("workload") if isinstance(plan.get("workload"), dict) else {}
+    methods: set[str] = set()
+    if rpc_mode == "mixed":
+        for item in list(workload.get("mixed_weighted") or []):
+            if isinstance(item, dict):
+                method = str(item.get("method") or "").strip()
+            else:
+                method = str(item or "").strip()
+            if method:
+                methods.add(method)
+    single = str(workload.get("single") or "").strip()
+    if single:
+        methods.add(single)
+    for method in list(plan.get("rpc_methods") or []):
+        text = str(method or "").strip()
+        if text:
+            methods.add(text)
+    return methods
 
 
 def _diagnose_sync(table: dict[str, Any]) -> list[dict[str, Any]]:

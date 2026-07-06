@@ -14,7 +14,7 @@ from typing import Any
 from urllib import request as urlrequest
 
 from runners.artifacts import write_artifact_index
-from runners.guardrails import validate_execution_plan
+from runners.guardrails import build_benchmark_command, validate_execution_plan
 from runners.materialize import load_runtime_env_file, materialize_runtime_env
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -44,7 +44,7 @@ def submit_job(
     job["artifacts"]["runtime_env_file"] = runtime_env_file
     _write_json(run_dir / "job.json", job)
 
-    guardrail_errors = validate_execution_plan(plan, approved=approved or mock)
+    guardrail_errors = [] if mock else validate_execution_plan(plan, approved=approved)
     if guardrail_errors:
         job["status"] = "failed"
         job["updated_at"] = _now()
@@ -95,7 +95,7 @@ def submit_job(
     try:
         env = load_runtime_env_file(runtime_env_file)
         completed = subprocess.run(
-            plan["execution"]["command"],
+            build_benchmark_command(plan["execution"]["command"]),
             cwd=plan["execution"].get("working_dir", str(REPO_ROOT)),
             env={**os.environ, **env},
             text=True,

@@ -55,7 +55,7 @@ def execute_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str
     if name == "run_preflight":
         return run_preflight(_required(args, "plan"))
     if name == "submit_job":
-        kwargs = {"mock": bool(args.get("mock", False)), "approved": bool(args.get("approved", False))}
+        kwargs = {"mock": False, "approved": bool(args.get("approved", False))}
         if args.get("jobs_dir"):
             kwargs["jobs_dir"] = args["jobs_dir"]
         return submit_job(_required(args, "plan_file"), **kwargs)

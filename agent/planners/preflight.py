@@ -128,6 +128,7 @@ def _tool_available(name: str, reported: dict[str, Any]) -> bool:
 def _fidelity_checks(plan: dict[str, Any]) -> dict[str, list[Any]]:
     checks: list[dict[str, Any]] = []
     warnings: list[str] = []
+    assumed_for_smoke = bool(plan.get("assumed_for_smoke"))
     discovery = plan.get("discovery", {})
     candidates = _candidate_names(discovery.get("disks", {}))
     materialized = plan.get("materialized_config", {})
@@ -137,14 +138,26 @@ def _fidelity_checks(plan: dict[str, Any]) -> dict[str, list[Any]]:
     iface = discovery.get("network", {}).get("default_interface", "")
 
     if candidates:
-        checks.append(_check("ledger_device_candidate_known", ledger in candidates, f"ledger={ledger}, candidates={', '.join(candidates)}"))
-        if accounts:
-            checks.append(_check("accounts_device_candidate_known", accounts in candidates, f"accounts={accounts}, candidates={', '.join(candidates)}"))
+        if assumed_for_smoke:
+            warnings.append(
+                "assumed_for_smoke plan uses smoke-only disk assumptions; "
+                f"ledger={ledger}, accounts={accounts or '<none>'}, candidates={', '.join(candidates)}"
+            )
+        else:
+            checks.append(_check("ledger_device_candidate_known", ledger in candidates, f"ledger={ledger}, candidates={', '.join(candidates)}"))
+            if accounts:
+                checks.append(_check("accounts_device_candidate_known", accounts in candidates, f"accounts={accounts}, candidates={', '.join(candidates)}"))
     else:
         warnings.append("disk inventory was unavailable; disk charts may be degraded unless the selected devices are visible to iostat")
 
     if iface:
-        checks.append(_check("network_interface_detected_or_confirmed", network == iface or bool(network), f"selected={network}, detected={iface}"))
+        if assumed_for_smoke and network and network != iface:
+            warnings.append(
+                "assumed_for_smoke plan uses a smoke-only network interface assumption; "
+                f"selected={network}, detected={iface}"
+            )
+        else:
+            checks.append(_check("network_interface_detected_or_confirmed", network == iface or bool(network), f"selected={network}, detected={iface}"))
     else:
         warnings.append("network interface could not be detected; network charts depend on the confirmed NETWORK_INTERFACE")
 

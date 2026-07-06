@@ -548,15 +548,21 @@ generate_auto_config() {
         CHAIN_CONFIG="$cached_config"
 
     else
-        # Read chain template from config/chains/<name>.json
-        # instead of the legacy UNIFIED_BLOCKCHAIN_CONFIG heredoc. The .json
-        # file is the authoritative chain template; _meta field is stripped by jq
-        # so downstream consumers see the same shape as before.
+        # Read the job-local Agent override first when present. This lets an
+        # Agent-confirmed workload change affect target generation without
+        # mutating the canonical config/chains/<name>.json template.
         local chains_dir="${CONFIG_LOADER_DIR:-$(dirname "${BASH_SOURCE[0]}")}/chains"
         local chain_file="$chains_dir/${blockchain_node_lower}.json"
-        if [[ ! -f "$chain_file" ]]; then
+        local override_file="${CHAIN_CONFIG_OVERRIDE_FILE:-}"
+        if [[ -n "$override_file" && -f "$override_file" ]]; then
+            CHAIN_CONFIG=$(jq -c 'del(._meta)' "$override_file")
+            echo "   Using Agent chain config override: $override_file" >&2
+        elif [[ ! -f "$chain_file" ]]; then
             CHAIN_CONFIG=""
         else
+            # The .json file is the authoritative chain template; _meta field
+            # is stripped by jq so downstream consumers see the same shape as
+            # before.
             CHAIN_CONFIG=$(jq -c 'del(._meta)' "$chain_file")
         fi
         # Cache parsing result

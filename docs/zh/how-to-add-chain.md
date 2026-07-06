@@ -136,9 +136,31 @@ address、transaction、block、contract/view 类型 method。
 7. 在 `tools/fake-node/configs/` 对应 family YAML 中增加 fixture 映射。
 8. 录制该 method 自己的 fixture，并运行 coverage/runtime probes。
 
+`weight` 必须是正整数。target generator 会把缺失、非法或为 0 的权重视为 `1`，
+确保已配置的 method 在 mixed-mode smoke 和 benchmark 中仍会被覆盖。如果要禁用某个
+method，需要从 `mixed_weighted` 中移除，不要把 `weight` 设置为 `0`。
+
 不要因为某个 method 出现在官方文档中就直接加入 mixed。只有当框架能构造合法
 请求、录制真实响应、通过 fake-node 回放，并进入 proxy/HTML 归因链路时，才应
 加入 mixed workload。
+
+自定义 RPC 支持在验证完成前应保持为 job-local。Agent 可以为某次 benchmark 起草
+workload override，但不能因为用户要求添加 method 就直接修改 `config/chains/*.json`。
+只有 endpoint validation、fixture 录制、fake-node coverage、smoke 和文档更新都通过后，
+才应该把 method 提升到 canonical chain template。
+
+对于已有链的自定义 method，仅有 method 名称不够。需要收集并验证：
+
+1. 链或 API 产品的可访问 endpoint。
+2. 精确 method 或 route。
+3. 完整 request 结构，包括 params、body、path variables、query values，以及必要 header。
+4. 每个 `TARGET_*` placeholder 的真实样本值。
+5. 成功 response，必要时还包括有代表性的错误 response。
+6. single/mixed workload 参与方式和 mixed 权重。
+7. 能回放验证响应的 fake-node fixture。
+
+如果用户希望某个 method 权重为 `0`，应从 `mixed_weighted` 移除该 method。当前
+target generator 会归一化 0 权重，已配置 method 仍可能被执行。
 
 ### 4. 配置参数格式
 
@@ -276,6 +298,12 @@ python3 tools/fake-node/check_fixture_coverage.py
 - REST 链经常需要 `asset_id`、`token_id`、`validator_address`、`denom` 等链特定样本。
 
 如果样本不真实，fixture 录制可能得到 400/404/空对象，fake-node 就无法模拟真实业务。
+
+新增链和自定义 method 都必须做 endpoint validation。用户提供的 request/response 样本
+只是有用证据，不是事实本身；只有框架 probe 用户提供的 endpoint，并观察到同样行为后，
+才可以认为样本可信。如果 endpoint 属于某个节点平台的其他 API 产品，不要假设它与该链
+常见 RPC family 兼容。例如 EVM endpoint 可以走 JSON-RPC 路径，但 provider 的 billing
+或 management REST API 可能需要 REST adapter，甚至需要新增 adapter family。
 
 ### 6. 配置 REST Path 或 Sidecar Path
 

@@ -91,6 +91,24 @@ generate_test_summary() {
     local max_qps="$3"
     local start_time="$4"
     local end_time="$5"
+    local initial_qps qps_step duration_per_level
+    case "$benchmark_mode" in
+        quick)
+            initial_qps="${QUICK_INITIAL_QPS:-1000}"
+            qps_step="${QUICK_QPS_STEP:-500}"
+            duration_per_level="${QUICK_DURATION:-60}"
+            ;;
+        intensive)
+            initial_qps="${INTENSIVE_INITIAL_QPS:-50000}"
+            qps_step="${INTENSIVE_QPS_STEP:-250}"
+            duration_per_level="${INTENSIVE_DURATION:-600}"
+            ;;
+        standard|*)
+            initial_qps="${STANDARD_INITIAL_QPS:-2000}"
+            qps_step="${STANDARD_QPS_STEP:-500}"
+            duration_per_level="${STANDARD_DURATION:-600}"
+            ;;
+    esac
     
     # Auto-detect bottleneck information
     local bottleneck_info=$(auto_detect_bottlenecks)
@@ -143,10 +161,10 @@ generate_test_summary() {
   "bottleneck_values": $bottleneck_values_json,
   "bottleneck_summary": "$bottleneck_types",
   "test_parameters": {
-    "initial_qps": ${FULL_INITIAL_QPS:-1000},
-    "max_qps": ${FULL_MAX_QPS:-5000},
-    "qps_step": ${FULL_QPS_STEP:-500},
-    "duration_per_level": ${FULL_DURATION:-600}
+    "initial_qps": ${initial_qps},
+    "max_qps": ${max_qps},
+    "qps_step": ${qps_step},
+    "duration_per_level": ${duration_per_level}
   },
   "data_size": {
     "logs_mb": $logs_mb,

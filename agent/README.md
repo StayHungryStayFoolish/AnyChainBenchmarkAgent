@@ -71,8 +71,8 @@ checkpoint artifact for chain, target mode, RPC mode, confirmed environment
 values, missing fields, pending question, plan file, and latest job. It is not a
 natural-language parser and must not become one.
 The state keeps a bounded revision history so ADK can handle "go back" or
-"that value was wrong" by reverting or patching structured fields, then running
-validators again.
+"that value was wrong" by reverting to a safe revision or applying an explicit
+structured-field update, then running validators again.
 
 ## Runtime Contract
 
@@ -84,7 +84,7 @@ user message
 -> specialized sub-agent
 -> deterministic tool and validator gates
 -> preflight, runbook, and user confirmation
--> lifecycle smoke or isolated fake-node benchmark smoke
+-> isolated fake-node benchmark smoke
 -> confirmation-gated benchmark job
 -> artifact index
 -> evidence-based analysis
@@ -223,7 +223,7 @@ python3 agent/cli.py tool-call --name load_execution_contract --arguments '{"use
 python3 agent/cli.py tool-call --name prepare_benchmark_run --arguments '{"chain":"solana","goal":"smoke","rpc_mode":"single","use_fake_node":true}'
 python3 agent/cli.py plan --request /tmp/request.json --output /tmp/plan.json --dry-run
 python3 agent/cli.py preflight --plan /tmp/plan.json
-python3 agent/cli.py submit --plan /tmp/plan.json --mock
+python3 agent/cli.py tool-call --name run_fake_node_smoke_benchmark --arguments '{"plan_file":"/tmp/plan.json","approved":true}'
 python3 agent/cli.py status --job-id <job_id>
 python3 agent/cli.py analyze --job-id <job_id>
 python3 agent/cli.py tool-schema
@@ -235,6 +235,10 @@ Real benchmark submission is confirmation-gated:
 ```bash
 python3 agent/cli.py submit --plan /tmp/plan.json --approved
 ```
+
+`agent/cli.py submit --dev-lifecycle-mock` is reserved for low-level
+job-lifecycle developer tests. It is not a product smoke path and must not be
+presented to users as a benchmark validation command.
 
 ## LLM And Google Auth
 
@@ -319,4 +323,8 @@ python3 agent/cli.py adk-eval
 
 Before adding a new chain or RPC method, generate an onboarding package and a
 draft template, then validate chain templates, fake-node fixtures, target
-generation, and smoke execution.
+generation, and smoke execution. Custom RPC methods and existing-family new
+chains remain job-local / `needs_review` until a reachable endpoint, exact
+request shape, response evidence, fixture recording, and fake-node smoke prove
+the behavior. Do not treat a provider API product as compatible with a chain
+family only because it is hosted by the same platform.

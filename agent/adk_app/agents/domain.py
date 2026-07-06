@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import inspect
+
+from adk_app.callbacks import after_model_callback
+from adk_app.callbacks import before_tool_callback
 from adk_app.instructions import (
     BENCHMARK_CONFIG_INSTRUCTION,
     DEPENDENCY_INSTRUCTION,
@@ -12,6 +16,7 @@ from adk_app.instructions import (
     ONBOARDING_INSTRUCTION,
     RESUME_ANALYZE_INSTRUCTION,
     RPC_WORKLOAD_INSTRUCTION,
+    SHARED_DOMAIN_AGENT_INSTRUCTION,
 )
 from adk_app.tools.actions import get_action_tools
 from adk_app.tools.enterprise import get_enterprise_tools
@@ -32,11 +37,47 @@ from adk_app.tools.validators import (
     load_default_workload,
     validate_chain_template,
     validate_execution_gate,
+    validate_rpc_endpoint,
     validate_required_config,
     validate_rpc_workload,
 )
 from adk_app.tools.web_research import get_google_search_tools
-from adk_app.tools.workflow_state import load_workflow_state, reset_workflow_state, update_workflow_state
+from adk_app.tools.workflow_state import (
+    answer_pending_question,
+    load_workflow_state,
+    propose_benchmark_target_mode_choice,
+    propose_chain_identity_resolution,
+    propose_chain_protocol_resolution,
+    request_unsupported_chain_handoff,
+    request_custom_rpc_handoff,
+    propose_chain_change_confirmation,
+    propose_chain_selection_question,
+    propose_opening_help_choice,
+    reset_workflow_state,
+    update_workflow_state,
+)
+
+
+def _instruction(body: str) -> str:
+    return f"{SHARED_DOMAIN_AGENT_INSTRUCTION}\n\n{body}"
+
+
+def _build_agent(agent_cls, **kwargs):
+    if _agent_accepts(agent_cls, "before_tool_callback"):
+        kwargs["before_tool_callback"] = before_tool_callback
+    if _agent_accepts(agent_cls, "after_model_callback"):
+        kwargs["after_model_callback"] = after_model_callback
+    return agent_cls(**kwargs)
+
+
+def _agent_accepts(agent_cls, parameter: str) -> bool:
+    try:
+        signature = inspect.signature(agent_cls)
+    except (TypeError, ValueError):
+        return True
+    if parameter in signature.parameters:
+        return True
+    return any(item.kind == inspect.Parameter.VAR_KEYWORD for item in signature.parameters.values())
 
 
 def build_domain_agents(agent_cls, model: str) -> list:
@@ -47,82 +88,126 @@ def build_domain_agents(agent_cls, model: str) -> list:
     domain gates deterministic.
     """
     return [
-        agent_cls(
+        _build_agent(
+            agent_cls,
             name="intent_router_agent",
             model=model,
             description="Classifies user intent and extracts entities without executing benchmark tools.",
-            instruction=INTENT_ROUTER_INSTRUCTION,
-            tools=[load_workflow_state, update_workflow_state, load_framework_context, load_framework_index],
-        ),
-        agent_cls(
-            name="environment_discovery_agent",
-            model=model,
-            description="Discovers local cloud, VM/Kubernetes, disk, network, and dependency context.",
-            instruction=ENVIRONMENT_DISCOVERY_INSTRUCTION,
-            tools=[load_workflow_state, update_workflow_state, discover_environment, run_doctor, build_missing_config_questions],
-        ),
-        agent_cls(
-            name="dependency_agent",
-            model=model,
-            description="Audits and installs dependencies only after explicit approval.",
-            instruction=DEPENDENCY_INSTRUCTION,
-            tools=[load_workflow_state, update_workflow_state, audit_dependencies, *get_action_tools()],
-        ),
-        agent_cls(
-            name="benchmark_configuration_agent",
-            model=model,
-            description="Collects and validates fake-node or real-node benchmark configuration.",
-            instruction=BENCHMARK_CONFIG_INSTRUCTION,
+            instruction=_instruction(INTENT_ROUTER_INSTRUCTION),
             tools=[
                 load_workflow_state,
                 update_workflow_state,
+                answer_pending_question,
+                propose_opening_help_choice,
+                propose_benchmark_target_mode_choice,
+                propose_chain_selection_question,
+                propose_chain_identity_resolution,
+                propose_chain_protocol_resolution,
+                request_unsupported_chain_handoff,
+                request_custom_rpc_handoff,
+                propose_chain_change_confirmation,
+                load_framework_context,
+                load_framework_index,
+            ],
+        ),
+        _build_agent(
+            agent_cls,
+            name="environment_discovery_agent",
+            model=model,
+            description="Discovers local cloud, VM/Kubernetes, disk, network, and dependency context.",
+            instruction=_instruction(ENVIRONMENT_DISCOVERY_INSTRUCTION),
+            tools=[
+                load_workflow_state,
+                update_workflow_state,
+                answer_pending_question,
+                propose_chain_change_confirmation,
+                discover_environment,
+                run_doctor,
+                build_missing_config_questions,
+            ],
+        ),
+        _build_agent(
+            agent_cls,
+            name="dependency_agent",
+            model=model,
+            description="Audits and installs dependencies only after explicit approval.",
+            instruction=_instruction(DEPENDENCY_INSTRUCTION),
+            tools=[load_workflow_state, update_workflow_state, answer_pending_question, audit_dependencies, *get_action_tools()],
+        ),
+        _build_agent(
+            agent_cls,
+            name="benchmark_configuration_agent",
+            model=model,
+            description="Collects and validates fake-node or real-node benchmark configuration.",
+            instruction=_instruction(BENCHMARK_CONFIG_INSTRUCTION),
+            tools=[
+                load_workflow_state,
+                update_workflow_state,
+                answer_pending_question,
+                propose_chain_identity_resolution,
+                propose_chain_protocol_resolution,
+                request_unsupported_chain_handoff,
+                request_custom_rpc_handoff,
+                propose_chain_change_confirmation,
                 validate_required_config,
+                validate_rpc_endpoint,
                 build_missing_config_questions,
                 validate_chain_template,
                 *get_planning_tools(),
             ],
         ),
-        agent_cls(
+        _build_agent(
+            agent_cls,
             name="rpc_workload_agent",
             model=model,
             description="Configures single, mixed, and custom RPC workloads.",
-            instruction=RPC_WORKLOAD_INSTRUCTION,
-            tools=[load_workflow_state, update_workflow_state, load_default_workload, validate_rpc_workload, validate_chain_template],
+            instruction=_instruction(RPC_WORKLOAD_INSTRUCTION),
+            tools=[load_workflow_state, update_workflow_state, answer_pending_question, load_default_workload, validate_rpc_workload, validate_chain_template],
         ),
-        agent_cls(
+        _build_agent(
+            agent_cls,
             name="chain_rpc_onboarding_agent",
             model=model,
             description="Produces evidence-backed handoffs for unsupported chains, new families, and custom RPC methods.",
-            instruction=ONBOARDING_INSTRUCTION,
+            instruction=_instruction(ONBOARDING_INSTRUCTION),
             tools=[
                 load_workflow_state,
                 update_workflow_state,
+                answer_pending_question,
+                propose_chain_identity_resolution,
+                propose_chain_protocol_resolution,
+                request_unsupported_chain_handoff,
+                request_custom_rpc_handoff,
                 load_framework_index,
                 validate_chain_template,
                 build_onboarding_handoff,
+                validate_rpc_endpoint,
                 *get_google_search_tools(),
                 *get_planning_tools(),
             ],
         ),
-        agent_cls(
+        _build_agent(
+            agent_cls,
             name="execution_agent",
             model=model,
             description="Runs preflight, smoke, fake-node smoke, and real benchmark jobs through approval-gated tools.",
-            instruction=EXECUTION_INSTRUCTION,
-            tools=[load_workflow_state, update_workflow_state, validate_execution_gate, *get_planning_tools(), *get_action_tools()],
+            instruction=_instruction(EXECUTION_INSTRUCTION),
+            tools=[load_workflow_state, update_workflow_state, answer_pending_question, validate_execution_gate, *get_planning_tools(), *get_action_tools()],
         ),
-        agent_cls(
+        _build_agent(
+            agent_cls,
             name="resume_analyze_agent",
             model=model,
             description="Resumes jobs, tails logs, analyzes artifacts, and explains report evidence.",
-            instruction=RESUME_ANALYZE_INSTRUCTION,
-            tools=[load_workflow_state, update_workflow_state, latest_job, *get_read_only_tools(), *get_action_tools()],
+            instruction=_instruction(RESUME_ANALYZE_INSTRUCTION),
+            tools=[load_workflow_state, update_workflow_state, answer_pending_question, latest_job, *get_read_only_tools(), *get_action_tools()],
         ),
-        agent_cls(
+        _build_agent(
+            agent_cls,
             name="knowledge_agent",
             model=model,
             description="Answers framework capability and enterprise KB questions from local repo facts first.",
-            instruction=KNOWLEDGE_INSTRUCTION,
-            tools=[load_workflow_state, update_workflow_state, reset_workflow_state, load_framework_context, load_framework_index, knowledge_search, *get_enterprise_tools()],
+            instruction=_instruction(KNOWLEDGE_INSTRUCTION),
+            tools=[load_workflow_state, update_workflow_state, answer_pending_question, reset_workflow_state, load_framework_context, load_framework_index, knowledge_search, *get_enterprise_tools()],
         ),
     ]

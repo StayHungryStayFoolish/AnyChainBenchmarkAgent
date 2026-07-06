@@ -17,6 +17,8 @@ if str(AGENT_ROOT) not in sys.path:
     sys.path.insert(0, str(AGENT_ROOT))
 
 from runners.artifacts import write_artifact_index  # noqa: E402
+from runners.guardrails import build_benchmark_command  # noqa: E402
+from runners.job_manager import _discover_completed_artifacts  # noqa: E402
 from runners.materialize import load_runtime_env_file  # noqa: E402
 
 
@@ -44,7 +46,7 @@ def main(argv: list[str] | None = None) -> int:
             handle.write(f"[anychain-agent] detached worker pid={os.getpid()} started at {_now()}\n")
             handle.flush()
             completed = subprocess.run(
-                command,
+                build_benchmark_command(command),
                 cwd=plan["execution"].get("working_dir", str(REPO_ROOT)),
                 env={**os.environ, **env},
                 text=True,
@@ -56,6 +58,8 @@ def main(argv: list[str] | None = None) -> int:
         job["exit_code"] = completed.returncode
         if completed.returncode != 0:
             job["error"] = f"benchmark command exited with {completed.returncode}"
+        else:
+            job.setdefault("artifacts", {}).update(_discover_completed_artifacts(plan, env))
     except Exception as exc:  # pragma: no cover - defensive detached worker guard
         job["status"] = "failed"
         job["error"] = str(exc)

@@ -34,7 +34,7 @@ def missing_smoke_blockers(values: dict[str, Any]) -> list[str]:
         blockers.append("use_fake_node")
     if values.get("rpc_mode") == "mixed":
         blockers.append("mixed_weights_confirmed")
-    return [key for key in blockers if key not in values or _is_missing(values.get(key))]
+    return [key for key in blockers if key not in values or _is_missing_blocker(key, values.get(key))]
 
 
 def _is_missing(value: Any) -> bool:
@@ -45,3 +45,9 @@ def _is_missing(value: Any) -> bool:
     if isinstance(value, (list, tuple, set, dict)):
         return not value
     return False
+
+
+def _is_missing_blocker(key: str, value: Any) -> bool:
+    if key == "use_fake_node" and isinstance(value, bool):
+        return False
+    return _is_missing(value)

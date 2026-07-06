@@ -6,7 +6,7 @@ from typing import Any
 
 try:
     from agent.utils.redaction import redact
-except ImportError:  # pragma: no cover - legacy script execution path
+except ImportError:  # pragma: no cover - direct script execution path
     from utils.redaction import redact
 
 

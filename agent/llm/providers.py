@@ -115,6 +115,15 @@ def _vertex_openai_base_url(config: LLMConfig) -> str:
     )
 
 
+def _vertex_raw_predict_url(config: LLMConfig, publisher: str, model: str) -> str:
+    location = config.google_location.strip()
+    return (
+        f"https://{_vertex_aiplatform_host(location)}/v1/"
+        f"projects/{config.google_project}/locations/{location}/"
+        f"publishers/{publisher}/models/{model}:rawPredict"
+    )
+
+
 class GeminiAPIKeyProvider:
     """Gemini API provider using a direct API key."""
 
@@ -153,11 +162,7 @@ class VertexClaudeProvider:
     def complete(self, request: LLMRequest) -> LLMResponse:
         system, messages = _anthropic_messages(request.messages)
         token = get_google_access_token(self.config)
-        url = (
-            f"https://{self.config.google_location}-aiplatform.googleapis.com/v1/"
-            f"projects/{self.config.google_project}/locations/{self.config.google_location}/"
-            f"publishers/anthropic/models/{self.config.model}:rawPredict"
-        )
+        url = _vertex_raw_predict_url(self.config, "anthropic", self.config.model)
         payload: dict[str, Any] = {
             "anthropic_version": "vertex-2023-10-16",
             "messages": messages,
