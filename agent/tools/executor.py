@@ -5,29 +5,56 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from analyzers.artifact_qa import answer_artifact_question
-from analyzers.bottleneck_rules import diagnose_artifacts
-from analyzers.result_analyzer import analyze_job
-from discovery.environment import discover_environment
-from knowledge.framework_capabilities import load_framework_capabilities
-from knowledge.framework_context import load_framework_context
-from knowledge.framework_index import load_or_build_framework_index
-from knowledge.gap_analyzer import analyze_capability_gap
-from knowledge.loader import load_knowledge_provider, provider_status
-from onboarding.template_drafter import draft_chain_template
-from planners.preflight import run_preflight
-from planners.strategy_planner import generate_plan
-from runners.job_manager import get_job, submit_job, tail_job_log
-from validators.config_contract import build_missing_config_questions, validate_required_config
-from validators.execution_gate import validate_execution_gate
-from validators.onboarding_gate import build_onboarding_handoff
-from validators.rpc_workload import default_workload, validate_rpc_workload
-from validators.chain_template import validate_chain_template
-from adk_app.tools.actions import run_fake_node_smoke_benchmark
-from adk_app.tools.actions import install_dependencies
-from adk_app.tools.planning import prepare_benchmark_run
-from adk_app.tools.read_only import audit_dependencies
-from adk_app.tools.read_only import load_execution_contract
+try:
+    from ..analyzers.artifact_qa import answer_artifact_question
+    from ..analyzers.bottleneck_rules import diagnose_artifacts
+    from ..analyzers.result_analyzer import analyze_job
+    from ..discovery.environment import discover_environment
+    from ..knowledge.framework_capabilities import load_framework_capabilities
+    from ..knowledge.framework_context import load_framework_context
+    from ..knowledge.framework_index import load_or_build_framework_index
+    from ..knowledge.gap_analyzer import analyze_capability_gap
+    from ..knowledge.loader import load_knowledge_provider, provider_status
+    from ..onboarding.template_drafter import draft_chain_template
+    from ..planners.preflight import run_preflight
+    from ..planners.strategy_planner import generate_plan
+    from ..runners.job_manager import get_job, submit_job, tail_job_log
+    from ..validators.config_contract import build_missing_config_questions, validate_required_config
+    from ..validators.execution_gate import validate_execution_gate
+    from ..validators.onboarding_gate import build_onboarding_handoff
+    from ..validators.rpc_workload import default_workload, validate_rpc_workload
+    from ..validators.chain_template import validate_chain_template
+except ImportError:  # script execution with agent/ on sys.path
+    from analyzers.artifact_qa import answer_artifact_question
+    from analyzers.bottleneck_rules import diagnose_artifacts
+    from analyzers.result_analyzer import analyze_job
+    from discovery.environment import discover_environment
+    from knowledge.framework_capabilities import load_framework_capabilities
+    from knowledge.framework_context import load_framework_context
+    from knowledge.framework_index import load_or_build_framework_index
+    from knowledge.gap_analyzer import analyze_capability_gap
+    from knowledge.loader import load_knowledge_provider, provider_status
+    from onboarding.template_drafter import draft_chain_template
+    from planners.preflight import run_preflight
+    from planners.strategy_planner import generate_plan
+    from runners.job_manager import get_job, submit_job, tail_job_log
+    from validators.config_contract import build_missing_config_questions, validate_required_config
+    from validators.execution_gate import validate_execution_gate
+    from validators.onboarding_gate import build_onboarding_handoff
+    from validators.rpc_workload import default_workload, validate_rpc_workload
+    from validators.chain_template import validate_chain_template
+try:
+    from ..adk_app.tools.actions import run_fake_node_smoke_benchmark
+    from ..adk_app.tools.actions import install_dependencies
+    from ..adk_app.tools.planning import prepare_benchmark_run
+    from ..adk_app.tools.read_only import audit_dependencies
+    from ..adk_app.tools.read_only import load_execution_contract
+except ImportError:  # script execution with agent/ on sys.path
+    from adk_app.tools.actions import run_fake_node_smoke_benchmark
+    from adk_app.tools.actions import install_dependencies
+    from adk_app.tools.planning import prepare_benchmark_run
+    from adk_app.tools.read_only import audit_dependencies
+    from adk_app.tools.read_only import load_execution_contract
 
 
 def execute_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:

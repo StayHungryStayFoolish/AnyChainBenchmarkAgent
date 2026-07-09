@@ -181,6 +181,67 @@ def collect_proxy_method_metrics(proxy_csv: Path, allowed_methods: set[str], max
     return metrics
 
 
+def read_latest_csv_row(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8", newline="") as fh:
+            rows = csv.DictReader(fh)
+            latest: dict[str, Any] = {}
+            for row in rows:
+                if row:
+                    latest = dict(row)
+            return latest
+    except OSError:
+        return {}
+
+
+def emit_latest_csv_metrics(builder: PrometheusBuilder, latest_row: dict[str, Any], labels: dict[str, Any]) -> None:
+    if not latest_row:
+        return
+
+    for field, metric, help_text in (
+        ("cpu_iowait", "cpu_iowait_percent", "CPU iowait percent from performance_latest.csv."),
+        ("execution_mgas_per_sec", "execution_mgas_per_sec", "Node execution throughput in million gas per second when exposed by client metrics."),
+        ("execution_gas_per_sec", "execution_gas_per_sec", "Node execution throughput in gas per second when exposed by client metrics."),
+        ("node_process_cpu_pct", "node_process_cpu_percent", "Observed blockchain node process CPU percent."),
+        ("node_thread_count", "node_thread_count", "Observed blockchain node thread count."),
+        ("node_hottest_thread_cpu_pct", "node_hottest_thread_cpu_percent", "CPU percent of the hottest observed node thread."),
+        ("node_hottest_thread_core", "node_hottest_thread_core", "CPU core id running the hottest observed node thread."),
+        ("node_hottest_core_cpu_pct", "node_hottest_core_cpu_percent", "CPU percent of the hottest core used by the node process."),
+        ("node_cpu_concentration_top1_pct", "node_cpu_concentration_top1_percent", "Node CPU concentration in the hottest thread/core."),
+        ("node_cpu_concentration_top5_pct", "node_cpu_concentration_top5_percent", "Node CPU concentration across the top five threads/cores."),
+        ("local_block_height", "local_block_height", "Local node block height from performance_latest.csv."),
+        ("mainnet_block_height", "mainnet_block_height", "Reference/mainnet block height from performance_latest.csv."),
+        ("block_height_diff", "block_height_diff_csv", "Reference minus local block height difference from performance_latest.csv."),
+        ("freshness_gap_seconds", "sync_freshness_gap_seconds_csv", "Local progress freshness gap from performance_latest.csv."),
+    ):
+        builder.gauge(metric, help_text, latest_row.get(field), labels)
+
+    execution_labels = {
+        **labels,
+        "source": latest_row.get("execution_metric_source", "unknown"),
+        "status": latest_row.get("execution_metric_status", "unknown"),
+    }
+    builder.gauge(
+        "execution_metric_available",
+        "Whether node execution/MGas metrics were available in the latest CSV row.",
+        1 if to_float(latest_row.get("execution_mgas_per_sec")) is not None or to_float(latest_row.get("execution_gas_per_sec")) is not None else 0,
+        execution_labels,
+    )
+
+    node_labels = {
+        **labels,
+        "status": latest_row.get("node_cpu_status", "unknown"),
+        "pid": latest_row.get("node_process_pid", ""),
+        "hottest_thread": latest_row.get("node_hottest_thread_name", ""),
+    }
+    builder.gauge(
+        "node_cpu_attribution_available",
+        "Whether node process/thread CPU attribution was available in the latest CSV row.",
+        1 if to_float(latest_row.get("node_process_cpu_pct")) is not None else 0,
+        node_labels,
+    )
+
+
 def build_metrics(
     memory_dir: Path,
     logs_dir: Path,
@@ -200,10 +261,12 @@ def build_metrics(
     sync_cache = read_json(memory_dir / "block_height_monitor_cache.json")
     bottleneck = read_json(memory_dir / "bottleneck_status.json")
     qps_status = read_json(memory_dir / "qps_status.json")
+    latest_csv = read_latest_csv_row(logs_dir / "performance_latest.csv")
 
     builder.gauge("exporter_up", "Exporter scrape succeeded.", 1, labels)
     builder.gauge("artifact_latest_metrics_present", "Whether latest_metrics.json is readable.", 1 if latest else 0, labels)
     builder.gauge("artifact_sync_cache_present", "Whether block_height_monitor_cache.json is readable.", 1 if sync_cache else 0, labels)
+    builder.gauge("artifact_performance_csv_present", "Whether performance_latest.csv is readable.", 1 if latest_csv else 0, labels)
 
     for field, metric, help_text in (
         ("cpu_usage", "cpu_usage_percent", "CPU usage percent from latest metrics."),
@@ -230,11 +293,15 @@ def build_metrics(
         sync_labels,
     )
     for field, metric, help_text in (
+        ("local_block_height", "local_block_height", "Local node block height from sync cache."),
+        ("mainnet_block_height", "mainnet_block_height", "Reference/mainnet block height from sync cache."),
         ("block_height_diff", "block_height_diff", "Target minus local block height difference."),
         ("lag_value", "sync_lag_value", "Reported sync lag value."),
         ("freshness_gap_seconds", "sync_freshness_gap_seconds", "Local progress freshness gap in seconds."),
     ):
         builder.gauge(metric, help_text, sync_cache.get(field), sync_labels)
+
+    emit_latest_csv_metrics(builder, latest_csv, labels)
 
     detected = str(bottleneck.get("bottleneck_detected", "false")).lower() == "true"
     bottleneck_types = bottleneck.get("bottleneck_types") if isinstance(bottleneck.get("bottleneck_types"), list) else []

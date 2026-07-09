@@ -9,20 +9,22 @@
 [![Shell Script](https://img.shields.io/badge/shell-bash-green.svg)](https://www.gnu.org/software/bash/)
 
 A production-oriented benchmark framework for blockchain node QPS, latency,
-bottleneck, sync-health, and per-RPC-method analysis, with an ADK-based Agent
-control plane.
+bottleneck, sync-health, and per-RPC-method analysis, with a LangGraph
+Harness-based Agent control plane.
 
 The benchmark execution plane remains deterministic: Vegeta, RPC proxy,
 monitoring collectors, fake-node, report generation, and archiving are still the
 source of truth. The intended human-facing entrypoint is `./bin/anychain-agent`.
-The Agent must use Google ADK for natural-language understanding, typed intent,
-specialized sub-agent delegation, and tool orchestration. Model output may draft
-structured requests, plans, and explanations, but deterministic tools and
-validators own execution gates.
+The product workflow is owned by the LangGraph Harness: it holds checkpointed
+state, routes typed intents to configuration groups, validates every gate, and
+selects the next blocking question. Google ADK remains available as a model/tool
+bridge for Gemini and Google capabilities, but it does not own a second
+benchmark wizard.
 
-The benchmark engine is the stable execution layer. The Agent routes
-natural-language requests through Google ADK and uses deterministic tools,
-validators, preflight checks, smoke tests, and approval gates before execution.
+The benchmark engine is the stable execution layer. The Agent uses the
+configured LLM only to interpret ambiguous natural language into typed Harness
+actions; deterministic tools, validators, preflight checks, smoke tests, and
+approval gates own execution.
 
 ## Contents
 
@@ -49,12 +51,12 @@ Preview the generated benchmark report before running the framework:
 #### Agent Intelligence
 
 - Turn natural-language benchmark goals into structured, validated plans through
-  Google ADK, not terminal keyword matching.
+  the LangGraph Harness, not terminal keyword matching.
 - Detect the local environment and ask only for missing values it cannot safely
   infer.
 - Guide missing configuration through Agent checklists instead of expecting
   users to understand every benchmark variable up front.
-- Use ADK multi-agent orchestration with deterministic tool and validator gates.
+- Use a LangGraph Harness workflow with deterministic tool and validator gates.
 - Score plan risk, run preflight, and require explicit approval before real
   benchmark execution.
 - Run long benchmarks in detached/background mode after user approval, so tests
@@ -91,9 +93,9 @@ Preview the generated benchmark report before running the framework:
 ```text
 prompt or request
   -> AnyChain terminal shell for stable I/O only
-  -> ADK root coordinator
-  -> typed intent path
-  -> specialized sub-agent delegation
+  -> LangGraph Harness checkpointed workflow
+  -> typed LLM intent resolver
+  -> group workflow and fallback path
   -> deterministic tool and validator gates
   -> read-only discovery
   -> benchmark plan
@@ -324,9 +326,9 @@ required values before a real run.
 
 ### 5. Start The Agent
 
-Start the Agent. This command opens the AnyChain product terminal. Google ADK
-owns natural-language understanding and orchestration, while the terminal owns
-stable input/output and startup checks:
+Start the Agent. This command opens the AnyChain product terminal. The
+LangGraph Harness owns workflow state, group routing, validation, and execution
+approval; Google ADK is only the optional model/tool bridge:
 
 ```bash
 ./bin/anychain-agent
@@ -683,7 +685,7 @@ smoke.
 - [AI Assistant Operator Guide](AGENTS.md)
 - [Configuration Guide](config/README.md)
 - [Agent Control Plane](agent/README.md)
-- [ADK Agent Architecture](docs/en/adk-agent-architecture.md)
+- [Agent Architecture](docs/en/adk-agent-architecture.md)
 - [AnyChain Agent AI Work Gate](docs/en/anychain-agent-ai-work-gate.md)
 - [Full Framework Reference](docs/en/framework-reference.md)
 - [Framework Flow and Data Lifecycle](docs/en/framework-flow.md)

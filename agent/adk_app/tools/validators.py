@@ -7,14 +7,24 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from validators.chain_template import validate_chain_template as _validate_chain_template
-from validators.config_contract import build_missing_config_questions as _build_missing_config_questions
-from validators.config_contract import validate_required_config as _validate_required_config
-from validators.execution_gate import validate_execution_gate as _validate_execution_gate
-from validators.onboarding_gate import build_onboarding_handoff as _build_onboarding_handoff
-from validators.endpoint_probe import validate_rpc_endpoint as _validate_rpc_endpoint
-from validators.rpc_workload import default_workload as _default_workload
-from validators.rpc_workload import validate_rpc_workload as _validate_rpc_workload
+try:
+    from ...validators.chain_template import validate_chain_template as _validate_chain_template
+    from ...validators.config_contract import build_missing_config_questions as _build_missing_config_questions
+    from ...validators.config_contract import validate_required_config as _validate_required_config
+    from ...validators.execution_gate import validate_execution_gate as _validate_execution_gate
+    from ...validators.onboarding_gate import build_onboarding_handoff as _build_onboarding_handoff
+    from ...validators.endpoint_probe import validate_rpc_endpoint as _validate_rpc_endpoint
+    from ...validators.rpc_workload import default_workload as _default_workload
+    from ...validators.rpc_workload import validate_rpc_workload as _validate_rpc_workload
+except ImportError:  # script execution with agent/ on sys.path
+    from validators.chain_template import validate_chain_template as _validate_chain_template
+    from validators.config_contract import build_missing_config_questions as _build_missing_config_questions
+    from validators.config_contract import validate_required_config as _validate_required_config
+    from validators.execution_gate import validate_execution_gate as _validate_execution_gate
+    from validators.onboarding_gate import build_onboarding_handoff as _build_onboarding_handoff
+    from validators.endpoint_probe import validate_rpc_endpoint as _validate_rpc_endpoint
+    from validators.rpc_workload import default_workload as _default_workload
+    from validators.rpc_workload import validate_rpc_workload as _validate_rpc_workload
 
 from .read_only import _tool_result
 

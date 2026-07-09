@@ -134,6 +134,9 @@ adk_ready() {
     [[ -x "$venv_dir/bin/adk" ]] || return 1
     "$venv_dir/bin/python" - <<'PY' >/dev/null 2>&1
 import google.adk
+import langgraph
+import langgraph.graph
+import langgraph.checkpoint.sqlite
 import prompt_toolkit
 PY
 }

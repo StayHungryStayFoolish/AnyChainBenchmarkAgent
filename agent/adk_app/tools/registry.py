@@ -8,18 +8,16 @@ from .enterprise import get_enterprise_tools
 from .planning import get_planning_tools
 from .read_only import get_read_only_tools
 from .validators import get_validator_tools
-from .workflow_state import get_workflow_state_tools
 
 
 def get_adk_tools(include_actions: bool = False) -> list:
     """Return ADK tool callables.
 
-    Action tools are available to the ADK root agent only when explicitly
-    requested. They must be paired with ADK confirmation callbacks and runner
-    guardrails.
+    Action tools are available only when explicitly requested by development
+    scaffolds. Product workflow state is owned by ``agent.harness`` and must
+    not be exposed here as ADK mutation tools.
     """
     tools = [
-        *get_workflow_state_tools(),
         *get_read_only_tools(),
         *get_auth_tools(),
         *get_planning_tools(),

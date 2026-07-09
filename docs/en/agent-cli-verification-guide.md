@@ -13,7 +13,8 @@ customer data, or personal credentials in shared evidence.
 Verify that `./bin/anychain-agent` behaves like a product Agent:
 
 - starts cleanly in a real terminal;
-- uses the configured LLM through Google ADK;
+- uses the configured LLM through the LangGraph Harness, with Google ADK only
+  as the optional Gemini/Google tool bridge;
 - correctly reports the configured auth mode, including Google ADC or attached
   service-account modes when available;
 - keeps input/output stable for English and Chinese;
@@ -90,47 +91,73 @@ explain what it will install and verify it requests approval before invoking
 Run before any fix and again after any fix:
 
 ```bash
-python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract
+python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract tests.test_agent_langgraph_harness
 python3 tools/check_agent_boundaries.py --root .
 python3 agent/cli.py adk-eval
 git diff --check
 ```
 
-Then run the live matrices with the configured model:
+Then run the LangGraph CLI matrix with the configured model. It drives the same
+`./bin/anychain-agent` entrypoint users run, isolates terminal/checkpoint state
+per scenario, and validates LangGraph checkpoint state:
 
 ```bash
-python3 tests/agent_live/run_live_matrix.py \
-  --matrix tests/agent_live/agent_intent_smoke_scenarios.json \
-  --require-live \
-  --provider <provider> \
-  --model <model> \
-  --timeout 240
-
-python3 tests/agent_live/run_live_matrix.py \
-  --matrix tests/agent_live/agent_product_acceptance_scenarios.json \
-  --require-live \
-  --provider <provider> \
-  --model <model> \
-  --timeout 240
-
-python3 tests/agent_live/run_live_matrix.py \
-  --matrix tests/agent_live/agent_chaos_conversation_scenarios.json \
-  --require-live \
-  --provider <provider> \
-  --model <model> \
-  --timeout 240
-
-python3 tests/agent_live/run_live_matrix.py \
-  --matrix tests/agent_live/agent_edge_acceptance_scenarios.json \
-  --require-live \
-  --provider <provider> \
-  --model <model> \
-  --timeout 240
+python3 tests/agent_live/run_langgraph_cli_matrix.py
 ```
 
 Use `provider=gemini` only when Gemini credentials are configured. Use another
 repository-supported provider for non-search live validation, but do not claim
 Google Search coverage unless Gemini ADK `google_search` is actually available.
+
+## Dual-AI Chaos Verification
+
+For broad Agent workflow, routing, group-state, or Harness changes, the scripted
+matrix is only a regression guard. It does not prove the product conversation is
+stable.
+
+Run an additional dual-AI chaos session:
+
+- Start the real Docker/Linux CLI: `./bin/anychain-agent`.
+- Configure the Agent to use a real provider such as DeepSeek for non-search
+  validation.
+- Let Codex act as the user simulator. Codex must choose each next user message
+  from the live Agent response, not from a fixed list of scripted prompts.
+- Save the complete transcript and review the user-visible flow, not only final
+  checkpoint state.
+
+The Codex user simulator must cover at least these behaviors:
+
+1. Start with arbitrary text, not only `Hi` or `hello`.
+2. Answer a pending question with a valid short option, an invalid value, and a
+   natural-language detour.
+3. Jump between groups: disk, network, chain, target mode, workload/RPC, QPS,
+   observability, sync-observe, evidence analysis, and report analysis.
+4. Return/backtrack from one group to another, including a half-completed group.
+5. Change chain, target mode, RPC mode, QPS profile, custom RPC methods, and
+   observability after some values have already been confirmed.
+6. Paste copied config in env/YAML/JSON form and require the Agent to infer,
+   summarize, and ask for confirmation before applying it.
+7. Paste request/response samples, endpoint URLs, official-doc excerpts, and
+   contradictory evidence for custom RPC flows.
+8. Exercise Case 1, Case 2, and Case 3 chain/RPC onboarding paths, then jump
+   back to a supported chain or another case.
+9. Switch languages and include technical scalar values with whitespace or
+   punctuation.
+10. Resume from a partial previous session and test continue, modify, and clear.
+
+If a failure appears in this session, classify it before changing code:
+
+- terminal shell problem: input, Ctrl+C, language persistence, transcript
+  rendering, dependency prompt;
+- Harness state problem: group completion, fallback order, interruption stack,
+  invalidation, resume;
+- intent problem: LLM action extraction or unsupported ambiguity handling;
+- validator/tool problem: endpoint probe, custom RPC schema, fixture, QPS,
+  observability, preflight/smoke;
+- documentation drift.
+
+Fix the owning layer. Do not add terminal keyword routing, fuzzy matching, or
+special-case patches that bypass the LangGraph Harness.
 
 ## Manual Terminal Tests
 
@@ -480,13 +507,14 @@ responsible code path:
 - deterministic guard or tool issue: `agent/validators/` or
   `agent/adk_app/tools/`;
 - terminal UX issue: `agent/terminal/`;
-- workflow state issue: `agent/adk_app/workflow/`;
-- live matrix gap: `tests/agent_live/*.json`;
+- workflow state issue: `agent/harness/`;
+- live matrix gap: `tests/agent_live/run_langgraph_cli_matrix.py`;
 - documentation drift: update the relevant README or docs page.
 
 Do not fix business behavior by adding keyword lists, fuzzy matching, or regex
-intent routing in terminal code. Intent understanding must remain model-driven
-through ADK, with deterministic tools used as validation and execution gates.
+intent routing in terminal code. Ambiguous intent understanding must remain
+model-driven through the LangGraph Harness intent resolver, with deterministic
+group workflows used as validation and execution gates.
 
 ## Evidence To Return
 

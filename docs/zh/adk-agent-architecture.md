@@ -1,9 +1,9 @@
-# AnyChain ADK Agent Architecture
+# AnyChain Agent 架构
 
-AnyChain Agent is a Google ADK-based domain agent that controls the
-blockchain-node-benchmark engine. ADK owns reasoning and delegation. The
-benchmark framework owns deterministic validation, execution, artifacts, and
-evidence.
+AnyChain Agent 是基于 LangGraph Harness 的产品级 Agent，用于控制
+blockchain-node-benchmark 引擎。Harness 负责 workflow 状态、group 路由、
+fallback 顺序、校验门禁和执行决策。Google ADK 只是可选的模型/工具 bridge；
+它不能再拥有第二套 benchmark wizard，也不能绕过 Harness 修改 workflow state。
 
 ## Architecture Overview
 
@@ -11,31 +11,18 @@ evidence.
 flowchart TD
   U["User terminal"] --> T["AnyChain product terminal<br/>bin/anychain-agent"]
   T --> D["Startup diagnostics<br/>framework context, environment, dependencies, jobs"]
-  T --> R["ADK root coordinator"]
+  T --> H["LangGraph Harness<br/>agent/harness"]
 
-  R --> DS["Discovery Agent"]
-  R --> DEP["Dependency Agent"]
-  R --> CFG["Configuration Agent"]
-  R --> RPC["RPC Workload Agent"]
-  R --> ONB["Chain/RPC Onboarding Agent"]
-  R --> EXE["Execution Agent"]
-  R --> ANA["Resume & Analysis Agent"]
-  R --> KB["Knowledge Agent"]
+  H --> I["Typed intent resolver<br/>configured LLM"]
+  H --> G["Group workflows<br/>provider, disk, network, chain, workload, QPS, sync-observe"]
+  H --> S["Persistent checkpoint<br/>ANYCHAIN_AGENT_CHECKPOINT_PATH"]
+  H --> VAL["Deterministic validators<br/>config, workload, onboarding, execution gate"]
+  H --> PLAN["Plan and runtime.env builder"]
+  H --> JOB["Detached job manager<br/>.agent/jobs/job_id"]
+  H --> SEARCH["Gemini-only google_search<br/>onboarding/custom RPC evidence"]
 
-  DS --> TOOLS["ADK function tools"]
-  DEP --> TOOLS
-  CFG --> TOOLS
-  RPC --> TOOLS
-  ONB --> TOOLS
-  EXE --> TOOLS
-  ANA --> TOOLS
-  KB --> TOOLS
-
-  TOOLS --> VAL["Deterministic validators<br/>config, workload, onboarding, execution gate"]
-  TOOLS --> PLAN["Plan and runtime.env builder"]
-  TOOLS --> STATE["Workflow state<br/>.agent/sessions/session/conversation_state.json"]
-  TOOLS --> JOB["Detached job manager<br/>.agent/jobs/job_id"]
-  TOOLS --> SEARCH["Gemini-only google_search<br/>onboarding/custom RPC evidence"]
+  I --> G
+  G --> VAL
 
   VAL --> PRE["Preflight"]
   PRE --> SMOKE["隔离 fake-node smoke"]
@@ -53,9 +40,9 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-  A["Understand<br/>ADK + model"] --> B["Plan<br/>ADK coordinator"]
-  B --> C["Ask<br/>one blocking topic"]
-  C --> D["Configure<br/>typed tools"]
+  A["User turn"] --> B["Typed intent<br/>LLM resolver"]
+  B --> C["Route to group<br/>LangGraph Harness"]
+  C --> D["Ask one blocking question<br/>or activate requested group"]
   D --> E["Validate<br/>deterministic gates"]
   E --> F{"Ready?"}
   F -- "No" --> C
@@ -68,8 +55,10 @@ flowchart LR
 
 The loop prevents the Agent from acting like a keyword bot:
 
-- user intent is interpreted by ADK and the configured model;
-- confirmed facts are stored as structured workflow state;
+- user intent is interpreted by the configured model and returned as typed graph actions;
+- confirmed facts are stored as structured LangGraph state;
+- users may jump between groups, go back, or revise prior answers;
+- completing an interrupted group falls back to the next missing required group;
 - every execution path passes through deterministic validators;
 - the Agent asks for missing information instead of inventing values;
 - smoke tests are isolated from final benchmark job artifacts;
@@ -95,7 +84,8 @@ confirm or provide a value.
 
 ```mermaid
 flowchart TD
-  C["Conversation state"] --> S[".agent/sessions/session/conversation_state.json"]
+  C["LangGraph checkpoint"] --> S["ANYCHAIN_AGENT_CHECKPOINT_PATH<br/>default .agent/checkpoints/agent.sqlite"]
+  T["Terminal session state"] --> TS["--state-file JSON"]
   P["Plan"] --> E[".agent/jobs/job_id/runtime.env"]
   J["Job metadata"] --> M[".agent/jobs/job_id/job.json"]
   L["Benchmark logs"] --> LOG[".agent/jobs/job_id/benchmark.log"]
@@ -104,8 +94,9 @@ flowchart TD
 ```
 
 `runtime.env` is the final per-job confirmed configuration. Users should not
-edit it manually. If a user changes an earlier answer, ADK must update or revert
-workflow state and regenerate downstream runtime artifacts through tools.
+edit it manually. If a user changes an earlier answer, the Harness must update
+or invalidate the affected group state and regenerate downstream runtime
+artifacts through deterministic tools.
 
 ## Google Search Boundary
 
@@ -126,7 +117,7 @@ repository explicitly adds and verifies a provider-specific search integration.
 
 `sync-observe` 是节点同步/资源观察的一等 workflow，不属于 RPC workload 路径。
 当用户希望观察节点追高速度、MGas/s、节点进程 CPU/线程热点、磁盘 latency/iowait
-或网络行为，并且不希望发送 benchmark RPC 流量时，ADK 应该路由到
+或网络行为，并且不希望发送 benchmark RPC 流量时，Harness 应该路由到
 sync-observe workflow。
 
 该 workflow 需要确认：
@@ -152,7 +143,7 @@ Before changing Agent code, read:
 Then run relevant checks:
 
 ```bash
-python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract
+python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract tests.test_agent_langgraph_harness
 python3 tools/check_agent_boundaries.py --root .
 python3 agent/cli.py adk-eval
 git diff --check

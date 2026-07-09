@@ -4,10 +4,16 @@ from __future__ import annotations
 
 from typing import Any
 
-from knowledge.entry_contract import OPTIONAL_ACCOUNTS_FIELDS
-from workflows.group_registry import GROUP_QUESTION_ORDER
-from workflows.group_registry import question_keys_for_group
-from workflows.requirements import ENVIRONMENT_BLOCKERS, REAL_NODE_BLOCKERS, missing_smoke_blockers
+try:
+    from ..knowledge.entry_contract import OPTIONAL_ACCOUNTS_FIELDS
+    from ..workflows.group_registry import GROUP_QUESTION_ORDER
+    from ..workflows.group_registry import question_keys_for_group
+    from ..workflows.requirements import ENVIRONMENT_BLOCKERS, REAL_NODE_BLOCKERS, missing_smoke_blockers
+except ImportError:  # script execution with agent/ on sys.path
+    from knowledge.entry_contract import OPTIONAL_ACCOUNTS_FIELDS
+    from workflows.group_registry import GROUP_QUESTION_ORDER
+    from workflows.group_registry import question_keys_for_group
+    from workflows.requirements import ENVIRONMENT_BLOCKERS, REAL_NODE_BLOCKERS, missing_smoke_blockers
 
 
 OPTIONAL_ACCOUNTS_KEYS = tuple(field.key for field in OPTIONAL_ACCOUNTS_FIELDS if field.key != "accounts_device")

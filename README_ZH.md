@@ -9,15 +9,15 @@
 [![Shell Script](https://img.shields.io/badge/shell-bash-green.svg)](https://www.gnu.org/software/bash/)
 
 这是一个面向生产环境的多链节点 benchmark Agent 与压测框架，用于分析节点
-QPS、延迟、瓶颈、同步健康和每个 RPC method 的表现。Agent 可以把用户测试目标
-转换成可验证的 plan，执行 preflight，提交 job，跟踪 artifact，并基于证据解释结果。
+QPS、延迟、瓶颈、同步健康和每个 RPC method 的表现。Agent 控制面基于
+LangGraph Harness，可以把用户测试目标转换成可验证的 plan，执行 preflight，
+提交 job，跟踪 artifact，并基于证据解释结果。
 
 压测执行面仍然是确定性的：Vegeta、RPC proxy、监控 collector、fake-node、报告生成
-和归档是事实来源。面向用户的 Agent 运行时基于 Google ADK，需要配置真实模型；
-无凭据的离线检查只用于 CI 和开发测试。模型只能通过工具生成结构化 request、plan
-和解释，不能直接执行命令。
-Agent 必须使用 Google ADK 做自然语言理解、typed intent、专用 sub-agent 委派和
-tool orchestration；确定性工具和 validator 负责最终执行门禁。
+和归档是事实来源。面向用户的产品 workflow 由 LangGraph Harness 拥有：它负责
+checkpoint state、typed intent 路由、配置 group、fallback 顺序、validator gate 和
+执行决策。Google ADK 只是 Gemini/Google 能力的可选模型与工具 bridge，不拥有第二套
+benchmark wizard。模型只能把模糊自然语言解析成 typed Harness action，不能直接执行命令。
 
 ## 目录
 
@@ -46,7 +46,7 @@ tool orchestration；确定性工具和 validator 负责最终执行门禁。
 - 将自然语言 benchmark 目标转换成结构化、可验证的 plan。
 - 自动检测本地环境，只询问无法安全推断的缺失值。
 - 通过 Agent checklist 引导用户补齐缺失配置，而不是要求用户先理解所有变量。
-- 使用 ADK multi-agent orchestration，并通过确定性 tool 和 validator gate 约束执行。
+- 使用 LangGraph Harness workflow，并通过确定性 tool 和 validator gate 约束执行。
 - 进行风险评分、preflight，并在真实 benchmark 前要求用户明确确认。
 - 真实 benchmark 默认以 detached/background 方式执行，长时间压测不会因为终端断开而停止。
 - 使用同一个 output-dir 重新打开 Agent 时，会自动恢复最近一次 job 状态。
@@ -76,9 +76,9 @@ tool orchestration；确定性工具和 validator 负责最终执行门禁。
 ```text
 prompt 或 request
   -> AnyChain terminal shell，只负责稳定 I/O
-  -> ADK root coordinator
-  -> typed intent path
-  -> specialized sub-agent delegation
+  -> LangGraph Harness checkpointed workflow
+  -> typed LLM intent resolver
+  -> group workflow 和 fallback path
   -> deterministic tool and validator gates
   -> read-only discovery
   -> benchmark plan
@@ -289,8 +289,9 @@ chain、RPC URL、磁盘、机器类型等 benchmark 信息可以先不配置。
 
 ### 5. 启动 Agent
 
-启动 Agent。该命令会打开 AnyChain 产品终端。底层使用 Google ADK runtime
-能力，但不会把原始 `adk run` 终端 UI 暴露给用户：
+启动 Agent。该命令会打开 AnyChain 产品终端。LangGraph Harness 负责 workflow state、
+group 路由、校验和执行确认；Google ADK 只是可选模型/工具 bridge，不会把原始
+`adk run` 终端 UI 暴露给用户：
 
 ```bash
 ./bin/anychain-agent
@@ -606,7 +607,7 @@ provider，像 Greenfield billing REST API 这类不是 BSC/EVM JSON-RPC 的 API
 - [AI Assistant Operator Guide](AGENTS.md)
 - [配置指南](config/README.md)
 - [Agent 控制平面](agent/README.md)
-- [ADK Agent 架构](docs/zh/adk-agent-architecture.md)
+- [Agent 架构](docs/zh/adk-agent-architecture.md)
 - [AnyChain Agent AI 工作 Gate](docs/zh/anychain-agent-ai-work-gate.md)
 - [完整框架 Reference](docs/zh/framework-reference.md)
 - [框架流程与数据生命周期](docs/zh/framework-flow.md)

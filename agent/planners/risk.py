@@ -5,7 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from knowledge.gap_analyzer import analyze_capability_gap
+try:
+    from ..knowledge.gap_analyzer import analyze_capability_gap
+except ImportError:  # script execution with agent/ on sys.path
+    from knowledge.gap_analyzer import analyze_capability_gap
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]

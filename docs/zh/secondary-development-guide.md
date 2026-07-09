@@ -28,9 +28,10 @@ Agent 发起压测：
 
 ```text
 用户 prompt
--> ADK root coordinator
--> typed intent path
--> specialized sub-agent
+-> terminal I/O shell
+-> LangGraph Harness typed intent path
+-> group workflow and checkpoint state
+-> optional ADK compatibility bridge/tool call
 -> deterministic tool and validator gates
 -> benchmark plan
 -> preflight 与风险检查

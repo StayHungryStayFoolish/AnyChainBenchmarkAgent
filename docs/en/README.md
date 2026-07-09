@@ -1,7 +1,7 @@
 # English Documentation
 
 - [Framework Flow and Data Lifecycle](framework-flow.md)
-- [AnyChain ADK Agent Architecture](adk-agent-architecture.md)
+- [AnyChain Agent Architecture](adk-agent-architecture.md)
 - [AnyChain Agent AI Work Gate](anychain-agent-ai-work-gate.md)
 - [Module Guide](module-guide.md)
 - [Full Framework Reference](framework-reference.md)

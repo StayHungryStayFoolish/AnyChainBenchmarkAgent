@@ -1,8 +1,8 @@
 """Canonical group registry for the AnyChain Agent workflow.
 
 This module is intentionally pure data plus small lookup helpers. It is the
-source of truth for group order, field ownership, group question ids, and the
-ADK product-node mapping. It does not parse user text, mutate workflow state,
+source of truth for group order, field ownership, and group question ids used
+by the LangGraph Harness. It does not parse user text, mutate workflow state,
 or render terminal prompts.
 """
 

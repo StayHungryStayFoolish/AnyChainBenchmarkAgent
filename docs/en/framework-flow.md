@@ -498,7 +498,11 @@ flowchart LR
 The exporter:
 
 - reads `latest_metrics.json`, `block_height_monitor_cache.json`,
-  `bottleneck_status.json`, `qps_status.json`, and `proxy_method.csv`;
+  `bottleneck_status.json`, `qps_status.json`, `performance_latest.csv`,
+  and `proxy_method.csv`;
+- exposes sync-observe fields from the latest performance CSV row, including
+  MGas/s when available, execution metric status/source, node process CPU,
+  hottest thread/core CPU, CPU iowait, and block-height fields;
 - exposes a bounded Prometheus text-format snapshot;
 - filters per-method metrics to workload methods from the selected chain
   template;

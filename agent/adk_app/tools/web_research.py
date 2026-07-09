@@ -10,7 +10,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from llm.config import LLMConfig, load_llm_config
+try:
+    from ...llm.config import LLMConfig, load_llm_config
+except ImportError:  # script execution with agent/ on sys.path
+    from llm.config import LLMConfig, load_llm_config
 
 
 @dataclass(frozen=True)

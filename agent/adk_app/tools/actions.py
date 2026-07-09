@@ -6,9 +6,14 @@ from pathlib import Path
 from typing import Any
 import subprocess
 
-from runners.job_manager import resume_job as _resume_job
-from runners.job_manager import submit_job as _submit_job
-from planners.strategy_planner import write_json
+try:
+    from ...runners.job_manager import resume_job as _resume_job
+    from ...runners.job_manager import submit_job as _submit_job
+    from ...planners.strategy_planner import write_json
+except ImportError:  # script execution with agent/ on sys.path
+    from runners.job_manager import resume_job as _resume_job
+    from runners.job_manager import submit_job as _submit_job
+    from planners.strategy_planner import write_json
 
 from .read_only import _tool_result
 

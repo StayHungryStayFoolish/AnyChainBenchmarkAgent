@@ -14,10 +14,11 @@ If these rules conflict with an implementation shortcut, the rules win.
 
 ## Non-Negotiable Product Boundary
 
-AnyChain Agent is an ADK-based domain agent for blockchain node benchmarking.
-It must reduce user configuration burden and call deterministic benchmark
-tools safely. It is not a shell script wizard, not a keyword router, and not a
-collection of fallback demos.
+AnyChain Agent 是基于 LangGraph Harness 的区块链节点 benchmark domain agent。
+Harness 负责产品 workflow state、group routing、fallback ordering、validator
+gates 和 execution decisions。Google ADK 只是可选的 model/tool bridge，不是第二套
+benchmark wizard。Agent 必须降低用户配置负担，并安全调用确定性的 benchmark
+tools。它不是 shell script wizard，不是 keyword router，也不是 fallback demo 集合。
 
 The product loop is:
 
@@ -25,10 +26,9 @@ The product loop is:
 Understand -> Plan -> Ask -> Configure -> Validate -> Execute -> Observe -> Analyze -> Iterate
 ```
 
-ADK and the configured model own natural-language understanding, planning,
-question selection, and iteration. Repository tools own deterministic checks,
-configuration materialization, benchmark execution, evidence collection, and
-artifact-backed analysis.
+配置的模型负责把模糊自然语言理解为 typed Harness actions。LangGraph Harness
+负责 planning、group selection、question selection、fallback ordering 和 iteration。
+仓库工具负责确定性检查、配置物化、benchmark execution、证据采集和基于 artifact 的分析。
 
 ## Forbidden Patterns
 
@@ -36,11 +36,11 @@ Do not add or reintroduce:
 
 - business intent routing in terminal code through keyword lists, fuzzy matches,
   regex guesses, or language-specific phrase tables;
-- workflow shortcuts that bypass ADK sub-agents, typed tools, validators, user
+- workflow shortcuts that bypass LangGraph Harness groups, typed tools, validators, user
   confirmation, preflight, or smoke testing;
-- old non-ADK wizard/fallback logic for benchmark planning;
+- old non-Harness wizard/fallback logic for benchmark planning;
 - phrase-patching that rewrites model style instead of fixing instructions or
-  ADK workflow behavior;
+  Harness workflow behavior;
 - claims that an unsupported chain, RPC method, fixture, endpoint, or
   benchmark path works without evidence;
 - changes to `config/agent_config.sh` unless the user explicitly asks;
@@ -48,7 +48,8 @@ Do not add or reintroduce:
   or live benchmark archives.
 
 Stable terminal commands such as `help`, `doctor`, `jobs`, `status`, `logs`,
-`follow`, and `exit` are allowed. Business requests must go through ADK.
+`follow`, and `exit` are allowed. Business requests must go through the
+LangGraph Harness workflow.
 
 ## Required Agent Behavior
 
@@ -77,8 +78,9 @@ real `LOCAL_RPC_URL`, `MAINNET_RPC_URL`, chain changes, RPC mode, RPC methods,
 and weights.
 
 Users must be able to correct prior answers. If the user says a previous value
-was wrong, wants to go back, or changes the test target, ADK must update or
-revert workflow state, re-run validators, and ask the next blocking question.
+was wrong, wants to go back, or changes the test target, the Harness must
+update or revert workflow state, re-run validators, and ask the next blocking
+question.
 
 ## Required Configuration Gates
 
@@ -282,18 +284,27 @@ The Agent must do the following before execution:
 1. Keep the canonical `config/chains/<chain>.json` unchanged.
 2. Create or update a job-local runtime chain template override for the custom
    workload.
-3. Probe the endpoint with the proposed method and params. User-provided
+3. Classify user-provided method evidence before probing it. A pasted value may
+   be a JSON-RPC method name, JSON-RPC request, REST path, REST endpoint URL,
+   response sample, official documentation excerpt, or contradictory evidence.
+   The Agent must not treat URLs or REST documentation titles as JSON-RPC method
+   names.
+4. Probe the endpoint with the proposed method and params. User-provided
    request/response samples are evidence to verify, not facts to trust.
-4. Confirm the method shape can be represented by the current chain template
+5. Confirm the method shape can be represented by the current chain template
    schema: `param_formats`, `_meta.rest_paths`, or `param_spec`.
-5. If schema support is missing, stop and produce a coding handoff. Do not hide
+6. If schema support is missing, stop and produce a coding handoff. Do not hide
    schema failures behind generic benchmark errors.
-6. Record or generate method-specific fixture evidence for every active custom
+7. Record or generate method-specific fixture evidence for every active custom
    method.
-7. Validate workload weights. Mixed workload weights must sum to 100%. If the
+8. Validate workload weights. Mixed workload weights must sum to 100%. If the
    user fully replaces the default workload, remove default methods from the
    runtime override so target generation cannot send unwanted default requests.
-8. Run preflight and fake-node smoke before treating the custom method as usable
+9. After a method/schema probe passes, immediately ask whether the user wants to
+   add another custom method, finish with the current set, or change how the
+   custom methods apply to the workload. The Agent must not loop back to the
+   same schema-evidence question after a successful probe.
+10. Run preflight and fake-node smoke before treating the custom method as usable
    for the job.
 
 If any validation step fails, the Agent must show the failure reason, endpoint
@@ -376,12 +387,21 @@ route the turn into a two-step chain identity workflow and follow this sequence:
    endpoint. Probe the endpoint before trusting it. User-provided endpoints,
    request samples, response samples, and method documentation are evidence to
    verify, not facts to accept blindly.
-6. For each user-selected RPC method, validate the live request against the
-   endpoint, confirm the parameter schema can be expressed by the current chain
-   template schema (`param_formats`, `_meta.rest_paths`, or `param_spec`), and
-   record or generate method-specific fixture evidence. If request/response
-   samples conflict with live endpoint behavior or official docs, stop and ask
-   the user to correct the evidence.
+6. For each user-selected RPC method, classify the evidence first, then validate
+   the live request against the endpoint. JSON-RPC evidence must be probed as
+   JSON-RPC. REST path or REST documentation evidence must either match a REST
+   adapter flow or force the Agent to ask the user to switch protocol family;
+   it must not be sent as a JSON-RPC method string. Confirm the parameter schema
+   can be expressed by the current chain template schema (`param_formats`,
+   `_meta.rest_paths`, or `param_spec`), and record or generate method-specific
+   fixture evidence. If request/response samples conflict with live endpoint
+   behavior or official docs, stop and ask the user to correct the evidence.
+   After each method validates, ask whether to add another method or finish the
+   current method set. When the user finishes, ask how to apply the validated
+   methods: `single` uses one validated method and does not need weights;
+   `mixed` must list every participating validated method and require weights
+   whose total is exactly `100`. Do not silently reuse template defaults for a
+   new-chain job-local workload.
 7. If fixture recording, template validation, or fake-node smoke passes, the
    Agent may continue into the normal benchmark configuration flow and ask the
    remaining resource, workload, observability, preflight, and execution
@@ -494,14 +514,14 @@ Agent code changes must run the smallest relevant tests first. For broad Agent
 workflow changes, run:
 
 ```bash
-python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract
+python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract tests.test_agent_langgraph_harness
 python3 tools/check_agent_boundaries.py --root .
 python3 agent/cli.py adk-eval
 git diff --check
 ```
 
 When live model behavior is affected and a safe key is available, run the
-DeepSeek live acceptance matrices in an isolated environment. When benchmark
+LangGraph live CLI matrix in an isolated environment. When benchmark
 execution is affected, run fake-node smoke in Docker or an isolated Linux
 environment.
 
@@ -512,7 +532,7 @@ untested behavior as complete.
 
 Before finishing an Agent task, answer these internally:
 
-- Did the change preserve ADK-owned intent recognition?
+- Did the change preserve LangGraph Harness-owned intent routing and group state?
 - Did terminal code remain a stable I/O shell rather than a business router?
 - Did every new execution path pass through validators?
 - Can users override inferred values?

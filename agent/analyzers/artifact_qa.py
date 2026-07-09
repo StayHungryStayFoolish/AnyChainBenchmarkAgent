@@ -7,9 +7,14 @@ import json
 from pathlib import Path
 from typing import Any
 
-from analyzers.bottleneck_rules import diagnose_artifacts, format_diagnostics
-from analyzers.chart_explainer import explain_charts, format_chart_explanation
-from analyzers.execution_artifacts import diagnose_execution_artifacts
+try:
+    from .bottleneck_rules import diagnose_artifacts, format_diagnostics
+    from .chart_explainer import explain_charts, format_chart_explanation
+    from .execution_artifacts import diagnose_execution_artifacts
+except ImportError:  # script execution with agent/ on sys.path
+    from analyzers.bottleneck_rules import diagnose_artifacts, format_diagnostics
+    from analyzers.chart_explainer import explain_charts, format_chart_explanation
+    from analyzers.execution_artifacts import diagnose_execution_artifacts
 
 
 def answer_artifact_question(

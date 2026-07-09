@@ -5,9 +5,16 @@ from __future__ import annotations
 import importlib
 from typing import Any, Mapping
 
-from llm.config import load_agent_environment
-from knowledge.base import KnowledgeProvider, NoopKnowledgeProvider
-from knowledge.http_provider import HTTPKnowledgeProvider
+try:
+    from ..llm.config import load_agent_environment
+except ImportError:  # script execution with agent/ on sys.path
+    from llm.config import load_agent_environment
+try:
+    from .base import KnowledgeProvider, NoopKnowledgeProvider
+    from .http_provider import HTTPKnowledgeProvider
+except ImportError:  # script execution with agent/ on sys.path
+    from knowledge.base import KnowledgeProvider, NoopKnowledgeProvider
+    from knowledge.http_provider import HTTPKnowledgeProvider
 
 
 def load_knowledge_provider(env: Mapping[str, str] | None = None) -> KnowledgeProvider:

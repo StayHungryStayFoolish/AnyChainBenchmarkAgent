@@ -97,9 +97,9 @@ def extract_supported_chain_from_text(
     """Extract only exact supported chain scalar text.
 
     Natural-language phrases such as ``test bnb fake-node`` or
-    ``bnb greenfield`` are not parsed here. They must go through ADK/LLM and
-    typed workflow tools so unsupported-chain onboarding, clarification, and
-    endpoint gates remain in control.
+    ``bnb greenfield`` are not parsed here. They must go through the Harness
+    LLM intent resolver and typed workflow gates so unsupported-chain
+    onboarding, clarification, and endpoint validation remain in control.
     """
 
     lowered = str(text or "").strip().lower()

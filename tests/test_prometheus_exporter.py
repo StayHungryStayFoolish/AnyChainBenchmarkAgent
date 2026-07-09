@@ -69,6 +69,24 @@ def main() -> int:
             + "\n",
             encoding="utf-8",
         )
+        (logs_dir / "performance_latest.csv").write_text(
+            "\n".join(
+                [
+                    (
+                        "timestamp,cpu_iowait,local_block_height,mainnet_block_height,block_height_diff,"
+                        "freshness_gap_seconds,execution_mgas_per_sec,execution_gas_per_sec,"
+                        "execution_metric_source,execution_metric_status,node_process_pid,"
+                        "node_process_cpu_pct,node_thread_count,node_hottest_thread_name,"
+                        "node_hottest_thread_cpu_pct,node_hottest_thread_core,"
+                        "node_hottest_core_cpu_pct,node_cpu_concentration_top1_pct,"
+                        "node_cpu_concentration_top5_pct,node_cpu_status"
+                    ),
+                    "2026-06-11 12:00:00,1.5,100,105,5,2.5,12.25,12250000,client_metrics,ok,4242,188.5,64,geth,91.2,3,98.7,48.1,80.4,ok",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
         result = subprocess.run(
             [
@@ -104,6 +122,18 @@ def main() -> int:
             'blockchain_benchmark_rpc_method_errors_total{chain="solana",method="getAccountInfo",rpc_mode="mixed",status_class="5xx"} 1'
             in output
         )
+        assert 'blockchain_benchmark_artifact_performance_csv_present{chain="solana",rpc_mode="mixed"} 1' in output
+        assert 'blockchain_benchmark_execution_mgas_per_sec{chain="solana",rpc_mode="mixed"} 12.25' in output
+        assert 'blockchain_benchmark_execution_gas_per_sec{chain="solana",rpc_mode="mixed"} 1.225e+07' in output
+        assert (
+            'blockchain_benchmark_execution_metric_available{chain="solana",rpc_mode="mixed",source="client_metrics",status="ok"} 1'
+            in output
+        )
+        assert 'blockchain_benchmark_node_process_cpu_percent{chain="solana",rpc_mode="mixed"} 188.5' in output
+        assert 'blockchain_benchmark_node_hottest_thread_cpu_percent{chain="solana",rpc_mode="mixed"} 91.2' in output
+        assert 'blockchain_benchmark_cpu_iowait_percent{chain="solana",rpc_mode="mixed"} 1.5' in output
+        assert 'blockchain_benchmark_local_block_height{chain="solana",rpc_mode="mixed"} 100' in output
+        assert 'blockchain_benchmark_mainnet_block_height{chain="solana",rpc_mode="mixed"} 105' in output
         assert "method=\"getHealth\"" not in output
 
     print("✅ Prometheus exporter synthetic metrics test passed")

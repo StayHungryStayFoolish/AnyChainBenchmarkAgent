@@ -9,11 +9,18 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from knowledge.entry_contract import (
-    ENTRYPOINT_SCRIPTS,
-    dependency_names,
-    validate_mixed_weighted,
-)
+try:
+    from ..knowledge.entry_contract import (
+        ENTRYPOINT_SCRIPTS,
+        dependency_names,
+        validate_mixed_weighted,
+    )
+except ImportError:  # script execution with agent/ on sys.path
+    from knowledge.entry_contract import (
+        ENTRYPOINT_SCRIPTS,
+        dependency_names,
+        validate_mixed_weighted,
+    )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -23,6 +30,7 @@ def run_preflight(plan: dict[str, Any]) -> dict[str, Any]:
     warnings = []
 
     chain = plan.get("chain", "")
+    is_sync_observe = str(plan.get("workflow_type") or plan.get("run_mode") or "").strip().lower().replace("-", "_") == "sync_observe"
     checks.append(_check(
         "required_inputs_present",
         not plan.get("required_inputs"),
@@ -52,12 +60,12 @@ def run_preflight(plan: dict[str, Any]) -> dict[str, Any]:
         checks.append(_check("fake_node_fixtures_available", (fake_node_dir / "fixtures").is_dir(), str(fake_node_dir / "fixtures")))
 
     rpc_mode = plan.get("rpc_mode", "")
-    checks.append(_check("rpc_mode_valid", rpc_mode in {"single", "mixed"}, rpc_mode))
-    if rpc_mode == "mixed":
+    checks.append(_check("rpc_mode_valid", rpc_mode in {"single", "mixed"} or is_sync_observe, rpc_mode))
+    if rpc_mode == "mixed" and not is_sync_observe:
         ok, detail = validate_mixed_weighted(plan.get("chain_template_requirements", {}))
         checks.append(_check("mixed_weighted_total_valid", ok, detail))
 
-    if not plan.get("use_fake_node"):
+    if not plan.get("use_fake_node") and not is_sync_observe:
         local_rpc_url = plan.get("execution", {}).get("environment", {}).get("LOCAL_RPC_URL", "")
         checks.append(_check("local_rpc_url_valid", _valid_endpoint(local_rpc_url), local_rpc_url))
 

@@ -9,10 +9,16 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from planners.chain_template_requirements import inspect_chain_template
-from planners.config_checklist import build_configuration_checklist, missing_required_from_checklist
-from planners.risk import score_plan_risk
-from planners.config_questions import required_questions
+try:
+    from .chain_template_requirements import inspect_chain_template
+    from .config_checklist import build_configuration_checklist, missing_required_from_checklist
+    from .risk import score_plan_risk
+    from .config_questions import required_questions
+except ImportError:  # script execution with agent/ on sys.path
+    from planners.chain_template_requirements import inspect_chain_template
+    from planners.config_checklist import build_configuration_checklist, missing_required_from_checklist
+    from planners.risk import score_plan_risk
+    from planners.config_questions import required_questions
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -52,12 +58,14 @@ def write_json(path: str | Path, payload: dict[str, Any]) -> None:
 
 def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = None) -> dict[str, Any]:
     chain = (request.get("chain") or "").strip().lower()
+    workflow_type = _workflow_type(request)
+    is_sync_observe = workflow_type == "sync_observe"
     goal = request.get("goal") or "baseline"
-    strategy = _strategy_from_mode(request.get("benchmark_mode")) or GOAL_TO_STRATEGY.get(goal, "baseline")
+    strategy = "sync_observe" if is_sync_observe else (_strategy_from_mode(request.get("benchmark_mode")) or GOAL_TO_STRATEGY.get(goal, "baseline"))
     benchmark_mode = _benchmark_mode(strategy)
-    rpc_mode = request.get("rpc_mode") or "single"
-    use_fake_node = request.get("use_fake_node") if isinstance(request.get("use_fake_node"), bool) else None
-    qps = {**DEFAULT_QPS[strategy], **request.get("qps", {})}
+    rpc_mode = "sync_observe" if is_sync_observe else (request.get("rpc_mode") or "single")
+    use_fake_node = False if is_sync_observe else (request.get("use_fake_node") if isinstance(request.get("use_fake_node"), bool) else None)
+    qps = {} if is_sync_observe else {**DEFAULT_QPS[strategy], **request.get("qps", {})}
     confirmations = set(request.get("confirmations", []))
     assumed_values = dict(request.get("assumed_values") or {})
     assumed_for_smoke = bool(request.get("assumed_for_smoke"))
@@ -68,9 +76,9 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
     required_inputs = []
     if not chain:
         required_inputs.append("chain")
-    if use_fake_node is None:
+    if use_fake_node is None and not is_sync_observe:
         required_inputs.append("use_fake_node")
-    if use_fake_node is False and not request.get("local_rpc_url"):
+    if use_fake_node is False and not is_sync_observe and not request.get("local_rpc_url"):
         required_inputs.append("local_rpc_url")
     requires_confirmation = []
     if request.get("workload", {}).get("methods") and "mixed_weights_confirmation" not in confirmations:
@@ -78,20 +86,31 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
     if strategy == "stress" and "stress_execution_confirmation" not in confirmations:
         requires_confirmation.append("stress_execution")
 
-    command = ["./blockchain_node_benchmark.sh", _mode_flag(strategy), f"--{rpc_mode}"]
-    if use_fake_node is True:
-        command.append("--fake-node")
+    if is_sync_observe:
+        command = ["./blockchain_node_benchmark.sh", "--sync-observe"]
+        stop_condition = str(request.get("sync_observe_stop_condition") or "").strip()
+        if stop_condition == "until_synced":
+            command.append("--until-synced")
+        if stop_condition == "duration" and request.get("sync_observe_duration_seconds") is not None:
+            command.extend(["--duration", str(int(request.get("sync_observe_duration_seconds") or 0))])
+    else:
+        command = ["./blockchain_node_benchmark.sh", _mode_flag(strategy), f"--{rpc_mode}"]
+        if use_fake_node is True:
+            command.append("--fake-node")
 
-    qps_prefix = _qps_env_prefix(strategy)
+    qps_prefix = _qps_env_prefix(strategy) if not is_sync_observe else "SYNC_OBSERVE"
     env = {
         "BLOCKCHAIN_NODE": chain,
         "RPC_MODE": rpc_mode,
         "LOCAL_RPC_URL": request.get("local_rpc_url", ""),
         "MAINNET_RPC_URL": request.get("mainnet_rpc_url", ""),
-        f"{qps_prefix}_INITIAL_QPS": str(qps["initial"]),
-        f"{qps_prefix}_MAX_QPS": str(qps["max"]),
-        f"{qps_prefix}_QPS_STEP": str(qps["step"]),
-        f"{qps_prefix}_DURATION": str(qps["duration_seconds"]),
+        f"{qps_prefix}_INITIAL_QPS": str(qps.get("initial", "")),
+        f"{qps_prefix}_MAX_QPS": str(qps.get("max", "")),
+        f"{qps_prefix}_QPS_STEP": str(qps.get("step", "")),
+        f"{qps_prefix}_DURATION": str(qps.get("duration_seconds", "")),
+        "SYNC_OBSERVE_MODE": str(is_sync_observe).lower(),
+        "SYNC_OBSERVE_STOP_CONDITION": str(request.get("sync_observe_stop_condition", "")),
+        "SYNC_OBSERVE_DURATION": str(request.get("sync_observe_duration_seconds", "")),
         "OBSERVABILITY_STACK_ENABLED": str(
             bool(request.get("observability", {}).get("enabled", False))
         ).lower(),
@@ -171,6 +190,8 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
         "chain": chain,
         "strategy": strategy,
         "benchmark_mode": benchmark_mode,
+        "workflow_type": workflow_type,
+        "run_mode": workflow_type,
         "goal": goal,
         "rpc_mode": rpc_mode,
         "use_fake_node": use_fake_node,
@@ -201,6 +222,10 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
         "advanced_defaults": {
             "qps": qps,
             "observability": request.get("observability", {"enabled": False, "mode": "local"}),
+            "sync_observe": {
+                "stop_condition": request.get("sync_observe_stop_condition", ""),
+                "duration_seconds": request.get("sync_observe_duration_seconds", ""),
+            },
         },
         "execution": {
             "working_dir": str(REPO_ROOT),
@@ -268,7 +293,14 @@ def _strategy_from_mode(mode: Any) -> str:
     return ""
 
 
+def _workflow_type(request: dict[str, Any]) -> str:
+    text = str(request.get("workflow_type") or request.get("run_mode") or "").strip().lower().replace("-", "_")
+    return "sync_observe" if text in {"sync_observe", "sync", "observe_sync"} else "rpc_benchmark"
+
+
 def _benchmark_mode(strategy: str) -> str:
+    if strategy == "sync_observe":
+        return "sync_observe"
     if strategy == "smoke":
         return "quick"
     if strategy == "stress":

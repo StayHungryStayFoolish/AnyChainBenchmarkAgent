@@ -18,10 +18,10 @@ If these rules conflict with an implementation shortcut, the rules win.
 
 Do not change Agent workflow code until the task is documented.
 
-For any change that affects Agent behavior, ADK prompts, sub-agent routing,
-decision tree branches, terminal interaction, workflow state, benchmark
-execution, validators, runner lifecycle, fake-node smoke, endpoint validation,
-or onboarding:
+For any change that affects Agent behavior, Harness prompts, LLM routing,
+workflow branches, terminal interaction, workflow state, benchmark execution,
+validators, runner lifecycle, fake-node smoke, endpoint validation, or
+onboarding:
 
 1. Read `AI_CODING_GUIDE.md`, this file,
    `docs/en/adk-agent-architecture.md`, and the current reviewed task/design
@@ -48,8 +48,8 @@ Forbidden shortcuts:
 
 If a test or live CLI run exposes a new failure, stop and classify it in the
 task document before coding the fix. The fix must address the root cause in
-ADK workflow, typed state, deterministic tools, validators, or terminal I/O
-boundaries, not just the exact wording of the failed prompt.
+LangGraph Harness workflow, typed state, deterministic tools, validators, or
+terminal I/O boundaries, not just the exact wording of the failed prompt.
 
 The classification must also state why a local patch is not the right product
 fix. If the selected implementation uses a local patch anyway, the task
@@ -72,9 +72,12 @@ problem is:
 
 ## Non-Negotiable Product Boundary
 
-AnyChain Agent is an ADK-based domain agent for blockchain node benchmarking.
-It must reduce user configuration burden and call deterministic benchmark
-tools safely. It is not a shell script wizard, not a keyword router, and not a
+AnyChain Agent is a LangGraph Harness-based domain agent for blockchain node
+benchmarking. The Harness owns product workflow state, group routing,
+fallback ordering, validation gates, and execution decisions. Google ADK is an
+optional model/tool bridge, not a second benchmark wizard. The Agent must
+reduce user configuration burden and call deterministic benchmark tools
+safely. It is not a shell script wizard, not a keyword router, and not a
 collection of fallback demos.
 
 The product loop is:
@@ -83,10 +86,11 @@ The product loop is:
 Understand -> Plan -> Ask -> Configure -> Validate -> Execute -> Observe -> Analyze -> Iterate
 ```
 
-ADK and the configured model own natural-language understanding, planning,
-question selection, and iteration. Repository tools own deterministic checks,
-configuration materialization, benchmark execution, evidence collection, and
-artifact-backed analysis.
+The configured model helps interpret ambiguous natural-language turns into
+typed Harness actions. LangGraph Harness owns planning, group selection,
+question selection, fallback ordering, and iteration. Repository tools own
+deterministic checks, configuration materialization, benchmark execution,
+evidence collection, and artifact-backed analysis.
 
 ## Decision Tree And Y/N Contract
 
@@ -124,11 +128,11 @@ Do not add or reintroduce:
 
 - business intent routing in terminal code through keyword lists, fuzzy matches,
   regex guesses, or language-specific phrase tables;
-- workflow shortcuts that bypass ADK sub-agents, typed tools, validators, user
+- workflow shortcuts that bypass LangGraph Harness groups, typed tools, validators, user
   confirmation, preflight, or smoke testing;
-- old non-ADK wizard/fallback logic for benchmark planning;
+- old non-Harness wizard/fallback logic for benchmark planning;
 - phrase-patching that rewrites model style instead of fixing instructions or
-  ADK workflow behavior;
+  Harness workflow behavior;
 - claims that an unsupported chain, RPC method, fixture, endpoint, or
   benchmark path works without evidence;
 - changes to `config/agent_config.sh` unless the user explicitly asks;
@@ -136,7 +140,8 @@ Do not add or reintroduce:
   or live benchmark archives.
 
 Stable terminal commands such as `help`, `doctor`, `jobs`, `status`, `logs`,
-`follow`, and `exit` are allowed. Business requests must go through ADK.
+`follow`, and `exit` are allowed. Business requests must go through LangGraph
+Harness routing and group workflows.
 
 ## Legacy-Code Pollution Gate
 
@@ -146,8 +151,8 @@ imported.
 
 Allowed retained code must fit one of these roles:
 
-- ADK runtime and sub-agent construction;
-- ADK function-tool wrappers;
+- LangGraph Harness runtime, group workflow, checkpoint, and typed event code;
+- ADK compatibility bridge and function-tool wrappers;
 - deterministic AnyChain planners, validators, runners, analyzers, discovery,
   onboarding, or knowledge providers;
 - terminal I/O, exact shell commands, Ctrl+C/log-follow handling, dependency
@@ -156,7 +161,7 @@ Allowed retained code must fit one of these roles:
 
 Remove or migrate:
 
-- old non-ADK benchmark wizards;
+- old non-Harness benchmark wizards;
 - fallback custom brains or mock agents;
 - terminal keyword/fuzzy/regex business routing;
 - phrase-repair loops that try to hide bad planning;
@@ -168,9 +173,9 @@ If useful deterministic behavior exists inside obsolete code, move that
 behavior to the correct planner, validator, runner, analyzer, onboarding, or
 ADK tool wrapper. The old conversational wrapper should not remain.
 
-The Agent is not product-ready while legacy code can bypass ADK-owned intent,
-typed pending questions, deterministic validators, preflight, smoke, or user
-approval gates.
+The Agent is not product-ready while legacy code can bypass LangGraph Harness
+intent routing, typed pending questions, deterministic validators, preflight,
+smoke, or user approval gates.
 
 The current high-risk areas that must be reviewed before more Agent code
 repair are:
@@ -178,14 +183,14 @@ repair are:
 - `agent/adk_app/terminal_presenter.py` and
   `agent/adk_app/terminal_contract.py`: must not exist. Broad LLM rewrite,
   regex phrase-repair, and standalone terminal prompt wrapper behavior belong
-  nowhere in the product path. Product behavior should be fixed in ADK prompts,
-  typed state, tools, callbacks, and validators.
+  nowhere in the product path. Product behavior should be fixed in Harness
+  prompts/instructions, typed state, tools, callbacks, and validators.
 - `agent/terminal/repl.py`: may keep exact terminal controls and safe I/O, but
   must not contain benchmark-domain intent routing or field extraction.
-- `agent/workflows/conversation_state.py`: must become strong enough to carry
-  the decision tree's typed pending questions and branch transitions. A generic
-  prompt/id field is not sufficient for product-grade Y/N, numbered-choice,
-  manual-value, URL, disk, and rollback behavior.
+- `agent/harness/`: must remain the single product workflow runtime. LangGraph
+  checkpoint state, typed pending questions, group transitions, validators,
+  rollback/jump behavior, and next-blocking-group selection belong here.
+  Retired file-backed workflow state machines must not return.
 - `agent/adk_app/workflow/schemas.py`: must not stay limited to a thin intent
   enum if workflow transitions depend on richer structured state.
 - `agent/tools/schema.py`, `agent/tools/executor.py`, and
@@ -203,7 +208,7 @@ Preserve deterministic domain tools unless a concrete replacement exists:
 `agent/discovery`, `agent/diagnostics`, `agent/planners`, `agent/validators`,
 `agent/runners`, `agent/analyzers`, `agent/onboarding`, and `agent/knowledge`
 are the benchmark engine's domain surface. The repair task is to wire them into
-ADK correctly, not to replace them with model prose.
+the Harness correctly, not to replace them with model prose.
 
 Do not use "isolate legacy code" as a cleanup outcome. Isolation is acceptable
 for Python environments, smoke output directories, generated job artifacts, or
@@ -240,8 +245,9 @@ real `LOCAL_RPC_URL`, `MAINNET_RPC_URL`, chain changes, RPC mode, RPC methods,
 and weights.
 
 Users must be able to correct prior answers. If the user says a previous value
-was wrong, wants to go back, or changes the test target, ADK must update or
-revert workflow state, re-run validators, and ask the next blocking question.
+was wrong, wants to go back, or changes the test target, the Harness must
+update or revert workflow state, re-run validators, and ask the next blocking
+question.
 
 ## Required Configuration Gates
 
@@ -454,18 +460,27 @@ The Agent must do the following before execution:
 1. Keep the canonical `config/chains/<chain>.json` unchanged.
 2. Create or update a job-local runtime chain template override for the custom
    workload.
-3. Probe the endpoint with the proposed method and params. User-provided
+3. Classify user-provided method evidence before probing it. A pasted value may
+   be a JSON-RPC method name, JSON-RPC request, REST path, REST endpoint URL,
+   response sample, official documentation excerpt, or contradictory evidence.
+   The Agent must not treat URLs or REST documentation titles as JSON-RPC method
+   names.
+4. Probe the endpoint with the proposed method and params. User-provided
    request/response samples are evidence to verify, not facts to trust.
-4. Confirm the method shape can be represented by the current chain template
+5. Confirm the method shape can be represented by the current chain template
    schema: `param_formats`, `_meta.rest_paths`, or `param_spec`.
-5. If schema support is missing, stop and produce a coding handoff. Do not hide
+6. If schema support is missing, stop and produce a coding handoff. Do not hide
    schema failures behind generic benchmark errors.
-6. Record or generate method-specific fixture evidence for every active custom
+7. Record or generate method-specific fixture evidence for every active custom
    method.
-7. Validate workload weights. Mixed workload weights must sum to 100%. If the
+8. Validate workload weights. Mixed workload weights must sum to 100%. If the
    user fully replaces the default workload, remove default methods from the
    runtime override so target generation cannot send unwanted default requests.
-8. Run preflight and fake-node smoke before treating the custom method as usable
+9. After a method/schema probe passes, immediately ask whether the user wants to
+   add another custom method, finish with the current set, or change how the
+   custom methods apply to the workload. The Agent must not loop back to the
+   same schema-evidence question after a successful probe.
+10. Run preflight and fake-node smoke before treating the custom method as usable
    for the job.
 
 If any validation step fails, the Agent must show the failure reason, endpoint
@@ -548,12 +563,21 @@ route the turn into a two-step chain identity workflow and follow this sequence:
    endpoint. Probe the endpoint before trusting it. User-provided endpoints,
    request samples, response samples, and method documentation are evidence to
    verify, not facts to accept blindly.
-6. For each user-selected RPC method, validate the live request against the
-   endpoint, confirm the parameter schema can be expressed by the current chain
-   template schema (`param_formats`, `_meta.rest_paths`, or `param_spec`), and
-   record or generate method-specific fixture evidence. If request/response
-   samples conflict with live endpoint behavior or official docs, stop and ask
-   the user to correct the evidence.
+6. For each user-selected RPC method, classify the evidence first, then validate
+   the live request against the endpoint. JSON-RPC evidence must be probed as
+   JSON-RPC. REST path or REST documentation evidence must either match a REST
+   adapter flow or force the Agent to ask the user to switch protocol family;
+   it must not be sent as a JSON-RPC method string. Confirm the parameter schema
+   can be expressed by the current chain template schema (`param_formats`,
+   `_meta.rest_paths`, or `param_spec`), and record or generate method-specific
+   fixture evidence. If request/response samples conflict with live endpoint
+   behavior or official docs, stop and ask the user to correct the evidence.
+   After each method validates, ask whether to add another method or finish the
+   current method set. When the user finishes, ask how to apply the validated
+   methods: `single` uses one validated method and does not need weights;
+   `mixed` must list every participating validated method and require weights
+   whose total is exactly `100`. Do not silently reuse template defaults for a
+   new-chain job-local workload.
 7. If fixture recording, template validation, or fake-node smoke passes, the
    Agent may continue into the normal benchmark configuration flow and ask the
    remaining resource, workload, observability, preflight, and execution
@@ -666,16 +690,26 @@ Agent code changes must run the smallest relevant tests first. For broad Agent
 workflow changes, run:
 
 ```bash
-python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract
+python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract tests.test_agent_langgraph_harness
 python3 tools/check_agent_boundaries.py --root .
 python3 agent/cli.py adk-eval
 git diff --check
 ```
 
 When live model behavior is affected and a safe key is available, run the
-DeepSeek live acceptance matrices in an isolated environment. When benchmark
+LangGraph live CLI matrix in an isolated environment. When benchmark
 execution is affected, run fake-node smoke in Docker or an isolated Linux
 environment.
+
+For broad Agent workflow, group-state, routing, or Harness changes, the
+LangGraph live CLI matrix is not sufficient by itself. Run a dual-AI chaos
+session where the real `./bin/anychain-agent` CLI uses the configured live model
+and Codex acts as the user simulator, choosing each next turn dynamically from
+the Agent's latest response. The transcript must include real user-style
+interruptions, backtracking, group jumps, language switching, pasted
+configuration/evidence, custom RPC cases, unknown-chain cases, resume behavior,
+and final review/preflight/smoke paths. If the full transcript is not reviewed,
+do not claim product readiness.
 
 If a boundary cannot be tested locally, report it as untested. Do not describe
 untested behavior as complete.
@@ -684,7 +718,7 @@ untested behavior as complete.
 
 Before finishing an Agent task, answer these internally:
 
-- Did the change preserve ADK-owned intent recognition?
+- Did the change preserve LangGraph Harness-owned intent routing and group state?
 - Did terminal code remain a stable I/O shell rather than a business router?
 - Did every new execution path pass through validators?
 - Can users override inferred values?

@@ -138,7 +138,10 @@ flowchart TD
 ## 可选 Prometheus/Grafana 流程
 
 Prometheus/Grafana 默认关闭。启用后，exporter 只读取已有运行产物，不查询区块链
-RPC，也不写 benchmark 状态。
+RPC，也不写 benchmark 状态。它会读取 runtime JSON、`performance_latest.csv`
+和 `proxy_method.csv`；在 sync-observe 模式下，会暴露 MGas/s（如果节点
+metrics 提供）、execution metric source/status、节点进程 CPU、热点线程/核心
+CPU、CPU iowait 和区块高度字段。
 
 ```mermaid
 flowchart LR

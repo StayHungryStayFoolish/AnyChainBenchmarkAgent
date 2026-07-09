@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from onboarding.chain_onboarding import generate_onboarding_package
+try:
+    from ..onboarding.chain_onboarding import generate_onboarding_package
+except ImportError:  # script execution with agent/ on sys.path
+    from onboarding.chain_onboarding import generate_onboarding_package
 
 
 def build_onboarding_handoff(

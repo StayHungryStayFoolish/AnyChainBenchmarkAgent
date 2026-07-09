@@ -1,7 +1,8 @@
 """Exact terminal job commands.
 
 Natural-language job questions must stay outside this module and flow through
-ADK. This module only handles stable shell-like terminal commands.
+the LangGraph Harness. This module only handles stable shell-like terminal
+commands.
 """
 
 from __future__ import annotations
@@ -10,8 +11,12 @@ import time
 from pathlib import Path
 from typing import Protocol
 
-from runners.job_manager import get_job, list_jobs, tail_job_log
-from terminal.language import t
+try:
+    from ..runners.job_manager import get_job, list_jobs, tail_job_log
+    from .language import t
+except ImportError:  # product script adds agent/ to sys.path
+    from runners.job_manager import get_job, list_jobs, tail_job_log
+    from terminal.language import t
 
 
 class JobCommandState(Protocol):

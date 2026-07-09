@@ -7,10 +7,18 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from discovery.environment import discover_environment
-from knowledge.framework_capabilities import load_framework_capabilities
-from llm.config import load_agent_environment, load_llm_config
-from llm.google_auth import credential_plan
+try:
+    from ..discovery.environment import discover_environment
+    from ..knowledge.framework_capabilities import load_framework_capabilities
+except ImportError:  # script execution with agent/ on sys.path
+    from discovery.environment import discover_environment
+    from knowledge.framework_capabilities import load_framework_capabilities
+try:
+    from ..llm.config import load_agent_environment, load_llm_config
+    from ..llm.google_auth import credential_plan
+except ImportError:  # script execution with agent/ on sys.path
+    from llm.config import load_agent_environment, load_llm_config
+    from llm.google_auth import credential_plan
 
 
 def run_doctor(discovery: dict[str, Any] | None = None) -> dict[str, Any]:

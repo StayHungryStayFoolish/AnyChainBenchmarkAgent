@@ -221,6 +221,14 @@ PROMETHEUS_PORT=9091
 GRAFANA_PORT=3001
 ```
 
+Exporter 是只读的，会读取 runtime JSON 和
+`current/logs/performance_latest.csv`，所以普通 RPC benchmark 和
+`sync-observe` 使用同一个 `/metrics` 入口。`sync-observe` 下会暴露区块高度、
+节点 metrics 提供的 MGas/s 或 gas/s、execution metric source/status、节点进程
+CPU、热点线程/核心 CPU、CPU iowait，以及现有磁盘、网络、系统指标。如果客户端
+没有暴露 execution gas 指标，MGas/s 不会被伪造，`execution_metric_available`
+会通过 source/status label 说明不可用状态。
+
 也可以手动启动或停止：
 
 ```bash

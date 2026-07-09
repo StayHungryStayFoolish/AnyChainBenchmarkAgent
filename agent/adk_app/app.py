@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .instructions import ADK_MIGRATION_BOUNDARY, ROOT_INSTRUCTION
+from .instructions import ADK_BRIDGE_BOUNDARY, ADK_COMPATIBILITY_INSTRUCTION
 from .compat import adk_feature_report
 from .models import adk_status
 from .runner_bridge import runner_bridge_status
@@ -17,8 +17,8 @@ def status_payload() -> dict:
         "adk": status,
         "features": adk_feature_report().get("features", {}),
         "runner": runner_status,
-        "root_instruction_present": bool(ROOT_INSTRUCTION),
-        "migration_boundary": ADK_MIGRATION_BOUNDARY,
+        "bridge_instruction_present": bool(ADK_COMPATIBILITY_INSTRUCTION),
+        "bridge_boundary": ADK_BRIDGE_BOUNDARY,
         "next_actions": [
             "install google-adk in an isolated environment",
             "configure a real model provider in config/agent_config.sh",

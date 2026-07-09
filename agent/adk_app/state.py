@@ -5,7 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from runners.job_manager import list_jobs, resume_job
+try:
+    from ..runners.job_manager import list_jobs, resume_job
+except ImportError:  # script execution with agent/ on sys.path
+    from runners.job_manager import list_jobs, resume_job
 
 
 def load_startup_state(

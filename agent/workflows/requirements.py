@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from knowledge.entry_contract import REAL_NODE_ENDPOINT_FIELDS, runtime_baseline_keys
+try:
+    from ..knowledge.entry_contract import REAL_NODE_ENDPOINT_FIELDS, runtime_baseline_keys
+except ImportError:  # script execution with agent/ on sys.path
+    from knowledge.entry_contract import REAL_NODE_ENDPOINT_FIELDS, runtime_baseline_keys
 
 COMMON_BLOCKERS = (
     "chain",

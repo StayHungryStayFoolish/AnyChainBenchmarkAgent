@@ -241,6 +241,15 @@ PROMETHEUS_PORT=9091
 GRAFANA_PORT=3001
 ```
 
+The exporter is read-only. It reads runtime JSON plus
+`current/logs/performance_latest.csv`, so the same endpoint works for normal
+RPC benchmarks and `sync-observe`. In `sync-observe`, it exposes block-height
+progress, execution MGas/s/gas/s when the node client reports it, execution
+metric status/source, node process CPU, hottest thread/core CPU, CPU iowait,
+and the existing disk/network/system gauges. If the client does not expose
+execution gas metrics, the MGas/s gauge is omitted and
+`execution_metric_available` is emitted with the source/status labels.
+
 You can also start or stop it manually:
 
 ```bash

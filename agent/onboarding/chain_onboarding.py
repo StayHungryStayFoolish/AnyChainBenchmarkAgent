@@ -4,9 +4,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from knowledge.gap_analyzer import analyze_capability_gap
-from onboarding.families import SUPPORTED_FAMILIES
-from onboarding.quality_gate import coding_brief, onboarding_quality_gate
+try:
+    from ..knowledge.gap_analyzer import analyze_capability_gap
+    from .families import SUPPORTED_FAMILIES
+    from .quality_gate import coding_brief, onboarding_quality_gate
+except ImportError:  # script execution with agent/ on sys.path
+    from knowledge.gap_analyzer import analyze_capability_gap
+    from onboarding.families import SUPPORTED_FAMILIES
+    from onboarding.quality_gate import coding_brief, onboarding_quality_gate
 
 
 def generate_onboarding_package(

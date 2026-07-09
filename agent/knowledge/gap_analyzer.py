@@ -5,7 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from knowledge.framework_capabilities import load_framework_capabilities
+try:
+    from .framework_capabilities import load_framework_capabilities
+except ImportError:  # script execution with agent/ on sys.path
+    from knowledge.framework_capabilities import load_framework_capabilities
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]

@@ -9,7 +9,7 @@
 - [二次开发指南](secondary-development-guide.md)
 - [GitHub PR Gate 与分支保护](github-pr-gates.md)
 - [GitHub PR 提交流程](github-pr-workflow.md)
-- [AnyChain ADK Agent 架构](adk-agent-architecture.md)
+- [AnyChain Agent 架构](adk-agent-architecture.md)
 - [AnyChain Agent AI 工作 Gate](anychain-agent-ai-work-gate.md)
 
 中英文 docs 应尽量保持长期用户文档内容一致。面向 AI coding agent 和维护者的工程

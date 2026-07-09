@@ -5,24 +5,44 @@ from __future__ import annotations
 from typing import Any
 import subprocess
 
-from analyzers.artifact_qa import answer_artifact_question as _answer_artifact_question
-from analyzers.bottleneck_rules import diagnose_artifacts as _diagnose_artifacts
-from analyzers.result_analyzer import analyze_job
-from diagnostics.doctor import run_doctor as _run_doctor
-from discovery.environment import discover_environment as _discover_environment
-from knowledge.framework_capabilities import load_framework_capabilities as _load_framework_capabilities
-from knowledge.framework_context import load_framework_context as _load_framework_context
-from knowledge.framework_index import load_or_build_framework_index as _load_or_build_framework_index
-from knowledge.entry_contract import (
-    ENTRYPOINT_PHASES,
-    OPTIONAL_ACCOUNTS_FIELDS,
-    REAL_NODE_ENDPOINT_FIELDS,
-    RUNTIME_BASELINE_FIELDS,
-    dependency_names,
-    required_keys_for_target,
-)
-from knowledge.loader import load_knowledge_provider, provider_status
-from runners.job_manager import get_job, list_jobs, resume_job, tail_job_log as _tail_job_log
+try:
+    from ...analyzers.artifact_qa import answer_artifact_question as _answer_artifact_question
+    from ...analyzers.bottleneck_rules import diagnose_artifacts as _diagnose_artifacts
+    from ...analyzers.result_analyzer import analyze_job
+    from ...diagnostics.doctor import run_doctor as _run_doctor
+    from ...discovery.environment import discover_environment as _discover_environment
+    from ...knowledge.framework_capabilities import load_framework_capabilities as _load_framework_capabilities
+    from ...knowledge.framework_context import load_framework_context as _load_framework_context
+    from ...knowledge.framework_index import load_or_build_framework_index as _load_or_build_framework_index
+    from ...knowledge.entry_contract import (
+        ENTRYPOINT_PHASES,
+        OPTIONAL_ACCOUNTS_FIELDS,
+        REAL_NODE_ENDPOINT_FIELDS,
+        RUNTIME_BASELINE_FIELDS,
+        dependency_names,
+        required_keys_for_target,
+    )
+    from ...knowledge.loader import load_knowledge_provider, provider_status
+    from ...runners.job_manager import get_job, list_jobs, resume_job, tail_job_log as _tail_job_log
+except ImportError:  # script execution with agent/ on sys.path
+    from analyzers.artifact_qa import answer_artifact_question as _answer_artifact_question
+    from analyzers.bottleneck_rules import diagnose_artifacts as _diagnose_artifacts
+    from analyzers.result_analyzer import analyze_job
+    from diagnostics.doctor import run_doctor as _run_doctor
+    from discovery.environment import discover_environment as _discover_environment
+    from knowledge.framework_capabilities import load_framework_capabilities as _load_framework_capabilities
+    from knowledge.framework_context import load_framework_context as _load_framework_context
+    from knowledge.framework_index import load_or_build_framework_index as _load_or_build_framework_index
+    from knowledge.entry_contract import (
+        ENTRYPOINT_PHASES,
+        OPTIONAL_ACCOUNTS_FIELDS,
+        REAL_NODE_ENDPOINT_FIELDS,
+        RUNTIME_BASELINE_FIELDS,
+        dependency_names,
+        required_keys_for_target,
+    )
+    from knowledge.loader import load_knowledge_provider, provider_status
+    from runners.job_manager import get_job, list_jobs, resume_job, tail_job_log as _tail_job_log
 
 
 def discover_environment() -> dict[str, Any]:

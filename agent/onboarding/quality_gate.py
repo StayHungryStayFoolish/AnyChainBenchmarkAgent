@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from onboarding.families import SUPPORTED_FAMILIES
+try:
+    from .families import SUPPORTED_FAMILIES
+except ImportError:  # script execution with agent/ on sys.path
+    from onboarding.families import SUPPORTED_FAMILIES
 
 
 REQUIRED_CHAIN_EVIDENCE = [

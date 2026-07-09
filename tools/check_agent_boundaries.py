@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Guard AnyChain Agent against non-ADK routing regressions.
+"""Guard AnyChain Agent against non-Harness routing regressions.
 
 This check intentionally covers only mechanical boundaries. It does not judge
 LLM quality; live model matrices do that. Keep this script small and targeted.
@@ -20,6 +20,20 @@ LEGACY_AGENT_FILES = [
     "agent/workflows/planning_bridge.py",
     "agent/workflows/state.py",
     "agent/adk_app/terminal_contract.py",
+    "agent/adk_app/callbacks.py",
+    "agent/adk_app/agents/domain.py",
+    "agent/adk_app/tools/workflow_state.py",
+    "agent/adk_app/workflow/product_context.py",
+    "agent/workflows/conversation_state.py",
+    "agent/workflows/transition_executor.py",
+    "agent/terminal/input_classifier.py",
+    "agent/terminal/pending_answers.py",
+    "tests/agent_live/run_live_matrix.py",
+    "tests/agent_live/run_live_pty_conversation.py",
+    "tests/agent_live/agent_intent_smoke_scenarios.json",
+    "tests/agent_live/agent_product_acceptance_scenarios.json",
+    "tests/agent_live/agent_chaos_conversation_scenarios.json",
+    "tests/agent_live/agent_edge_acceptance_scenarios.json",
 ]
 
 TERMINAL_FORBIDDEN = [
@@ -29,9 +43,19 @@ TERMINAL_FORBIDDEN = [
     "planning_bridge",
     "terminal.responder",
     "request_answers",
+    "runner_bridge",
+    "workflows.conversation_state",
+    "workflows.transition_executor",
 ]
 
 RUNNER_BRIDGE_FORBIDDEN = [
+    "build_terminal_turn_prompt",
+    "build_root_agent",
+    "workflow_tool_session",
+    "workflows.conversation_state",
+    "google.genai",
+    "run_async(",
+    "state_delta",
     "terminal_presenter",
     "present_terminal_text",
     "_run_with_runner_retry",
@@ -51,6 +75,68 @@ WORKFLOW_TOOL_FORBIDDEN = [
     "process_openers",
     "_LEADING_PROCESS",
 ]
+
+ADK_ROOT_FORBIDDEN = [
+    "callbacks",
+    "build_domain_agents",
+    "before_tool_callback",
+    "after_model_callback",
+    "sub_agents",
+    "ROOT_INSTRUCTION",
+]
+
+ADK_REGISTRY_FORBIDDEN = [
+    "workflow_state",
+    "get_workflow_state_tools",
+]
+
+ADK_DIAGNOSTIC_FILES = {
+    "agent/adk_app/runtime.py": [
+        "AnyChainGraphRuntime",
+        "process_turn",
+        "agent.harness",
+        "harness.graph",
+        "harness.groups",
+    ],
+    "agent/adk_app/workflow/native_smoke.py": [
+        "AnyChainGraphRuntime",
+        "process_turn",
+        "agent.harness",
+        "harness.graph",
+        "harness.groups",
+    ],
+    "agent/adk_app/workflow/schemas.py": [
+        "AnyChainGraphRuntime",
+        "process_turn",
+        "agent.harness",
+        "harness.graph",
+        "harness.groups",
+        "pending_question",
+        "confirmed_config",
+        "action_queue",
+    ],
+}
+
+PURE_METADATA_FILES = {
+    "agent/workflows/group_registry.py": [
+        "provider_from_config",
+        "LLMRequest",
+        "PendingQuestion",
+        "AgentGraphState",
+        "input(",
+        "print(",
+        "subprocess.",
+    ],
+    "agent/workflows/requirements.py": [
+        "provider_from_config",
+        "LLMRequest",
+        "PendingQuestion",
+        "AgentGraphState",
+        "input(",
+        "print(",
+        "subprocess.",
+    ],
+}
 
 PRODUCT_TEST_FORBIDDEN = [
     "removes_leading_process_narration",
@@ -105,6 +191,36 @@ def main() -> int:
         for needle in WORKFLOW_TOOL_FORBIDDEN:
             if needle in text:
                 failures.append(f"workflow-state tools must not contain output phrase-repair marker {needle!r}: {workflow_tools}")
+
+    adk_root = root / "agent" / "adk_app" / "root_agent.py"
+    if adk_root.exists():
+        text = adk_root.read_text(encoding="utf-8", errors="replace")
+        for needle in ADK_ROOT_FORBIDDEN:
+            if needle in text:
+                failures.append(f"ADK root agent must not expose retired workflow control marker {needle!r}: {adk_root}")
+
+    adk_registry = root / "agent" / "adk_app" / "tools" / "registry.py"
+    if adk_registry.exists():
+        text = adk_registry.read_text(encoding="utf-8", errors="replace")
+        for needle in ADK_REGISTRY_FORBIDDEN:
+            if needle in text:
+                failures.append(f"ADK tool registry must not expose retired workflow-state tools marker {needle!r}: {adk_registry}")
+
+    for rel, needles in ADK_DIAGNOSTIC_FILES.items():
+        path = root / rel
+        if path.exists():
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for needle in needles:
+                if needle in text:
+                    failures.append(f"ADK diagnostic file must not own product workflow marker {needle!r}: {path}")
+
+    for rel, needles in PURE_METADATA_FILES.items():
+        path = root / rel
+        if path.exists():
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for needle in needles:
+                if needle in text:
+                    failures.append(f"workflow metadata file must stay pure data/helper logic, found {needle!r}: {path}")
 
     product_terminal_tests = root / "tests" / "test_agent_product_terminal.py"
     if product_terminal_tests.exists():

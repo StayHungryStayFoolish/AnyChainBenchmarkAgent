@@ -10,12 +10,11 @@ from __future__ import annotations
 
 import inspect
 
-from llm.config import load_llm_config
+try:
+    from ..llm.config import load_llm_config
+except ImportError:  # script execution with agent/ on sys.path
+    from llm.config import load_llm_config
 
-from .callbacks import after_model_callback
-from .callbacks import before_tool_callback
-from .agents.domain import build_domain_agents
-from .instructions import ROOT_INSTRUCTION
 from .tools.registry import get_adk_tools
 
 
@@ -33,6 +32,18 @@ except ImportError:  # pragma: no cover - exercised when extensions are not inst
 DEFAULT_MODEL = "gemini-3.1-pro"
 
 
+ADK_MODEL_BRIDGE_INSTRUCTION = """
+You are the ADK model/tool surface for AnyChain Benchmark Agent.
+
+The product workflow, state machine, human confirmation flow, and benchmark
+execution gates are owned by the LangGraph Harness in agent.harness. Do not
+invent a separate wizard, mutate workflow state, or claim that a benchmark can
+run without Harness approval. Use available read-only, planning, validation,
+auth, enterprise, and knowledge tools only to answer framework questions or
+produce typed evidence for the Harness.
+"""
+
+
 def resolve_adk_model(default: str = DEFAULT_MODEL) -> str:
     """Resolve the configured model name without taking over ADK model calls.
 
@@ -47,22 +58,22 @@ def resolve_adk_model(default: str = DEFAULT_MODEL) -> str:
 
 
 def build_root_agent(model: str | None = None, tools: list | None = None):
-    """Build the ADK root agent when the optional ADK dependency is available."""
+    """Build the ADK root agent when the optional ADK dependency is available.
+
+    The product workflow is owned by ``agent.harness``. This ADK agent is kept
+    as a provider/tool surface for ADK discovery and Gemini/google tooling; it
+    must not expose the retired workflow-state mutation tools or callback-based
+    workflow repair logic.
+    """
     if Agent is None:
         raise RuntimeError("google-adk is not installed")
     adk_model = model or build_adk_model()
     kwargs = {
         "name": "anychain_benchmark_agent",
         "model": adk_model,
-        "instruction": ROOT_INSTRUCTION,
-        "tools": tools if tools is not None else get_adk_tools(include_actions=True),
+        "instruction": ADK_MODEL_BRIDGE_INSTRUCTION,
+        "tools": tools if tools is not None else get_adk_tools(include_actions=False),
     }
-    if tools is None and _agent_accepts("sub_agents"):
-        kwargs["sub_agents"] = build_domain_agents(Agent, adk_model)
-    if _agent_accepts("before_tool_callback"):
-        kwargs["before_tool_callback"] = before_tool_callback
-    if _agent_accepts("after_model_callback"):
-        kwargs["after_model_callback"] = after_model_callback
     return Agent(**kwargs)
 
 

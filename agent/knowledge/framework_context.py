@@ -10,8 +10,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from knowledge.framework_capabilities import REPO_ROOT, load_framework_capabilities
-from knowledge.framework_index import load_or_build_framework_index
+try:
+    from .framework_capabilities import REPO_ROOT, load_framework_capabilities
+    from .framework_index import load_or_build_framework_index
+except ImportError:  # script execution with agent/ on sys.path
+    from knowledge.framework_capabilities import REPO_ROOT, load_framework_capabilities
+    from knowledge.framework_index import load_or_build_framework_index
 
 
 DOC_INDEX = [

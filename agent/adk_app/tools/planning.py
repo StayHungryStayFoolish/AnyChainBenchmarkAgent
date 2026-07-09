@@ -5,15 +5,26 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from diagnostics.doctor import run_doctor as _run_doctor
-from discovery.environment import discover_environment as _discover_environment
-from onboarding.template_drafter import draft_chain_template as _draft_chain_template
-from planners.diff import diff_plans
-from planners.preflight import run_preflight as _run_preflight
-from planners.strategy_planner import generate_plan as _generate_plan
-from planners.strategy_planner import write_json
-from runners.runbook import render_runbook as _render_runbook
-from validators.config_contract import build_missing_config_questions as _build_missing_config_questions
+try:
+    from ...diagnostics.doctor import run_doctor as _run_doctor
+    from ...discovery.environment import discover_environment as _discover_environment
+    from ...onboarding.template_drafter import draft_chain_template as _draft_chain_template
+    from ...planners.diff import diff_plans
+    from ...planners.preflight import run_preflight as _run_preflight
+    from ...planners.strategy_planner import generate_plan as _generate_plan
+    from ...planners.strategy_planner import write_json
+    from ...runners.runbook import render_runbook as _render_runbook
+    from ...validators.config_contract import build_missing_config_questions as _build_missing_config_questions
+except ImportError:  # script execution with agent/ on sys.path
+    from diagnostics.doctor import run_doctor as _run_doctor
+    from discovery.environment import discover_environment as _discover_environment
+    from onboarding.template_drafter import draft_chain_template as _draft_chain_template
+    from planners.diff import diff_plans
+    from planners.preflight import run_preflight as _run_preflight
+    from planners.strategy_planner import generate_plan as _generate_plan
+    from planners.strategy_planner import write_json
+    from runners.runbook import render_runbook as _render_runbook
+    from validators.config_contract import build_missing_config_questions as _build_missing_config_questions
 
 from .read_only import _tool_result
 
@@ -28,6 +39,7 @@ def prepare_benchmark_run(
     cloud_provider: str = "",
     target_rpc_url: str = "",
     mainnet_rpc_url: str = "",
+    mainnet_rpc_url_reviewed: bool | None = None,
     ledger_device: str = "",
     accounts_device: str = "",
     blockchain_process_names: list[str] | None = None,
@@ -53,6 +65,9 @@ def prepare_benchmark_run(
     observability_enabled: bool | None = None,
     observability_mode: str = "",
     observability_auto_stop: bool | None = None,
+    workflow_type: str = "",
+    sync_observe_stop_condition: str = "",
+    sync_observe_duration_seconds: int | None = None,
     exporter_port: str = "",
     prometheus_port: str = "",
     grafana_port: str = "",
@@ -82,6 +97,7 @@ def prepare_benchmark_run(
         cloud_provider=cloud_provider or discovery.get("cloud", {}).get("provider", ""),
         target_rpc_url=target_rpc_url,
         mainnet_rpc_url=mainnet_rpc_url,
+        mainnet_rpc_url_reviewed=mainnet_rpc_url_reviewed,
         ledger_device=ledger_device or discovery.get("disks", {}).get("proposed_ledger_device", ""),
         accounts_device=accounts_device or discovery.get("disks", {}).get("proposed_accounts_device", ""),
         blockchain_process_names=blockchain_process_names,
@@ -107,6 +123,9 @@ def prepare_benchmark_run(
         observability_enabled=observability_enabled,
         observability_mode=observability_mode,
         observability_auto_stop=observability_auto_stop,
+        workflow_type=workflow_type,
+        sync_observe_stop_condition=sync_observe_stop_condition,
+        sync_observe_duration_seconds=sync_observe_duration_seconds,
         exporter_port=exporter_port,
         prometheus_port=prometheus_port,
         grafana_port=grafana_port,
@@ -170,6 +189,7 @@ def draft_benchmark_request(
     cloud_provider: str = "",
     target_rpc_url: str = "",
     mainnet_rpc_url: str = "",
+    mainnet_rpc_url_reviewed: bool | None = None,
     ledger_device: str = "",
     accounts_device: str = "",
     blockchain_process_names: list[str] | None = None,
@@ -195,6 +215,9 @@ def draft_benchmark_request(
     observability_enabled: bool | None = None,
     observability_mode: str = "",
     observability_auto_stop: bool | None = None,
+    workflow_type: str = "",
+    sync_observe_stop_condition: str = "",
+    sync_observe_duration_seconds: int | None = None,
     exporter_port: str = "",
     prometheus_port: str = "",
     grafana_port: str = "",
@@ -218,6 +241,7 @@ def draft_benchmark_request(
         cloud_provider=cloud_provider,
         target_rpc_url=target_rpc_url,
         mainnet_rpc_url=mainnet_rpc_url,
+        mainnet_rpc_url_reviewed=mainnet_rpc_url_reviewed,
         ledger_device=ledger_device,
         accounts_device=accounts_device,
         blockchain_process_names=blockchain_process_names,
@@ -243,6 +267,9 @@ def draft_benchmark_request(
         observability_enabled=observability_enabled,
         observability_mode=observability_mode,
         observability_auto_stop=observability_auto_stop,
+        workflow_type=workflow_type,
+        sync_observe_stop_condition=sync_observe_stop_condition,
+        sync_observe_duration_seconds=sync_observe_duration_seconds,
         exporter_port=exporter_port,
         prometheus_port=prometheus_port,
         grafana_port=grafana_port,
@@ -369,6 +396,7 @@ def _structured_request(
     cloud_provider: str,
     target_rpc_url: str,
     mainnet_rpc_url: str,
+    mainnet_rpc_url_reviewed: bool | None,
     ledger_device: str,
     accounts_device: str,
     blockchain_process_names: list[str] | None,
@@ -394,6 +422,9 @@ def _structured_request(
     observability_enabled: bool | None,
     observability_mode: str,
     observability_auto_stop: bool | None,
+    workflow_type: str,
+    sync_observe_stop_condition: str,
+    sync_observe_duration_seconds: int | None,
     exporter_port: str,
     prometheus_port: str,
     grafana_port: str,
@@ -460,6 +491,8 @@ def _structured_request(
         "chain": chain,
         "goal": goal or "baseline",
         "rpc_mode": rpc_mode or "single",
+        "workflow_type": workflow_type,
+        "run_mode": workflow_type,
         "deployment": {
             "type": deployment_type or "unknown",
             "provider": cloud_provider,
@@ -481,6 +514,7 @@ def _structured_request(
         "local_rpc_url": target_rpc_url,
         "target_rpc_url": target_rpc_url,
         "mainnet_rpc_url": mainnet_rpc_url,
+        "mainnet_rpc_url_reviewed": bool(mainnet_rpc_url_reviewed) if mainnet_rpc_url_reviewed is not None else False,
         "ledger_device": ledger_device,
         "accounts_device": accounts_device,
         "cloud_region": cloud_region,
@@ -515,6 +549,13 @@ def _structured_request(
             qps[key] = int(value)
     if qps:
         request["qps"] = qps
+    if workflow_type:
+        request["workflow_type"] = workflow_type
+        request["run_mode"] = workflow_type
+    if sync_observe_stop_condition:
+        request["sync_observe_stop_condition"] = sync_observe_stop_condition
+    if sync_observe_duration_seconds is not None:
+        request["sync_observe_duration_seconds"] = int(sync_observe_duration_seconds)
     if rpc_methods:
         request["rpc_methods"] = list(rpc_methods)
     if mixed_weights:

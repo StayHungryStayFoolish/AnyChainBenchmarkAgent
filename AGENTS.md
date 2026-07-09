@@ -22,8 +22,10 @@ runtime docs.
 
 ## What This Project Is
 
-AnyChain Benchmark Agent is a Google ADK-based terminal Agent for blockchain
-node benchmark workflows. The Agent helps users:
+AnyChain Benchmark Agent is a LangGraph Harness-based terminal Agent for
+blockchain node benchmark workflows. Google ADK is an optional model/tool
+bridge for Gemini and Google capabilities, not the product workflow owner. The
+Agent helps users:
 
 - configure an LLM provider;
 - inspect local environment and dependencies;
@@ -33,8 +35,9 @@ node benchmark workflows. The Agent helps users:
 - run preflight, smoke, detached jobs, log follow, and report analysis;
 - generate secondary-development plans for new chains or RPC methods.
 
-The deterministic benchmark engine remains the source of truth. The Agent
-must use ADK and deterministic tools instead of terminal keyword routing.
+The deterministic benchmark engine remains the source of truth. Ambiguous user
+intent must flow through the Harness LLM resolver and deterministic workflow
+groups instead of terminal keyword routing.
 
 ## Fast Path For Helping A User Configure The Agent
 
@@ -211,7 +214,8 @@ research is unavailable unless a provider-specific integration is added later.
 
 - `README.md`: user-facing quick start and full overview.
 - `agent/README.md`: Agent runtime and development contract.
-- `docs/en/adk-agent-architecture.md`: ADK architecture and Agent Loop.
+- `docs/en/adk-agent-architecture.md`: LangGraph Harness architecture, ADK
+  bridge boundary, and Agent Loop.
 - `docs/en/anychain-agent-ai-work-gate.md`: project-specific AI coding gate.
 - `docs/zh/adk-agent-architecture.md` and
   `docs/zh/anychain-agent-ai-work-gate.md`: Chinese-directory mirrors for users
@@ -242,7 +246,7 @@ research is unavailable unless a provider-specific integration is added later.
 When code changes are made, run:
 
 ```bash
-python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract
+python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract tests.test_agent_langgraph_harness
 python3 tools/check_agent_boundaries.py --root .
 python3 agent/cli.py adk-eval
 git diff --check

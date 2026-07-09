@@ -13,9 +13,14 @@ from pathlib import Path
 from typing import Any
 from urllib import request as urlrequest
 
-from runners.artifacts import write_artifact_index
-from runners.guardrails import build_benchmark_command, validate_execution_plan
-from runners.materialize import load_runtime_env_file, materialize_runtime_env
+try:
+    from .artifacts import write_artifact_index
+    from .guardrails import build_benchmark_command, validate_execution_plan
+    from .materialize import load_runtime_env_file, materialize_runtime_env
+except ImportError:  # script execution with agent/ on sys.path
+    from runners.artifacts import write_artifact_index
+    from runners.guardrails import build_benchmark_command, validate_execution_plan
+    from runners.materialize import load_runtime_env_file, materialize_runtime_env
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_JOBS_DIR = REPO_ROOT / ".agent" / "jobs"

@@ -7,8 +7,12 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from llm.config import load_llm_config
-from llm.google_auth import credential_plan
+try:
+    from ...llm.config import load_llm_config
+    from ...llm.google_auth import credential_plan
+except ImportError:  # script execution with agent/ on sys.path
+    from llm.config import load_llm_config
+    from llm.google_auth import credential_plan
 
 from .read_only import _tool_result
 
@@ -77,4 +81,3 @@ def _next_actions(auth_mode: str, data: dict[str, Any], validation_errors: list[
             return ["set GOOGLE_APPLICATION_CREDENTIALS to an existing JSON key file path"]
         return ["run llm-smoke", "prefer ADC or impersonation for enterprise usage"]
     return ["run llm-smoke"]
-

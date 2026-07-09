@@ -1,5 +1,8 @@
-"""Specialized ADK sub-agents for AnyChain Benchmark Agent."""
+"""Retired ADK agent compatibility package.
 
-from .domain import build_domain_agents
+Product orchestration now belongs to ``agent.harness``. This package remains
+as an empty compatibility package so ADK app discovery does not recreate a
+second workflow brain.
+"""
 
-__all__ = ["build_domain_agents"]
+__all__: list[str] = []

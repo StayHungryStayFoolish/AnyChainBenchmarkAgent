@@ -7,9 +7,14 @@ from typing import Any
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-from llm.config import LLMConfig, load_llm_config
-from llm.google_auth import get_google_access_token
-from llm.types import LLMMessage, LLMProvider, LLMRequest, LLMResponse
+try:
+    from .config import LLMConfig, load_llm_config
+    from .google_auth import get_google_access_token
+    from .types import LLMMessage, LLMProvider, LLMRequest, LLMResponse
+except ImportError:  # script execution with agent/ on sys.path
+    from llm.config import LLMConfig, load_llm_config
+    from llm.google_auth import get_google_access_token
+    from llm.types import LLMMessage, LLMProvider, LLMRequest, LLMResponse
 
 
 class OpenAIProvider:

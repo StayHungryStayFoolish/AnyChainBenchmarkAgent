@@ -7,7 +7,22 @@ import re
 
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")
 _ASCII_ALPHA_RE = re.compile(r"[A-Za-z]")
-_SINGLE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:/+-]+[,，;；]?$")
+_SINGLE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:/+-]+[,，;；、]?$")
+_TECHNICAL_SCALAR_RE = re.compile(
+    r"^([A-Za-z_][A-Za-z0-9_.:/-]*\s*=\s*[^=,\s]+)(\s*[,，]\s*[A-Za-z_][A-Za-z0-9_.:/-]*\s*=\s*[^=,\s]+)*[,，;；]?$"
+)
+_CONFIG_FACT_RE = re.compile(
+    r"\b(region|zone|machine|ledger|accounts|network|bandwidth|iops|throughput|endpoint|qps|rpc|grafana|prometheus)\b|[A-Za-z_][A-Za-z0-9_.:/-]*\s*=",
+    re.IGNORECASE,
+)
+_TECHNICAL_DOC_RE = re.compile(
+    r"\b(path parameters?|query parameters?|request|response|method|jsonrpc|rest api|endpoint|curl|headers?)\b",
+    re.IGNORECASE,
+)
+_TECHNICAL_PASTE_RE = re.compile(
+    r"(^|\n)\s*(curl\b|--data\b|--header\b|response\s*:|request\s*:|traceback\b|\{|\[)",
+    re.IGNORECASE,
+)
 
 
 def detect_language(text: str, default: str = "en") -> str:
@@ -20,7 +35,13 @@ def detect_language(text: str, default: str = "en") -> str:
         return "en"
     if _CJK_RE.search(raw):
         return "zh"
+    if default == "zh" and ("\n" in raw or _TECHNICAL_PASTE_RE.search(raw)):
+        return "zh"
     if default == "zh" and _SINGLE_TOKEN_RE.fullmatch(raw.strip()):
+        return "zh"
+    if default == "zh" and _TECHNICAL_SCALAR_RE.fullmatch(raw.strip()):
+        return "zh"
+    if default == "zh" and (_CONFIG_FACT_RE.search(raw) or _TECHNICAL_DOC_RE.search(raw)):
         return "zh"
     if _ASCII_ALPHA_RE.search(raw):
         return "en"
@@ -48,6 +69,13 @@ _ZH = {
     "agent": "Agent> {message}",
     "bye": "已退出 AnyChain Benchmark Agent。",
     "help": "你可以说：测试 solana、使用 fake-node、doctor、jobs、status、logs <job_id>、follow <job_id>、help、exit。",
+    "resume_session_offer": "检测到之前的 Agent 配置会话：\n{summary}\n请选择下一步：\n1. 继续之前的配置\n2. 保留已确认配置，但告诉我你要修改哪一项\n3. 清空之前的配置，重新开始",
+    "resume_session_continue": "已继续之前的配置。{next_step}",
+    "resume_session_modify": "已保留已确认配置，并退出旧的待回答问题。请直接告诉我要修改哪一项，例如链、模式、磁盘、QPS、RPC 或可观测性。",
+    "resume_session_clear": "已清空之前的 Agent 配置会话。请告诉我这次要测试什么，或先选择 fake-node / real-node / sync-observe。",
+    "resume_session_invalid": "请回复 1、2 或 3：1 继续，2 修改已有配置，3 清空重新开始。",
+    "resume_pending_next": "当前待确认：{prompt}",
+    "resume_no_pending_next": "当前没有待确认问题，你可以继续描述目标或要修改的配置。",
     "startup_doctor_start": "正在启动时执行只读环境和依赖检查。",
     "startup_doctor_summary": "启动检查完成：status={status}，cloud={cloud}，deployment={deployment}，缺失依赖={missing}，能力={chains} chains / {methods} RPC methods。",
     "environment_inference_summary": "环境推断草案：\n{summary}",
@@ -100,6 +128,13 @@ _EN = {
     "agent": "Agent> {message}",
     "bye": "Exited AnyChain Benchmark Agent.",
     "help": "Try: benchmark solana, use fake-node, doctor, jobs, status, logs <job_id>, follow <job_id>, help, exit.",
+    "resume_session_offer": "Found an existing Agent configuration session:\n{summary}\nChoose next step:\n1. Continue the previous configuration\n2. Keep confirmed values, but tell me what to change\n3. Clear the previous configuration and start over",
+    "resume_session_continue": "Continuing the previous configuration. {next_step}",
+    "resume_session_modify": "Kept confirmed values and cleared the old pending question. Tell me what to change, such as chain, mode, disk, QPS, RPC, or observability.",
+    "resume_session_clear": "Cleared the previous Agent configuration session. Tell me what to test, or choose fake-node / real-node / sync-observe first.",
+    "resume_session_invalid": "Reply with 1, 2, or 3: 1 continue, 2 modify existing config, 3 clear and start over.",
+    "resume_pending_next": "Current pending question: {prompt}",
+    "resume_no_pending_next": "There is no pending question. Continue describing the goal or the configuration to change.",
     "startup_doctor_start": "Running startup read-only environment and dependency diagnostics.",
     "startup_doctor_summary": "Startup diagnostics complete: status={status}, cloud={cloud}, deployment={deployment}, missing dependencies={missing}, capabilities={chains} chains / {methods} RPC methods.",
     "environment_inference_summary": "Environment inference draft:\n{summary}",

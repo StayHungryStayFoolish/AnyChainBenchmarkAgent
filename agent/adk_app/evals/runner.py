@@ -1,31 +1,24 @@
-"""Offline ADK contract evaluations.
+"""Offline ADK compatibility evaluations.
 
-These checks intentionally do not simulate natural-language understanding.
-Intent recognition belongs to the installed ADK runtime and configured model.
-Without model credentials, the reliable offline contract is that the ADK agent
-loads, exposes the expected tool set, and keeps confirmation-gated actions
-behind approval callbacks.
+Product workflow behavior is tested through the LangGraph Harness tests and
+CLI matrix. These checks only verify that the optional ADK package surface can
+load without exposing retired workflow-state tools.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from adk_app.callbacks import before_tool_callback
-from adk_app.workflow.schemas import validate_intent_route
-from adk_app.instructions import ROOT_INSTRUCTION
-from adk_app.root_agent import resolve_adk_model
-from adk_app.agents.domain import build_domain_agents
+from adk_app.instructions import ADK_BRIDGE_BOUNDARY, ADK_COMPATIBILITY_INSTRUCTION
+from adk_app.root_agent import ADK_MODEL_BRIDGE_INSTRUCTION, resolve_adk_model
 from adk_app.tools.registry import get_adk_tools
+from adk_app.workflow.schemas import validate_intent_route
 
 
 def run_offline_evals() -> dict[str, Any]:
-    """Run no-credential ADK contract checks.
-
-    Real prompt routing must be tested through ADK with a configured model
-    provider.
-    """
+    """Run no-credential ADK compatibility checks."""
     tool_names = {tool.__name__ for tool in get_adk_tools(include_actions=True)}
+    retired_tools = {"load_workflow_state", "update_workflow_state", "answer_pending_question"}
     required_tools = {
         "discover_environment",
         "run_doctor",
@@ -56,32 +49,12 @@ def run_offline_evals() -> dict[str, Any]:
         "build_onboarding_handoff",
     }
 
-    class _FakeAgent:
-        def __init__(self, **kwargs):
-            self.__dict__.update(kwargs)
-
-    domain_agents = build_domain_agents(_FakeAgent, "eval-model")
-    domain_agent_names = {agent.name for agent in domain_agents}
-    required_domain_agents = {
-        "intent_router_agent",
-        "environment_discovery_agent",
-        "dependency_agent",
-        "benchmark_configuration_agent",
-        "rpc_workload_agent",
-        "chain_rpc_onboarding_agent",
-        "execution_agent",
-        "resume_analyze_agent",
-        "knowledge_agent",
-    }
-
-    class _Tool:
-        name = "submit_benchmark_job"
-
-    blocked = before_tool_callback(_Tool(), {"plan_file": "/tmp/plan.json"}, tool_context=None)
     results = [
         {
-            "name": "root_instruction_present",
-            "passed": bool(ROOT_INSTRUCTION and "Use a structured router only for intent classification" in ROOT_INSTRUCTION),
+            "name": "compat_instruction_present",
+            "passed": "LangGraph Harness" in ADK_MODEL_BRIDGE_INSTRUCTION
+            and "LangGraph Harness" in ADK_COMPATIBILITY_INSTRUCTION
+            and "retired" in ADK_BRIDGE_BOUNDARY,
         },
         {
             "name": "required_tools_registered",
@@ -89,19 +62,9 @@ def run_offline_evals() -> dict[str, Any]:
             "missing": sorted(required_tools - tool_names),
         },
         {
-            "name": "adk_domain_agents_registered",
-            "passed": required_domain_agents.issubset(domain_agent_names),
-            "missing": sorted(required_domain_agents - domain_agent_names),
-            "agent_count": len(domain_agents),
-        },
-        {
-            "name": "domain_agents_use_narrow_tool_surfaces",
-            "passed": all(getattr(agent, "tools", None) for agent in domain_agents)
-            and len(next(agent for agent in domain_agents if agent.name == "rpc_workload_agent").tools) < len(tool_names),
-        },
-        {
-            "name": "action_callback_blocks_unapproved_submit",
-            "passed": bool(blocked and blocked.get("requires_user_confirmation")),
+            "name": "retired_workflow_tools_not_registered",
+            "passed": not (retired_tools & tool_names),
+            "unexpected": sorted(retired_tools & tool_names),
         },
         {
             "name": "model_resolution_uses_real_default",
@@ -130,5 +93,5 @@ def run_offline_evals() -> dict[str, Any]:
         "case_count": len(results),
         "passed_count": sum(1 for item in results if item["passed"]),
         "results": results,
-        "note": "This is an ADK contract eval. Natural-language routing requires a configured ADK model provider.",
+        "note": "Product workflow is validated through LangGraph Harness tests, not ADK workflow prompts.",
     }
