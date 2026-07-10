@@ -125,6 +125,62 @@ Run an additional dual-AI chaos session:
 - Save the complete transcript and review the user-visible flow, not only final
   checkpoint state.
 
+Codex must use explicit user personas. Do not run a neutral happy-path checklist.
+At minimum exercise these personas:
+
+- first-time confused evaluator: asks who the Agent is, where to start, what
+  fake-node/real-node/sync-observe mean, and what the Agent will do next;
+- impatient operations engineer: gives short answers, asks whether execution
+  happened, and expects direct state and next-action summaries;
+- copy/paste-heavy technical user: pastes env/YAML/JSON/log/request/response
+  blocks with whitespace, punctuation, and partial data;
+- requirement-changing user: changes chain, target mode, QPS, RPC mode,
+  custom RPC methods, endpoint, region/zone, and observability mid-flow;
+- mixed-language user: alternates Chinese and English while using technical
+  identifiers;
+- report/debug analyst: asks for latest job, logs, reports, errors, and
+  evidence interpretation;
+- custom-RPC integrator: exercises supported-chain custom RPC and new-chain
+  existing-family onboarding with incomplete or contradictory evidence;
+- unsupported-chain evaluator: triggers secondary-development handoff and then
+  returns to a supported path;
+- resume-session user: starts from a previous partial checkpoint, then tests
+  continue, modify, clear, and natural-language detours.
+
+The first-time confused evaluator is a mandatory baseline. Start from a
+non-empty previous checkpoint, normally a partial `sync-observe / bsc` session,
+then ask questions equivalent to:
+
+```text
+who are u?
+你从哪里来
+你要去哪里
+你可以做什么？
+那我们现在可以从哪里开始？
+fake node，real node，sync observe 都是什么？
+fake node
+```
+
+The Agent must explain itself, explain modes, handle the old session explicitly,
+and must not silently reuse a stale chain. Continue the path through resource
+confirmation, workload, QPS, observability, and preflight/smoke approval. A
+positive answer to the preflight/smoke prompt, such as `1`, `Y`, or `是的`, must
+execute preflight/smoke or return a concrete blocker. It must not be consumed by
+chain selection, generic help, or framework capability text.
+
+After execution approval, the persona must ask:
+
+```text
+你执行过测试了么？
+当前是什么状态？
+那你接下来要做什么？
+那你该做什么了？
+```
+
+The Agent must answer from checkpoint/job/preflight/smoke state and provide a
+specific next action. Generic workflow descriptions or "no pending question"
+answers fail this gate.
+
 The Codex user simulator must cover at least these behaviors:
 
 1. Start with arbitrary text, not only `Hi` or `hello`.
@@ -144,6 +200,10 @@ The Codex user simulator must cover at least these behaviors:
 9. Switch languages and include technical scalar values with whitespace or
    punctuation.
 10. Resume from a partial previous session and test continue, modify, and clear.
+11. Verify execution side effects after approval: preflight/smoke/job state,
+    artifact paths, or a clear blocker must exist.
+12. Ask current-state and next-action questions after major transitions. The
+    response must be grounded in state, not generic documentation.
 
 If a failure appears in this session, classify it before changing code:
 

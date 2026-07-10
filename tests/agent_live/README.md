@@ -16,10 +16,14 @@ It drives the same product entrypoint a user runs:
 ./bin/anychain-agent
 ```
 
-Each scenario uses an isolated terminal state file and an isolated LangGraph
-checkpoint database through `ANYCHAIN_AGENT_CHECKPOINT_PATH`. The runner reads
-LangGraph checkpoint state after the conversation. It must not read or write
-legacy `.agent/sessions/*/conversation_state.json` files.
+Each scenario uses an isolated terminal state file, isolated session id, isolated
+LangGraph checkpoint database, and `session_purpose=live-matrix`. The runner
+passes `--state-file`, `--session-id`, `--checkpoint-path`, and
+`--session-purpose live-matrix` to the same CLI users run. It also sets the
+matching `ANYCHAIN_AGENT_*` environment variables so endpoint probe evidence can
+be traced back to the test session. The runner reads LangGraph checkpoint state
+after the conversation. It must not read or write legacy
+`.agent/sessions/*/conversation_state.json` files.
 
 ## Required Dual-AI Chaos Test
 
@@ -34,8 +38,46 @@ Agent workflow or Harness change, run a real terminal conversation where:
   a real technical user: jump between groups, answer partially, paste noisy
   config/log/request/response blocks, switch language, change chain/mode/QPS/RPC
   choices, go back, contradict earlier answers, and ask explanatory questions.
+- The user simulator must run named personas, not a neutral checklist. At
+  minimum include: first-time confused evaluator, impatient operations engineer,
+  copy/paste-heavy technical user, requirement-changing user, mixed-language
+  user, report/debug analyst, custom-RPC integrator, new-chain evaluator, and
+  resume-session user. Each persona must choose turns from the live Agent
+  response and may ask basic product questions before giving benchmark inputs.
 - The full transcript is the primary evidence. Passing state assertions without
   a stable user-facing transcript does not pass this gate.
+
+### Baseline Persona Transcript That Must Pass
+
+Every broad Agent workflow or Harness change must include a dual-AI chaos
+transcript equivalent to this first-time confused evaluator path. It must start
+from a non-empty previous checkpoint, normally a partial `sync-observe / bsc`
+session, not from a clean state:
+
+1. Ask identity and orientation questions, for example `who are u?`,
+   `你从哪里来`, `你要去哪里`, `你可以做什么？`, and `那我们现在可以从哪里开始？`.
+   The Agent must explain itself and give a usable next step instead of dumping
+   raw framework facts or saying only that no pending question exists.
+2. Ask mode concepts, for example `fake node，real node，sync observe 都是什么？`.
+   The Agent must explain the three modes and the boundaries between
+   fake-node, real-node, and sync-observe.
+3. Choose `fake node` from the old `sync-observe / bsc` session. The Agent must
+   explicitly handle the old chain/mode state: either ask whether to keep the
+   old chain or ask for the chain. It must not silently reuse a stale chain.
+4. Complete the normal fake-node resource, workload, QPS, observability, and
+   preflight/smoke confirmation path using short answers such as `1`, `y`,
+   `n`, and natural-language confirmations.
+5. When the Agent asks whether to run preflight and smoke, a valid positive
+   answer such as `1`, `Y`, or `是的` must execute the preflight/smoke path or
+   produce a clear execution blocker. It must not route the answer to chain
+   selection, capability text, or generic help.
+6. After confirmation, ask `你执行过测试了么？`, `当前是什么状态？`,
+   `那你接下来要做什么？`, and `那你该做什么了？`. The Agent must answer from
+   checkpoint/job/preflight/smoke state and provide the concrete next action.
+   It must not answer only with a generic workflow description.
+
+This baseline is intentionally basic. If it fails, the Agent is not ready for
+more advanced custom-RPC, unknown-chain, or report-analysis claims.
 
 Minimum dual-AI chaos coverage:
 
@@ -57,6 +99,14 @@ Minimum dual-AI chaos coverage:
    multiple groups; inferred values must be reviewed with the user before use.
 8. Resume behavior after a previous partial session: continue, modify, and clear
    must all be tested.
+9. Execution-side effects: after the user approves preflight/smoke or a run, the
+   test must verify the expected job/preflight/smoke state, artifact paths, or a
+   clear blocker. A reply that merely says something without changing state is a
+   failure.
+10. Current-state and next-action questions: after every major group transition
+   and especially after execution approval, ask the Agent what happened, what
+   the current state is, and what it will do next. The answer must be specific
+   to the checkpoint and job state.
 
 Dual-AI chaos failures must be fixed in the owning Harness group, validator,
 or terminal boundary. Do not patch failures with keyword lists, fuzzy matching,
@@ -107,3 +157,5 @@ Failed scenario transcripts are written to:
 ```
 
 Those transcripts are debugging artifacts and should not be committed.
+Each retained transcript starts with scenario/session/checkpoint metadata so
+state bleed can be audited before any product claim.
