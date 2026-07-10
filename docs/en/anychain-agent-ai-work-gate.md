@@ -711,6 +711,27 @@ configuration/evidence, custom RPC cases, unknown-chain cases, resume behavior,
 and final review/preflight/smoke paths. If the full transcript is not reviewed,
 do not claim product readiness.
 
+The Codex user simulator must use explicit personas rather than a neutral
+happy-path checklist. Required personas include a first-time confused evaluator,
+an impatient operations engineer, a copy/paste-heavy technical user, a
+requirement-changing user, a mixed-language user, a report/debug analyst, a
+custom-RPC integrator, a new-chain evaluator, an unsupported-chain handoff
+evaluator, and a resume-session user.
+
+The first-time confused evaluator is the baseline gate and must start from a
+non-empty previous checkpoint such as partial `sync-observe / bsc`. It must ask
+basic questions like `who are u?`, `你从哪里来`, `你要去哪里`, `你可以做什么？`,
+`那我们现在可以从哪里开始？`, and
+`fake node，real node，sync observe 都是什么？`, then switch to `fake node`.
+The Harness must explicitly handle the old session and stale chain/mode state;
+it must not silently reuse the previous chain. The same transcript must continue
+through resource confirmation, workload, QPS, observability, and
+preflight/smoke approval. A positive answer to the preflight/smoke prompt must
+execute that path or return a concrete blocker. Afterward, questions like
+`你执行过测试了么？`, `当前是什么状态？`, `那你接下来要做什么？`, and
+`那你该做什么了？` must be answered from checkpoint/job/preflight/smoke state,
+not with generic workflow prose or "no pending question" text.
+
 If a boundary cannot be tested locally, report it as untested. Do not describe
 untested behavior as complete.
 

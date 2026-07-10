@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any, Literal, TypedDict
 
 
@@ -26,6 +27,7 @@ class PendingQuestion(TypedDict, total=False):
 
 class AgentGraphState(TypedDict, total=False):
     thread_id: str
+    session: dict[str, Any]
     language: str
     last_user_input: str
     input_shape: str
@@ -93,9 +95,34 @@ DEFAULT_GROUP_ORDER = [
 ]
 
 
-def new_state(thread_id: str, language: str = "en") -> AgentGraphState:
+def _utc_timestamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def ensure_session_metadata(state: AgentGraphState, thread_id: str, session_purpose: str = "user") -> AgentGraphState:
+    """Attach runtime session metadata without changing benchmark workflow state."""
+
+    now = _utc_timestamp()
+    session = dict(state.get("session") or {})
+    session.setdefault("id", thread_id)
+    session.setdefault("purpose", session_purpose or "user")
+    session.setdefault("created_at", now)
+    session["updated_at"] = now
+    state["session"] = session
+    state["thread_id"] = thread_id
+    return state
+
+
+def new_state(thread_id: str, language: str = "en", session_purpose: str = "user") -> AgentGraphState:
+    now = _utc_timestamp()
     return {
         "thread_id": thread_id,
+        "session": {
+            "id": thread_id,
+            "purpose": session_purpose or "user",
+            "created_at": now,
+            "updated_at": now,
+        },
         "language": language,
         "last_user_input": "",
         "input_shape": "",

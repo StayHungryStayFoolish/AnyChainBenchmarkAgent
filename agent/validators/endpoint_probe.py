@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import re
 import subprocess
 import time
@@ -54,6 +55,7 @@ def validate_rpc_endpoint(
         "response_shape_hash": "",
         "error": "",
         "evidence_file": "",
+        "session": _runtime_session_metadata(),
         "ready": False,
         "checks": [],
         "warnings": [],
@@ -403,6 +405,14 @@ def _write_evidence(result: dict[str, Any]) -> Path:
     path = EVIDENCE_DIR / f"{chain}-{digest}.json"
     path.write_text(json.dumps(redact(result), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return path
+
+
+def _runtime_session_metadata() -> dict[str, Any]:
+    return {
+        "id": os.environ.get("ANYCHAIN_AGENT_SESSION_ID") or "default",
+        "purpose": os.environ.get("ANYCHAIN_AGENT_SESSION_PURPOSE") or "user",
+        "checkpoint_path": os.environ.get("ANYCHAIN_AGENT_CHECKPOINT_PATH") or "",
+    }
 
 
 def _adapter_family(chain: str) -> str:

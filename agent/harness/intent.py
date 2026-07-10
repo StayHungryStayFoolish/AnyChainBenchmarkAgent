@@ -49,6 +49,7 @@ ALLOWED_ACTION_TYPES = [
     "choose_target_mode",
     "choose_chain",
     "change_chain",
+    "reset_session",
     "change_group",
     "go_back",
     "ask_capabilities",
@@ -132,24 +133,32 @@ def _action_queue_prompt() -> str:
         "Allowed sync_observe_source values: existing_local_node, endpoint_only, client_setup, demo_only.\n"
         f"Allowed group values: {', '.join(ALLOWED_GROUPS)}.\n"
         "If the user says several things in one turn, return several actions in the same order a helpful product agent should handle them. "
+        "If the user asks how to restart, clear previous config, start over, or begin from scratch without directly commanding it, use answer_opening_question with topic=reset_help. "
+        "If the user directly asks to reset, clear previous config, start over, discard old config, or restart the Agent configuration, use reset_session. "
         "If the user asks to switch response language and also gives configuration intent, ignore the language switch as an action and still extract the configuration actions. "
         "If the user asks about capabilities/support AND also expresses a benchmark/run/closed-loop goal or mentions a chain, include ask_capabilities plus the benchmark actions; do not let the capability answer replace the benchmark goal. "
-        "If the user asks what the Agent can do, use answer_opening_question with topic=capabilities. "
+        "If the user asks who you are, where you come from, where you are going, what you are for, or what kind of agent this is, use answer_opening_question with topic=identity. "
+        "If the user asks what the Agent can do, use answer_opening_question with topic=agent_capabilities. "
+        "If the user asks which chains, adapter families, RPC methods, or templates are supported, use answer_opening_question with topic=supported_chains. "
+        "If the user asks what 'this' current prompt/menu/pending question is for, use answer_opening_question with topic=current_context. "
         "If the user asks what is currently selected/configured, current chain, current mode, current settings, or current state, use answer_opening_question with topic=current_config. "
         "If the user wants to quickly try/validate/run something but is unsure which mode or chain to choose, use answer_opening_question with topic=recommendation; do not choose a mode unless they explicitly choose one. "
         "If the user asks what they must do/provide/prepare to run a benchmark, use answer_opening_question with topic=requirements. "
         "If the user asks how the workflow runs or what the steps are, use answer_opening_question with topic=workflow. "
         "If the user asks the difference between fake-node, real-node, and sync-observe, use answer_opening_question with topic=mode_comparison. "
+        "If the user asks how to measure QPS capacity, maximum throughput, maximum requests, saturation, latency under load, or bottlenecks, use answer_opening_question with topic=performance_benchmark_guidance unless they also explicitly selected a target mode. "
+        "If that same turn names a chain, include both actions: answer_opening_question topic=performance_benchmark_guidance first, then choose_chain/change_chain. "
         "If the user says they do not understand, asks whether you understood, says you answered the wrong question, or asks what you mean, use answer_opening_question with topic=correction. "
         "If the user asks what a config field/group means, use answer_opening_question with topic=config_explanation and subject when known. "
         "If the user asks about adding chains, adding custom RPC methods, or extension paths without starting the concrete workflow, use answer_opening_question with topic=extension. "
         "If the user says they are unsure between fake-node and real-node, do not choose a target mode; preserve chain/capability actions and let the Harness ask the target-mode question. "
-        "Use choose_target_mode only when the user explicitly says fake-node, simulated/mock node, real-node, real node,真实节点,模拟节点,sync-observe, observe sync, or an equivalent explicit mode. "
+        "Use choose_target_mode only when the user explicitly says fake-node, simulated/mock node, real-node, real node,真实节点,模拟节点,sync-observe, observe sync, observe block catch-up/import, 观察追块, 追块, or an equivalent explicit mode. "
         "Never infer real-node merely because the user says test/benchmark/测试/压测. "
         "If no target mode is explicit, do not emit choose_target_mode; emit other actions and let the Harness ask the target-mode question. "
         "When you emit choose_target_mode, include target_mode_explicit=true. "
         "If the same turn explicitly mentions both target mode and chain, include both. "
         "If the user names a chain while another chain is confirmed, use change_chain. "
+        "If the user says they want to test another/different chain but does not provide the chain name, use change_group group=chain_identity; do not continue the current preflight/smoke path. "
         "If no chain is confirmed, use choose_chain. "
         "For a chain not listed in configured chains, still emit choose_chain/change_chain with the raw chain_text; the Harness will run chain identity gates. "
         "If the user explicitly states a likely protocol/family for an unknown chain, include adapter_family and chain_exists=true while still leaving final confirmation to the Harness. "
@@ -163,7 +172,7 @@ def _action_queue_prompt() -> str:
         "If the user wants to configure or adjust QPS but does not name quick/standard/intensive, use change_group group=qps_profile instead. "
         "Use set_qps_override when the user gives concrete QPS parameter values, including natural language such as initial qps=5, max qps 100, qps step 10, or duration 30 seconds. "
         "For qps_overrides use keys INITIAL_QPS, MAX_QPS, QPS_STEP, and DURATION. "
-        "Chinese QPS examples: '跳转到 QPS 配置，把 benchmark 模式设成 quick' or '先配置 QPS quick' => actions change_group group=qps_profile then set_qps_mode qps_mode=quick. "
+        "For any language, when the user asks to configure QPS and also gives a concrete mode such as quick/standard/intensive, emit change_group group=qps_profile followed by set_qps_mode. "
         "If the user is answering a disk/network/provider question but says '先配置 QPS', '先把 QPS 改成 quick', or 'configure QPS first, then return to disk/network/provider', emit change_group group=qps_profile followed by set_qps_mode when quick/standard/intensive is explicit; do not treat it as an answer to the current pending question. "
         "When the user says to configure one group first and then return to the current/pending group, do not emit a second change_group for the return; the Harness fallback path will resume the earliest incomplete group after the first group is confirmed. "
         "Use set_observability only when the user clearly selects, disables, or asks to keep off disabled/local/exporter observability. "
@@ -174,16 +183,19 @@ def _action_queue_prompt() -> str:
         "Use set_sync_observe_source when the user clearly chooses an existing local node, endpoint-only observation, Agent-prepared client setup, or demo-only sync-observe plumbing. "
         "Use set_accounts_presence when the user clearly says whether there is a separate accounts/state disk. "
         "Examples: no separate accounts disk, 没有 accounts 盘 => has_accounts_device=false; separate accounts disk, 有独立 accounts 盘 => has_accounts_device=true. "
-        "Use start_custom_rpc when the user wants to add, validate, replace, or test a custom RPC method. "
+        "Use start_custom_rpc when the user clearly wants to add, validate, replace, or test a concrete custom RPC method. "
+        "If the user only asks whether custom RPC methods can be added, how custom RPC works, or whether it is possible, use answer_opening_question topic=extension instead of start_custom_rpc. "
         "For start_custom_rpc, include rpc_method when the method name is explicit, rpc_endpoint when the user gives a URL for validating it, and rpc_schema_evidence when the user pasted request/response/docs. "
         "If one turn contains both configuration facts and a custom RPC request, emit propose_config_values first, then start_custom_rpc, so the Harness can review config and then continue the custom RPC workflow. "
         "Do not put custom RPC method names into unmapped_values when start_custom_rpc can represent the intent. "
         "Use propose_config_values when the user pastes YAML, JSON, env vars, shell snippets, tables, multi-line notes, or mixed natural language that contains benchmark configuration facts across one or more groups. "
         "For propose_config_values, map only known AnyChain fields into config_values and put anything else into unmapped_values. "
         "Do not use propose_config_values for chain names, target mode, QPS mode, RPC mode, observability, or sync-observe source when a more specific action exists. "
-        "If the user pasted logs/errors/transcripts, use analyze_evidence. "
+        "If the user only asks whether you can analyze logs/errors but does not include the actual log/error content, use answer_opening_question topic=evidence_help. "
+        "If the user pasted actual logs/errors/transcripts, use analyze_evidence. "
         "If the user asks about reports, metrics, or artifacts, use analyze_report. "
         "If the user is only greeting, use greeting. "
+        "Examples: 'I want to benchmark BSC max throughput and find bottlenecks, not just test the tool itself' => actions answer_opening_question topic=performance_benchmark_guidance then choose_chain chain_text='BSC'; no choose_target_mode. "
         "Examples: 'I want to quickly validate the framework, not sure fake-node or real-node, maybe BNB, also show supported chains' => actions ask_capabilities then choose_chain chain_text='BNB'; no choose_target_mode. "
         "If unsure, return one unknown action with a concise reason.\n"
         "Schema: {actions:[{type:string,target_mode?:string,target_mode_explicit?:boolean,chain_text?:string,group?:string,rpc_mode?:string,"
@@ -270,7 +282,7 @@ def _action_queue_payload(state: AgentGraphState, text: str) -> dict[str, Any]:
                     "adapter_family": "optional jsonrpc|substrate|rest|tendermint|bitcoin_jsonrpc|hedera_dual|unsupported|unknown for unknown-chain hints",
                     "chain_exists": "optional boolean when the user claims or implies the unknown chain exists",
                     "group": "optional allowed group",
-                    "topic": "optional for answer_opening_question: capabilities|current_config|requirements|workflow|mode_comparison|recommendation|config_explanation|extension|correction",
+                    "topic": "optional for answer_opening_question: identity|agent_capabilities|supported_chains|capabilities|current_context|current_config|requirements|workflow|mode_comparison|performance_benchmark_guidance|recommendation|config_explanation|extension|correction|evidence_help|reset_help",
                     "subject": "optional field, chain, method, or concept being asked about",
                     "rpc_mode": "optional single|mixed",
                     "qps_mode": "optional quick|standard|intensive",
@@ -414,7 +426,7 @@ def _system_prompt() -> str:
         "You do not mutate state and you do not ask workflow questions. "
         "Map the user turn to one typed action for the graph.\n"
         "Allowed intents: greeting, choose_target_mode, choose_chain, change_chain, "
-        "change_group, go_back, ask_capabilities, answer_opening_question, analyze_evidence, analyze_report, answer_pending, unknown.\n"
+        "reset_session, change_group, go_back, ask_capabilities, answer_opening_question, analyze_evidence, analyze_report, answer_pending, unknown.\n"
         "Allowed target_mode values: fake-node, real-node, sync-observe.\n"
         f"Allowed group values: {', '.join(ALLOWED_GROUPS)}.\n"
         "If the user mentions a chain not already confirmed, use choose_chain or change_chain with chain_text. "
@@ -423,14 +435,23 @@ def _system_prompt() -> str:
         "If the user says they do not want the current target mode and implies another target mode, include the new target_mode. "
         "If the user says to go back to a named area such as RPC/QPS/disk/network/observability/report/logs, use change_group. "
         "If the user only says go back/previous/undo without naming an area, use go_back. "
-        "If the user asks a general framework capability question, use answer_opening_question topic=capabilities. "
+        "If the user asks who you are, where you come from, where you are going, what you are for, or what kind of agent this is, use answer_opening_question topic=identity. "
+        "If the user asks what the Agent can do, use answer_opening_question topic=agent_capabilities. "
+        "If the user asks which chains, adapter families, RPC methods, or templates are supported, use answer_opening_question topic=supported_chains. "
+        "If the user asks a general framework capability question, use answer_opening_question topic=agent_capabilities. "
+        "If the user asks how to restart, clear previous config, start over, or begin from scratch without directly commanding it, use answer_opening_question topic=reset_help. "
+        "If the user directly asks to reset, clear previous config, start over, discard old config, or restart the Agent configuration, use reset_session. "
+        "If the user asks what this current prompt/menu/pending question means or is for, use answer_opening_question topic=current_context. "
         "If the user asks what is currently selected/configured, current chain, current mode, current settings, or current state, use answer_opening_question topic=current_config. "
         "If the user wants to quickly try/validate/run something but is unsure what to choose, use answer_opening_question topic=recommendation. "
         "If the user asks what they need to provide/prepare to run a benchmark, use answer_opening_question topic=requirements. "
         "If the user asks the workflow/steps/mode differences, use answer_opening_question topic=workflow or mode_comparison. "
+        "If the user asks how to measure QPS capacity, maximum throughput, saturation, or bottlenecks, use answer_opening_question topic=performance_benchmark_guidance unless they also explicitly selected a target mode. "
         "If the user says you misunderstood, asks whether you understood, says they do not understand, or asks what you mean, use answer_opening_question topic=correction. "
         "If the user asks an extension/custom RPC/new-chain question, use answer_opening_question topic=extension. "
-        "If the user pasted logs/errors/transcripts, use analyze_evidence. "
+        "If the user says they want to test another/different chain but does not provide the chain name, use change_group group=chain_identity. "
+        "If the user only asks whether you can analyze logs/errors but does not include the actual log/error content, use answer_opening_question topic=evidence_help. "
+        "If the user pasted actual logs/errors/transcripts, use analyze_evidence. "
         "If unsure, return unknown with a concise reason."
     )
 

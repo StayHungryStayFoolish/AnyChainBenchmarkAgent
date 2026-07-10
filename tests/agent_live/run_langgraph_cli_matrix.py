@@ -57,12 +57,18 @@ def _run_scenario(scenario: Scenario) -> list[str]:
         session_id = f"matrix-{scenario.name}"
         env = os.environ.copy()
         env["ANYCHAIN_AGENT_CHECKPOINT_PATH"] = str(checkpoint)
+        env["ANYCHAIN_AGENT_SESSION_ID"] = session_id
+        env["ANYCHAIN_AGENT_SESSION_PURPOSE"] = "live-matrix"
         command = [
             str(REPO_ROOT / "bin" / "anychain-agent"),
             "--state-file",
             str(state_file),
             "--session-id",
             session_id,
+            "--checkpoint-path",
+            str(checkpoint),
+            "--session-purpose",
+            "live-matrix",
         ]
         for prompt in scenario.prompts:
             command.extend(["--prompt", prompt])
@@ -77,11 +83,12 @@ def _run_scenario(scenario: Scenario) -> list[str]:
                 timeout=300,
                 check=False,
             )
-            transcript = proc.stdout
+            transcript = _transcript_header(scenario.name, session_id, state_file, checkpoint, "live-matrix") + proc.stdout
         except subprocess.TimeoutExpired as exc:
             transcript = exc.stdout or ""
             if isinstance(transcript, bytes):
                 transcript = transcript.decode("utf-8", errors="replace")
+            transcript = _transcript_header(scenario.name, session_id, state_file, checkpoint, "live-matrix") + str(transcript)
             log_dir = REPO_ROOT / ".agent" / "live-matrix"
             log_dir.mkdir(parents=True, exist_ok=True)
             transcript_file = log_dir / f"{scenario.name}.timeout.transcript.txt"
@@ -108,6 +115,16 @@ def _load_graph_state(session_id: str, checkpoint: Path) -> dict[str, Any]:
     snapshot = runtime.graph.get_state({"configurable": {"thread_id": session_id}})
     values = getattr(snapshot, "values", None) or {}
     return dict(values)
+
+
+def _transcript_header(scenario: str, session_id: str, state_file: Path, checkpoint: Path, purpose: str) -> str:
+    return (
+        f"# scenario: {scenario}\n"
+        f"# session_id: {session_id}\n"
+        f"# session_purpose: {purpose}\n"
+        f"# state_file: {state_file}\n"
+        f"# checkpoint_path: {checkpoint}\n\n"
+    )
 
 
 def _scenarios() -> list[Scenario]:

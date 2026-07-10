@@ -84,7 +84,15 @@ def main(argv: list[str] | None = None) -> int:
     elif args.prompt:
         state.language = detect_language(args.prompt[0], state.language)
     io = OutputOnlyIO() if args.prompt else TerminalIO()
-    app = AnyChainTerminal(state=state, store=store, io=io, session_id=args.session_id)
+    app = AnyChainTerminal(
+        state=state,
+        store=store,
+        io=io,
+        session_id=args.session_id,
+        checkpoint_path=args.checkpoint_path,
+        fresh_session=args.fresh_session,
+        session_purpose=args.session_purpose,
+    )
     if args.prompt:
         app.startup()
         for prompt in args.prompt:
@@ -101,11 +109,17 @@ class AnyChainTerminal:
         store: TerminalSessionStore | None = None,
         io: TerminalIO | OutputOnlyIO | None = None,
         session_id: str | None = None,
+        checkpoint_path: str | Path | None = None,
+        fresh_session: bool = False,
+        session_purpose: str = "user",
     ) -> None:
         self.state = state or TerminalSession()
         self.store = store or TerminalSessionStore()
         self.io = io or TerminalIO()
         self.session_id = session_id or DEFAULT_AGENT_SESSION_ID
+        self.checkpoint_path = Path(checkpoint_path) if checkpoint_path else None
+        self.fresh_session = bool(fresh_session)
+        self.session_purpose = session_purpose or "user"
         self._harness: AnyChainGraphRuntime | None = None
         self._startup_state: dict[str, Any] = {}
         self._llm_config = load_llm_config()
@@ -195,7 +209,10 @@ class AnyChainTerminal:
             self.state.current_question_id = ""
             self.state.pending_missing_dependencies = []
             self._ensure_harness()
-            self._offer_harness_resume_if_needed()
+            if self.fresh_session:
+                self._ensure_harness().reset(language=self.state.language)
+            else:
+                self._offer_harness_resume_if_needed()
         self.io.agent(self.state.language, t(self.state.language, "help"))
 
     def handle_user_text(self, text: str) -> None:
@@ -268,7 +285,7 @@ class AnyChainTerminal:
                 return True
             if lowered in {"2", "modify", "change"}:
                 self.state.current_question_id = ""
-                self._ensure_harness().update({"pending_question": {}, "active_group": "", "visible_response": []})
+                self._ensure_harness().update({"pending_question": {}, "evidence_collection": {}, "active_group": "", "visible_response": []})
                 self.io.agent(self.state.language, t(self.state.language, "resume_session_modify"))
                 return True
             if lowered in {"3", "clear", "reset", "fresh"}:
@@ -277,7 +294,11 @@ class AnyChainTerminal:
                 self.io.agent(self.state.language, t(self.state.language, "resume_session_clear"))
                 return True
             if not lowered.isdigit():
+                if _is_resume_session_explanation_request(lowered):
+                    self.io.agent(self.state.language, t(self.state.language, "resume_session_explain"))
+                    return True
                 self.state.current_question_id = ""
+                self._ensure_harness().update({"pending_question": {}, "evidence_collection": {}, "active_group": "", "visible_response": []})
                 return False
             self.io.agent(self.state.language, t(self.state.language, "resume_session_invalid"))
             return True
@@ -301,13 +322,23 @@ class AnyChainTerminal:
 
     def _ensure_harness(self) -> AnyChainGraphRuntime:
         if self._harness is None:
-            self._harness = AnyChainGraphRuntime(thread_id=self.session_id)
+            self._harness = AnyChainGraphRuntime(
+                thread_id=self.session_id,
+                checkpoint_path=self.checkpoint_path,
+                session_purpose=self.session_purpose,
+            )
         return self._harness
 
     def _offer_harness_resume_if_needed(self) -> None:
         if isinstance(self.io, OutputOnlyIO):
             return
         snapshot = self._ensure_harness().snapshot()
+        session = snapshot.get("session") or {}
+        snapshot_purpose = str(session.get("purpose") or "user")
+        if self.session_purpose == "user" and snapshot_purpose != "user":
+            return
+        if snapshot.get("evidence_collection"):
+            snapshot = self._ensure_harness().update({"evidence_collection": {}})
         if not _has_resumable_harness_state(snapshot):
             return
         self.state.current_question_id = "resume_harness_session"
@@ -438,6 +469,22 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=os.environ.get("ANYCHAIN_AGENT_SESSION_ID", DEFAULT_AGENT_SESSION_ID),
         help="Agent session id. Tests and live matrices should isolate it per scenario.",
     )
+    parser.add_argument(
+        "--checkpoint-path",
+        default=os.environ.get("ANYCHAIN_AGENT_CHECKPOINT_PATH"),
+        help="Use an explicit LangGraph checkpoint database. Tests must isolate this per scenario.",
+    )
+    parser.add_argument(
+        "--fresh-session",
+        action="store_true",
+        help="Reset the selected Harness thread before handling user turns.",
+    )
+    parser.add_argument(
+        "--session-purpose",
+        choices=["user", "chaos", "live-matrix", "dev"],
+        default=os.environ.get("ANYCHAIN_AGENT_SESSION_PURPOSE", "user"),
+        help="Label the runtime session so test/dev checkpoints cannot be resumed as user state.",
+    )
     return parser.parse_args(argv)
 
 
@@ -514,7 +561,9 @@ def _format_harness_resume_summary(snapshot: dict[str, Any]) -> str:
     pending = snapshot.get("pending_question") or {}
     qps = snapshot.get("qps_profile") or {}
     observability = snapshot.get("observability") or {}
+    session = snapshot.get("session") or {}
     lines = [
+        f"- session purpose: {session.get('purpose') or '<unknown>'}",
         f"- target_mode: {snapshot.get('target_mode') or '<not selected>'}",
         f"- workflow_mode: {snapshot.get('workflow_mode') or '<not selected>'}",
         f"- chain: {identity.get('canonical') or '<not selected>'}",
@@ -525,6 +574,25 @@ def _format_harness_resume_summary(snapshot: dict[str, Any]) -> str:
         f"- pending question: {pending.get('id') or '<none>'}",
     ]
     return "\n".join(lines)
+
+
+def _is_resume_session_explanation_request(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    return any(
+        marker in lowered
+        for marker in (
+            "这个",
+            "这是什么",
+            "什么意思",
+            "做什么",
+            "what is this",
+            "what does this mean",
+            "what is it",
+            "explain",
+        )
+    )
 
 
 def _known_value(value: Any) -> str:

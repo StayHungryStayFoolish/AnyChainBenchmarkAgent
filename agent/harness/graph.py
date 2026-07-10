@@ -8,7 +8,7 @@ from typing import Any
 from .checkpoints import create_sqlite_checkpointer, default_checkpoint_path
 from .nodes.router import route_after_user_turn
 from .groups import process_turn
-from .state import AgentGraphState, new_state
+from .state import AgentGraphState, ensure_session_metadata, new_state
 
 
 class AnyChainGraphRuntime:
@@ -19,8 +19,10 @@ class AnyChainGraphRuntime:
         thread_id: str,
         checkpoint_path: str | Path | None = None,
         checkpointer: Any | None = None,
+        session_purpose: str = "user",
     ) -> None:
         self.thread_id = thread_id
+        self.session_purpose = session_purpose or "user"
         self.checkpointer = checkpointer or create_sqlite_checkpointer(checkpoint_path or default_checkpoint_path())
         self.graph = build_graph(self.checkpointer)
 
@@ -31,6 +33,7 @@ class AnyChainGraphRuntime:
         if context:
             for key, value in context.items():
                 state[key] = value
+        state = ensure_session_metadata(state, self.thread_id, self.session_purpose)
         return self.graph.invoke(
             state,
             config={"configurable": {"thread_id": self.thread_id}},
@@ -40,11 +43,12 @@ class AnyChainGraphRuntime:
         return self._load_state(language="en")
 
     def reset(self, language: str = "en") -> AgentGraphState:
-        fresh = new_state(self.thread_id, language=language)
+        fresh = new_state(self.thread_id, language=language, session_purpose=self.session_purpose)
         return self.update(fresh)
 
     def update(self, patch: dict[str, Any]) -> AgentGraphState:
         config = {"configurable": {"thread_id": self.thread_id}}
+        patch = ensure_session_metadata(dict(patch), self.thread_id, self.session_purpose)
         self.graph.update_state(config, patch)
         snapshot = self.graph.get_state(config)
         values = getattr(snapshot, "values", None) or {}
@@ -56,10 +60,10 @@ class AnyChainGraphRuntime:
             snapshot = self.graph.get_state(config)
             values = getattr(snapshot, "values", None) or {}
             if values:
-                return dict(values)
+                return ensure_session_metadata(dict(values), self.thread_id, self.session_purpose)
         except Exception:
             pass
-        return new_state(self.thread_id, language=language)
+        return new_state(self.thread_id, language=language, session_purpose=self.session_purpose)
 
 
 def build_graph(checkpointer: Any) -> Any:

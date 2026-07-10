@@ -12,7 +12,7 @@ _TECHNICAL_SCALAR_RE = re.compile(
     r"^([A-Za-z_][A-Za-z0-9_.:/-]*\s*=\s*[^=,\s]+)(\s*[,，]\s*[A-Za-z_][A-Za-z0-9_.:/-]*\s*=\s*[^=,\s]+)*[,，;；]?$"
 )
 _CONFIG_FACT_RE = re.compile(
-    r"\b(region|zone|machine|ledger|accounts|network|bandwidth|iops|throughput|endpoint|qps|rpc|grafana|prometheus)\b|[A-Za-z_][A-Za-z0-9_.:/-]*\s*=",
+    r"\b(region|zone|machine|machine_type|ledger|accounts|storage|network|bandwidth|iops|throughput|endpoint|qps|rpc|grafana|prometheus)\b|[A-Za-z_][A-Za-z0-9_.:/-]*\s*[:=]",
     re.IGNORECASE,
 )
 _TECHNICAL_DOC_RE = re.compile(
@@ -20,7 +20,7 @@ _TECHNICAL_DOC_RE = re.compile(
     re.IGNORECASE,
 )
 _TECHNICAL_PASTE_RE = re.compile(
-    r"(^|\n)\s*(curl\b|--data\b|--header\b|response\s*:|request\s*:|traceback\b|\{|\[)",
+    r"(^|\n)\s*(curl\b|--data\b|--header\b|response\s*:|request\s*:|traceback\b|file\s+\"|file\s+'|\{|\[)",
     re.IGNORECASE,
 )
 
@@ -74,6 +74,7 @@ _ZH = {
     "resume_session_modify": "已保留已确认配置，并退出旧的待回答问题。请直接告诉我要修改哪一项，例如链、模式、磁盘、QPS、RPC 或可观测性。",
     "resume_session_clear": "已清空之前的 Agent 配置会话。请告诉我这次要测试什么，或先选择 fake-node / real-node / sync-observe。",
     "resume_session_invalid": "请回复 1、2 或 3：1 继续，2 修改已有配置，3 清空重新开始。",
+    "resume_session_explain": "这是上次未完成的 Agent 配置会话恢复菜单：\n1. 继续之前的配置：保留上次状态，从当前待确认项继续。\n2. 保留已确认配置，但修改某一项：清掉旧的待回答问题，你可以直接说要改链、模式、磁盘、QPS、RPC 或可观测性。\n3. 清空之前的配置，重新开始：丢弃上次 Agent 配置状态，重新选择测试目标。\n如果不确定，回复 `3` 最干净；如果想沿用上次配置，回复 `1`。",
     "resume_pending_next": "当前待确认：{prompt}",
     "resume_no_pending_next": "当前没有待确认问题，你可以继续描述目标或要修改的配置。",
     "startup_doctor_start": "正在启动时执行只读环境和依赖检查。",
@@ -133,6 +134,7 @@ _EN = {
     "resume_session_modify": "Kept confirmed values and cleared the old pending question. Tell me what to change, such as chain, mode, disk, QPS, RPC, or observability.",
     "resume_session_clear": "Cleared the previous Agent configuration session. Tell me what to test, or choose fake-node / real-node / sync-observe first.",
     "resume_session_invalid": "Reply with 1, 2, or 3: 1 continue, 2 modify existing config, 3 clear and start over.",
+    "resume_session_explain": "This is the previous unfinished Agent configuration session recovery menu:\n1. Continue: keep the previous state and resume from the current pending item.\n2. Keep confirmed values but change something: clear the old pending question, then tell me what to change, such as chain, mode, disk, QPS, RPC, or observability.\n3. Clear and start over: discard the previous Agent configuration state and choose a new test target.\nIf unsure, reply `3` for the cleanest start; reply `1` to continue the previous setup.",
     "resume_pending_next": "Current pending question: {prompt}",
     "resume_no_pending_next": "There is no pending question. Continue describing the goal or the configuration to change.",
     "startup_doctor_start": "Running startup read-only environment and dependency diagnostics.",
