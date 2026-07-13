@@ -29,8 +29,8 @@ KEY_CODE_PATHS = [
     },
     {
         "topic": "benchmark_orchestration",
-        "paths": ["agent/harness", "agent/adk_app/root_agent.py", "agent/adk_app/tools", "agent/validators", "agent/planners", "agent/runners"],
-        "purpose": "LangGraph Harness orchestration, ADK model/tool bridge, deterministic validation gates, plan generation, runtime.env preparation, preflight, smoke, and jobs.",
+        "paths": ["agent/harness", "agent/tools/executor.py", "agent/validators", "agent/planners", "agent/runners"],
+        "purpose": "LangGraph Harness orchestration, the CLI tool-dispatch surface, deterministic validation gates, plan generation, runtime.env preparation, preflight, smoke, and jobs.",
     },
     {
         "topic": "chain_templates",

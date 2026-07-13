@@ -27,13 +27,47 @@ CHAINS_DIR = REPO_ROOT / "config" / "chains"
 EVIDENCE_DIR = REPO_ROOT / ".agent" / "evidence" / "endpoint-probes"
 DEFAULT_ADDRESS = "0x0000000000000000000000000000000000000000"
 
-# The generic (eth_*-style) JSON-RPC probe applies to the canonical `jsonrpc`
-# adapter family. Earlier code matched non-canonical aliases
-# (`evm`/`ethereum`/`ethereum_jsonrpc`) that the adapter-family taxonomy never
-# produces — free-text like "EVM" is normalized to `jsonrpc` upstream, and chain
-# templates store `jsonrpc` — so this set is aligned with the canonical
-# `onboarding.families.SUPPORTED_FAMILIES` taxonomy (audit Finding C3).
-GENERIC_JSONRPC_PROBE_FAMILIES = {"jsonrpc"}
+# The generic (single-POST-JSON-RPC-call) probe applies to adapter families
+# whose RPC transport is a plain `{"jsonrpc": "2.0", "method": ..., "params":
+# ...}` POST body — `jsonrpc` (EVM/non-EVM), `substrate` (Substrate's own
+# JSON-RPC, e.g. `system_chain`), and `bitcoin_jsonrpc` (Bitcoin-Core-style
+# RPC, e.g. `getblockchaininfo`). `rest`/`tendermint`/`hedera_dual` are
+# GET-path/REST-shaped transports the generic probe does not build requests
+# for; they are excluded here deliberately, not by oversight (see
+# `NEW_CHAIN_SAFE_HEALTH_METHOD`'s docstring and known-issues.md).
+GENERIC_JSONRPC_PROBE_FAMILIES = {"jsonrpc", "substrate", "bitcoin_jsonrpc"}
+
+# A safe, parameter-less method usable to sanity-check a brand-new chain's
+# endpoint before any chain template exists for it (Case 2: "new chain in an
+# existing adapter family"). Populated only for families whose generic probe
+# is a plain POST JSON-RPC call (see `GENERIC_JSONRPC_PROBE_FAMILIES`) and
+# that have one universally-supported such method across real chains in the
+# family. `bitcoin_jsonrpc`'s `getblockchaininfo` matches the `health_probe`
+# every existing bitcoin_jsonrpc template already declares in `_meta`.
+NEW_CHAIN_SAFE_HEALTH_METHOD = {
+    "jsonrpc": "eth_chainId",
+    "substrate": "system_chain",
+    "bitcoin_jsonrpc": "getblockchaininfo",
+}
+
+# Families whose RPC transport is GET-path/REST-shaped rather than a plain
+# POST JSON-RPC call. The generic JSON-RPC probe above cannot serve these; a
+# separate generic REST probe (below) builds GET/POST HTTP requests instead.
+REST_SHAPED_FAMILIES = {"rest", "tendermint", "hedera_dual"}
+
+# Like `NEW_CHAIN_SAFE_HEALTH_METHOD` but for REST-shaped families: a
+# parameter-less GET path usable to sanity-check a template-less chain's
+# endpoint. Only `tendermint` has one that is genuinely universal across real
+# chains in the family -- essentially every Cosmos-SDK chain exposes the
+# SDK's own `/cosmos/base/tendermint/...` gRPC-gateway REST module regardless
+# of the chain's own app-specific API surface (confirmed live on cosmos-hub
+# and Juno). `rest`/`hedera_dual` chains are too heterogeneous (Algorand,
+# Aptos, Cardano, Tezos, TON, Hedera's mirror node... each has a completely
+# different REST API) for any single path to be safe to assume; those two
+# fall back to `_probe_bare_reachability` instead (see `validate_rpc_endpoint`).
+NEW_CHAIN_SAFE_REST_HEALTH_METHOD = {
+    "tendermint": "GET /cosmos/base/tendermint/v1beta1/blocks/latest",
+}
 
 
 def validate_rpc_endpoint(
@@ -90,6 +124,31 @@ def validate_rpc_endpoint(
             method_params=method_params,
             timeout=timeout,
         )
+    if _should_use_generic_rest_probe(chain, result["transport"], selected_methods):
+        return _validate_generic_rest_endpoint(
+            result,
+            endpoint=endpoint,
+            methods=selected_methods,
+            method_params=method_params,
+            timeout=timeout,
+        )
+    if not _chain_template_exists(chain) and not selected_methods and result["transport"] in REST_SHAPED_FAMILIES:
+        safe_rest_method = NEW_CHAIN_SAFE_REST_HEALTH_METHOD.get(result["transport"])
+        if safe_rest_method:
+            return _validate_generic_rest_endpoint(
+                result,
+                endpoint=endpoint,
+                methods=[safe_rest_method],
+                method_params={},
+                timeout=timeout,
+            )
+        # No family-wide safe path exists (`rest`/`hedera_dual` are too
+        # heterogeneous). Fall back to a bare reachability check rather than
+        # the template-requiring adapter path below, which would crash
+        # (`FileNotFoundError`) for a chain with no `config/chains/<chain>.json`
+        # -- Case 2's defining condition. A real method is validated next, once
+        # the user supplies one.
+        return _validate_bare_reachability(result, endpoint=endpoint, timeout=timeout)
 
     health = _probe_health(chain, endpoint, timeout)
     result["safe_method"] = str(health.get("rpc_method") or health.get("name") or "endpoint_health_probe")
@@ -203,6 +262,152 @@ def _probe_generic_jsonrpc_method(
         response_shape_hash=_response_shape_hash(sample),
         response_sample=sample[:512],
     )
+
+
+def _should_use_generic_rest_probe(chain: str, adapter_family: str, methods: list[str]) -> bool:
+    """Mirror of `_should_use_generic_jsonrpc_probe` for GET-path/REST methods.
+
+    A templated chain already goes through the correct per-chain adapter
+    (`_probe_health`/`_probe_method`, which knows the chain's real REST param
+    formats); this only applies to a template-less chain (Case 2) whose
+    user-supplied method(s) are themselves `GET /path`-shaped.
+    """
+
+    if _chain_template_exists(chain):
+        return False
+    if adapter_family not in REST_SHAPED_FAMILIES:
+        return False
+    return bool(methods) and all(_looks_like_rest_method(method) for method in methods)
+
+
+def _looks_like_rest_method(value: str) -> bool:
+    return bool(re.match(r"^(GET|POST|PUT|PATCH|DELETE)\s+/", (value or "").strip(), re.IGNORECASE))
+
+
+def _split_rest_method(method: str) -> tuple[str, str]:
+    match = re.match(r"^(GET|POST|PUT|PATCH|DELETE)\s+(/\S*)", method.strip(), re.IGNORECASE)
+    if not match:
+        return "GET", method.strip()
+    return match.group(1).upper(), match.group(2)
+
+
+def _fill_rest_path_placeholders(path: str, params: Any) -> str:
+    """Substitute `{placeholder}` path segments with the schema-evidence value.
+
+    A genuinely new chain has no known address/id format, so this trusts
+    whatever the user supplied as schema evidence (the same trust model
+    `_probe_generic_jsonrpc_method` already applies to JSON-RPC `params`)
+    rather than guessing a chain-specific sample value. A single scalar
+    param fills the first placeholder; a list fills placeholders in order.
+    Query-string placeholders (e.g. `?account.id={addr}`) are filled the
+    same way as path placeholders.
+    """
+
+    values: list[str] = []
+    if isinstance(params, list):
+        values = [str(item) for item in params]
+    elif isinstance(params, (str, int, float)) and str(params):
+        values = [str(params)]
+    if not values:
+        return path
+
+    def _replace(_match: re.Match) -> str:
+        return values.pop(0) if values else _match.group(0)
+
+    return re.sub(r"\{[^{}]+\}", _replace, path)
+
+
+def _validate_generic_rest_endpoint(
+    result: dict[str, Any],
+    *,
+    endpoint: str,
+    methods: list[str],
+    method_params: dict[str, Any],
+    timeout: float,
+) -> dict[str, Any]:
+    selected_methods = list(dict.fromkeys([method.strip() for method in methods if method.strip()]))[:5]
+    result["transport"] = result.get("transport") or "rest"
+    result["selected_methods"] = selected_methods
+    result["selected_method"] = selected_methods[0] if selected_methods else ""
+    if not selected_methods:
+        result["blockers"].append("generic REST validation requires at least one GET/POST path")
+        return _finalize_result(result)
+    health_method = selected_methods[0]
+    result["safe_method"] = health_method
+    result["checks"].append(_probe_generic_rest_method(endpoint, health_method, method_params, timeout, name="endpoint_health_probe"))
+    for method in selected_methods:
+        result["checks"].append(_probe_generic_rest_method(endpoint, method, method_params, timeout))
+    failed = [item for item in result["checks"] if not item.get("passed")]
+    result["ready"] = not failed
+    result["blockers"].extend(f"{item.get('name')}: {item.get('detail')}" for item in failed)
+    if result["ready"]:
+        result["warnings"].append(
+            "generic REST probe passed for an unsupported chain; create a reviewed job-local chain override or chain template before benchmark execution"
+        )
+    return _finalize_result(result)
+
+
+def _probe_generic_rest_method(
+    endpoint: str,
+    method: str,
+    method_params: dict[str, Any],
+    timeout: float,
+    *,
+    name: str | None = None,
+) -> dict[str, Any]:
+    http_method, path = _split_rest_method(method)
+    params = method_params.get(method, [])
+    filled_path = _fill_rest_path_placeholders(path, params)
+    url = endpoint.rstrip("/") + filled_path
+    request_data = {"method": http_method, "url": url, "headers": {}, "body": ""}
+    status, sample = _call_request(request_data, timeout)
+    return _check(
+        name or f"method_probe:{method}",
+        _acceptable_status(status, sample),
+        f"status={status}, sample={sample[:160]}",
+        rpc_method=method,
+        params=redact(params),
+        http_status=status,
+        response_shape_hash=_response_shape_hash(sample),
+        response_sample=sample[:512],
+    )
+
+
+def _validate_bare_reachability(result: dict[str, Any], *, endpoint: str, timeout: float) -> dict[str, Any]:
+    """Minimal sanity check for a template-less chain in a REST-shaped family
+
+    with no single safe path known across the whole family (`rest`/
+    `hedera_dual` -- Algorand, Aptos, Cardano, Tezos, TON, Hedera's mirror
+    node all expose completely different REST APIs). Accepts *any* completed
+    HTTP response (2xx through 5xx) as "the server is alive"; a genuine
+    protocol/method-level check happens once the user supplies a real method,
+    via `_validate_generic_rest_endpoint` above. This only needs to catch a
+    dead host, a typo'd domain, or the wrong protocol -- not validate the
+    chain's actual API, which the untemplated chain's protocol is not yet
+    known well enough to do.
+    """
+
+    result["transport"] = result.get("transport") or "rest"
+    result["safe_method"] = "endpoint_health_probe"
+    status, sample = _call_request({"method": "GET", "url": endpoint, "headers": {}, "body": ""}, timeout)
+    reachable = isinstance(status, int)
+    check = _check(
+        "endpoint_health_probe",
+        reachable,
+        f"status={status}, sample={sample[:160]}",
+        http_status=status,
+        response_shape_hash=_response_shape_hash(sample),
+        response_sample=sample[:512],
+    )
+    result["checks"].append(check)
+    result["ready"] = reachable
+    if not reachable:
+        result["blockers"].append(f"endpoint_health_probe: {check['detail']}")
+    else:
+        result["warnings"].append(
+            "bare reachability check only (no chain-specific method validated yet); provide a real method next to validate the actual API"
+        )
+    return _finalize_result(result)
 
 
 def _probe_health(chain: str, endpoint: str, timeout: float) -> dict[str, Any]:
@@ -482,13 +687,24 @@ def health_probe_methods(chain: str, adapter_family: str) -> tuple[list[str] | N
     `jsonrpc`-transport chain is EVM (`eth_chainId`), which wrongly rejects
     non-EVM jsonrpc chains (solana/sui/near/starknet/tron/avalanche-x). Returns
     (None, {}) so the probe falls back to the adapter's own per-chain health check
-    when no param-less method is declared. For a new jsonrpc chain with no
-    template yet, `eth_chainId` is a safe EVM-family default.
+    when no param-less method is declared. For a brand-new chain with no
+    template yet (Case 2), falls back to `NEW_CHAIN_SAFE_HEALTH_METHOD`'s
+    per-family default when one exists.
+
+    Restricting this to `GENERIC_JSONRPC_PROBE_FAMILIES` families is load-bearing,
+    not incidental: for any other family, a template-less chain has no methods
+    here, `_should_use_generic_jsonrpc_probe` cannot pick the generic path, and
+    `validate_rpc_endpoint` falls through to the template-requiring
+    `_probe_health`/`_probe_method` (`tools/chain_adapters/cli.py`), which raises
+    `FileNotFoundError` for a chain with no `config/chains/<chain>.json` -- i.e.
+    Case 2 endpoint validation was structurally unable to ever pass for any
+    family without an entry here (found live testing a genuinely new `substrate`
+    chain, Moonriver, against `substrate`'s DEFAULT_GROUP_ORDER path).
     """
 
     chain = (chain or "").strip().lower()
     adapter_family = (adapter_family or "").strip().lower()
-    if adapter_family != "jsonrpc":
+    if adapter_family not in GENERIC_JSONRPC_PROBE_FAMILIES:
         return None, {}
     hp = _chain_meta(chain).get("health_probe")
     hp = hp if isinstance(hp, dict) else {}
@@ -497,7 +713,10 @@ def health_probe_methods(chain: str, adapter_family: str) -> tuple[list[str] | N
         return [method], {method: list(hp.get("params") or [])}
     if _chain_template_exists(chain):
         return None, {}
-    return ["eth_chainId"], {"eth_chainId": []}
+    safe_method = NEW_CHAIN_SAFE_HEALTH_METHOD.get(adapter_family)
+    if not safe_method:
+        return None, {}
+    return [safe_method], {safe_method: []}
 
 
 def _response_shape_hash(sample: str) -> str:

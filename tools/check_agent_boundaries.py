@@ -48,78 +48,9 @@ TERMINAL_FORBIDDEN = [
     "workflows.transition_executor",
 ]
 
-RUNNER_BRIDGE_FORBIDDEN = [
-    "build_terminal_turn_prompt",
-    "build_root_agent",
-    "workflow_tool_session",
-    "workflows.conversation_state",
-    "google.genai",
-    "run_async(",
-    "state_delta",
-    "terminal_presenter",
-    "present_terminal_text",
-    "_run_with_runner_retry",
-    "_format_terminal_envelope_if_needed",
-    "_needs_terminal_envelope_formatting",
-    "_contains_process_narration",
-    "_terminal_formatter_system_prompt",
-    "provider.complete(",
-    "process_openers",
-    "_LEADING_PROCESS",
-    "language == \"zh\"",
-    "language == 'zh'",
-]
-
-WORKFLOW_TOOL_FORBIDDEN = [
-    "_safe_discovery_summary",
-    "process_openers",
-    "_LEADING_PROCESS",
-]
-
-ADK_ROOT_FORBIDDEN = [
-    "callbacks",
-    "build_domain_agents",
-    "before_tool_callback",
-    "after_model_callback",
-    "sub_agents",
-    "ROOT_INSTRUCTION",
-]
-
-ADK_REGISTRY_FORBIDDEN = [
-    "workflow_state",
-    "get_workflow_state_tools",
-]
-
 HARNESS_FORBIDDEN_MARKERS = [
     "adk_app",
 ]
-
-ADK_DIAGNOSTIC_FILES = {
-    "agent/adk_app/runtime.py": [
-        "AnyChainGraphRuntime",
-        "process_turn",
-        "agent.harness",
-        "harness.graph",
-        "harness.groups",
-    ],
-    "agent/adk_app/workflow/native_smoke.py": [
-        "AnyChainGraphRuntime",
-        "process_turn",
-        "agent.harness",
-        "harness.graph",
-        "harness.groups",
-    ],
-    "agent/adk_app/workflow/schemas.py": [
-        "AnyChainGraphRuntime",
-        "process_turn",
-        "agent.harness",
-        "harness.graph",
-        "harness.groups",
-        "pending_question",
-        "confirmed_config",
-        "action_queue",
-    ],
-}
 
 PURE_METADATA_FILES = {
     "agent/workflows/group_registry.py": [
@@ -178,37 +109,9 @@ def main() -> int:
             if needle in text:
                 failures.append(f"terminal must not contain business router marker {needle!r}: {terminal}")
 
-    presenter = root / "agent" / "adk_app" / "terminal_presenter.py"
-    if presenter.exists():
-        failures.append(f"obsolete terminal presenter file must not exist: {presenter}")
-
-    runner_bridge = root / "agent" / "adk_app" / "runner_bridge.py"
-    if runner_bridge.exists():
-        text = runner_bridge.read_text(encoding="utf-8", errors="replace")
-        for needle in RUNNER_BRIDGE_FORBIDDEN:
-            if needle in text:
-                failures.append(f"runner bridge must not call terminal presenter rewrite marker {needle!r}: {runner_bridge}")
-
-    workflow_tools = root / "agent" / "adk_app" / "tools" / "workflow_state.py"
-    if workflow_tools.exists():
-        text = workflow_tools.read_text(encoding="utf-8", errors="replace")
-        for needle in WORKFLOW_TOOL_FORBIDDEN:
-            if needle in text:
-                failures.append(f"workflow-state tools must not contain output phrase-repair marker {needle!r}: {workflow_tools}")
-
-    adk_root = root / "agent" / "adk_app" / "root_agent.py"
-    if adk_root.exists():
-        text = adk_root.read_text(encoding="utf-8", errors="replace")
-        for needle in ADK_ROOT_FORBIDDEN:
-            if needle in text:
-                failures.append(f"ADK root agent must not expose retired workflow control marker {needle!r}: {adk_root}")
-
-    adk_registry = root / "agent" / "adk_app" / "tools" / "registry.py"
-    if adk_registry.exists():
-        text = adk_registry.read_text(encoding="utf-8", errors="replace")
-        for needle in ADK_REGISTRY_FORBIDDEN:
-            if needle in text:
-                failures.append(f"ADK tool registry must not expose retired workflow-state tools marker {needle!r}: {adk_registry}")
+    adk_app_dir = root / "agent" / "adk_app"
+    if adk_app_dir.exists():
+        failures.append(f"agent.adk_app was fully retired (see agent/llm/search_grounding.py); must not exist: {adk_app_dir}")
 
     harness_dir = root / "agent" / "harness"
     for path in sorted(harness_dir.rglob("*.py")):
@@ -216,14 +119,6 @@ def main() -> int:
         for needle in HARNESS_FORBIDDEN_MARKERS:
             if needle in text:
                 failures.append(f"Harness must not depend on the ADK bridge layer, found {needle!r}: {path}")
-
-    for rel, needles in ADK_DIAGNOSTIC_FILES.items():
-        path = root / rel
-        if path.exists():
-            text = path.read_text(encoding="utf-8", errors="replace")
-            for needle in needles:
-                if needle in text:
-                    failures.append(f"ADK diagnostic file must not own product workflow marker {needle!r}: {path}")
 
     for rel, needles in PURE_METADATA_FILES.items():
         path = root / rel

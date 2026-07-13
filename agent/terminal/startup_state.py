@@ -1,4 +1,4 @@
-"""ADK session-state adapter backed by AnyChain runtime artifacts."""
+"""REPL startup state: safe, file-backed job state for session/process restarts."""
 
 from __future__ import annotations
 
@@ -14,10 +14,10 @@ except ImportError:  # script execution with agent/ on sys.path
 def load_startup_state(
     jobs_dir: str | Path = ".agent/jobs",
 ) -> dict[str, Any]:
-    """Load safe job state for ADK tools and runtime startup.
+    """Load safe job state for terminal startup.
 
     The returned state is intentionally file-backed so long-running benchmark
-    jobs can outlive the terminal session or ADK process.
+    jobs can outlive the terminal session or process restart.
     """
     latest = _latest_job_state(jobs_dir)
     return {
@@ -26,19 +26,6 @@ def load_startup_state(
         "resume_available": bool(latest),
         "next_actions": _startup_next_actions(latest),
     }
-
-
-def preserved_state_for_adk(state: dict[str, Any]) -> dict[str, Any]:
-    """Extract job-critical values that should be rehydrated into ADK state."""
-    preserved: dict[str, Any] = {}
-    latest = state.get("latest_job") or {}
-    if latest:
-        preserved.setdefault("job_id", latest.get("job_id", ""))
-        preserved.setdefault("job_status", latest.get("status", ""))
-        preserved.setdefault("runtime_env_file", latest.get("runtime_env_file", ""))
-        preserved.setdefault("artifact_index", latest.get("artifact_index", ""))
-        preserved.setdefault("plan_file", latest.get("plan_file", ""))
-    return {key: value for key, value in preserved.items() if value not in ("", None)}
 
 
 def _latest_job_state(jobs_dir: str | Path) -> dict[str, Any]:

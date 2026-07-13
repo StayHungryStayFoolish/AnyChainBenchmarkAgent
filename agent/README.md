@@ -10,8 +10,11 @@ The human-facing product entrypoint is:
 The product terminal owns stable input/output, language detection, startup
 diagnostics, dependency-installation consent, and job recovery commands. The
 benchmark workflow itself is owned by the LangGraph Harness in
-`agent/harness/`. Google ADK remains available as the model/tool surface for
-Gemini and Google capabilities, but it must not own product workflow state.
+`agent/harness/`. The Harness's own model calls are plain OpenAI-compatible
+HTTP requests for every provider (OpenAI, DeepSeek, and Gemini on Vertex
+alike) — Google ADK is used for exactly one optional capability, Gemini
+`google_search` grounding (`agent/llm/search_grounding.py`), and must not own
+product workflow state or a second conversation loop.
 
 ## Development Gate
 
@@ -66,6 +69,7 @@ Core groups:
 - `accounts_disk`
 - `network`
 - `endpoint_process`
+- `chain_auxiliary_endpoints`
 - `workload_rpc`
 - `target_samples_fixtures`
 - `qps_profile`
@@ -92,8 +96,11 @@ analysis.
 - `terminal/repl.py`: product terminal shell and job command integration.
 - `terminal/io.py`, `terminal/language.py`, `terminal/job_commands.py`: stable
   terminal support code.
-- `adk_app/root_agent.py`: ADK model/tool bridge only.
-- `adk_app/tools/`: ADK function-tool wrappers around deterministic modules.
+- `llm/search_grounding.py`: the sole `google-adk` consumer — Gemini
+  `google_search` grounding, called as a plain function from `harness/groups.py`.
+- `tools/executor.py`, `tools/schema.py`: the one programmatic tool-dispatch
+  surface for `agent/cli.py tool-call`/`tool-schema` (CI and enterprise
+  platform integration), calling the same deterministic modules directly.
 - `workflows/group_registry.py`, `workflows/requirements.py`: shared
   requirement metadata still consumed by validators.
 - `validators/`, `planners/`, `runners/`, `analyzers/`, `knowledge/`,
@@ -104,34 +111,32 @@ Retired files must not return:
 
 - `agent/workflows/conversation_state.py`
 - `agent/workflows/transition_executor.py`
-- `agent/adk_app/callbacks.py`
-- `agent/adk_app/agents/domain.py`
-- `agent/adk_app/tools/workflow_state.py`
-- `agent/adk_app/workflow/product_context.py`
 - `agent/terminal/input_classifier.py`
 - `agent/terminal/pending_answers.py`
+- `agent/adk_app/` (the entire package — an ADK-native `Agent`/`Runner`
+  tool-calling surface that duplicated the Harness's conversation loop and
+  was never the shipped product's entrypoint; its two genuinely-needed pieces
+  moved to `agent/diagnostics/adk_status.py` and
+  `agent/terminal/startup_state.py`, and its `google_search` capability moved
+  to `agent/llm/search_grounding.py`)
 
 ## Boundary Notes
 
-Some files remain for compatibility, diagnostics, or shared metadata. They are
-allowed only within these boundaries:
+Some files remain for compatibility or shared metadata. They are allowed only
+within these boundaries:
 
-- `adk_app/agent.py`: ADK discovery wrapper; it must only expose `root_agent`.
-- `adk_app/runtime.py`: developer diagnostic bridge for official `adk run`;
-  it is not the product terminal and must not process user benchmark turns.
-- `adk_app/runner_bridge.py`: ADK runner availability checks only; no model
-  calls, terminal text rewriting, or workflow state mutation.
-- `adk_app/workflow/native_smoke.py`: credential-free ADK runtime smoke only;
-  it is not product acceptance for multi-turn terminal behavior.
-- `adk_app/workflow/schemas.py`: eval/schema diagnostics only; it must not
-  define or execute the product workflow state machine.
+- `llm/search_grounding.py`: the only file that may import `google.adk`; it
+  must stay a plain function callable from Harness code (no persistent
+  Agent/Runner, no second conversation loop, no workflow state mutation).
 - `workflows/group_registry.py` and `workflows/requirements.py`: pure metadata
   for validators and Harness checks; no user-text parsing, no state mutation,
-  and no terminal rendering.
+  and no terminal rendering. `group_registry.py`'s `GROUP_ORDER` must be
+  imported from `harness/state.py::DEFAULT_GROUP_ORDER`, never a separately
+  hand-typed copy.
 
 If a future change needs product workflow control, add it to `harness/` or the
-deterministic domain modules it invokes. Do not route product behavior through
-ADK compatibility files or terminal helpers.
+deterministic domain modules it invokes. Do not build a second Agent/Runner
+tool-calling loop to do it.
 
 ## Runtime Use
 
@@ -185,7 +190,6 @@ Run the core no-credential contract checks:
 ```bash
 python3 tools/check_agent_boundaries.py --root .
 python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract tests.test_agent_langgraph_harness
-python3 agent/cli.py adk-eval
 ```
 
 Run live CLI matrix tests with configured LLM credentials:
@@ -205,7 +209,6 @@ platforms:
 
 ```bash
 python3 agent/cli.py adk-status
-python3 agent/cli.py adk-eval
 python3 agent/cli.py capabilities
 python3 agent/cli.py doctor --format json
 python3 agent/cli.py plan --request request.json --out plan.json

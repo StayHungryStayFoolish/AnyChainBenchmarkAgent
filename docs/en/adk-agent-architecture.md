@@ -2,9 +2,13 @@
 
 AnyChain Agent is a LangGraph Harness-based product agent that controls the
 blockchain-node-benchmark engine. The Harness owns workflow state, group
-routing, fallback ordering, validation gates, and execution decisions. Google
-ADK is an optional model/tool bridge; it must not own a second benchmark wizard
-or mutate workflow state outside the Harness.
+routing, fallback ordering, validation gates, and execution decisions. The
+Harness's own model calls are plain OpenAI-compatible HTTP requests for every
+provider (OpenAI, DeepSeek, and Gemini on Vertex alike); Google ADK is used
+for exactly one optional capability, Gemini `google_search` grounding
+(`agent/llm/search_grounding.py`), called as a plain function from Harness
+code. It must never own a second benchmark wizard, a second conversation
+loop, or mutate workflow state outside the Harness.
 
 ## Architecture Overview
 
@@ -104,8 +108,11 @@ artifacts through deterministic tools.
 ADK `google_search` is intentionally narrow:
 
 - enabled only for Gemini with Google authentication and an ADK runtime that
-  exposes the tool;
-- mounted only on the Chain/RPC Onboarding Agent;
+  exposes the tool (`agent/llm/search_grounding.py::web_research_status`);
+- invoked only as a scoped, single-query function call
+  (`run_google_search_grounding`) from specific Harness call sites (currently
+  real-node client setup) — never a persistent Agent/Runner or a second
+  conversation loop;
 - used for unsupported chain and custom RPC research;
 - official documentation is preferred;
 - search evidence does not replace endpoint tests, fixture recording, template
@@ -147,7 +154,6 @@ Then run relevant checks:
 ```bash
 python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract tests.test_agent_langgraph_harness
 python3 tools/check_agent_boundaries.py --root .
-python3 agent/cli.py adk-eval
 git diff --check
 ```
 

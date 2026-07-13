@@ -142,6 +142,7 @@ def _action_queue_prompt() -> str:
         "If the user asks to jump to RPC/QPS/disk/network/observability/report/logs, use change_group with the closest allowed group. "
         "Even if the sentence contains go back/previous/return, when it names a configuration area such as RPC, QPS, disk, network, observability, report, or logs, use change_group instead of go_back. "
         "Use go_back only when the user asks for a generic previous step and does not name an area. "
+        "If the current pending question is custom_rpc_endpoint or new_chain_endpoint (validating a custom RPC method's endpoint, or a new/unsupported chain's endpoint) and the user wants to cancel, give up, abandon this method, or stop trying to validate it (e.g. 算了/取消/放弃/不弄了/never mind/forget it/stop this), use go_back if no area is named, or change_group group=workload_rpc when they mention workload/method/RPC; never re-render the same endpoint question as if their words were an attempted endpoint. "
         "Use set_rpc_mode only when the user clearly selects single or mixed. "
         "Use set_qps_mode only when the user explicitly says quick, standard, or intensive. "
         "If the user wants to configure or adjust QPS but does not name quick/standard/intensive, use change_group group=qps_profile instead. "
@@ -403,9 +404,8 @@ def _chain_identity_prompt() -> str:
         "whether it is just a typo/partial alias for a known chain, and what adapter family it likely uses. "
         "Do not claim certainty if unsure. "
         f"Allowed adapter_family values: {', '.join(ADAPTER_FAMILIES + ['unsupported', 'unknown'])}. "
-        "If the current provider can use Google Search, set needs_google_search=true when fresh official verification is required. "
         "Schema: {chain_exists:boolean|null, canonical_chain_name:string, adapter_family:string, possible_known_chain:string, "
-        "needs_google_search:boolean, evidence_summary:string, confidence:'low'|'medium'|'high'}."
+        "evidence_summary:string, confidence:'low'|'medium'|'high'}."
     )
 
 
@@ -457,7 +457,8 @@ def _rpc_schema_prompt() -> str:
         "transport:'jsonrpc'|'rest'|'unknown', method:string, endpoint_url:string, rest_path:string, http_method:string, "
         "params:[{index:number,name:string,type:string,meaning:string,example:any,required:boolean}], "
         "params_json:any, response_summary:string, response_fields:[{name:string,type:string,meaning:string}], "
-        "auth_notes:string, rate_limit_notes:string, conflicts:[string], confidence:'low'|'medium'|'high', reason:string}."
+        "auth_notes:string, rate_limit_notes:string, conflicts:[string], confidence:'low'|'medium'|'high', reason:string, "
+        "evidence_summary:string}."
     )
 
 

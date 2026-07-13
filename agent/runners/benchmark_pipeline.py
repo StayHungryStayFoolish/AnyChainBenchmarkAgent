@@ -1,12 +1,11 @@
 """Shared benchmark preparation/execution pipeline.
 
-Both the ADK tool bridge (`agent/adk_app/tools/{planning,actions}.py`) and the
+Both the CLI tool-dispatch surface (`agent/tools/executor.py`) and the
 LangGraph Harness (`agent/harness/nodes/execution.py`) call these functions
 directly, so the plan/preflight/smoke business logic lives in exactly one
-place instead of being reached backwards through the ADK bridge from the
-Harness. The ADK wrappers add only LLM-facing tool docstrings and the
-`approved`/`_confirmation_required` gate; the Harness calls straight in since
-it already gates approval itself via its own graph state.
+place. `executor.py` adds the `approved`/confirmation gate for its callers;
+the Harness calls straight in since it already gates approval itself via its
+own graph state.
 """
 
 from __future__ import annotations
@@ -75,7 +74,7 @@ def prepare_benchmark_run(
     workflow_type: str = "",
     sync_observe_stop_condition: str = "",
     sync_observe_duration_seconds: int | None = None,
-    sync_observe_local_attribution: bool = True,
+    sync_observe_source: str = "",
     exporter_port: str = "",
     prometheus_port: str = "",
     grafana_port: str = "",
@@ -131,7 +130,7 @@ def prepare_benchmark_run(
         workflow_type=workflow_type,
         sync_observe_stop_condition=sync_observe_stop_condition,
         sync_observe_duration_seconds=sync_observe_duration_seconds,
-        sync_observe_local_attribution=sync_observe_local_attribution,
+        sync_observe_source=sync_observe_source,
         exporter_port=exporter_port,
         prometheus_port=prometheus_port,
         grafana_port=grafana_port,
@@ -295,7 +294,7 @@ def _structured_request(
     workflow_type: str,
     sync_observe_stop_condition: str,
     sync_observe_duration_seconds: int | None,
-    sync_observe_local_attribution: bool,
+    sync_observe_source: str,
     exporter_port: str,
     prometheus_port: str,
     grafana_port: str,
@@ -423,7 +422,8 @@ def _structured_request(
     if workflow_type:
         request["workflow_type"] = workflow_type
         request["run_mode"] = workflow_type
-        request["sync_observe_local_attribution"] = sync_observe_local_attribution
+    if sync_observe_source:
+        request["sync_observe_source"] = sync_observe_source
     if sync_observe_stop_condition:
         request["sync_observe_stop_condition"] = sync_observe_stop_condition
     if sync_observe_duration_seconds is not None:

@@ -16,11 +16,11 @@ from urllib import request as urlrequest
 try:
     from .artifacts import write_artifact_index
     from .guardrails import build_benchmark_command, validate_execution_plan
-    from .materialize import load_runtime_env_file, materialize_runtime_env
+    from .materialize import benchmark_subprocess_env, load_runtime_env_file, materialize_runtime_env
 except ImportError:  # script execution with agent/ on sys.path
     from runners.artifacts import write_artifact_index
     from runners.guardrails import build_benchmark_command, validate_execution_plan
-    from runners.materialize import load_runtime_env_file, materialize_runtime_env
+    from runners.materialize import benchmark_subprocess_env, load_runtime_env_file, materialize_runtime_env
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_JOBS_DIR = REPO_ROOT / ".agent" / "jobs"
@@ -102,7 +102,7 @@ def submit_job(
         completed = subprocess.run(
             build_benchmark_command(plan["execution"]["command"]),
             cwd=plan["execution"].get("working_dir", str(REPO_ROOT)),
-            env={**os.environ, **env},
+            env=benchmark_subprocess_env(env),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,

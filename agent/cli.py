@@ -12,11 +12,7 @@ from analyzers.result_analyzer import analyze_job
 from analyzers.history import compare_latest, list_history
 from analyzers.artifact_qa import answer_artifact_question
 from analyzers.bottleneck_rules import diagnose_artifacts
-from adk_app.app import status_payload as adk_status_payload
-from adk_app.compat import adk_feature_report
-from adk_app.workflow.native_smoke import run_native_workflow_smoke
-from adk_app.evals.runner import run_offline_evals as run_adk_offline_evals
-from adk_app.runtime import run_adk_cli
+from diagnostics.adk_status import adk_status
 from diagnostics.doctor import run_doctor
 from discovery.environment import discover_environment
 from knowledge.gap_analyzer import analyze_capability_gap
@@ -26,6 +22,7 @@ from knowledge.loader import load_knowledge_provider, provider_status
 from llm.config import load_llm_config
 from llm.google_auth import credential_plan
 from llm.providers import provider_from_config
+from llm.search_grounding import web_research_status
 from llm.types import LLMMessage, LLMRequest
 from onboarding.chain_onboarding import generate_onboarding_package
 from onboarding.template_drafter import draft_chain_template
@@ -111,8 +108,6 @@ def main(argv: list[str] | None = None) -> int:
     tool_call.add_argument("--name", required=True)
     tool_call.add_argument("--arguments", default="{}", help="JSON object or path to a JSON file")
 
-    sub.add_parser("adk-native-smoke", help="Run a credential-free native google-adk Workflow smoke test")
-
     validate = sub.add_parser("validate-plan", help="Validate plan shape")
     validate.add_argument("plan")
 
@@ -160,19 +155,8 @@ def main(argv: list[str] | None = None) -> int:
     runbook.add_argument("--plan", required=True)
     runbook.add_argument("--output")
 
-    adk_run = sub.add_parser("adk-run", help="Developer diagnostic: run the official ADK CLI")
-    adk_run.add_argument("--prompt", help="Send one prompt to the ADK CLI through stdin, then exit")
-    adk_run.add_argument("--agent-dir", default=None)
-    adk_run.add_argument("--adk-bin", default="adk")
-    adk_run.add_argument("adk_arg", nargs=argparse.REMAINDER)
-
-    adk_status_cmd = sub.add_parser("adk-status", help="Show optional ADK runtime availability")
+    adk_status_cmd = sub.add_parser("adk-status", help="Show optional google_search grounding availability")
     adk_status_cmd.add_argument("--output")
-
-    adk_feature_cmd = sub.add_parser("adk-feature-report", help="Show offline-safe Google ADK feature compatibility")
-    adk_feature_cmd.add_argument("--output")
-
-    sub.add_parser("adk-eval", help="Run no-key ADK package and tool-contract checks")
 
     args = parser.parse_args(argv)
 
@@ -290,10 +274,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "tool-call":
         return _emit(execute_tool(args.name, load_arguments(args.arguments)), None)
 
-    if args.command == "adk-native-smoke":
-        payload = run_native_workflow_smoke()
-        return _emit(payload, None)
-
     if args.command == "validate-plan":
         errors = validate_plan_shape(load_json(args.plan))
         payload = {"valid": not errors, "errors": errors}
@@ -340,27 +320,13 @@ def main(argv: list[str] | None = None) -> int:
         print(text, end="")
         return 0
 
-    if args.command == "adk-run":
-        runtime_args: list[str] = []
-        if args.prompt:
-            runtime_args.extend(["--prompt", args.prompt])
-        if args.agent_dir:
-            runtime_args.extend(["--agent-dir", args.agent_dir])
-        if args.adk_bin:
-            runtime_args.extend(["--adk-bin", args.adk_bin])
-        runtime_args.extend(args.adk_arg or [])
-        return run_adk_cli(runtime_args)
-
     if args.command == "adk-status":
-        return _emit(adk_status_payload(), args.output)
-
-    if args.command == "adk-feature-report":
-        return _emit(adk_feature_report(), args.output)
-
-    if args.command == "adk-eval":
-        payload = run_adk_offline_evals()
-        _emit(payload, None)
-        return 0 if payload["status"] == "passed" else 1
+        status = adk_status().as_dict()
+        payload = {
+            "adk_package": status,
+            "google_search_grounding": web_research_status().as_dict(),
+        }
+        return _emit(payload, args.output)
 
     parser.error(f"unsupported command: {args.command}")
     return 2

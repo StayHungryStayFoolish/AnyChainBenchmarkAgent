@@ -16,8 +16,11 @@ LangGraph Harness，可以把用户测试目标转换成可验证的 plan，执�
 压测执行面仍然是确定性的：Vegeta、RPC proxy、监控 collector、fake-node、报告生成
 和归档是事实来源。面向用户的产品 workflow 由 LangGraph Harness 拥有：它负责
 checkpoint state、typed intent 路由、配置 group、fallback 顺序、validator gate 和
-执行决策。Google ADK 只是 Gemini/Google 能力的可选模型与工具 bridge，不拥有第二套
-benchmark wizard。模型只能把模糊自然语言解析成 typed Harness action，不能直接执行命令。
+执行决策。Harness 自身的模型调用对所有 provider（OpenAI、DeepSeek、Vertex 上的
+Gemini）统一走 OpenAI 兼容的 HTTP 请求；Google ADK 只用于唯一一项可选能力——
+真实节点客户端准备流程中的 Gemini `google_search` 联网检索（见
+`agent/llm/search_grounding.py`），绝不拥有第二套 benchmark wizard 或对话循环。
+模型只能把模糊自然语言解析成 typed Harness action，不能直接执行命令。
 
 ## 目录
 
@@ -290,8 +293,8 @@ chain、RPC URL、磁盘、机器类型等 benchmark 信息可以先不配置。
 ### 5. 启动 Agent
 
 启动 Agent。该命令会打开 AnyChain 产品终端。LangGraph Harness 负责 workflow state、
-group 路由、校验和执行确认；Google ADK 只是可选模型/工具 bridge，不会把原始
-`adk run` 终端 UI 暴露给用户：
+group 路由、校验和执行确认；Google ADK 只用于可选的 Gemini `google_search`
+联网检索能力：
 
 ```bash
 ./bin/anychain-agent

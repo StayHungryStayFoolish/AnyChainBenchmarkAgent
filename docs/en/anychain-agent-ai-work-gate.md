@@ -180,19 +180,22 @@ smoke, or user approval gates.
 The current high-risk areas that must be reviewed before more Agent code
 repair are:
 
-- `agent/adk_app/terminal_presenter.py` and
-  `agent/adk_app/terminal_contract.py`: must not exist. Broad LLM rewrite,
-  regex phrase-repair, and standalone terminal prompt wrapper behavior belong
+- `agent/adk_app/`: must not exist, in whole. The entire package was an
+  ADK-native `Agent`/`Runner` tool-calling surface that duplicated the
+  Harness's conversation loop and was never the shipped product's entrypoint
+  (see `agent/README.md`'s "Retired files must not return"). Broad LLM
+  rewrite, regex phrase-repair, or a standalone conversation loop belong
   nowhere in the product path. Product behavior should be fixed in Harness
-  prompts/instructions, typed state, tools, callbacks, and validators.
+  prompts/instructions, typed state, tools, and validators. The one exception
+  is `agent/llm/search_grounding.py`, the sole permitted `google-adk`
+  consumer (optional Gemini `google_search` grounding, called as a plain
+  function from Harness code — never a second conversation loop).
 - `agent/terminal/repl.py`: may keep exact terminal controls and safe I/O, but
   must not contain benchmark-domain intent routing or field extraction.
 - `agent/harness/`: must remain the single product workflow runtime. LangGraph
   checkpoint state, typed pending questions, group transitions, validators,
   rollback/jump behavior, and next-blocking-group selection belong here.
   Retired file-backed workflow state machines must not return.
-- `agent/adk_app/workflow/schemas.py`: must not stay limited to a thin intent
-  enum if workflow transitions depend on richer structured state.
 - `agent/tools/schema.py`, `agent/tools/executor.py`, and
   `agent/runners/job_manager.py`: any `mock` lifecycle support must be removed
   from the product Agent execution path. If it remains for developer or
@@ -200,9 +203,6 @@ repair are:
   support and unreachable from normal terminal benchmark flows. User-facing
   smoke must be complete traffic, proxy, monitoring, report, archive, and
   artifact discovery.
-- `agent/adk_app/workflow/native_smoke.py` and `agent/adk_app/evals/runner.py`:
-  developer contract tests only. They cannot be used as product acceptance for
-  terminal multi-turn behavior.
 
 Preserve deterministic domain tools unless a concrete replacement exists:
 `agent/discovery`, `agent/diagnostics`, `agent/planners`, `agent/validators`,
@@ -692,7 +692,6 @@ workflow changes, run:
 ```bash
 python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract tests.test_agent_langgraph_harness
 python3 tools/check_agent_boundaries.py --root .
-python3 agent/cli.py adk-eval
 git diff --check
 ```
 

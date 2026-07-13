@@ -1,14 +1,18 @@
-# Optional ADK runtime dependencies.
+# Optional Agent runtime dependencies.
 #
 # Install in an isolated virtual environment. Do not install into the host
 # Python used by blockchain nodes.
 #
-# Google ADK runtime dependencies emit warnings on Python 3.9. Use Python 3.10+
-# for ADK runtime testing and production Agent usage.
+# The LangGraph Harness (the product's actual conversation loop) needs only
+# langgraph/langgraph-checkpoint-sqlite/openai/prompt-toolkit below — it makes
+# plain OpenAI-compatible HTTP calls for every provider, including DeepSeek
+# and Gemini on Vertex. google-adk is needed for exactly one optional
+# capability: Gemini `google_search` grounding (see
+# agent/llm/search_grounding.py). Google ADK emits warnings on Python 3.9;
+# use Python 3.10+ for ADK runtime testing and production Agent usage.
 
 google-adk
 langgraph
 langgraph-checkpoint-sqlite
-litellm
 openai
 prompt-toolkit

@@ -93,7 +93,6 @@ Run before any fix and again after any fix:
 ```bash
 python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract tests.test_agent_langgraph_harness
 python3 tools/check_agent_boundaries.py --root .
-python3 agent/cli.py adk-eval
 git diff --check
 ```
 
@@ -563,9 +562,9 @@ Expected:
 If a scenario fails twice, inspect the redacted logs and fix the smallest
 responsible code path:
 
-- prompt or agent instruction issue: `agent/adk_app/instructions.py`;
+- ambiguous-intent resolver issue: `agent/harness/intent.py`;
 - deterministic guard or tool issue: `agent/validators/` or
-  `agent/adk_app/tools/`;
+  `agent/tools/executor.py`;
 - terminal UX issue: `agent/terminal/`;
 - workflow state issue: `agent/harness/`;
 - live matrix gap: `tests/agent_live/run_langgraph_cli_matrix.py`;

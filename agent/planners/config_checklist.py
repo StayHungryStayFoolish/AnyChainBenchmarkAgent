@@ -36,6 +36,19 @@ SYNC_OBSERVE_REQUIRED = {field.key: field.description for field in field_specs_f
 
 SYNC_OBSERVE_OPTIONAL = {field.key: field.description for field in field_specs_for("sync_observe") if not field.required}
 
+# Per-`sync_observe_source` waived requirements. `endpoint_only` watches a
+# remote node -- there is no local process, so `node_process_identity` (local
+# CPU/thread attribution) cannot and need not be provided. `demo_only` has
+# neither a local process nor a real endpoint at all, so it also waives
+# `mainnet_rpc_url_reviewed` (there is no real mainnet RPC to have reviewed).
+# `existing_local_node`/`client_setup` need both genuinely satisfied (and
+# `client_setup` is never the terminal source at preflight time -- it always
+# transitions to one of the other three before reaching this checklist).
+SYNC_OBSERVE_SOURCE_WAIVERS: dict[str, set[str]] = {
+    "endpoint_only": {"node_process_identity"},
+    "demo_only": {"node_process_identity", "mainnet_rpc_url_reviewed"},
+}
+
 ENVIRONMENT_REVIEW = {
     "cloud_provider": "Detected cloud provider: gcp, aws, azure, or other.",
     "deployment_platform": "Detected runtime platform: GCE, EC2, GKE, EKS, self-hosted Kubernetes, Docker/container, or VM.",
@@ -67,13 +80,9 @@ def build_configuration_checklist(request: dict[str, Any], plan: dict[str, Any])
 
     benchmark_items = []
     if workload_type == "sync_observe":
-        local_attribution = bool(request_values.get("sync_observe_local_attribution", True))
+        waived = SYNC_OBSERVE_SOURCE_WAIVERS.get(str(request_values.get("sync_observe_source") or ""), set())
         for key, description in SYNC_OBSERVE_REQUIRED.items():
-            # Endpoint-only sync-observe watches a remote node: there is no local
-            # process, so node_process_identity (local CPU/thread attribution)
-            # cannot and need not be provided. Requiring it would deadlock a flow
-            # that never asks for it.
-            if key == "node_process_identity" and not local_attribution:
+            if key in waived:
                 benchmark_items.append(_item(key, description, True, "info"))
                 continue
             benchmark_items.append(_item(key, description, _is_present(key, request_values.get(key)), "blocker"))
@@ -174,7 +183,7 @@ def _flatten_request_values(request: dict[str, Any], plan: dict[str, Any]) -> di
         "network_interface": request.get("network_interface") or materialized.get("NETWORK_INTERFACE"),
         "network_max_bandwidth_gbps": request.get("network_max_bandwidth_gbps") or materialized.get("NETWORK_MAX_BANDWIDTH_GBPS"),
         "sync_observe_stop_condition": request.get("sync_observe_stop_condition") or materialized.get("SYNC_OBSERVE_STOP_CONDITION"),
-        "sync_observe_local_attribution": request.get("sync_observe_local_attribution", True),
+        "sync_observe_source": request.get("sync_observe_source", ""),
         "node_prometheus_metrics_url": request.get("node_prometheus_metrics_url") or materialized.get("NODE_PROMETHEUS_METRICS_URL"),
         "node_process_identity": (
             request.get("node_process_pid")

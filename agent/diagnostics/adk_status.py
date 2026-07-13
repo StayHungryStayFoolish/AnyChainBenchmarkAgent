@@ -1,4 +1,11 @@
-"""ADK availability and model integration helpers."""
+"""Optional google-adk package availability probe.
+
+Google ADK is used for exactly one thing in this codebase: the optional
+Gemini `google_search` grounding capability (see `agent/llm/search_grounding.py`).
+This module only reports whether the package is importable, for the REPL
+startup banner and `agent/cli.py adk-status` — it never constructs an ADK
+Agent/Runner itself.
+"""
 
 from __future__ import annotations
 

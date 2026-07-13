@@ -249,6 +249,172 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("ok", sample)
 
+    def test_new_chain_endpoint_validation_works_for_generic_pop_families_without_a_template(self) -> None:
+        """Case 2 ("new chain in an existing adapter family") was structurally
+
+        broken for every family except `jsonrpc`: `health_probe_methods`
+        returned `(None, {})` for any other family, so a template-less chain
+        (Case 2's defining condition -- it has no `config/chains/<chain>.json`
+        yet) ended up with zero probe methods. `_should_use_generic_jsonrpc_probe`
+        then fell through to the template-requiring `_probe_health`/
+        `_probe_method` path (`tools/chain_adapters/cli.py health-probe`),
+        which raises `FileNotFoundError` for a chain with no template --
+        Case 2 endpoint validation could never pass for `substrate`,
+        `bitcoin_jsonrpc`, `tendermint`, `rest`, or `hedera_dual`, regardless
+        of the real endpoint's health. Found live testing a genuinely new
+        `substrate` chain (Moonriver) end to end against a real public RPC.
+
+        Fixed for the two families whose transport is a plain POST JSON-RPC
+        call (`substrate`, `bitcoin_jsonrpc`) by giving `health_probe_methods`
+        a safe universal fallback method for a template-less chain, same as
+        the existing `jsonrpc`/`eth_chainId` design.
+        `tendermint`/`rest`/`hedera_dual` are GET/REST-shaped transports the
+        generic probe does not build requests for; left as an open item
+        (known-issues.md) rather than rushed into this fix.
+        """
+
+        import json
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        from agent.validators.endpoint_probe import health_probe_methods, validate_rpc_endpoint
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                length = int(self.headers.get("Content-Length") or 0)
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                body = json.dumps({"jsonrpc": "2.0", "id": payload.get("id", 1), "result": f"ok:{payload.get('method')}"}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args: Any) -> None:  # noqa: D401
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), _Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        endpoint = f"http://127.0.0.1:{server.server_port}/"
+        try:
+            for chain, family, expected_method in (
+                ("moonriver-unit-test", "substrate", "system_chain"),
+                ("dash-unit-test", "bitcoin_jsonrpc", "getblockchaininfo"),
+            ):
+                methods, params = health_probe_methods(chain, family)
+                self.assertEqual(methods, [expected_method], family)
+                result = validate_rpc_endpoint(
+                    chain=chain,
+                    endpoint=endpoint,
+                    methods=methods,
+                    adapter_family=family,
+                    method_params=params,
+                    timeout=3.0,
+                )
+                self.assertTrue(result["ready"], f"{family}: {result.get('blockers')}")
+                self.assertEqual(result["status"], "ok")
+        finally:
+            server.shutdown()
+            thread.join(timeout=2)
+
+    def test_new_chain_endpoint_validation_works_for_rest_shaped_families_without_a_template(self) -> None:
+        """B.25 (known-issues.md): Case 2 endpoint validation for the
+
+        GET-path/REST-shaped families (`rest`/`tendermint`/`hedera_dual`) was
+        left unfixed by the POST-JSON-RPC fix above, since the generic
+        JSON-RPC prober cannot build GET requests. Found live testing two
+        genuinely new chains: Juno (`tendermint`, `https://juno-api.polkachu.com`)
+        and Stellar (`rest`, `https://horizon.stellar.org`) both reproduced the
+        identical `CalledProcessError`/`FileNotFoundError` crash.
+
+        Fixed with a family-tiered strategy: `tendermint` gets a genuinely
+        universal safe default (`GET /cosmos/base/tendermint/v1beta1/blocks/latest`,
+        present on every Cosmos-SDK chain's own SDK-provided REST module,
+        confirmed live on cosmos-hub and Juno); `rest`/`hedera_dual` have no
+        such universal path (Algorand/Aptos/Cardano/Tezos/TON/Hedera all speak
+        completely different REST APIs) and fall back to a bare reachability
+        check instead of crashing. Once the user supplies a real GET/POST
+        method (the natural next step for any of the three families), the new
+        generic REST prober validates it directly.
+        """
+
+        import json
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        from agent.validators.endpoint_probe import validate_rpc_endpoint
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path == "/cosmos/base/tendermint/v1beta1/blocks/latest":
+                    body = json.dumps({"block": {"header": {"height": "123"}}}).encode()
+                    self.send_response(200)
+                elif self.path == "/cosmos/staking/v1beta1/pool":
+                    body = json.dumps({"pool": {"bonded_tokens": "1"}}).encode()
+                    self.send_response(200)
+                elif self.path == "/v2/accounts/ABC123":
+                    body = json.dumps({"address": "ABC123"}).encode()
+                    self.send_response(200)
+                else:
+                    body = b"not found"
+                    self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args: Any) -> None:  # noqa: D401
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), _Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        endpoint = f"http://127.0.0.1:{server.server_port}"
+        try:
+            # tendermint: the universal safe default health path succeeds.
+            result = validate_rpc_endpoint(chain="juno-unit-test", endpoint=endpoint, adapter_family="tendermint", timeout=3.0)
+            self.assertTrue(result["ready"], result.get("blockers"))
+            self.assertEqual(result["selected_method"], "GET /cosmos/base/tendermint/v1beta1/blocks/latest")
+
+            # rest (no universal default): a bare reachability check succeeds
+            # even against a path this server 404s -- "the server responded"
+            # is the whole point, not "this exact path exists."
+            result = validate_rpc_endpoint(chain="stellar-unit-test", endpoint=endpoint, adapter_family="rest", timeout=3.0)
+            self.assertTrue(result["ready"], result.get("blockers"))
+            self.assertIn("bare reachability", " ".join(result.get("warnings") or []))
+
+            # hedera_dual: same bare-reachability fallback as rest.
+            result = validate_rpc_endpoint(chain="hedera-dual-unit-test", endpoint=endpoint, adapter_family="hedera_dual", timeout=3.0)
+            self.assertTrue(result["ready"], result.get("blockers"))
+
+            # A user-supplied custom GET method on a template-less tendermint
+            # chain validates via the generic REST prober, not a crash.
+            result = validate_rpc_endpoint(
+                chain="juno-unit-test",
+                endpoint=endpoint,
+                methods=["GET /cosmos/staking/v1beta1/pool"],
+                adapter_family="tendermint",
+                method_params={},
+                timeout=3.0,
+            )
+            self.assertTrue(result["ready"], result.get("blockers"))
+
+            # Same for a template-less `rest` chain with a path placeholder,
+            # filled from schema-evidence-style params.
+            result = validate_rpc_endpoint(
+                chain="algorand-clone-unit-test",
+                endpoint=endpoint,
+                methods=["GET /v2/accounts/{address}"],
+                adapter_family="rest",
+                method_params={"GET /v2/accounts/{address}": ["ABC123"]},
+                timeout=3.0,
+            )
+            self.assertTrue(result["ready"], result.get("blockers"))
+        finally:
+            server.shutdown()
+            thread.join(timeout=2)
+
     def test_target_mode_choice_asks_chain_before_provider_values(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
 
@@ -375,6 +541,85 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         self.assertEqual(result.get("target_mode"), "")
         self.assertEqual(result["pending_question"]["id"], "opening_next_action")
         self.assertEqual(len(result["completed_actions"]), 2)
+
+    def test_opening_menu_info_option_shows_capability_content_not_a_dead_loop(self) -> None:
+        """Selecting the opening menu's 4th numbered option ("learn supported
+
+        chains, RPC methods, and extension paths", value `"info"`) used to be
+        a complete dead loop: `group == "opening"`'s handler set `active_group`
+        to `report_artifact_analysis` but never appended any content, and
+        since `target_mode` was still unset, the very same turn's
+        `_ask_next_blocking_question` call recomputed the next group via
+        routing and got "opening" again (routing's first check is `if not
+        target_mode: return "opening"`) -- the user saw the identical opening
+        menu again with zero information ever shown, repeatable indefinitely.
+
+        The free-text equivalent (the `ask_capabilities` action, e.g. "what
+        chains do you support") already rendered real content correctly; this
+        was two disconnected code paths for the same stated capability, only
+        one of which worked. Found via live manual testing (not caught by
+        prior dual-AI chaos: chaos turns were consistently generated as
+        free-text stress cases for the LLM resolver, never as a literal
+        numbered-menu selection of a purely informational option).
+        """
+
+        from agent.harness.groups import process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("unit-thread", language="zh")
+        state["active_group"] = "opening"
+        state["pending_question"] = {
+            "id": "opening_next_action",
+            "group": "opening",
+            "kind": "numbered_choice",
+            "field": "target_mode",
+            "options": [
+                {"label": "启动 fake-node 测试", "value": "fake-node"},
+                {"label": "启动 real-node 测试", "value": "real-node"},
+                {"label": "观察节点同步", "value": "sync-observe"},
+                {"label": "了解支持的链、RPC method 和二次开发方式", "value": "info"},
+            ],
+            "manual_input_allowed": False,
+        }
+        state["last_user_input"] = "4"
+        result = process_turn(state)
+
+        visible = "\n".join(result.get("visible_response") or [])
+        self.assertIn("当前框架", visible)
+        self.assertEqual(result.get("target_mode"), "")
+        # Content was shown and the turn stopped -- it must not have silently
+        # re-rendered the identical opening menu a second time in this same
+        # response (the old dead-loop behavior).
+        self.assertEqual(visible.count("了解支持的链"), 0)
+
+        # The natural next step is still correctly "opening" (unchanged target
+        # mode), so the next real turn will offer the same menu again -- this
+        # one-time info display must not have permanently broken navigation.
+        from agent.harness.groups import _next_group
+        self.assertEqual(_next_group(result), "opening")
+
+    def test_opening_menu_sync_observe_label_names_the_framework_term(self) -> None:
+        """Found live via user manual testing (2026-07-13): the opening
+
+        target-mode menu's fake-node/real-node options keep the literal
+        framework term in their Chinese label ("启动 fake-node 测试", "启动
+        real-node 测试"), but the sync-observe option was fully translated
+        away as "观察节点同步" with no mention of `sync-observe` anywhere --
+        inconsistent with the other two options, and confusing because every
+        other place in the harness (prompts, status dumps, docs) refers to
+        this mode by its literal name. Fixed so all three mode options name
+        their framework term consistently.
+        """
+
+        from agent.harness.groups import process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("unit-thread", language="zh")
+        result = process_turn(state)
+        pending = result.get("pending_question") or {}
+        labels = [str(option.get("label") or "") for option in pending.get("options") or []]
+        sync_observe_label = next((label for label in labels if "sync-observe" in label), "")
+        self.assertTrue(sync_observe_label, f"no sync-observe option named the term: {labels}")
 
     def test_analyze_report_action_returns_visible_job_entrypoint(self) -> None:
         from agent.harness.groups import process_turn
@@ -1203,6 +1448,57 @@ network:
         self.assertEqual(result["sync_observe"]["source"], "demo_only")
         self.assertEqual(result["pending_question"]["id"], "CLOUD_REGION")
 
+    def test_sync_observe_demo_ack_auto_executes_instead_of_asking_real_only_questions(self) -> None:
+        """Live-found design gap (2026-07-13, user manual testing, fixed per
+
+        explicit user direction): `stop_condition` (run-until-stopped/fixed
+        duration/stop-when-synced) and `duration_seconds` only make sense for
+        a real, indefinite-length sync process -- there is none for a
+        plumbing-only demo. The old flow still asked the user to pick among
+        them, then observability, then advanced tuning, before finally
+        routing through the *same* preflight/submit path as a real
+        observation -- so "just a demo" quietly submitted a real job with
+        nothing real to observe, after 4 extra questions whose semantics did
+        not apply. Fixed so confirming the demo disclaimer auto-fills safe
+        internal defaults for all four and runs preflight/smoke immediately.
+        """
+
+        from unittest.mock import patch
+
+        from agent.harness.groups import process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("unit-thread", language="zh")
+        state["target_mode"] = "sync-observe"
+        state["workflow_mode"] = "sync_observe"
+        state["chain_identity"] = {"raw": "bsc", "canonical": "bsc", "adapter_family": "jsonrpc", "status": "confirmed", "case": "known"}
+        state["confirmed_config"] = {"BLOCKCHAIN_NODE": "bsc"}
+        state["sync_observe"] = {"source": "demo_only"}
+        state["active_group"] = "sync_observe"
+        state["pending_question"] = {
+            "id": "sync_observe_demo_ack",
+            "group": "sync_observe",
+            "kind": "yes_no",
+            "field": "sync_observe_demo_ack",
+            "options": [{"label": "Y", "value": True}, {"label": "N", "value": False}],
+            "manual_input_allowed": False,
+        }
+        state["last_user_input"] = "y"
+
+        with patch("agent.harness.groups.run_approved_preflight_and_smoke") as run_preflight:
+            run_preflight.side_effect = lambda s: s
+            result = process_turn(state)
+
+        run_preflight.assert_called_once()
+        self.assertEqual(result["sync_observe"]["stop_condition"], "duration")
+        self.assertEqual(result["sync_observe"]["duration_seconds"], 60)
+        self.assertEqual(result["observability"]["mode"], "disabled")
+        self.assertTrue(result["advanced_tuning"]["confirmed"])
+        self.assertTrue(result["preflight"]["approved"])
+        # The disclaimer text must still reach the user even though
+        # execution was auto-triggered in the same turn.
+        self.assertIn("只做 sync-observe 流程 demo", "\n".join(result.get("visible_response") or []))
+
     def test_paused_action_queue_resumes_after_confirmation(self) -> None:
         from agent.harness.groups import process_turn
         from agent.harness.state import new_state
@@ -1544,6 +1840,41 @@ network:
             r2 = process_turn(r)
         self.assertEqual((r2.get("confirmed_config") or {}).get("CLOUD_REGION"), "asia-east1")
 
+    def test_optional_chain_auxiliary_field_accepts_plain_english_decline(self) -> None:
+        """B.18 (known-issues.md): an optional `chain_auxiliary_endpoints`
+
+        field (e.g. `RPC_API_KEY`, described to the user as optional) rejected
+        a plain-English decline ("skip it, I don't have one") as "that reply
+        does not look like an answer", while the bare word "none" was
+        accepted immediately after -- `_is_plain_scalar_answer`'s "single
+        word, no punctuation" gate has no natural-language matching, unlike
+        the broader NL matching `has_accounts_device` already used
+        (`_text_mentions_no_accounts_disk`/`_text_mentions_yes_accounts_disk`).
+        Fixed by mirroring that same pattern for optional auxiliary fields.
+        """
+
+        from agent.harness.groups import _question_for_group, process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("t", language="en")
+        state["target_mode"] = "real-node"
+        state["workflow_mode"] = "rpc_benchmark"
+        state["chain_identity"] = {"raw": "dogecoin", "canonical": "dogecoin", "status": "confirmed", "case": "known"}
+        state["active_group"] = "chain_auxiliary_endpoints"
+
+        question = _question_for_group(state, "chain_auxiliary_endpoints")
+        self.assertEqual(question["id"], "RPC_API_KEY")
+        self.assertEqual(question["kind"], "manual_value")
+
+        state["pending_question"] = question
+        state["last_user_input"] = "skip it, I don't have one"
+        with patch("agent.harness.groups.resolve_action_queue", return_value={"actions": []}):
+            result = process_turn(state)
+
+        self.assertEqual((result.get("confirmed_config") or {}).get("RPC_API_KEY"), "none")
+        # It must not have stored the user's literal sentence as the "key".
+        self.assertNotIn("skip", str((result.get("confirmed_config") or {}).get("RPC_API_KEY") or ""))
+
     def test_config_field_explanation_answers_from_runtime_contract(self) -> None:
         """Asking what a config field means / whether it affects results must be
 
@@ -1686,6 +2017,80 @@ network:
                 label = _reason_label(reason, language)
                 self.assertNotIn(forbidden, label)
                 self.assertTrue(label.strip())
+
+    def test_execution_status_prefers_live_job_status_over_stale_snapshot(self) -> None:
+        """B.20 (known-issues.md): `_execution_status` read `state["job"]`,
+
+        a one-time snapshot written at submission time
+        (`agent/harness/nodes/execution.py`) and never refreshed. A
+        `current_config`/status-dump response could claim `job_running` for a
+        job that had actually long since finished, contradicting the
+        deterministic `status`/`jobs`/`logs` commands (which already read
+        correctly from disk via `job_manager`). Fixed by looking up the live
+        on-disk status by `job_id` via `job_manager.get_job` and preferring it
+        over the stale snapshot.
+        """
+
+        from unittest.mock import patch
+
+        from agent.harness.oracle import compute_next_action
+
+        state = {"job": {"job_id": "job_demo", "status": "running"}}
+        with patch("agent.harness.oracle.get_job", return_value={"status": "failed"}):
+            action = compute_next_action(state)
+        self.assertEqual(action.execution_status, "job_failed")
+
+        # If the live lookup fails (e.g. the job directory is gone), fall
+        # back to the snapshot rather than raising.
+        with patch("agent.harness.oracle.get_job", side_effect=FileNotFoundError("gone")):
+            action = compute_next_action(state)
+        self.assertEqual(action.execution_status, "job_running")
+
+    def test_config_status_not_forced_complete_by_a_stale_unrelated_job(self) -> None:
+        """Live-found regression (2026-07-13, user manual testing): `job`/
+
+        `latest_job_id` deliberately survive a full reset
+        (`RESET_PRESERVED_KEYS`) so `analyze_report`/`status` keep working for
+        the last completed job. `compute_next_action` used to force
+        `config_status` to "complete" whenever `execution_status` showed any
+        job status at all, with no check that the job belonged to the
+        in-progress workflow -- so a brand-new sync-observe setup with a
+        leftover `job_failed` from an earlier, unrelated run reported
+        `config_status: complete` in the same response that also named a real
+        unmet next blocking question (`choose sync-observe stop condition`),
+        a directly self-contradictory status dump.
+        """
+
+        from unittest.mock import patch
+
+        from agent.harness.oracle import compute_next_action
+
+        state = {
+            "target_mode": "sync-observe",
+            "workflow_mode": "sync_observe",
+            "chain_identity": {"status": "confirmed", "canonical": "bsc"},
+            "confirmed_config": {
+                "CLOUD_REGION": "us-central1",
+                "CLOUD_ZONE": "us-central1-a",
+                "MACHINE_TYPE": "e2-standard-4",
+                "LEDGER_DEVICE": "sda",
+                "DATA_VOL_TYPE": "pd-ssd",
+                "DATA_VOL_SIZE": "10",
+                "DATA_VOL_MAX_IOPS": "3000",
+                "DATA_VOL_MAX_THROUGHPUT": "125",
+                "has_accounts_device": False,
+                "NETWORK_INTERFACE": "ens4",
+                "NETWORK_MAX_BANDWIDTH_GBPS": "10",
+            },
+            "sync_observe": {"source": "demo_only", "demo_acknowledged": True},
+            "job": {"job_id": "job_old_unrelated", "status": "failed"},
+        }
+        with patch("agent.harness.oracle.get_job", return_value={"status": "failed"}):
+            action = compute_next_action(state)
+        self.assertEqual(action.execution_status, "job_failed")
+        self.assertEqual(action.config_status, "incomplete")
+        self.assertEqual(action.next_blocking_group, "sync_observe")
+        self.assertTrue(action.blockers)
 
     def test_endpoint_question_context_explains_field_not_generic_state_dump(self) -> None:
         """"Why do I need this field, can I skip it" for LOCAL_RPC_URL/
@@ -2189,6 +2594,37 @@ network:
         self.assertIsNotNone(question)
         self.assertEqual(question["id"], "LOCAL_RPC_URL")
 
+    def test_custom_rpc_schema_failure_reprompts_for_schema_evidence(self) -> None:
+        """B.22 (known-issues.md): a custom-RPC schema validation failure must
+
+        leave a real re-ask question active, not just a bare error message.
+        `_validate_rpc_schema` used to write `custom_rpc["params"]` *before*
+        knowing whether validation would succeed, and never cleared it on
+        failure. The `custom_rpc_schema_evidence` question only renders while
+        `"params" not in custom_rpc`, so a single failed attempt permanently
+        defeated that gate for the rest of the session -- recoverable only by
+        chance (free-text routing), never via a formal pending question.
+        """
+
+        from unittest.mock import patch
+
+        from agent.harness.groups import _question_for_group, _validate_rpc_schema
+        from agent.harness.state import new_state
+
+        state = new_state("unit-thread", language="zh")
+        state["target_mode"] = "real-node"
+        state["workflow_mode"] = "rpc_benchmark"
+        state["chain_identity"] = {"raw": "bsc", "canonical": "bsc", "adapter_family": "jsonrpc", "status": "confirmed", "case": "known"}
+        state["custom_rpc"] = {"status": "needs_schema_evidence", "endpoint": "https://bsc-rpc.publicnode.com", "endpoint_ready": True, "method": "eth_getBalance"}
+
+        with patch("agent.harness.groups.validate_rpc_endpoint", return_value={"ready": False, "error": "bad params", "evidence_file": ""}):
+            state = _validate_rpc_schema(state, ["not-a-valid-address"], case="custom_rpc")
+
+        self.assertNotIn("params", state["custom_rpc"])
+        question = _question_for_group(state, "endpoint_process")
+        self.assertIsNotNone(question)
+        self.assertEqual(question["id"], "custom_rpc_schema_evidence")
+
     def test_chain_workload_question_answered_not_selected(self) -> None:
         """"bsc 有哪些 rpc workload" is a question about a chain's default methods,
 
@@ -2419,6 +2855,108 @@ network:
         rejected = _apply_endpoint_answer(state2, "https://docs.example.com/api/eth_getLogs", q)
         self.assertIn("这看起来像 endpoint", "\n".join(rejected.get("visible_response") or []))
 
+    def test_custom_rpc_schema_extraction_grounds_with_google_search_unconditionally(self) -> None:
+        """B.1 (known-issues.md), second call site: `extract_rpc_schema_from_evidence`'s
+
+        draft used to include a `needs_google_search` self-judgment signal
+        (mirroring the chain-identity resolver's field of the same name), but
+        the confirmed framework design is that adding a custom RPC method
+        always re-verifies with google_search once it is available --
+        unconditionally, not gated by the underlying LLM's own confidence
+        (even a fully-confident draft still gets the search). The field was
+        removed from the resolver schema/prompt entirely rather than kept as
+        an unused decision point. `_augment_schema_draft_with_search` grounds
+        every draft with a real `run_google_search_grounding()` call whenever
+        `google_search_available` is true, and surfaces the result in the
+        schema confirmation prompt shown to the user.
+        """
+
+        from unittest.mock import patch
+
+        from agent.harness.groups import _apply_endpoint_answer
+        from agent.harness.state import new_state
+        from agent.llm.search_grounding import SearchGroundingResult
+
+        state = new_state("t", language="en")
+        state["chain_identity"] = {"canonical": "bsc", "adapter_family": "jsonrpc", "status": "confirmed", "case": "known"}
+        state["web_research"] = {"google_search_available": True}
+        state["custom_rpc"] = {"status": "needs_schema_evidence", "endpoint": "https://bsc-rpc.publicnode.com", "endpoint_ready": True, "method": "eth_call"}
+        q = {"id": "custom_rpc_schema_evidence", "group": "endpoint_process", "kind": "evidence", "field": "custom_rpc_schema_evidence", "manual_input_allowed": True}
+
+        # High confidence, no `needs_google_search` field at all -- search
+        # must still run, proving it is not gated by that removed field.
+        draft = {
+            "status": "draft",
+            "evidence_kind": "docs_excerpt",
+            "transport": "jsonrpc",
+            "method": "eth_call",
+            "params": [{"index": 0, "name": "callObject", "type": "object", "meaning": "call parameters", "example": {}, "required": True}],
+            "params_json": [{}],
+            "response_summary": "returns call result",
+            "confidence": "high",
+        }
+        with (
+            patch("agent.harness.groups.extract_rpc_schema_from_evidence", return_value=dict(draft)),
+            patch(
+                "agent.harness.groups.run_google_search_grounding",
+                return_value=SearchGroundingResult(available=True, query="q", text_summary="eth_call takes a call object and a block tag per the official JSON-RPC spec."),
+            ) as grounding,
+        ):
+            result = _apply_endpoint_answer(state, "the docs mention a call object but I'm not sure of the exact shape", q)
+
+        grounding.assert_called_once()
+        prompt = "\n".join(result.get("visible_response") or [])
+        self.assertIn("eth_call takes a call object", prompt)
+
+        # Search unavailable -> never called, LLM draft used as-is.
+        state2 = new_state("t2", language="en")
+        state2["chain_identity"] = {"canonical": "bsc", "adapter_family": "jsonrpc", "status": "confirmed", "case": "known"}
+        state2["web_research"] = {"google_search_available": False}
+        state2["custom_rpc"] = {"status": "needs_schema_evidence", "endpoint": "https://bsc-rpc.publicnode.com", "endpoint_ready": True, "method": "eth_call"}
+        with (
+            patch("agent.harness.groups.extract_rpc_schema_from_evidence", return_value=dict(draft)),
+            patch("agent.harness.groups.run_google_search_grounding") as grounding2,
+        ):
+            _apply_endpoint_answer(state2, "the docs mention a call object but I'm not sure of the exact shape", q)
+        grounding2.assert_not_called()
+
+    def test_custom_rpc_method_accepts_get_path_for_rest_shaped_chain_family(self) -> None:
+        """`GET /path`-shaped custom RPC methods must be accepted, not rejected,
+
+        for a chain whose own adapter family is REST-shaped (rest/tendermint/
+        hedera_dual) -- every default method on a `cosmos-hub`/`algorand`/
+        `hedera` chain already looks exactly like this, so it is the *correct*
+        format for that family, not a mistake. Found live testing Case 1
+        (custom RPC method on an already-supported chain) on `cosmos-hub`:
+        `custom_rpc_method` unconditionally rejected any `GET /...` answer via
+        `_looks_like_rest_path_or_doc_method`, with no adapter-family
+        awareness, even though `cosmos-hub`'s own template methods are all
+        `GET /cosmos/...` paths. The same unconditional check also existed on
+        the Case 2 (`new_chain_method`) path.
+        """
+
+        from agent.harness.groups import _apply_endpoint_answer
+        from agent.harness.state import new_state
+
+        q = {"id": "custom_rpc_method", "group": "endpoint_process", "kind": "manual_value", "field": "custom_rpc_method", "manual_input_allowed": True}
+
+        # tendermint (cosmos-hub): a GET path is the correct format -- accepted.
+        state = new_state("t", language="zh")
+        state["chain_identity"] = {"canonical": "cosmos-hub", "adapter_family": "tendermint", "status": "confirmed", "case": "known"}
+        state["custom_rpc"] = {"status": "needs_method", "endpoint": "https://cosmos-rest.publicnode.com", "endpoint_ready": True}
+        result = _apply_endpoint_answer(state, "GET /cosmos/staking/v1beta1/pool", q)
+        self.assertEqual((result.get("custom_rpc") or {}).get("method"), "GET /cosmos/staking/v1beta1/pool")
+        self.assertEqual((result.get("custom_rpc") or {}).get("status"), "needs_schema_evidence")
+        response = "\n".join(result.get("visible_response") or [])
+        self.assertNotIn("这看起来像 endpoint", response)
+
+        # jsonrpc (bsc): the same GET-path answer is still a real mistake -- rejected.
+        state2 = new_state("t2", language="zh")
+        state2["chain_identity"] = {"canonical": "bsc", "adapter_family": "jsonrpc", "status": "confirmed", "case": "known"}
+        state2["custom_rpc"] = {"status": "needs_method", "endpoint": "https://bsc-rpc.publicnode.com", "endpoint_ready": True}
+        rejected = _apply_endpoint_answer(state2, "GET /cosmos/staking/v1beta1/pool", q)
+        self.assertIn("这看起来像 endpoint", "\n".join(rejected.get("visible_response") or []))
+
     def test_analyze_latest_job_uses_disk_latest_not_stale_hint(self) -> None:
         """"Analyze the latest job" must analyze the most recent job on disk, not a
 
@@ -2439,12 +2977,52 @@ network:
         with patch("agent.harness.groups.list_jobs", return_value=newest), patch("agent.harness.groups.resume_job", return_value=summary):
             out = _report_artifact_entry_response(state)
         self.assertIn("job_NEWEST_failed", out)
-        self.assertNotIn("job_STALE_running", out)
 
         # Falls back to the hint only when there are no jobs on disk.
         with patch("agent.harness.groups.list_jobs", return_value=[]), patch("agent.harness.groups.resume_job", return_value=summary) as rj:
             _report_artifact_entry_response(state)
             rj.assert_called_with("job_STALE_running")
+
+    def test_analyze_report_includes_real_log_excerpt_not_just_paths(self) -> None:
+        """B.21 (known-issues.md): `_report_artifact_entry_response` used to
+
+        only list artifact *paths* (run_dir, artifact_index, runtime.env),
+        even when the same turn explicitly asked to interpret them ("跟我解释
+        一下这个报告，帮我看看瓶颈在哪") -- it never read `benchmark.log` or the
+        artifact index inline, only suggesting a follow-up ask. Fixed by
+        reading the job's real log via `tail_job_log` and surfacing the most
+        relevant lines (error/failure markers for a failed job) directly in
+        the response.
+        """
+
+        from unittest.mock import patch
+
+        from agent.harness.groups import _report_artifact_entry_response
+        from agent.harness.state import new_state
+
+        state = new_state("t", language="zh")
+        jobs = [{"job_id": "job_REAL_failed", "status": "failed"}]
+        summary = {"status": "failed", "run_dir": "x", "artifact_index": "i.json", "runtime_env_file": "r.env", "next_actions": ["logs", "artifact-qa"]}
+        log = {
+            "job_id": "job_REAL_failed",
+            "log_file": "x/benchmark.log",
+            "exists": True,
+            "lines": [
+                "Starting execution: blockchain_node_benchmark.sh",
+                "Preparing configuration...",
+                "❌ --fake-node: Go toolchain is required to build fake-node, but go was not found",
+                "Executing framework cleanup...",
+            ],
+        }
+        with (
+            patch("agent.harness.groups.list_jobs", return_value=jobs),
+            patch("agent.harness.groups.resume_job", return_value=summary),
+            patch("agent.harness.groups.tail_job_log", return_value=log),
+        ):
+            out = _report_artifact_entry_response(state)
+
+        self.assertIn("Go toolchain is required", out)
+        self.assertNotIn("Preparing configuration", out)  # only the relevant line, not the whole tail
 
     def test_prepare_kwargs_are_all_accepted_by_prepare_benchmark_run(self) -> None:
         """Every key `_prepare_kwargs` produces must be a parameter of
@@ -2487,11 +3065,30 @@ network:
         base = {"chain": "ethereum", "workflow_type": "sync_observe", "sync_observe_stop_condition": "duration"}
 
         # Local node process present -> attribution required.
-        local = build_configuration_checklist({**base, "sync_observe_local_attribution": True}, plan)
+        local = build_configuration_checklist({**base, "sync_observe_source": "existing_local_node"}, plan)
         self.assertIn("node_process_identity", local["missing_blockers"])
         # Endpoint-only (no local process) -> waived.
-        endpoint_only = build_configuration_checklist({**base, "sync_observe_local_attribution": False}, plan)
+        endpoint_only = build_configuration_checklist({**base, "sync_observe_source": "endpoint_only"}, plan)
         self.assertNotIn("node_process_identity", endpoint_only["missing_blockers"])
+
+    def test_sync_observe_demo_only_waives_real_node_requirements_for_preflight(self) -> None:
+        """demo_only has neither a local process nor a real endpoint at all --
+
+        it must waive both `node_process_identity` and `mainnet_rpc_url_reviewed`,
+        not just the former. Regression for a live bug: the checklist only ever
+        knew how to waive `node_process_identity` (for `endpoint_only`), so
+        confirming the demo_only disclaimer and auto-running preflight always
+        failed with `missing: mainnet_rpc_url_reviewed, node_process_identity`.
+        """
+
+        from agent.planners.config_checklist import build_configuration_checklist
+
+        plan = {"chain": "ethereum", "use_fake_node": False, "workflow_type": "sync_observe", "materialized_config": {}, "chain_template_requirements": {}}
+        base = {"chain": "ethereum", "workflow_type": "sync_observe", "sync_observe_stop_condition": "duration"}
+
+        demo_only = build_configuration_checklist({**base, "sync_observe_source": "demo_only"}, plan)
+        self.assertNotIn("node_process_identity", demo_only["missing_blockers"])
+        self.assertNotIn("mainnet_rpc_url_reviewed", demo_only["missing_blockers"])
 
     def test_mixed_default_workload_confirms_weights_for_preflight(self) -> None:
         """A confirmed mixed workload (default template weights or validated custom
@@ -2521,6 +3118,62 @@ network:
         state["rpc_mode"] = "single"
         state["workload"] = {"confirmed": True, "choice": "default"}
         self.assertNotIn("mixed_weights_confirmed", _prepare_kwargs(state)["confirmations"])
+
+    def test_adjust_mixed_weights_skips_endpoint_revalidation(self) -> None:
+        """B.23 (known-issues.md): choosing "adjust mixed weights" for a
+
+        chain's own default methods used to be forced through the exact same
+        endpoint/method (re-)validation cycle as "add a genuinely new custom
+        RPC method" -- the `workload_choice` handler's `else` branch treated
+        `value == "weights"` and `value == "custom_rpc"` identically. This
+        wastes a real network round-trip re-probing methods that are already
+        known-good (they are the chain template's own validated defaults) and
+        mislabels a "just reweight what's already there" action as "adding a
+        custom method." Fixed with a genuine separate branch that jumps
+        straight to the weight-entry question, which already supports
+        weighting template-default methods (merges validated custom methods,
+        empty here, with the chain's own template methods).
+        """
+
+        from agent.harness.groups import _question_for_group, process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("t", language="zh")
+        state["target_mode"] = "real-node"
+        state["workflow_mode"] = "rpc_benchmark"
+        state["chain_identity"] = {"raw": "bsc", "canonical": "bsc", "adapter_family": "jsonrpc", "status": "confirmed", "case": "known"}
+        state["rpc_mode"] = "mixed"
+        state["active_group"] = "workload_rpc"
+        state["pending_question"] = {
+            "id": "workload_confirm",
+            "group": "workload_rpc",
+            "kind": "numbered_choice",
+            "field": "workload_choice",
+            "options": [
+                {"label": "使用默认值", "value": "default"},
+                {"label": "添加自定义 RPC method", "value": "custom_rpc"},
+                {"label": "调整 mixed 权重", "value": "weights"},
+                {"label": "更换链或目标模式", "value": "change_target"},
+            ],
+            "manual_input_allowed": False,
+        }
+        state["last_user_input"] = "3"
+        result = process_turn(state)
+
+        # Must go straight to the weight question -- NOT the endpoint
+        # question a genuinely new custom method would require.
+        self.assertEqual(result["pending_question"]["id"], "custom_rpc_weights")
+        question = _question_for_group(result, "endpoint_process")
+        self.assertEqual(question["id"], "custom_rpc_weights")
+        self.assertIn("eth_getBalance", question["prompt"])
+
+        # Real weights over the chain's own template-default methods (no
+        # custom method was ever validated) must be accepted directly.
+        result["last_user_input"] = "eth_getBalance=40,eth_getTransactionCount=20,eth_blockNumber=20,eth_gasPrice=20"
+        final = process_turn(result)
+        self.assertEqual(final["rpc_mode"], "mixed")
+        self.assertTrue(final["workload"]["confirmed"])
+        self.assertEqual(final["custom_rpc"]["status"], "validated")
 
     def test_numbered_answer_to_confirm_or_value_question_applies(self) -> None:
         """A numbered answer ("1"/"2") to a confirm_or_value question that renders
@@ -2565,10 +3218,20 @@ network:
         # jsonrpc chains without a declared param-less health method fall back so
         # the probe uses the adapter's own health check, never an EVM method.
         self.assertEqual(health_probe_methods("sui", "jsonrpc"), (None, {}))
-        # Non-jsonrpc families are left to the adapter health probe.
-        self.assertEqual(health_probe_methods("bitcoin", "bitcoin_jsonrpc"), (None, {}))
-        # A brand-new jsonrpc chain (no template yet) defaults to the EVM guess.
+        # `bitcoin`'s own template declares `getblockchaininfo` as its health
+        # method (matches every bitcoin_jsonrpc template's `_meta.health_probe`).
+        self.assertEqual(health_probe_methods("bitcoin", "bitcoin_jsonrpc"), (["getblockchaininfo"], {"getblockchaininfo": []}))
+        # Families whose transport isn't a plain POST JSON-RPC call (rest/
+        # tendermint/hedera_dual) are left to the adapter health probe.
+        self.assertEqual(health_probe_methods("algorand", "rest"), (None, {}))
+        # A brand-new jsonrpc chain (no template yet) defaults to the EVM guess;
+        # substrate/bitcoin_jsonrpc get their own family-generic default too
+        # (`#59`: Case 2 endpoint validation could never pass for a template-less
+        # chain in either family before this, since `_probe_health` requires a
+        # `config/chains/<chain>.json` that a genuinely new chain never has).
         self.assertEqual(health_probe_methods("brand-new-l2", "jsonrpc"), (["eth_chainId"], {"eth_chainId": []}))
+        self.assertEqual(health_probe_methods("brand-new-parachain", "substrate"), (["system_chain"], {"system_chain": []}))
+        self.assertEqual(health_probe_methods("brand-new-fork", "bitcoin_jsonrpc"), (["getblockchaininfo"], {"getblockchaininfo": []}))
 
         # The generic jsonrpc path uses the first selected method as its health
         # probe, not a hardcoded eth_chainId.
@@ -2847,6 +3510,132 @@ network:
         self.assertEqual(state["active_group"], "provider_deployment")
         self.assertEqual(state["pending_question"]["id"], "CLOUD_REGION")
 
+    def test_go_back_out_of_stuck_custom_rpc_endpoint_abandons_it(self) -> None:
+        """B.17 (known-issues.md): navigating away from a stuck
+
+        `custom_rpc_endpoint` question via `go_back` used to bounce right
+        back to the identical question. Root cause was not missing
+        navigation handling -- `_pop_previous_group` already correctly skips
+        `group_history`'s top entry when it equals the current group
+        (`endpoint_process`, the group *containing* the pending question) and
+        lands on the real previous group (`network`). But `network` has
+        nothing left to ask (already confirmed), so
+        `_ask_next_blocking_question` recomputes via the shared routing chain
+        and finds `custom_rpc` still incomplete -- re-rendering the exact
+        question the user tried to leave, since leaving it never abandoned
+        the half-finished custom-method attempt. Fixed by clearing
+        `custom_rpc`/`workload.choice` when navigating away from this
+        specific pending question, so routing naturally lands back on
+        `workload_confirm` instead.
+        """
+
+        from agent.harness.groups import process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("unit-thread", language="zh")
+        state["target_mode"] = "real-node"
+        state["workflow_mode"] = "rpc_benchmark"
+        state["chain_identity"] = {"raw": "bsc", "canonical": "bsc", "adapter_family": "jsonrpc", "status": "confirmed", "case": "known"}
+        state["confirmed_config"] = {
+            "BLOCKCHAIN_NODE": "bsc",
+            "CLOUD_REGION": "us-1",
+            "CLOUD_ZONE": "us-1-z",
+            "MACHINE_TYPE": "n2",
+            "LEDGER_DEVICE": "vda",
+            "DATA_VOL_TYPE": "hyperdisk-balanced",
+            "DATA_VOL_SIZE": "926",
+            "DATA_VOL_MAX_IOPS": "20000",
+            "DATA_VOL_MAX_THROUGHPUT": "1000",
+            "has_accounts_device": False,
+            "NETWORK_INTERFACE": "eth0",
+            "NETWORK_MAX_BANDWIDTH_GBPS": "100",
+            "LOCAL_RPC_URL": "https://bsc-dataseed.binance.org",
+            "BLOCKCHAIN_PROCESS_NAMES": "bsc-node",
+            "MAINNET_RPC_URL_REVIEWED": True,
+        }
+        state["endpoint_evidence"] = {"local_rpc_url_ready": True}
+        state["rpc_mode"] = "mixed"
+        state["workload"] = {"choice": "custom_rpc"}
+        state["custom_rpc"] = {"status": "needs_endpoint"}
+        state["active_group"] = "endpoint_process"
+        state["group_history"] = ["provider_deployment", "ledger_disk", "accounts_disk", "network", "endpoint_process"]
+        state["pending_question"] = {
+            "id": "custom_rpc_endpoint",
+            "group": "endpoint_process",
+            "kind": "url",
+            "field": "custom_rpc_endpoint",
+            "manual_input_allowed": True,
+        }
+        state["last_user_input"] = "算了，不弄了，返回 workload 菜单"
+
+        with patch("agent.harness.groups.resolve_action_queue", return_value={"actions": [{"type": "go_back", "confidence": "high"}]}):
+            result = process_turn(state)
+
+        self.assertEqual(result["custom_rpc"], {})
+        self.assertEqual(result["pending_question"]["id"], "workload_confirm")
+        self.assertEqual(result["active_group"], "workload_rpc")
+
+    def test_go_back_out_of_stuck_sync_observe_rpc_url_abandons_it(self) -> None:
+        """Same bug class as B.17, found live via dual-AI chaos testing of
+
+        sync-observe: `go_back` while `SYNC_OBSERVE_RPC_URL` is the pending
+        question (sync-observe's `endpoint_only`/`existing_local_node` real
+        endpoint probe, asked from within `endpoint_process`) bounced right
+        back to the identical question. `_pop_previous_group` correctly skips
+        `group_history`'s top entry (`endpoint_process`, the group
+        *containing* the pending question) and lands on the real previous
+        group (`network`), but `network` has nothing left to ask, so
+        `_ask_next_blocking_question` recomputes via the shared routing chain
+        and finds `sync_observe`'s source (`endpoint_only`) still
+        unvalidated -- re-rendering the exact question the user tried to
+        leave. Fixed by clearing `sync_observe.source` (and related
+        acknowledgement/evidence flags) when navigating away from this
+        pending question, the same way `custom_rpc_endpoint` is abandoned,
+        so routing naturally lands back on `sync_observe_source` instead of
+        looping.
+        """
+
+        from agent.harness.groups import process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("unit-thread", language="en")
+        state["target_mode"] = "sync-observe"
+        state["workflow_mode"] = "sync_observe"
+        state["chain_identity"] = {"raw": "ethereum", "canonical": "ethereum", "adapter_family": "jsonrpc", "status": "confirmed", "case": "known"}
+        state["confirmed_config"] = {
+            "BLOCKCHAIN_NODE": "ethereum",
+            "CLOUD_REGION": "us-1",
+            "CLOUD_ZONE": "us-1-z",
+            "MACHINE_TYPE": "n2",
+            "LEDGER_DEVICE": "vda",
+            "DATA_VOL_TYPE": "hyperdisk-balanced",
+            "DATA_VOL_SIZE": "926",
+            "DATA_VOL_MAX_IOPS": "20000",
+            "DATA_VOL_MAX_THROUGHPUT": "1000",
+            "has_accounts_device": False,
+            "NETWORK_INTERFACE": "eth0",
+            "NETWORK_MAX_BANDWIDTH_GBPS": "100",
+        }
+        state["sync_observe"] = {"source": "endpoint_only", "local_attribution_available": False}
+        state["endpoint_evidence"] = {}
+        state["active_group"] = "endpoint_process"
+        state["group_history"] = ["provider_deployment", "ledger_disk", "accounts_disk", "network", "sync_observe", "endpoint_process"]
+        state["pending_question"] = {
+            "id": "SYNC_OBSERVE_RPC_URL",
+            "group": "endpoint_process",
+            "kind": "url",
+            "field": "SYNC_OBSERVE_RPC_URL",
+            "manual_input_allowed": True,
+        }
+        state["last_user_input"] = "actually I don't have a real endpoint, let's go back"
+
+        with patch("agent.harness.groups.resolve_action_queue", return_value={"actions": [{"type": "go_back", "confidence": "high"}]}):
+            result = process_turn(state)
+
+        self.assertEqual(result["sync_observe"].get("source"), "")
+        self.assertEqual(result["pending_question"]["id"], "sync_observe_source")
+        self.assertEqual(result["active_group"], "sync_observe")
+
     def test_go_back_uses_group_history_without_phrase_matching(self) -> None:
         from agent.harness.groups import process_turn
         from agent.harness.state import new_state
@@ -2982,6 +3771,86 @@ network:
         self.assertNotEqual(result.get("chain_identity", {}).get("canonical"), "solana")
         self.assertEqual(result["chain_identity"]["status"], "needs_identity_confirmation")
         self.assertEqual(result["pending_question"]["id"], "unknown_chain_identity_confirm")
+
+    def test_unknown_chain_identity_grounds_with_google_search_unconditionally(self) -> None:
+        """B.1 (known-issues.md): `needs_google_search` -- a flag the
+
+        chain-identity resolver used to set in its JSON response -- was never
+        read anywhere in the repo; nothing acted on it, even though
+        `web_research.google_search_available` (a *different* flag) is
+        correctly wired up (`#48`/`#49`). Confirmed framework design: adding a
+        new chain always re-verifies with a fresh google_search once it is
+        available, unconditionally -- not gated by the underlying LLM's own
+        confidence (even a `confidence: high` resolution still gets searched).
+        The `needs_google_search` field was removed from the resolver
+        schema/prompt entirely (an unused self-judgment gate does not belong
+        in the framework once the real trigger is "search whenever
+        available") rather than left as a second, unused decision point.
+        Fixed by calling the same `run_google_search_grounding()` `#48`/`#49`
+        already wired into the sync-observe client-setup handoff a second
+        time here (this is the "new chain identity" call site;
+        `extract_rpc_schema_from_evidence`'s "adding a custom RPC method"
+        call site gets the identical treatment) whenever search is actually
+        available, surfacing the grounded evidence in the confirmation
+        prompt shown to the user.
+        """
+
+        from unittest.mock import patch
+
+        from agent.harness.groups import process_turn
+        from agent.harness.state import new_state
+        from agent.llm.search_grounding import SearchGroundingResult
+
+        def _mk() -> dict:
+            state = new_state("unit-thread")
+            state["target_mode"] = "fake-node"
+            state["workflow_mode"] = "rpc_benchmark"
+            state["web_research"] = {"google_search_available": True}
+            state["pending_question"] = {
+                "id": "chain",
+                "group": "chain_identity",
+                "kind": "chain",
+                "field": "chain",
+                "manual_input_allowed": True,
+            }
+            state["last_user_input"] = "newlychain"
+            return state
+
+        # High confidence, no `needs_google_search` field at all -- search
+        # must still run, proving it is not gated by that removed field.
+        resolution = {
+            "chain_exists": True,
+            "canonical_chain_name": "newlychain",
+            "adapter_family": "jsonrpc",
+            "confidence": "high",
+        }
+
+        # search available -> grounding is actually called and shown.
+        with (
+            patch("agent.harness.groups.resolve_unknown_chain_identity", return_value=dict(resolution)),
+            patch(
+                "agent.harness.groups.run_google_search_grounding",
+                return_value=SearchGroundingResult(available=True, query="q", text_summary="NewlyChain is a real L1, jsonrpc-compatible."),
+            ) as grounding,
+        ):
+            result = process_turn(_mk())
+
+        grounding.assert_called_once()
+        prompt = result["pending_question"]["prompt"]
+        self.assertIn("NewlyChain is a real L1", prompt)
+
+        # search unavailable -> grounding is never called, no crash, and the
+        # confirmation prompt still renders normally without a search line.
+        with (
+            patch("agent.harness.groups.resolve_unknown_chain_identity", return_value=dict(resolution)),
+            patch("agent.harness.groups.run_google_search_grounding") as grounding2,
+        ):
+            state2 = _mk()
+            state2["web_research"] = {"google_search_available": False}
+            result2 = process_turn(state2)
+
+        grounding2.assert_not_called()
+        self.assertEqual(result2["pending_question"]["id"], "unknown_chain_identity_confirm")
 
     def test_unknown_chain_candidate_accepts_yes_and_advances(self) -> None:
         from agent.harness.groups import process_turn
@@ -4356,45 +5225,61 @@ network:
         self.assertEqual(state.get("pending_question"), {})
         self.assertNotEqual(state.get("active_group"), "preflight_smoke_execution")
 
-    def test_retired_adk_runner_bridge_cannot_own_product_workflow(self) -> None:
-        from agent.adk_app.runner_bridge import ADKRunnerBridge, run_text_once, runner_bridge_status, sanitize_adk_text
+    def test_sync_observe_client_setup_with_google_search_grounds_the_handoff_message(self) -> None:
+        from unittest.mock import patch
 
-        bridge_file = Path(__file__).resolve().parents[1] / "agent" / "adk_app" / "runner_bridge.py"
-        bridge_text = bridge_file.read_text(encoding="utf-8")
+        from agent.harness.groups import process_turn
+        from agent.harness.state import new_state
+        from agent.llm.search_grounding import SearchGroundingResult
 
-        self.assertNotIn("workflows.conversation_state", bridge_text)
-        self.assertNotIn("build_terminal_turn_prompt", bridge_text)
-        self.assertNotIn("build_root_agent", bridge_text)
-        self.assertNotIn("google.genai", bridge_text)
-        self.assertIsInstance(runner_bridge_status().as_dict(), dict)
-        self.assertEqual(sanitize_adk_text("  ok  "), "ok")
-        with self.assertRaisesRegex(RuntimeError, "retired"):
-            ADKRunnerBridge()
-        with self.assertRaisesRegex(RuntimeError, "retired"):
-            run_text_once("Hi")
+        state = new_state("unit-thread")
+        state["target_mode"] = "sync-observe"
+        state["workflow_mode"] = "sync_observe"
+        state["chain_identity"] = {"raw": "bsc", "canonical": "bsc", "adapter_family": "jsonrpc", "status": "confirmed", "case": "known"}
+        state["web_research"] = {"google_search_available": True}
+        state["confirmed_config"] = {
+            "BLOCKCHAIN_NODE": "bsc",
+            "CLOUD_REGION": "us-1",
+            "CLOUD_ZONE": "us-1-z",
+            "MACHINE_TYPE": "n2",
+            "LEDGER_DEVICE": "vda",
+            "DATA_VOL_TYPE": "hyperdisk-balanced",
+            "DATA_VOL_SIZE": "926",
+            "DATA_VOL_MAX_IOPS": "20000",
+            "DATA_VOL_MAX_THROUGHPUT": "1000",
+            "has_accounts_device": False,
+            "NETWORK_INTERFACE": "eth0",
+            "NETWORK_MAX_BANDWIDTH_GBPS": "100",
+        }
+        state["pending_question"] = {
+            "id": "sync_observe_source",
+            "group": "sync_observe",
+            "kind": "numbered_choice",
+            "field": "sync_observe_source",
+            "options": [{"label": "client setup", "value": "client_setup"}],
+            "manual_input_allowed": False,
+        }
+        state["last_user_input"] = "1"
+        state = process_turn(state)
+        self.assertEqual(state["pending_question"]["id"], "sync_observe_client_setup_ack")
 
-    def test_adk_root_and_registry_do_not_expose_retired_workflow_runtime(self) -> None:
-        import sys
+        fake_result = SearchGroundingResult(
+            available=True,
+            query="bsc official blockchain node client",
+            text_summary="Use the official bsc-erigon Docker image.",
+            citations=["https://example.invalid/bsc-docs"],
+        )
+        with patch("agent.harness.groups.run_google_search_grounding", return_value=fake_result) as mocked:
+            state["last_user_input"] = "y"
+            state = process_turn(state)
 
-        agent_root = Path(__file__).resolve().parents[1] / "agent"
-        if str(agent_root) not in sys.path:
-            sys.path.insert(0, str(agent_root))
-
-        from agent.adk_app.root_agent import ADK_MODEL_BRIDGE_INSTRUCTION
-        from agent.adk_app.tools.registry import get_adk_tools
-
-        repo = Path(__file__).resolve().parents[1]
-        root_text = (repo / "agent" / "adk_app" / "root_agent.py").read_text(encoding="utf-8")
-        registry_text = (repo / "agent" / "adk_app" / "tools" / "registry.py").read_text(encoding="utf-8")
-        tool_names = {getattr(item, "__name__", str(item)) for item in get_adk_tools()}
-
-        self.assertIn("LangGraph Harness", ADK_MODEL_BRIDGE_INSTRUCTION)
-        self.assertNotIn("before_tool_callback", root_text)
-        self.assertNotIn("after_model_callback", root_text)
-        self.assertNotIn("build_domain_agents", root_text)
-        self.assertNotIn("ROOT_INSTRUCTION", root_text)
-        self.assertNotIn("workflow_state", registry_text)
-        self.assertFalse({"load_workflow_state", "update_workflow_state", "answer_pending_question"} & tool_names)
+        mocked.assert_called_once()
+        self.assertIn("Use the official bsc-erigon Docker image.", state["visible_response"][0])
+        self.assertIn("https://example.invalid/bsc-docs", state["visible_response"][0])
+        self.assertEqual(
+            state["sync_observe"]["client_setup_search_result"]["text_summary"],
+            "Use the official bsc-erigon Docker image.",
+        )
 
     def test_custom_rpc_success_asks_continue_instead_of_looping_schema(self) -> None:
         from agent.harness.groups import process_turn
@@ -6416,9 +7301,13 @@ network:
         self.assertEqual(REST_TRANSPORT_FAMILIES | JSONRPC_TRANSPORT_FAMILIES, canonical)
         self.assertEqual(REST_TRANSPORT_FAMILIES & JSONRPC_TRANSPORT_FAMILIES, set())
         # endpoint_probe's generic-JSON-RPC set must only contain canonical
-        # family values (no non-canonical evm/ethereum aliases).
+        # family values (no non-canonical evm/ethereum aliases). It covers every
+        # family whose transport is a plain POST JSON-RPC call -- `jsonrpc`,
+        # `substrate`, and `bitcoin_jsonrpc` -- not just `jsonrpc`; the
+        # GET/REST-shaped families (`rest`/`tendermint`/`hedera_dual`) are
+        # deliberately excluded (see `#59` in known-issues.md).
         self.assertTrue(GENERIC_JSONRPC_PROBE_FAMILIES <= canonical)
-        self.assertEqual(GENERIC_JSONRPC_PROBE_FAMILIES, {"jsonrpc"})
+        self.assertEqual(GENERIC_JSONRPC_PROBE_FAMILIES, {"jsonrpc", "substrate", "bitcoin_jsonrpc"})
 
     def test_generic_jsonrpc_probe_uses_canonical_family_not_evm_alias(self) -> None:
         """Finding C3 value drift: `_should_use_generic_jsonrpc_probe` used to
@@ -6637,6 +7526,129 @@ network:
         state = self._fully_configured_state_before_advanced_tuning()
         self.assertEqual(_next_group(state), "advanced_tuning")
         self.assertEqual(_next_group_and_reason(state), ("advanced_tuning", "review advanced tuning settings"))
+
+    def test_oracle_and_groups_agree_on_next_group_after_client_setup_ack(self) -> None:
+        """After the client-setup handoff is acknowledged, `groups.py`'s
+
+        `_question_for_group` asks `sync_observe_after_client_setup` (choose
+        the real data source now that a client is being prepared) before it
+        will ever ask for a stop condition. `routing.next_group_and_reason`
+        (and therefore `oracle.py`'s advisory "next blocking item" preview)
+        used to skip straight to "choose sync-observe stop condition"
+        instead, because it had no branch for `client_setup_acknowledged`
+        being true, only for it being false — a stale/misleading preview
+        immediately after the handoff turn.
+        """
+
+        from agent.harness.groups import _question_for_group
+        from agent.harness.oracle import _next_group_and_reason
+        from agent.harness.state import new_state
+
+        state = new_state("unit-thread")
+        state["target_mode"] = "sync-observe"
+        state["workflow_mode"] = "sync_observe"
+        state["chain_identity"] = {"raw": "bsc", "canonical": "bsc", "adapter_family": "jsonrpc", "status": "confirmed", "case": "known"}
+        state["confirmed_config"] = {
+            "BLOCKCHAIN_NODE": "bsc",
+            "CLOUD_REGION": "us-1",
+            "CLOUD_ZONE": "us-1-z",
+            "MACHINE_TYPE": "n2",
+            "LEDGER_DEVICE": "vda",
+            "DATA_VOL_TYPE": "hyperdisk-balanced",
+            "DATA_VOL_SIZE": "926",
+            "DATA_VOL_MAX_IOPS": "20000",
+            "DATA_VOL_MAX_THROUGHPUT": "1000",
+            "has_accounts_device": False,
+            "NETWORK_INTERFACE": "eth0",
+            "NETWORK_MAX_BANDWIDTH_GBPS": "100",
+        }
+        state["sync_observe"] = {"source": "client_setup", "client_setup_acknowledged": True}
+
+        question = _question_for_group(state, "sync_observe")
+        self.assertEqual(question["id"], "sync_observe_after_client_setup")
+
+        group, reason = _next_group_and_reason(state)
+        self.assertEqual(group, "sync_observe")
+        self.assertEqual(reason, "choose sync-observe data source after client setup")
+        self.assertNotEqual(reason, "choose sync-observe stop condition")
+
+    def test_change_group_does_not_skip_a_just_invalidated_earlier_group(self) -> None:
+        """Found via live dual-AI chaos (2026-07-13, tendermint-family coverage
+
+        sweep): a single turn that both switches the real-node chain and asks
+        to jump ahead (e.g. "switch to hedera, only have a real endpoint, ...")
+        can resolve into a compound action queue: `change_chain` (which pauses
+        on a `chain_change_confirm` interrupt) followed by a queued
+        `change_group` targeting a later group (e.g. `workload_rpc`). Once the
+        interrupt is confirmed, `_invalidate_for_chain_change` correctly clears
+        `endpoint_evidence` for the new chain, but the queued `change_group`
+        then ran via `_activate_group_question` with no check that the target
+        group's prerequisites were still satisfied -- it jumped straight to
+        `workload_rpc` and asked for the new chain's workload before its
+        endpoint had ever been validated, while `confirmed_config`'s stale
+        `LOCAL_RPC_URL` (still the OLD chain's endpoint) sat unchanged.
+        Confirmed live via checkpoint inspection: `active_group` became
+        `workload_rpc` immediately after the chain-change confirm, with
+        `endpoint_evidence == {}` and `confirmed_config["LOCAL_RPC_URL"]`
+        still pointing at the previous chain's endpoint.
+        """
+
+        from agent.harness.groups import process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("unit-thread")
+        state["target_mode"] = "real-node"
+        state["workflow_mode"] = "rpc_benchmark"
+        state["chain_identity"] = {"raw": "cosmos-hub", "canonical": "cosmos-hub", "adapter_family": "tendermint", "status": "confirmed", "case": "known"}
+        state["confirmed_config"] = {
+            "BLOCKCHAIN_NODE": "cosmos-hub",
+            "CLOUD_REGION": "us-1",
+            "CLOUD_ZONE": "us-1-z",
+            "MACHINE_TYPE": "n2",
+            "LEDGER_DEVICE": "vda",
+            "DATA_VOL_TYPE": "hyperdisk-balanced",
+            "DATA_VOL_SIZE": "926",
+            "DATA_VOL_MAX_IOPS": "20000",
+            "DATA_VOL_MAX_THROUGHPUT": "1000",
+            "has_accounts_device": False,
+            "NETWORK_INTERFACE": "eth0",
+            "NETWORK_MAX_BANDWIDTH_GBPS": "100",
+            "LOCAL_RPC_URL": "https://cosmos-rest.publicnode.com",
+            "BLOCKCHAIN_PROCESS_NAMES": "cosmos-hub-node",
+            "MAINNET_RPC_URL_REVIEWED": True,
+        }
+        state["endpoint_evidence"] = {"local_rpc_url_ready": True}
+        state["rpc_mode"] = "mixed"
+        state["workload"] = {"confirmed": True, "choice": "default"}
+        state["active_group"] = "qps_profile"
+        state["pending_question"] = {
+            "id": "benchmark_mode",
+            "group": "qps_profile",
+            "kind": "numbered_choice",
+            "field": "benchmark_mode",
+            "options": [{"label": "quick", "value": "quick"}],
+            "manual_input_allowed": False,
+        }
+
+        state["last_user_input"] = "先别定 QPS，我想先换成 hedera 测一下，只有真实 metrics endpoint"
+        with patch("agent.harness.groups.resolve_action_queue") as resolver:
+            resolver.return_value = {
+                "actions": [
+                    {"type": "change_chain", "chain_text": "hedera", "confidence": "high"},
+                    {"type": "change_group", "group": "workload_rpc", "confidence": "high"},
+                ]
+            }
+            state = process_turn(state)
+        self.assertEqual(state["pending_question"]["id"], "chain_change_confirm")
+
+        state["last_user_input"] = "1"
+        state = process_turn(state)
+
+        self.assertEqual(state["chain_identity"]["canonical"], "hedera")
+        self.assertEqual(state["endpoint_evidence"], {})
+        self.assertEqual(state["active_group"], "endpoint_process")
+        self.assertEqual(state["pending_question"]["id"], "LOCAL_RPC_URL")
+        self.assertNotEqual(state["pending_question"]["id"], "workload_confirm")
 
     def test_routing_recognizes_phase4_custom_rpc_statuses(self) -> None:
         """Code review (Phase 4 diff) found `routing.next_group_and_reason`'s

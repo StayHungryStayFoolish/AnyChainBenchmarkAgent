@@ -26,18 +26,18 @@ AGENT_ROOT = REPO_ROOT / "agent"
 if str(AGENT_ROOT) not in sys.path:
     sys.path.insert(0, str(AGENT_ROOT))
 
-from adk_app.models import adk_status  # noqa: E402
-from adk_app.state import load_startup_state  # noqa: E402
-from adk_app.tools.web_research import web_research_status  # noqa: E402
+from diagnostics.adk_status import adk_status  # noqa: E402
 from diagnostics.doctor import run_doctor  # noqa: E402
 from harness.graph import AnyChainGraphRuntime  # noqa: E402
 from knowledge.framework_capabilities import load_framework_capabilities  # noqa: E402
 from knowledge.framework_context import load_framework_context  # noqa: E402
 from llm.config import load_llm_config  # noqa: E402
+from llm.search_grounding import web_research_status  # noqa: E402
 from runners.job_manager import list_jobs  # noqa: E402
 from terminal.io import OutputOnlyIO, TerminalIO  # noqa: E402
 from terminal.job_commands import JobCommandHandler  # noqa: E402
 from terminal.language import detect_language, t  # noqa: E402
+from terminal.startup_state import load_startup_state  # noqa: E402
 from utils.redaction import redact  # noqa: E402
 
 

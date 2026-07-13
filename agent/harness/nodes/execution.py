@@ -33,6 +33,12 @@ def run_approved_preflight_and_smoke(state: AgentGraphState) -> AgentGraphState:
     if output.get("preflight", {}).get("status") in {"passed", "blocked"} or output.get("smoke"):
         return output
 
+    # Preserve any message already queued by the caller (e.g. a demo-mode
+    # disclaimer shown right before auto-triggering execution) instead of
+    # overwriting it -- mirrors the prefix-then-append pattern used
+    # throughout `groups.py` (e.g. `_ask_next_blocking_question`).
+    prefix = list(output.get("visible_response") or [])
+
     if output.get("workflow_mode") == "sync_observe":
         prepared = prepare_benchmark_run(**_prepare_kwargs(output))
         data = prepared.get("data", {})
@@ -45,12 +51,12 @@ def run_approved_preflight_and_smoke(state: AgentGraphState) -> AgentGraphState:
             "evidence_paths": prepared.get("evidence_paths", []),
         }
         if not preflight.get("passed"):
-            output["visible_response"] = [_blocked_message(prepared)]
+            output["visible_response"] = prefix + [_blocked_message(prepared)]
             output["_stop_after_response"] = True
             return output
         job_result = submit_benchmark_job(str(data.get("plan_file", "")))
         output["job"] = (job_result.get("data") or {}).get("job", {})
-        output["visible_response"] = [_job_message(job_result, prefix="Sync-observe job submitted")]
+        output["visible_response"] = prefix + [_job_message(job_result, prefix="Sync-observe job submitted")]
         output["_stop_after_response"] = True
         return output
 
@@ -65,7 +71,7 @@ def run_approved_preflight_and_smoke(state: AgentGraphState) -> AgentGraphState:
         "evidence_paths": prepared.get("evidence_paths", []),
     }
     if not preflight.get("passed"):
-        output["visible_response"] = [_blocked_message(prepared)]
+        output["visible_response"] = prefix + [_blocked_message(prepared)]
         output["_stop_after_response"] = True
         return output
 
@@ -73,11 +79,11 @@ def run_approved_preflight_and_smoke(state: AgentGraphState) -> AgentGraphState:
         smoke = run_fake_node_smoke_benchmark(str(data.get("plan_file", "")))
         output["smoke"] = smoke
         output["job"] = (smoke.get("data") or {}).get("job", {})
-        output["visible_response"] = [_smoke_message(smoke)]
+        output["visible_response"] = prefix + [_smoke_message(smoke)]
         output["_stop_after_response"] = True
         return output
 
-    output["visible_response"] = [
+    output["visible_response"] = prefix + [
         "Preflight passed. Real-node execution still requires an isolated smoke validation before final benchmark submission."
     ]
     output["_stop_after_response"] = True
@@ -126,7 +132,7 @@ def _prepare_kwargs(state: AgentGraphState) -> dict[str, Any]:
         "workflow_type": "sync_observe" if state.get("workflow_mode") == "sync_observe" else "rpc_benchmark",
         "sync_observe_stop_condition": str((state.get("sync_observe") or {}).get("stop_condition") or ""),
         "sync_observe_duration_seconds": _int_or_none((state.get("sync_observe") or {}).get("duration_seconds")),
-        "sync_observe_local_attribution": bool((state.get("sync_observe") or {}).get("local_attribution_available", True)),
+        "sync_observe_source": str((state.get("sync_observe") or {}).get("source") or ""),
         "mainnet_rpc_url_reviewed": bool(confirmed.get("MAINNET_RPC_URL_REVIEWED")),
         "confirmations": [
             "benchmark_mode_confirmed",

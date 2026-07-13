@@ -6,14 +6,23 @@ parse user text, mutate workflow state, or render terminal prompts.
 It is NOT consulted by the live conversational routing path
 (`agent/harness/groups.py` / `agent/harness/routing.py`); that path uses
 `agent.harness.state.DEFAULT_GROUP_ORDER`, the actual single source of truth
-for group order (architecture audit Finding A). Keep `GROUP_ORDER` below
-consistent with `DEFAULT_GROUP_ORDER` so this file's metadata does not
-describe a group set that no longer matches reality.
+for group order (architecture audit Finding A). `GROUP_ORDER` below imports
+that same source directly (not a hand-typed copy), so the two cannot drift;
+the `GROUPS` tuple still carries `fields`/`questions`/`product_node`/
+`category` metadata `state.py` does not have, which `config_contract.py`
+genuinely needs, kept decoupled from harness behavioral/runtime types per
+this module's boundary rule (see `tools/check_agent_boundaries.py`'s
+`PURE_METADATA_FILES` entry for the exact forbidden markers).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+try:
+    from ..harness.state import DEFAULT_GROUP_ORDER
+except ImportError:  # script execution with agent/ on sys.path
+    from harness.state import DEFAULT_GROUP_ORDER
 
 
 @dataclass(frozen=True)
@@ -257,7 +266,27 @@ GROUPS: tuple[WorkflowGroup, ...] = (
 )
 
 
-GROUP_ORDER: tuple[str, ...] = tuple(group.name for group in GROUPS)
+GROUP_ORDER: tuple[str, ...] = tuple(DEFAULT_GROUP_ORDER)
+_GROUPS_NAMES = tuple(group.name for group in GROUPS)
+if _GROUPS_NAMES != GROUP_ORDER:
+    # Not an `assert` on purpose: `python -O` strips asserts, and this
+    # invariant (this file's GROUPS metadata describing the real group set)
+    # must hold even in optimized runs. This module is imported at process
+    # startup by agent.validators.config_contract, agent.tools.executor, and
+    # agent.runners.benchmark_pipeline, so a drift here fails those imports
+    # too, not just this file's own preflight path — that is intentional:
+    # the existing tests.test_agent_langgraph_harness::
+    # test_group_registry_order_matches_state_default_group_order test can
+    # only catch this in CI; this check catches it the moment anything
+    # imports the drifted module, in any environment.
+    raise RuntimeError(
+        "agent.workflows.group_registry.GROUPS has drifted from "
+        "agent.harness.state.DEFAULT_GROUP_ORDER.\n"
+        f"  GROUPS names:            {_GROUPS_NAMES}\n"
+        f"  DEFAULT_GROUP_ORDER:     {GROUP_ORDER}\n"
+        "Fix: update the GROUPS tuple above (add/remove/reorder a "
+        "WorkflowGroup entry) so its names match DEFAULT_GROUP_ORDER exactly."
+    )
 GROUP_FIELD_MAP: dict[str, set[str]] = {group.name: set(group.fields) for group in GROUPS}
 GROUP_QUESTION_ORDER: tuple[tuple[str, tuple[str, ...]], ...] = tuple(
     (group.name, group.questions) for group in GROUPS if group.questions

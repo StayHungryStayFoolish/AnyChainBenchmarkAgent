@@ -19,7 +19,7 @@ if str(AGENT_ROOT) not in sys.path:
 from runners.artifacts import write_artifact_index  # noqa: E402
 from runners.guardrails import build_benchmark_command  # noqa: E402
 from runners.job_manager import _discover_completed_artifacts  # noqa: E402
-from runners.materialize import load_runtime_env_file  # noqa: E402
+from runners.materialize import benchmark_subprocess_env, load_runtime_env_file  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -48,7 +48,7 @@ def main(argv: list[str] | None = None) -> int:
             completed = subprocess.run(
                 build_benchmark_command(command),
                 cwd=plan["execution"].get("working_dir", str(REPO_ROOT)),
-                env={**os.environ, **env},
+                env=benchmark_subprocess_env(env),
                 text=True,
                 stdout=handle,
                 stderr=subprocess.STDOUT,

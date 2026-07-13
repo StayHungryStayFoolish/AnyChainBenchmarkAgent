@@ -7,6 +7,11 @@ from typing import Any
 
 from .routing import next_group_and_reason
 
+try:
+    from agent.runners.job_manager import get_job
+except ModuleNotFoundError:  # script execution with agent/ on sys.path
+    from runners.job_manager import get_job
+
 
 @dataclass(frozen=True)
 class NextAction:
@@ -42,9 +47,20 @@ def compute_next_action(state: dict[str, Any]) -> NextAction:
         )
 
     group, reason = _next_group_and_reason(state)
+    # `group in {"job_monitoring", ""}` (from `routing.next_group_and_reason`,
+    # the single source of truth for "is this workflow's config complete")
+    # is the only correct test here. A prior version also forced
+    # config_status to "complete" whenever `execution_status` showed any job
+    # status at all -- but `job`/`latest_job_id` deliberately survive a full
+    # reset (`RESET_PRESERVED_KEYS`) so `analyze_report`/`status` keep
+    # working for the last completed job, so that shortcut falsely reported
+    # a brand-new, still-in-progress workflow as "complete" whenever any
+    # unrelated past job happened to exist in state (reproduced live: a
+    # fresh sync-observe setup reported `config_status: complete` with
+    # `execution_status: job_failed` from an unrelated earlier job, while
+    # still correctly naming an unmet next blocking question in the same
+    # response).
     config_status = "complete" if group in {"job_monitoring", ""} else "incomplete"
-    if execution_status in {"job_running", "job_completed", "job_failed"}:
-        config_status = "complete"
     action = _recommended_action_for_group(group, reason, execution_status)
     blockers = () if config_status == "complete" else (reason or group,)
     return NextAction(
@@ -326,6 +342,8 @@ def _reason_label(reason: str, language: str) -> str:
         "review advanced tuning settings": ("确认是否调整高级调优参数", "review advanced tuning settings"),
         "approve preflight/smoke": ("确认执行 preflight/smoke", "approve preflight/smoke"),
         "choose sync-observe data source": ("选择真实同步观测数据来源", "choose the sync-observe data source"),
+        "acknowledge real client setup handoff": ("确认真实节点客户端准备交接", "acknowledge the real node client setup handoff"),
+        "choose sync-observe data source after client setup": ("选择真实客户端准备完成后的数据来源", "choose the sync-observe data source after client setup"),
         "validate real sync-observe RPC endpoint": ("验证真实 sync-observe RPC endpoint", "validate the real sync-observe RPC endpoint"),
         "choose sync-observe stop condition": ("选择 sync-observe 停止条件", "choose the sync-observe stop condition"),
         "validate LOCAL_RPC_URL": ("验证 `LOCAL_RPC_URL`", "validate `LOCAL_RPC_URL`"),
@@ -354,7 +372,21 @@ def _execution_status(state: dict[str, Any]) -> str:
     smoke = state.get("smoke") or {}
     preflight = state.get("preflight") or {}
     if job.get("status"):
+        # `state["job"]` is a one-time snapshot written at submission time
+        # (`agent/harness/nodes/execution.py`) and never refreshed -- a
+        # `current_config`/status-dump response could claim `job_running` for
+        # a job that has actually long since finished, contradicting the
+        # deterministic `status`/`jobs`/`logs` commands (which already read
+        # correctly from disk via `job_manager`). Prefer the live on-disk
+        # status by `job_id` when available; fall back to the snapshot only
+        # if the job can no longer be read (e.g. its directory was removed).
+        job_id = str(job.get("job_id") or "").strip()
         status = str(job.get("status"))
+        if job_id:
+            try:
+                status = str(get_job(job_id).get("status") or status)
+            except Exception:
+                pass
         if status in {"running", "submitted", "completed", "failed"}:
             return f"job_{status}" if status != "submitted" else "job_submitted"
         return status

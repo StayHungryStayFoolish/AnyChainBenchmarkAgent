@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 from pathlib import Path
@@ -9,6 +10,33 @@ from typing import Any
 
 
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def benchmark_subprocess_env(job_env: dict[str, str]) -> dict[str, str]:
+    """Build the environment for the `blockchain_node_benchmark.sh` subprocess.
+
+    The benchmark pipeline's own analysis/report scripts call bare `python3`
+    (not the Agent's `.venv-adk`, which is unrelated to the benchmark
+    framework's own dependencies). `scripts/install_deps.sh` documents `.venv`
+    (a separate, repo-root virtualenv) as the framework's own Python
+    environment (`source .venv/bin/activate`) -- but the Agent process is not
+    necessarily launched with that venv active, so its own `os.environ`
+    (inherited by the subprocess) may resolve `python3` to the system
+    interpreter, which lacks pandas/matplotlib/scipy/etc. That subprocess
+    then fails partway through (at the analysis/report stage, well after
+    Vegeta has already run) with confusing per-script failure messages rather
+    than a clear "missing Python package" error. Prepending `.venv/bin` to
+    PATH when it exists makes real benchmark execution work regardless of
+    which venv (or none) launched the Agent itself, matching the framework's
+    own documented setup rather than silently depending on it.
+    """
+
+    env = {**os.environ, **job_env}
+    venv_bin = _REPO_ROOT / ".venv" / "bin"
+    if venv_bin.is_dir():
+        env["PATH"] = f"{venv_bin}{os.pathsep}{env.get('PATH', '')}"
+    return env
 
 
 def build_runtime_env(plan: dict[str, Any]) -> dict[str, str]:

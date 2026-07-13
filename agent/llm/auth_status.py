@@ -1,4 +1,4 @@
-"""Safe provider/auth diagnostics for ADK workflows."""
+"""Safe LLM provider/auth diagnostics, shared by the CLI tool-call surface."""
 
 from __future__ import annotations
 
@@ -8,14 +8,14 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from ...llm.config import load_llm_config
-    from ...llm.google_auth import credential_plan
+    from .config import load_llm_config
+    from .google_auth import credential_plan
 except ImportError:  # script execution with agent/ on sys.path
     from llm.config import load_llm_config
     from llm.google_auth import credential_plan
 
 try:
-    from ...runners.tool_result import tool_result as _tool_result
+    from ..runners.tool_result import tool_result as _tool_result
 except ImportError:  # script execution with agent/ on sys.path
     from runners.tool_result import tool_result as _tool_result
 
@@ -52,11 +52,6 @@ def inspect_llm_auth() -> dict[str, Any]:
         warnings=warnings,
         next_actions=next_actions,
     )
-
-
-def get_auth_tools() -> list:
-    """Return auth diagnostic tool callables."""
-    return [inspect_llm_auth]
 
 
 def _local_adc_file() -> Path:

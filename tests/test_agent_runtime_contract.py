@@ -12,20 +12,17 @@ class AgentRuntimeContractTest(unittest.TestCase):
         retired = [
             "agent/workflows/conversation_state.py",
             "agent/workflows/transition_executor.py",
-            "agent/adk_app/callbacks.py",
-            "agent/adk_app/agents/domain.py",
-            "agent/adk_app/tools/workflow_state.py",
-            "agent/adk_app/workflow/product_context.py",
             "agent/terminal/input_classifier.py",
             "agent/terminal/pending_answers.py",
+            "agent/adk_app",
         ]
         existing = [item for item in retired if (repo / item).exists()]
         self.assertEqual(existing, [])
 
-    def test_adk_tools_do_not_expose_workflow_mutation_tools(self) -> None:
-        from agent.adk_app.tools.registry import get_adk_tools
+    def test_tool_dispatch_does_not_expose_workflow_mutation_tools(self) -> None:
+        from agent.tools.schema import tool_schema
 
-        names = {getattr(item, "__name__", str(item)) for item in get_adk_tools()}
+        names = {tool["function"]["name"] for tool in tool_schema()["tools"]}
         self.assertFalse({"load_workflow_state", "update_workflow_state", "answer_pending_question"} & names)
 
     def test_harness_group_registry_is_authoritative_for_product_flow(self) -> None:

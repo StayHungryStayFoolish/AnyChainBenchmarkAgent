@@ -19,6 +19,11 @@ def tool_schema() -> dict[str, list[dict[str, Any]]]:
             {},
         ),
         _tool(
+            "run_doctor",
+            "Summarize readiness, missing dependencies, LLM auth, KB config, and capabilities.",
+            {},
+        ),
+        _tool(
             "load_capabilities",
             "Return supported chain templates, RPC methods, adapter families, fake-node fixture status, and framework limits.",
             {},
@@ -283,6 +288,28 @@ def tool_schema() -> dict[str, list[dict[str, Any]]]:
             "Search the configured enterprise Knowledge Base adapter when enabled.",
             {"query": _string("Search query."), "chain": _string("Optional chain filter.")},
             required=["query"],
+        ),
+        _tool(
+            "validate_fake_node_fixture_coverage",
+            "Validate fake-node fixture coverage through the canonical fake-node checker.",
+            {
+                "chains": _string("Chain filter, or 'all'. Defaults to all."),
+                "modes": _string("Comma-separated modes to check. Defaults to single,mixed."),
+                "strict": _boolean("Fail on placeholder fixtures. Defaults to true.", default=True),
+            },
+        ),
+        _tool(
+            "validate_fake_node_fixture_authenticity",
+            "Validate that fixture files have matching recorded request/response evidence.",
+            {
+                "modes": _string("Comma-separated modes to check. Defaults to single,mixed."),
+                "allow_incomplete": _boolean("Allow incomplete recorded evidence."),
+            },
+        ),
+        _tool(
+            "inspect_llm_auth",
+            "Inspect configured LLM auth mode without reading or printing secrets.",
+            {},
         ),
     ]
     return {"tools": tools}

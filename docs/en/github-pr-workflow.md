@@ -37,7 +37,6 @@ For branch protection settings and required checks, see
    ```bash
    python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract tests.test_agent_langgraph_harness
    python3 tools/check_agent_boundaries.py --root .
-   python3 agent/cli.py adk-eval
    ```
 
 5. Commit with a Conventional Commit subject.

@@ -105,6 +105,8 @@ def next_group_and_reason(state: dict[str, Any]) -> tuple[str, str]:
             return "endpoint_process", "confirm sync-health / MAINNET_RPC_URL behavior"
         if source == "client_setup" and not sync.get("client_setup_acknowledged"):
             return "sync_observe", "acknowledge real client setup handoff"
+        if source == "client_setup" and sync.get("client_setup_acknowledged"):
+            return "sync_observe", "choose sync-observe data source after client setup"
         if not sync.get("stop_condition"):
             return "sync_observe", "choose sync-observe stop condition"
         if sync.get("stop_condition") == "duration" and not sync.get("duration_seconds"):

@@ -9,18 +9,25 @@ try:
     from ..analyzers.artifact_qa import answer_artifact_question
     from ..analyzers.bottleneck_rules import diagnose_artifacts
     from ..analyzers.result_analyzer import analyze_job
+    from ..diagnostics.doctor import run_doctor
     from ..discovery.environment import discover_environment
+    from ..knowledge.execution_contract import load_execution_contract
     from ..knowledge.framework_capabilities import load_framework_capabilities
     from ..knowledge.framework_context import load_framework_context
     from ..knowledge.framework_index import load_or_build_framework_index
     from ..knowledge.gap_analyzer import analyze_capability_gap
     from ..knowledge.loader import load_knowledge_provider, provider_status
+    from ..llm.auth_status import inspect_llm_auth
     from ..onboarding.template_drafter import draft_chain_template
     from ..planners.preflight import run_preflight
     from ..planners.strategy_planner import generate_plan
+    from ..runners.benchmark_pipeline import prepare_benchmark_run, run_fake_node_smoke_benchmark
+    from ..runners.dependency_installer import audit_dependencies, install_dependencies
     from ..runners.job_manager import get_job, submit_job, tail_job_log
+    from ..runners.tool_result import tool_result
     from ..validators.config_contract import build_missing_config_questions, validate_required_config
     from ..validators.execution_gate import validate_execution_gate
+    from ..validators.fixture_checks import validate_fake_node_fixture_authenticity, validate_fake_node_fixture_coverage
     from ..validators.onboarding_gate import build_onboarding_handoff
     from ..validators.rpc_workload import default_workload, validate_rpc_workload
     from ..validators.chain_template import validate_chain_template
@@ -28,33 +35,28 @@ except ImportError:  # script execution with agent/ on sys.path
     from analyzers.artifact_qa import answer_artifact_question
     from analyzers.bottleneck_rules import diagnose_artifacts
     from analyzers.result_analyzer import analyze_job
+    from diagnostics.doctor import run_doctor
     from discovery.environment import discover_environment
+    from knowledge.execution_contract import load_execution_contract
     from knowledge.framework_capabilities import load_framework_capabilities
     from knowledge.framework_context import load_framework_context
     from knowledge.framework_index import load_or_build_framework_index
     from knowledge.gap_analyzer import analyze_capability_gap
     from knowledge.loader import load_knowledge_provider, provider_status
+    from llm.auth_status import inspect_llm_auth
     from onboarding.template_drafter import draft_chain_template
     from planners.preflight import run_preflight
     from planners.strategy_planner import generate_plan
+    from runners.benchmark_pipeline import prepare_benchmark_run, run_fake_node_smoke_benchmark
+    from runners.dependency_installer import audit_dependencies, install_dependencies
     from runners.job_manager import get_job, submit_job, tail_job_log
+    from runners.tool_result import tool_result
     from validators.config_contract import build_missing_config_questions, validate_required_config
     from validators.execution_gate import validate_execution_gate
+    from validators.fixture_checks import validate_fake_node_fixture_authenticity, validate_fake_node_fixture_coverage
     from validators.onboarding_gate import build_onboarding_handoff
     from validators.rpc_workload import default_workload, validate_rpc_workload
     from validators.chain_template import validate_chain_template
-try:
-    from ..adk_app.tools.actions import run_fake_node_smoke_benchmark
-    from ..adk_app.tools.actions import install_dependencies
-    from ..adk_app.tools.planning import prepare_benchmark_run
-    from ..adk_app.tools.read_only import audit_dependencies
-    from ..adk_app.tools.read_only import load_execution_contract
-except ImportError:  # script execution with agent/ on sys.path
-    from adk_app.tools.actions import run_fake_node_smoke_benchmark
-    from adk_app.tools.actions import install_dependencies
-    from adk_app.tools.planning import prepare_benchmark_run
-    from adk_app.tools.read_only import audit_dependencies
-    from adk_app.tools.read_only import load_execution_contract
 
 
 def execute_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -87,14 +89,22 @@ def execute_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str
             kwargs["jobs_dir"] = args["jobs_dir"]
         return submit_job(_required(args, "plan_file"), **kwargs)
     if name == "run_fake_node_smoke_benchmark":
+        if not bool(args.get("approved", False)):
+            return _confirmation_required(
+                "run_fake_node_smoke_benchmark",
+                "Run real quick benchmark traffic against fake-node with isolated output paths.",
+            )
         return run_fake_node_smoke_benchmark(
             _required(args, "plan_file"),
             jobs_dir=args.get("jobs_dir", ".agent/jobs"),
-            approved=bool(args.get("approved", False)),
         )
     if name == "install_dependencies":
+        if not bool(args.get("approved", False)):
+            return _confirmation_required(
+                "install_dependencies",
+                "Install or update local benchmark and Agent runtime dependencies.",
+            )
         return install_dependencies(
-            approved=bool(args.get("approved", False)),
             no_sudo=bool(args.get("no_sudo", True)),
             include_vegeta=bool(args.get("include_vegeta", True)),
             include_agent_runtime=bool(args.get("include_agent_runtime", False)),
@@ -102,6 +112,21 @@ def execute_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str
             adk_venv=args.get("adk_venv", ".venv-adk"),
             allow_system_python=bool(args.get("allow_system_python", False)),
         )
+    if name == "run_doctor":
+        return run_doctor()
+    if name == "validate_fake_node_fixture_coverage":
+        return validate_fake_node_fixture_coverage(
+            chains=args.get("chains", "all"),
+            modes=args.get("modes", "single,mixed"),
+            strict=bool(args.get("strict", True)),
+        )
+    if name == "validate_fake_node_fixture_authenticity":
+        return validate_fake_node_fixture_authenticity(
+            modes=args.get("modes", "single,mixed"),
+            allow_incomplete=bool(args.get("allow_incomplete", False)),
+        )
+    if name == "inspect_llm_auth":
+        return inspect_llm_auth()
     if name == "get_job_status":
         return _get_job(args)
     if name == "tail_job_log":
@@ -174,6 +199,15 @@ def execute_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str
             payload["rpc_methods"] = provider.get_rpc_methods(args["chain"])
         return payload
     raise ValueError(f"unsupported tool: {name}")
+
+
+def _confirmation_required(action: str, summary: str) -> dict[str, Any]:
+    return tool_result(
+        status="needs_confirmation",
+        data={"action": action, "summary": summary},
+        next_actions=["ask user for explicit yes/no confirmation"],
+        requires_user_confirmation=True,
+    )
 
 
 def load_arguments(value: str) -> dict[str, Any]:

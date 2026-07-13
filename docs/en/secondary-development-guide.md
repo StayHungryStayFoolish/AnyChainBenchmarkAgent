@@ -87,10 +87,8 @@ Development locations:
 - `agent/knowledge/base.py`: provider contract.
 - `agent/knowledge/http_provider.py`: generic HTTP adapter.
 - `agent/knowledge/loader.py`: provider selection.
-- `agent/adk_app/instructions.py`: how ADK should ground KB evidence and avoid
-  unsupported claims.
-- `agent/adk_app/tools/read_only.py`: ADK read-only tools that expose KB search
-  and local capability evidence.
+- `agent/tools/executor.py`: exposes the `knowledge_search` tool that queries
+  the configured KB provider and local capability evidence.
 - `agent/cli.py`: smoke commands and integration entrypoints.
 
 Expected contract:
@@ -137,9 +135,8 @@ Development locations:
 - `config/agent_config.sh`: LLM, Google auth, and optional KB defaults.
 - `agent/runners/job_manager.py`: job status, artifact index, and detached run
   lifecycle.
-- `agent/adk_app/instructions.py`: root ADK instruction.
-- `agent/adk_app/tools/`: ADK function-tool wrappers.
-- `agent/adk_app/evals/`: no-key ADK package and tool-contract checks.
+- `agent/llm/search_grounding.py`: the sole `google-adk` consumer (optional
+  Gemini `google_search` grounding); all other tool wrappers are retired.
 
 Supported integration modes:
 

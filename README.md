@@ -17,9 +17,12 @@ monitoring collectors, fake-node, report generation, and archiving are still the
 source of truth. The intended human-facing entrypoint is `./bin/anychain-agent`.
 The product workflow is owned by the LangGraph Harness: it holds checkpointed
 state, routes typed intents to configuration groups, validates every gate, and
-selects the next blocking question. Google ADK remains available as a model/tool
-bridge for Gemini and Google capabilities, but it does not own a second
-benchmark wizard.
+selects the next blocking question. The Harness's own model calls are plain
+OpenAI-compatible HTTP requests for every provider (OpenAI, DeepSeek, and
+Gemini on Vertex alike); Google ADK is used for exactly one optional
+capability — Gemini `google_search` grounding during real-node client setup
+(see `agent/llm/search_grounding.py`) — and never owns a second benchmark
+wizard or conversation loop.
 
 The benchmark engine is the stable execution layer. The Agent uses the
 configured LLM only to interpret ambiguous natural language into typed Harness
@@ -328,7 +331,8 @@ required values before a real run.
 
 Start the Agent. This command opens the AnyChain product terminal. The
 LangGraph Harness owns workflow state, group routing, validation, and execution
-approval; Google ADK is only the optional model/tool bridge:
+approval; Google ADK is only used for the optional Gemini `google_search`
+grounding capability:
 
 ```bash
 ./bin/anychain-agent

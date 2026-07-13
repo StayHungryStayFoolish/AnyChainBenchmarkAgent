@@ -72,7 +72,6 @@ environment.
    ```bash
    source config/agent_config.sh
    python3 agent/cli.py adk-status
-   python3 agent/cli.py adk-eval
    ```
 
 6. Start the product terminal:
@@ -248,7 +247,6 @@ When code changes are made, run:
 ```bash
 python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract tests.test_agent_langgraph_harness
 python3 tools/check_agent_boundaries.py --root .
-python3 agent/cli.py adk-eval
 git diff --check
 ```
 
