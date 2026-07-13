@@ -80,47 +80,6 @@ def run_doctor(discovery: dict[str, Any] | None = None) -> dict[str, Any]:
     return report
 
 
-def format_doctor_report(report: dict[str, Any]) -> str:
-    env = report.get("environment", {})
-    cloud = env.get("cloud", {})
-    deployment = env.get("deployment", {})
-    deps = env.get("dependencies", {})
-    llm = report.get("llm", {})
-    kb = report.get("knowledge_base", {})
-    google_auth = report.get("google_auth", {})
-    capabilities = report.get("capabilities", {})
-    lines = [
-        "Agent doctor report.",
-        f"- status: {report.get('status')}",
-        f"- cloud: {cloud.get('provider', 'unknown')} / {cloud.get('platform', 'unknown')}",
-        f"- deployment: {deployment.get('type', 'unknown')}",
-        f"- required dependencies missing: {', '.join(deps.get('missing_required', [])) or '<none>'}",
-        f"- optional dependencies missing: {', '.join(deps.get('missing_optional', [])) or '<none>'}",
-        f"- LLM provider: {llm.get('provider')} / {llm.get('model')}",
-        f"- LLM validation errors: {', '.join(llm.get('validation_errors', [])) or '<none>'}",
-        f"- Google auth mode: {google_auth.get('auth_mode', '<not-used>')}",
-        f"- gcloud available: {google_auth.get('gcloud_available', '<not-required>')}",
-        f"- local ADC file exists: {google_auth.get('local_adc_file_exists', '<not-required>')}",
-        f"- knowledge base: {kb.get('provider', 'disabled')}",
-        (
-            "- capabilities: "
-            f"{capabilities.get('chain_count')} chains, "
-            f"{capabilities.get('family_count')} families, "
-            f"{capabilities.get('unique_rpc_method_count')} unique RPC methods, "
-            f"{capabilities.get('fake_node_fixture_file_count')} fake-node fixtures"
-        ),
-    ]
-    warnings = report.get("warnings", [])
-    if warnings:
-        lines.append("Warnings:")
-        lines.extend(f"- {warning}" for warning in warnings)
-    next_actions = report.get("next_actions", [])
-    if next_actions:
-        lines.append("Next actions:")
-        lines.extend(f"- {action}" for action in next_actions)
-    return "\n".join(lines)
-
-
 def _readiness(required_missing: list[str], llm_errors: list[str]) -> str:
     if required_missing:
         return "needs_dependencies"

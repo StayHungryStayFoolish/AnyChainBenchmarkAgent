@@ -8,7 +8,7 @@ from typing import Any
 from .checkpoints import create_sqlite_checkpointer, default_checkpoint_path
 from .nodes.router import route_after_user_turn
 from .groups import process_turn
-from .state import AgentGraphState, ensure_session_metadata, new_state
+from .state import AgentGraphState, RESET_PRESERVED_KEYS, ensure_session_metadata, new_state
 
 
 class AnyChainGraphRuntime:
@@ -43,7 +43,22 @@ class AnyChainGraphRuntime:
         return self._load_state(language="en")
 
     def reset(self, language: str = "en") -> AgentGraphState:
+        """Reset workflow configuration while preserving startup facts.
+
+        Startup environment discovery, framework summary, web-research
+        status, and job/report history are read-only facts independent of
+        user configuration; clearing configuration must not silently
+        destroy them. This mirrors `groups._reset_workflow_state`, which is
+        the same operation reached through the `reset_session` typed intent
+        action — both must agree on what "reset" preserves.
+        """
+
+        current = self._load_state(language=language)
         fresh = new_state(self.thread_id, language=language, session_purpose=self.session_purpose)
+        for key in RESET_PRESERVED_KEYS:
+            if key in current:
+                fresh[key] = current[key]  # type: ignore[literal-required]
+        fresh["audit_events"] = list(current.get("audit_events") or []) + [{"event": "workflow_reset"}]
         return self.update(fresh)
 
     def update(self, patch: dict[str, Any]) -> AgentGraphState:

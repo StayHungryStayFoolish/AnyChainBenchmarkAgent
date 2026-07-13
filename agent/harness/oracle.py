@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from .routing import next_group_and_reason
+
 
 @dataclass(frozen=True)
 class NextAction:
@@ -167,6 +169,81 @@ def format_current_context(state: dict[str, Any], language: str) -> str:
     return f"There is no pending question. {format_recommended_next_action(action, language)}"
 
 
+_STARTUP_DISCOVERY_CONFIRMABLE_KEYS = (
+    "CLOUD_REGION",
+    "CLOUD_ZONE",
+    "MACHINE_TYPE",
+    "LEDGER_DEVICE",
+    "DATA_VOL_TYPE",
+    "DATA_VOL_SIZE",
+    "DATA_VOL_MAX_IOPS",
+    "DATA_VOL_MAX_THROUGHPUT",
+    "has_accounts_device",
+    "NETWORK_INTERFACE",
+    "NETWORK_MAX_BANDWIDTH_GBPS",
+)
+
+
+def format_startup_discovery(state: dict[str, Any], language: str) -> str:
+    """Explain read-only startup environment inference.
+
+    `discovery` is populated once at Agent startup and is independent of
+    `confirmed_config`. Clearing user configuration must not be confused
+    with clearing this data, and the two must be explained separately.
+    """
+
+    discovery = state.get("discovery") or {}
+    if not discovery:
+        return _localized(
+            language,
+            "启动时的环境推断数据当前不存在，可能是首次运行或诊断尚未完成。输入 `doctor` 可以重新执行只读环境检查。",
+            "No startup environment inference data is available yet; this may be the first run or diagnostics have not completed. Type `doctor` to re-run read-only environment diagnostics.",
+        )
+    cloud = discovery.get("cloud") or {}
+    deployment = discovery.get("deployment") or {}
+    host = discovery.get("host") or {}
+    network = discovery.get("network") or {}
+    disks = discovery.get("disks") or {}
+    confirmed = state.get("confirmed_config") or {}
+    memory = host.get("memory_gib")
+    inferred_lines = [
+        f"- CLOUD_PROVIDER: {cloud.get('provider') or '<unknown>'}",
+        f"- deployment: {cloud.get('platform') or deployment.get('type') or '<unknown>'}",
+        f"- CPU: {host.get('cpu_count') or '<unknown>'}",
+        f"- Memory: {memory} GiB" if memory not in (None, "") else "- Memory: <unknown>",
+        f"- NETWORK_INTERFACE candidate: {network.get('default_interface') or '<none>'}",
+        f"- LEDGER_DEVICE candidate: {disks.get('proposed_ledger_device') or '<none>'}",
+        f"- ACCOUNTS_DEVICE candidate: {disks.get('proposed_accounts_device') or '<none detected>'}",
+        f"- dependency status: {discovery.get('dependencies') or '<unknown>'}",
+    ]
+    needs_confirmation = [key for key in _STARTUP_DISCOVERY_CONFIRMABLE_KEYS if key not in confirmed]
+    if confirmed:
+        confirmed_note = _localized(
+            language,
+            f"已确认配置字段：{', '.join(sorted(str(key) for key in confirmed.keys()))}。",
+            f"Confirmed config fields: {', '.join(sorted(str(key) for key in confirmed.keys()))}.",
+        )
+    else:
+        confirmed_note = _localized(
+            language,
+            "当前没有已确认的配置（如果刚清空过配置，这是正常现象，不代表启动推断也被清空）。",
+            "There is no confirmed configuration right now (this is expected right after clearing config; it does not mean startup inference was also cleared).",
+        )
+    if str(language or "").startswith("zh"):
+        return (
+            "启动时的只读环境推断仍然存在，可作为后续配置参考：\n"
+            + "\n".join(inferred_lines)
+            + f"\n尚未推断/需要你确认的项：{', '.join(needs_confirmation) if needs_confirmation else '<none>'}。\n"
+            + confirmed_note
+        )
+    return (
+        "Startup read-only environment inference is still available for later configuration:\n"
+        + "\n".join(inferred_lines)
+        + f"\nNot yet inferred / needs confirmation: {', '.join(needs_confirmation) if needs_confirmation else '<none>'}.\n"
+        + confirmed_note
+    )
+
+
 def format_recommended_next_action(action: NextAction, language: str) -> str:
     """Render a user-facing next action without leaking internal group ids."""
 
@@ -210,11 +287,13 @@ def _group_label(group: str, language: str) -> str:
         "accounts_disk": ("accounts/state 磁盘", "accounts/state disk"),
         "network": ("网络配置", "network configuration"),
         "endpoint_process": ("endpoint 和节点进程", "endpoint and node process"),
+        "chain_auxiliary_endpoints": ("链辅助 endpoint", "chain auxiliary endpoints"),
         "workload_rpc": ("RPC workload", "RPC workload"),
         "target_samples_fixtures": ("target samples / fixtures", "target samples / fixtures"),
         "qps_profile": ("QPS profile", "QPS profile"),
         "sync_observe": ("sync-observe", "sync-observe"),
         "observability": ("Prometheus/Grafana 可观测性", "Prometheus/Grafana observability"),
+        "advanced_tuning": ("高级调优参数", "advanced tuning settings"),
         "preflight_smoke_execution": ("preflight/smoke", "preflight/smoke"),
         "job_monitoring": ("job 监控", "job monitoring"),
     }
@@ -228,6 +307,14 @@ def _reason_label(reason: str, language: str) -> str:
     if reason.startswith("confirm "):
         field = reason.removeprefix("confirm ").strip()
         return _localized(language, f"确认 `{field}`", f"confirm `{field}`")
+    # `routing.next_group_and_reason` emits these two as
+    # f"continue ...: {internal_status_enum}" — without a label, the raw
+    # internal status (e.g. "needs_schema_evidence") leaked verbatim into a
+    # user-facing sentence.
+    if reason.startswith("continue new-chain validation:"):
+        return _localized(language, "继续验证新链", "continue verifying the new chain")
+    if reason.startswith("continue custom RPC workflow:"):
+        return _localized(language, "继续自定义 RPC 配置", "continue the custom RPC setup")
     mapping = {
         "choose target mode": ("选择测试模式", "choose target mode"),
         "confirm chain identity": ("确认链名和协议", "confirm chain identity"),
@@ -236,6 +323,7 @@ def _reason_label(reason: str, language: str) -> str:
         "choose benchmark QPS mode": ("选择 quick、standard 或 intensive", "choose quick, standard, or intensive"),
         "confirm or adjust QPS profile": ("确认或调整 QPS 参数", "confirm or adjust the QPS profile"),
         "choose observability mode": ("选择是否开启或接入 Prometheus/Grafana", "choose observability mode"),
+        "review advanced tuning settings": ("确认是否调整高级调优参数", "review advanced tuning settings"),
         "approve preflight/smoke": ("确认执行 preflight/smoke", "approve preflight/smoke"),
         "choose sync-observe data source": ("选择真实同步观测数据来源", "choose the sync-observe data source"),
         "validate real sync-observe RPC endpoint": ("验证真实 sync-observe RPC endpoint", "validate the real sync-observe RPC endpoint"),
@@ -250,90 +338,15 @@ def _reason_label(reason: str, language: str) -> str:
 
 
 def _next_group_and_reason(state: dict[str, Any]) -> tuple[str, str]:
-    confirmed = state.get("confirmed_config") or {}
-    identity = state.get("chain_identity") or {}
-    target_mode = str(state.get("target_mode") or "").strip()
-    workflow_mode = str(state.get("workflow_mode") or "").strip()
+    """Delegate to `routing.next_group_and_reason`.
 
-    if not target_mode:
-        return "opening", "choose target mode"
-    if identity.get("status") in {
-        "existing_family_needs_endpoint",
-        "existing_family_needs_method",
-        "existing_family_needs_schema_evidence",
-        "existing_family_schema_needs_confirmation",
-        "existing_family_needs_workload_scope",
-        "existing_family_needs_single_method",
-        "existing_family_needs_weights",
-    }:
-        return "endpoint_process", f"continue new-chain validation: {identity.get('status')}"
-    if identity.get("status") == "existing_family_runtime_choice":
-        return "target_samples_fixtures", "choose new-chain runtime path"
-    if not identity.get("canonical") or identity.get("status") not in {"confirmed", "case2_runtime_override"}:
-        return "chain_identity", "confirm chain identity"
-    for key in ("CLOUD_REGION", "CLOUD_ZONE", "MACHINE_TYPE"):
-        if not confirmed.get(key):
-            return "provider_deployment", f"confirm {key}"
-    for key in ("LEDGER_DEVICE", "DATA_VOL_TYPE", "DATA_VOL_SIZE", "DATA_VOL_MAX_IOPS", "DATA_VOL_MAX_THROUGHPUT"):
-        if not confirmed.get(key):
-            return "ledger_disk", f"confirm {key}"
-    if "has_accounts_device" not in confirmed:
-        return "accounts_disk", "confirm whether accounts/state disk exists"
-    if confirmed.get("has_accounts_device"):
-        for key in ("ACCOUNTS_DEVICE", "ACCOUNTS_VOL_TYPE", "ACCOUNTS_VOL_SIZE", "ACCOUNTS_VOL_MAX_IOPS", "ACCOUNTS_VOL_MAX_THROUGHPUT"):
-            if not confirmed.get(key):
-                return "accounts_disk", f"confirm {key}"
-    for key in ("NETWORK_INTERFACE", "NETWORK_MAX_BANDWIDTH_GBPS"):
-        if not confirmed.get(key):
-            return "network", f"confirm {key}"
-    endpoint_evidence = state.get("endpoint_evidence") or {}
-    if target_mode == "real-node" and not endpoint_evidence.get("local_rpc_url_ready"):
-        return "endpoint_process", "validate LOCAL_RPC_URL"
-    if target_mode == "real-node" and not confirmed.get("BLOCKCHAIN_PROCESS_NAMES"):
-        return "endpoint_process", "confirm BLOCKCHAIN_PROCESS_NAMES"
-    if target_mode == "real-node" and not confirmed.get("MAINNET_RPC_URL_REVIEWED"):
-        return "endpoint_process", "confirm MAINNET_RPC_URL / sync-health behavior"
+    This used to be an independent reimplementation of the same
+    precondition chain `groups._next_group` uses to drive live turn
+    routing. Two hand-maintained copies could (and did, in at least one
+    case) disagree; see architecture audit Finding B1.
+    """
 
-    sync = state.get("sync_observe") or {}
-    if workflow_mode == "sync_observe":
-        source = sync.get("source")
-        if not source:
-            return "sync_observe", "choose sync-observe data source"
-        if source in {"existing_local_node", "endpoint_only"} and not endpoint_evidence.get("sync_rpc_url_ready"):
-            return "endpoint_process", "validate real sync-observe RPC endpoint"
-        if source == "existing_local_node" and not confirmed.get("BLOCKCHAIN_PROCESS_NAMES"):
-            return "endpoint_process", "confirm node process for sync-observe attribution"
-        if source in {"existing_local_node", "endpoint_only"} and not confirmed.get("MAINNET_RPC_URL_REVIEWED"):
-            return "endpoint_process", "confirm sync-health / MAINNET_RPC_URL behavior"
-        if source == "client_setup" and not sync.get("client_setup_acknowledged"):
-            return "sync_observe", "acknowledge real client setup handoff"
-        if not sync.get("stop_condition"):
-            return "sync_observe", "choose sync-observe stop condition"
-        if sync.get("stop_condition") == "duration" and not sync.get("duration_seconds"):
-            return "sync_observe", "confirm sync-observe duration"
-        if not (state.get("observability") or {}).get("mode"):
-            return "observability", "choose observability mode"
-        if not (state.get("preflight") or {}).get("approved"):
-            return "preflight_smoke_execution", "approve preflight/smoke"
-        return "job_monitoring", "monitor sync-observe job"
-
-    custom_rpc = state.get("custom_rpc") or {}
-    if custom_rpc.get("status") in {"needs_endpoint", "needs_method", "needs_schema_evidence", "schema_needs_confirmation", "needs_scope", "needs_weights", "probe_failed"}:
-        return "endpoint_process", f"continue custom RPC workflow: {custom_rpc.get('status')}"
-    if not state.get("rpc_mode"):
-        return "workload_rpc", "choose RPC mode"
-    if not (state.get("workload") or {}).get("confirmed"):
-        return "workload_rpc", "confirm RPC workload"
-    qps = state.get("qps_profile") or {}
-    if not qps.get("mode"):
-        return "qps_profile", "choose benchmark QPS mode"
-    if not qps.get("confirmed"):
-        return "qps_profile", "confirm or adjust QPS profile"
-    if not (state.get("observability") or {}).get("mode"):
-        return "observability", "choose observability mode"
-    if not (state.get("preflight") or {}).get("approved"):
-        return "preflight_smoke_execution", "approve preflight/smoke"
-    return "job_monitoring", "monitor benchmark job"
+    return next_group_and_reason(state)
 
 
 def _execution_status(state: dict[str, Any]) -> str:

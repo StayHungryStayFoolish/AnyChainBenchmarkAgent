@@ -20,6 +20,82 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
         self.assertNotIn("terminal.pending_answers", text)
         self.assertNotIn("terminal.input_classifier", text)
 
+    def test_startup_preserves_dependency_offer_so_yes_installs(self) -> None:
+        """The startup "[Y/n]" dependency-install offer must stay actionable.
+
+        Regression for a real first-interaction bug: `_startup_doctor` set
+        current_question_id="install_dependencies" (missing vegeta), but the
+        ADK-available branch in `startup()` then reset current_question_id="",
+        so the user's "y" never reached `_install_dependencies` and fell through
+        to the harness (greeting/capabilities).
+        """
+
+        import sys
+        import types
+
+        repo = Path(__file__).resolve().parents[1]
+        agent_root = str(repo / "agent")
+        if agent_root not in sys.path:
+            sys.path.insert(0, agent_root)
+        sys.modules.pop("utils", None)
+        sys.modules.pop("utils.redaction", None)
+
+        from terminal import repl as repl_mod
+        from terminal.io import OutputOnlyIO
+        from terminal.repl import AnyChainTerminal, TerminalSession
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = AnyChainTerminal(
+                state=TerminalSession(language="en"),
+                io=OutputOnlyIO(),
+                session_id="dep-thread",
+                checkpoint_path=Path(tmpdir) / "cp.sqlite",
+                session_purpose="chaos",
+            )
+            installed = {"called": False}
+            app._load_framework_context = lambda: None  # type: ignore[method-assign]
+            app._startup_doctor = lambda: setattr(app.state, "current_question_id", "install_dependencies")  # type: ignore[method-assign]
+            app._install_dependencies = lambda: installed.__setitem__("called", True)  # type: ignore[method-assign]
+            app._offer_harness_resume_if_needed = lambda: None  # type: ignore[method-assign]
+
+            with patch.object(
+                repl_mod, "adk_status", return_value=types.SimpleNamespace(as_dict=lambda: {"available": True, "reason": "t"})
+            ), patch.object(repl_mod, "_adk_runner_status", return_value={"available": True, "reason": "t"}):
+                app.startup()
+                # The offer must survive startup, not be clobbered.
+                self.assertEqual(app.state.current_question_id, "install_dependencies")
+                # "y" must route to the installer.
+                app.handle_user_text("y")
+
+        self.assertTrue(installed["called"])
+
+    def test_logs_command_reports_clean_error_for_missing_job(self) -> None:
+        """`logs <bad-id>` must emit a clean "job not found" message, not a raw
+
+        FileNotFoundError. Regression for a live chaos finding: `_logs` called
+        tail_job_log without a guard, leaking the exception to the user, while
+        `_follow_logs`/`_status` reported cleanly.
+        """
+
+        from agent.terminal.job_commands import JobCommandHandler
+
+        class _State:
+            language = "en"
+            latest_job_id = ""
+
+        messages: list[str] = []
+
+        class _IO:
+            def agent(self, language: str, message: str) -> None:
+                messages.append(message)
+
+        handler = JobCommandHandler(_State(), _IO())
+        handler._logs("totally-bogus-xyz")  # must not raise
+        joined = "\n".join(messages)
+        self.assertNotIn("FileNotFoundError", joined)
+        self.assertNotIn("Traceback", joined)
+        self.assertIn("totally-bogus-xyz", joined)
+
     def test_technical_scalar_keeps_existing_chinese_language(self) -> None:
         from agent.terminal.language import detect_language
 
@@ -39,7 +115,7 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime = AnyChainGraphRuntime(thread_id="terminal-contract", checkpoint_path=Path(tmpdir) / "checkpoint.sqlite")
-            with patch("agent.harness.groups.resolve_intent_action", return_value={"intent": "greeting", "confidence": "high"}):
+            with patch("agent.harness.groups.resolve_action_queue", return_value={"actions": [{"type": "greeting", "confidence": "high"}]}):
                 state = runtime.invoke("Hi", language="en")
 
         self.assertEqual(state["active_group"], "opening")

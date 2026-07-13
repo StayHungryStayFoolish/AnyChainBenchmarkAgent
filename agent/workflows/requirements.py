@@ -5,21 +5,11 @@ from __future__ import annotations
 from typing import Any
 
 try:
-    from ..knowledge.entry_contract import REAL_NODE_ENDPOINT_FIELDS, runtime_baseline_keys
+    from ..knowledge.entry_contract import REAL_NODE_ENDPOINT_FIELDS, WORKFLOW_CONFIRMATION_FIELDS, runtime_baseline_keys
 except ImportError:  # script execution with agent/ on sys.path
-    from knowledge.entry_contract import REAL_NODE_ENDPOINT_FIELDS, runtime_baseline_keys
+    from knowledge.entry_contract import REAL_NODE_ENDPOINT_FIELDS, WORKFLOW_CONFIRMATION_FIELDS, runtime_baseline_keys
 
-COMMON_BLOCKERS = (
-    "chain",
-    "use_fake_node",
-    "rpc_mode",
-    "benchmark_mode_confirmed",
-    "qps_profile_confirmed",
-    "observability_choice_confirmed",
-    "chain_template_reviewed",
-    "rpc_workload_confirmed",
-    "rpc_param_samples_confirmed",
-)
+COMMON_BLOCKERS = tuple(field.key for field in WORKFLOW_CONFIRMATION_FIELDS)
 ENVIRONMENT_BLOCKERS = runtime_baseline_keys()
 FAKE_NODE_BLOCKERS: tuple[str, ...] = ()
 REAL_NODE_ENDPOINT_BLOCKERS = tuple(field.key for field in REAL_NODE_ENDPOINT_FIELDS)

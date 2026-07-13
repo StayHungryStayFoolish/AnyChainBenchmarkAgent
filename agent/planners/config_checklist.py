@@ -4,51 +4,37 @@ from __future__ import annotations
 
 from typing import Any
 
+try:
+    from ..knowledge.entry_contract import (
+        OPTIONAL_ACCOUNTS_FIELDS,
+        REAL_NODE_ENDPOINT_FIELDS,
+        RUNTIME_BASELINE_FIELDS,
+        WORKFLOW_CONFIRMATION_FIELDS,
+        field_specs_for,
+    )
+except ImportError:  # script execution with agent/ on sys.path
+    from knowledge.entry_contract import (
+        OPTIONAL_ACCOUNTS_FIELDS,
+        REAL_NODE_ENDPOINT_FIELDS,
+        RUNTIME_BASELINE_FIELDS,
+        WORKFLOW_CONFIRMATION_FIELDS,
+        field_specs_for,
+    )
 
-ENDPOINT_REQUIRED = {
-    "local_rpc_url": "Local RPC URL for the blockchain node under test.",
-}
+
+ENDPOINT_REQUIRED = {field.key: field.description for field in REAL_NODE_ENDPOINT_FIELDS if field.key == "local_rpc_url"}
+
+_ENVIRONMENT_REVIEW_KEYS = {"cloud_region", "cloud_zone", "machine_type"}
 
 RUNTIME_BASELINE_REQUIRED = {
-    "blockchain_process_names": "Process names or command-line fragments used for node resource attribution.",
-    "ledger_device": "Ledger/data disk device used for disk charts and bottleneck attribution.",
-    "data_vol_type": "Ledger/data disk type used for report metadata and baseline interpretation.",
-    "data_vol_size": "Ledger/data disk size in GiB.",
-    "data_vol_max_iops": "Provisioned data disk IOPS baseline.",
-    "data_vol_max_throughput": "Provisioned data disk throughput baseline in MiB/s.",
-    "network_interface": "Network interface used by the node.",
-    "network_max_bandwidth_gbps": "Instance or pod network bandwidth baseline in Gbps.",
+    field.key: field.description for field in RUNTIME_BASELINE_FIELDS if field.key not in _ENVIRONMENT_REVIEW_KEYS
 }
 
-COMMON_REQUIRED = {
-    "chain": "Chain template name, for example solana or ethereum.",
-    "use_fake_node": "Choose fake-node closed-loop testing or real-node testing.",
-    "rpc_mode": "single or mixed RPC workload mode.",
-    "benchmark_mode_confirmed": "Confirm benchmark mode: quick, standard, or intensive.",
-    "qps_profile_confirmed": "Confirm QPS defaults for the selected mode, including initial QPS, max QPS, step, and duration.",
-    "observability_choice_confirmed": "Confirm whether to disable observability, start local Prometheus/Grafana, or expose only the exporter for an existing stack.",
-    "chain_template_reviewed": "Review the selected chain template runtime endpoint variables, sample variables, and default RPC workload.",
-    "rpc_workload_confirmed": "Confirm the selected single/mixed RPC methods and weights.",
-    "rpc_param_samples_confirmed": "Confirm TARGET_* parameter samples for the selected RPC methods.",
-}
+COMMON_REQUIRED = {field.key: field.description for field in WORKFLOW_CONFIRMATION_FIELDS}
 
-SYNC_OBSERVE_REQUIRED = {
-    "chain": "Chain template name used for sync-health interpretation.",
-    "sync_observe_stop_condition": "Confirm sync-observe stop condition: run until stopped, fixed duration, or until synced.",
-    "ledger_device": "Ledger/data disk device used for sync-resource charts and bottleneck attribution.",
-    "data_vol_type": "Ledger/data disk type used for report metadata and baseline interpretation.",
-    "data_vol_size": "Ledger/data disk size in GiB.",
-    "data_vol_max_iops": "Provisioned data disk IOPS baseline.",
-    "data_vol_max_throughput": "Provisioned data disk throughput baseline in MiB/s.",
-    "network_interface": "Network interface used by the node.",
-    "network_max_bandwidth_gbps": "Instance or pod network bandwidth baseline in Gbps.",
-    "node_process_identity": "Node process PID or command-line fragment for node CPU/thread attribution.",
-    "mainnet_rpc_url_reviewed": "Confirm MAINNET_RPC_URL or selected chain-template sync-health behavior for target-height comparison.",
-}
+SYNC_OBSERVE_REQUIRED = {field.key: field.description for field in field_specs_for("sync_observe") if field.required}
 
-SYNC_OBSERVE_OPTIONAL = {
-    "node_prometheus_metrics_url": "Optional node Prometheus metrics endpoint for MGas/s and client-native execution metrics.",
-}
+SYNC_OBSERVE_OPTIONAL = {field.key: field.description for field in field_specs_for("sync_observe") if not field.required}
 
 ENVIRONMENT_REVIEW = {
     "cloud_provider": "Detected cloud provider: gcp, aws, azure, or other.",
@@ -58,13 +44,7 @@ ENVIRONMENT_REVIEW = {
     "machine_type": "Machine or instance type for report metadata.",
 }
 
-ACCOUNTS_OPTIONAL = {
-    "accounts_device": "Optional second disk for account/state data.",
-    "accounts_vol_type": "Accounts/state disk type.",
-    "accounts_vol_size": "Accounts/state disk size in GiB.",
-    "accounts_vol_max_iops": "Provisioned accounts/state disk IOPS baseline.",
-    "accounts_vol_max_throughput": "Provisioned accounts/state disk throughput in MiB/s.",
-}
+ACCOUNTS_OPTIONAL = {field.key: field.description for field in OPTIONAL_ACCOUNTS_FIELDS}
 
 AGENT_REQUIRED_FOR_LLM = {
     "llm_provider": "LLM provider selected in config/agent_config.sh.",
@@ -87,7 +67,15 @@ def build_configuration_checklist(request: dict[str, Any], plan: dict[str, Any])
 
     benchmark_items = []
     if workload_type == "sync_observe":
+        local_attribution = bool(request_values.get("sync_observe_local_attribution", True))
         for key, description in SYNC_OBSERVE_REQUIRED.items():
+            # Endpoint-only sync-observe watches a remote node: there is no local
+            # process, so node_process_identity (local CPU/thread attribution)
+            # cannot and need not be provided. Requiring it would deadlock a flow
+            # that never asks for it.
+            if key == "node_process_identity" and not local_attribution:
+                benchmark_items.append(_item(key, description, True, "info"))
+                continue
             benchmark_items.append(_item(key, description, _is_present(key, request_values.get(key)), "blocker"))
         for key, description in SYNC_OBSERVE_OPTIONAL.items():
             benchmark_items.append(_item(key, description, bool(request_values.get(key)), "info"))
@@ -186,6 +174,7 @@ def _flatten_request_values(request: dict[str, Any], plan: dict[str, Any]) -> di
         "network_interface": request.get("network_interface") or materialized.get("NETWORK_INTERFACE"),
         "network_max_bandwidth_gbps": request.get("network_max_bandwidth_gbps") or materialized.get("NETWORK_MAX_BANDWIDTH_GBPS"),
         "sync_observe_stop_condition": request.get("sync_observe_stop_condition") or materialized.get("SYNC_OBSERVE_STOP_CONDITION"),
+        "sync_observe_local_attribution": request.get("sync_observe_local_attribution", True),
         "node_prometheus_metrics_url": request.get("node_prometheus_metrics_url") or materialized.get("NODE_PROMETHEUS_METRICS_URL"),
         "node_process_identity": (
             request.get("node_process_pid")

@@ -5,18 +5,24 @@ from __future__ import annotations
 from typing import Any
 
 try:
-    from ..knowledge.entry_contract import OPTIONAL_ACCOUNTS_FIELDS
+    from ..knowledge.entry_contract import ENV_TO_KEY, OPTIONAL_ACCOUNTS_FIELDS, field_specs_for
     from ..workflows.group_registry import GROUP_QUESTION_ORDER
     from ..workflows.group_registry import question_keys_for_group
     from ..workflows.requirements import ENVIRONMENT_BLOCKERS, REAL_NODE_BLOCKERS, missing_smoke_blockers
+    from ..planners import question_prompts
 except ImportError:  # script execution with agent/ on sys.path
-    from knowledge.entry_contract import OPTIONAL_ACCOUNTS_FIELDS
+    from knowledge.entry_contract import ENV_TO_KEY, OPTIONAL_ACCOUNTS_FIELDS, field_specs_for
     from workflows.group_registry import GROUP_QUESTION_ORDER
     from workflows.group_registry import question_keys_for_group
     from workflows.requirements import ENVIRONMENT_BLOCKERS, REAL_NODE_BLOCKERS, missing_smoke_blockers
+    from planners import question_prompts
 
 
 OPTIONAL_ACCOUNTS_KEYS = tuple(field.key for field in OPTIONAL_ACCOUNTS_FIELDS if field.key != "accounts_device")
+# A subset selector for one branch condition in `_build_next_question`
+# (collapse these four confirmations into a single `workload_customization_choice`
+# question once rpc_mode is known), not a "required fields" catalog in its own
+# right — intentionally kept as a literal rather than derived.
 WORKLOAD_CONFIRMATION_KEYS = frozenset({
     "chain_template_reviewed",
     "rpc_workload_confirmed",
@@ -24,7 +30,11 @@ WORKLOAD_CONFIRMATION_KEYS = frozenset({
     "mixed_weights_confirmed",
 })
 
-SYNC_OBSERVE_BLOCKERS = (
+# Ordered view over `entry_contract.field_specs_for("sync_observe")` — the
+# derived set matches exactly, reordered to the sequence sync-observe
+# questions have always been asked in (chain/mode choice, then hardware
+# baseline, then node identity, then endpoint review).
+_SYNC_OBSERVE_ORDER = (
     "chain",
     "sync_observe_stop_condition",
     "ledger_device",
@@ -37,31 +47,13 @@ SYNC_OBSERVE_BLOCKERS = (
     "node_process_identity",
     "mainnet_rpc_url_reviewed",
 )
-
-ENV_TO_KEY = {
-    "BLOCKCHAIN_NODE": "chain",
-    "RPC_MODE": "rpc_mode",
-    "LOCAL_RPC_URL": "local_rpc_url",
-    "MAINNET_RPC_URL": "mainnet_rpc_url_reviewed",
-    "BLOCKCHAIN_PROCESS_NAMES": "blockchain_process_names",
-    "BLOCKCHAIN_PROCESS_NAMES_STR": "blockchain_process_names",
-    "LEDGER_DEVICE": "ledger_device",
-    "DATA_VOL_TYPE": "data_vol_type",
-    "DATA_VOL_SIZE": "data_vol_size",
-    "DATA_VOL_MAX_IOPS": "data_vol_max_iops",
-    "DATA_VOL_MAX_THROUGHPUT": "data_vol_max_throughput",
-    "ACCOUNTS_DEVICE": "accounts_device",
-    "ACCOUNTS_VOL_TYPE": "accounts_vol_type",
-    "ACCOUNTS_VOL_SIZE": "accounts_vol_size",
-    "ACCOUNTS_VOL_MAX_IOPS": "accounts_vol_max_iops",
-    "ACCOUNTS_VOL_MAX_THROUGHPUT": "accounts_vol_max_throughput",
-    "NETWORK_INTERFACE": "network_interface",
-    "NETWORK_MAX_BANDWIDTH_GBPS": "network_max_bandwidth_gbps",
-    "CLOUD_REGION": "cloud_region",
-    "CLOUD_ZONE": "cloud_zone",
-    "MACHINE_TYPE": "machine_type",
-    "OBSERVABILITY_STACK_MODE": "observability_choice_confirmed",
-}
+_sync_observe_required_keys = {field.key for field in field_specs_for("sync_observe") if field.required} | {"chain"}
+if _sync_observe_required_keys != set(_SYNC_OBSERVE_ORDER):
+    # Not an `assert` on purpose: `python -O` strips asserts, and this
+    # invariant (single source of truth for sync-observe blockers) must hold
+    # even in optimized runs.
+    raise RuntimeError("SYNC_OBSERVE_BLOCKERS drifted from entry_contract.field_specs_for('sync_observe')")
+SYNC_OBSERVE_BLOCKERS = _SYNC_OBSERVE_ORDER
 
 def validate_required_config(target_mode: str | None, confirmed_config: dict[str, Any]) -> dict[str, Any]:
     """Return required-config status for fake-node or real-node benchmarks."""
@@ -119,7 +111,7 @@ def build_missing_config_questions(
         question = _typed_question({
             "id": key,
             "severity": "blocker",
-            "prompt": _prompt_for_key(key),
+            "prompt": _prompt_for_key(key, target_mode=target_mode or ""),
             "manual_input_allowed": True,
             "allow_manual_input": True,
             "manual_input_hint": "Reply with a listed number/id when candidates are shown, or type a custom value.",
@@ -127,20 +119,12 @@ def build_missing_config_questions(
         if key == "ledger_device" and candidates:
             question["candidates"] = candidates
             question["options"] = _options_from_candidates(candidates)
-            question["prompt"] = "Choose LEDGER_DEVICE from the detected disk inventory or enter a device name."
+            question["prompt"] = question_prompts.device_prompt("LEDGER_DEVICE")
         if key == "benchmark_mode_confirmed":
-            question["candidates"] = [
-                {"id": "quick", "description": "Short smoke/sanity run."},
-                {"id": "standard", "description": "Normal benchmark run."},
-                {"id": "intensive", "description": "Long bottleneck discovery run."},
-            ]
+            question["candidates"] = list(question_prompts.BENCHMARK_MODE_CANDIDATES)
             question["options"] = _options_from_candidates(question["candidates"])
         if key == "observability_choice_confirmed":
-            question["candidates"] = [
-                {"id": "disabled", "description": "Do not start observability stack."},
-                {"id": "local", "description": "Start exporter, local Prometheus, and local Grafana."},
-                {"id": "exporter", "description": "Start only exporter for an existing Prometheus/Grafana environment."},
-            ]
+            question["candidates"] = list(question_prompts.OBSERVABILITY_CANDIDATES)
             question["options"] = _options_from_candidates(question["candidates"])
         if key == "qps_profile_confirmed":
             question["interaction_mode"] = "accept_defaults_or_adjust_item"
@@ -163,7 +147,7 @@ def build_missing_config_questions(
         question = _typed_question({
             "id": "has_accounts_device",
             "severity": "confirm",
-            "prompt": "Does this node have a separate accounts/state disk?",
+            "prompt": question_prompts.text_for("has_accounts_device"),
             "candidates": candidates,
             "options": _options_from_candidates(candidates),
             "manual_input_allowed": True,
@@ -220,7 +204,7 @@ def _build_sync_observe_missing_questions(
         _typed_question({
             "id": key,
             "severity": "blocker",
-            "prompt": _prompt_for_key(key),
+            "prompt": _prompt_for_key(key, target_mode="sync-observe"),
             "manual_input_allowed": True,
             "allow_manual_input": True,
         })
@@ -360,7 +344,7 @@ def _question_for_next_key(
             "id": "benchmark_profile_choice",
             "kind": "numbered_choice",
             "field": "benchmark_mode_confirmed",
-            "prompt": "Choose benchmark mode: 1 quick, 2 standard, or 3 intensive.",
+            "prompt": question_prompts.benchmark_mode_prompt(),
             "options": [
                 {
                     "id": "1",
@@ -414,7 +398,7 @@ def _question_for_next_key(
             "id": "observability_mode_choice",
             "kind": "numbered_choice",
             "field": "observability_choice_confirmed",
-            "prompt": "Choose observability mode: 1 disabled, 2 local Prometheus/Grafana, or 3 exporter-only.",
+            "prompt": question_prompts.observability_mode_prompt(),
             "options": [
                 {
                     "id": "1",
@@ -450,7 +434,7 @@ def _question_for_next_key(
             "id": "sync_observe_stop_condition",
             "kind": "numbered_choice",
             "field": "sync_observe_stop_condition",
-            "prompt": "Choose sync-observe stop condition: 1 until stopped, 2 fixed duration, or 3 until synced.",
+            "prompt": question_prompts.sync_observe_stop_condition_prompt(),
             "options": [
                 {
                     "id": "1",
@@ -478,78 +462,23 @@ def _question_for_next_key(
                 },
             ],
         })
+    target_mode = "sync-observe" if _is_sync_observe(values) else _target_from_values(values)
     return _typed_question({
         "id": key,
         "kind": _expected_answer_for(key),
         "field": _field_for(key),
-        "prompt": _prompt_for_key(key),
+        "prompt": _prompt_for_key(key, target_mode="" if target_mode == "unknown" else target_mode),
         "current_value": _current_value_for_key(key, values, discovery),
         "manual_input_allowed": True,
     })
 
 
 def _workload_customization_prompt(chain: str, rpc_mode: str) -> str:
-    return (
-        f"Review the {chain} {rpc_mode} RPC workload. Choose the next step:\n"
-        "1. Continue with the chain template defaults\n"
-        "2. Add a custom RPC method\n"
-        "3. Adjust mixed weights\n"
-        "4. Change chain or target mode\n"
-        "Reply with `1`, `2`, `3`, or `4`, or describe the change manually."
-    )
+    return question_prompts.workload_customization_prompt(chain, rpc_mode)
 
 
 def _workload_customization_options() -> list[dict[str, Any]]:
-    return [
-        {
-            "id": "1",
-            "value": "use_defaults",
-            "label": "continue with defaults",
-            "state_patch": {
-                "workflow_step": "workload_default_confirmed",
-                "confirmed_config": {
-                    "chain_template_reviewed": True,
-                    "rpc_workload_confirmed": True,
-                    "rpc_param_samples_confirmed": True,
-                    "mixed_weights_confirmed": True,
-                },
-            },
-            "transition": {
-                "workflow_step": "workload_default_confirmed",
-                "tool": "validate_rpc_workload",
-            },
-        },
-        {
-            "id": "2",
-            "value": "add_custom_rpc",
-            "label": "add a custom RPC method",
-            "state_patch": {"workflow_step": "custom_rpc_requested", "fixture_status": {"status": "needs_endpoint"}},
-            "transition": {
-                "workflow_step": "custom_rpc_endpoint_gate",
-                "next_question_id": "custom_rpc_endpoint_gate",
-            },
-        },
-        {
-            "id": "3",
-            "value": "adjust_weights",
-            "label": "adjust mixed weights",
-            "state_patch": {"workflow_step": "mixed_weight_adjustment_requested"},
-            "transition": {
-                "workflow_step": "mixed_weights_adjust",
-                "next_question_id": "mixed_weights_confirm",
-            },
-        },
-        {
-            "id": "4",
-            "value": "change_chain_or_mode",
-            "label": "change chain or target mode",
-            "state_patch": {"workflow_step": "chain_selection"},
-            "transition": {
-                "workflow_step": "chain_selection",
-                "next_question_id": "chain_selection",
-            },
-        },
-    ]
+    return question_prompts.workload_customization_options()
 
 
 def _current_value_for_key(key: str, values: dict[str, Any], discovery: dict[str, Any]) -> Any:
@@ -624,59 +553,13 @@ def _size_to_gib(value: Any) -> str:
     return f"{gib:.2f}".rstrip("0").rstrip(".")
 
 
-def _prompt_for_key(key: str) -> str:
-    prompts = {
-        "chain": "Which blockchain node should be benchmarked?",
-        "rpc_mode": "Choose RPC mode: single or mixed.",
-        "rpc_workload_confirmed": "Confirm the RPC methods and workload weights.",
-        "mixed_weights_confirmed": "Confirm that mixed RPC method weights are explicit and sum to 100%.",
-        "rpc_param_samples_confirmed": "Confirm TARGET_* sample values for the selected RPC methods.",
-        "benchmark_mode_confirmed": "Choose quick, standard, or intensive benchmark mode.",
-        "qps_profile_confirmed": "Confirm INITIAL_QPS, MAX_QPS, QPS_STEP, and DURATION for the selected mode.",
-        "observability_choice_confirmed": "Choose disabled, local Prometheus/Grafana, or exporter-only observability mode.",
-        "chain_template_reviewed": "Review selected chain template endpoints, TARGET_* sample variables, and default workload.",
-        "use_fake_node": "Choose fake-node closed-loop testing or real-node testing.",
-        "local_rpc_url": "Provide LOCAL_RPC_URL for the node under test.",
-        "mainnet_rpc_url_reviewed": "Provide MAINNET_RPC_URL or confirm template/default sync-health handling.",
-        "cloud_region": "Confirm CLOUD_REGION; use the detected value or enter a custom region.",
-        "cloud_zone": "Confirm CLOUD_ZONE; use the detected value or enter a custom zone.",
-        "machine_type": "Confirm MACHINE_TYPE or instance type for report metadata.",
-        "blockchain_process_names": "Provide node process names or command-line fragments used for attribution.",
-        "ledger_device": "Confirm the ledger/data disk device.",
-        "data_vol_type": "Confirm DATA_VOL_TYPE for the ledger/data disk, for example hyperdisk-balanced, hyperdisk-extreme, pd-ssd, pd-balanced, local-ssd, ssd, or nvme.",
-        "data_vol_size": "Confirm DATA_VOL_SIZE in GiB for the ledger/data disk.",
-        "data_vol_max_iops": "Confirm DATA_VOL_MAX_IOPS for the ledger/data disk.",
-        "data_vol_max_throughput": "Confirm DATA_VOL_MAX_THROUGHPUT in MiB/s for the ledger/data disk.",
-        "accounts_vol_type": "Confirm ACCOUNTS_VOL_TYPE for the accounts/state disk, for example hyperdisk-balanced, hyperdisk-extreme, pd-ssd, pd-balanced, local-ssd, ssd, or nvme.",
-        "accounts_vol_size": "Confirm ACCOUNTS_VOL_SIZE in GiB for the accounts/state disk.",
-        "accounts_vol_max_iops": "Confirm ACCOUNTS_VOL_MAX_IOPS for the accounts/state disk.",
-        "accounts_vol_max_throughput": "Confirm ACCOUNTS_VOL_MAX_THROUGHPUT in MiB/s for the accounts/state disk.",
-        "network_interface": "Confirm the network interface used by the node.",
-        "network_max_bandwidth_gbps": "Confirm NETWORK_MAX_BANDWIDTH_GBPS for saturation analysis.",
-        "sync_observe_stop_condition": "Choose sync-observe stop condition: run until stopped, fixed duration, or until synced.",
-        "node_prometheus_metrics_url": "Confirm NODE_PROMETHEUS_METRICS_URL if the node exposes Prometheus metrics, or leave it unavailable.",
-        "node_process_identity": "Confirm the node PID or process-name/command-line fragment for CPU/thread attribution.",
-    }
-    return prompts.get(key, f"Provide required value: {key}")
+def _prompt_for_key(key: str, *, target_mode: str = "") -> str:
+    return question_prompts.text_for(key, target_mode=target_mode)
 
 
 def _qps_profile_prompt(values: dict[str, Any]) -> str:
     mode = str(values.get("benchmark_mode_confirmed") or values.get("benchmark_mode") or "").strip().lower()
-    if mode not in {"quick", "standard", "intensive"}:
-        mode = "selected"
-    fake_node = values.get("use_fake_node") is True
-    if fake_node:
-        return (
-            "Use the selected mode's default QPS profile? Reply `Y` to keep it, or `N` to adjust "
-            "INITIAL_QPS, MAX_QPS, QPS_STEP, or DURATION.\n"
-            "Note: fake-node smoke uses a safe low-traffic override during execution (1 QPS, 10s) "
-            "to validate the full closed loop. This is not a real-node performance test. "
-            "Real-node benchmarks use the selected mode's full QPS profile."
-        )
-    return (
-        f"Review the {mode} QPS profile defaults from config/user_config.sh. Reply `Y` to keep them, "
-        "or `N` to adjust INITIAL_QPS, MAX_QPS, QPS_STEP, or DURATION."
-    )
+    return question_prompts.qps_profile_prompt(mode, fake_node=values.get("use_fake_node") is True)
 
 
 def _typed_question(question: dict[str, Any]) -> dict[str, Any]:

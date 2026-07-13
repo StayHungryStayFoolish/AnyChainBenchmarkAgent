@@ -11,30 +11,42 @@ try:
     from agent.knowledge.framework_capabilities import load_framework_capabilities
     from agent.runners.job_manager import list_jobs, resume_job
     from agent.validators.rpc_workload import default_workload
-    from agent.validators.endpoint_probe import validate_rpc_endpoint
+    from agent.validators.endpoint_probe import health_probe_methods, validate_rpc_endpoint
+    from agent.planners import question_prompts
+    from agent.onboarding.families import SUPPORTED_FAMILIES
 except ModuleNotFoundError:  # product script adds agent/ to sys.path
     from knowledge.chain_identity import canonicalize_chain_scalar, repo_chain_names
     from knowledge.framework_capabilities import load_framework_capabilities
     from runners.job_manager import list_jobs, resume_job
     from validators.rpc_workload import default_workload
-    from validators.endpoint_probe import validate_rpc_endpoint
+    from validators.endpoint_probe import health_probe_methods, validate_rpc_endpoint
+    from planners import question_prompts
+    from onboarding.families import SUPPORTED_FAMILIES
 
-from .state import AgentGraphState, PendingQuestion, new_state
+from .state import AgentGraphState, PendingQuestion, RESET_PRESERVED_KEYS, new_state
 from .intent import (
     ALLOWED_GROUPS,
     extract_chain_mention,
     extract_rpc_schema_from_evidence,
     resolve_action_queue,
-    resolve_intent_action,
     resolve_pending_choice,
     resolve_unknown_chain_identity,
 )
 from .nodes.execution import run_approved_preflight_and_smoke
-from .oracle import compute_next_action, format_current_context, format_current_state, format_recommended_next_action
+from .oracle import (
+    compute_next_action,
+    format_current_context,
+    format_current_state,
+    format_recommended_next_action,
+    format_startup_discovery,
+)
+from .routing import chain_auxiliary_fields_needed, next_group_and_reason
 from .turns import adjudicate_turn
 
 
-SUPPORTED_ADAPTER_FAMILIES = {"jsonrpc", "substrate", "rest", "tendermint", "bitcoin_jsonrpc", "hedera_dual"}
+# Single source of truth for the supported adapter families (audit Finding C3):
+# derive from `agent.onboarding.families.SUPPORTED_FAMILIES` rather than retyping.
+SUPPORTED_ADAPTER_FAMILIES = set(SUPPORTED_FAMILIES)
 CONFIRMABLE_CONFIG_FIELDS = {
     "CLOUD_REGION",
     "CLOUD_ZONE",
@@ -52,9 +64,21 @@ CONFIRMABLE_CONFIG_FIELDS = {
     "NETWORK_INTERFACE",
     "NETWORK_MAX_BANDWIDTH_GBPS",
     "BLOCKCHAIN_PROCESS_NAMES",
+    "CHAIN_REST_URL",
+    "CHAIN_INDEXER_URL",
+    "CHAIN_SIDECAR_URL",
+    "CHAIN_EVM_RPC_URL",
+    "CHAIN_JSON_RPC_URL",
+    "CHAIN_MIRROR_URL",
+    "RPC_API_KEY",
 }
 PROPOSED_ENDPOINT_FIELDS = {"LOCAL_RPC_URL", "MAINNET_RPC_URL"}
-SPECIAL_CONFIG_FIELDS = {"RPC_MODE", "HAS_ACCOUNTS_DEVICE"}
+SPECIAL_CONFIG_FIELDS = {
+    "RPC_MODE",
+    "HAS_ACCOUNTS_DEVICE",
+    "SYNC_OBSERVE_STOP_CONDITION",
+    "SYNC_OBSERVE_DURATION_SECONDS",
+}
 QUEUE_RESUME_PENDING_IDS = {
     "inferred_config_review",
     "target_mode_change_confirm",
@@ -110,7 +134,11 @@ def process_turn(state: AgentGraphState) -> AgentGraphState:
         state = _apply_direct_config_assignments(state, direct_assignments)
         return _ask_next_blocking_question(state)
 
-    if state.get("evidence_buffer") and _looks_like_evidence_analysis_request(text):
+    if (
+        state.get("evidence_buffer")
+        and _looks_like_evidence_analysis_request(text)
+        and not _looks_like_job_specific_reference(text)
+    ):
         return _analyze_saved_evidence(state, text)
 
     handoff = _route_secondary_handoff_text(state, text)
@@ -181,6 +209,25 @@ def process_turn(state: AgentGraphState) -> AgentGraphState:
         state["visible_response"] = [_pending_context_response(state, pending, language)]
         state["_stop_after_response"] = True
         return state
+
+    # A bare number typed at a choice menu is always a (possibly invalid) option
+    # pick, never free text. An out-of-range digit must be rejected
+    # deterministically and keep the question, instead of being handed to the LLM
+    # resolver, which can hallucinate an unrelated action (e.g. read "0" as a
+    # chain change) and silently drop the pending question.
+    if pending and str(pending.get("kind") or "") in {"numbered_choice", "yes_no"}:
+        bare = text.strip().rstrip(".)、。 ").strip()
+        if bare.isdigit() and not _matches_numbered_option(bare, pending):
+            option_count = len(pending.get("options") or [])
+            state["visible_response"] = [
+                _localized(
+                    language,
+                    f"请输入 1 到 {option_count} 之间的选项编号，或直接说明要切换到哪个配置项。",
+                    f"Please enter an option number between 1 and {option_count}, or say which configuration area to switch to.",
+                ),
+                _render_question(pending, language),
+            ]
+            return state
 
     routed = None
     if not (pending and str(pending.get("kind") or "") == "numbered_choice" and _looks_like_assignment_answer(text)):
@@ -267,7 +314,7 @@ def _reset_workflow_state(state: AgentGraphState) -> AgentGraphState:
     """Clear Agent workflow configuration while preserving startup facts."""
 
     reset = new_state(str(state.get("thread_id") or "default"), language=str(state.get("language") or "en"))
-    for key in ("discovery", "framework_summary", "web_research", "latest_job_id", "job", "report_context"):
+    for key in RESET_PRESERVED_KEYS:
         if key in state:
             reset[key] = state.get(key)  # type: ignore[literal-required]
     reset["audit_events"] = list(state.get("audit_events") or []) + [{"event": "workflow_reset"}]
@@ -275,7 +322,14 @@ def _reset_workflow_state(state: AgentGraphState) -> AgentGraphState:
 
 
 def _route_free_text(state: AgentGraphState, text: str) -> AgentGraphState | None:
-    if _looks_like_pasted_evidence(text):
+    # A multi-line paste accompanied by an explicit analysis request ("分析",
+    # "why", "explain"...) is analyzable evidence even when it is not a Python
+    # traceback — e.g. a benchmark result dump (success ratio, latencies, 429s).
+    # Capture it instead of letting the resolver pluck an incidental chain name
+    # out of the report and discard the analysis request.
+    if _looks_like_pasted_evidence(text) or (
+        _is_multiline_paste(text) and _looks_like_evidence_analysis_request(text)
+    ):
         return _start_freeform_evidence_collection(state, text)
 
     queue = resolve_action_queue(state, text)
@@ -284,120 +338,9 @@ def _route_free_text(state: AgentGraphState, text: str) -> AgentGraphState | Non
     if config_proposal and not any(str(item.get("type") or "") == "propose_config_values" for item in actions):
         actions.append(config_proposal)
     actions = _augment_actions_with_missing_goal_context(state, actions, text)
+
     if _has_meaningful_queue(actions):
-        routed = _process_action_queue(state, actions, text)
-        if routed:
-            return routed
-
-    action = resolve_intent_action(state, text)
-    return _route_single_action(state, action, text)
-
-
-def _route_single_action(state: AgentGraphState, action: dict[str, Any], text: str) -> AgentGraphState | None:
-    intent = str(action.get("intent") or "unknown").strip()
-    target_mode = _normalized_target_mode(action.get("target_mode"))
-    if intent in {"greeting", "unknown"} and not target_mode and not action.get("chain_text") and not action.get("group"):
-        if intent == "greeting":
-            state["active_group"] = "opening"
-            state["pending_question"] = {}
-            return state
-        return None
-    chain_candidate = _strip_scalar(str(action.get("chain_text") or ""))
-    if intent in {"choose_chain", "change_chain"} and chain_candidate:
-        if target_mode:
-            action["target_mode"] = target_mode
-            current_mode = str(state.get("target_mode") or "").strip()
-            if not current_mode:
-                state["target_mode"] = target_mode
-                state["workflow_mode"] = "sync_observe" if target_mode == "sync-observe" else "rpc_benchmark"
-                _invalidate_for_target_mode(state)
-        ambiguity = _chain_ambiguity_question(state, text, chain_candidate)
-        if ambiguity:
-            state["pending_question"] = ambiguity
-            state["active_group"] = "chain_identity"
-            state["visible_response"] = [_render_question(ambiguity, state.get("language", "en"))]
-            return state
-        if intent == "change_chain" or (state.get("chain_identity") or {}).get("canonical"):
-            return _request_chain_change_confirmation(state, chain_candidate, action)
-        return _handle_chain_candidate(state, chain_candidate, action)
-    if target_mode and not (state.get("chain_identity") or {}).get("canonical"):
-        mention = extract_chain_mention(state, text)
-        if bool(mention.get("found")) and str(mention.get("confidence") or "").lower() in {"medium", "high"}:
-            mentioned_chain = _strip_scalar(str(mention.get("chain_text") or ""))
-            if mentioned_chain:
-                state["target_mode"] = target_mode
-                state["workflow_mode"] = "sync_observe" if target_mode == "sync-observe" else "rpc_benchmark"
-                _invalidate_for_target_mode(state)
-                return _handle_chain_candidate(state, mentioned_chain, mention)
-    if intent == "choose_target_mode" and target_mode:
-        current_mode = str(state.get("target_mode") or "").strip()
-        if current_mode and current_mode != target_mode:
-            return _request_target_mode_change_confirmation(state, target_mode)
-        state["target_mode"] = target_mode
-        state["workflow_mode"] = "sync_observe" if target_mode == "sync-observe" else "rpc_benchmark"
-        _invalidate_for_target_mode(state)
-        state["active_group"] = "chain_identity"
-        state["pending_question"] = {}
-        return state
-    if target_mode:
-        current_mode = str(state.get("target_mode") or "").strip()
-        if current_mode and current_mode != target_mode:
-            return _request_target_mode_change_confirmation(state, target_mode)
-        state["target_mode"] = target_mode
-        state["workflow_mode"] = "sync_observe" if target_mode == "sync-observe" else "rpc_benchmark"
-        _invalidate_for_target_mode(state)
-        state["active_group"] = "chain_identity"
-        state["pending_question"] = {}
-        return state
-    group = str(action.get("group") or "").strip()
-    if intent == "change_group" and group in ALLOWED_GROUPS:
-        return _activate_group_question(state, group)
-    if intent == "go_back":
-        previous_group = _pop_previous_group(state)
-        if previous_group:
-            return _activate_group_question(state, previous_group, record_history=False)
-        state["visible_response"] = [_localized(
-            state.get("language", "en"),
-            "当前没有可回退的配置组。你可以直接说明要回到哪个配置项，例如 RPC、QPS、磁盘或可观测性。",
-            "There is no previous configuration group to return to. You can directly name the area, such as RPC, QPS, disk, or observability.",
-        )]
-        state["_stop_after_response"] = True
-        return state
-    if intent == "ask_capabilities":
-        state["active_group"] = "report_artifact_analysis"
-        state["pending_question"] = {}
-        state["visible_response"] = [_framework_capability_summary(state)]
-        state["_stop_after_response"] = True
-        return state
-    if intent == "answer_opening_question":
-        if not state.get("pending_question"):
-            state["active_group"] = "opening"
-        state["visible_response"] = [_opening_consultation_response(state, action, text)]
-        state["_stop_after_response"] = True
-        return state
-    if intent == "analyze_evidence":
-        if not _looks_like_pasted_evidence(text):
-            state["active_group"] = "error_evidence_analysis"
-            state["pending_question"] = {}
-            state["visible_response"] = [_evidence_help_response(state)]
-            state["_stop_after_response"] = True
-            return state
-        state["active_group"] = "error_evidence_analysis"
-        state.setdefault("evidence_buffer", []).append({"text": text})
-        state["pending_question"] = {}
-        state["visible_response"] = [_localized(
-            state.get("language", "en"),
-            "我已把这段内容作为证据保存。下一步会结合框架上下文分析原因和建议动作。",
-            "I saved this as evidence. Next I can analyze it with the framework context and suggest actions.",
-        )]
-        state["_stop_after_response"] = True
-        return state
-    if intent == "analyze_report":
-        state["active_group"] = "report_artifact_analysis"
-        state["pending_question"] = {}
-        state["visible_response"] = [_report_artifact_entry_response(state)]
-        state["_stop_after_response"] = True
-        return state
+        return _process_action_queue(state, actions, text)
     return None
 
 
@@ -437,7 +380,15 @@ def _augment_actions_with_missing_goal_context(state: AgentGraphState, actions: 
     if target_mode and "choose_target_mode" not in existing_types and not state.get("target_mode"):
         prefix.append({"type": "choose_target_mode", "target_mode": target_mode, "target_mode_explicit": True, "confidence": "high"})
         existing_types.add("choose_target_mode")
-    if not (state.get("chain_identity") or {}).get("canonical") and "choose_chain" not in existing_types and "change_chain" not in existing_types:
+    # A chain-info QUESTION (the resolver typed it as answer_opening_question with
+    # a chain-scoped topic) names a chain but is not a selection — do not augment
+    # it into choose_chain, or the question turns into picking the chain.
+    chain_info_question = any(
+        str(item.get("type") or "") == "answer_opening_question"
+        and str(item.get("topic") or "").strip().lower() in {"supported_chains", "extension"}
+        for item in prepared
+    )
+    if not chain_info_question and not (state.get("chain_identity") or {}).get("canonical") and "choose_chain" not in existing_types and "change_chain" not in existing_types:
         mention = extract_chain_mention(state, text)
         if bool(mention.get("found")) and str(mention.get("confidence") or "").lower() in {"medium", "high"}:
             chain_text = _strip_scalar(str(mention.get("chain_text") or ""))
@@ -539,6 +490,7 @@ def _has_meaningful_queue(actions: list[dict[str, Any]]) -> bool:
     if len(meaningful) > 1:
         return True
     queue_only_types = {
+        "greeting",
         "choose_target_mode",
         "choose_chain",
         "set_rpc_mode",
@@ -740,8 +692,38 @@ def _apply_queue_action(state: AgentGraphState, action: dict[str, Any], text: st
         if not state.get("pending_question"):
             state["active_group"] = "opening"
         response = list(state.get("visible_response") or [])
-        response.append(_opening_consultation_response(state, action, origin_text))
+        consultation = _opening_consultation_response(state, action, origin_text)
+        # When one turn asks about several concepts the resolver may emit
+        # overlapping answer_opening_question actions (e.g. mode_comparison AND
+        # execution_preflight_smoke), and each now cross-answers the other half —
+        # producing identical blocks. Show a given consultation block only once.
+        if consultation not in response:
+            response.append(consultation)
         state["visible_response"] = response
+        # A recommendation must be actionable: offer to start it so the user can
+        # simply accept ("y"/"是"/"按你推荐的来") instead of re-triggering the same
+        # recommendation text. Otherwise accepting a recommendation loops.
+        if str(action.get("topic") or "").strip().lower() in {"recommendation", "recommend_start"} and not state.get("action_queue"):
+            recommended = _recommended_opening_setup(state, origin_text)
+            state["active_group"] = "opening"
+            question = _option_question(
+                "opening",
+                "accept_recommendation",
+                _localized(
+                    state.get("language", "en"),
+                    f"要现在就按推荐开始吗？（{recommended['chain']} + {recommended['target_mode']}）",
+                    f"Start with the recommendation now? ({recommended['chain']} + {recommended['target_mode']})",
+                ),
+                [{"label": "Y", "value": True}, {"label": "N", "value": False}],
+                field="accept_recommendation",
+                kind="yes_no",
+                manual_input_allowed=False,
+            )
+            question["recommended_setup"] = recommended
+            state["pending_question"] = question
+            state["visible_response"] = response + [_render_question(question, state.get("language", "en"))]
+            state["_stop_after_response"] = True
+            return state
         if not state.get("action_queue"):
             state["_stop_after_response"] = True
         return state
@@ -810,8 +792,32 @@ def _apply_queue_action(state: AgentGraphState, action: dict[str, Any], text: st
         overrides = action.get("qps_overrides")
         if not isinstance(overrides, dict) or not overrides:
             return None
+        cleaned = {str(k): _strip_scalar(str(v)) for k, v in overrides.items()}
+        # Validate against the mode's baseline defaults merged with previously
+        # stored overrides and this turn's values, so the MAX_QPS >= INITIAL_QPS
+        # invariant still fires when only one side is ever overridden (the other
+        # side implicitly stays at the mode default, e.g. intensive's
+        # INITIAL_QPS=50000) as well as when the two are set across separate turns.
+        qps_state = state.get("qps_profile") or {}
+        merged = {
+            **question_prompts.qps_profile_defaults(qps_state.get("mode")),
+            **(qps_state.get("overrides") or {}),
+            **cleaned,
+        }
+        invalid = _invalid_qps_overrides(merged)
+        if invalid:
+            # Reject non-positive / non-integer / inverted QPS values at entry
+            # instead of storing them (nothing validated them downstream).
+            state["active_group"] = "qps_profile"
+            state["pending_question"] = {}
+            state["visible_response"] = list(state.get("visible_response") or []) + [_localized(
+                state.get("language", "en"),
+                f"QPS 数值无效：{invalid}。INITIAL_QPS/MAX_QPS/QPS_STEP/DURATION 必须是正整数，且 MAX_QPS 不小于 INITIAL_QPS。请重新输入。",
+                f"Invalid QPS values: {invalid}. INITIAL_QPS/MAX_QPS/QPS_STEP/DURATION must be positive integers and MAX_QPS must be >= INITIAL_QPS. Please re-enter.",
+            )]
+            return state
         qps = state.setdefault("qps_profile", {})
-        qps.setdefault("overrides", {}).update({str(k): _strip_scalar(str(v)) for k, v in overrides.items()})
+        qps.setdefault("overrides", {}).update(cleaned)
         qps["default_decision_made"] = True
         qps["confirmed"] = True
         state["preflight"] = {}
@@ -833,6 +839,24 @@ def _apply_queue_action(state: AgentGraphState, action: dict[str, Any], text: st
             f"可观测性模式已设置为 `{mode}`。",
             f"Observability mode is set to `{mode}`.",
         ))
+        if mode == "exporter":
+            # exporter mode's entire purpose is scraping from an existing
+            # Prometheus; without the scrape target, the user has no way to
+            # act on it. Default matches config/user_config.sh's EXPORTER_PORT.
+            response.append(_localized(
+                state.get("language", "en"),
+                "只启动只读 exporter，不启动本地 Prometheus/Grafana。请把你已有的 Prometheus 配置为抓取 `http://<本机地址>:9108/metrics`（默认 EXPORTER_PORT=9108）。",
+                "Only the read-only exporter starts; local Prometheus/Grafana do not. Configure your existing Prometheus to scrape `http://<benchmark-host>:9108/metrics` (default EXPORTER_PORT=9108).",
+            ))
+        elif mode == "local":
+            # Starts services with fixed default ports on this host — the user
+            # needs to know them to check reachability/avoid port conflicts.
+            # Defaults match config/user_config.sh's EXPORTER_PORT/PROMETHEUS_PORT/GRAFANA_PORT.
+            response.append(_localized(
+                state.get("language", "en"),
+                "将在本机启动 exporter(默认端口 9108)、Prometheus(默认端口 9091) 和 Grafana(默认端口 3001)。",
+                "Will start exporter (default port 9108), Prometheus (default port 9091), and Grafana (default port 3001) on this host.",
+            ))
         state["visible_response"] = response
         state["preflight"] = {}
         state["smoke"] = {}
@@ -1090,91 +1114,16 @@ def _pop_previous_group(state: AgentGraphState) -> str:
 
 
 def _next_group(state: AgentGraphState) -> str:
-    if not state.get("target_mode"):
-        return "opening"
-    identity = state.get("chain_identity") or {}
-    if identity.get("status") == "existing_family_needs_endpoint":
-        return "endpoint_process"
-    if identity.get("status") in {
-        "existing_family_needs_method",
-        "existing_family_needs_schema_evidence",
-        "existing_family_schema_needs_confirmation",
-        "existing_family_needs_workload_scope",
-        "existing_family_needs_single_method",
-        "existing_family_needs_weights",
-    }:
-        return "endpoint_process"
-    if identity.get("status") == "existing_family_runtime_choice":
-        return "target_samples_fixtures"
-    if not _chain_confirmed(state):
-        return "chain_identity"
-    confirmed = state.get("confirmed_config") or {}
-    for key in ("CLOUD_REGION", "CLOUD_ZONE", "MACHINE_TYPE"):
-        if not confirmed.get(key):
-            return "provider_deployment"
-    for key in ("LEDGER_DEVICE", "DATA_VOL_TYPE", "DATA_VOL_SIZE", "DATA_VOL_MAX_IOPS", "DATA_VOL_MAX_THROUGHPUT"):
-        if not confirmed.get(key):
-            return "ledger_disk"
-    if "has_accounts_device" not in confirmed:
-        return "accounts_disk"
-    if confirmed.get("has_accounts_device"):
-        for key in ("ACCOUNTS_DEVICE", "ACCOUNTS_VOL_TYPE", "ACCOUNTS_VOL_SIZE", "ACCOUNTS_VOL_MAX_IOPS", "ACCOUNTS_VOL_MAX_THROUGHPUT"):
-            if not confirmed.get(key):
-                return "accounts_disk"
-    for key in ("NETWORK_INTERFACE", "NETWORK_MAX_BANDWIDTH_GBPS"):
-        if not confirmed.get(key):
-            return "network"
-    if state.get("target_mode") == "real-node" and not state.get("endpoint_evidence", {}).get("local_rpc_url_ready"):
-        return "endpoint_process"
-    if state.get("target_mode") == "real-node" and not confirmed.get("BLOCKCHAIN_PROCESS_NAMES"):
-        return "endpoint_process"
-    if state.get("target_mode") == "real-node" and not confirmed.get("MAINNET_RPC_URL_REVIEWED"):
-        return "endpoint_process"
-    if state.get("workflow_mode") == "sync_observe" and not state.get("sync_observe", {}).get("source"):
-        return "sync_observe"
-    if state.get("workflow_mode") == "sync_observe" and state.get("sync_observe", {}).get("source") in {"existing_local_node", "endpoint_only"} and not state.get("endpoint_evidence", {}).get("sync_rpc_url_ready"):
-        return "endpoint_process"
-    if state.get("workflow_mode") == "sync_observe" and state.get("sync_observe", {}).get("source") == "existing_local_node" and not confirmed.get("BLOCKCHAIN_PROCESS_NAMES"):
-        return "endpoint_process"
-    if state.get("workflow_mode") == "sync_observe" and state.get("sync_observe", {}).get("source") == "client_setup" and not state.get("sync_observe", {}).get("client_setup_acknowledged"):
-        return "sync_observe"
-    if state.get("workflow_mode") == "sync_observe" and state.get("sync_observe", {}).get("source") in {"existing_local_node", "endpoint_only"} and not confirmed.get("MAINNET_RPC_URL_REVIEWED"):
-        return "endpoint_process"
-    custom_rpc = state.get("custom_rpc") or {}
-    if custom_rpc.get("status") in {
-        "needs_endpoint",
-        "needs_method",
-        "needs_schema_evidence",
-        "schema_needs_confirmation",
-        "needs_scope",
-        "needs_weights",
-        "probe_failed",
-    }:
-        return "endpoint_process"
-    if state.get("workflow_mode") == "sync_observe":
-        if not state.get("sync_observe", {}).get("stop_condition"):
-            return "sync_observe"
-        if state.get("sync_observe", {}).get("stop_condition") == "duration" and not state.get("sync_observe", {}).get("duration_seconds"):
-            return "sync_observe"
-        if not state.get("observability", {}).get("mode"):
-            return "observability"
-        if not state.get("preflight", {}).get("approved"):
-            return "preflight_smoke_execution"
-        return "job_monitoring"
-    if not state.get("rpc_mode"):
-        return "workload_rpc"
-    if not state.get("workload", {}).get("confirmed"):
-        return "workload_rpc"
-    qps_profile = state.get("qps_profile") or {}
-    if not qps_profile.get("mode"):
-        return "qps_profile"
-    if not qps_profile.get("confirmed"):
-        return "qps_profile"
-    if not state.get("observability", {}).get("mode"):
-        return "observability"
-    if not state.get("preflight", {}).get("approved"):
-        return "preflight_smoke_execution"
-    return "job_monitoring"
+    """Return the next blocking group name.
+
+    Delegates to `routing.next_group_and_reason`, the single shared
+    implementation also used by `oracle.py`'s status/explanation text, so
+    the two can never disagree about what group is next (see architecture
+    audit Finding B1).
+    """
+
+    group, _reason = next_group_and_reason(state)
+    return group
 
 
 def _question_for_group(state: AgentGraphState, group: str) -> PendingQuestion | None:
@@ -1189,13 +1138,30 @@ def _question_for_group(state: AgentGraphState, group: str) -> PendingQuestion |
             return _protocol_family_question(state)
         return _chain_question(state)
     if group == "provider_deployment":
-        for key, prompt_en, prompt_zh in (
-            ("CLOUD_REGION", "Confirm CLOUD_REGION; use the detected value or enter a custom region.", "请输入 CLOUD_REGION（云区域），可以使用检测值或输入自定义值。"),
-            ("CLOUD_ZONE", "Confirm CLOUD_ZONE; use the detected value or enter a custom zone.", "请输入 CLOUD_ZONE（可用区），可以使用检测值或输入自定义值。"),
-            ("MACHINE_TYPE", "Confirm MACHINE_TYPE or instance type for report metadata.", "请输入 MACHINE_TYPE（机器或实例规格），用于报告元数据。"),
+        cloud = discovery.get("cloud") or {}
+        pd_inferred = state.get("inferred_config") or {}
+        for key, logical_key, detected_key in (
+            ("CLOUD_REGION", "cloud_region", "region"),
+            ("CLOUD_ZONE", "cloud_zone", "zone"),
+            ("MACHINE_TYPE", "machine_type", "machine_type"),
         ):
-            if not confirmed.get(key):
-                return _manual_question(group, key, _localized(language, prompt_zh, prompt_en), kind="manual_value")
+            if confirmed.get(key):
+                continue
+            detected = str(cloud.get(detected_key) or "").strip()
+            # Offer the detected value as a Y/N confirm so "use the detected value"
+            # actually stores the detected value, not the user's literal sentence.
+            # "N" drops to a manual prompt for a custom value on the next turn.
+            if detected and not pd_inferred.get(f"{key}_manual_required"):
+                return _option_question(
+                    group,
+                    key,
+                    _localized(language, f"检测到 {key} 为 `{detected}`，是否使用？", f"Detected {key}: `{detected}`. Use it?"),
+                    [{"label": "Y", "value": detected}, {"label": "N", "value": "__manual__"}],
+                    field=key,
+                    kind="yes_no",
+                    manual_input_allowed=True,
+                )
+            return _manual_question(group, key, question_prompts.text_for(logical_key, language=language), kind="manual_value")
     if group == "ledger_disk":
         return _disk_group_question(state, prefix="DATA", device_key="LEDGER_DEVICE", group="ledger_disk")
     if group == "accounts_disk":
@@ -1221,13 +1187,13 @@ def _question_for_group(state: AgentGraphState, group: str) -> PendingQuestion |
             return _choice_question(
                 group,
                 "network_interface",
-                _localized(language, "请选择网络接口，或直接输入接口名。", "Choose the network interface, or type the interface name."),
+                question_prompts.text_for("network_interface", language=language),
                 [{"label": f"{name}{' (default)' if name == default else ''}", "value": name} for name in interfaces],
                 "NETWORK_INTERFACE",
                 kind="device",
             )
         if not confirmed.get("NETWORK_MAX_BANDWIDTH_GBPS"):
-            return _manual_question(group, "NETWORK_MAX_BANDWIDTH_GBPS", _localized(language, "请输入 NETWORK_MAX_BANDWIDTH_GBPS。", "Confirm NETWORK_MAX_BANDWIDTH_GBPS for saturation analysis."), kind="manual_value")
+            return _manual_question(group, "NETWORK_MAX_BANDWIDTH_GBPS", question_prompts.text_for("network_max_bandwidth_gbps", language=language), kind="manual_value")
     if group == "endpoint_process":
         identity = state.get("chain_identity") or {}
         custom_rpc = state.get("custom_rpc") or {}
@@ -1328,14 +1294,7 @@ def _question_for_group(state: AgentGraphState, group: str) -> PendingQuestion |
             )
         if identity.get("status") == "existing_family_needs_single_method":
             methods = _validated_new_chain_methods(identity)
-            return _option_question(
-                group,
-                "new_chain_single_method",
-                _localized(language, "请选择 single workload 使用哪个已验证 method。", "Choose which validated method to use as the single workload."),
-                [{"label": method, "value": method} for method in methods],
-                field="new_chain_single_method",
-                kind="numbered_choice",
-            )
+            return _single_method_disambiguation_question(group, "new_chain_single_method", language, methods)
         if identity.get("status") == "existing_family_needs_weights":
             methods = _validated_new_chain_methods(identity)
             example = _single_method_weight_example(methods)
@@ -1349,6 +1308,16 @@ def _question_for_group(state: AgentGraphState, group: str) -> PendingQuestion |
                 ),
                 kind="manual_value",
             )
+    if group == "chain_auxiliary_endpoints":
+        chain = str((state.get("chain_identity") or {}).get("canonical") or "").strip()
+        for field in chain_auxiliary_fields_needed(chain):
+            if not confirmed.get(field):
+                return _manual_question(
+                    group,
+                    field,
+                    question_prompts.chain_auxiliary_field_prompt(chain, field, language=language),
+                    kind="manual_value",
+                )
     if group == "workload_rpc":
         if not state.get("rpc_mode"):
             return _option_question(
@@ -1522,6 +1491,20 @@ def _question_for_group(state: AgentGraphState, group: str) -> PendingQuestion |
                 field="sync_observe_after_demo",
                 kind="numbered_choice",
             )
+        if not sync.get("stop_condition"):
+            zh = str(language or "").startswith("zh")
+            return _option_question(
+                group,
+                "sync_observe_stop_condition",
+                _localized(language, "请选择 sync-observe 停止条件。", "Choose sync-observe stop condition."),
+                [
+                    {"label": "一直运行直到用户停止" if zh else "Run until stopped", "value": "until_stopped"},
+                    {"label": "固定时长" if zh else "Fixed duration", "value": "duration"},
+                    {"label": "同步完成后停止" if zh else "Stop after synced", "value": "until_synced"},
+                ],
+                field="sync_observe_stop_condition",
+                kind="numbered_choice",
+            )
         if sync.get("stop_condition") == "duration" and not sync.get("duration_seconds"):
             return _manual_question(
                 group,
@@ -1529,19 +1512,11 @@ def _question_for_group(state: AgentGraphState, group: str) -> PendingQuestion |
                 _localized(language, "请输入 sync-observe 观察时长，单位秒。", "Enter the sync-observe duration in seconds."),
                 kind="manual_value",
             )
-        zh = str(language or "").startswith("zh")
-        return _option_question(
-            group,
-            "sync_observe_stop_condition",
-            _localized(language, "请选择 sync-observe 停止条件。", "Choose sync-observe stop condition."),
-            [
-                {"label": "一直运行直到用户停止" if zh else "Run until stopped", "value": "until_stopped"},
-                {"label": "固定时长" if zh else "Fixed duration", "value": "duration"},
-                {"label": "同步完成后停止" if zh else "Stop after synced", "value": "until_synced"},
-            ],
-            field="sync_observe_stop_condition",
-            kind="numbered_choice",
-        )
+        # sync-observe group is fully configured (source, endpoint/process,
+        # stop condition, and duration when applicable). Return None so the
+        # harness advances to the next group (observability/preflight) via
+        # routing.next_group_and_reason instead of re-asking the stop condition.
+        return None
     if group == "observability":
         if state.get("observability", {}).get("mode"):
             return None
@@ -1558,7 +1533,49 @@ def _question_for_group(state: AgentGraphState, group: str) -> PendingQuestion |
             field="observability_mode",
             kind="numbered_choice",
         )
+    if group == "advanced_tuning":
+        tuning = state.setdefault("advanced_tuning", {})
+        if not tuning.get("default_decision_made"):
+            return _option_question(
+                group,
+                "advanced_tuning_confirm",
+                _advanced_tuning_default_prompt(language),
+                [{"label": "Y", "value": True}, {"label": "N", "value": False}],
+                field="advanced_tuning_confirmed",
+                kind="yes_no",
+                manual_input_allowed=False,
+            )
+        if not tuning.get("confirmed"):
+            if not tuning.get("adjust_field"):
+                zh = str(language or "").startswith("zh")
+                return _option_question(
+                    group,
+                    "advanced_tuning_adjust_field",
+                    _localized(language, "请选择要调整的高级调优参数。", "Choose the advanced tuning parameter to adjust."),
+                    [{"label": label, "value": key} for key, label in _ADVANCED_TUNING_FIELD_LABELS.items()]
+                    + [{"label": "完成调整" if zh else "Finish adjustments", "value": "done"}],
+                    field="advanced_tuning_adjust_field",
+                    kind="numbered_choice",
+                )
+            return _manual_question(
+                group,
+                "advanced_tuning_adjust_value",
+                _localized(
+                    language,
+                    f"请输入 {tuning.get('adjust_field')} 的值。",
+                    f"Enter the value for {tuning.get('adjust_field')}.",
+                ),
+                kind="manual_value",
+            )
     if group == "preflight_smoke_execution":
+        # Only offer the run confirmation when the config is genuinely ready. If
+        # routing would still divert to an earlier missing group (e.g. a
+        # real-node jump to "run" without endpoint/workload/QPS), return None so
+        # the harness advances to that group instead of falsely claiming
+        # "configuration is collected".
+        next_group, _reason = next_group_and_reason(state)
+        if next_group != "preflight_smoke_execution":
+            return None
         return _option_question(
             group,
             "preflight_smoke_confirm",
@@ -1581,6 +1598,31 @@ def _apply_pending_answer(state: AgentGraphState, text: str, question: PendingQu
         state["active_group"] = str(group)
     if question_id == "inferred_config_review":
         return _apply_inferred_config_review(state, bool(value))
+    if question_id == "accept_recommendation":
+        recommended = question.get("recommended_setup") if isinstance(question.get("recommended_setup"), dict) else {}
+        if not value:
+            state["pending_question"] = {}
+            state["active_group"] = "opening"
+            state["visible_response"] = [_localized(
+                state.get("language", "en"),
+                "好的，不按推荐。你可以直接说要测哪条链、用哪种模式（fake-node / real-node / sync-observe）。",
+                "OK, not using the recommendation. Tell me which chain and mode (fake-node / real-node / sync-observe) you want.",
+            )]
+            return state
+        chain = str(recommended.get("chain") or "solana")
+        mode = str(recommended.get("target_mode") or "fake-node")
+        state["target_mode"] = mode
+        state["workflow_mode"] = "sync_observe" if mode == "sync-observe" else "rpc_benchmark"
+        state["chain_identity"] = {"raw": chain, "canonical": chain, "status": "confirmed", "case": "known"}
+        confirmed["BLOCKCHAIN_NODE"] = chain
+        state["active_group"] = ""
+        state["pending_question"] = {}
+        state["visible_response"] = [_localized(
+            state.get("language", "en"),
+            f"好的，按推荐开始：链 `{chain}`，模式 `{mode}`。我会逐项确认缺失配置。",
+            f"Starting the recommendation: chain `{chain}`, mode `{mode}`. I will confirm the remaining configuration item by item.",
+        )]
+        return state
     if question.get("id") == "target_mode_change_confirm":
         requested_mode = str(state.get("target_mode_change_candidate") or "").strip()
         state["target_mode_change_candidate"] = ""
@@ -1740,14 +1782,29 @@ def _apply_pending_answer(state: AgentGraphState, text: str, question: PendingQu
             return _enter_case_for_adapter_family(state, family)
         return _handle_chain_candidate(state, str(value or text).strip())
     if group == "provider_deployment" and field:
-        confirmed[field] = _strip_scalar(str(value))
+        if value == "__manual__":
+            # User declined the detected value; ask for a custom one next turn.
+            state.setdefault("inferred_config", {})[f"{field}_manual_required"] = True
+        else:
+            confirmed[field] = _strip_scalar(str(value))
     elif group in {"ledger_disk", "accounts_disk"}:
         _apply_disk_answer(state, value, question)
     elif group == "network":
         if field:
-            confirmed[field] = _strip_scalar(str(value))
+            candidate = _strip_scalar(str(value))
+            if field in _POSITIVE_NUMBER_FIELDS and _invalid_positive_number(candidate):
+                state["visible_response"] = list(state.get("visible_response") or []) + [_localized(
+                    state.get("language", "en"),
+                    f"{field} 数值无效：{value}。请输入一个正数。",
+                    f"Invalid value for {field}: {value}. Enter a positive number.",
+                )]
+            else:
+                confirmed[field] = candidate
     elif group == "endpoint_process":
         return _apply_endpoint_answer(state, value, question)
+    elif group == "chain_auxiliary_endpoints":
+        if field:
+            confirmed[field] = _strip_scalar(str(value))
     elif group == "workload_rpc":
         if field == "rpc_mode":
             state["rpc_mode"] = str(value)
@@ -1803,7 +1860,28 @@ def _apply_pending_answer(state: AgentGraphState, text: str, question: PendingQu
         elif field == "qps_adjust_value":
             adjust_field = str(qps.get("adjust_field") or "")
             if adjust_field:
-                qps.setdefault("overrides", {})[adjust_field] = _strip_scalar(str(value))
+                candidate = _strip_scalar(str(value))
+                # Validate against the mode's baseline defaults merged with the
+                # overrides so far, not the overrides alone: overriding only
+                # MAX_QPS (e.g. to 100) while INITIAL_QPS stays at the mode's
+                # default (e.g. intensive's 50000) is still an inverted profile
+                # that must be caught here, even though INITIAL_QPS itself was
+                # never present in `overrides`.
+                merged = {
+                    **question_prompts.qps_profile_defaults(qps.get("mode")),
+                    **(qps.get("overrides") or {}),
+                    adjust_field: candidate,
+                }
+                invalid = _invalid_qps_overrides(merged)
+                if invalid:
+                    # Keep adjust_field set so the group re-asks the value.
+                    state["visible_response"] = [_localized(
+                        state.get("language", "en"),
+                        f"{adjust_field} 数值无效：{invalid}。请重新输入。",
+                        f"Invalid value for {adjust_field}: {invalid}. Please re-enter.",
+                    )]
+                    return state
+                qps.setdefault("overrides", {})[adjust_field] = candidate
             qps.pop("adjust_field", None)
     elif group == "sync_observe":
         sync = state.setdefault("sync_observe", {})
@@ -1852,9 +1930,65 @@ def _apply_pending_answer(state: AgentGraphState, text: str, question: PendingQu
         elif field == "sync_observe_stop_condition":
             sync["stop_condition"] = str(value)
         elif field == "sync_observe_duration_seconds":
-            sync["duration_seconds"] = _strip_scalar(str(value))
+            candidate = _strip_scalar(str(value))
+            if not re.fullmatch(r"[0-9]+", candidate) or int(candidate) <= 0:
+                # Leave duration_seconds unset so the group re-asks the value.
+                state["visible_response"] = [_localized(
+                    state.get("language", "en"),
+                    f"sync-observe 观察时长无效：{value}。请输入一个正整数（单位秒）。",
+                    f"Invalid sync-observe duration: {value}. Enter a positive integer number of seconds.",
+                )]
+                return state
+            sync["duration_seconds"] = candidate
     elif group == "observability":
-        state.setdefault("observability", {})["mode"] = str(value)
+        mode = str(value)
+        state.setdefault("observability", {})["mode"] = mode
+        if mode == "exporter":
+            # exporter mode's entire purpose is scraping from an existing
+            # Prometheus; without the scrape target, the user has no way to
+            # act on it. Default matches config/user_config.sh's EXPORTER_PORT.
+            response = list(state.get("visible_response") or [])
+            response.append(_localized(
+                state.get("language", "en"),
+                "只启动只读 exporter，不启动本地 Prometheus/Grafana。请把你已有的 Prometheus 配置为抓取 `http://<本机地址>:9108/metrics`（默认 EXPORTER_PORT=9108）。",
+                "Only the read-only exporter starts; local Prometheus/Grafana do not. Configure your existing Prometheus to scrape `http://<benchmark-host>:9108/metrics` (default EXPORTER_PORT=9108).",
+            ))
+            state["visible_response"] = response
+        elif mode == "local":
+            # Starts services with fixed default ports on this host — the user
+            # needs to know them to check reachability/avoid port conflicts.
+            response = list(state.get("visible_response") or [])
+            response.append(_localized(
+                state.get("language", "en"),
+                "将在本机启动 exporter(默认端口 9108)、Prometheus(默认端口 9091) 和 Grafana(默认端口 3001)。",
+                "Will start exporter (default port 9108), Prometheus (default port 9091), and Grafana (default port 3001) on this host.",
+            ))
+            state["visible_response"] = response
+    elif group == "advanced_tuning":
+        tuning = state.setdefault("advanced_tuning", {})
+        if field == "advanced_tuning_confirmed":
+            tuning["default_decision_made"] = True
+            tuning["confirmed"] = bool(value)
+        elif field == "advanced_tuning_adjust_field":
+            if value == "done":
+                tuning["confirmed"] = True
+                tuning.pop("adjust_field", None)
+            else:
+                tuning["adjust_field"] = str(value)
+        elif field == "advanced_tuning_adjust_value":
+            adjust_field = str(tuning.get("adjust_field") or "")
+            if adjust_field:
+                candidate = _strip_scalar(str(value))
+                if _invalid_advanced_tuning_value(adjust_field, candidate):
+                    # Keep adjust_field set so the group re-asks the value.
+                    state["visible_response"] = list(state.get("visible_response") or []) + [_localized(
+                        state.get("language", "en"),
+                        f"{adjust_field} 数值无效：{value}。请输入一个正数{'（百分比字段不超过 100）' if _is_percentage_tuning_field(adjust_field) else ''}。请重新输入。",
+                        f"Invalid value for {adjust_field}: {value}. Enter a positive number{' (percentage fields must not exceed 100)' if _is_percentage_tuning_field(adjust_field) else ''}. Please re-enter.",
+                    )]
+                    return state
+                tuning.setdefault("overrides", {})[adjust_field] = candidate
+            tuning.pop("adjust_field", None)
     elif group == "preflight_smoke_execution":
         state.setdefault("preflight", {})["approved"] = bool(value)
         if value:
@@ -2181,14 +2315,18 @@ def _apply_direct_config_assignments(state: AgentGraphState, config_values: dict
     endpoint_proposals = state.setdefault("endpoint_evidence", {}).setdefault("proposed_values", {})
     applied: dict[str, str] = {}
     endpoint_saved: dict[str, str] = {}
+    invalid: dict[str, Any] = {}
     for key, value in config_values.items():
         key = str(key or "").strip().upper()
         key, scalar = _normalize_proposed_config_value(key, value)
         if scalar in {"", None}:
             continue
         if key in CONFIRMABLE_CONFIG_FIELDS:
-            confirmed[key] = scalar
-            applied[key] = scalar
+            if key in _POSITIVE_NUMBER_FIELDS and _invalid_positive_number(scalar):
+                invalid[key] = scalar
+            else:
+                confirmed[key] = scalar
+                applied[key] = scalar
         elif key in PROPOSED_ENDPOINT_FIELDS:
             endpoint_proposals[key] = scalar
             endpoint_saved[key] = scalar
@@ -2220,6 +2358,12 @@ def _apply_direct_config_assignments(state: AgentGraphState, config_values: dict
             state.get("language", "en"),
             "已保存 endpoint 候选值，后续仍会验证：" + ", ".join(f"{key}={value}" for key, value in sorted(endpoint_saved.items())),
             "Saved endpoint candidates for later validation: " + ", ".join(f"{key}={value}" for key, value in sorted(endpoint_saved.items())),
+        ))
+    if invalid:
+        messages.append(_localized(
+            state.get("language", "en"),
+            "以下数值无效，未写入：" + ", ".join(f"{key}={value}" for key, value in sorted(invalid.items())),
+            "The following values were invalid and were not applied: " + ", ".join(f"{key}={value}" for key, value in sorted(invalid.items())),
         ))
     state["visible_response"] = messages
     state["pending_question"] = {}
@@ -2382,6 +2526,27 @@ def _looks_like_evidence_analysis_request(text: str) -> bool:
     return any(token in lowered for token in ("什么意思", "什么原因", "分析", "怎么修", "修复", "下一步", "why", "what does", "what means", "explain", "fix", "next step"))
 
 
+_JOB_ID_RE = re.compile(r"\bjob_\d{8,}_[0-9a-f]{4,}\b", re.IGNORECASE)
+
+
+def _looks_like_job_specific_reference(text: str) -> bool:
+    """True when `text` names a specific job (an id, or "latest/recent job").
+
+    `evidence_buffer` only ever grows (nothing ever clears it), so once any
+    text has been buffered as pasted evidence, `_looks_like_evidence_analysis_request`'s
+    broad keyword match ("分析", "why", "fix", ...) would otherwise re-analyze
+    that first stale entry forever — even for a later turn that names a real,
+    different job by id or asks about "the latest job". Those must fall
+    through to normal turn routing so the resolver's `analyze_report` action
+    (which reads the actual on-disk job/report, not the evidence buffer) can
+    handle them instead.
+    """
+
+    if _JOB_ID_RE.search(text):
+        return True
+    return "job" in str(text or "").lower()
+
+
 def _format_config_proposal_prompt(state: AgentGraphState, proposal: dict[str, Any]) -> str:
     language = state.get("language", "en")
     config_values = proposal.get("config_values") if isinstance(proposal.get("config_values"), dict) else {}
@@ -2421,14 +2586,18 @@ def _apply_inferred_config_review(state: AgentGraphState, accepted: bool) -> Age
     endpoint_proposals = state.setdefault("endpoint_evidence", {}).setdefault("proposed_values", {})
     applied: dict[str, Any] = {}
     endpoint_saved: dict[str, Any] = {}
+    invalid: dict[str, Any] = {}
     for key, value in config_values.items():
         key = str(key or "").strip().upper()
         key, scalar = _normalize_proposed_config_value(key, value)
         if scalar in {"", None}:
             continue
         if key in CONFIRMABLE_CONFIG_FIELDS:
-            confirmed[key] = scalar
-            applied[key] = scalar
+            if key in _POSITIVE_NUMBER_FIELDS and _invalid_positive_number(scalar):
+                invalid[key] = scalar
+            else:
+                confirmed[key] = scalar
+                applied[key] = scalar
         elif key in PROPOSED_ENDPOINT_FIELDS:
             endpoint_proposals[key] = scalar
             endpoint_saved[key] = scalar
@@ -2448,6 +2617,29 @@ def _apply_inferred_config_review(state: AgentGraphState, accepted: bool) -> Age
                 for accounts_key in ("ACCOUNTS_DEVICE", "ACCOUNTS_VOL_TYPE", "ACCOUNTS_VOL_SIZE", "ACCOUNTS_VOL_MAX_IOPS", "ACCOUNTS_VOL_MAX_THROUGHPUT"):
                     confirmed.pop(accounts_key, None)
             applied["has_accounts_device"] = has_accounts
+        elif key == "SYNC_OBSERVE_STOP_CONDITION":
+            stop_condition = scalar.lower()
+            if stop_condition in {"until_stopped", "duration", "until_synced"}:
+                sync = state.setdefault("sync_observe", {})
+                sync["stop_condition"] = stop_condition
+                if stop_condition != "duration":
+                    sync.pop("duration_seconds", None)
+                state["preflight"] = {}
+                state["smoke"] = {}
+                state.setdefault("invalidated_groups", []).extend(["sync_observe", "preflight_smoke_execution"])
+                applied[key] = stop_condition
+            else:
+                invalid[key] = scalar
+        elif key == "SYNC_OBSERVE_DURATION_SECONDS":
+            if re.fullmatch(r"[0-9]+", scalar) and int(scalar) > 0:
+                sync = state.setdefault("sync_observe", {})
+                sync["duration_seconds"] = scalar
+                state["preflight"] = {}
+                state["smoke"] = {}
+                state.setdefault("invalidated_groups", []).extend(["sync_observe", "preflight_smoke_execution"])
+                applied[key] = scalar
+            else:
+                invalid[key] = scalar
     inferred.setdefault("accepted_reviews", []).append({
         "applied": applied,
         "endpoint_proposals": endpoint_saved,
@@ -2467,6 +2659,12 @@ def _apply_inferred_config_review(state: AgentGraphState, accepted: bool) -> Age
             state.get("language", "en"),
             "已保存 endpoint 候选值，后续会要求验证：" + ", ".join(f"{key}={value}" for key, value in sorted(endpoint_saved.items())),
             "Saved endpoint candidate values for later validation: " + ", ".join(f"{key}={value}" for key, value in sorted(endpoint_saved.items())),
+        ))
+    if invalid:
+        messages.append(_localized(
+            state.get("language", "en"),
+            "以下候选值无效，未写入：" + ", ".join(f"{key}={value}" for key, value in sorted(invalid.items())),
+            "The following candidate values were invalid and were not applied: " + ", ".join(f"{key}={value}" for key, value in sorted(invalid.items())),
         ))
     if proposal.get("unmapped_values"):
         messages.append(_localized(
@@ -2495,6 +2693,17 @@ def _drop_resolved_config_proposal_actions(state: AgentGraphState) -> None:
     ]
 
 
+def _single_method_disambiguation_question(group: str, question_id: str, language: str, methods: list[str]) -> PendingQuestion:
+    return _option_question(
+        group,
+        question_id,
+        _localized(language, "请选择 single workload 使用哪个已验证 method。", "Choose which validated method to use as the single workload."),
+        [{"label": method, "value": method} for method in methods],
+        field=question_id,
+        kind="numbered_choice",
+    )
+
+
 def _endpoint_active_validation_question(
     state: AgentGraphState,
     group: str,
@@ -2510,6 +2719,8 @@ def _endpoint_active_validation_question(
     the node-under-test endpoint.
     """
 
+    if custom_rpc.get("status") == "needs_adapter_family_confirmation":
+        return _custom_rpc_adapter_family_question(state)
     if custom_rpc.get("status") in {"needs_endpoint", "probe_failed"} and not custom_rpc.get("endpoint_ready"):
         return _manual_question(
             group,
@@ -2548,6 +2759,9 @@ def _endpoint_active_validation_question(
             field="custom_rpc_continue",
             kind="numbered_choice",
         )
+    if custom_rpc.get("status") == "needs_single_method":
+        methods = _validated_custom_methods(custom_rpc)
+        return _single_method_disambiguation_question(group, "custom_rpc_single_method", language, methods)
     if custom_rpc.get("status") == "needs_scope":
         zh = str(language or "").startswith("zh")
         return _option_question(
@@ -2605,12 +2819,13 @@ def _apply_endpoint_answer(state: AgentGraphState, value: Any, question: Pending
     if question_id == "LOCAL_RPC_URL":
         endpoint = _extract_url_candidate(str(value)) or _strip_scalar(str(value))
         chain = (state.get("chain_identity") or {}).get("canonical") or ""
+        probe_methods, probe_params = health_probe_methods(chain, _chain_adapter_family(state))
         result = validate_rpc_endpoint(
             chain=chain,
             endpoint=endpoint,
-            methods=["eth_chainId"] if _chain_adapter_family(state) == "jsonrpc" else None,
+            methods=probe_methods,
             adapter_family=_chain_adapter_family(state),
-            method_params={"eth_chainId": []},
+            method_params=probe_params,
             timeout=3.0,
         )
         state.setdefault("endpoint_evidence", {})["local_rpc_url_probe"] = result
@@ -2676,12 +2891,13 @@ def _apply_endpoint_answer(state: AgentGraphState, value: Any, question: Pending
         endpoint = _extract_url_candidate(str(value)) or _strip_scalar(str(value))
         custom["endpoint"] = endpoint
         chain = (state.get("chain_identity") or {}).get("canonical") or ""
+        probe_methods, probe_params = health_probe_methods(chain, _chain_adapter_family(state))
         result = validate_rpc_endpoint(
             chain=chain,
             endpoint=endpoint,
-            methods=["eth_chainId"] if _chain_adapter_family(state) == "jsonrpc" else None,
+            methods=probe_methods,
             adapter_family=_chain_adapter_family(state),
-            method_params={"eth_chainId": []},
+            method_params=probe_params,
             timeout=3.0,
         )
         custom["endpoint_probe"] = result
@@ -2715,12 +2931,13 @@ def _apply_endpoint_answer(state: AgentGraphState, value: Any, question: Pending
         identity = state.setdefault("chain_identity", {})
         chain = str(identity.get("canonical") or identity.get("raw") or "").strip()
         adapter_family = _chain_adapter_family(state)
+        probe_methods, probe_params = health_probe_methods(chain, adapter_family)
         result = validate_rpc_endpoint(
             chain=chain,
             endpoint=endpoint,
-            methods=["eth_chainId"] if adapter_family == "jsonrpc" else None,
+            methods=probe_methods,
             adapter_family=adapter_family,
-            method_params={"eth_chainId": []},
+            method_params=probe_params,
             timeout=3.0,
         )
         state.setdefault("endpoint_evidence", {})["candidate_endpoint"] = endpoint
@@ -2753,7 +2970,12 @@ def _apply_endpoint_answer(state: AgentGraphState, value: Any, question: Pending
     if question_id == "new_chain_method":
         identity = state.setdefault("chain_identity", {})
         method_value = _strip_scalar(str(value))
-        if _looks_like_url_value(method_value) or _looks_like_rest_path_or_doc_method(method_value):
+        # Try to parse a pasted JSON-RPC body (copied curl/docs) FIRST; only reject
+        # as a URL/REST-path/doc title when no method could be extracted.
+        parsed_method, parsed = _parse_rpc_params_or_request(_extract_json_object_or_array(str(value)) or str(value))
+        if not (parsed_method and parsed is not None) and (
+            _looks_like_url_value(method_value) or _looks_like_rest_path_or_doc_method(method_value)
+        ):
             identity["status"] = "existing_family_needs_method"
             state["pending_question"] = {}
             state["visible_response"] = [_localized(
@@ -2762,7 +2984,6 @@ def _apply_endpoint_answer(state: AgentGraphState, value: Any, question: Pending
                 "This looks like an endpoint, REST path, or documentation title rather than a directly verifiable RPC method name. Provide the method name; if this is a REST API, switch/confirm the adapter family as `rest` first, then provide the REST path and request/response evidence.",
             )]
             return state
-        parsed_method, parsed = _parse_rpc_params_or_request(_extract_json_object_or_array(str(value)) or str(value))
         if parsed_method and parsed is not None:
             identity["candidate_method"] = parsed_method
             identity["schema_draft"] = {
@@ -2773,7 +2994,7 @@ def _apply_endpoint_answer(state: AgentGraphState, value: Any, question: Pending
                 "evidence_kind": "jsonrpc_request",
                 "transport": "jsonrpc",
             }
-            return _validate_new_chain_rpc_schema(state, parsed)
+            return _validate_rpc_schema(state, parsed, case="new_chain")
         identity["candidate_method"] = method_value
         identity["status"] = "existing_family_needs_schema_evidence"
         state["pending_question"] = {}
@@ -2785,7 +3006,7 @@ def _apply_endpoint_answer(state: AgentGraphState, value: Any, question: Pending
             if parsed_method:
                 identity["candidate_method"] = parsed_method
             if _is_direct_json_rpc_input(str(value)):
-                return _validate_new_chain_rpc_schema(state, parsed)
+                return _validate_rpc_schema(state, parsed, case="new_chain")
             identity["schema_evidence"] = str(value)
             identity["schema_draft"] = _jsonrpc_schema_draft(parsed_method or str(identity.get("candidate_method") or ""), parsed)
             identity["status"] = "existing_family_schema_needs_confirmation"
@@ -2802,7 +3023,7 @@ def _apply_endpoint_answer(state: AgentGraphState, value: Any, question: Pending
         draft = extract_rpc_schema_from_evidence(state, str(value), method_hint=str(identity.get("candidate_method") or ""))
         identity["schema_evidence"] = str(value)
         identity["schema_draft"] = draft
-        conflict = _new_chain_schema_conflict(state, draft)
+        conflict = _rpc_schema_conflict(state, draft, case="new_chain")
         if conflict:
             return conflict
         if not _schema_draft_has_params(draft):
@@ -2837,7 +3058,7 @@ def _apply_endpoint_answer(state: AgentGraphState, value: Any, question: Pending
             )]
             return state
         parsed = _schema_params_from_draft(identity.get("schema_draft") or {})
-        return _validate_new_chain_rpc_schema(state, parsed)
+        return _validate_rpc_schema(state, parsed, case="new_chain")
     if question_id == "new_chain_method_continue":
         identity = state.setdefault("chain_identity", {})
         if value == "add_another":
@@ -2942,15 +3163,11 @@ def _apply_endpoint_answer(state: AgentGraphState, value: Any, question: Pending
         return state
     if question_id == "custom_rpc_method":
         method = _strip_scalar(str(value))
-        if _looks_like_url_value(method) or _looks_like_rest_path_or_doc_method(method):
-            custom["status"] = "needs_method"
-            state["pending_question"] = {}
-            state["visible_response"] = [_localized(
-                language,
-                "这看起来像 endpoint、REST path 或文档标题，不像当前链可直接验证的 RPC method 名称。请提供 method 名称；如果你要改协议/链，请直接说明要切换到哪个链或协议族。",
-                "This looks like an endpoint, REST path, or documentation title rather than a verifiable RPC method name for the current chain. Provide the method name; if you need to change protocol or chain, say which chain or adapter family to switch to.",
-            )]
-            return state
+        # Users usually paste copied RPC content (a curl command or JSON-RPC body),
+        # which contains a URL. Try to extract the method+params from a JSON-RPC
+        # body FIRST; only reject as a URL/REST-path/doc title when no method could
+        # be parsed — otherwise a pasted `curl ... --data '{"method":...}'` would be
+        # wrongly rejected for containing an endpoint URL.
         parsed_method, parsed = _parse_rpc_params_or_request(_extract_json_object_or_array(str(value)) or str(value))
         if parsed_method and parsed is not None:
             custom["method"] = parsed_method
@@ -2962,7 +3179,16 @@ def _apply_endpoint_answer(state: AgentGraphState, value: Any, question: Pending
                 "evidence_kind": "jsonrpc_request",
                 "transport": "jsonrpc",
             }
-            return _validate_custom_rpc_schema(state, parsed)
+            return _validate_rpc_schema(state, parsed, case="custom_rpc")
+        if _looks_like_url_value(method) or _looks_like_rest_path_or_doc_method(method):
+            custom["status"] = "needs_method"
+            state["pending_question"] = {}
+            state["visible_response"] = [_localized(
+                language,
+                "这看起来像 endpoint、REST path 或文档标题，不像当前链可直接验证的 RPC method 名称。请提供 method 名称；如果你要改协议/链，请直接说明要切换到哪个链或协议族。",
+                "This looks like an endpoint, REST path, or documentation title rather than a verifiable RPC method name for the current chain. Provide the method name; if you need to change protocol or chain, say which chain or adapter family to switch to.",
+            )]
+            return state
         custom["method"] = method
         custom["status"] = "needs_schema_evidence"
         state["pending_question"] = {}
@@ -2973,7 +3199,7 @@ def _apply_endpoint_answer(state: AgentGraphState, value: Any, question: Pending
             if parsed_method:
                 custom["method"] = parsed_method
             if _is_direct_json_rpc_input(str(value)):
-                return _validate_custom_rpc_schema(state, parsed)
+                return _validate_rpc_schema(state, parsed, case="custom_rpc")
             custom["schema_evidence"] = str(value)
             custom["schema_draft"] = _jsonrpc_schema_draft(parsed_method or str(custom.get("method") or ""), parsed)
             custom["status"] = "schema_needs_confirmation"
@@ -2990,7 +3216,7 @@ def _apply_endpoint_answer(state: AgentGraphState, value: Any, question: Pending
         draft = extract_rpc_schema_from_evidence(state, str(value), method_hint=str(custom.get("method") or ""))
         custom["schema_evidence"] = str(value)
         custom["schema_draft"] = draft
-        conflict = _custom_rpc_schema_conflict(state, draft)
+        conflict = _rpc_schema_conflict(state, draft, case="custom_rpc")
         if conflict:
             return conflict
         if not _schema_draft_has_params(draft):
@@ -3024,7 +3250,20 @@ def _apply_endpoint_answer(state: AgentGraphState, value: Any, question: Pending
             )]
             return state
         parsed = _schema_params_from_draft(custom.get("schema_draft") or {})
-        return _validate_custom_rpc_schema(state, parsed)
+        return _validate_rpc_schema(state, parsed, case="custom_rpc")
+    if question_id == "custom_rpc_adapter_family_confirm":
+        family = str(value or "").strip()
+        if not _confirm_adapter_family(state, family):
+            return state
+        custom["status"] = "needs_endpoint"
+        custom["endpoint_ready"] = False
+        state["pending_question"] = {}
+        state["visible_response"] = [_localized(
+            language,
+            f"已更新协议族为 `{family}`。请重新提供可访问的 RPC endpoint 用于验证。",
+            f"Adapter family updated to `{family}`. Provide a reachable RPC endpoint to validate again.",
+        )]
+        return state
     if question_id == "custom_rpc_continue":
         if value == "add_another":
             custom["status"] = "needs_method"
@@ -3040,8 +3279,12 @@ def _apply_endpoint_answer(state: AgentGraphState, value: Any, question: Pending
     if question_id == "custom_rpc_scope":
         custom["scope"] = str(value)
         validated_methods = _validated_custom_methods(custom)
-        method = validated_methods[0] if validated_methods else str(custom.get("method") or "")
         if value == "single_replace":
+            if len(validated_methods) > 1:
+                custom["status"] = "needs_single_method"
+                state["pending_question"] = {}
+                return state
+            method = validated_methods[0] if validated_methods else str(custom.get("method") or "")
             state["rpc_mode"] = "single"
             state["workload"] = {"confirmed": True, "choice": "custom_rpc", "methods": [method], "replace_defaults": True}
             custom["status"] = "validated"
@@ -3051,8 +3294,23 @@ def _apply_endpoint_answer(state: AgentGraphState, value: Any, question: Pending
         custom["status"] = "needs_weights"
         state["pending_question"] = {}
         return state
+    if question_id == "custom_rpc_single_method":
+        method = str(value)
+        state["rpc_mode"] = "single"
+        state["workload"] = {"confirmed": True, "choice": "custom_rpc", "methods": [method], "replace_defaults": True}
+        custom["status"] = "validated"
+        custom["methods"] = [method]
+        state["pending_question"] = {}
+        return state
     if question_id == "custom_rpc_weights":
-        weights = _parse_weight_spec_for_methods(str(value), _validated_custom_methods(custom))
+        # Existing-chain custom RPC weights may span the chain's template-default
+        # methods in addition to the validated custom methods (that is why this is
+        # looser than `new_chain_custom_weights`, which has no template to fall
+        # back on). But a method that is neither validated-custom NOR a template
+        # default is a typo/garbage (e.g. "eth_fooBar") and must be rejected — it
+        # would otherwise become a benchmark method that does not exist.
+        validated_methods = _validated_custom_methods(custom)
+        weights = _parse_weight_spec_for_methods(str(value), validated_methods)
         if not weights:
             custom["status"] = "needs_weights"
             state["pending_question"] = {}
@@ -3062,15 +3320,28 @@ def _apply_endpoint_answer(state: AgentGraphState, value: Any, question: Pending
                 "No valid weights were found. Use `method=weight,method2=weight2` format.",
             )]
             return state
+        chain = str((state.get("chain_identity") or {}).get("canonical") or "").strip()
+        template_methods = set(default_workload(chain).get("methods") or []) if chain else set()
+        allowed_methods = set(validated_methods) | template_methods
+        # No `allowed_methods and ...` short-circuit: an empty allowed set means
+        # there is nothing legitimate to weight (no validated custom method, no
+        # template default), so every named method is unknown and must be
+        # rejected rather than silently accepted.
+        unknown = [method for method in weights if method not in allowed_methods]
         total = sum(weights.values())
-        if total != 100:
+        if unknown or total != 100:
             custom["status"] = "needs_weights"
             custom["weights"] = weights
             state["pending_question"] = {}
+            details = []
+            if unknown:
+                details.append(f"未知 method（既不是已验证自定义 method，也不是模板默认 method）：{', '.join(unknown)}")
+            if total != 100:
+                details.append(f"权重总和为 {total}，必须等于 100")
             state["visible_response"] = [_localized(
                 language,
-                f"当前权重总和为 {total}，必须等于 100。当前配置：{_format_weights(weights)}。请重新输入。",
-                f"The current weight total is {total}; it must equal 100. Current weights: {_format_weights(weights)}. Enter the weights again.",
+                f"自定义 RPC mixed 权重需要调整：{'; '.join(details)}。当前配置：{_format_weights(weights)}。请重新输入。",
+                f"Custom RPC mixed weights need adjustment: {'; '.join(details)}. Current weights: {_format_weights(weights)}. Enter the weights again.",
             )]
             return state
         custom["status"] = "validated"
@@ -3206,6 +3477,16 @@ def _apply_custom_rpc_inline_workload_hint(state: AgentGraphState) -> bool:
         return False
     scope = str(hint.get("scope") or "")
     if scope == "single_replace":
+        if len(methods) > 1:
+            # Mirror the canonical `custom_rpc_scope` handler: an inline
+            # "use a single method" hint must not silently pick methods[0]
+            # when several methods validated. Route to the same
+            # needs_single_method disambiguation instead.
+            custom["scope"] = "single_replace"
+            custom["status"] = "needs_single_method"
+            custom.pop("inline_workload_hint", None)
+            state["pending_question"] = {}
+            return True
         method = methods[0]
         custom["scope"] = "single_replace"
         custom["status"] = "validated"
@@ -3513,17 +3794,27 @@ def _request_chain_change_confirmation(state: AgentGraphState, raw: str, action:
         return _handle_chain_candidate(state, raw, action)
     if canonical and canonical == previous and not mode_changed:
         identity = state.setdefault("chain_identity", {})
-        if identity.get("status") != "confirmed":
+        newly_confirmed = identity.get("status") != "confirmed"
+        if newly_confirmed:
             identity.update({"canonical": canonical, "status": "confirmed", "case": "known"})
             state.setdefault("confirmed_config", {})["BLOCKCHAIN_NODE"] = canonical
-            state["active_group"] = "provider_deployment"
-            state["pending_question"] = {}
-        state["pending_question"] = {}
-        state["visible_response"] = [_localized(
+        message = _localized(
             state.get("language", "en"),
             f"当前链已经是 `{previous}`。我会继续当前配置流程。",
             f"The current chain is already `{previous}`. I will continue the current configuration flow.",
-        )]
+        )
+        # A no-op "change" to the current chain must not drop an active question.
+        # A spurious same-chain mention (or meaningless input the resolver misread
+        # as choose_chain) would otherwise wipe the pending question and derail
+        # the flow. Keep and re-show the current question when one is active.
+        active_pending = {} if newly_confirmed else (state.get("pending_question") or {})
+        if active_pending:
+            state["visible_response"] = [message, _render_question(active_pending, state.get("language", "en"))]
+            return state
+        if newly_confirmed:
+            state["active_group"] = "provider_deployment"
+        state["pending_question"] = {}
+        state["visible_response"] = [message]
         return state
     if canonical:
         candidate_label = canonical
@@ -3613,6 +3904,17 @@ def _request_chain_change_confirmation(state: AgentGraphState, raw: str, action:
 def _request_target_mode_change_confirmation(state: AgentGraphState, target_mode: str) -> AgentGraphState:
     current_mode = str(state.get("target_mode") or "").strip() or "<unset>"
     interrupted_group = str(state.get("active_group") or "").strip()
+    current_chain = str((state.get("chain_identity") or {}).get("canonical") or "").strip()
+    # Surface the carried-over chain explicitly so a mode switch never silently
+    # reuses a stale chain from a previous session (baseline chaos gate step 3).
+    if current_chain:
+        chain_clause_zh = f"链 `{current_chain}` 会保留（如需更换请直接说明要测哪条链）；"
+        chain_clause_en = (
+            f"Chain `{current_chain}` will be kept (say which chain you want if it should change); "
+        )
+    else:
+        chain_clause_zh = ""
+        chain_clause_en = ""
     state["target_mode_change_candidate"] = target_mode
     state["active_group"] = "target_mode"
     state["pending_question"] = _option_question(
@@ -3620,8 +3922,15 @@ def _request_target_mode_change_confirmation(state: AgentGraphState, target_mode
         "target_mode_change_confirm",
         _localized(
             state.get("language", "en"),
-            f"是否确认从 `{current_mode}` 切换到 `{target_mode}`？切换后 endpoint、workload、QPS、preflight/smoke 会重新确认。",
-            f"Confirm switching from `{current_mode}` to `{target_mode}`? Endpoint, workload, QPS, and preflight/smoke will be re-confirmed.",
+            # Not "endpoint、workload、QPS、preflight/smoke 会重新确认" (unconditional
+            # for all four): `_invalidate_for_target_mode` only actually resets
+            # workload/RPC state, and only when switching into sync-observe.
+            # Endpoint and QPS carry over untouched whenever they still apply —
+            # claiming they'd always be re-confirmed was simply false and
+            # observed live as misleading (e.g. a stale intensive QPS profile
+            # silently carried through a sync-observe round trip).
+            f"是否确认从 `{current_mode}` 切换到 `{target_mode}`？{chain_clause_zh}切换后必要的配置组会重新确认；仍然适用的配置（如已验证的 endpoint、QPS）会保留。",
+            f"Confirm switching from `{current_mode}` to `{target_mode}`? {chain_clause_en}Necessary configuration groups will be re-confirmed after switching; anything still applicable (e.g. a validated endpoint or QPS profile) is kept.",
         ),
         [{"label": "Y", "value": True}, {"label": "N", "value": False}],
         field="target_mode_change_confirmed",
@@ -3630,6 +3939,26 @@ def _request_target_mode_change_confirmation(state: AgentGraphState, target_mode
     state["pending_question"]["interrupted_group"] = interrupted_group
     state["visible_response"] = [_render_question(state["pending_question"], state.get("language", "en"))]
     return state
+
+
+_POSITIVE_NUMBER_FIELDS = {
+    "DATA_VOL_SIZE",
+    "DATA_VOL_MAX_IOPS",
+    "DATA_VOL_MAX_THROUGHPUT",
+    "ACCOUNTS_VOL_SIZE",
+    "ACCOUNTS_VOL_MAX_IOPS",
+    "ACCOUNTS_VOL_MAX_THROUGHPUT",
+    "NETWORK_MAX_BANDWIDTH_GBPS",
+}
+
+
+def _invalid_positive_number(value: str) -> bool:
+    """True unless `value` is a positive integer or decimal (e.g. "-50", "0", "abc")."""
+
+    text = str(value or "").strip()
+    if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", text):
+        return True
+    return float(text) <= 0
 
 
 def _apply_disk_answer(state: AgentGraphState, value: Any, question: PendingQuestion) -> None:
@@ -3646,7 +3975,18 @@ def _apply_disk_answer(state: AgentGraphState, value: Any, question: PendingQues
         if value == "__manual__":
             inferred[f"{field}_manual_required"] = True
             return
-        confirmed[field] = _strip_scalar(str(value))
+        candidate = _strip_scalar(str(value))
+        if field in _POSITIVE_NUMBER_FIELDS and _invalid_positive_number(candidate):
+            # Leave the field unset so the group re-asks it; nothing here builds
+            # `visible_response` directly (the harness re-renders the same
+            # question on the next call), so surface the rejection reason too.
+            state["visible_response"] = list(state.get("visible_response") or []) + [_localized(
+                state.get("language", "en"),
+                f"{field} 数值无效：{value}。请输入一个正数。",
+                f"Invalid value for {field}: {value}. Enter a positive number.",
+            )]
+            return
+        confirmed[field] = candidate
         if field in {"LEDGER_DEVICE", "ACCOUNTS_DEVICE"}:
             size = _disk_size_for_device(state, str(value))
             size_key = "DATA_VOL_SIZE" if field == "LEDGER_DEVICE" else "ACCOUNTS_VOL_SIZE"
@@ -3667,7 +4007,7 @@ def _disk_group_question(state: AgentGraphState, *, prefix: str, device_key: str
         return _choice_question(
             group,
             device_key,
-            _localized(language, f"请选择 {device_key}，或直接输入设备名。", f"Choose {device_key}, or type the device name."),
+            question_prompts.device_prompt(device_key, language=language),
             candidates,
             device_key,
             kind="device",
@@ -3721,9 +4061,26 @@ def _chain_question(state: AgentGraphState) -> PendingQuestion:
     return _manual_question(
         "chain_identity",
         "chain",
-        _localized(language, f"你想测试哪条链？当前目标模式：{target_mode or '未选择'}。", f"Which chain do you want to benchmark? Current target mode: {target_mode or 'not selected'}."),
+        question_prompts.chain_prompt(target_mode=target_mode, language=language),
         kind="chain",
     )
+
+
+# Only families whose display label differs from the bare family value need an
+# override; every other family renders as its own name (audit Finding C3 keeps
+# the value list derived from the canonical `SUPPORTED_FAMILIES`).
+_ADAPTER_FAMILY_OPTION_LABELS = {"jsonrpc": "jsonrpc / EVM"}
+
+
+def _adapter_family_options(language: str) -> list[dict[str, Any]]:
+    options = [
+        {"label": _ADAPTER_FAMILY_OPTION_LABELS.get(family, family), "value": family}
+        for family in SUPPORTED_FAMILIES
+    ]
+    options.append(
+        {"label": "不属于以上协议族 / 不确定" if str(language or "").startswith("zh") else "None of the above / unsure", "value": "unsupported"}
+    )
+    return options
 
 
 def _protocol_family_question(state: AgentGraphState) -> PendingQuestion:
@@ -3732,15 +4089,19 @@ def _protocol_family_question(state: AgentGraphState) -> PendingQuestion:
         "chain_identity",
         "adapter_family_confirm",
         _localized(language, "请确认该链属于哪个协议族。", "Confirm which adapter family this chain belongs to."),
-        [
-            {"label": "jsonrpc / EVM", "value": "jsonrpc"},
-            {"label": "substrate", "value": "substrate"},
-            {"label": "rest", "value": "rest"},
-            {"label": "tendermint", "value": "tendermint"},
-            {"label": "bitcoin_jsonrpc", "value": "bitcoin_jsonrpc"},
-            {"label": "hedera_dual", "value": "hedera_dual"},
-            {"label": "不属于以上协议族 / 不确定" if str(language or "").startswith("zh") else "None of the above / unsure", "value": "unsupported"},
-        ],
+        _adapter_family_options(language),
+        field="adapter_family",
+        kind="numbered_choice",
+    )
+
+
+def _custom_rpc_adapter_family_question(state: AgentGraphState) -> PendingQuestion:
+    language = state.get("language", "en")
+    return _option_question(
+        "endpoint_process",
+        "custom_rpc_adapter_family_confirm",
+        _localized(language, "请确认该链的协议族。", "Confirm this chain's adapter family."),
+        _adapter_family_options(language),
         field="adapter_family",
         kind="numbered_choice",
     )
@@ -3801,6 +4162,25 @@ def _confirm_or_value_question(group: str, question_id: str, prompt: str, *, fie
     )
 
 
+def _leading_yes_no(text: str) -> str:
+    """Return "y", "n", or "" for a leading y/yes/n/no token in `text`.
+
+    Matches a leading whole word only (word-boundary terminated), so "note",
+    "nvme", "north", and "yesterday" do not false-match — but a declined
+    yes/no confirm followed by free text ("N，我要调一下") does. Used to keep a
+    compound "N + extra intent" answer on the deterministic pending-answer
+    path instead of falling through to the LLM resolver, which has no
+    functional action type for "the user is still answering the pending
+    question" (see `answer_pending`'s permanent rejection in
+    `_apply_queue_action`).
+    """
+
+    match = re.match(r"^(yes|no|y|n)\b", text.strip().lower())
+    if not match:
+        return ""
+    return "y" if match.group(1) in {"y", "yes"} else "n"
+
+
 def _answer_fits_pending(text: str, question: PendingQuestion) -> bool:
     raw = _strip_scalar(text)
     if not raw:
@@ -3813,7 +4193,20 @@ def _answer_fits_pending(text: str, question: PendingQuestion) -> bool:
             _text_mentions_no_accounts_disk(raw) or _text_mentions_yes_accounts_disk(raw)
         ):
             return True
-        return raw.lower() in {"y", "yes", "n", "no"}
+        # Accept the option number/label the user is shown (e.g. "1"/"2"/"Y"/"N"),
+        # not just the y/yes/n/no words. `_coerce_answer` already maps a bare
+        # digit to the matching option value, so a numbered answer to a yes/no
+        # confirm must be treated as a direct answer instead of falling through
+        # to the free-text/LLM resolver (which cannot reliably map a lone "1").
+        if raw.lower() in {"y", "yes", "n", "no"} or _matches_numbered_option(raw, question):
+            return True
+        # A leading y/n token plus trailing free text ("N，我要调一下") must also
+        # stay on this deterministic path: the LLM resolver has no functional
+        # action type for "still answering the pending question" (it emits the
+        # permanently-rejected `answer_pending`), which previously produced a
+        # turn with no visible response at all. Excluded when the trailing text
+        # itself reads as a question, so a genuine question is not swallowed.
+        return bool(_leading_yes_no(raw)) and not _looks_like_user_question(raw)
     if kind == "numbered_choice" and question.get("id") == "unknown_chain_identity_confirm":
         candidate = _chain_from_option_label(str((question.get("options") or [{}])[0].get("label") or ""))
         raw_chain = canonicalize_chain_scalar(raw, known_chains=set(repo_chain_names()))
@@ -3823,11 +4216,15 @@ def _answer_fits_pending(text: str, question: PendingQuestion) -> bool:
             return True
         if _adapter_family_hint_from_text(raw):
             return True
-    if kind == "numbered_choice" and question.get("id") == "adapter_family_confirm":
+    if kind == "numbered_choice" and question.get("id") in {"adapter_family_confirm", "custom_rpc_adapter_family_confirm"}:
         if _adapter_family_hint_from_text(raw):
             return True
     if kind == "confirm_or_value":
-        if raw.lower() in {"y", "yes", "n", "no"}:
+        # Accept the option number shown ("1"/"2") as well as y/yes/n/no — the
+        # question renders numbered options, and `_coerce_answer` maps a bare digit
+        # to the matching option value, so a numbered answer must be treated as a
+        # direct answer instead of falling through to the LLM resolver.
+        if raw.lower() in {"y", "yes", "n", "no"} or _matches_numbered_option(raw, question):
             return True
         question_id = str(question.get("id") or "")
         field = str(question.get("field") or "")
@@ -3852,7 +4249,7 @@ def _answer_fits_pending(text: str, question: PendingQuestion) -> bool:
             if str(question.get("id") or "") in {"LOCAL_RPC_URL", "SYNC_OBSERVE_RPC_URL"}:
                 return _is_bare_endpoint_answer(raw)
             return bool(_extract_url_candidate(raw))
-        return _is_single_turn_value(raw)
+        return _is_single_turn_value(raw) and not _looks_like_user_question(raw)
     if kind == "evidence" and question.get("manual_input_allowed"):
         return bool(str(text or "").strip())
     if kind == "manual_value" and question.get("manual_input_allowed"):
@@ -3862,10 +4259,20 @@ def _answer_fits_pending(text: str, question: PendingQuestion) -> bool:
             return bool(str(text or "").strip()) and len(str(text or "")) <= 4000
         if raw.lower() in {"y", "yes", "n", "no"}:
             return False
-        return _is_plain_scalar_answer(raw)
+        return _is_plain_scalar_answer(raw) and not _looks_like_user_question(raw)
     if kind == "device" and question.get("manual_input_allowed"):
-        return _is_plain_scalar_answer(raw)
+        return _is_plain_scalar_answer(raw) and not _looks_like_user_question(raw)
     return False
+
+
+def _stringify_option_field(value: Any) -> str:
+    """Stringify an option field for comparison without collapsing `False`/`0`.
+
+    `str(value or "")` turns any falsy `value` (including the Python `False`
+    used as a yes/no option's value) into `""` before `str()` ever runs.
+    """
+
+    return "" if value is None else str(value)
 
 
 def _coerce_answer(text: str, question: PendingQuestion) -> Any:
@@ -3890,7 +4297,7 @@ def _coerce_answer(text: str, question: PendingQuestion) -> Any:
         family = _adapter_family_hint_from_text(raw)
         if family:
             return {"choose_protocol_family": family}
-    if question.get("kind") == "numbered_choice" and question.get("id") == "adapter_family_confirm":
+    if question.get("kind") == "numbered_choice" and question.get("id") in {"adapter_family_confirm", "custom_rpc_adapter_family_confirm"}:
         family = _adapter_family_hint_from_text(raw)
         if family:
             return family
@@ -3900,20 +4307,32 @@ def _coerce_answer(text: str, question: PendingQuestion) -> Any:
                 return False
             if _text_mentions_yes_accounts_disk(raw):
                 return True
-        if lowered in {"y", "yes"}:
+        # A leading y/n token with trailing free text ("N，我要调一下") must coerce
+        # the same as a bare "N" — matching `_answer_fits_pending`'s leading-token
+        # acceptance. Using the full `lowered` string here would fall through to
+        # `return raw` below and coerce as a truthy non-empty string, silently
+        # inverting a decline into an accept.
+        leading = _leading_yes_no(lowered)
+        if lowered in {"y", "yes"} or leading == "y":
             if options:
                 return options[0].get("value")
             return True
-        if lowered in {"n", "no"}:
+        if lowered in {"n", "no"} or leading == "n":
             if len(options) > 1:
                 return options[1].get("value")
             return False
     for option in options:
-        if lowered in {
-            str(option.get("value") or "").lower(),
-            str(option.get("label") or "").lower(),
-            str(option.get("id") or "").lower(),
-        }:
+        # NOT `str(option.get(...) or "")`: for a `False`-valued option (e.g. the
+        # "N" side of a yes/no confirm), `False or ""` collapses to `""` before
+        # `str()` ever runs, so it can never match a candidate answer of "false"
+        # — the loop falls through to `return raw` below, silently coercing a
+        # falsy answer into whatever truthy string was passed in.
+        candidates = {
+            _stringify_option_field(option.get("value")).lower(),
+            _stringify_option_field(option.get("label")).lower(),
+            _stringify_option_field(option.get("id")).lower(),
+        }
+        if lowered in candidates:
             return option.get("value")
     return raw
 
@@ -3984,41 +4403,70 @@ def _workload_default_prompt(state: AgentGraphState, language: str) -> str:
         mixed = ", ".join(f"{row.get('method')}={row.get('weight')}" for row in mixed_rows if row.get("method"))
     else:
         mixed = "<none>"
-    if str(language or "").startswith("zh"):
-        return (
-            f"当前链 `{chain}` 的模板 workload：\n"
-            f"- 当前 RPC 模式：`{rpc_mode}`\n"
-            f"- single 默认 method：`{single}`\n"
-            f"- mixed 默认权重：{mixed}\n"
-            "请选择如何继续。"
-        )
-    return (
-        f"Current chain template workload for `{chain}`:\n"
-        f"- Current RPC mode: `{rpc_mode}`\n"
-        f"- Default single method: `{single}`\n"
-        f"- Default mixed weights: {mixed}\n"
-        "Choose how to continue."
-    )
+    summary = question_prompts.workload_defaults_summary(chain, rpc_mode, single, mixed, language=language)
+    suffix = "请选择如何继续。" if str(language or "").startswith("zh") else "Choose how to continue."
+    return f"{summary}\n{suffix}"
+
+
+def _invalid_qps_overrides(overrides: dict[str, str]) -> str:
+    """Return a human-readable reason if any QPS override value is invalid.
+
+    INITIAL_QPS/MAX_QPS/QPS_STEP/DURATION must be positive integers, and when
+    both are given, MAX_QPS must be >= INITIAL_QPS. Returns "" when all valid.
+    """
+
+    numeric_keys = ("INITIAL_QPS", "MAX_QPS", "QPS_STEP", "DURATION")
+    bad: list[str] = []
+    parsed: dict[str, int] = {}
+    for key in numeric_keys:
+        if key not in overrides:
+            continue
+        raw = str(overrides[key]).strip()
+        if not re.fullmatch(r"[0-9]+", raw) or int(raw) <= 0:
+            bad.append(f"{key}={overrides[key]}")
+        else:
+            parsed[key] = int(raw)
+    if bad:
+        return ", ".join(bad)
+    if "INITIAL_QPS" in parsed and "MAX_QPS" in parsed and parsed["MAX_QPS"] < parsed["INITIAL_QPS"]:
+        return f"MAX_QPS({parsed['MAX_QPS']}) < INITIAL_QPS({parsed['INITIAL_QPS']})"
+    return ""
 
 
 def _qps_default_prompt(mode: str, language: str) -> str:
-    mode = (mode or "quick").strip().lower()
-    profiles = {
-        "quick": {"INITIAL_QPS": "1000", "MAX_QPS": "1500", "QPS_STEP": "500", "DURATION": "60"},
-        "standard": {"INITIAL_QPS": "2000", "MAX_QPS": "50000", "QPS_STEP": "500", "DURATION": "600"},
-        "intensive": {"INITIAL_QPS": "50000", "MAX_QPS": "9999999", "QPS_STEP": "250", "DURATION": "600"},
-    }
-    values = profiles.get(mode, profiles["quick"])
-    summary = ", ".join(f"{key}={value}" for key, value in values.items())
-    if str(language or "").startswith("zh"):
-        return (
-            f"`{mode}` 模式默认 QPS 配置：{summary}。\n"
-            "fake-node smoke 执行阶段会使用安全小流量覆盖来验证闭环；真实性能测试以最终 profile 为准。是否使用这些默认值？"
-        )
-    return (
-        f"Default QPS profile for `{mode}`: {summary}.\n"
-        "fake-node smoke uses a safe low-traffic execution override to validate the loop; real benchmarks use the final profile. Use these defaults?"
-    )
+    return question_prompts.qps_profile_prompt(mode, fake_node=True, language=language)
+
+
+_ADVANCED_TUNING_FIELD_LABELS = {
+    "MONITOR_INTERVAL": "MONITOR_INTERVAL / unified monitoring interval (seconds)",
+    "DISK_MONITOR_RATE": "DISK_MONITOR_RATE / disk-specific monitor rate",
+    "SUCCESS_RATE_THRESHOLD": "SUCCESS_RATE_THRESHOLD / QPS success-rate threshold (%)",
+    "MAX_LATENCY_THRESHOLD": "MAX_LATENCY_THRESHOLD / QPS max latency threshold (ms)",
+    "BOTTLENECK_CPU_THRESHOLD": "BOTTLENECK_CPU_THRESHOLD / CPU bottleneck threshold (%)",
+    "BOTTLENECK_MEMORY_THRESHOLD": "BOTTLENECK_MEMORY_THRESHOLD / memory bottleneck threshold (%)",
+    "BOTTLENECK_DISK_UTIL_THRESHOLD": "BOTTLENECK_DISK_UTIL_THRESHOLD / disk utilization bottleneck threshold (%)",
+    "BOTTLENECK_DISK_LATENCY_THRESHOLD": "BOTTLENECK_DISK_LATENCY_THRESHOLD / disk latency bottleneck threshold (ms)",
+    "BOTTLENECK_NETWORK_THRESHOLD": "BOTTLENECK_NETWORK_THRESHOLD / network bottleneck threshold (%)",
+    "BOTTLENECK_ERROR_RATE_THRESHOLD": "BOTTLENECK_ERROR_RATE_THRESHOLD / error-rate bottleneck threshold (%)",
+    "BOTTLENECK_DISK_IOPS_THRESHOLD": "BOTTLENECK_DISK_IOPS_THRESHOLD / disk IOPS bottleneck threshold (%)",
+    "BOTTLENECK_DISK_THROUGHPUT_THRESHOLD": "BOTTLENECK_DISK_THROUGHPUT_THRESHOLD / disk throughput bottleneck threshold (%)",
+}
+
+
+def _is_percentage_tuning_field(field: str) -> bool:
+    return "(%)" in _ADVANCED_TUNING_FIELD_LABELS.get(field, "")
+
+
+def _invalid_advanced_tuning_value(field: str, value: str) -> bool:
+    """True unless `value` is a positive number, and (for "(%)" fields) <= 100."""
+
+    if _invalid_positive_number(value):
+        return True
+    return _is_percentage_tuning_field(field) and float(value) > 100
+
+
+def _advanced_tuning_default_prompt(language: str) -> str:
+    return question_prompts.advanced_tuning_default_prompt(language=language)
 
 
 def _render_question(question: PendingQuestion, language: str) -> str:
@@ -4103,6 +4551,16 @@ def _normalize_proposed_config_value(key: str, value: Any) -> tuple[str, Any]:
     scalar = _strip_scalar(str(value)).strip().strip("\"'")
     if not normalized_key or not scalar:
         return normalized_key, ""
+    # The resolver's extracted key is free-text guessed from phrasing, not a
+    # canonical lookup, and produced "SYNC_OBSERVE_DURATION" for a live "改成
+    # 600" turn instead of the registered "SYNC_OBSERVE_DURATION_SECONDS" — fold
+    # known variants onto the canonical key before the allowlist check.
+    key_aliases = {
+        "SYNC_OBSERVE_DURATION": "SYNC_OBSERVE_DURATION_SECONDS",
+        "SYNC_OBSERVE_DURATION_SEC": "SYNC_OBSERVE_DURATION_SECONDS",
+        "SYNC_OBSERVE_STOP_CONDITIONS": "SYNC_OBSERVE_STOP_CONDITION",
+    }
+    normalized_key = key_aliases.get(normalized_key, normalized_key)
     if normalized_key == "ACCOUNTS_DEVICE" and _is_absence_value(scalar):
         return "HAS_ACCOUNTS_DEVICE", False
     if normalized_key == "HAS_ACCOUNTS_DEVICE":
@@ -4115,7 +4573,7 @@ def _normalize_proposed_config_value(key: str, value: Any) -> tuple[str, Any]:
         return normalized_key, scalar
     if normalized_key in {"DATA_VOL_SIZE", "ACCOUNTS_VOL_SIZE"}:
         size = _size_to_gib(scalar)
-        return normalized_key, size or _first_number_text(scalar)
+        return normalized_key, size or _signed_number_text(scalar)
     if normalized_key in {
         "DATA_VOL_MAX_IOPS",
         "DATA_VOL_MAX_THROUGHPUT",
@@ -4123,9 +4581,23 @@ def _normalize_proposed_config_value(key: str, value: Any) -> tuple[str, Any]:
         "ACCOUNTS_VOL_MAX_THROUGHPUT",
         "NETWORK_MAX_BANDWIDTH_GBPS",
     }:
-        return normalized_key, _first_number_text(scalar)
+        return normalized_key, _signed_number_text(scalar)
     if normalized_key in {"DATA_VOL_TYPE", "ACCOUNTS_VOL_TYPE"}:
         return normalized_key, scalar.lower()
+    if normalized_key == "SYNC_OBSERVE_DURATION_SECONDS":
+        # Deliberately not `_first_number_text`: it strips a leading "-" via
+        # regex-only digit extraction, which would silently turn an invalid
+        # "-50" into a valid-looking "50" instead of letting the caller reject
+        # it. Pass the scalar through untouched so sign errors surface.
+        return normalized_key, scalar
+    if normalized_key == "SYNC_OBSERVE_STOP_CONDITION":
+        lowered = scalar.lower()
+        aliases = {
+            "duration": "duration", "fixed": "duration", "固定时长": "duration", "固定": "duration",
+            "until_stopped": "until_stopped", "stopped": "until_stopped", "手动停止": "until_stopped", "一直运行": "until_stopped",
+            "until_synced": "until_synced", "synced": "until_synced", "同步完成": "until_synced",
+        }
+        return normalized_key, aliases.get(lowered, lowered)
     return normalized_key, scalar
 
 
@@ -4207,6 +4679,10 @@ def _pending_answer_contains_extra_intent(text: str, question: PendingQuestion) 
 
 def _pending_context_response(state: AgentGraphState, question: PendingQuestion, language: str) -> str:
     question_id = str(question.get("id") or "").strip()
+    if question_id in {"LOCAL_RPC_URL", "SYNC_OBSERVE_RPC_URL"}:
+        field_explanation = _config_field_explanation(state, question_id, language)
+        if field_explanation:
+            return field_explanation
     if question_id in {"new_chain_endpoint", "custom_rpc_endpoint"}:
         if question_id == "new_chain_endpoint":
             if str(language or "").startswith("zh"):
@@ -4265,11 +4741,24 @@ def _post_pending_answer_context_requested(state: AgentGraphState, text: str, an
     return True
 
 
+_ENGLISH_QUESTION_WORDS_RE = re.compile(r"\b(?:what|why|how|which|current)\b")
+
+
 def _looks_like_user_question(text: str) -> bool:
     raw = str(text or "").strip().lower()
     if not raw:
         return False
-    if any(mark in raw for mark in ("?", "？", "什么", "为何", "为什么", "怎么", "如何", "是否", "能不能", "可以吗", "what", "why", "how", "which", "current")):
+    if any(mark in raw for mark in ("?", "？", "什么", "为何", "为什么", "怎么", "如何", "是否", "能不能", "可以吗", "吗")):
+        return True
+    # English question words only signal a question inside a multi-word
+    # phrase; a single bare token (e.g. "concurrent-tier-01", a device path)
+    # cannot be an English sentence and must not be flagged as one.
+    if " " in raw and _ENGLISH_QUESTION_WORDS_RE.search(raw):
+        return True
+    # Colloquial Chinese yes/no questions often end in a sentence-final
+    # particle (了么/呢) without any "？" or other lexical marker above.
+    trimmed = raw.rstrip("。.!！ \t")
+    if trimmed.endswith(("么", "呢")):
         return True
     return False
 
@@ -4282,9 +4771,38 @@ def _first_number_text(value: Any) -> str:
     return str(int(number)) if number.is_integer() else str(number)
 
 
+def _signed_number_text(value: Any) -> str:
+    """Like `_first_number_text`, but preserves a leading "-" when the whole
+
+    input is a clean (possibly negative) number. `_first_number_text`'s regex
+    has no sign handling, so a pasted "-50" would otherwise silently become
+    the applied value "50" instead of being rejected by `_invalid_positive_number`
+    downstream — worse than doing nothing, since it changes the value without
+    telling the user. Noisy text with an embedded number (e.g. "20 GiB please")
+    has no leading minus either way, so this only changes behavior for the
+    negative case.
+    """
+
+    text = str(value or "").strip()
+    match = re.fullmatch(r"-?[0-9]+(?:\.[0-9]+)?", text)
+    if match:
+        return match.group(0)
+    return _first_number_text(text)
+
+
 def _looks_like_pasted_evidence(text: str) -> bool:
     lowered = text.lower()
     return any(token in lowered for token in ("traceback", "runtimeerror", "error:", "exception", "agent>", "user>", "failed"))
+
+
+def _is_multiline_paste(text: str) -> bool:
+    """True when the text is a genuine multi-line paste (>= 3 non-empty lines).
+
+    Used to distinguish a pasted report/log/data block from a one-line answer,
+    without keyword-matching the block's content.
+    """
+
+    return len([line for line in str(text or "").splitlines() if line.strip()]) >= 3
 
 
 def _looks_like_evidence_fragment(text: str, question: dict[str, Any]) -> bool:
@@ -4422,21 +4940,42 @@ def _extract_json_object_or_array(value: str) -> str:
     return ""
 
 
+_ADAPTER_FAMILY_NEGATION_RE = re.compile(
+    r"(没有|没|无|不是|不用|非|not|no|without|non[- ]?)"
+    # allow a negated enumeration between the negation and the matched family,
+    # e.g. "不是 REST/cosmos/substrate" negates every family in the list.
+    r"(?:[\s\-_,，、/|]|也|且|and|or|"
+    r"json[-_ ]?rpc|jsonrpc|evm|rest|substrate|polkadot|tendermint|cosmos(?:[ -]?sdk)?|cometbft|"
+    r"bitcoin(?:[_ ]?jsonrpc)?|hedera|ethereum[-_ ]?compatible|api|http)*$"
+)
+
+
 def _adapter_family_hint_from_text(value: str) -> str:
     text = str(value or "").strip().lower()
     if not text:
         return ""
-    if re.search(r"\b(evm|json[-_ ]?rpc|ethereum[-_ ]?compatible|eth_[a-z0-9_]+)\b", text):
+
+    def mentioned(pattern: str) -> bool:
+        match = re.search(pattern, text)
+        if not match:
+            return False
+        # A negated family term ("没有 json-rpc", "not json-rpc", "非 REST") is a
+        # denial, not an assertion. Keyword extraction must not read it as a
+        # positive family choice — doing so would promote an unsupported-protocol
+        # chain into a supported family and skip the Case-3 official-docs handoff.
+        return not _ADAPTER_FAMILY_NEGATION_RE.search(text[: match.start()])
+
+    if mentioned(r"\b(evm|json[-_ ]?rpc|ethereum[-_ ]?compatible|eth_[a-z0-9_]+)\b"):
         return "jsonrpc"
-    if "substrate" in text or "polkadot" in text:
+    if mentioned(r"substrate|polkadot"):
         return "substrate"
-    if re.search(r"\b(rest|http api|rest api)\b", text):
+    if mentioned(r"\b(rest|http api|rest api)\b"):
         return "rest"
-    if "tendermint" in text or "cosmos sdk" in text or "cometbft" in text:
+    if mentioned(r"tendermint|cosmos sdk|cometbft"):
         return "tendermint"
-    if "bitcoin_jsonrpc" in text or "bitcoin json-rpc" in text or "bitcoin jsonrpc" in text:
+    if mentioned(r"bitcoin[_ ]jsonrpc|bitcoin json-rpc"):
         return "bitcoin_jsonrpc"
-    if "hedera" in text:
+    if mentioned(r"hedera"):
         return "hedera_dual"
     return ""
 
@@ -4739,82 +5278,73 @@ def _schema_indicates_jsonrpc(draft: dict[str, Any]) -> bool:
     return bool(re.match(r"^[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+$", method))
 
 
-def _new_chain_schema_conflict(state: AgentGraphState, draft: dict[str, Any]) -> AgentGraphState | None:
+def _rpc_schema_conflict(state: AgentGraphState, draft: dict[str, Any], *, case: str) -> AgentGraphState | None:
     adapter_family = _chain_adapter_family(state)
+    language = state.get("language", "en")
     if adapter_family == "jsonrpc" and _schema_indicates_rest(draft):
+        direction = "jsonrpc_to_rest"
+    elif adapter_family == "rest" and _schema_indicates_jsonrpc(draft):
+        direction = "rest_to_jsonrpc"
+    else:
+        return None
+
+    if case == "new_chain":
         identity = state.setdefault("chain_identity", {})
         identity["status"] = "needs_protocol_confirmation"
-        identity["adapter_family"] = ""
-        state.setdefault("endpoint_evidence", {})["candidate_endpoint_ready"] = False
+        if direction == "jsonrpc_to_rest":
+            identity["adapter_family"] = ""
+            state.setdefault("endpoint_evidence", {})["candidate_endpoint_ready"] = False
         state["pending_question"] = _protocol_family_question(state)
-        state["visible_response"] = [
-            _localized(
-                state.get("language", "en"),
+        if direction == "jsonrpc_to_rest":
+            msg = _localized(
+                language,
                 "你刚提供的证据更像 REST API（REST path、URL 或 REST 文档片段），但当前选择的是 `jsonrpc / EVM`。请先重新确认协议族；如果确认是 REST，我会重新验证 REST endpoint 和 method schema。",
                 "The evidence looks like a REST API (REST path, URL, or REST docs excerpt), but the current adapter family is `jsonrpc / EVM`. Confirm the adapter family first; if it is REST, I will re-validate the REST endpoint and method schema.",
-            ),
-            _render_question(state["pending_question"], state.get("language", "en")),
-        ]
-        return state
-    if adapter_family == "rest" and _schema_indicates_jsonrpc(draft):
-        identity = state.setdefault("chain_identity", {})
-        identity["status"] = "needs_protocol_confirmation"
-        state["pending_question"] = _protocol_family_question(state)
-        state["visible_response"] = [
-            _localized(
-                state.get("language", "en"),
+            )
+        else:
+            msg = _localized(
+                language,
                 "你刚提供的证据更像 JSON-RPC request/method，但当前选择的是 `rest`。请先重新确认协议族。",
                 "The evidence looks like a JSON-RPC request/method, but the current adapter family is `rest`. Confirm the adapter family first.",
-            ),
-            _render_question(state["pending_question"], state.get("language", "en")),
-        ]
-        return state
-    return None
+            )
+    else:
+        custom = state.setdefault("custom_rpc", {})
+        custom["status"] = "needs_adapter_family_confirmation"
+        custom["endpoint_ready"] = False
+        state["pending_question"] = _custom_rpc_adapter_family_question(state)
+        if direction == "jsonrpc_to_rest":
+            msg = _localized(
+                language,
+                "你提供的证据更像 REST API，但当前已确认链的 adapter family 是 `jsonrpc`。请先重新确认协议族；如果确认是 REST，我会重新验证 REST endpoint 和 method schema。",
+                "The evidence looks like a REST API, but the confirmed chain adapter family is `jsonrpc`. Confirm the adapter family first; if it is REST, I will re-validate the REST endpoint and method schema.",
+            )
+        else:
+            msg = _localized(
+                language,
+                "你提供的证据更像 JSON-RPC，但当前链 adapter family 是 `rest`。请先重新确认协议族。",
+                "The evidence looks like JSON-RPC, but the current chain adapter family is `rest`. Confirm the adapter family first.",
+            )
+
+    state["visible_response"] = [msg, _render_question(state["pending_question"], language)]
+    return state
 
 
-def _custom_rpc_schema_conflict(state: AgentGraphState, draft: dict[str, Any]) -> AgentGraphState | None:
-    adapter_family = _chain_adapter_family(state)
-    if adapter_family == "jsonrpc" and _schema_indicates_rest(draft):
-        custom = state.setdefault("custom_rpc", {})
-        custom["status"] = "needs_schema_evidence"
-        state["pending_question"] = {}
-        state["visible_response"] = [_localized(
-            state.get("language", "en"),
-            "你提供的证据更像 REST API，但当前已确认链的 adapter family 是 `jsonrpc`。请提供 JSON-RPC method/request/response 证据；如果你要测试 REST 协议链，请先切换链或进入新链 onboarding。",
-            "The evidence looks like a REST API, but the confirmed chain adapter family is `jsonrpc`. Provide JSON-RPC method/request/response evidence; if you need a REST protocol chain, switch chain or enter new-chain onboarding first.",
-        )]
-        return state
-    if adapter_family == "rest" and _schema_indicates_jsonrpc(draft):
-        custom = state.setdefault("custom_rpc", {})
-        custom["status"] = "needs_schema_evidence"
-        state["pending_question"] = {}
-        state["visible_response"] = [_localized(
-            state.get("language", "en"),
-            "你提供的证据更像 JSON-RPC，但当前链 adapter family 是 `rest`。请提供 REST path/request/response 证据，或切换到 JSON-RPC/EVM 链。",
-            "The evidence looks like JSON-RPC, but the current chain adapter family is `rest`. Provide REST path/request/response evidence, or switch to a JSON-RPC/EVM chain.",
-        )]
-        return state
-    return None
+def _validated_rpc_methods(case_dict: dict[str, Any], *, fallback_key: str) -> list[str]:
+    methods: list[str] = []
+    for item in case_dict.get("validated_methods") or []:
+        if isinstance(item, dict) and item.get("method"):
+            methods.append(str(item["method"]))
+    if case_dict.get(fallback_key):
+        methods.append(str(case_dict[fallback_key]))
+    return list(dict.fromkeys(method for method in methods if method))
 
 
 def _validated_custom_methods(custom: dict[str, Any]) -> list[str]:
-    methods: list[str] = []
-    for item in custom.get("validated_methods") or []:
-        if isinstance(item, dict) and item.get("method"):
-            methods.append(str(item["method"]))
-    if custom.get("method"):
-        methods.append(str(custom["method"]))
-    return list(dict.fromkeys(method for method in methods if method))
+    return _validated_rpc_methods(custom, fallback_key="method")
 
 
 def _validated_new_chain_methods(identity: dict[str, Any]) -> list[str]:
-    methods: list[str] = []
-    for item in identity.get("validated_methods") or []:
-        if isinstance(item, dict) and item.get("method"):
-            methods.append(str(item["method"]))
-    if identity.get("candidate_method"):
-        methods.append(str(identity["candidate_method"]))
-    return list(dict.fromkeys(method for method in methods if method))
+    return _validated_rpc_methods(identity, fallback_key="candidate_method")
 
 
 def _format_schema_confirmation_prompt(language: str, draft: dict[str, Any]) -> str:
@@ -4879,84 +5409,34 @@ def _sync_client_setup_handoff_message(state: AgentGraphState) -> str:
     )
 
 
-def _validate_custom_rpc_schema(state: AgentGraphState, params: Any) -> AgentGraphState:
-    language = state.get("language", "en")
-    custom = state.setdefault("custom_rpc", {})
-    custom["params"] = params
-    draft = custom.get("schema_draft") if isinstance(custom.get("schema_draft"), dict) else {}
-    draft_method = str(draft.get("method") or "").strip()
-    if draft_method:
-        custom["method"] = draft_method
-    chain = (state.get("chain_identity") or {}).get("canonical") or ""
-    endpoint = str(custom.get("endpoint") or "")
-    method = str(custom.get("method") or "")
-    result = validate_rpc_endpoint(
-        chain=chain,
-        endpoint=endpoint,
-        methods=[method],
-        adapter_family=(state.get("chain_identity") or {}).get("adapter_family") or "",
-        method_params={method: params},
-        timeout=3.0,
-    )
-    custom["method_probe"] = result
-    state.setdefault("endpoint_evidence", {})["custom_rpc_method_probe"] = result
-    if not result.get("ready"):
-        custom["status"] = "needs_schema_evidence"
-        state["pending_question"] = {}
-        state["visible_response"] = [_localized(
-            language,
-            f"method/schema 验证失败：{result.get('error') or result.get('status')}。证据：{result.get('evidence_file') or '<none>'}。请修正 method、params 或证据。",
-            f"Method/schema validation failed: {result.get('error') or result.get('status')}. Evidence: {result.get('evidence_file') or '<none>'}. Correct the method, params, or evidence.",
-        )]
-        return state
-    custom.setdefault("validated_methods", []).append({
-        "method": method,
-        "params": params,
-        "evidence_file": result.get("evidence_file") or "",
-    })
-    custom["status"] = "method_validated_next"
-    if not isinstance(custom.get("inline_workload_hint"), dict):
-        source_text = str(custom.get("source_turn_text") or state.get("last_user_input") or "")
-        hint = _custom_rpc_inline_workload_hint(source_text, _validated_custom_methods(custom))
-        if hint:
-            custom["inline_workload_hint"] = hint
-    state["visible_response"] = [_localized(
-        language,
-        f"method/schema 验证通过。证据：{result.get('evidence_file') or '<none>'}。验证 endpoint 仍只作为证据保存，最终测试 endpoint 会在 endpoint 配置组单独确认。",
-        f"Method/schema validation passed. Evidence: {result.get('evidence_file') or '<none>'}. The validation endpoint remains evidence-only; the final benchmark endpoint will be confirmed separately in the endpoint configuration group.",
-    )]
-    if _apply_custom_rpc_inline_workload_hint(state):
-        return state
-    state["pending_question"] = _option_question(
-        "endpoint_process",
-        "custom_rpc_continue",
-        _localized(
-            language,
-            "这个自定义 RPC method 已验证通过。下一步怎么处理？",
-            "This custom RPC method has been validated. What should happen next?",
-        ),
-        [
-            {"label": "继续添加另一个自定义 RPC method" if str(language or "").startswith("zh") else "Add another custom RPC method", "value": "add_another"},
-            {"label": "当前 method 已够，继续配置 workload" if str(language or "").startswith("zh") else "This is enough; continue workload setup", "value": "finish"},
-        ],
-        field="custom_rpc_continue",
-        kind="numbered_choice",
-    )
-    state["visible_response"] = list(state.get("visible_response") or []) + [_render_question(state["pending_question"], language)]
-    return state
+def _rpc_case_dict(state: AgentGraphState, case: str) -> dict[str, Any]:
+    return state.setdefault("chain_identity", {}) if case == "new_chain" else state.setdefault("custom_rpc", {})
 
 
-def _validate_new_chain_rpc_schema(state: AgentGraphState, params: Any) -> AgentGraphState:
+def _rpc_case_endpoint(state: AgentGraphState, case: str) -> str:
+    if case == "new_chain":
+        return str((state.get("endpoint_evidence") or {}).get("candidate_endpoint") or "")
+    return str((state.get("custom_rpc") or {}).get("endpoint") or "")
+
+
+def _chain_name_for_probe(state: AgentGraphState) -> str:
+    identity = state.get("chain_identity") or {}
+    return str(identity.get("canonical") or identity.get("raw") or "").strip()
+
+
+def _validate_rpc_schema(state: AgentGraphState, params: Any, *, case: str) -> AgentGraphState:
     language = state.get("language", "en")
-    identity = state.setdefault("chain_identity", {})
-    identity["candidate_params"] = params
-    draft = identity.get("schema_draft") if isinstance(identity.get("schema_draft"), dict) else {}
+    case_dict = _rpc_case_dict(state, case)
+    method_field = "candidate_method" if case == "new_chain" else "method"
+    params_field = "candidate_params" if case == "new_chain" else "params"
+    case_dict[params_field] = params
+    draft = case_dict.get("schema_draft") if isinstance(case_dict.get("schema_draft"), dict) else {}
     draft_method = str(draft.get("method") or "").strip()
     if draft_method:
-        identity["candidate_method"] = draft_method
-    endpoint = str((state.get("endpoint_evidence") or {}).get("candidate_endpoint") or "")
-    method = str(identity.get("candidate_method") or "")
-    chain = str(identity.get("canonical") or identity.get("raw") or "").strip()
+        case_dict[method_field] = draft_method
+    chain = _chain_name_for_probe(state)
+    endpoint = _rpc_case_endpoint(state, case)
+    method = str(case_dict.get(method_field) or "")
     result = validate_rpc_endpoint(
         chain=chain,
         endpoint=endpoint,
@@ -4965,22 +5445,59 @@ def _validate_new_chain_rpc_schema(state: AgentGraphState, params: Any) -> Agent
         method_params={method: params},
         timeout=3.0,
     )
-    state.setdefault("endpoint_evidence", {})["new_chain_method_probe"] = result
+    if case == "custom_rpc":
+        case_dict["method_probe"] = result
+    evidence_key = "new_chain_method_probe" if case == "new_chain" else "custom_rpc_method_probe"
+    state.setdefault("endpoint_evidence", {})[evidence_key] = result
     if not result.get("ready"):
-        identity["status"] = "existing_family_needs_schema_evidence"
+        if case == "new_chain":
+            case_dict["status"] = "existing_family_needs_schema_evidence"
+            fail_zh = f"新链 method/schema 验证失败：{result.get('error') or result.get('status')}。证据：{result.get('evidence_file') or '<none>'}。请修正 method、params 或证据。"
+            fail_en = f"New-chain method/schema validation failed: {result.get('error') or result.get('status')}. Evidence: {result.get('evidence_file') or '<none>'}. Correct the method, params, or evidence."
+        else:
+            case_dict["status"] = "needs_schema_evidence"
+            fail_zh = f"method/schema 验证失败：{result.get('error') or result.get('status')}。证据：{result.get('evidence_file') or '<none>'}。请修正 method、params 或证据。"
+            fail_en = f"Method/schema validation failed: {result.get('error') or result.get('status')}. Evidence: {result.get('evidence_file') or '<none>'}. Correct the method, params, or evidence."
         state["pending_question"] = {}
-        state["visible_response"] = [_localized(
-            language,
-            f"新链 method/schema 验证失败：{result.get('error') or result.get('status')}。证据：{result.get('evidence_file') or '<none>'}。请修正 method、params 或证据。",
-            f"New-chain method/schema validation failed: {result.get('error') or result.get('status')}. Evidence: {result.get('evidence_file') or '<none>'}. Correct the method, params, or evidence.",
-        )]
+        state["visible_response"] = [_localized(language, fail_zh, fail_en)]
         return state
-    identity.setdefault("validated_methods", []).append({
+    case_dict.setdefault("validated_methods", []).append({
         "method": method,
         "params": params,
         "evidence_file": result.get("evidence_file") or "",
     })
-    identity["status"] = "existing_family_method_validated_next"
+    if case == "custom_rpc":
+        case_dict["status"] = "method_validated_next"
+        if not isinstance(case_dict.get("inline_workload_hint"), dict):
+            source_text = str(case_dict.get("source_turn_text") or state.get("last_user_input") or "")
+            hint = _custom_rpc_inline_workload_hint(source_text, _validated_custom_methods(case_dict))
+            if hint:
+                case_dict["inline_workload_hint"] = hint
+        state["visible_response"] = [_localized(
+            language,
+            f"method/schema 验证通过。证据：{result.get('evidence_file') or '<none>'}。验证 endpoint 仍只作为证据保存，最终测试 endpoint 会在 endpoint 配置组单独确认。",
+            f"Method/schema validation passed. Evidence: {result.get('evidence_file') or '<none>'}. The validation endpoint remains evidence-only; the final benchmark endpoint will be confirmed separately in the endpoint configuration group.",
+        )]
+        if _apply_custom_rpc_inline_workload_hint(state):
+            return state
+        state["pending_question"] = _option_question(
+            "endpoint_process",
+            "custom_rpc_continue",
+            _localized(
+                language,
+                "这个自定义 RPC method 已验证通过。下一步怎么处理？",
+                "This custom RPC method has been validated. What should happen next?",
+            ),
+            [
+                {"label": "继续添加另一个自定义 RPC method" if str(language or "").startswith("zh") else "Add another custom RPC method", "value": "add_another"},
+                {"label": "当前 method 已够，继续配置 workload" if str(language or "").startswith("zh") else "This is enough; continue workload setup", "value": "finish"},
+            ],
+            field="custom_rpc_continue",
+            kind="numbered_choice",
+        )
+        state["visible_response"] = list(state.get("visible_response") or []) + [_render_question(state["pending_question"], language)]
+        return state
+    case_dict["status"] = "existing_family_method_validated_next"
     state["pending_question"] = _option_question(
         "endpoint_process",
         "new_chain_method_continue",
@@ -5136,22 +5653,42 @@ def _format_weights(weights: dict[str, int]) -> str:
     return ", ".join(f"{method}={weight}" for method, weight in weights.items())
 
 
-def _enter_case_for_adapter_family(state: AgentGraphState, family: str) -> AgentGraphState:
+def _confirm_adapter_family(state: AgentGraphState, family: str) -> bool:
+    """Record `chain_identity.adapter_family`; return False if unsupported.
+
+    On an unsupported family, this also routes the turn to the
+    secondary-development handoff before returning False, so callers should
+    return `state` unchanged when this returns False.
+    """
+
     identity = state.setdefault("chain_identity", {})
     family = str(family or "").strip()
     identity["adapter_family"] = family
     if family not in SUPPORTED_ADAPTER_FAMILIES:
-        identity["status"] = "unsupported_family_handoff"
-        identity["case"] = "case3"
-        state.setdefault("secondary_handoff", {})["status"] = "collecting_evidence"
-        state["pending_question"] = {}
-        state["visible_response"] = [_localized(
-            state.get("language", "en"),
-            "该链目前不属于已支持协议族。请提供官方协议/RPC 文档、endpoint 文档、request/response 示例；我会生成二次开发交接文档。",
-            "This chain is outside the supported adapter families. Provide official protocol/RPC docs, endpoint docs, and request/response examples; I will generate a secondary-development handoff.",
-        )]
-        state["_stop_after_response"] = True
+        _route_unsupported_adapter_family(state)
+        return False
+    return True
+
+
+def _route_unsupported_adapter_family(state: AgentGraphState) -> AgentGraphState:
+    identity = state.setdefault("chain_identity", {})
+    identity["status"] = "unsupported_family_handoff"
+    identity["case"] = "case3"
+    state.setdefault("secondary_handoff", {})["status"] = "collecting_evidence"
+    state["pending_question"] = {}
+    state["visible_response"] = [_localized(
+        state.get("language", "en"),
+        "该链目前不属于已支持协议族。请提供官方协议/RPC 文档、endpoint 文档、request/response 示例；我会生成二次开发交接文档。",
+        "This chain is outside the supported adapter families. Provide official protocol/RPC docs, endpoint docs, and request/response examples; I will generate a secondary-development handoff.",
+    )]
+    state["_stop_after_response"] = True
+    return state
+
+
+def _enter_case_for_adapter_family(state: AgentGraphState, family: str) -> AgentGraphState:
+    if not _confirm_adapter_family(state, family):
         return state
+    identity = state.setdefault("chain_identity", {})
     identity["status"] = "existing_family_needs_endpoint"
     identity["case"] = "case2"
     identity["identity_confirmed"] = True
@@ -5177,10 +5714,17 @@ def _route_secondary_handoff_text(state: AgentGraphState, text: str) -> AgentGra
         return None
     if state.get("pending_question"):
         return None
-    if _looks_like_handoff_navigation(text):
-        return None
     stripped = str(text or "").strip()
-    if not _looks_like_handoff_generation_request(stripped) and not _looks_like_handoff_evidence(stripped):
+    is_generation_request = _looks_like_handoff_generation_request(stripped)
+    if not is_generation_request and not _looks_like_handoff_evidence(stripped):
+        return None
+    # A plain evidence-shaped turn may actually be the user navigating away
+    # (reset, jump to another group, analyze a past report). Route that
+    # evidence-vs-navigation decision through the shared action-queue resolver
+    # instead of a keyword blocklist (audit Findings B4/F: no keyword business
+    # routing outside terminal rendering). An explicit "generate the handoff"
+    # request is a deterministic intent and is never overridden by the resolver.
+    if not is_generation_request and _handoff_text_is_navigation(state, text):
         return None
     evidence_items = handoff.setdefault("evidence", [])
     if stripped:
@@ -5211,29 +5755,36 @@ def _looks_like_handoff_generation_request(text: str) -> bool:
     return any(token in lowered for token in ("生成", "交接", "handoff", "development doc", "coding doc"))
 
 
-def _looks_like_handoff_navigation(text: str) -> bool:
-    lowered = str(text or "").strip().lower()
-    return any(token in lowered for token in (
-        "重新开始",
-        "清空",
-        "回到",
-        "改回",
-        "换成",
-        "先别管",
-        "最近",
-        "报告",
-        "日志",
-        "switch to",
-        "change to",
-        "start over",
-        "clear",
-        "latest",
-        "job",
-        "report",
-        "log",
-        "status",
-        "analyze",
-    ))
+# Typed actions that mean the user is navigating away from the secondary-handoff
+# evidence collection (resetting, jumping to another group, asking to analyze a
+# past report, or asking a question) rather than pasting development evidence.
+# Deliberately excludes chain/mode selection and analyze_evidence: pasted
+# development evidence routinely names chains, protocols, and endpoints, so the
+# resolver classifies it as choose_chain/analyze_evidence — treating those as
+# navigation would drop real evidence (verified via live DeepSeek runs).
+_HANDOFF_NAVIGATION_ACTIONS = {
+    "reset_session",
+    "change_group",
+    "go_back",
+    "ask_capabilities",
+    "answer_opening_question",
+    "analyze_report",
+}
+
+
+def _handoff_text_is_navigation(state: AgentGraphState, text: str) -> bool:
+    """Classify handoff-state text as navigation vs. evidence via the resolver.
+
+    Replaces the previous keyword blocklist: the shared action-queue resolver
+    decides whether an evidence-shaped turn is actually a navigation/command
+    turn. Only clear navigation intents route away; unknown/greeting and
+    evidence-oriented actions (analyze_evidence, propose_config_values) stay in
+    the collection flow so pasted development evidence is still captured.
+    """
+
+    queue = resolve_action_queue(state, text)
+    actions = _normalized_action_queue(queue)
+    return any(str(item.get("type") or "") in _HANDOFF_NAVIGATION_ACTIONS for item in actions)
 
 
 def _looks_like_handoff_evidence(text: str) -> bool:
@@ -5349,6 +5900,160 @@ def _consume_queued_new_chain_rpc_action(state: AgentGraphState) -> bool:
     return changed
 
 
+def _mode_comparison_explanation(language: str) -> str:
+    return _localized(
+        language,
+        (
+            "三种模式的区别：\n"
+            "1. fake-node：使用预录 fixtures 验证框架闭环，不测真实节点性能。\n"
+            "2. real-node：对真实 LOCAL_RPC_URL 做 RPC 压测，需要真实 endpoint 和节点进程信息。\n"
+            "3. sync-observe：观察真实节点追块/同步状态、CPU、内存、磁盘、网络和可用的 MGas/s 指标，不走 vegeta 压测。\n"
+            "所以 fake-node 的作用是低风险验证 Agent、配置、fixtures、执行、日志和 HTML 报告是否能闭环；它不能回答真实节点 QPS、同步速度或硬件瓶颈。\n"
+            "如果目标是“能支持多少 QPS、瓶颈在哪里”，应使用 real-node benchmark；如果目标是“节点追块/import 过程表现”，才使用 sync-observe。"
+        ),
+        (
+            "Mode differences:\n"
+            "1. fake-node: uses recorded fixtures to validate the framework loop; it does not measure real node performance.\n"
+            "2. real-node: runs RPC load tests against a real LOCAL_RPC_URL and needs endpoint/process details.\n"
+            "3. sync-observe: observes real node sync progress, CPU, memory, disk, network, and available MGas/s metrics; it does not run vegeta load tests.\n"
+            "So fake-node is useful for low-risk validation of the Agent, config, fixtures, execution, logs, and HTML report loop; it cannot answer real-node QPS, sync speed, or hardware bottlenecks.\n"
+            "If the goal is QPS capacity or bottleneck discovery, use real-node benchmark; if the goal is sync/import observation, use sync-observe."
+        ),
+    )
+
+
+def _preflight_smoke_explanation(language: str) -> str:
+    return _localized(
+        language,
+        (
+            "preflight 与 smoke 是正式压测/观测前的两道轻量校验，本身都不是完整 benchmark：\n"
+            "1. preflight（预检）：对生成的 benchmark plan 做提交前静态校验——检查配置是否完整、依赖是否就绪、chain 模板/schema、endpoint 与必填变量是否齐全；返回通过或列出 blockers，有 blocker 时不会启动，而是让你先补齐。\n"
+            "2. smoke（冒烟）：用 fake-node fixtures 以极小负载真正跑一遍最短闭环，确认执行、指标采集、日志和 HTML 报告链路能端到端产出，再决定是否放大到真实 run。\n"
+            "两者都通过后，才会进入正式的 real-node QPS 压测或 sync-observe 观测。"
+        ),
+        (
+            "preflight and smoke are two lightweight checks before the full load test/observation; neither is the full benchmark:\n"
+            "1. preflight: static pre-submission validation of the generated benchmark plan — it checks config completeness, dependency readiness, the chain template/schema, and that the endpoint and required variables are present; it returns passed or lists blockers, and will not launch when blocked but asks you to fill the gaps first.\n"
+            "2. smoke: a real minimal-load run of the shortest loop using fake-node fixtures, to confirm execution, metric collection, logs, and the HTML report pipeline work end to end before scaling up.\n"
+            "Only after both pass does the real-node QPS load test or sync-observe run begin."
+        ),
+    )
+
+
+def _environment_readiness_response(state: AgentGraphState, language: str) -> str:
+    """Answer "can my machine run this / is my env ready" from startup discovery."""
+
+    discovery = state.get("discovery") or {}
+    deps = discovery.get("dependencies") or {}
+    missing_required = [str(d) for d in (deps.get("missing_required") or [])]
+    missing_optional = [str(d) for d in (deps.get("missing_optional") or [])]
+    cloud = discovery.get("cloud") or {}
+    host = discovery.get("host") or {}
+    ready = not missing_required
+    specs = (
+        f"{cloud.get('provider', '?')}/{cloud.get('machine_type', '?')}, "
+        f"{host.get('cpu_count', '?')} CPU, {host.get('memory_gib', '?')} GiB, {host.get('os', '?')}"
+    )
+    return _localized(
+        language,
+        (
+            f"环境就绪状态：{'就绪，可以开始' if ready else '缺少必需依赖，暂不能运行'}。\n"
+            f"检测到的机器：{specs}。\n"
+            f"必需依赖：{'齐全' if ready else '缺少 ' + ', '.join(missing_required)}；"
+            f"可选依赖缺失：{', '.join(missing_optional) if missing_optional else '无'}。\n"
+            "fake-node 不需要真实节点即可跑闭环验证；real-node 需要可达的 LOCAL_RPC_URL；"
+            "sync-observe 需要真实节点或可观测 endpoint。"
+            + ("" if ready else "\n运行前请先安装必需依赖：回复 doctor 查看，或允许我运行 scripts/install_deps.sh。")
+        ),
+        (
+            f"Environment readiness: {'ready to start' if ready else 'missing required dependencies; cannot run yet'}.\n"
+            f"Detected machine: {specs}.\n"
+            f"Required dependencies: {'all present' if ready else 'missing ' + ', '.join(missing_required)}; "
+            f"missing optional: {', '.join(missing_optional) if missing_optional else 'none'}.\n"
+            "fake-node needs no real node for the closed-loop check; real-node needs a reachable LOCAL_RPC_URL; "
+            "sync-observe needs a real node or observable endpoint."
+            + ("" if ready else "\nInstall required deps before running: reply doctor, or allow me to run scripts/install_deps.sh.")
+        ),
+    )
+
+
+def _config_field_knowledge(identifier: str):
+    """Return the RuntimeField whose env/key/label matches `identifier`, else None.
+
+    The canonical per-field contract (agent/knowledge/entry_contract.py) is the
+    single source of truth for what a config field is, why it is needed, and
+    whether it can be inferred — config explanations read from it rather than
+    restating field facts inline.
+    """
+
+    ident = _strip_scalar(str(identifier or "")).strip().lower()
+    if not ident:
+        return None
+    try:
+        from agent.knowledge.entry_contract import ALL_RUNTIME_FIELDS
+    except ImportError:  # script execution with agent/ on sys.path
+        from knowledge.entry_contract import ALL_RUNTIME_FIELDS
+
+    def _normalize(value: str) -> str:
+        return value.replace("_", "").replace("-", "").replace(" ", "")
+
+    # The resolver's `subject` is free-text guessed from the user's phrasing
+    # (e.g. "停止条件" -> "sync_observe_stop_conditions"), not a canonical key
+    # lookup, so an English pluralization or separator mismatch against the
+    # exact snake_case field key is expected and must not sink the match.
+    ident_variants = {_normalize(ident), _normalize(ident.rstrip("s"))}
+    for field in ALL_RUNTIME_FIELDS:
+        candidates = {field.env.lower(), field.key.lower(), field.label.lower()}
+        if ident in candidates:
+            return field
+        if ident_variants & {_normalize(c) for c in candidates if c}:
+            return field
+    return None
+
+
+def _config_field_explanation(state: AgentGraphState, subject: str, language: str) -> str | None:
+    """Explain a specific config field from the runtime contract, or None.
+
+    Resolves the field from the resolver's `subject`, falling back to the active
+    pending question's field, so "does this disk type matter?" during the
+    DATA_VOL_TYPE prompt is answered concretely (purpose, inferability, whether
+    it must be confirmed) instead of a generic "paste the field" reply.
+    """
+
+    field = _config_field_knowledge(subject)
+    if field is None:
+        pending_field = str((state.get("pending_question") or {}).get("field") or "")
+        field = _config_field_knowledge(pending_field)
+    if field is None:
+        return None
+    modes = "、".join(m.replace("_", "-") for m in field.applies_to)
+    required_zh = "必填" if field.required else "可选"
+    required_en = "required" if field.required else "optional"
+    # Some fields (e.g. sync-observe fields) have no 1:1 env var and use their
+    # logical key as the display identifier instead.
+    display_id = field.env or field.key
+    # Do not assert whether the value was inferred (the static contract flag does
+    # not track what startup actually detected). State how to provide it, matching
+    # what the field's own prompt offers ("use the detected value or type one").
+    return _localized(
+        language,
+        (
+            f"`{display_id}`（{field.label}）\n"
+            f"作用：{field.description or field.reason}\n"
+            f"是否影响结果：它是{required_zh}的分析/归因输入，{field.reason}\n"
+            f"取值：如果启动检测给出了候选值，可以直接接受；否则请手动输入。\n"
+            f"适用模式：{modes}。"
+        ),
+        (
+            f"`{display_id}` ({field.label})\n"
+            f"Purpose: {field.description or field.reason}\n"
+            f"Effect on results: it is a {required_en} analysis/attribution input — {field.reason}\n"
+            f"Value: accept the detected candidate if startup found one, otherwise enter it manually.\n"
+            f"Applies to: {modes}."
+        ),
+    )
+
+
 def _opening_consultation_response(state: AgentGraphState, action: dict[str, Any], text: str) -> str:
     language = state.get("language", "en")
     topic = str(action.get("topic") or "").strip().lower()
@@ -5359,9 +6064,9 @@ def _opening_consultation_response(state: AgentGraphState, action: dict[str, Any
         topic = "agent_capabilities"
     if topic in {"who", "who_are_you", "identity", "origin", "purpose", "destination", "direction"}:
         topic = "identity"
-    if topic in {"what_can_you_do", "agent_capability", "agent_capabilities"}:
+    if topic in {"what_can_you_do", "agent_capability", "agent_capabilities", "capabilities"}:
         topic = "agent_capabilities"
-    if topic in {"capabilities", "supported", "supported_chains", "chains", "rpc_methods", "templates"}:
+    if topic in {"supported", "supported_chains", "chains", "rpc_methods", "templates"}:
         topic = "supported_chains"
     if topic in {"current", "state", "settings", "current_settings"}:
         topic = "current_config"
@@ -5369,8 +6074,27 @@ def _opening_consultation_response(state: AgentGraphState, action: dict[str, Any
         topic = "current_context"
     if topic in {"reset", "restart", "start_over", "clear", "reset_help"}:
         topic = "reset_help"
+    if topic in {
+        "discovery",
+        "startup_discovery",
+        "environment_inference",
+        "environment_discovery",
+        "inferred_values",
+        "env_discovery",
+        "inferred_environment",
+    }:
+        topic = "startup_discovery"
     if topic in {"prepare", "prerequisites", "checklist"}:
         topic = "requirements"
+    if topic in {
+        "environment_readiness",
+        "env_readiness",
+        "host_readiness",
+        "machine_readiness",
+        "can_run",
+        "readiness",
+    }:
+        topic = "environment_readiness"
     if topic in {"modes", "mode"}:
         topic = "mode_comparison"
     if topic in {"fake_node", "fake_node_usefulness", "fake-node", "fake-node-usefulness"}:
@@ -5386,12 +6110,24 @@ def _opening_consultation_response(state: AgentGraphState, action: dict[str, Any
         return _evidence_help_response(state)
     if topic == "agent_capabilities":
         return _agent_capabilities_response(state)
+    if topic == "environment_readiness":
+        return _environment_readiness_response(state, language)
     if topic == "supported_chains":
+        # "bsc 有哪些 rpc workload" / "what methods does solana support" asks about
+        # ONE chain's workload. The resolver marks the chain in `subject`; answer
+        # from that chain's template instead of dumping the generic chain list.
+        workload_chain = _known_chain_from_subject(action)
+        if workload_chain:
+            summary = _chain_workload_summary(state, workload_chain)
+            if summary:
+                return summary
         return _framework_capability_summary(state)
     if topic == "current_context":
         return format_current_context(state, language)
     if topic == "current_config":
         return format_current_state(state, language)
+    if topic == "startup_discovery":
+        return format_startup_discovery(state, language)
     if topic == "reset_help":
         return _localized(
             language,
@@ -5448,26 +6184,22 @@ def _opening_consultation_response(state: AgentGraphState, action: dict[str, Any
                 "You can jump, go back, or change any group; after that I recompute the next missing item instead of restarting."
             ),
         )
+    # A single turn often asks about the modes AND preflight/smoke together. The
+    # resolver collapses that into one topic, so whichever of the two it picks,
+    # answer the other half too when the user's turn explicitly names it — instead
+    # of silently dropping the second question.
+    asks_modes = bool(re.search(r"fake[- ]?node|real[- ]?node|sync[- ]?observe|模式", text, re.IGNORECASE))
+    asks_preflight_smoke = bool(re.search(r"preflight|smoke|预检|冒烟", text, re.IGNORECASE))
+    if topic in {"execution_preflight_smoke", "preflight", "smoke", "preflight_smoke"}:
+        answer = _preflight_smoke_explanation(language)
+        if asks_modes:
+            answer = _mode_comparison_explanation(language) + "\n\n" + answer
+        return answer
     if topic == "mode_comparison":
-        return _localized(
-            language,
-            (
-                "三种模式的区别：\n"
-                "1. fake-node：使用预录 fixtures 验证框架闭环，不测真实节点性能。\n"
-                "2. real-node：对真实 LOCAL_RPC_URL 做 RPC 压测，需要真实 endpoint 和节点进程信息。\n"
-                "3. sync-observe：观察真实节点追块/同步状态、CPU、内存、磁盘、网络和可用的 MGas/s 指标，不走 vegeta 压测。\n"
-                "所以 fake-node 的作用是低风险验证 Agent、配置、fixtures、执行、日志和 HTML 报告是否能闭环；它不能回答真实节点 QPS、同步速度或硬件瓶颈。\n"
-                "如果目标是“能支持多少 QPS、瓶颈在哪里”，应使用 real-node benchmark；如果目标是“节点追块/import 过程表现”，才使用 sync-observe。"
-            ),
-            (
-                "Mode differences:\n"
-                "1. fake-node: uses recorded fixtures to validate the framework loop; it does not measure real node performance.\n"
-                "2. real-node: runs RPC load tests against a real LOCAL_RPC_URL and needs endpoint/process details.\n"
-                "3. sync-observe: observes real node sync progress, CPU, memory, disk, network, and available MGas/s metrics; it does not run vegeta load tests.\n"
-                "So fake-node is useful for low-risk validation of the Agent, config, fixtures, execution, logs, and HTML report loop; it cannot answer real-node QPS, sync speed, or hardware bottlenecks.\n"
-                "If the goal is QPS capacity or bottleneck discovery, use real-node benchmark; if the goal is sync/import observation, use sync-observe."
-            ),
-        )
+        answer = _mode_comparison_explanation(language)
+        if asks_preflight_smoke:
+            answer = answer + "\n\n" + _preflight_smoke_explanation(language)
+        return answer
     if topic == "performance_benchmark_guidance":
         return _localized(
             language,
@@ -5501,6 +6233,13 @@ def _opening_consultation_response(state: AgentGraphState, action: dict[str, Any
     if topic == "recommend_start":
         return _opening_consultation_response(state, {**action, "topic": "recommendation"}, text)
     if topic == "extension":
+        # "how do I add a custom RPC method for bsc" names a chain in `subject`;
+        # answer with that chain's concrete custom-RPC how-to when it is known.
+        extension_chain = _known_chain_from_subject(action)
+        if extension_chain:
+            howto = _chain_custom_rpc_howto(state, extension_chain)
+            if howto:
+                return howto
         return _localized(
             language,
             (
@@ -5517,6 +6256,9 @@ def _opening_consultation_response(state: AgentGraphState, action: dict[str, Any
             ),
         )
     if topic == "config_explanation":
+        field_explanation = _config_field_explanation(state, subject, language)
+        if field_explanation:
+            return field_explanation
         label = subject or _localized(language, "这个配置项", "this config item")
         if not subject and state.get("pending_question"):
             return format_current_context(state, language)
@@ -5646,6 +6388,94 @@ def _saved_evidence_analysis_response(language: str, evidence: str) -> str:
     )
 
 
+def _known_chain_from_subject(action: dict[str, Any]) -> str:
+    """Return the known chain the resolver named in `subject`, else "".
+
+    Chain identity comes from the resolver's typed `subject` field (a
+    chain-specific question is emitted as answer_opening_question with the chain
+    in `subject`) — not from a harness-side text scan. Returns "" when the
+    subject is absent or not a known chain.
+    """
+
+    subject = _strip_scalar(str(action.get("subject") or ""))
+    if not subject:
+        return ""
+    return canonicalize_chain_scalar(subject, known_chains=set(repo_chain_names())) or ""
+
+
+def _recommended_opening_setup(state: AgentGraphState, text: str) -> dict[str, str]:
+    """The setup a recommendation proposes: fake-node on a known chain (a chain
+    named in the turn, else solana)."""
+
+    known = set(repo_chain_names())
+    lowered = str(text or "").lower()
+    chain = ""
+    for candidate in sorted(known, key=len, reverse=True):
+        if re.search(rf"(?<![a-z0-9_-]){re.escape(candidate)}(?![a-z0-9_-])", lowered):
+            chain = candidate
+            break
+    return {"chain": chain or "solana", "target_mode": "fake-node"}
+
+
+def _chain_custom_rpc_howto(state: AgentGraphState, chain: str) -> str:
+    """Answer "how do I add a custom RPC method for chain X" concretely."""
+
+    language = state.get("language", "en")
+    defaults = ", ".join(default_workload(chain).get("methods") or []) or "<none>"
+    return _localized(
+        language,
+        (
+            f"给已支持链 `{chain}` 添加自定义 RPC method 的步骤：\n"
+            f"1. 回复“测试 {chain}”开始配置，在 workload 步骤选择“添加自定义 RPC method”。\n"
+            f"2. 提供该 method 可访问的 endpoint，我会先探测验证（仅作证据，不自动作为最终压测 endpoint）。\n"
+            f"3. 提供 method 名称和 schema 证据：params JSON、curl/request、response 示例或官方文档片段。\n"
+            f"4. 我抽取并校验 schema，确认用 single 还是 mixed 及权重，然后进入 smoke。\n"
+            f"模板默认 method（{defaults}）可以保留追加，也可以替换。"
+        ),
+        (
+            f"How to add a custom RPC method for supported chain `{chain}`:\n"
+            f"1. Reply \"benchmark {chain}\" to start, then choose \"add custom RPC method\" in the workload step.\n"
+            f"2. Provide a reachable endpoint for the method — I probe it as evidence only (not the final benchmark endpoint).\n"
+            f"3. Provide the method name and schema evidence: params JSON, curl/request, response sample, or official docs.\n"
+            f"4. I extract and validate the schema, confirm single vs mixed and weights, then run smoke.\n"
+            f"Template default methods ({defaults}) can be kept and appended, or replaced."
+        ),
+    )
+
+
+def _chain_workload_summary(state: AgentGraphState, chain: str) -> str | None:
+    """Answer "what RPC workload/methods does chain X have" from the template."""
+
+    language = state.get("language", "en")
+    workload = default_workload(chain)
+    if not workload.get("exists"):
+        return None
+    single = str(workload.get("single") or "<none>")
+    mixed_rows = workload.get("mixed_weighted") or []
+    mixed = ", ".join(
+        f"{row.get('method')}={row.get('weight')}" for row in mixed_rows if row.get("method")
+    ) or "<none>"
+    methods = workload.get("methods") or []
+    methods_str = ", ".join(methods) if methods else "<none>"
+    return _localized(
+        language,
+        (
+            f"链 `{chain}` 的默认 RPC workload：\n"
+            f"- single 模式默认 method：{single}\n"
+            f"- mixed 模式默认权重：{mixed}\n"
+            f"- 模板包含的 RPC methods：{methods_str}\n"
+            f"你可以直接说“测试 {chain}”开始配置，也可以在 workload 阶段添加自定义 RPC method 或调整权重。"
+        ),
+        (
+            f"Default RPC workload for `{chain}`:\n"
+            f"- single default method: {single}\n"
+            f"- mixed default weights: {mixed}\n"
+            f"- RPC methods in the template: {methods_str}\n"
+            f"Say \"benchmark {chain}\" to start, or add a custom RPC method / adjust weights during the workload step."
+        ),
+    )
+
+
 def _framework_capability_summary(state: AgentGraphState) -> str:
     framework = state.get("framework_summary") or {}
     language = state.get("language", "en")
@@ -5687,13 +6517,17 @@ def _framework_capability_summary(state: AgentGraphState) -> str:
 
 def _report_artifact_entry_response(state: AgentGraphState) -> str:
     language = state.get("language", "en")
-    job_id = str(state.get("latest_job_id") or "").strip()
+    # The most recent job on disk is authoritative for "analyze the latest job".
+    # The injected `latest_job_id` context is a startup hint that goes stale once a
+    # new job is submitted mid-session, so it is only a fallback.
+    job_id = ""
+    try:
+        jobs = list_jobs(limit=1)
+        job_id = str(jobs[0].get("job_id") or "") if jobs else ""
+    except Exception:
+        job_id = ""
     if not job_id:
-        try:
-            jobs = list_jobs(limit=1)
-            job_id = str(jobs[0].get("job_id") or "") if jobs else ""
-        except Exception:
-            job_id = ""
+        job_id = str(state.get("latest_job_id") or "").strip()
     if not job_id:
         return _localized(
             language,

@@ -4,12 +4,18 @@ from __future__ import annotations
 
 from typing import Any
 
+try:
+    from . import question_prompts
+except ImportError:  # script execution with agent/ on sys.path
+    from planners import question_prompts
+
 
 def required_questions(plan: dict[str, Any]) -> list[dict[str, Any]]:
     questions: list[dict[str, Any]] = []
     if _is_sync_observe_plan(plan):
         return _dedupe_questions(_sync_observe_questions(plan))
 
+    target_mode = _target_mode_from_plan(plan)
     for item in plan.get("required_inputs", []):
         if item in _SPECIALIZED_REQUIRED_QUESTIONS:
             continue
@@ -17,7 +23,7 @@ def required_questions(plan: dict[str, Any]) -> list[dict[str, Any]]:
             "id": item,
             "category": "required_input",
             "severity": "blocker",
-            "prompt": _required_prompt(item),
+            "prompt": _required_prompt(item, target_mode=target_mode),
         }))
 
     confidence = plan.get("confidence", {})
@@ -81,15 +87,8 @@ def required_questions(plan: dict[str, Any]) -> list[dict[str, Any]]:
             "id": "benchmark_mode_confirmed",
             "category": "execution",
             "severity": "blocker",
-            "prompt": (
-                "Choose benchmark mode. quick is a short smoke/sanity run, standard is the normal "
-                "performance benchmark, and intensive searches for bottlenecks and can run much longer."
-            ),
-            "candidates": [
-                {"id": "quick", "description": "Short validation run; safest first step."},
-                {"id": "standard", "description": "Normal benchmark run using standard QPS settings."},
-                {"id": "intensive", "description": "Long bottleneck discovery run with auto-stop when configured."},
-            ],
+            "prompt": question_prompts.benchmark_mode_prompt(),
+            "candidates": list(question_prompts.BENCHMARK_MODE_CANDIDATES),
             "current_value": plan.get("benchmark_mode") or plan.get("strategy"),
         }))
 
@@ -99,9 +98,9 @@ def required_questions(plan: dict[str, Any]) -> list[dict[str, Any]]:
             "id": "qps_profile_confirmed",
             "category": "execution",
             "severity": "blocker",
-            "prompt": (
-                "Show the selected mode's default QPS profile with parameter meanings, then ask whether "
-                "to keep the defaults. Only if the user wants changes, ask which item to adjust."
+            "prompt": question_prompts.qps_profile_prompt(
+                str(plan.get("benchmark_mode") or ""),
+                fake_node=plan.get("use_fake_node") is True,
             ),
             "interaction_mode": "accept_defaults_or_adjust_item",
             "accepted_reply_examples": ["keep defaults", "use defaults", "yes"],
@@ -132,10 +131,7 @@ def required_questions(plan: dict[str, Any]) -> list[dict[str, Any]]:
             "id": "observability_choice_confirmed",
             "category": "observability",
             "severity": "confirm",
-            "prompt": (
-                "Choose observability mode: disabled, local Prometheus/Grafana, or exporter-only "
-                "for an existing Prometheus/Grafana environment."
-            ),
+            "prompt": question_prompts.observability_mode_prompt(),
             "candidates": [
                 {"id": "disabled", "description": "Do not start the optional observability stack."},
                 {
@@ -153,12 +149,18 @@ def required_questions(plan: dict[str, Any]) -> list[dict[str, Any]]:
     checklist = plan.get("configuration_checklist", {})
     for item in checklist.get("environment", []):
         if item.get("id") not in confirmed:
+            item_id = item["id"]
+            prompt = (
+                question_prompts.text_for(item_id)
+                if item_id in question_prompts.FIELD_PROMPTS
+                else f"Confirm {item['description']}"
+            )
             question = {
-                "id": item["id"],
+                "id": item_id,
                 "category": "environment",
                 "severity": "confirm",
-                "prompt": f"Confirm {item['description']}",
-                "current_value": _current_value(plan, item["id"]),
+                "prompt": prompt,
+                "current_value": _current_value(plan, item_id),
             }
             if item["id"] == "deployment_platform":
                 question["candidates"] = [
@@ -178,10 +180,7 @@ def required_questions(plan: dict[str, Any]) -> list[dict[str, Any]]:
             "id": "has_accounts_device",
             "category": "storage",
             "severity": "confirm",
-            "prompt": (
-                "Does this node use a second accounts/state disk? If yes, confirm ACCOUNTS_DEVICE "
-                "from the lsblk inventory and provide ACCOUNTS_VOL_* baselines."
-            ),
+            "prompt": question_prompts.text_for("has_accounts_device"),
             "current_value": _current_value(plan, "accounts_device"),
             "candidates": disk_candidates,
         }))
@@ -198,7 +197,7 @@ def required_questions(plan: dict[str, Any]) -> list[dict[str, Any]]:
     if chain_requirements.get("exists"):
         workload_menu_needed = _workload_menu_required(confirmed)
         if workload_menu_needed:
-            questions.append(_workload_customization_question(chain_requirements))
+            questions.append(_workload_customization_question(chain_requirements, plan))
         sample_vars = chain_requirements.get("runtime_sample_variables", [])
         if sample_vars and not workload_menu_needed and "rpc_param_samples_confirmation" not in confirmed:
             questions.append(_with_manual_input({
@@ -260,29 +259,19 @@ def required_questions(plan: dict[str, Any]) -> list[dict[str, Any]]:
     return _dedupe_questions(questions)
 
 
-def _required_prompt(item: str) -> str:
-    prompts = {
-        "chain": "Which blockchain node should be tested?",
-        "local_rpc_url": "Provide the local RPC endpoint, or choose fake-node for closed-loop testing.",
-        "use_fake_node": "Choose fake-node closed-loop testing or real-node testing.",
-        "blockchain_process_names": "Provide blockchain node process names or command-line fragments for resource attribution.",
-        "ledger_device": "Confirm the ledger/data disk device used by the node.",
-        "data_vol_type": "Provide the ledger/data disk type.",
-        "data_vol_size": "Provide the ledger/data disk size in GiB.",
-        "data_vol_max_iops": "Provide the provisioned ledger/data disk IOPS baseline.",
-        "data_vol_max_throughput": "Provide the provisioned ledger/data disk throughput baseline in MiB/s.",
-        "network_interface": "Confirm the network interface used by the node.",
-        "network_max_bandwidth_gbps": "Provide the instance or pod network bandwidth baseline in Gbps.",
-        "rpc_mode": "Choose single or mixed RPC workload mode.",
-        "benchmark_mode_confirmed": "Choose quick, standard, or intensive benchmark mode.",
-        "qps_profile_confirmed": "Confirm INITIAL_QPS, MAX_QPS, QPS_STEP, and DURATION for the selected mode.",
-        "observability_choice_confirmed": "Choose disabled, local Prometheus/Grafana, or exporter-only observability mode.",
-        "chain_template_reviewed": "Review selected chain template endpoints, TARGET_* sample variables, and default workload.",
-        "sync_observe_stop_condition": "Choose how sync-observe should stop: run until stopped, fixed duration, or until synced.",
-        "node_prometheus_metrics_url": "Provide the node Prometheus metrics endpoint if available, or leave it unset.",
-        "node_process_identity": "Provide the node process PID or command-line fragments for CPU/thread attribution.",
-    }
-    return prompts.get(item, f"Provide required value: {item}")
+def _target_mode_from_plan(plan: dict[str, Any]) -> str:
+    if _is_sync_observe_plan(plan):
+        return "sync-observe"
+    use_fake_node = plan.get("use_fake_node")
+    if use_fake_node is True:
+        return "fake-node"
+    if use_fake_node is False:
+        return "real-node"
+    return ""
+
+
+def _required_prompt(item: str, *, target_mode: str = "") -> str:
+    return question_prompts.text_for(item, target_mode=target_mode)
 
 
 def _is_sync_observe_plan(plan: dict[str, Any]) -> bool:
@@ -356,15 +345,14 @@ def _workload_menu_required(confirmed: set[str]) -> bool:
     return not _WORKLOAD_MENU_CONFIRMATIONS.issubset(confirmed)
 
 
-def _workload_customization_question(chain_requirements: dict[str, Any]) -> dict[str, Any]:
+def _workload_customization_question(chain_requirements: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+    chain = str(plan.get("chain") or chain_requirements.get("chain") or "selected chain").strip() or "selected chain"
+    rpc_mode = str(plan.get("rpc_mode") or "selected").strip().lower() or "selected"
     return _with_manual_input({
         "id": "workload_customization_choice",
         "category": "workload",
         "severity": "blocker",
-        "prompt": (
-            "Review the selected chain template defaults and choose one workload path: "
-            "continue with defaults, add a custom RPC method, adjust mixed weights, or change chain/mode."
-        ),
+        "prompt": question_prompts.workload_customization_prompt(chain, rpc_mode),
         "runtime_endpoint_variables": chain_requirements.get("runtime_endpoint_variables", []),
         "runtime_sample_variables": chain_requirements.get("runtime_sample_variables", []),
         "single": chain_requirements.get("single_method"),

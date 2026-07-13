@@ -102,7 +102,13 @@ class JobCommandHandler:
         )
 
     def _logs(self, job_id: str) -> None:
-        payload = tail_job_log(job_id, lines=80)
+        try:
+            payload = tail_job_log(job_id, lines=80)
+        except Exception:
+            # Mirror `_follow_logs`/`_status`: a missing job id must produce a
+            # clean "job not found" message, not a raw FileNotFoundError string.
+            self.io.agent(self.state.language, t(self.state.language, "job_not_found", job_id=job_id))
+            return
         self.io.agent(
             self.state.language,
             t(self.state.language, "log_path", job_id=job_id, path=payload.get("log_file", "")),

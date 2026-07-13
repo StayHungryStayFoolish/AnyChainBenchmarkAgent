@@ -90,6 +90,10 @@ ADK_REGISTRY_FORBIDDEN = [
     "get_workflow_state_tools",
 ]
 
+HARNESS_FORBIDDEN_MARKERS = [
+    "adk_app",
+]
+
 ADK_DIAGNOSTIC_FILES = {
     "agent/adk_app/runtime.py": [
         "AnyChainGraphRuntime",
@@ -205,6 +209,13 @@ def main() -> int:
         for needle in ADK_REGISTRY_FORBIDDEN:
             if needle in text:
                 failures.append(f"ADK tool registry must not expose retired workflow-state tools marker {needle!r}: {adk_registry}")
+
+    harness_dir = root / "agent" / "harness"
+    for path in sorted(harness_dir.rglob("*.py")):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for needle in HARNESS_FORBIDDEN_MARKERS:
+            if needle in text:
+                failures.append(f"Harness must not depend on the ADK bridge layer, found {needle!r}: {path}")
 
     for rel, needles in ADK_DIAGNOSTIC_FILES.items():
         path = root / rel

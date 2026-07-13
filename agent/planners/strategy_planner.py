@@ -14,11 +14,13 @@ try:
     from .config_checklist import build_configuration_checklist, missing_required_from_checklist
     from .risk import score_plan_risk
     from .config_questions import required_questions
+    from ..knowledge.entry_contract import field_specs_for
 except ImportError:  # script execution with agent/ on sys.path
     from planners.chain_template_requirements import inspect_chain_template
     from planners.config_checklist import build_configuration_checklist, missing_required_from_checklist
     from planners.risk import score_plan_risk
     from planners.config_questions import required_questions
+    from knowledge.entry_contract import field_specs_for
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -387,34 +389,55 @@ def _chain_config_override(chain: str, request: dict[str, Any]) -> dict[str, Any
 
 
 def _ordered_required_inputs(items: set[str]) -> list[str]:
-    priority = [
-        "chain",
-        "use_fake_node",
-        "rpc_mode",
-        "benchmark_mode_confirmed",
-        "qps_profile_confirmed",
-        "observability_choice_confirmed",
-        "chain_template_reviewed",
-        "local_rpc_url",
-        "mainnet_rpc_url_reviewed",
-        "blockchain_process_names",
-        "ledger_device",
-        "has_accounts_device",
-        "data_vol_type",
-        "data_vol_size",
-        "data_vol_max_iops",
-        "data_vol_max_throughput",
-        "accounts_device",
-        "accounts_vol_type",
-        "accounts_vol_size",
-        "accounts_vol_max_iops",
-        "accounts_vol_max_throughput",
-        "network_interface",
-        "network_max_bandwidth_gbps",
-        "rpc_workload_confirmed",
-        "mixed_weights_confirmed",
-        "rpc_param_samples_confirmed",
-    ]
-    known = [item for item in priority if item in items]
-    unknown = sorted(item for item in items if item not in priority)
+    known = [item for item in _REQUIRED_INPUT_PRIORITY if item in items]
+    unknown = sorted(item for item in items if item not in _REQUIRED_INPUT_PRIORITY)
     return known + unknown
+
+
+# The order questions are asked in for a real-node plan. Kept as an explicit
+# ordered list (rather than derived from `entry_contract.field_specs_for`,
+# whose grouping order differs) because reordering this list is a live
+# behavior change, not just a catalog-membership one. `has_accounts_device`
+# and `mixed_weights_confirmed` are not modeled as `RuntimeField`s (they are
+# derived confirmation flags, not entrypoint values), hence the explicit
+# exception set below. The check below only catches a key being REMOVED or
+# renamed out of `entry_contract.py`'s canonical catalog (a stale reference);
+# it cannot catch a key being ADDED to the catalog and never added here, since
+# that still satisfies the subset check — such a field would silently fall
+# into `_ordered_required_inputs`'s alphabetical "unknown" tail instead of a
+# deliberate position. `cloud_region`/`cloud_zone`/`machine_type` are a known,
+# pre-existing case of this: they are in the canonical catalog for real_node
+# but were never part of this priority list.
+_REQUIRED_INPUT_PRIORITY = [
+    "chain",
+    "use_fake_node",
+    "rpc_mode",
+    "benchmark_mode_confirmed",
+    "qps_profile_confirmed",
+    "observability_choice_confirmed",
+    "chain_template_reviewed",
+    "local_rpc_url",
+    "mainnet_rpc_url_reviewed",
+    "blockchain_process_names",
+    "ledger_device",
+    "has_accounts_device",
+    "data_vol_type",
+    "data_vol_size",
+    "data_vol_max_iops",
+    "data_vol_max_throughput",
+    "accounts_device",
+    "accounts_vol_type",
+    "accounts_vol_size",
+    "accounts_vol_max_iops",
+    "accounts_vol_max_throughput",
+    "network_interface",
+    "network_max_bandwidth_gbps",
+    "rpc_workload_confirmed",
+    "mixed_weights_confirmed",
+    "rpc_param_samples_confirmed",
+]
+_known_real_node_keys = {field.key for field in field_specs_for("real_node")} | {"has_accounts_device", "mixed_weights_confirmed"}
+if not set(_REQUIRED_INPUT_PRIORITY) <= _known_real_node_keys:
+    # Not an `assert` on purpose: `python -O` strips asserts, and this
+    # invariant must hold even in optimized runs.
+    raise RuntimeError("_REQUIRED_INPUT_PRIORITY references a key removed from entry_contract.field_specs_for('real_node')")

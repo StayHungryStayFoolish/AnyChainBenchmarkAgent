@@ -26,7 +26,10 @@ except ImportError:  # script execution with agent/ on sys.path
     from validators.rpc_workload import default_workload as _default_workload
     from validators.rpc_workload import validate_rpc_workload as _validate_rpc_workload
 
-from .read_only import _tool_result
+try:
+    from ...runners.tool_result import tool_result as _tool_result
+except ImportError:  # script execution with agent/ on sys.path
+    from runners.tool_result import tool_result as _tool_result
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 FIXTURE_COVERAGE = REPO_ROOT / "tools" / "fake-node" / "check_fixture_coverage.py"

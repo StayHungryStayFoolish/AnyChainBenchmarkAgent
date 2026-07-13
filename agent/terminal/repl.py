@@ -34,6 +34,7 @@ from harness.graph import AnyChainGraphRuntime  # noqa: E402
 from knowledge.framework_capabilities import load_framework_capabilities  # noqa: E402
 from knowledge.framework_context import load_framework_context  # noqa: E402
 from llm.config import load_llm_config  # noqa: E402
+from runners.job_manager import list_jobs  # noqa: E402
 from terminal.io import OutputOnlyIO, TerminalIO  # noqa: E402
 from terminal.job_commands import JobCommandHandler  # noqa: E402
 from terminal.language import detect_language, t  # noqa: E402
@@ -206,12 +207,18 @@ class AnyChainTerminal:
             self.io.agent(self.state.language, t(self.state.language, "adk_missing_hint"))
             self.io.agent(self.state.language, t(self.state.language, "agent_runtime_offer"))
         else:
-            self.state.current_question_id = ""
-            self.state.pending_missing_dependencies = []
+            # `_startup_doctor` may already have set an "install_dependencies"
+            # offer (missing vegeta etc.). Do not clobber it here, or the "[Y/n]"
+            # prompt becomes dead — the user's "y" would never reach
+            # `_install_dependencies` and would fall through to the harness.
+            deps_offer_pending = self.state.current_question_id == "install_dependencies"
+            if not deps_offer_pending:
+                self.state.current_question_id = ""
+                self.state.pending_missing_dependencies = []
             self._ensure_harness()
             if self.fresh_session:
                 self._ensure_harness().reset(language=self.state.language)
-            else:
+            elif not deps_offer_pending:
                 self._offer_harness_resume_if_needed()
         self.io.agent(self.state.language, t(self.state.language, "help"))
 
@@ -268,6 +275,16 @@ class AnyChainTerminal:
             return
         for message in messages:
             self.io.agent(self.state.language, str(message))
+
+        # A turn may have submitted a new job (fake-node smoke, benchmark). Refresh
+        # the latest-job hint from disk so "analyze the latest job" and the injected
+        # context point at the just-submitted job, not the startup-detected one.
+        try:
+            recent = list_jobs(limit=1)
+            if recent:
+                self.state.latest_job_id = str(recent[0].get("job_id") or "") or self.state.latest_job_id
+        except Exception:
+            pass
 
     def _handle_pending_confirmation(self, lowered: str) -> bool:
         if self.state.current_question_id == "resume_harness_session":

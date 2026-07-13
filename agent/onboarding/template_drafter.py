@@ -12,6 +12,13 @@ try:
 except ImportError:  # script execution with agent/ on sys.path
     from onboarding.families import SUPPORTED_FAMILIES
 
+# The supported families partition into two proxy-transport classes. Define the
+# REST-transport members once and derive the JSON-RPC-transport members as the
+# complement of the canonical list (audit Finding C3), so a newly added family
+# is classified as JSON-RPC-transport unless it is explicitly listed here.
+REST_TRANSPORT_FAMILIES = {"rest", "hedera_dual"}
+JSONRPC_TRANSPORT_FAMILIES = set(SUPPORTED_FAMILIES) - REST_TRANSPORT_FAMILIES
+
 
 def draft_chain_template(
     chain: str,
@@ -100,7 +107,7 @@ def _default_params() -> dict[str, str]:
 
 
 def _proxy_extraction(adapter_family: str) -> dict[str, Any]:
-    if adapter_family in {"jsonrpc", "bitcoin_jsonrpc", "substrate", "tendermint"}:
+    if adapter_family in JSONRPC_TRANSPORT_FAMILIES:
         return {
             "extractors": [
                 {
@@ -127,7 +134,7 @@ def _proxy_extraction(adapter_family: str) -> dict[str, Any]:
 
 
 def _transport(adapter_family: str) -> str:
-    if adapter_family in {"rest", "hedera_dual"}:
+    if adapter_family in REST_TRANSPORT_FAMILIES:
         return "rest"
     return "jsonrpc_list"
 

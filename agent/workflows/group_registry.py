@@ -1,9 +1,14 @@
-"""Canonical group registry for the AnyChain Agent workflow.
+"""Group metadata for `agent/validators/config_contract.py`'s preflight path.
 
-This module is intentionally pure data plus small lookup helpers. It is the
-source of truth for group order, field ownership, and group question ids used
-by the LangGraph Harness. It does not parse user text, mutate workflow state,
-or render terminal prompts.
+This module is intentionally pure data plus small lookup helpers. It does not
+parse user text, mutate workflow state, or render terminal prompts.
+
+It is NOT consulted by the live conversational routing path
+(`agent/harness/groups.py` / `agent/harness/routing.py`); that path uses
+`agent.harness.state.DEFAULT_GROUP_ORDER`, the actual single source of truth
+for group order (architecture audit Finding A). Keep `GROUP_ORDER` below
+consistent with `DEFAULT_GROUP_ORDER` so this file's metadata does not
+describe a group set that no longer matches reality.
 """
 
 from __future__ import annotations
@@ -59,11 +64,6 @@ GROUPS: tuple[WorkflowGroup, ...] = (
             "machine_type",
         ),
         questions=("cloud_region", "cloud_zone", "machine_type"),
-        product_node="environment_config",
-    ),
-    WorkflowGroup(
-        name="hardware_discovery",
-        fields=("cpu", "memory", "disk_inventory", "network_inventory"),
         product_node="environment_config",
     ),
     WorkflowGroup(
@@ -132,8 +132,10 @@ GROUPS: tuple[WorkflowGroup, ...] = (
             "custom_rpc_method",
             "custom_rpc_schema_evidence",
             "custom_rpc_schema_confirm",
+            "custom_rpc_adapter_family_confirm",
             "custom_rpc_continue",
             "custom_rpc_scope",
+            "custom_rpc_single_method",
             "custom_rpc_weights",
             "new_chain_endpoint",
             "new_chain_method",
@@ -149,6 +151,15 @@ GROUPS: tuple[WorkflowGroup, ...] = (
     WorkflowGroup(
         name="chain_auxiliary_endpoints",
         fields=(
+            "CHAIN_REST_URL",
+            "CHAIN_INDEXER_URL",
+            "CHAIN_SIDECAR_URL",
+            "CHAIN_EVM_RPC_URL",
+            "CHAIN_JSON_RPC_URL",
+            "CHAIN_MIRROR_URL",
+            "RPC_API_KEY",
+        ),
+        questions=(
             "CHAIN_REST_URL",
             "CHAIN_INDEXER_URL",
             "CHAIN_SIDECAR_URL",
@@ -211,12 +222,24 @@ GROUPS: tuple[WorkflowGroup, ...] = (
     WorkflowGroup(
         name="advanced_tuning",
         fields=("advanced_tuning",),
+        questions=(
+            "advanced_tuning_confirm",
+            "advanced_tuning_adjust_field",
+            "advanced_tuning_adjust_value",
+        ),
         product_node="advanced_threshold_review",
     ),
     WorkflowGroup(
         name="preflight_smoke_execution",
         fields=("preflight_result", "smoke_result", "approval"),
+        questions=("preflight_smoke_confirm",),
         product_node="preflight_smoke",
+        category="execution",
+    ),
+    WorkflowGroup(
+        name="job_monitoring",
+        fields=("job", "latest_job_id"),
+        product_node="job_monitoring",
         category="execution",
     ),
     WorkflowGroup(
@@ -260,8 +283,10 @@ SETUP_QUESTION_IDS: frozenset[str] = frozenset(
         "custom_rpc_method",
         "custom_rpc_schema_evidence",
         "custom_rpc_schema_confirm",
+        "custom_rpc_adapter_family_confirm",
         "custom_rpc_continue",
         "custom_rpc_scope",
+        "custom_rpc_single_method",
         "custom_rpc_weights",
         "new_chain_endpoint",
         "new_chain_method",
@@ -366,8 +391,10 @@ def group_for_question_id(question_id: str) -> str:
         "custom_rpc_method": "endpoint_process",
         "custom_rpc_schema_evidence": "endpoint_process",
         "custom_rpc_schema_confirm": "endpoint_process",
+        "custom_rpc_adapter_family_confirm": "endpoint_process",
         "custom_rpc_continue": "endpoint_process",
         "custom_rpc_scope": "endpoint_process",
+        "custom_rpc_single_method": "endpoint_process",
         "custom_rpc_weights": "endpoint_process",
         "benchmark_profile_choice": "qps_profile",
         "benchmark_profile_confirm": "qps_profile",

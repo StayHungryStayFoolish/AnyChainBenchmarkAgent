@@ -44,6 +44,13 @@ except ImportError:  # script execution with agent/ on sys.path
     from knowledge.loader import load_knowledge_provider, provider_status
     from runners.job_manager import get_job, list_jobs, resume_job, tail_job_log as _tail_job_log
 
+try:
+    from ...runners.benchmark_pipeline import _job_terminal_commands, _job_user_next_actions
+    from ...runners.tool_result import tool_result as _tool_result
+except ImportError:  # script execution with agent/ on sys.path
+    from runners.benchmark_pipeline import _job_terminal_commands, _job_user_next_actions
+    from runners.tool_result import tool_result as _tool_result
+
 
 def discover_environment() -> dict[str, Any]:
     """Inspect the local host without changing it.
@@ -347,23 +354,6 @@ def get_read_only_tools() -> list:
     ]
 
 
-def _tool_result(
-    data: dict[str, Any],
-    status: str = "ok",
-    evidence_paths: list[str] | None = None,
-    warnings: list[str] | None = None,
-    next_actions: list[str] | None = None,
-) -> dict[str, Any]:
-    return {
-        "status": status,
-        "data": data,
-        "evidence_paths": [path for path in (evidence_paths or []) if path],
-        "warnings": [warning for warning in (warnings or []) if warning],
-        "next_actions": next_actions or [],
-        "requires_user_confirmation": False,
-    }
-
-
 def _field_payload(field: Any) -> dict[str, Any]:
     return {
         "key": field.key,
@@ -393,25 +383,3 @@ def _repo_root() -> str:
     from pathlib import Path
 
     return str(Path(__file__).resolve().parents[3])
-
-
-def _job_terminal_commands(job: dict[str, Any]) -> dict[str, str]:
-    job_id = str(job.get("job_id", "") or "").strip()
-    if not job_id:
-        return {"status": "status", "logs": "logs", "follow": "follow", "analyze": "analyze latest job"}
-    return {
-        "status": f"status {job_id}",
-        "logs": f"logs {job_id}",
-        "follow": f"follow {job_id}",
-        "analyze": "analyze latest job",
-    }
-
-
-def _job_user_next_actions(job: dict[str, Any]) -> list[str]:
-    commands = _job_terminal_commands(job)
-    return [
-        f"check status with `{commands['status']}`",
-        f"show recent logs with `{commands['logs']}`",
-        f"stream logs with `{commands['follow']}`",
-        f"after completion, ask `{commands['analyze']}`",
-    ]

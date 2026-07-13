@@ -14,7 +14,10 @@ except ImportError:  # script execution with agent/ on sys.path
     from llm.config import load_llm_config
     from llm.google_auth import credential_plan
 
-from .read_only import _tool_result
+try:
+    from ...runners.tool_result import tool_result as _tool_result
+except ImportError:  # script execution with agent/ on sys.path
+    from runners.tool_result import tool_result as _tool_result
 
 
 def inspect_llm_auth() -> dict[str, Any]:

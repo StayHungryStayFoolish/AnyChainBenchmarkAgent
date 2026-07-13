@@ -61,6 +61,7 @@ class AgentGraphState(TypedDict, total=False):
     fixture_evidence: dict[str, Any]
     sync_observe: dict[str, Any]
     observability: dict[str, Any]
+    advanced_tuning: dict[str, Any]
     secondary_handoff: dict[str, Any]
     preflight: dict[str, Any]
     smoke: dict[str, Any]
@@ -72,16 +73,26 @@ class AgentGraphState(TypedDict, total=False):
     audit_events: list[dict[str, Any]]
 
 
+RESET_PRESERVED_KEYS = (
+    "discovery",
+    "framework_summary",
+    "web_research",
+    "latest_job_id",
+    "job",
+    "report_context",
+)
+
+
 DEFAULT_GROUP_ORDER = [
     "opening",
     "target_mode",
     "chain_identity",
     "provider_deployment",
-    "hardware_discovery",
     "ledger_disk",
     "accounts_disk",
     "network",
     "endpoint_process",
+    "chain_auxiliary_endpoints",
     "workload_rpc",
     "target_samples_fixtures",
     "qps_profile",
@@ -93,6 +104,16 @@ DEFAULT_GROUP_ORDER = [
     "error_evidence_analysis",
     "report_artifact_analysis",
 ]
+"""Canonical group order/membership for the AnyChain Agent Harness.
+
+This is the single source of truth (architecture audit Finding A).
+`agent/harness/intent.py`'s `ALLOWED_GROUPS` imports this list directly
+instead of retyping it, and `agent/workflows/group_registry.py` must keep
+its `GROUP_ORDER` consistent with this list. `hardware_discovery` was
+removed: it was declared here but never implemented in `groups.py` and had
+no product specification anywhere in the docs (unlike `advanced_tuning` and
+`chain_auxiliary_endpoints`, which are documented in
+`docs/en/anychain-agent-ai-work-gate.md` and are now implemented)."""
 
 
 def _utc_timestamp() -> str:
@@ -156,6 +177,7 @@ def new_state(thread_id: str, language: str = "en", session_purpose: str = "user
         "fixture_evidence": {},
         "sync_observe": {},
         "observability": {},
+        "advanced_tuning": {},
         "secondary_handoff": {},
         "preflight": {},
         "smoke": {},

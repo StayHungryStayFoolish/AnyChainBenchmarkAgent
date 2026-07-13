@@ -11,11 +11,17 @@ if str(AGENT_ROOT) not in sys.path:
     sys.path.insert(0, str(AGENT_ROOT))
 
 try:
-    from ...adk_app.tools.actions import run_fake_node_smoke_benchmark, submit_benchmark_job
-    from ...adk_app.tools.planning import prepare_benchmark_run
+    from ...runners.benchmark_pipeline import (
+        prepare_benchmark_run,
+        run_fake_node_smoke_benchmark,
+        submit_benchmark_job,
+    )
 except ImportError:  # script execution with agent/ on sys.path
-    from adk_app.tools.actions import run_fake_node_smoke_benchmark, submit_benchmark_job
-    from adk_app.tools.planning import prepare_benchmark_run
+    from runners.benchmark_pipeline import (
+        prepare_benchmark_run,
+        run_fake_node_smoke_benchmark,
+        submit_benchmark_job,
+    )
 
 from ..state import AgentGraphState
 
@@ -42,7 +48,7 @@ def run_approved_preflight_and_smoke(state: AgentGraphState) -> AgentGraphState:
             output["visible_response"] = [_blocked_message(prepared)]
             output["_stop_after_response"] = True
             return output
-        job_result = submit_benchmark_job(str(data.get("plan_file", "")), approved=True)
+        job_result = submit_benchmark_job(str(data.get("plan_file", "")))
         output["job"] = (job_result.get("data") or {}).get("job", {})
         output["visible_response"] = [_job_message(job_result, prefix="Sync-observe job submitted")]
         output["_stop_after_response"] = True
@@ -64,7 +70,7 @@ def run_approved_preflight_and_smoke(state: AgentGraphState) -> AgentGraphState:
         return output
 
     if output.get("target_mode") == "fake-node":
-        smoke = run_fake_node_smoke_benchmark(str(data.get("plan_file", "")), approved=True)
+        smoke = run_fake_node_smoke_benchmark(str(data.get("plan_file", "")))
         output["smoke"] = smoke
         output["job"] = (smoke.get("data") or {}).get("job", {})
         output["visible_response"] = [_smoke_message(smoke)]
@@ -120,6 +126,7 @@ def _prepare_kwargs(state: AgentGraphState) -> dict[str, Any]:
         "workflow_type": "sync_observe" if state.get("workflow_mode") == "sync_observe" else "rpc_benchmark",
         "sync_observe_stop_condition": str((state.get("sync_observe") or {}).get("stop_condition") or ""),
         "sync_observe_duration_seconds": _int_or_none((state.get("sync_observe") or {}).get("duration_seconds")),
+        "sync_observe_local_attribution": bool((state.get("sync_observe") or {}).get("local_attribution_available", True)),
         "mainnet_rpc_url_reviewed": bool(confirmed.get("MAINNET_RPC_URL_REVIEWED")),
         "confirmations": [
             "benchmark_mode_confirmed",
@@ -137,6 +144,12 @@ def _prepare_kwargs(state: AgentGraphState) -> dict[str, Any]:
             "sync_observe_stop_condition",
         ],
     }
+    # Mixed RPC mode requires weights to be confirmed. Both the default-workload
+    # path (template weights sum to 100) and the custom/adjusted path (validated
+    # to sum to 100) set `workload.confirmed`; without this the checklist blocks
+    # every mixed run on `mixed_weights_confirmed`.
+    if state.get("rpc_mode") == "mixed" and workload.get("confirmed"):
+        kwargs["confirmations"].append("mixed_weights_confirmed")
     process_names = str(confirmed.get("BLOCKCHAIN_PROCESS_NAMES") or "").strip()
     if process_names:
         kwargs["blockchain_process_names"] = [process_names]
@@ -179,8 +192,8 @@ def _blocked_message(prepared: dict[str, Any]) -> str:
 def _smoke_message(smoke: dict[str, Any]) -> str:
     data = smoke.get("data") or {}
     job = data.get("job") or {}
-    commands = data.get("terminal_commands") or []
-    command_text = "; ".join(str(item) for item in commands)
+    commands = data.get("terminal_commands") or {}
+    command_text = "; ".join(str(value) for value in commands.values())
     return (
         f"Fake-node smoke submitted: status={smoke.get('status')}, job_id={job.get('job_id', '<unknown>')}. "
         f"Use: {command_text or 'jobs/status/logs'}"
