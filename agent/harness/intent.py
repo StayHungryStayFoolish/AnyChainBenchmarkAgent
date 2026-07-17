@@ -415,13 +415,15 @@ def _reconstruct_missing_semantic_units(
                     content=(
                         "Reconstruct only the missing semantic_units for one immutable AnyChain action plan. "
                         "Return one JSON object only: {semantic_units:[{unit_id:string,clause_id:string,"
-                        "source_text:string,disposition:'action'|'unresolved',action_indexes:[integer],reason:string,"
+                        "source_text:string,disposition:'action'|'context'|'unresolved',action_indexes:[integer],reason:string,"
                         "optional scope_constraint:'consultation_only'}]}. Do not return actions. Do not add, remove, "
                         "reorder, rename, reinterpret, or repair any supplied action. Every clause must be covered by "
                         "ordered exact source_text anchors. When conjunctions make a lossless split uncertain, use "
                         "one full-clause unit mapped to every supplied action that preserves part of it. Keep structured "
-                        "clauses atomic. Use unresolved with no action indexes only when the immutable actions cannot "
-                        "preserve an explicit demand. Do not calculate character offsets."
+                        "clauses atomic. Use context only for prose with no present request, answer, question, selection, "
+                        "mutation, navigation, or execution instruction; context has no action indexes and structured "
+                        "input can never be context. Use unresolved with no action indexes only when the immutable actions "
+                        "cannot preserve an explicit demand. Do not calculate character offsets."
                     ),
                 ),
                 LLMMessage(
@@ -533,6 +535,11 @@ def _validate_semantic_fulfillment(
         and index not in pending_admissions
     ]
     units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
+    context_units = [
+        unit
+        for unit in units
+        if isinstance(unit, dict) and str(unit.get("disposition") or "") == "context"
+    ]
     action_units_per_clause: dict[str, int] = {}
     for unit in units:
         if not isinstance(unit, dict) or str(unit.get("disposition") or "") != "action":
@@ -563,7 +570,7 @@ def _validate_semantic_fulfillment(
             )
         ):
             mutation_units.append(unit)
-    if not risky_indexes and not mutation_units:
+    if not risky_indexes and not mutation_units and not context_units:
         return validate_plan_coverage(payload, clauses)
 
     reviews_input: list[dict[str, Any]] = []
@@ -630,7 +637,7 @@ def _validate_semantic_fulfillment(
         })
 
     reviewed_pending: dict[str, Any] = {}
-    if any(
+    if context_units or any(
         str(actions[index].get("type") or "") == "answer_pending"
         or _matching_pending_option(actions[index], state)
         for index in risky_indexes
@@ -655,6 +662,19 @@ def _validate_semantic_fulfillment(
         provider,
         reviews=reviews_input,
         unit_reviews=unit_reviews_input,
+        context_reviews=[{
+            "unit_id": str(unit.get("unit_id") or ""),
+            "source_text": str(unit.get("source_text") or ""),
+            "input_shape": next(
+                (
+                    clause.input_shape
+                    for clause in clauses
+                    if clause.clause_id == str(unit.get("clause_id") or "")
+                ),
+                "",
+            ),
+            "planner_reason": str(unit.get("reason") or ""),
+        } for unit in context_units],
         pending_question=reviewed_pending,
     )
     rows = result.get("reviews") if isinstance(result.get("reviews"), list) else []
@@ -697,6 +717,21 @@ def _validate_semantic_fulfillment(
         if not row["complete"]:
             reason = str(row.get("reason") or "mapped actions omit an explicit request").strip()
             errors.append(f"semantic unit {unit_id} fulfilment failed: {reason}")
+    context_rows = result.get("context_reviews") if isinstance(result.get("context_reviews"), list) else []
+    context_by_unit_id = {
+        str(row.get("unit_id") or ""): row
+        for row in context_rows
+        if isinstance(row, dict) and str(row.get("unit_id") or "")
+    }
+    for unit in context_units:
+        unit_id = str(unit.get("unit_id") or "")
+        row = context_by_unit_id.get(unit_id)
+        if not row or not isinstance(row.get("context_only"), bool):
+            errors.append(f"context admission review missing for {unit_id or '<missing>'}")
+            continue
+        if not row["context_only"]:
+            reason = str(row.get("reason") or "source contains a current actionable demand").strip()
+            errors.append(f"context semantic unit {unit_id} admission failed: {reason}")
     if errors:
         return PlanCoverageResult(
             valid=False,
@@ -727,6 +762,7 @@ def _request_semantic_fulfillment_review(
     *,
     reviews: list[dict[str, Any]],
     unit_reviews: list[dict[str, Any]],
+    context_reviews: list[dict[str, Any]] | None = None,
     pending_question: dict[str, Any],
 ) -> dict[str, Any]:
     """Run independent, bounded audits for actions and compound units.
@@ -736,7 +772,7 @@ def _request_semantic_fulfillment_review(
     the other contract.
     """
 
-    result: dict[str, Any] = {"reviews": [], "unit_reviews": []}
+    result: dict[str, Any] = {"reviews": [], "unit_reviews": [], "context_reviews": []}
     if reviews:
         result["reviews"] = _request_bounded_semantic_rows(
             provider,
@@ -752,6 +788,13 @@ def _request_semantic_fulfillment_review(
             rows=unit_reviews,
             pending_question={},
         )
+    if context_reviews:
+        result["context_reviews"] = _request_bounded_semantic_rows(
+            provider,
+            review_kind="contexts",
+            rows=context_reviews,
+            pending_question=pending_question,
+        )
     return result
 
 
@@ -765,9 +808,10 @@ def _request_bounded_semantic_rows(
     """Return schema-valid rows, retrying only missing IDs once."""
 
     is_action_review = review_kind == "actions"
-    payload_key = "reviews" if is_action_review else "unit_reviews"
+    is_context_review = review_kind == "contexts"
+    payload_key = "reviews" if is_action_review else ("context_reviews" if is_context_review else "unit_reviews")
     id_key = "action_index" if is_action_review else "unit_id"
-    verdict_key = "supported" if is_action_review else "complete"
+    verdict_key = "supported" if is_action_review else ("context_only" if is_context_review else "complete")
     requested = {row.get(id_key): row for row in rows}
     accepted: dict[Any, dict[str, Any]] = {}
 
@@ -778,7 +822,7 @@ def _request_bounded_semantic_rows(
         ensure_turn_active()
         request_rows = [requested[key] for key in missing]
         request_payload: dict[str, Any] = {payload_key: request_rows}
-        if is_action_review:
+        if is_action_review or is_context_review:
             request_payload["pending_question"] = pending_question
         response = provider.complete(LLMRequest(
             messages=[
@@ -2222,7 +2266,7 @@ def _recover_registry_bounded_semantic_actions(
                     "Adjudicate only structurally unrepresented AnyChain group-control intent. Return JSON only: "
                     "{decisions:[{unit_id:string,disposition:'navigation'|'shared_navigation'|'generic_resume'|'consultation'|"
                     "'owner_mutation'|'explicit_target_mode'|'unresolved_target_mode'|'turn_local_action'|"
-                    "'not_group_control',group:string,"
+                    "'context'|'not_group_control',group:string,"
                     "existing_action_index:integer|null,"
                     "target_mode:'fake-node'|'real-node'|'sync-observe'|'',"
                     "consultation_topic:string,turn_local_action_type:string,evidence_quote:string,"
@@ -2246,7 +2290,10 @@ def _recover_registry_bounded_semantic_actions(
                     "recoverable_turn_local_action purpose; set turn_local_action_type to that exact registered type. "
                     "The complete user turn will be supplied only through its declared source_argument. Do not select "
                     "a durable configuration or execution action. Use not_group_control for ambiguity or unrelated "
-                    "content. Never infer a "
+                    "content that may still require clarification. Use context only for prose that is background, "
+                    "provenance, or a tentative future possibility and contains no present request, answer, question, "
+                    "selection, correction, contradiction, mutation, navigation, evidence submission, or execution "
+                    "instruction. Context creates no action and will be independently audited after recovery. Never infer a "
                     "destination from workflow order, current state, defaults, or a pending question. group must be an "
                     "exact registered name for navigation/owner_mutation and empty otherwise. consultation_topic must be "
                     "an exact allowed topic for consultation and empty otherwise. target_mode must be empty unless "
@@ -2254,7 +2301,7 @@ def _recover_registry_bounded_semantic_actions(
                     "turn_local_action. existing_action_index must be null unless disposition is "
                     "shared_navigation. evidence_quote must be the shortest "
                     "exact excerpt from source_text that proves the disposition; use an empty quote only for "
-                    "not_group_control."
+                    "not_group_control. Context requires a non-empty exact evidence quote."
                 ),
             ),
             LLMMessage(role="user", content=json.dumps({
@@ -2291,6 +2338,7 @@ def _recover_registry_bounded_semantic_actions(
     }
     replacements: dict[str, dict[str, Any]] = {}
     shared_navigation_indexes: dict[str, int] = {}
+    context_unit_ids: set[str] = set()
     for candidate in candidates:
         unit_id = candidate["unit_id"]
         source = candidate["source_text"]
@@ -2310,6 +2358,9 @@ def _recover_registry_bounded_semantic_actions(
             and existing_action_index in sibling_navigation_indexes
         ):
             shared_navigation_indexes[unit_id] = existing_action_index
+            continue
+        if disposition == "context":
+            context_unit_ids.add(unit_id)
             continue
         if disposition == "navigation" and group in known_groups:
             replacement = {
@@ -2415,6 +2466,11 @@ def _recover_registry_bounded_semantic_actions(
             unit["action_indexes"] = [*indexes, shared_new_index]
             unit["disposition"] = "action"
             unit["reason"] = "registry-bounded shared navigation recovery"
+            continue
+        if unit_id in context_unit_ids:
+            unit["action_indexes"] = []
+            unit["disposition"] = "context"
+            unit["reason"] = "registry-bounded non-action context recovery"
             continue
         replacement = replacements.get(unit_id)
         if replacement is None:
@@ -2739,6 +2795,12 @@ def _semantic_fulfillment_prompt(*, review_kind: str = "both") -> str:
             "{unit_reviews:[{unit_id:string,complete:boolean,missing_demand_quote:string,reason:string}]}. "
             "Return no other keys and review every supplied unit_id exactly once. "
         )
+    elif review_kind == "contexts":
+        output_contract = (
+            "Audit only the supplied proposed context rows. Return one JSON object only: "
+            "{context_reviews:[{unit_id:string,context_only:boolean,reason:string}]}. "
+            "Return no other keys and review every supplied unit_id exactly once. "
+        )
     else:
         output_contract = (
             "Audit high-risk AnyChain action-purpose mappings and compound-unit completeness. Return one JSON object only: "
@@ -2747,7 +2809,8 @@ def _semantic_fulfillment_prompt(*, review_kind: str = "both") -> str:
         )
     return (
         output_contract
-        + "Operations are opaque, already-registered Harness operations. Internal operation names are intentionally absent because registration, lifecycle, ordering, and choose-versus-change selection are deterministic Harness responsibilities. Never infer or discuss an internal operation name and never reject a purpose on registry or lifecycle grounds. Decide only whether the exact source_units "
+        + "For context_reviews, context_only is true only when source_text is prose containing background, provenance, or a tentative future possibility and contains no present request, answer, question, selection, correction, contradiction, mutation, navigation, evidence submission, or execution instruction. A statement that answers the supplied pending_question is not context. input_shape must be prose. planner_reason is untrusted and cannot establish the verdict. Missing or ambiguous intent is false. "
+        "Operations are opaque, already-registered Harness operations. Internal operation names are intentionally absent because registration, lifecycle, ordering, and choose-versus-change selection are deterministic Harness responsibilities. Never infer or discuss an internal operation name and never reject a purpose on registry or lifecycle grounds. Decide only whether the exact source_units "
         "semantically and explicitly support the declared purpose and its supplied arguments. Workflow state "
         "and a pending question are context, never user evidence. For unit_reviews, ignore pending_question entirely: "
         "an explicit mutation or navigation may interrupt the old question, and the coordinator alone decides interruption, invalidation, and resume behavior. "
@@ -2782,11 +2845,11 @@ def _action_plan_repair_prompt() -> str:
         "Preserve every semantic-unit source_text partition from invalid_output that already exactly covers its authoritative clause. When one invalid action must be split into multiple valid typed actions, keep that valid partition and update only its action_indexes to reference all replacement actions; do not repartition or reinterpret the user turn. "
         "Return semantic_units with ordered exact source_text anchors copied from every clause. "
         "The Harness derives character offsets; do not calculate them. Each row is "
-        "{unit_id, clause_id, source_text, disposition:'action'|'unresolved', optional scope_constraint:'consultation_only', "
+        "{unit_id, clause_id, source_text, disposition:'action'|'context'|'unresolved', optional scope_constraint:'consultation_only', "
         "action_indexes:[zero-based indexes], reason}. Split prose only when exact contiguous anchors cover every word. "
         "When conjunctions or framing make a lossless split uncertain, use one full-clause unit mapped to every preserving typed action. "
         "Keep structured clauses atomic. Anchors may omit only punctuation or whitespace between units; never omit prose. "
-        "Introductory, framing, and trailing prose around a structured block must have its own semantic unit mapped to the block-consuming action, or be explicitly unresolved when the relationship is unclear. "
+        "Introductory, framing, and trailing prose around a structured block must have its own semantic unit mapped to the block-consuming action, be context only when it contains no present operation and will pass independent context admission, or be explicitly unresolved when the relationship is unclear. Structured clauses can never be context. "
         "structured_candidates are deterministic syntax facts for their clause. When that clause is configuration/review input, preserve config_values and unmapped_values in propose_config_values, route workflow_values through their typed workflow actions, and map the atomic clause to every action needed to preserve it. A same-turn instruction to review or apply that partial configuration and continue asking for required values not supplied is processing scope of propose_config_values; map it to that proposal without adding resume_current_flow, bypassing review, or leaving it unresolved. "
         "An explicit consultation-only, not-starting-yet, or no-change unit sets scope_constraint='consultation_only' and maps to all read-only consultation action indexes it scopes; it is not unresolved. "
         "Never claim an action covers a URL, exact wire RPC method, or concrete fact unless that exact value is present in the mapped owning action."

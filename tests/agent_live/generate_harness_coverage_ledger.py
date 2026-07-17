@@ -496,6 +496,90 @@ def refresh_ledger_status(ledger: dict[str, Any]) -> dict[str, Any]:
     return ledger
 
 
+def ingest_evidence_artifacts(
+    ledger: Mapping[str, Any],
+    references: Iterable[str | Path],
+) -> dict[str, Any]:
+    """Atomically attach validated execution artifacts to their ledger lanes.
+
+    Evidence producers do not own the coverage ledger.  This boundary resolves
+    each artifact against the authoritative edge inventory and validates the
+    complete artifact before any derived ledger state is changed.
+    """
+
+    candidate = deepcopy(dict(ledger))
+    revision = dict(candidate.get("revision") or {})
+    if not str(revision.get("commit") or "").strip() or not str(
+        revision.get("worktree_hash") or ""
+    ).strip():
+        raise ValueError("coverage ledger has no repository revision identity")
+    edge_by_key = {
+        str(edge.get("edge_key") or ""): edge
+        for edge in candidate.get("edges") or ()
+        if str(edge.get("edge_key") or "")
+    }
+    normalized = [str(Path(reference).resolve()) for reference in references]
+    if not normalized:
+        raise ValueError("no evidence artifacts were provided")
+
+    validated: list[tuple[dict[str, Any], str, str, str]] = []
+    batch_outcomes: dict[tuple[str, str], str] = {}
+    for reference in normalized:
+        try:
+            raw = json.loads(Path(reference).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"cannot load evidence artifact {reference}: {exc}") from exc
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"evidence artifact is not an object: {reference}")
+        edge_key = str(raw.get("edge_key") or "")
+        edge = edge_by_key.get(edge_key)
+        if edge is None:
+            raise ValueError(f"evidence artifact references an unknown edge: {edge_key or '<empty>'}")
+        evidence_class = str(raw.get("evidence_class") or "")
+        if evidence_class == "catalog" or evidence_class not in EVIDENCE_CLASSES:
+            raise ValueError(f"evidence artifact has an invalid execution lane: {evidence_class or '<empty>'}")
+        lane = (edge.get("evidence") or {}).get(evidence_class) or {}
+        if not bool(lane.get("required")):
+            raise ValueError(
+                f"edge is not required for {evidence_class}: "
+                f"{lane.get('applicability_reason') or 'unspecified'}"
+            )
+        artifact, reason = load_valid_evidence_reference(
+            reference,
+            edge=edge,
+            revision=revision,
+        )
+        if artifact is None:
+            raise ValueError(f"invalid evidence artifact {reference}: {reason}")
+        outcome = str(artifact.get("outcome") or "")
+        if outcome not in {"passed", "failed", "externally_blocked"}:
+            raise ValueError(f"unsupported evidence outcome: {outcome or '<empty>'}")
+        key = (edge_key, evidence_class)
+        previous_batch_outcome = batch_outcomes.setdefault(key, outcome)
+        if previous_batch_outcome != outcome:
+            raise ValueError(
+                f"conflicting evidence outcomes for {edge_key} [{evidence_class}]: "
+                f"{previous_batch_outcome} vs {outcome}"
+            )
+        current_status = str(lane.get("status") or "not_run")
+        if current_status not in {"not_run", outcome}:
+            raise ValueError(
+                f"evidence outcome conflicts with the ledger for {edge_key} "
+                f"[{evidence_class}]: {current_status} vs {outcome}"
+            )
+        validated.append((edge, evidence_class, outcome, reference))
+
+    for edge, evidence_class, outcome, reference in validated:
+        lane = edge["evidence"][evidence_class]
+        lane["status"] = outcome
+        lane["evidence_ids"] = sorted(set([
+            *(str(item) for item in lane.get("evidence_ids") or ()),
+            reference,
+        ]))
+        edge[LEGACY_EVIDENCE_FIELDS[evidence_class]] = lane["evidence_ids"][-1]
+    return refresh_ledger_status(candidate)
+
+
 def _execution_closure(
     edges: Iterable[Mapping[str, Any]],
     evidence_class: str,
@@ -819,6 +903,13 @@ def main() -> int:
         type=Path,
         default=REPO_ROOT / ".agent" / "evidence" / "harness-coverage-ledger.json",
     )
+    parser.add_argument(
+        "--evidence",
+        type=Path,
+        nargs="+",
+        default=(),
+        help="validated execution artifacts to ingest atomically after catalog refresh",
+    )
     args = parser.parse_args()
     existing: Mapping[str, Any] | None = None
     if args.output.exists():
@@ -828,6 +919,8 @@ def main() -> int:
         except (OSError, json.JSONDecodeError):
             existing = None
     ledger = build_ledger(existing)
+    if args.evidence:
+        ledger = ingest_evidence_artifacts(ledger, args.evidence)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(ledger, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(ledger["summary"], sort_keys=True))

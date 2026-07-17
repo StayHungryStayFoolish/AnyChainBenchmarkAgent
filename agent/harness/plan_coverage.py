@@ -161,6 +161,16 @@ def validate_plan_coverage(
                 errors.append(f"unresolved semantic unit has action indexes: {unit_id}")
             unresolved.append(source_text)
             continue
+        if disposition == "context":
+            if expected[clause_id].input_shape != "prose":
+                errors.append(f"context semantic unit is not prose: {unit_id}")
+            if not str(raw.get("reason") or "").strip():
+                errors.append(f"context semantic unit has no reason: {unit_id}")
+            if indexes:
+                errors.append(f"context semantic unit has action indexes: {unit_id}")
+            if scope_constraint:
+                errors.append(f"context semantic unit has a scope constraint: {unit_id}")
+            continue
         if disposition != "action":
             errors.append(f"invalid semantic unit disposition for {unit_id}: {disposition or '<missing>'}")
             continue

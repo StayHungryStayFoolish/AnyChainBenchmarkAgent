@@ -22,6 +22,213 @@ def _unit(clause, index: int, action_indexes, *, disposition: str = "action", re
 
 
 class PlanCoverageTest(unittest.TestCase):
+    def test_prose_context_can_coexist_with_an_owned_action(self) -> None:
+        clauses = segment_user_turn(
+            "Use BNB Smart Chain for this run; I may add another RPC call afterward."
+        )
+        payload = {
+            "actions": [{
+                "type": "choose_chain",
+                "chain_text": "BNB Smart Chain",
+                "chain_candidates": ["BNB Smart Chain"],
+                "source_evidence": clauses[0].text,
+            }],
+            "semantic_units": [
+                _unit(clauses[0], 1, [0]),
+                _unit(
+                    clauses[1],
+                    2,
+                    [],
+                    disposition="context",
+                    reason="tentative future possibility",
+                ),
+            ],
+        }
+
+        result = validate_plan_coverage(payload, clauses)
+
+        self.assertTrue(result.valid, result.errors)
+
+    def test_context_requires_reason_and_cannot_own_actions(self) -> None:
+        clauses = segment_user_turn("I may add another RPC call afterward.")
+        payload = {
+            "actions": [{"type": "resume_current_flow"}],
+            "semantic_units": [
+                _unit(clauses[0], 1, [0], disposition="context", reason=""),
+            ],
+        }
+
+        result = validate_plan_coverage(payload, clauses)
+
+        self.assertFalse(result.valid)
+        self.assertIn("context semantic unit has no reason", "\n".join(result.errors))
+        self.assertIn("context semantic unit has action indexes", "\n".join(result.errors))
+
+    def test_structured_clause_cannot_be_context(self) -> None:
+        clauses = segment_user_turn('{"CLOUD_REGION":"asia-east1"}')
+        payload = {
+            "actions": [],
+            "semantic_units": [
+                _unit(clauses[0], 1, [], disposition="context", reason="background"),
+            ],
+        }
+
+        result = validate_plan_coverage(payload, clauses)
+
+        self.assertFalse(result.valid)
+        self.assertIn("context semantic unit is not prose", "\n".join(result.errors))
+
+    def test_context_requires_independent_admission_and_preserves_chain_action(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _validate_semantic_fulfillment
+        from agent.harness.state import new_state
+
+        clauses = segment_user_turn(
+            "Use BNB Smart Chain for this run; I may add another RPC call afterward."
+        )
+        payload = {
+            "actions": [{
+                "type": "choose_chain",
+                "chain_text": "BNB Smart Chain",
+                "chain_candidates": ["BNB Smart Chain"],
+                "source_evidence": clauses[0].text,
+            }],
+            "semantic_units": [
+                _unit(clauses[0], 1, [0]),
+                _unit(
+                    clauses[1],
+                    2,
+                    [],
+                    disposition="context",
+                    reason="tentative future possibility",
+                ),
+            ],
+            "chain_selection_admissions": [0],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "context_reviews": [{
+                "unit_id": "unit-2",
+                "context_only": True,
+                "reason": "no current operation requested",
+            }],
+        }))
+        state = new_state("context-admission", language="en")
+        state["pending_question"] = {
+            "id": "chain",
+            "kind": "manual_value",
+            "field": "BLOCKCHAIN_NODE",
+            "options": [],
+        }
+
+        result = _validate_semantic_fulfillment(provider, json.dumps(payload), clauses, state)
+
+        self.assertTrue(result.valid, result.errors)
+        request_payload = json.loads(provider.complete.call_args.args[0].messages[1].content)
+        self.assertEqual(request_payload["pending_question"]["id"], "chain")
+        self.assertEqual(request_payload["context_reviews"][0]["unit_id"], "unit-2")
+
+    def test_actionable_text_cannot_be_admitted_as_context(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _validate_semantic_fulfillment
+        from agent.harness.state import new_state
+
+        clauses = segment_user_turn("add eth_chainId now.")
+        payload = {
+            "actions": [],
+            "semantic_units": [
+                _unit(clauses[0], 1, [], disposition="context", reason="background"),
+            ],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "context_reviews": [{
+                "unit_id": "unit-1",
+                "context_only": False,
+                "reason": "this is a current custom RPC request",
+            }],
+        }))
+
+        result = _validate_semantic_fulfillment(
+            provider,
+            json.dumps(payload),
+            clauses,
+            new_state("context-rejection", language="en"),
+        )
+
+        self.assertFalse(result.valid)
+        self.assertIn("context semantic unit unit-1 admission failed", "\n".join(result.errors))
+
+    def test_registry_recovery_can_preserve_context_without_synthesizing_an_action(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_registry_bounded_semantic_actions
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.state import new_state
+
+        clauses = segment_user_turn(
+            "Use BNB Smart Chain for this run; I may add another RPC call afterward."
+        )
+        payload = {
+            "actions": [{
+                "type": "choose_chain",
+                "chain_text": "BNB Smart Chain",
+                "chain_candidates": ["BNB Smart Chain"],
+                "source_evidence": clauses[0].text,
+            }],
+            "semantic_units": [
+                _unit(clauses[0], 1, [0]),
+                _unit(
+                    clauses[1],
+                    2,
+                    [],
+                    disposition="unresolved",
+                    reason="no current action",
+                ),
+            ],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "decisions": [{
+                "unit_id": "unit-2",
+                "disposition": "context",
+                "group": "",
+                "existing_action_index": None,
+                "target_mode": "",
+                "consultation_topic": "",
+                "turn_local_action_type": "",
+                "evidence_quote": "I may add another RPC call afterward.",
+                "reason": "tentative future possibility",
+            }],
+        }))
+
+        recovered_text, changed = _recover_registry_bounded_semantic_actions(
+            provider,
+            json.dumps(payload),
+            clauses,
+            new_state("context-recovery", language="en"),
+            "; ".join(clause.text for clause in clauses),
+            PlanCoverageResult(
+                valid=False,
+                errors=(),
+                unresolved_clauses=(clauses[1].text,),
+            ),
+        )
+
+        recovered = json.loads(recovered_text)
+        self.assertTrue(changed)
+        self.assertEqual(len(recovered["actions"]), 1)
+        self.assertEqual(recovered["semantic_units"][1]["disposition"], "context")
+        self.assertEqual(recovered["semantic_units"][1]["action_indexes"], [])
+
     def test_explicit_navigation_suppresses_same_transaction_generic_resume(self) -> None:
         from agent.harness.action_registry import normalize_action_relations
 
