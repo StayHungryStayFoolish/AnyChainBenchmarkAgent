@@ -74,8 +74,9 @@ problem is:
 
 AnyChain Agent is a LangGraph Harness-based domain agent for blockchain node
 benchmarking. The Harness owns product workflow state, group routing,
-fallback ordering, validation gates, and execution decisions. Google ADK is an
-optional model/tool bridge, not a second benchmark wizard. The Agent must
+fallback ordering, validation gates, and execution decisions. Google ADK is
+used only by the optional Gemini `google_search` grounding function; it is not
+an Agent, Runner, workflow owner, or general tool bridge. The Agent must
 reduce user configuration burden and call deterministic benchmark tools
 safely. It is not a shell script wizard, not a keyword router, and not a
 collection of fallback demos.
@@ -152,7 +153,9 @@ imported.
 Allowed retained code must fit one of these roles:
 
 - LangGraph Harness runtime, group workflow, checkpoint, and typed event code;
-- ADK compatibility bridge and function-tool wrappers;
+- the optional Gemini `google_search` grounding function in
+  `agent/llm/search_grounding.py`; it is not an Agent, Runner, workflow owner,
+  or general tool-wrapper layer;
 - deterministic AnyChain planners, validators, runners, analyzers, discovery,
   onboarding, or knowledge providers;
 - terminal I/O, exact shell commands, Ctrl+C/log-follow handling, dependency
@@ -171,7 +174,7 @@ Remove or migrate:
 
 If useful deterministic behavior exists inside obsolete code, move that
 behavior to the correct planner, validator, runner, analyzer, onboarding, or
-ADK tool wrapper. The old conversational wrapper should not remain.
+knowledge component. The old conversational wrapper should not remain.
 
 The Agent is not product-ready while legacy code can bypass LangGraph Harness
 intent routing, typed pending questions, deterministic validators, preflight,
@@ -419,17 +422,24 @@ return-to-default-order behavior. Passing a linear happy path is not enough.
 
 ## Onboarding And Knowledge Boundary
 
-For a chain outside the supported templates, ADK must not jump directly to
+For a chain outside the supported templates, the Harness must not jump directly to
 adapter-family selection, endpoint collection, or development handoff. It must
 first resolve whether the chain identity appears to exist, then confirm the
 protocol/adapter family. If framework knowledge is insufficient, ask the user
 for official chain documentation, protocol/RPC documentation, endpoint
 information, method examples, request/response samples, and fixture evidence.
 
-When Gemini plus Google authentication is configured, ADK may use
+When an eligible Gemini configuration, valid Gemini/Google authentication, and
+the optional Google ADK extra are available, the Harness may use
 `google_search` only in onboarding and custom-RPC research flows. Search results
 are evidence, not authority to skip validation. Official documentation should
 be preferred over blogs or forums.
+
+Google ADK is an optional dependency, installed explicitly with
+`scripts/install_agent_deps.sh --with-google-search`. The core LangGraph
+terminal runtime and DeepSeek/OpenAI/Claude/non-search Gemini operation must
+start without it. The retained `requirements-adk.txt`, `.venv-adk`, and
+`--adk-venv` names are compatibility aliases only.
 
 ## Chain And RPC Onboarding Cases
 
@@ -467,6 +477,10 @@ The Agent must do the following before execution:
    names.
 4. Probe the endpoint with the proposed method and params. User-provided
    request/response samples are evidence to verify, not facts to trust.
+   Preserve an explicit empty params value for zero-parameter methods. For
+   positional or object params, preserve list order or object keys and confirm
+   each parameter's index/name, JSON wire type, blockchain semantic type or
+   encoding, meaning, required/optional status, and example separately.
 5. Confirm the method shape can be represented by the current chain template
    schema: `param_formats`, `_meta.rest_paths`, or `param_spec`.
 6. If schema support is missing, stop and produce a coding handoff. Do not hide
@@ -498,7 +512,8 @@ The Agent must complete two gates before Case 2 begins:
 1. Chain existence/identity gate: use the configured LLM with repository facts
    and current workflow state to decide whether the candidate appears to exist,
    is likely a typo for a supported chain, is unknown, or needs user-provided
-   evidence. With Gemini plus Google authentication, use ADK `google_search` on
+   evidence. With an eligible Gemini configuration, valid Gemini/Google
+   authentication, and the optional extra, use ADK `google_search` on
    official sources before asking the user to confirm the chain identity.
 2. Protocol-family gate: only after the chain identity is confirmed, infer the
    adapter family from repository facts, official docs, user-provided samples,
@@ -550,7 +565,8 @@ route the turn into a two-step chain identity workflow and follow this sequence:
    the user confirms the intended chain identity.
 3. Resolve protocol family second. Only after chain identity is confirmed,
    determine whether the chain appears to belong to an existing adapter family.
-   If Gemini plus Google authentication is available, use ADK `google_search`
+   If an eligible Gemini configuration, valid Gemini/Google authentication,
+   and the optional extra are available, use ADK `google_search`
    to look for official RPC documentation, official endpoint examples, and
    official request/response examples before proposing the family. If web
    research is unavailable, the model may use repository context and model
@@ -696,9 +712,11 @@ git diff --check
 ```
 
 When live model behavior is affected and a safe key is available, run the
-LangGraph live CLI matrix in an isolated environment. When benchmark
-execution is affected, run fake-node smoke in Docker or an isolated Linux
-environment.
+LangGraph live CLI matrix in Docker/Linux. Product acceptance and coverage
+evidence are Docker-only; host runs are developer checks. When benchmark
+execution is affected, run the applicable fake-node, local real-node,
+custom-RPC, or sync-observe path in Docker. fake-node alone does not qualify
+the other workflow paths.
 
 For broad Agent workflow, group-state, routing, or Harness changes, the
 LangGraph live CLI matrix is not sufficient by itself. Run a dual-AI chaos
@@ -709,6 +727,13 @@ interruptions, backtracking, group jumps, language switching, pasted
 configuration/evidence, custom RPC cases, unknown-chain cases, resume behavior,
 and final review/preflight/smoke paths. If the full transcript is not reviewed,
 do not claim product readiness.
+
+Generated schedules, cataloged edges, covering rows/tuples, and successful PTY
+returns are test intent or transport evidence, not observed execution. Passing
+coverage must be revision-bound to an actual state transition and independently
+verified postcondition; execution edges additionally require hashed job
+artifacts. Reports must keep generated/cataloged, observed-pass, observed-fail,
+not-run, externally-blocked, and uncovered denominators separate.
 
 The Codex user simulator must use explicit personas rather than a neutral
 happy-path checklist. Required personas include a first-time confused evaluator,

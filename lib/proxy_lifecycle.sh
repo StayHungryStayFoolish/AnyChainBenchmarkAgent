@@ -133,9 +133,9 @@ start_rpc_proxy() {
         fi
     fi
 
-    local chain_file="${SCRIPT_DIR}/config/chains/${BLOCKCHAIN_NODE:-solana}.json"
+    local chain_file="${ACTIVE_CHAIN_TEMPLATE_FILE:-}"
     if [[ ! -f "$chain_file" ]]; then
-        echo "⚠️  Chain template not found: $chain_file — skipping proxy"
+        echo "⚠️  Validated active chain template is unavailable: ${chain_file:-<unset>} — skipping proxy" >&2
         return 0
     fi
 

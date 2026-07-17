@@ -39,7 +39,7 @@ user prompt
 -> terminal I/O shell
 -> LangGraph Harness typed intent path
 -> group workflow and checkpoint state
--> optional ADK compatibility bridge/tool call
+-> optional Gemini google_search grounding function at its three scoped call sites
 -> deterministic tool and validator gates
 -> benchmark plan
 -> preflight and risk checks
@@ -89,7 +89,7 @@ Development locations:
 - `agent/knowledge/loader.py`: provider selection.
 - `agent/tools/executor.py`: exposes the `knowledge_search` tool that queries
   the configured KB provider and local capability evidence.
-- `agent/cli.py`: smoke commands and integration entrypoints.
+- `agent.cli` (implemented in `agent/cli.py`): smoke commands and integration entrypoints; invoke it with `python3 -m agent.cli`.
 
 Expected contract:
 
@@ -111,7 +111,7 @@ POST /workload/suggest
 Validation:
 
 ```bash
-python3 agent/cli.py knowledge-smoke
+python3 -m agent.cli knowledge-smoke
 python3 -m unittest tests.test_agent_runtime_contract -v
 ```
 
@@ -129,7 +129,7 @@ an internal Agent platform instead of only as a terminal chat.
 
 Development locations:
 
-- `agent/cli.py`: JSON CLI entrypoint.
+- `agent.cli` (implemented in `agent/cli.py`): JSON CLI entrypoint; invoke it with `python3 -m agent.cli`.
 - `agent/tools/schema.py`: OpenAI-compatible tool catalog.
 - `agent/tools/executor.py`: stable named tool execution.
 - `config/agent_config.sh`: LLM, Google auth, and optional KB defaults.
@@ -138,13 +138,20 @@ Development locations:
 - `agent/llm/search_grounding.py`: the sole `google-adk` consumer (optional
   Gemini `google_search` grounding); all other tool wrappers are retired.
 
+The platform's core integration depends on the LangGraph runtime in
+`requirements-adk.txt`; that filename is a compatibility alias and does not
+install Google ADK. Add `--with-google-search` to
+`scripts/install_agent_deps.sh` only when the platform explicitly needs Gemini
+search grounding. DeepSeek/OpenAI/Claude integrations must not import or require
+`google.adk`.
+
 Supported integration modes:
 
 - Human terminal: `./bin/anychain-agent`
-- JSON CLI: `python3 agent/cli.py <command>`
-- Tool schema export: `python3 agent/cli.py tool-schema`
+- JSON CLI: `python3 -m agent.cli <command>`
+- Tool schema export: `python3 -m agent.cli tool-schema`
 - Named tool call:
-  `python3 agent/cli.py tool-call --name <tool> --arguments '<json>'`
+  `python3 -m agent.cli tool-call --name <tool> --arguments '<json>'`
 
 Typical platform tools:
 
@@ -177,9 +184,9 @@ Boundaries:
 Validation:
 
 ```bash
-python3 agent/cli.py tool-schema
-python3 agent/cli.py tool-call --name load_capabilities
-python3 agent/cli.py tool-call --name discover_environment
+python3 -m agent.cli tool-schema
+python3 -m agent.cli tool-call --name load_capabilities
+python3 -m agent.cli tool-call --name discover_environment
 python3 -m unittest tests.test_agent_runtime_contract -v
 ```
 
@@ -305,6 +312,18 @@ Development locations:
 
 For simple methods, use `param_formats`. For positional params, object params,
 REST path params, query params, or request bodies, use `param_spec`.
+
+Do not infer parameter semantics from JSON syntax alone. Preserve explicit
+empty params for zero-parameter methods. For positional and object methods,
+preserve list order or object keys and confirm each parameter's index/name,
+JSON wire type, blockchain semantic type or encoding, meaning,
+required/optional status, and example. Probe the confirmed wire request against
+a reachable validation endpoint before catalog admission.
+
+Runtime workload scope is job-local: `single_replace` selects one validated
+method, `mixed_replace` drops template defaults, and `mixed_add` retains them.
+All active mixed weights are positive integers totaling exactly 100. None of
+these choices may mutate `config/chains/<chain>.json`.
 
 Example three-argument method:
 

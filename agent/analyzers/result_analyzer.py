@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import glob
 import json
 from pathlib import Path
 from typing import Any
@@ -12,6 +11,18 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def analyze_job(job: dict[str, Any]) -> dict[str, Any]:
+    status = str(job.get("status") or "unknown")
+    if status in {"queued", "running", "pending"}:
+        return {
+            "job_id": job["job_id"],
+            "status": status,
+            "grade": "IN_PROGRESS",
+            "grade_reason": "The benchmark job has not reached a terminal state.",
+            "summary": {"message": "Benchmark execution is still in progress."},
+            "artifacts": job.get("artifacts", {}),
+            "evidence": _evidence_from_artifacts(job.get("artifacts", {})),
+            "recommendations": ["Wait for completion before drawing performance conclusions."],
+        }
     artifacts = job.get("artifacts", {})
     evidence = _evidence_from_artifacts(artifacts)
     if evidence:
@@ -60,27 +71,6 @@ def analyze_job(job: dict[str, Any]) -> dict[str, Any]:
             "recommendations": job["analysis"].get("recommendations", []),
         }
 
-    latest_summary = _latest_archive_summary()
-    if latest_summary:
-        summary = _read_json(latest_summary)
-        grade = "WARNING" if summary.get("bottleneck_detected") else "PASS"
-        return {
-            "job_id": job["job_id"],
-            "status": job["status"],
-            "grade": grade,
-            "grade_reason": "Bottleneck detected." if summary.get("bottleneck_detected") else "Archive summary is available.",
-            "summary": {
-                "run_id": summary.get("run_id"),
-                "benchmark_mode": summary.get("benchmark_mode"),
-                "max_stable_qps": summary.get("max_successful_qps"),
-                "bottleneck_detected": summary.get("bottleneck_detected"),
-                "bottleneck_types": summary.get("bottleneck_types", []),
-            },
-            "artifacts": {"summary_json": str(latest_summary)},
-            "evidence": {"archive_summary": str(latest_summary)},
-            "recommendations": _recommendations(summary),
-        }
-
     return {
         "job_id": job["job_id"],
         "status": job["status"],
@@ -91,14 +81,6 @@ def analyze_job(job: dict[str, Any]) -> dict[str, Any]:
         "evidence": _evidence_from_artifacts(job.get("artifacts", {})),
         "recommendations": ["Run a benchmark job or point the Agent to an archived run."],
     }
-
-
-def _latest_archive_summary() -> Path | None:
-    matches = glob.glob(str(REPO_ROOT / "archives" / "*" / "test_summary.json"))
-    if not matches:
-        return None
-    return Path(max(matches, key=lambda item: Path(item).stat().st_mtime))
-
 
 def _read_json(path: Path) -> dict[str, Any]:
     with open(path, "r", encoding="utf-8") as handle:
@@ -131,7 +113,10 @@ def _evidence_from_artifacts(artifacts: dict[str, Any]) -> dict[str, str]:
 
 
 def _grade_job(job: dict[str, Any], evidence: dict[str, str]) -> tuple[str, str]:
-    if job.get("status") == "failed":
+    status = str(job.get("status") or "unknown")
+    if status in {"queued", "running", "pending"}:
+        return "IN_PROGRESS", "The benchmark job has not reached a terminal state."
+    if status == "failed":
         return "FAIL", job.get("error", "Benchmark job failed.")
     if job.get("artifacts", {}).get("mode") == "mock":
         return "WARNING", "Mock lifecycle completed; no real benchmark evidence was produced."

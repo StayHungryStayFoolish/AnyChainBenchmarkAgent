@@ -9,10 +9,7 @@ remaining surface stay in lockstep.
 
 from __future__ import annotations
 
-import ast
-import inspect
 import unittest
-from unittest.mock import patch
 
 
 class ToolDispatchParityTest(unittest.TestCase):
@@ -21,7 +18,7 @@ class ToolDispatchParityTest(unittest.TestCase):
         from agent.tools.schema import tool_schema
 
         schema_names = {tool["function"]["name"] for tool in tool_schema()["tools"]}
-        dispatch_names = _executor_dispatch_names(executor_module)
+        dispatch_names = set(executor_module.TOOL_OPERATION_BY_NAME)
 
         self.assertEqual(
             schema_names,
@@ -29,27 +26,11 @@ class ToolDispatchParityTest(unittest.TestCase):
             "agent/tools/schema.py and agent/tools/executor.py must advertise the exact same tool names",
         )
 
-        # Every schema name must actually be dispatchable: `execute_tool`
-        # raises this exact message only when `name` falls through every
-        # `if` branch, never for a missing/invalid argument on a real branch.
-        # `discover_environment`/`audit_dependencies`/`run_doctor` take zero
-        # required arguments, so without stubbing they would run real host
-        # discovery / shell out to real scripts on every test run — replace
-        # them with no-ops for the duration of this dispatch check only.
-        no_op = lambda *args, **kwargs: {}
-        with (
-            patch.object(executor_module, "discover_environment", no_op),
-            patch.object(executor_module, "audit_dependencies", no_op),
-            patch.object(executor_module, "run_doctor", no_op),
-        ):
-            for name in schema_names:
-                try:
-                    executor_module.execute_tool(name, {})
-                except ValueError as exc:
-                    if str(exc) == f"unsupported tool: {name}":
-                        self.fail(f"schema advertises {name!r} but executor does not dispatch it")
-                except Exception:
-                    pass  # missing required args / other real side effects are fine here
+        for name in schema_names:
+            self.assertTrue(
+                callable(executor_module.TOOL_OPERATION_BY_NAME[name].handler),
+                f"missing registered callable for tool {name!r}",
+            )
 
     def test_unsupported_tool_name_raises(self) -> None:
         from agent.tools.executor import execute_tool
@@ -57,24 +38,34 @@ class ToolDispatchParityTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             execute_tool("not_a_real_tool", {})
 
+    def test_obsolete_configuration_question_tools_are_not_exposed(self) -> None:
+        import agent.tools.executor as executor_module
+        from agent.tools.schema import tool_schema
 
-def _executor_dispatch_names(executor_module) -> set[str]:
-    """Extract every `if name == "..."` dispatch literal from `execute_tool`.
+        removed = {"validate_required_config", "build_missing_config_questions"}
+        schema_names = {tool["function"]["name"] for tool in tool_schema()["tools"]}
+        dispatch_names = set(executor_module.TOOL_OPERATION_BY_NAME)
 
-    Parses the function's syntax tree (via `ast`) rather than regex-matching
-    its source text, so reformatting the if-chain (whitespace, quote style,
-    reordering) can't silently break this check the way a regex would.
-    """
-    tree = ast.parse(inspect.getsource(executor_module.execute_tool))
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if not (isinstance(node, ast.Compare) and isinstance(node.left, ast.Name) and node.left.id == "name"):
-            continue
-        for op, comparator in zip(node.ops, node.comparators):
-            if isinstance(op, ast.Eq) and isinstance(comparator, ast.Constant) and isinstance(comparator.value, str):
-                names.add(comparator.value)
-    return names
+        self.assertTrue(removed.isdisjoint(schema_names))
+        self.assertTrue(removed.isdisjoint(dispatch_names))
+        for name in removed:
+            with self.assertRaisesRegex(ValueError, f"unsupported tool: {name}"):
+                executor_module.execute_tool(name, {})
 
+    def test_string_false_cannot_authorize_a_side_effect(self) -> None:
+        from agent.tools.executor import execute_tool
+
+        with self.assertRaisesRegex(ValueError, "expected boolean"):
+            execute_tool("submit_job", {"plan_file": "plan.json", "approved": "false"})
+
+    def test_nested_tool_values_follow_the_advertised_schema(self) -> None:
+        from agent.tools.executor import execute_tool
+
+        with self.assertRaisesRegex(ValueError, "expected integer"):
+            execute_tool(
+                "draft_request",
+                {"mixed_weights": {"eth_blockNumber": "100"}},
+            )
 
 if __name__ == "__main__":
     unittest.main()

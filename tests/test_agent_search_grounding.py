@@ -1,7 +1,7 @@
 """Regression tests for `agent.llm.search_grounding`.
 
 Covers the exact bug found via live dual-AI chaos analysis: the harness
-(`agent/harness/groups.py`) reads `state["web_research"]["google_search_available"]`,
+(`agent/harness/coordinator.py`) reads `state["web_research"]["google_search_available"]`,
 but the producer (formerly `agent/adk_app/tools/web_research.py`) emitted the
 key `enabled` — so the branch could never see a true value, even with a
 correctly configured Gemini + google_search setup. `WebResearchStatus`'s

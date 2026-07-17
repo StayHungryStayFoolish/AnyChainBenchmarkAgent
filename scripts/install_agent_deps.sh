@@ -3,8 +3,9 @@
 # AnyChain Benchmark Agent — Agent runtime dependency installer
 # =====================================================================
 # Installs or audits dependencies needed by the human-facing Agent runtime:
-#   1. Google ADK in an isolated Python 3.10+ virtual environment
-#   2. Optional Google Cloud CLI for local ADC / impersonation bootstrap
+#   1. Core LangGraph terminal runtime in an isolated Python 3.10+ environment
+#   2. Optional Gemini google_search support through Google ADK
+#   3. Optional Google Cloud CLI for local ADC / impersonation bootstrap
 #
 # This script does NOT install benchmark engine dependencies. Use:
 #   bash scripts/install_deps.sh
@@ -12,8 +13,10 @@
 # Usage:
 #   bash scripts/install_agent_deps.sh --check
 #   bash scripts/install_agent_deps.sh --yes
+#   bash scripts/install_agent_deps.sh --yes --with-google-search
 #   bash scripts/install_agent_deps.sh --yes --with-gcloud
 #   bash scripts/install_agent_deps.sh --yes --no-sudo
+#   bash scripts/install_agent_deps.sh --agent-venv .venv-agent
 #   bash scripts/install_agent_deps.sh --adk-venv .venv-adk
 #
 # Exit codes:
@@ -26,10 +29,11 @@
 set -euo pipefail
 
 MODE="interactive"   # interactive | yes | check
-SKIP_ADK=0
+SKIP_AGENT_RUNTIME=0
+WITH_GOOGLE_SEARCH=0
 WITH_GCLOUD=0
 SKIP_SUDO=0
-ADK_VENV=".venv-adk"
+AGENT_VENV=".venv-adk"
 PYTHON_BIN=""
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG_FILE="/tmp/install_agent_deps_$(date +%Y%m%d_%H%M%S).log"
@@ -61,13 +65,16 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --yes|-y) MODE="yes" ;;
         --check) MODE="check" ;;
-        --skip-adk) SKIP_ADK=1 ;;
+        --skip-agent-runtime) SKIP_AGENT_RUNTIME=1 ;;
+        --skip-adk) SKIP_AGENT_RUNTIME=1 ;;
+        --with-google-search) WITH_GOOGLE_SEARCH=1 ;;
         --with-gcloud) WITH_GCLOUD=1 ;;
         --no-sudo) SKIP_SUDO=1 ;;
-        --adk-venv)
+        --agent-venv|--adk-venv)
+            VENV_FLAG="$1"
             shift
-            [[ $# -gt 0 ]] || { err "--adk-venv requires a path"; exit 2; }
-            ADK_VENV="$1"
+            [[ $# -gt 0 ]] || { err "$VENV_FLAG requires a path"; exit 2; }
+            AGENT_VENV="$1"
             ;;
         --python-bin)
             shift
@@ -127,25 +134,34 @@ raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
 PY
 }
 
-adk_ready() {
+agent_runtime_ready() {
     local venv_dir="$1"
     [[ -x "$venv_dir/bin/python" ]] || return 1
     python_is_310 "$venv_dir/bin/python" || return 1
-    [[ -x "$venv_dir/bin/adk" ]] || return 1
     "$venv_dir/bin/python" - <<'PY' >/dev/null 2>&1
-import google.adk
 import langgraph
 import langgraph.graph
 import langgraph.checkpoint.sqlite
+import openai
 import prompt_toolkit
 PY
 }
 
-install_adk() {
+google_search_ready() {
+    local venv_dir="$1"
+    agent_runtime_ready "$venv_dir" || return 1
+    "$venv_dir/bin/python" - <<'PY' >/dev/null 2>&1
+from google.adk.agents import Agent
+from google.adk.runners import InMemoryRunner
+from google.adk.tools import google_search
+PY
+}
+
+install_agent_runtime() {
     local python="$1" venv_dir="$2"
     if [[ ! -x "$venv_dir/bin/python" ]] || ! python_is_310 "$venv_dir/bin/python"; then
         if [[ -e "$venv_dir" ]]; then
-            warn "Removing incomplete or unsupported ADK venv at $venv_dir"
+            warn "Removing incomplete or unsupported Agent venv at $venv_dir"
             rm -rf "$venv_dir"
         fi
         "$python" -m venv "$venv_dir"
@@ -156,6 +172,11 @@ install_adk() {
     fi
     "$venv_dir/bin/python" -m pip install --upgrade pip
     "$venv_dir/bin/python" -m pip install -r "$REPO_ROOT/requirements-adk.txt"
+}
+
+install_google_search() {
+    local venv_dir="$1"
+    "$venv_dir/bin/python" -m pip install google-adk
 }
 
 install_gcloud_apt() {
@@ -201,41 +222,65 @@ EOF
     fi
 }
 
-step "Step 1/3 — Check Agent Python and Google ADK"
+step "Step 1/3 — Check core Agent runtime"
 MISSING=()
-ADK_VENV_ABS="$REPO_ROOT/$ADK_VENV"
-if [[ "$ADK_VENV" = /* ]]; then
-    ADK_VENV_ABS="$ADK_VENV"
+AGENT_VENV_ABS="$REPO_ROOT/$AGENT_VENV"
+if [[ "$AGENT_VENV" = /* ]]; then
+    AGENT_VENV_ABS="$AGENT_VENV"
 fi
 
-if [[ "$SKIP_ADK" == "1" ]]; then
-    info "Skipping ADK check/install (--skip-adk)"
+if [[ "$SKIP_AGENT_RUNTIME" == "1" ]]; then
+    info "Skipping core Agent runtime check/install (--skip-agent-runtime/--skip-adk compatibility alias)"
 else
     PYTHON="$(select_python)"
     if [[ -z "$PYTHON" ]]; then
         warn "Python 3.10+ — MISSING"
         MISSING+=("agent:python3.10+")
-    elif adk_ready "$ADK_VENV_ABS"; then
-        ok "Google ADK available in $ADK_VENV_ABS"
+    elif agent_runtime_ready "$AGENT_VENV_ABS"; then
+        ok "Core Agent runtime available in $AGENT_VENV_ABS"
     else
-        warn "Google ADK venv — MISSING or incomplete at $ADK_VENV_ABS"
-        MISSING+=("agent:google-adk")
+        warn "Core Agent runtime — MISSING or incomplete at $AGENT_VENV_ABS"
+        MISSING+=("agent:core-runtime")
         if [[ "$MODE" != "check" ]]; then
-            info "Will create/use isolated venv: $ADK_VENV_ABS"
+            info "Will create/use isolated venv: $AGENT_VENV_ABS"
             info "Will install: $REPO_ROOT/requirements-adk.txt"
-            if confirm "Install Google ADK into isolated venv now?"; then
-                install_adk "$PYTHON" "$ADK_VENV_ABS" 2>&1 | tee -a "$LOG_FILE"
-                if adk_ready "$ADK_VENV_ABS"; then
-                    ok "Google ADK installed in $ADK_VENV_ABS"
+            if confirm "Install the core Agent runtime into the isolated venv now?"; then
+                install_agent_runtime "$PYTHON" "$AGENT_VENV_ABS" 2>&1 | tee -a "$LOG_FILE"
+                if agent_runtime_ready "$AGENT_VENV_ABS"; then
+                    ok "Core Agent runtime installed in $AGENT_VENV_ABS"
                 else
-                    err "Google ADK install did not produce a working adk CLI"
+                    err "Core Agent install did not produce a working LangGraph terminal runtime"
                     exit 1
                 fi
             else
-                warn "Skipped ADK install (user declined)"
+                warn "Skipped core Agent runtime install (user declined)"
             fi
         fi
     fi
+fi
+
+if [[ "$WITH_GOOGLE_SEARCH" == "1" ]]; then
+    if google_search_ready "$AGENT_VENV_ABS"; then
+        ok "Optional Gemini google_search support available"
+    else
+        warn "Optional Gemini google_search support — MISSING"
+        MISSING+=("agent:google-search")
+        if [[ "$MODE" != "check" ]]; then
+            if [[ "$SKIP_AGENT_RUNTIME" == "1" ]] && ! agent_runtime_ready "$AGENT_VENV_ABS"; then
+                err "--with-google-search requires a working core Agent runtime in $AGENT_VENV_ABS"
+                exit 1
+            fi
+            if confirm "Install optional Gemini google_search support through Google ADK?"; then
+                install_google_search "$AGENT_VENV_ABS" 2>&1 | tee -a "$LOG_FILE"
+                google_search_ready "$AGENT_VENV_ABS" || { err "Optional Gemini google_search install is incomplete"; exit 1; }
+                ok "Optional Gemini google_search support installed"
+            else
+                warn "Skipped optional Gemini google_search install (user declined)"
+            fi
+        fi
+    fi
+else
+    info "Optional Gemini google_search support was not requested; core providers remain usable"
 fi
 
 step "Step 2/3 — Check Google Cloud CLI"
@@ -273,8 +318,11 @@ fi
 
 step "Step 3/3 — Summary"
 STILL_MISSING=()
-if [[ "$SKIP_ADK" != "1" ]] && ! adk_ready "$ADK_VENV_ABS"; then
-    STILL_MISSING+=("agent:google-adk")
+if [[ "$SKIP_AGENT_RUNTIME" != "1" ]] && ! agent_runtime_ready "$AGENT_VENV_ABS"; then
+    STILL_MISSING+=("agent:core-runtime")
+fi
+if [[ "$WITH_GOOGLE_SEARCH" == "1" ]] && ! google_search_ready "$AGENT_VENV_ABS"; then
+    STILL_MISSING+=("agent:google-search")
 fi
 if [[ "$WITH_GCLOUD" == "1" ]] && ! command -v gcloud >/dev/null 2>&1; then
     STILL_MISSING+=("agent:gcloud")
@@ -282,8 +330,9 @@ fi
 
 if [[ ${#STILL_MISSING[@]} -eq 0 ]]; then
     ok "Agent dependencies satisfied."
-    log "Activate ADK venv with:"
-    log "    source $ADK_VENV_ABS/bin/activate"
+    ok "Core DeepSeek/OpenAI/Claude/Gemini runtime does not require Google ADK."
+    log "Activate Agent venv with:"
+    log "    source $AGENT_VENV_ABS/bin/activate"
     log "Then run:"
     log "    ./bin/anychain-agent"
     log "Log: $LOG_FILE"

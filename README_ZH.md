@@ -18,8 +18,9 @@ LangGraph Harness，可以把用户测试目标转换成可验证的 plan，执�
 checkpoint state、typed intent 路由、配置 group、fallback 顺序、validator gate 和
 执行决策。Harness 自身的模型调用对所有 provider（OpenAI、DeepSeek、Vertex 上的
 Gemini）统一走 OpenAI 兼容的 HTTP 请求；Google ADK 只用于唯一一项可选能力——
-真实节点客户端准备流程中的 Gemini `google_search` 联网检索（见
-`agent/llm/search_grounding.py`），绝不拥有第二套 benchmark wizard 或对话循环。
+unknown chain/protocol、自定义 RPC schema 和 sync-observe 节点客户端资料的
+Gemini `google_search` 联网检索（见 `agent/llm/search_grounding.py`），绝不拥有
+第二套 benchmark wizard 或对话循环。
 模型只能把模糊自然语言解析成 typed Harness action，不能直接执行命令。
 
 ## 目录
@@ -116,12 +117,22 @@ cd AnyChainBenchmarkAgent
 
 ### 2. 安装 Agent Runtime
 
-先安装隔离的 ADK 终端运行环境。这个脚本只为 AnyChain Benchmark Agent 创建环境，
-不要把 ADK 安装到生产区块链节点使用的 Python 环境中：
+先安装隔离的 LangGraph 终端运行环境。兼容路径仍叫 `requirements-adk.txt` 和
+`.venv-adk`，但默认安装不包含、也不依赖 Google ADK；该脚本不会修改生产区块链
+节点使用的 Python 环境：
 
 ```bash
 bash scripts/install_agent_deps.sh --yes
 ```
+
+Gemini `google_search` grounding 是独立的可选 extra：
+
+```bash
+bash scripts/install_agent_deps.sh --yes --with-google-search
+```
+
+DeepSeek、OpenAI、Claude 和不使用 search 的 Gemini 会话必须在没有该 extra 时正常
+启动运行。新脚本参数优先使用 `--agent-venv`；`--adk-venv` 仅作为兼容 alias 保留。
 
 如果用户跳过这一步并直接启动交互式 Agent，启动器会先检查终端必需依赖。缺少
 `prompt-toolkit` 时，Agent 会先请求用户确认，然后自动运行
@@ -129,7 +140,7 @@ bash scripts/install_agent_deps.sh --yes
 Ctrl+C、中文输入和宽字符删除能力是 Agent 终端的基础要求。
 
 如果宿主机没有 `python3.11`，可以使用任意 Python 3.10+ 解释器。底层 benchmark
-engine 的非 Agent 自动化仍可使用较旧 Python，但 ADK Agent 运行时需要 Python 3.10+。
+engine 的非 Agent 自动化仍可使用较旧 Python，但 Agent 运行时需要 Python 3.10+。
 启动脚本会自动优先使用 `.venv-adk/bin/python`，所以用户不需要先手动 activate venv
 再运行 `./bin/anychain-agent`。
 
@@ -217,8 +228,9 @@ GOOGLE_APPLICATION_CREDENTIALS=""         # 可选 JSON key fallback
   `attached_service_account`、`service_account_impersonation` 或
   `service_account_file`。
 
-Web research 受 provider 限制。只有当 Agent 使用 Gemini-family 模型，并且 Gemini /
-Google 认证有效时，ADK `google_search` 才会启用。`claude` on Vertex、DeepSeek、
+Web research 受 provider 限制。只有安装可选 `--with-google-search` extra、Agent 使用
+Gemini-family 模型，并且 Gemini/Google 认证有效时，ADK `google_search` 才可能启用。
+`claude` on Vertex、DeepSeek、
 OpenAI 和 `claude` API-key 模式不会启用 ADK `google_search`；这些模式下，Agent 会使用
 仓库事实、可选企业 KB 证据，或要求用户提供官方文档和 request/response 样本。
 
@@ -230,6 +242,8 @@ Google Cloud CLI：
 ```bash
 bash scripts/install_agent_deps.sh --yes --with-gcloud
 ```
+
+只有该环境还需要 Gemini web research 时，才额外添加 `--with-google-search`。
 
 如果使用 `google_adc`，安装完成后还需要创建本地 ADC 凭据：
 
@@ -273,7 +287,7 @@ Agent 提交 job 时会生成：
 高于 `config/user_config.sh`。用户不需要也不应该手动编辑它；它是报告和分析时证明
 本次运行使用了哪些变量的证据。
 
-Agent 启动的 job 默认写入 `.agent/jobs`。低阶 `python3 agent/cli.py submit`
+Agent 启动的 job 默认写入 `.agent/jobs`。低阶 `python3 -m agent.cli submit`
 也使用同一位置，除非显式传入 `--jobs-dir`。
 
 ### 4. 验证 Agent 配置
@@ -281,8 +295,8 @@ Agent 启动的 job 默认写入 `.agent/jobs`。低阶 `python3 agent/cli.py su
 启动交互会话前先验证 Agent 和 LLM 配置：
 
 ```bash
-python3 agent/cli.py adk-status
-python3 agent/cli.py llm-config
+python3 -m agent.cli adk-status
+python3 -m agent.cli llm-config
 ```
 
 chain、RPC URL、磁盘、机器类型等 benchmark 信息可以先不配置。Agent 会自动发现能
@@ -426,21 +440,22 @@ Agent 模型配置见上面的 [配置 Agent](#3-配置-agent)。支持的 provi
 - `openai`：OpenAI API key。
 - `deepseek`：通过 OpenAI-compatible endpoint 使用 DeepSeek API key。
 
-ADK `google_search` 只在 Gemini-family 模型和有效 Gemini/Google 认证下启用，并且只用于
-unsupported chain 和 custom RPC onboarding 场景。它提供证据，不替代 endpoint 确认、
+ADK `google_search` 只在安装可选 search extra、Gemini-family 模型与 Gemini/Google
+认证有效、并且 ADK tool 可用时启用。它仅用于 unknown-chain/protocol、自定义 RPC
+schema 和 sync-observe client 资料检索。搜索只提供证据，不替代 endpoint probe、
 fixture 录制、template validation 或 fake-node smoke。
 
 不调用模型，只检查配置：
 
 ```bash
-python3 agent/cli.py adk-status
-python3 agent/cli.py llm-config
+python3 -m agent.cli adk-status
+python3 -m agent.cli llm-config
 ```
 
 配置好凭据后再运行真实 provider smoke：
 
 ```bash
-python3 agent/cli.py llm-smoke --prompt 'Return JSON only: {"ok": true}'
+python3 -m agent.cli llm-smoke --prompt 'Return JSON only: {"ok": true}'
 ```
 
 ## 集成与运维
@@ -450,12 +465,12 @@ python3 agent/cli.py llm-smoke --prompt 'Return JSON only: {"ok": true}'
 本项目可以通过几种方式嵌入企业内部 Agent 平台：
 
 - **终端模式**：在受控 shell 中运行 `./bin/anychain-agent`。
-- **程序化模式**：调用 `python3 agent/cli.py` 子命令，通过 JSON 交换数据。
+- **程序化模式**：调用 `python3 -m agent.cli` 子命令，通过 JSON 交换数据。
   常用命令包括 `doctor`、`capabilities`、`draft-request`、`plan`、`preflight`、
   `submit`、`status`、`analyze` 和 `artifact-qa`。
-- **工具 schema 模式**：调用 `python3 agent/cli.py tool-schema`，导出
+- **工具 schema 模式**：调用 `python3 -m agent.cli tool-schema`，导出
   OpenAI-compatible function-tool schema，供企业 Agent 编排平台接入。
-- **工具调用模式**：调用 `python3 agent/cli.py tool-call --name <tool> --arguments '<json>'`，
+- **工具调用模式**：调用 `python3 -m agent.cli tool-call --name <tool> --arguments '<json>'`，
   让企业平台通过一个稳定命令执行指定 Agent tool。
 
 企业环境建议在运行镜像或部署 profile 中配置一次 `config/agent_config.sh`。密钥应由
@@ -477,18 +492,18 @@ workload 建议时，才需要启用自定义 Knowledge Base。
 通用 HTTP KB/RAG 服务可以使用 `AGENT_KNOWLEDGE_PROVIDER=http`。验证命令：
 
 ```bash
-python3 agent/cli.py knowledge-smoke --query "solana rpc methods" --chain solana
+python3 -m agent.cli knowledge-smoke --query "solana rpc methods" --chain solana
 ```
 
 企业 Agent 平台和 CI 可以检查底层 JSON 控制面：
 
 ```bash
-python3 agent/cli.py --help
-python3 agent/cli.py tool-schema
-python3 agent/cli.py tool-call --name load_capabilities
-python3 agent/cli.py plan --request /tmp/request.json --output /tmp/plan.json --dry-run
-python3 agent/cli.py preflight --plan /tmp/plan.json
-python3 agent/cli.py tool-call --name run_fake_node_smoke_benchmark \
+python3 -m agent.cli --help
+python3 -m agent.cli tool-schema
+python3 -m agent.cli tool-call --name load_capabilities
+python3 -m agent.cli plan --request /tmp/request.json --output /tmp/plan.json --dry-run
+python3 -m agent.cli preflight --plan /tmp/plan.json
+python3 -m agent.cli tool-call --name run_fake_node_smoke_benchmark \
   --arguments '{"plan_file":"/tmp/plan.json","approved":true}'
 ```
 
@@ -514,10 +529,10 @@ python3 agent/cli.py tool-call --name run_fake_node_smoke_benchmark \
 Agent job 辅助命令：
 
 ```bash
-python3 agent/cli.py jobs
-python3 agent/cli.py resume --job-id <job_id>
-python3 agent/cli.py logs --job-id <job_id>
-python3 agent/cli.py diagnose-artifacts --artifact-index <agent-output-dir>/jobs/<job_id>/artifact_index.json
+python3 -m agent.cli jobs
+python3 -m agent.cli resume --job-id <job_id>
+python3 -m agent.cli logs --job-id <job_id>
+python3 -m agent.cli diagnose-artifacts --artifact-index <agent-output-dir>/jobs/<job_id>/artifact_index.json
 ```
 
 `diagnose-artifacts` 会对已有 CSV 应用确定性瓶颈规则，包括 CPU 饱和、磁盘延迟/队列、
@@ -546,7 +561,7 @@ GRAFANA_PORT=3001
 修改模板前，先用 Agent 检查缺口：
 
 ```bash
-python3 agent/cli.py gap-analysis \
+python3 -m agent.cli gap-analysis \
   --chain solana \
   --method getBalance \
   --method customMethod
@@ -555,7 +570,7 @@ python3 agent/cli.py gap-analysis \
 生成插件化 onboarding package：
 
 ```bash
-python3 agent/cli.py onboarding-plan \
+python3 -m agent.cli onboarding-plan \
   --chain foochain \
   --adapter-family jsonrpc \
   --method foo_getBalance \
@@ -565,7 +580,7 @@ python3 agent/cli.py onboarding-plan \
 生成需要人工 review 的保守 chain template 草案：
 
 ```bash
-python3 agent/cli.py draft-chain-template \
+python3 -m agent.cli draft-chain-template \
   --chain foochain \
   --adapter-family jsonrpc \
   --method foo_getBalance \
@@ -582,6 +597,13 @@ python3 agent/cli.py draft-chain-template \
 endpoint 和 method payload。用户提供的 request/response 样本可以帮助起草 workload，
 但只有同一个 method 在可访问 endpoint 上验证成功，并且 fixture 通过 fake-node smoke
 之后，才算真正可用。
+
+参数 wire shape 与参数 meaning 是两个独立 gate。零参数 method 必须保留明确的空
+params；positional/object method 必须保留 list 顺序或 object key，并逐个确认
+index/name、JSON wire type、区块链 semantic type 或 encoding、meaning、
+required/optional 和 example。`single_replace` 使用一个已验证 method；
+`mixed_replace` 删除模板 defaults；`mixed_add` 保留 defaults。active mixed weights
+必须是正整数且总和严格为 100，所有变化只写入 job-local override。
 
 如果一个未配置的新链看起来属于现有 adapter family，chain template 只是起点，
 不是支持完成证明。onboarding 流程仍然必须完成协议分类、可访问 endpoint 的安全

@@ -4,22 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
-try:
-    from ..knowledge.entry_contract import (
-        OPTIONAL_ACCOUNTS_FIELDS,
-        REAL_NODE_ENDPOINT_FIELDS,
-        RUNTIME_BASELINE_FIELDS,
-        WORKFLOW_CONFIRMATION_FIELDS,
-        field_specs_for,
-    )
-except ImportError:  # script execution with agent/ on sys.path
-    from knowledge.entry_contract import (
-        OPTIONAL_ACCOUNTS_FIELDS,
-        REAL_NODE_ENDPOINT_FIELDS,
-        RUNTIME_BASELINE_FIELDS,
-        WORKFLOW_CONFIRMATION_FIELDS,
-        field_specs_for,
-    )
+from agent.knowledge.entry_contract import (
+    OPTIONAL_ACCOUNTS_FIELDS,
+    REAL_NODE_ENDPOINT_FIELDS,
+    RUNTIME_BASELINE_FIELDS,
+    WORKFLOW_CONFIRMATION_FIELDS,
+)
+from agent.harness.sync_observe_contract import SyncObserveRequest
 
 
 ENDPOINT_REQUIRED = {field.key: field.description for field in REAL_NODE_ENDPOINT_FIELDS if field.key == "local_rpc_url"}
@@ -31,23 +22,6 @@ RUNTIME_BASELINE_REQUIRED = {
 }
 
 COMMON_REQUIRED = {field.key: field.description for field in WORKFLOW_CONFIRMATION_FIELDS}
-
-SYNC_OBSERVE_REQUIRED = {field.key: field.description for field in field_specs_for("sync_observe") if field.required}
-
-SYNC_OBSERVE_OPTIONAL = {field.key: field.description for field in field_specs_for("sync_observe") if not field.required}
-
-# Per-`sync_observe_source` waived requirements. `endpoint_only` watches a
-# remote node -- there is no local process, so `node_process_identity` (local
-# CPU/thread attribution) cannot and need not be provided. `demo_only` has
-# neither a local process nor a real endpoint at all, so it also waives
-# `mainnet_rpc_url_reviewed` (there is no real mainnet RPC to have reviewed).
-# `existing_local_node`/`client_setup` need both genuinely satisfied (and
-# `client_setup` is never the terminal source at preflight time -- it always
-# transitions to one of the other three before reaching this checklist).
-SYNC_OBSERVE_SOURCE_WAIVERS: dict[str, set[str]] = {
-    "endpoint_only": {"node_process_identity"},
-    "demo_only": {"node_process_identity", "mainnet_rpc_url_reviewed"},
-}
 
 ENVIRONMENT_REVIEW = {
     "cloud_provider": "Detected cloud provider: gcp, aws, azure, or other.",
@@ -80,14 +54,32 @@ def build_configuration_checklist(request: dict[str, Any], plan: dict[str, Any])
 
     benchmark_items = []
     if workload_type == "sync_observe":
-        waived = SYNC_OBSERVE_SOURCE_WAIVERS.get(str(request_values.get("sync_observe_source") or ""), set())
-        for key, description in SYNC_OBSERVE_REQUIRED.items():
-            if key in waived:
-                benchmark_items.append(_item(key, description, True, "info"))
-                continue
-            benchmark_items.append(_item(key, description, _is_present(key, request_values.get(key)), "blocker"))
-        for key, description in SYNC_OBSERVE_OPTIONAL.items():
-            benchmark_items.append(_item(key, description, bool(request_values.get(key)), "info"))
+        sync_request = SyncObserveRequest.from_request_values(request_values)
+        presence = sync_request.checklist_presence()
+        descriptions = {
+            "sync_observe_source": "Confirm an existing local real-node process or a real endpoint-only source.",
+            "sync_observe_rpc_url": "Validate the real node RPC endpoint used to observe sync/import progress.",
+            "node_process_identity": "Confirm the local node process for CPU/thread attribution when observing a local process.",
+            "mainnet_rpc_url_reviewed": "Confirm the sync-health / MAINNET_RPC_URL comparison behavior.",
+            "sync_observe_stop_condition": "Confirm whether observation runs until stopped, for a duration, or until synced.",
+            "sync_observe_duration_seconds": "Provide a positive duration when the stop condition is duration.",
+        }
+        source_present = sync_request.source in {"existing_local_node", "endpoint_only"}
+        benchmark_items.append(_item("sync_observe_source", descriptions["sync_observe_source"], source_present, "blocker"))
+        for key in (
+            "sync_observe_rpc_url",
+            "node_process_identity",
+            "mainnet_rpc_url_reviewed",
+            "sync_observe_stop_condition",
+            "sync_observe_duration_seconds",
+        ):
+            benchmark_items.append(_item(key, descriptions[key], presence[key], "blocker"))
+        benchmark_items.append(_item(
+            "node_prometheus_metrics_url",
+            "Optional node Prometheus metrics endpoint for client-native MGas/s metrics.",
+            presence["node_prometheus_metrics_url"],
+            "info",
+        ))
     else:
         for key, description in COMMON_REQUIRED.items():
             benchmark_items.append(_item(key, description, _is_present(key, request_values.get(key)), "blocker"))
@@ -183,7 +175,9 @@ def _flatten_request_values(request: dict[str, Any], plan: dict[str, Any]) -> di
         "network_interface": request.get("network_interface") or materialized.get("NETWORK_INTERFACE"),
         "network_max_bandwidth_gbps": request.get("network_max_bandwidth_gbps") or materialized.get("NETWORK_MAX_BANDWIDTH_GBPS"),
         "sync_observe_stop_condition": request.get("sync_observe_stop_condition") or materialized.get("SYNC_OBSERVE_STOP_CONDITION"),
+        "sync_observe_duration_seconds": request.get("sync_observe_duration_seconds") or materialized.get("SYNC_OBSERVE_DURATION"),
         "sync_observe_source": request.get("sync_observe_source", ""),
+        "sync_observe_rpc_url": request.get("sync_observe_rpc_url") or materialized.get("SYNC_OBSERVE_RPC_URL"),
         "node_prometheus_metrics_url": request.get("node_prometheus_metrics_url") or materialized.get("NODE_PROMETHEUS_METRICS_URL"),
         "node_process_identity": (
             request.get("node_process_pid")

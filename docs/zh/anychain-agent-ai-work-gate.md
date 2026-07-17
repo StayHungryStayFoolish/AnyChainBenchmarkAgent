@@ -16,9 +16,15 @@ If these rules conflict with an implementation shortcut, the rules win.
 
 AnyChain Agent 是基于 LangGraph Harness 的区块链节点 benchmark domain agent。
 Harness 负责产品 workflow state、group routing、fallback ordering、validator
-gates 和 execution decisions。Google ADK 只是可选的 model/tool bridge，不是第二套
-benchmark wizard。Agent 必须降低用户配置负担，并安全调用确定性的 benchmark
+gates 和 execution decisions。Google ADK 仅由可选的 Gemini `google_search`
+grounding 函数使用；它不是 Agent、Runner、workflow owner 或通用 tool bridge。
+Agent 必须降低用户配置负担，并安全调用确定性的 benchmark
 tools。它不是 shell script wizard，不是 keyword router，也不是 fallback demo 集合。
+
+Google ADK 必须通过 `scripts/install_agent_deps.sh --with-google-search` 显式安装。
+core LangGraph terminal runtime 以及 DeepSeek/OpenAI/Claude/不使用 search 的 Gemini
+运行都不得依赖它。保留的 `requirements-adk.txt`、`.venv-adk` 和 `--adk-venv`
+只是迁移期兼容 alias。
 
 The product loop is:
 
@@ -243,14 +249,15 @@ return-to-default-order behavior. Passing a linear happy path is not enough.
 
 ## Onboarding And Knowledge Boundary
 
-For a chain outside the supported templates, ADK must not jump directly to
+For a chain outside the supported templates, Harness must not jump directly to
 adapter-family selection, endpoint collection, or development handoff. It must
 first resolve whether the chain identity appears to exist, then confirm the
 protocol/adapter family. If framework knowledge is insufficient, ask the user
 for official chain documentation, protocol/RPC documentation, endpoint
 information, method examples, request/response samples, and fixture evidence.
 
-When Gemini plus Google authentication is configured, ADK may use
+When an eligible Gemini configuration, valid Gemini/Google authentication, and
+the optional Google ADK extra are available, Harness may use
 `google_search` only in onboarding and custom-RPC research flows. Search results
 are evidence, not authority to skip validation. Official documentation should
 be preferred over blogs or forums.
@@ -291,6 +298,9 @@ The Agent must do the following before execution:
    names.
 4. Probe the endpoint with the proposed method and params. User-provided
    request/response samples are evidence to verify, not facts to trust.
+   零参数 method 必须保留明确的空 params。positional/object params 必须保留 list
+   顺序或 object key，并逐个确认 index/name、JSON wire type、区块链 semantic type
+   或 encoding、meaning、required/optional 和 example。
 5. Confirm the method shape can be represented by the current chain template
    schema: `param_formats`, `_meta.rest_paths`, or `param_spec`.
 6. If schema support is missing, stop and produce a coding handoff. Do not hide
@@ -322,7 +332,8 @@ The Agent must complete two gates before Case 2 begins:
 1. Chain existence/identity gate: use the configured LLM with repository facts
    and current workflow state to decide whether the candidate appears to exist,
    is likely a typo for a supported chain, is unknown, or needs user-provided
-   evidence. With Gemini plus Google authentication, use ADK `google_search` on
+   evidence. With an eligible Gemini configuration, valid Gemini/Google
+   authentication, and the optional extra, use ADK `google_search` on
    official sources before asking the user to confirm the chain identity.
 2. Protocol-family gate: only after the chain identity is confirmed, infer the
    adapter family from repository facts, official docs, user-provided samples,
@@ -374,7 +385,8 @@ route the turn into a two-step chain identity workflow and follow this sequence:
    the user confirms the intended chain identity.
 3. Resolve protocol family second. Only after chain identity is confirmed,
    determine whether the chain appears to belong to an existing adapter family.
-   If Gemini plus Google authentication is available, use ADK `google_search`
+   If an eligible Gemini configuration, valid Gemini/Google authentication,
+   and the optional extra are available, use ADK `google_search`
    to look for official RPC documentation, official endpoint examples, and
    official request/response examples before proposing the family. If web
    research is unavailable, the model may use repository context and model
@@ -520,9 +532,16 @@ git diff --check
 ```
 
 When live model behavior is affected and a safe key is available, run the
-LangGraph live CLI matrix in an isolated environment. When benchmark
-execution is affected, run fake-node smoke in Docker or an isolated Linux
-environment.
+LangGraph live CLI matrix in Docker/Linux。产品 acceptance 和 coverage evidence
+只接受 Docker 运行；host run 只能作为开发检查。benchmark execution 变更必须在
+Docker 中运行适用的 fake-node、local real-node、custom-RPC 或 sync-observe 路径；
+fake-node 不能替代其他 workflow path。
+
+生成的 schedule、cataloged edge、covering row/tuple 和成功返回的 PTY 文本都只是
+test intent 或 transport evidence，不是 observed execution。pass 必须绑定当前 revision
+的实际 state transition 与独立验证的 postcondition；execution edge 还必须包含 hash
+绑定的 job artifact。报告必须分开列出 generated/cataloged、observed-pass、
+observed-fail、not-run、externally-blocked 和 uncovered denominator。
 
 If a boundary cannot be tested locally, report it as untested. Do not describe
 untested behavior as complete.

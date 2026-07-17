@@ -1,105 +1,106 @@
-"""Group metadata for `agent/validators/config_contract.py`'s preflight path.
+"""Authoritative workflow-group specifications.
 
-This module is intentionally pure data plus small lookup helpers. It does not
-parse user text, mutate workflow state, or render terminal prompts.
-
-It is NOT consulted by the live conversational routing path
-(`agent/harness/groups.py` / `agent/harness/routing.py`); that path uses
-`agent.harness.state.DEFAULT_GROUP_ORDER`, the actual single source of truth
-for group order (architecture audit Finding A). `GROUP_ORDER` below imports
-that same source directly (not a hand-typed copy), so the two cannot drift;
-the `GROUPS` tuple still carries `fields`/`questions`/`product_node`/
-`category` metadata `state.py` does not have, which `config_contract.py`
-genuinely needs, kept decoupled from harness behavioral/runtime types per
-this module's boundary rule (see `tools/check_agent_boundaries.py`'s
-`PURE_METADATA_FILES` entry for the exact forbidden markers).
+This pure metadata module is the single source for group order, ownership,
+owned fields, and registered question ids. Runtime domains own
+question construction and readiness behavior; this registry does not parse
+user text, mutate state, or render responses.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-
-try:
-    from ..harness.state import DEFAULT_GROUP_ORDER
-except ImportError:  # script execution with agent/ on sys.path
-    from harness.state import DEFAULT_GROUP_ORDER
+from typing import Iterable
 
 
 @dataclass(frozen=True)
-class WorkflowGroup:
+class GroupSpec:
     name: str
+    owner: str
     fields: tuple[str, ...] = ()
     questions: tuple[str, ...] = ()
+    depends_on: tuple[str, ...] = ()
+    invalidates: tuple[str, ...] = ()
     product_node: str = ""
     category: str = "setup"
+    workflow_modes: tuple[str, ...] = ()
+    fallback: bool = True
 
 
-GROUPS: tuple[WorkflowGroup, ...] = (
-    WorkflowGroup(
+GROUPS: tuple[GroupSpec, ...] = (
+    GroupSpec(
         name="opening",
-        questions=("opening_next_action",),
+        owner="orientation",
+        questions=("opening_next_action", "resume_harness_session"),
         product_node="opening",
     ),
-    WorkflowGroup(
+    GroupSpec(
         name="target_mode",
+        owner="chain_rpc",
         fields=("target_mode", "workflow_mode", "use_fake_node"),
-        questions=("target_mode", "target_mode_change_confirm"),
+        questions=("target_mode_select", "target_mode_change_confirm"),
+        invalidates=(
+            "endpoint_process", "workload_rpc", "target_samples_fixtures",
+            "qps_profile", "sync_observe", "preflight_smoke_execution", "job_monitoring",
+        ),
         product_node="target_mode",
     ),
-    WorkflowGroup(
+    GroupSpec(
         name="chain_identity",
-        fields=("chain", "BLOCKCHAIN_NODE", "chain_identity"),
+        owner="chain_rpc",
+        fields=("BLOCKCHAIN_NODE", "chain_identity", "secondary_handoff"),
         questions=(
             "chain",
-            "chain_selection",
             "chain_ambiguity_confirm",
             "chain_change_confirm",
             "unknown_chain_identity_confirm",
             "adapter_family_confirm",
+            "case3_protocol_evidence",
+            "case3_evidence_next",
+        ),
+        depends_on=("target_mode",),
+        invalidates=(
+            "endpoint_process", "chain_auxiliary_endpoints", "workload_rpc",
+            "target_samples_fixtures", "preflight_smoke_execution", "job_monitoring",
         ),
         product_node="chain_selection",
     ),
-    WorkflowGroup(
+    GroupSpec(
         name="provider_deployment",
+        owner="environment",
         fields=(
             "CLOUD_PROVIDER",
             "CLOUD_REGION",
             "CLOUD_ZONE",
             "MACHINE_TYPE",
-            "deployment",
-            "cloud_provider",
-            "cloud_region",
-            "cloud_zone",
-            "machine_type",
         ),
-        questions=("cloud_region", "cloud_zone", "machine_type"),
+        questions=("CLOUD_REGION", "CLOUD_ZONE", "MACHINE_TYPE", "inferred_config_review"),
+        invalidates=("preflight_smoke_execution", "job_monitoring"),
         product_node="environment_config",
     ),
-    WorkflowGroup(
+    GroupSpec(
         name="ledger_disk",
+        owner="environment",
         fields=(
             "LEDGER_DEVICE",
             "DATA_VOL_TYPE",
             "DATA_VOL_SIZE",
             "DATA_VOL_MAX_IOPS",
             "DATA_VOL_MAX_THROUGHPUT",
-            "ledger_device",
-            "data_vol_type",
-            "data_vol_size",
-            "data_vol_max_iops",
-            "data_vol_max_throughput",
         ),
+        invalidates=("preflight_smoke_execution", "job_monitoring"),
         questions=(
-            "ledger_device",
-            "data_vol_type",
-            "data_vol_size",
-            "data_vol_max_iops",
-            "data_vol_max_throughput",
+            "LEDGER_DEVICE",
+            "DATA_VOL_TYPE",
+            "DATA_VOL_SIZE",
+            "DATA_VOL_MAX_IOPS",
+            "DATA_VOL_MAX_THROUGHPUT",
+            "inferred_config_review",
         ),
         product_node="environment_config",
     ),
-    WorkflowGroup(
+    GroupSpec(
         name="accounts_disk",
+        owner="environment",
         fields=(
             "has_accounts_device",
             "ACCOUNTS_DEVICE",
@@ -107,40 +108,42 @@ GROUPS: tuple[WorkflowGroup, ...] = (
             "ACCOUNTS_VOL_SIZE",
             "ACCOUNTS_VOL_MAX_IOPS",
             "ACCOUNTS_VOL_MAX_THROUGHPUT",
-            "accounts_device",
-            "accounts_vol_type",
-            "accounts_vol_size",
-            "accounts_vol_max_iops",
-            "accounts_vol_max_throughput",
         ),
+        invalidates=("preflight_smoke_execution", "job_monitoring"),
         questions=(
             "has_accounts_device",
-            "accounts_device",
-            "accounts_vol_type",
-            "accounts_vol_size",
-            "accounts_vol_max_iops",
-            "accounts_vol_max_throughput",
+            "ACCOUNTS_DEVICE",
+            "ACCOUNTS_VOL_TYPE",
+            "ACCOUNTS_VOL_SIZE",
+            "ACCOUNTS_VOL_MAX_IOPS",
+            "ACCOUNTS_VOL_MAX_THROUGHPUT",
+            "inferred_config_review",
         ),
         product_node="environment_config",
     ),
-    WorkflowGroup(
+    GroupSpec(
         name="network",
-        fields=("NETWORK_INTERFACE", "NETWORK_MAX_BANDWIDTH_GBPS", "network_interface", "network_max_bandwidth_gbps"),
-        questions=("network_interface", "network_max_bandwidth_gbps"),
+        owner="environment",
+        fields=("NETWORK_INTERFACE", "NETWORK_MAX_BANDWIDTH_GBPS"),
+        questions=("network_interface", "NETWORK_MAX_BANDWIDTH_GBPS", "inferred_config_review"),
+        invalidates=("preflight_smoke_execution", "job_monitoring"),
         product_node="environment_config",
     ),
-    WorkflowGroup(
+    GroupSpec(
         name="endpoint_process",
-        fields=("LOCAL_RPC_URL", "MAINNET_RPC_URL", "MAINNET_RPC_URL_REVIEWED", "BLOCKCHAIN_PROCESS_NAMES", "SYNC_OBSERVE_RPC_URL"),
+        owner="chain_rpc",
+        fields=("LOCAL_RPC_URL", "MAINNET_RPC_URL", "MAINNET_RPC_URL_REVIEWED", "BLOCKCHAIN_PROCESS_NAMES", "SYNC_OBSERVE_RPC_URL", "endpoint_evidence"),
         questions=(
             "LOCAL_RPC_URL",
             "SYNC_OBSERVE_RPC_URL",
             "MAINNET_RPC_URL_REVIEWED",
             "BLOCKCHAIN_PROCESS_NAMES",
+            "chain_change_input",
             "custom_rpc_endpoint",
             "custom_rpc_method",
             "custom_rpc_schema_evidence",
             "custom_rpc_schema_confirm",
+            "custom_rpc_response_confirm",
             "custom_rpc_adapter_family_confirm",
             "custom_rpc_continue",
             "custom_rpc_scope",
@@ -150,15 +153,19 @@ GROUPS: tuple[WorkflowGroup, ...] = (
             "new_chain_method",
             "new_chain_schema_evidence",
             "new_chain_schema_confirm",
+            "new_chain_response_confirm",
             "new_chain_method_continue",
             "new_chain_workload_scope",
             "new_chain_single_method",
             "new_chain_custom_weights",
         ),
+        depends_on=("target_mode", "chain_identity"),
+        invalidates=("target_samples_fixtures", "preflight_smoke_execution", "job_monitoring"),
         product_node="endpoint_process",
     ),
-    WorkflowGroup(
+    GroupSpec(
         name="chain_auxiliary_endpoints",
+        owner="chain_rpc",
         fields=(
             "CHAIN_REST_URL",
             "CHAIN_INDEXER_URL",
@@ -168,205 +175,207 @@ GROUPS: tuple[WorkflowGroup, ...] = (
             "CHAIN_MIRROR_URL",
             "RPC_API_KEY",
         ),
+        depends_on=("chain_identity",),
+        invalidates=("preflight_smoke_execution", "job_monitoring"),
         questions=(
-            "CHAIN_REST_URL",
-            "CHAIN_INDEXER_URL",
-            "CHAIN_SIDECAR_URL",
-            "CHAIN_EVM_RPC_URL",
-            "CHAIN_JSON_RPC_URL",
-            "CHAIN_MIRROR_URL",
             "RPC_API_KEY",
         ),
         product_node="real_node_endpoint",
     ),
-    WorkflowGroup(
+    GroupSpec(
         name="workload_rpc",
-        fields=("rpc_mode", "RPC_MODE", "rpc_methods", "mixed_weights", "custom_rpc", "custom_rpc_methods"),
+        owner="chain_rpc",
+        fields=("rpc_mode", "workload", "custom_rpc"),
         questions=(
             "rpc_mode",
-            "workload_customization_choice",
+            "workload_confirm",
+            "target_change_scope",
         ),
+        depends_on=("target_mode", "chain_identity"),
+        invalidates=("target_samples_fixtures", "preflight_smoke_execution", "job_monitoring"),
         product_node="rpc_workload",
+        workflow_modes=("rpc_benchmark",),
     ),
-    WorkflowGroup(
+    GroupSpec(
         name="target_samples_fixtures",
-        fields=("target_samples", "fixture_status"),
+        owner="chain_rpc",
+        fields=("target_samples", "fixture_evidence"),
+        questions=("new_chain_runtime_choice", "custom_rpc_fixture_choice"),
+        depends_on=("chain_identity", "workload_rpc"),
+        invalidates=("preflight_smoke_execution", "job_monitoring"),
         product_node="custom_rpc",
+        workflow_modes=("rpc_benchmark",),
     ),
-    WorkflowGroup(
+    GroupSpec(
         name="qps_profile",
-        fields=("benchmark_profile",),
-        questions=("benchmark_mode_confirmed", "qps_profile_confirmed"),
+        owner="performance",
+        fields=("qps_profile",),
+        questions=("benchmark_mode", "qps_profile_confirm", "qps_adjust_field", "qps_adjust_value"),
+        depends_on=("target_mode",),
+        invalidates=("preflight_smoke_execution", "job_monitoring"),
         product_node="rpc_workload",
+        workflow_modes=("rpc_benchmark",),
     ),
-    WorkflowGroup(
+    GroupSpec(
         name="sync_observe",
+        owner="sync_observe",
         fields=(
             "sync_observe",
-            "sync_observe_stop_condition",
             "NODE_PROMETHEUS_METRICS_URL",
             "NODE_PROCESS_PID",
-            "BLOCKCHAIN_PROCESS_NAMES",
-            "MAINNET_RPC_URL",
-            "node_prometheus_metrics_url",
-            "node_process_pid",
-            "node_process_identity",
-            "blockchain_process_names",
-            "mainnet_rpc_url_reviewed",
         ),
+        depends_on=("target_mode", "chain_identity", "endpoint_process"),
+        invalidates=("preflight_smoke_execution", "job_monitoring"),
         questions=(
+            "sync_observe_source",
+            "sync_observe_after_client_setup",
             "sync_observe_stop_condition",
-            "node_prometheus_metrics_url",
-            "node_process_identity",
-            "mainnet_rpc_url_reviewed",
+            "sync_observe_duration_seconds",
         ),
         product_node="sync_observe",
+        workflow_modes=("sync_observe",),
     ),
-    WorkflowGroup(
+    GroupSpec(
         name="observability",
+        owner="performance",
         fields=("observability",),
-        questions=("observability_choice_confirmed",),
+        questions=("observability_mode",),
+        invalidates=("preflight_smoke_execution", "job_monitoring"),
         product_node="observability",
     ),
-    WorkflowGroup(
+    GroupSpec(
         name="advanced_tuning",
+        owner="performance",
         fields=("advanced_tuning",),
         questions=(
             "advanced_tuning_confirm",
             "advanced_tuning_adjust_field",
             "advanced_tuning_adjust_value",
         ),
+        invalidates=("preflight_smoke_execution", "job_monitoring"),
         product_node="advanced_threshold_review",
     ),
-    WorkflowGroup(
+    GroupSpec(
         name="preflight_smoke_execution",
-        fields=("preflight_result", "smoke_result", "approval"),
+        owner="execution",
+        fields=("preflight", "plan", "plan_file", "smoke", "final_benchmark"),
         questions=("preflight_smoke_confirm",),
         product_node="preflight_smoke",
         category="execution",
     ),
-    WorkflowGroup(
+    GroupSpec(
         name="job_monitoring",
-        fields=("job", "latest_job_id"),
+        owner="execution",
+        fields=("job",),
         product_node="job_monitoring",
         category="execution",
+        fallback=False,
     ),
-    WorkflowGroup(
+    GroupSpec(
+        name="failure_recovery",
+        owner="recovery",
+        fields=("failure_recovery",),
+        questions=("failure_recovery_action",),
+        product_node="failure_recovery",
+        category="execution",
+        fallback=False,
+    ),
+    GroupSpec(
         name="error_evidence_analysis",
-        fields=("evidence", "evidence_buffer"),
+        owner="analysis",
+        fields=("evidence_buffer", "evidence_collection"),
         product_node="evidence_review",
         category="analysis",
+        fallback=False,
     ),
-    WorkflowGroup(
+    GroupSpec(
         name="report_artifact_analysis",
-        fields=("latest_job_id", "latest_plan_file"),
+        owner="analysis",
+        fields=("report_context",),
+        depends_on=("job_monitoring",),
         product_node="analysis",
         category="analysis",
+        fallback=False,
     ),
 )
 
 
-GROUP_ORDER: tuple[str, ...] = tuple(DEFAULT_GROUP_ORDER)
-_GROUPS_NAMES = tuple(group.name for group in GROUPS)
-if _GROUPS_NAMES != GROUP_ORDER:
-    # Not an `assert` on purpose: `python -O` strips asserts, and this
-    # invariant (this file's GROUPS metadata describing the real group set)
-    # must hold even in optimized runs. This module is imported at process
-    # startup by agent.validators.config_contract, agent.tools.executor, and
-    # agent.runners.benchmark_pipeline, so a drift here fails those imports
-    # too, not just this file's own preflight path — that is intentional:
-    # the existing tests.test_agent_langgraph_harness::
-    # test_group_registry_order_matches_state_default_group_order test can
-    # only catch this in CI; this check catches it the moment anything
-    # imports the drifted module, in any environment.
-    raise RuntimeError(
-        "agent.workflows.group_registry.GROUPS has drifted from "
-        "agent.harness.state.DEFAULT_GROUP_ORDER.\n"
-        f"  GROUPS names:            {_GROUPS_NAMES}\n"
-        f"  DEFAULT_GROUP_ORDER:     {GROUP_ORDER}\n"
-        "Fix: update the GROUPS tuple above (add/remove/reorder a "
-        "WorkflowGroup entry) so its names match DEFAULT_GROUP_ORDER exactly."
-    )
+SUPPORTED_WORKFLOW_MODES = frozenset({"rpc_benchmark", "sync_observe"})
+
+
+def validate_group_registry(groups: Iterable[GroupSpec]) -> tuple[GroupSpec, ...]:
+    """Build a registry only when ownership and graph metadata are unambiguous."""
+
+    registry = tuple(groups)
+    names = tuple(group.name for group in registry)
+    duplicate_names = sorted({name for name in names if names.count(name) > 1})
+    if duplicate_names:
+        raise RuntimeError(f"duplicate group names in GroupSpec registry: {duplicate_names}")
+    if not all(group.owner for group in registry):
+        raise RuntimeError("every GroupSpec must declare one owner")
+
+    field_groups: dict[str, list[str]] = {}
+    for group in registry:
+        for field in group.fields:
+            field_groups.setdefault(field, []).append(group.name)
+    duplicate_fields = {
+        field: owners for field, owners in field_groups.items() if len(owners) > 1
+    }
+    if duplicate_fields:
+        details = ", ".join(
+            f"{field}={owners}" for field, owners in sorted(duplicate_fields.items())
+        )
+        raise RuntimeError(f"duplicate persisted field ownership: {details}")
+
+    known = set(names)
+    for group in registry:
+        unknown_dependencies = sorted(set(group.depends_on) - known)
+        unknown_invalidations = sorted(set(group.invalidates) - known)
+        unknown_modes = sorted(set(group.workflow_modes) - SUPPORTED_WORKFLOW_MODES)
+        if unknown_dependencies or unknown_invalidations or unknown_modes:
+            raise RuntimeError(
+                f"invalid GroupSpec metadata for {group.name}: "
+                f"dependencies={unknown_dependencies}, "
+                f"invalidations={unknown_invalidations}, modes={unknown_modes}"
+            )
+        if group.name in group.depends_on:
+            raise RuntimeError(f"GroupSpec {group.name} cannot depend on itself")
+
+    dependencies = {group.name: group.depends_on for group in registry}
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in visiting:
+            raise RuntimeError(f"GroupSpec dependency cycle includes {name}")
+        if name in visited:
+            return
+        visiting.add(name)
+        for dependency in dependencies[name]:
+            visit(dependency)
+        visiting.remove(name)
+        visited.add(name)
+
+    for name in names:
+        visit(name)
+    return registry
+
+
+GROUPS = validate_group_registry(GROUPS)
+GROUP_ORDER: tuple[str, ...] = tuple(group.name for group in GROUPS)
+GROUP_OWNER: dict[str, str] = {group.name: group.owner for group in GROUPS}
 GROUP_FIELD_MAP: dict[str, set[str]] = {group.name: set(group.fields) for group in GROUPS}
+FIELD_GROUP: dict[str, str] = {
+    field: group.name for group in GROUPS for field in group.fields
+}
+FIELD_OWNER: dict[str, str] = {
+    field: group.owner for group in GROUPS for field in group.fields
+}
 GROUP_QUESTION_ORDER: tuple[tuple[str, tuple[str, ...]], ...] = tuple(
     (group.name, group.questions) for group in GROUPS if group.questions
 )
 GROUP_TO_PRODUCT_NODE: dict[str, str] = {group.name: group.product_node for group in GROUPS if group.product_node}
-
-SETUP_QUESTION_IDS: frozenset[str] = frozenset(
-    {
-        "chain",
-        "chain_selection",
-        "opening_next_action",
-        "target_mode",
-        "target_mode_change_confirm",
-        "chain_ambiguity_confirm",
-        "chain_change_confirm",
-        "unknown_chain_identity_confirm",
-        "adapter_family_confirm",
-        "real_node_local_rpc_url",
-        "LOCAL_RPC_URL",
-        "SYNC_OBSERVE_RPC_URL",
-        "MAINNET_RPC_URL_REVIEWED",
-        "custom_rpc_endpoint",
-        "custom_rpc_method",
-        "custom_rpc_schema_evidence",
-        "custom_rpc_schema_confirm",
-        "custom_rpc_adapter_family_confirm",
-        "custom_rpc_continue",
-        "custom_rpc_scope",
-        "custom_rpc_single_method",
-        "custom_rpc_weights",
-        "new_chain_endpoint",
-        "new_chain_method",
-        "new_chain_schema_evidence",
-        "new_chain_schema_confirm",
-        "new_chain_method_continue",
-        "new_chain_workload_scope",
-        "new_chain_single_method",
-        "new_chain_custom_weights",
-        "mainnet_rpc_url_reviewed",
-        "cloud_region",
-        "cloud_zone",
-        "machine_type",
-        "disk_ledger_choice",
-        "disk_accounts_exists",
-        "disk_accounts_choice",
-        "blockchain_process_names",
-        "benchmark_profile_choice",
-        "benchmark_profile_adjust_item",
-        "benchmark_profile_adjust_value",
-        "sync_observe_stop_condition",
-        "node_prometheus_metrics_url",
-        "node_process_identity",
-        "default_workload_confirm",
-        "workload_confirm",
-        "workload_customization_choice",
-        "mixed_weights_confirm",
-        "observability_mode_choice",
-        "observability_ports_confirm",
-        *[question for _group, questions in GROUP_QUESTION_ORDER for question in questions],
-        "local_rpc_url",
-        "rpc_mode_choice",
-        "benchmark_profile_confirm",
-    }
-)
-
-POST_CONFIG_QUESTION_IDS: frozenset[str] = frozenset(
-    {
-        "default_workload_confirm",
-        "workload_confirm",
-        "workload_customization_choice",
-        "benchmark_profile_choice",
-        "benchmark_profile_confirm",
-        "benchmark_profile_adjust_item",
-        "benchmark_profile_adjust_value",
-        "observability_mode_choice",
-        "observability_ports_confirm",
-    }
-)
-
-POST_CONFIG_BRANCHES: frozenset[str] = frozenset({"rpc_workload", "benchmark_profile", "observability"})
+GROUP_SPEC_BY_NAME: dict[str, GroupSpec] = {group.name: group for group in GROUPS}
 
 
 def normalize_group_name(value: object) -> str:
@@ -376,96 +385,24 @@ def normalize_group_name(value: object) -> str:
 
 def group_for_field(field_name: str) -> str:
     field = str(field_name or "").strip()
-    if not field:
-        return ""
-    for group, fields in GROUP_FIELD_MAP.items():
-        if field in fields:
-            return group
-    return ""
+    return FIELD_GROUP.get(field, "") if field else ""
 
 
-def group_for_question_id(question_id: str) -> str:
-    qid = str(question_id or "").strip()
-    if not qid:
-        return ""
-    for group, questions in GROUP_QUESTION_ORDER:
-        if qid in questions:
-            return group
-    aliases = {
-        "disk_ledger_choice": "ledger_disk",
-        "disk_accounts_exists": "accounts_disk",
-        "disk_accounts_choice": "accounts_disk",
-        "opening_next_action": "opening",
-        "target_mode": "target_mode",
-        "target_mode_change_confirm": "target_mode",
-        "chain": "chain_identity",
-        "chain_selection": "chain_identity",
-        "chain_ambiguity_confirm": "chain_identity",
-        "chain_change_confirm": "chain_identity",
-        "unknown_chain_identity_confirm": "chain_identity",
-        "adapter_family_confirm": "chain_identity",
-        "real_node_local_rpc_url": "endpoint_process",
-        "local_rpc_url": "endpoint_process",
-        "LOCAL_RPC_URL": "endpoint_process",
-        "SYNC_OBSERVE_RPC_URL": "endpoint_process",
-        "MAINNET_RPC_URL_REVIEWED": "endpoint_process",
-        "BLOCKCHAIN_PROCESS_NAMES": "endpoint_process",
-        "rpc_mode_choice": "workload_rpc",
-        "default_workload_confirm": "workload_rpc",
-        "workload_confirm": "workload_rpc",
-        "workload_customization_choice": "workload_rpc",
-        "mixed_weights_confirm": "workload_rpc",
-        "custom_rpc_endpoint_gate": "endpoint_process",
-        "custom_rpc_endpoint": "endpoint_process",
-        "custom_rpc_method": "endpoint_process",
-        "custom_rpc_schema_evidence": "endpoint_process",
-        "custom_rpc_schema_confirm": "endpoint_process",
-        "custom_rpc_adapter_family_confirm": "endpoint_process",
-        "custom_rpc_continue": "endpoint_process",
-        "custom_rpc_scope": "endpoint_process",
-        "custom_rpc_single_method": "endpoint_process",
-        "custom_rpc_weights": "endpoint_process",
-        "benchmark_profile_choice": "qps_profile",
-        "benchmark_profile_confirm": "qps_profile",
-        "benchmark_profile_adjust_item": "qps_profile",
-        "benchmark_profile_adjust_value": "qps_profile",
-        "observability_mode_choice": "observability",
-        "observability_ports_confirm": "observability",
-        "smoke_run_confirm": "preflight_smoke_execution",
-        "apply_pasted_evidence": "error_evidence_analysis",
-        "chain_identity_resolution": "chain_identity",
-        "chain_protocol_resolution": "chain_identity",
-        "unsupported_chain_endpoint_gate": "endpoint_process",
-        "unsupported_chain_handoff_confirm": "chain_identity",
-        "new_chain_endpoint": "endpoint_process",
-        "new_chain_method": "endpoint_process",
-        "new_chain_schema_evidence": "endpoint_process",
-        "new_chain_schema_confirm": "endpoint_process",
-        "new_chain_method_continue": "endpoint_process",
-        "new_chain_workload_scope": "endpoint_process",
-        "new_chain_single_method": "endpoint_process",
-        "new_chain_custom_weights": "endpoint_process",
-    }
-    return aliases.get(qid, "")
+def fallback_groups_for_workflow(workflow_mode: str) -> tuple[GroupSpec, ...]:
+    """Return the registry-ordered prerequisites applicable to one product path."""
+
+    mode = str(workflow_mode or "").strip()
+    return tuple(
+        group
+        for group in GROUPS
+        if group.fallback and (not group.workflow_modes or mode in group.workflow_modes)
+    )
 
 
 def product_node_for_group(group_name: str) -> str:
     return GROUP_TO_PRODUCT_NODE.get(normalize_group_name(group_name), "")
 
 
-def question_keys_for_group(group_name: str | None) -> tuple[str, ...]:
-    group = normalize_group_name(group_name)
-    if not group:
-        return ()
-    for name, questions in GROUP_QUESTION_ORDER:
-        if name == group:
-            return tuple(questions)
-    return ()
-
-
-def is_setup_question_id(question_id: str) -> bool:
-    return str(question_id or "").strip() in SETUP_QUESTION_IDS
-
-
-def is_post_config_question(question_id: str, branch: str = "") -> bool:
-    return str(question_id or "").strip() in POST_CONFIG_QUESTION_IDS or str(branch or "").strip() in POST_CONFIG_BRANCHES
+def invalidation_targets(group_name: str) -> tuple[str, ...]:
+    spec = GROUP_SPEC_BY_NAME.get(normalize_group_name(group_name))
+    return spec.invalidates if spec else ()

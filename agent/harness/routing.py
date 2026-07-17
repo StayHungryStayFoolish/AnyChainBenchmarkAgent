@@ -1,126 +1,165 @@
-"""Single source of truth for "what group is next" in the AnyChain Agent Harness.
+"""Registry-driven fallback routing for the AnyChain Agent Harness.
 
-`agent/harness/groups.py` (live turn routing) and `agent/harness/oracle.py`
-(status/explanation text) previously reimplemented this precondition chain
-independently by hand. Keeping one copy here means the group the Harness
-actually asks about next and the group it reports in status text can never
-disagree.
+The group registry owns product order and path applicability. Readiness
+predicates report domain facts only; they do not maintain a second workflow.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Callable
 
-try:
-    from agent.planners.chain_template_requirements import inspect_chain_template
-except ModuleNotFoundError:  # product script adds agent/ to sys.path
-    from planners.chain_template_requirements import inspect_chain_template
+from agent.planners.chain_template_requirements import inspect_chain_template
+from agent.workflows.group_registry import fallback_groups_for_workflow
+
+from .failures import unresolved_recovery
+from .sync_observe_contract import SyncObserveBlocker, SyncObserveRequest
+
+
+@dataclass(frozen=True)
+class GroupReadiness:
+    ready: bool
+    reason: str = ""
+    continuation: bool = False
+
+
+ReadinessPredicate = Callable[[dict[str, Any]], GroupReadiness]
 
 
 def chain_auxiliary_fields_needed(chain: str) -> list[str]:
-    """Return the chain-auxiliary-endpoint fields this chain's template
-
-    actually substitutes at runtime (e.g. `${RPC_API_KEY}`). Most of the
-    seven fields this group could ask about are not consumed by any current
-    chain template; only ask about ones a template genuinely needs.
-    """
+    """Return only auxiliary endpoint fields consumed by the chain template."""
 
     if not chain:
         return []
     return list(inspect_chain_template(chain).get("runtime_endpoint_variables") or [])
 
 
-def next_group_and_reason(state: dict[str, Any]) -> tuple[str, str]:
-    """Return (group, reason) for the next blocking configuration group."""
+def sync_observe_readiness(state: dict[str, Any]) -> SyncObserveBlocker | None:
+    """Return the single blocking request fact for the sync-observe path."""
 
-    target_mode = str(state.get("target_mode") or "").strip()
-    if not target_mode:
-        return "opening", "choose target mode"
+    if str(state.get("workflow_mode") or "") != "sync_observe":
+        return None
+    return SyncObserveRequest.from_state(state).blocker()
+
+
+def _ready() -> GroupReadiness:
+    return GroupReadiness(True)
+
+
+def _missing(reason: str, *, continuation: bool = False) -> GroupReadiness:
+    return GroupReadiness(False, reason, continuation)
+
+
+def _opening_readiness(state: dict[str, Any]) -> GroupReadiness:
+    return _ready() if str(state.get("target_mode") or "").strip() else _missing("choose target mode")
+
+
+def chain_identity_confirmed(state: dict[str, Any]) -> bool:
+    """Return whether workload consumers may trust the selected chain."""
 
     identity = state.get("chain_identity") or {}
-    identity_status = identity.get("status")
-    if identity_status == "existing_family_needs_endpoint":
-        return "endpoint_process", f"continue new-chain validation: {identity_status}"
-    if identity_status in {
+    return (
+        str(identity.get("status") or "") == "confirmed"
+        and bool(str(identity.get("canonical") or "").strip())
+    )
+
+
+def _chain_identity_readiness(state: dict[str, Any]) -> GroupReadiness:
+    status = str((state.get("chain_identity") or {}).get("status") or "")
+    delegated = {
+        "existing_family_needs_endpoint",
         "existing_family_needs_method",
         "existing_family_needs_schema_evidence",
         "existing_family_schema_needs_confirmation",
         "existing_family_needs_workload_scope",
         "existing_family_needs_single_method",
         "existing_family_needs_weights",
-    }:
-        return "endpoint_process", f"continue new-chain validation: {identity_status}"
-    if identity_status == "existing_family_runtime_choice":
-        return "target_samples_fixtures", "choose new-chain runtime path"
-    if identity_status != "confirmed":
-        # `case2_runtime_override` (a promoted new-chain-in-existing-family
-        # path) is stored in `chain_identity["case"]`, never in
-        # `chain_identity["status"]` — status is always "confirmed" once a
-        # chain is usable. Matching only "confirmed" here mirrors
-        # `groups._chain_confirmed` exactly; do not reintroduce a
-        # "case2_runtime_override" status check, it would be dead code.
-        return "chain_identity", "confirm chain identity"
+        "existing_family_runtime_choice",
+    }
+    if status in delegated:
+        return _ready()
+    return _ready() if status == "confirmed" else _missing("confirm chain identity")
 
+
+def _provider_readiness(state: dict[str, Any]) -> GroupReadiness:
     confirmed = state.get("confirmed_config") or {}
-    for key in ("CLOUD_REGION", "CLOUD_ZONE", "MACHINE_TYPE"):
-        if not confirmed.get(key):
-            return "provider_deployment", f"confirm {key}"
-    for key in ("LEDGER_DEVICE", "DATA_VOL_TYPE", "DATA_VOL_SIZE", "DATA_VOL_MAX_IOPS", "DATA_VOL_MAX_THROUGHPUT"):
-        if not confirmed.get(key):
-            return "ledger_disk", f"confirm {key}"
-    if "has_accounts_device" not in confirmed:
-        return "accounts_disk", "confirm whether accounts/state disk exists"
-    if confirmed.get("has_accounts_device"):
-        for key in ("ACCOUNTS_DEVICE", "ACCOUNTS_VOL_TYPE", "ACCOUNTS_VOL_SIZE", "ACCOUNTS_VOL_MAX_IOPS", "ACCOUNTS_VOL_MAX_THROUGHPUT"):
-            if not confirmed.get(key):
-                return "accounts_disk", f"confirm {key}"
-    for key in ("NETWORK_INTERFACE", "NETWORK_MAX_BANDWIDTH_GBPS"):
-        if not confirmed.get(key):
-            return "network", f"confirm {key}"
-
-    endpoint_evidence = state.get("endpoint_evidence") or {}
-    if target_mode == "real-node" and not endpoint_evidence.get("local_rpc_url_ready"):
-        return "endpoint_process", "validate LOCAL_RPC_URL"
-    if target_mode == "real-node" and not confirmed.get("BLOCKCHAIN_PROCESS_NAMES"):
-        return "endpoint_process", "confirm BLOCKCHAIN_PROCESS_NAMES"
-    if target_mode == "real-node" and not confirmed.get("MAINNET_RPC_URL_REVIEWED"):
-        return "endpoint_process", "confirm MAINNET_RPC_URL / sync-health behavior"
-
-    chain_name = str(identity.get("canonical") or "").strip()
-    for field in chain_auxiliary_fields_needed(chain_name):
+    for field in ("CLOUD_REGION", "CLOUD_ZONE", "MACHINE_TYPE"):
         if not confirmed.get(field):
-            return "chain_auxiliary_endpoints", f"confirm {field}"
+            return _missing(f"confirm {field}")
+    return _ready()
 
-    workflow_mode = str(state.get("workflow_mode") or "").strip()
-    sync = state.get("sync_observe") or {}
-    if workflow_mode == "sync_observe":
-        source = sync.get("source")
-        if not source:
-            return "sync_observe", "choose sync-observe data source"
-        if source in {"existing_local_node", "endpoint_only"} and not endpoint_evidence.get("sync_rpc_url_ready"):
-            return "endpoint_process", "validate real sync-observe RPC endpoint"
-        if source == "existing_local_node" and not confirmed.get("BLOCKCHAIN_PROCESS_NAMES"):
-            return "endpoint_process", "confirm node process for sync-observe attribution"
-        if source in {"existing_local_node", "endpoint_only"} and not confirmed.get("MAINNET_RPC_URL_REVIEWED"):
-            return "endpoint_process", "confirm sync-health / MAINNET_RPC_URL behavior"
-        if source == "client_setup" and not sync.get("client_setup_acknowledged"):
-            return "sync_observe", "acknowledge real client setup handoff"
-        if source == "client_setup" and sync.get("client_setup_acknowledged"):
-            return "sync_observe", "choose sync-observe data source after client setup"
-        if not sync.get("stop_condition"):
-            return "sync_observe", "choose sync-observe stop condition"
-        if sync.get("stop_condition") == "duration" and not sync.get("duration_seconds"):
-            return "sync_observe", "confirm sync-observe duration"
-        if not (state.get("observability") or {}).get("mode"):
-            return "observability", "choose observability mode"
-        if not (state.get("advanced_tuning") or {}).get("confirmed"):
-            return "advanced_tuning", "review advanced tuning settings"
-        if not (state.get("preflight") or {}).get("approved"):
-            return "preflight_smoke_execution", "approve preflight/smoke"
-        return "job_monitoring", "monitor sync-observe job"
 
-    custom_rpc = state.get("custom_rpc") or {}
-    if custom_rpc.get("status") in {
+def _ledger_readiness(state: dict[str, Any]) -> GroupReadiness:
+    confirmed = state.get("confirmed_config") or {}
+    for field in (
+        "LEDGER_DEVICE",
+        "DATA_VOL_TYPE",
+        "DATA_VOL_SIZE",
+        "DATA_VOL_MAX_IOPS",
+        "DATA_VOL_MAX_THROUGHPUT",
+    ):
+        if not confirmed.get(field):
+            return _missing(f"confirm {field}")
+    return _ready()
+
+
+def _accounts_readiness(state: dict[str, Any]) -> GroupReadiness:
+    confirmed = state.get("confirmed_config") or {}
+    if "has_accounts_device" not in confirmed:
+        return _missing("confirm whether accounts/state disk exists")
+    if confirmed.get("has_accounts_device"):
+        for field in (
+            "ACCOUNTS_DEVICE",
+            "ACCOUNTS_VOL_TYPE",
+            "ACCOUNTS_VOL_SIZE",
+            "ACCOUNTS_VOL_MAX_IOPS",
+            "ACCOUNTS_VOL_MAX_THROUGHPUT",
+        ):
+            if not confirmed.get(field):
+                return _missing(f"confirm {field}")
+    return _ready()
+
+
+def _network_readiness(state: dict[str, Any]) -> GroupReadiness:
+    confirmed = state.get("confirmed_config") or {}
+    for field in ("NETWORK_INTERFACE", "NETWORK_MAX_BANDWIDTH_GBPS"):
+        if not confirmed.get(field):
+            return _missing(f"confirm {field}")
+    return _ready()
+
+
+def _endpoint_readiness(state: dict[str, Any]) -> GroupReadiness:
+    identity_status = str((state.get("chain_identity") or {}).get("status") or "")
+    continuation_statuses = {
+        "existing_family_needs_endpoint",
+        "existing_family_needs_method",
+        "existing_family_needs_schema_evidence",
+        "existing_family_schema_needs_confirmation",
+        "existing_family_needs_workload_scope",
+        "existing_family_needs_single_method",
+        "existing_family_needs_weights",
+    }
+    if identity_status in continuation_statuses:
+        return _missing(
+            f"continue new-chain validation: {identity_status}", continuation=True
+        )
+
+    target_mode = str(state.get("target_mode") or "")
+    endpoint_evidence = state.get("endpoint_evidence") or {}
+    confirmed = state.get("confirmed_config") or {}
+    if target_mode == "real-node" and not endpoint_evidence.get("local_rpc_url_ready"):
+        return _missing("validate LOCAL_RPC_URL")
+    if target_mode == "real-node" and not confirmed.get("BLOCKCHAIN_PROCESS_NAMES"):
+        return _missing("confirm BLOCKCHAIN_PROCESS_NAMES")
+    if target_mode == "real-node" and not confirmed.get("MAINNET_RPC_URL_REVIEWED"):
+        return _missing("confirm MAINNET_RPC_URL / sync-health behavior")
+
+    sync_blocker = sync_observe_readiness(state)
+    if sync_blocker and sync_blocker.group == "endpoint_process":
+        return _missing(sync_blocker.reason)
+
+    custom_status = str((state.get("custom_rpc") or {}).get("status") or "")
+    if str(state.get("workflow_mode") or "") == "rpc_benchmark" and custom_status in {
         "needs_endpoint",
         "needs_method",
         "needs_schema_evidence",
@@ -131,20 +170,116 @@ def next_group_and_reason(state: dict[str, Any]) -> tuple[str, str]:
         "needs_weights",
         "probe_failed",
     }:
-        return "endpoint_process", f"continue custom RPC workflow: {custom_rpc.get('status')}"
+        return _missing(f"continue custom RPC workflow: {custom_status}")
+    return _ready()
+
+
+def _chain_auxiliary_readiness(state: dict[str, Any]) -> GroupReadiness:
+    identity = state.get("chain_identity") or {}
+    confirmed = state.get("confirmed_config") or {}
+    chain = str(identity.get("canonical") or "").strip()
+    for field in chain_auxiliary_fields_needed(chain):
+        if not confirmed.get(field):
+            return _missing(f"confirm {field}")
+    return _ready()
+
+
+def _workload_readiness(state: dict[str, Any]) -> GroupReadiness:
+    if not chain_identity_confirmed(state):
+        return _missing("confirm chain identity before configuring RPC workload")
     if not state.get("rpc_mode"):
-        return "workload_rpc", "choose RPC mode"
+        return _missing("choose RPC mode")
     if not (state.get("workload") or {}).get("confirmed"):
-        return "workload_rpc", "confirm RPC workload"
+        return _missing("confirm RPC workload")
+    return _ready()
+
+
+def _fixture_readiness(state: dict[str, Any]) -> GroupReadiness:
+    identity_status = str((state.get("chain_identity") or {}).get("status") or "")
+    if identity_status == "existing_family_runtime_choice" and state.get("target_mode") == "fake-node":
+        return _missing("choose new-chain runtime path", continuation=True)
+    fixture = state.get("fixture_evidence") or {}
+    if (
+        state.get("target_mode") == "fake-node"
+        and fixture.get("required")
+        and fixture.get("status") != "validated"
+    ):
+        return _missing("resolve missing fixtures for the effective custom workload")
+    return _ready()
+
+
+def _qps_readiness(state: dict[str, Any]) -> GroupReadiness:
     qps = state.get("qps_profile") or {}
     if not qps.get("mode"):
-        return "qps_profile", "choose benchmark QPS mode"
+        return _missing("choose benchmark QPS mode")
     if not qps.get("confirmed"):
-        return "qps_profile", "confirm or adjust QPS profile"
-    if not (state.get("observability") or {}).get("mode"):
-        return "observability", "choose observability mode"
-    if not (state.get("advanced_tuning") or {}).get("confirmed"):
-        return "advanced_tuning", "review advanced tuning settings"
-    if not (state.get("preflight") or {}).get("approved"):
-        return "preflight_smoke_execution", "approve preflight/smoke"
-    return "job_monitoring", "monitor benchmark job"
+        return _missing("confirm or adjust QPS profile")
+    return _ready()
+
+
+def _sync_readiness(state: dict[str, Any]) -> GroupReadiness:
+    blocker = sync_observe_readiness(state)
+    if blocker and blocker.group == "sync_observe":
+        return _missing(blocker.reason)
+    return _ready()
+
+
+def _observability_readiness(state: dict[str, Any]) -> GroupReadiness:
+    return _ready() if (state.get("observability") or {}).get("mode") else _missing("choose observability mode")
+
+
+def _advanced_readiness(state: dict[str, Any]) -> GroupReadiness:
+    return _ready() if (state.get("advanced_tuning") or {}).get("confirmed") else _missing("review advanced tuning settings")
+
+
+def _preflight_readiness(state: dict[str, Any]) -> GroupReadiness:
+    return _ready() if (state.get("preflight") or {}).get("approved") else _missing("approve preflight/smoke")
+
+
+GROUP_READINESS: dict[str, ReadinessPredicate] = {
+    "opening": _opening_readiness,
+    "target_mode": lambda _state: _ready(),
+    "chain_identity": _chain_identity_readiness,
+    "provider_deployment": _provider_readiness,
+    "ledger_disk": _ledger_readiness,
+    "accounts_disk": _accounts_readiness,
+    "network": _network_readiness,
+    "endpoint_process": _endpoint_readiness,
+    "chain_auxiliary_endpoints": _chain_auxiliary_readiness,
+    "workload_rpc": _workload_readiness,
+    "target_samples_fixtures": _fixture_readiness,
+    "qps_profile": _qps_readiness,
+    "sync_observe": _sync_readiness,
+    "observability": _observability_readiness,
+    "advanced_tuning": _advanced_readiness,
+    "preflight_smoke_execution": _preflight_readiness,
+}
+
+
+def group_readiness(state: dict[str, Any], group: str) -> GroupReadiness:
+    """Return one group's readiness fact without selecting another group."""
+
+    predicate = GROUP_READINESS.get(str(group or ""))
+    return predicate(state) if predicate else _ready()
+
+
+def next_group_and_reason(state: dict[str, Any]) -> tuple[str, str]:
+    """Return the first registry-ordered blocking prerequisite and its fact."""
+
+    if unresolved_recovery(state.get("failure_recovery")):
+        return "failure_recovery", "resolve the current execution failure"
+
+    specs = fallback_groups_for_workflow(str(state.get("workflow_mode") or ""))
+    facts = [(spec.name, group_readiness(state, spec.name)) for spec in specs]
+    for group, fact in facts:
+        if not fact.ready and fact.continuation:
+            return group, fact.reason
+    for group, fact in facts:
+        if not fact.ready:
+            return group, fact.reason
+    terminal_reason = (
+        "monitor sync-observe job"
+        if str(state.get("workflow_mode") or "") == "sync_observe"
+        else "monitor benchmark job"
+    )
+    return "job_monitoring", terminal_reason

@@ -15,10 +15,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-try:
-    from utils.redaction import redact
-except ModuleNotFoundError:
-    from agent.utils.redaction import redact
+from agent.utils.redaction import redact
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -490,7 +487,10 @@ def _call_request(request_data: dict[str, Any], timeout: float) -> tuple[int | s
         with urllib.request.urlopen(req, timeout=timeout) as response:
             return response.status, response.read(4096).decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read(4096).decode("utf-8", "replace")
+        try:
+            return exc.code, exc.read(4096).decode("utf-8", "replace")
+        finally:
+            exc.close()
     except Exception as exc:  # noqa: BLE001
         return "ERR", f"{type(exc).__name__}: {exc}; elapsed={time.time() - started:.2f}s"
 

@@ -4,10 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-try:
-    from ..planners.chain_template_requirements import inspect_chain_template
-except ImportError:  # script execution with agent/ on sys.path
-    from planners.chain_template_requirements import inspect_chain_template
+from agent.planners.chain_template_requirements import inspect_chain_template
 
 
 def validate_chain_template(chain: str) -> dict[str, Any]:

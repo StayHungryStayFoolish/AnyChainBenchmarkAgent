@@ -11,12 +11,9 @@ import time
 from pathlib import Path
 from typing import Protocol
 
-try:
-    from ..runners.job_manager import get_job, list_jobs, tail_job_log
-    from .language import t
-except ImportError:  # product script adds agent/ to sys.path
-    from runners.job_manager import get_job, list_jobs, tail_job_log
-    from terminal.language import t
+from agent.harness.failures import failure_record_from_job, render_failure_summary
+from agent.runners.job_manager import get_job, list_jobs, tail_job_log
+from agent.terminal.language import t
 
 
 class JobCommandState(Protocol):
@@ -96,10 +93,15 @@ class JobCommandHandler:
         self._emit_job_status(jobs[0])
 
     def _emit_job_status(self, job: dict) -> None:
-        self.io.agent(
+        message = t(
             self.state.language,
-            t(self.state.language, "job_found", job_id=job.get("job_id", ""), status=job.get("status", "unknown")),
+            "job_found",
+            job_id=job.get("job_id", ""),
+            status=job.get("status", "unknown"),
         )
+        if str(job.get("status") or "") in {"failed", "partial"}:
+            message += "\n" + render_failure_summary(failure_record_from_job(job), self.state.language)
+        self.io.agent(self.state.language, message)
 
     def _logs(self, job_id: str) -> None:
         try:
@@ -147,7 +149,7 @@ class JobCommandHandler:
                     status = get_job(job_id).get("status", "unknown")
                 except Exception:
                     status = "unknown"
-                if status in {"completed", "failed"}:
+                if status in {"completed", "failed", "partial"}:
                     self.io.agent(self.state.language, t(self.state.language, "follow_done", status=status))
                     return
                 time.sleep(2)

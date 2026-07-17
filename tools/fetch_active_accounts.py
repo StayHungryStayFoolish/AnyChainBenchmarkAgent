@@ -153,6 +153,51 @@ def flatten_system_addresses(system_addresses: Any) -> list[str]:
     return addresses
 
 
+def selected_rpc_methods(config: dict[str, Any]) -> list[str]:
+    rpc_methods = config.get("rpc_methods")
+    if not isinstance(rpc_methods, dict):
+        return []
+
+    mode = str(os.environ.get("RPC_MODE", "single")).strip().lower()
+    if mode == "mixed":
+        weighted = rpc_methods.get("mixed_weighted")
+        if isinstance(weighted, list):
+            methods = [
+                str(item.get("method", "")).strip()
+                for item in weighted
+                if isinstance(item, dict) and str(item.get("method", "")).strip()
+            ]
+            if methods:
+                return methods
+
+    raw_methods = rpc_methods.get(mode)
+    if isinstance(raw_methods, str):
+        return [method.strip() for method in raw_methods.split(",") if method.strip()]
+    if isinstance(raw_methods, list):
+        return [str(method).strip() for method in raw_methods if str(method).strip()]
+    return []
+
+
+def method_requires_target_seed(config: dict[str, Any], method: str) -> bool:
+    param_spec = config.get("param_spec")
+    if isinstance(param_spec, dict):
+        spec = param_spec.get(method)
+        if isinstance(spec, dict) and isinstance(spec.get("params"), list):
+            return len(spec["params"]) > 0
+
+    param_formats = config.get("param_formats")
+    if isinstance(param_formats, dict) and param_formats.get(method) == "no_params":
+        return False
+    return True
+
+
+def workload_requires_target_seed(config: dict[str, Any]) -> bool:
+    methods = selected_rpc_methods(config)
+    if not methods:
+        return True
+    return any(method_requires_target_seed(config, method) for method in methods)
+
+
 def select_target_seed(config: dict[str, Any], requested_target: str) -> str:
     if requested_target:
         return requested_target
@@ -165,6 +210,9 @@ def select_target_seed(config: dict[str, Any], requested_target: str) -> str:
     system_addresses = flatten_system_addresses(config.get("system_addresses"))
     if system_addresses:
         return system_addresses[0]
+
+    if not workload_requires_target_seed(config):
+        return "__ANYCHAIN_NO_TARGET__"
 
     raise ValueError(
         "No target seed is available. Set TARGET_ADDRESS in config/user_config.sh "

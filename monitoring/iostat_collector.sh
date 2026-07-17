@@ -78,6 +78,29 @@ _device_is_monitorable() {
     _device_visible_to_iostat "$device"
 }
 
+stop_iostat_collectors() {
+    local runtime_dir="${TMP_DIR:-/tmp}"
+    local pid_file pid command
+
+    shopt -s nullglob
+    for pid_file in "$runtime_dir"/iostat_*.pid; do
+        pid="$(cat "$pid_file" 2>/dev/null || true)"
+        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+            command="$(ps -p "$pid" -o comm= 2>/dev/null | xargs || true)"
+            if [[ "$command" == "iostat" ]]; then
+                kill -TERM "$pid" 2>/dev/null || true
+                for _ in 1 2 3 4 5; do
+                    kill -0 "$pid" 2>/dev/null || break
+                    sleep 0.1
+                done
+                kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+            fi
+        fi
+        rm -f "$pid_file" "${pid_file%.pid}.data" 2>/dev/null || true
+    done
+    shopt -u nullglob
+}
+
 # Get complete iostat data
 get_iostat_data() {
     local device="$1"

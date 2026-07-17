@@ -1,5 +1,7 @@
 # AnyChain Agent 架构
 
+该文件名仅为保持已有文档链接稳定，并不表示 ADK 拥有 Agent runtime。
+
 AnyChain Agent 是基于 LangGraph Harness 的产品级 Agent，用于控制
 blockchain-node-benchmark 引擎。Harness 负责 workflow 状态、group 路由、
 fallback 顺序、校验门禁和执行决策。Harness 自身的模型调用对所有 provider
@@ -8,6 +10,21 @@ Google ADK 只用于唯一一项可选能力——Gemini `google_search` 联网�
 （`agent/llm/search_grounding.py`），以普通函数调用的方式从 Harness 代码里触发。
 它绝不能拥有第二套 benchmark wizard、第二套对话循环，也不能绕过 Harness 修改
 workflow state。
+
+## 依赖拓扑
+
+runtime 分为两层依赖：
+
+- core：`langgraph`、`langgraph-checkpoint-sqlite`、`openai` 和
+  `prompt-toolkit`；该层负责终端和所有已配置 provider，包括 DeepSeek，且不导入
+  `google.adk`；
+- 可选 search extra：`google-adk`，仅在执行
+  `scripts/install_agent_deps.sh --with-google-search` 时安装，只服务于限定范围内的
+  Gemini `google_search` 函数。
+
+`requirements-adk.txt`、`.venv-adk` 和 `--adk-venv` 是迁移期 alias，不表示 ADK
+拥有 runtime；推荐使用 `--agent-venv`。缺少 Google ADK 只能禁用联网检索，不能阻塞
+CLI 启动、provider 认证、plan、validation 或 execution。
 
 ## Architecture Overview
 
@@ -18,25 +35,30 @@ flowchart TD
   T --> H["LangGraph Harness<br/>agent/harness"]
 
   H --> I["Typed intent resolver<br/>configured LLM"]
-  H --> G["Group workflows<br/>provider, disk, network, chain, workload, QPS, sync-observe"]
+  H --> G["20 个 group / 8 个 domain owner<br/>由 registry 定义唯一所有权"]
   H --> S["Persistent checkpoint<br/>ANYCHAIN_AGENT_CHECKPOINT_PATH"]
   H --> VAL["Deterministic validators<br/>config, workload, onboarding, execution gate"]
   H --> PLAN["Plan and runtime.env builder"]
   H --> JOB["Detached job manager<br/>.agent/jobs/job_id"]
-  H --> SEARCH["Gemini-only google_search<br/>onboarding/custom RPC evidence"]
+  H --> SEARCH["Gemini-only google_search<br/>chain/custom RPC/sync client evidence"]
 
   I --> G
   G --> VAL
 
   VAL --> PRE["Preflight"]
-  PRE --> SMOKE["隔离 fake-node smoke"]
-  SMOKE --> APPROVE["User approval callback"]
-  APPROVE --> BENCH["Benchmark engine<br/>blockchain_node_benchmark.sh"]
+  PRE --> MODE{"Workflow path"}
+  MODE -->|"fake-node"| FSMOKE["完整且隔离的 fake-node smoke"]
+  MODE -->|"real-node"| RSMOKE["安全且隔离的 real-node smoke"]
+  RSMOKE --> APPROVE["独立的最终 benchmark 审批"]
+  APPROVE --> BENCH["最终 benchmark engine<br/>blockchain_node_benchmark.sh"]
+  MODE -->|"sync-observe"| SYNC["同步/资源观察<br/>不使用 Vegeta 或 QPS"]
+  FSMOKE --> ART["报告、图表和归档"]
+  SYNC --> ART
   BENCH --> PROXY["Proxy and per-method attribution"]
   BENCH --> MON["Monitoring system"]
   BENCH --> FN["fake-node fixtures"]
-  BENCH --> ART["Reports, charts, archives"]
-  ART --> ANA
+  BENCH --> ART
+  ART --> ANA["基于证据的分析"]
   ANA --> U
 ```
 
@@ -57,34 +79,63 @@ flowchart LR
   J --> A
 ```
 
-The loop prevents the Agent from acting like a keyword bot:
+唯一元数据权威来源是 `agent/workflows/group_registry.py::GROUPS`。它定义
+20 个 group 及其字段、问题、依赖、失效关系和 owner。
+`agent/harness/state.py::DEFAULT_GROUP_ORDER` 与
+`agent/harness/domains/registry.py` 都是派生的 runtime view，不是额外权威来源。
 
-- user intent is interpreted by the configured model and returned as typed graph actions;
-- confirmed facts are stored as structured LangGraph state;
-- users may jump between groups, go back, or revise prior answers;
-- completing an interrupted group falls back to the next missing required group;
-- every execution path passes through deterministic validators;
-- the Agent asks for missing information instead of inventing values;
-- smoke tests are isolated from final benchmark job artifacts;
-- real benchmark jobs require preflight, smoke, and user approval;
-- analysis must cite generated evidence paths.
+| 顺序 | Group | Owner |
+|---:|---|---|
+| 1 | `opening` | `orientation` |
+| 2 | `target_mode` | `chain_rpc` |
+| 3 | `chain_identity` | `chain_rpc` |
+| 4 | `provider_deployment` | `environment` |
+| 5 | `ledger_disk` | `environment` |
+| 6 | `accounts_disk` | `environment` |
+| 7 | `network` | `environment` |
+| 8 | `endpoint_process` | `chain_rpc` |
+| 9 | `chain_auxiliary_endpoints` | `chain_rpc` |
+| 10 | `workload_rpc` | `chain_rpc` |
+| 11 | `target_samples_fixtures` | `chain_rpc` |
+| 12 | `qps_profile` | `performance` |
+| 13 | `sync_observe` | `sync_observe` |
+| 14 | `observability` | `performance` |
+| 15 | `advanced_tuning` | `performance` |
+| 16 | `preflight_smoke_execution` | `execution` |
+| 17 | `job_monitoring` | `execution` |
+| 18 | `failure_recovery` | `recovery` |
+| 19 | `error_evidence_analysis` | `analysis` |
+| 20 | `report_artifact_analysis` | `analysis` |
 
-## Accuracy Boundaries
+这 20 个 group 由 8 个 domain owner 负责。该循环通过以下方式避免 Agent
+退化为关键词机器人：
 
-The Agent may infer and suggest values, but it must not silently decide:
+- 配置的模型负责理解用户意图，并返回类型化的 graph action；
+- 已确认事实存储为结构化 LangGraph state；
+- 用户可以在 group 之间跳转、回退或修改先前答案；
+- 被中断的 group 完成后，fallback 到下一个缺失的必需 group；
+- 每条执行路径都必须通过确定性 validator；
+- Agent 必须询问缺失信息，不能自行编造值；
+- smoke 测试与最终 benchmark job 产物相互隔离；
+- real-node 最终 benchmark 必须经过 preflight、隔离 smoke 成功和独立最终审批；
+  重复审批必须幂等；
+- 分析结论必须引用生成的证据路径。
 
-- `LEDGER_DEVICE` when multiple disks are plausible;
-- whether a separate `ACCOUNTS_DEVICE` exists;
-- custom RPC parameter contracts;
-- mixed workload weights;
-- unsupported chain adapter family;
-- real-node endpoint validity before preflight;
-- external Prometheus/Grafana scraping behavior.
+## 准确性边界
 
-When uncertain, the Agent must show the available evidence and ask the user to
-confirm or provide a value.
+Agent 可以推断并建议值，但不得静默决定以下内容：
 
-## Runtime State And Artifacts
+- 多块磁盘都可能符合条件时的 `LEDGER_DEVICE`；
+- 是否存在独立的 `ACCOUNTS_DEVICE`；
+- 自定义 RPC 的参数契约；
+- mixed workload 权重；
+- 未支持链的 adapter family；
+- preflight 前 real-node endpoint 是否有效；
+- 外部 Prometheus/Grafana 的抓取行为。
+
+存在不确定性时，Agent 必须展示已有证据，并请用户确认或提供值。
+
+## Runtime 状态与产物
 
 ```mermaid
 flowchart TD
@@ -97,28 +148,47 @@ flowchart TD
   R["Report archive"] --> REP["benchmark-data/archives/run_timestamp"]
 ```
 
-`runtime.env` is the final per-job confirmed configuration. Users should not
-edit it manually. If a user changes an earlier answer, the Harness must update
-or invalidate the affected group state and regenerate downstream runtime
-artifacts through deterministic tools.
+`runtime.env` 是每个 job 最终确认的配置，用户不应手动编辑。如果用户修改
+先前答案，Harness 必须更新或失效受影响的 group state，并通过确定性工具重新
+生成下游 runtime 产物。
 
-## Google Search Boundary
+## Google Search 边界
 
-ADK `google_search` is intentionally narrow:
+ADK `google_search` 的边界必须保持狭窄：
 
-- enabled only for Gemini with Google authentication and an ADK runtime that
-  exposes the tool (`agent/llm/search_grounding.py::web_research_status`);
-- invoked only as a scoped, single-query function call
-  (`run_google_search_grounding`) from specific Harness call sites (currently
-  real-node client setup) — never a persistent Agent/Runner or a second
-  conversation loop;
-- used for unsupported chain and custom RPC research;
-- official documentation is preferred;
-- search evidence does not replace endpoint tests, fixture recording, template
-  validation, or fake-node smoke.
+- 仅当 Gemini 配置符合条件、Gemini/Google 认证有效，并且 ADK runtime 暴露该工具时启用
+  （`agent/llm/search_grounding.py::web_research_status`）；
+- 仅由 chain identity、自定义 RPC schema、sync-observe client setup 三类
+  domain path 通过 `run_google_search_grounding` 发起一次性 scoped query，绝不
+  运行持久 Agent/Runner 或第二套 conversation loop；
+- 用于 unknown chain/protocol、自定义 RPC 和节点客户端资料检索；
+- 优先采用官方文档；
+- 搜索证据不能替代 endpoint 测试、fixture 录制、template 校验或 fake-node
+  smoke。
 
-Other model providers must report web research as unavailable unless the
-repository explicitly adds and verifies a provider-specific search integration.
+除非仓库明确新增并验证特定 provider 的搜索集成，否则其他模型 provider 必须将
+联网检索报告为不可用。
+
+## 自定义 RPC 契约
+
+自定义 RPC onboarding 必须分别保留 wire facts 和确认语义。零参数 method 使用明确
+的空 params；positional 和 object params 必须保留原始 list 顺序或 object key，并逐个
+确认 index/name、JSON wire type、区块链 semantic type 或 encoding、meaning、
+required/optional 以及 example。request/response sample 只是 evidence，不能替代对
+可访问 endpoint 的 probe。
+
+`single_replace` 只选择一个已验证自定义 method；`mixed_replace` 只使用已验证的自定义
+methods；`mixed_add` 保留模板默认 methods 并追加自定义 methods。mixed 中每个 active
+method 都必须有正整数 weight，且总和严格为 100。所有变化都属于 job-local runtime
+override，canonical chain template 保持不可变。fake-node 执行还要求真实 method fixture
+和 coverage；real-node 执行仍必须使用最终 `LOCAL_RPC_URL`。
+
+## 历史问题文档卫生
+
+已退役的日期型 repair plan 和 known-issues register 不是架构依据。
+`tests/agent_live/legacy_issue_map.py` 将其中仍有效的条目映射到当前 20 个
+group、owner、测试证据和 disposition。证据缺失、过时、仅人工验证、间接验证，
+或已经不再断言同一行为的条目必须保持 `open`。
 
 ## Sync-Observe 边界
 
@@ -139,15 +209,16 @@ sync-observe workflow。
 除非用户明确切换回 RPC benchmark，否则该 workflow 不应询问 RPC mode、自定义 RPC
 workload、mixed weights、Vegeta 或 QPS profile。
 
-## Development Gates
+## 开发门禁
 
-Before changing Agent code, read:
+修改 Agent 代码前，必须阅读：
 
 1. `AI_CODING_GUIDE.md`
-2. `docs/zh/anychain-agent-ai-work-gate.md`
-3. `agent/README.md`
+2. `AGENTS.md`
+3. `docs/zh/anychain-agent-ai-work-gate.md`
+4. `agent/README.md`
 
-Then run relevant checks:
+随后运行相关检查：
 
 ```bash
 python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract tests.test_agent_langgraph_harness
@@ -155,7 +226,16 @@ python3 tools/check_agent_boundaries.py --root .
 git diff --check
 ```
 
-For model-facing behavior, run the current product Harness defined by the
-reviewed task/design document. Lower-level live/PTY scripts can be provider
-drivers or developer helpers, but product readiness requires realistic CLI
-scenarios and deterministic assertions.
+对模型交互行为，必须运行当前产品 Harness。底层 live/PTY 脚本只能作为 provider
+driver 或开发辅助，不能替代真实 CLI 场景和确定性断言。
+
+固定 CLI matrix 不足以作为产品验收。按照 `tests/agent_live/README.md` 执行：
+DeepSeek 运行真实 Docker/Linux CLI，Codex 必须读取上一轮实际回复后再决定下一条用户
+输入。生成的 schedule、row、tuple、PTY 返回文本以及 host-only run 都不是已执行
+coverage。pass 必须绑定当前 revision 的 observed state transition 和独立验证的
+postcondition；execution edge 还必须包含 hash 绑定的 job artifact。registry edge、
+高风险多边序列、covering rows、真实执行 artifact 和规定的新 no-S1/S2 动态轮次，必须
+分别报告 `observed-pass`、`observed-fail`、`not-run` 和 `externally-blocked`
+denominator。fake-node 只能证明
+自身闭环，不能证明 real-node 或 sync-observe workflow coverage。没有可用认证时，真实
+Gemini `google_search` 必须明确记录为外部验证边界。

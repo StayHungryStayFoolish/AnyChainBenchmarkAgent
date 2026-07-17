@@ -506,6 +506,12 @@ stop_unified_monitoring() {
         fi
     done
 
+    # iostat collectors are owned by iostat_collector.sh and tracked by its
+    # PID files rather than by the wrapper process array above.
+    if declare -F stop_iostat_collectors >/dev/null 2>&1; then
+        stop_iostat_collectors
+    fi
+
     # Generate error recovery report
     if [[ "$ERROR_RECOVERY_ENABLED" == "true" ]]; then
         echo "📋 Generating error recovery report..."

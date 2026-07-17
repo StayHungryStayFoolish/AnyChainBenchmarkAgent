@@ -1,7 +1,7 @@
 """Shared structured-result envelope for tool-shaped call results.
 
-Used by the LangGraph Harness (`agent/harness/nodes/execution.py`) and the
-CLI tool-dispatch surface (`agent/tools/executor.py`) alike, so both build the
+Used by the LangGraph Harness (`agent/harness/domains/execution_runtime.py`) and
+the CLI tool-dispatch surface (`agent/tools/executor.py`) alike, so both build the
 same `{status, data, evidence_paths, warnings, next_actions}` shape from one
 definition.
 """

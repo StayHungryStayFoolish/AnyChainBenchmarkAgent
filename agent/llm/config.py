@@ -47,6 +47,10 @@ class LLMConfig:
     anthropic_api_key_present: bool = False
     openai_api_key_present: bool = False
     deepseek_api_key_present: bool = False
+    turn_timeout_seconds: float = 120.0
+    connect_timeout_seconds: float = 10.0
+    read_timeout_seconds: float = 60.0
+    max_retries: int = 1
 
     def validate(self) -> list[str]:
         errors: list[str] = []
@@ -54,6 +58,14 @@ class LLMConfig:
             errors.append(f"unsupported LLM_PROVIDER: {self.provider}")
         if self.auth_mode not in SUPPORTED_LLM_AUTH_MODES:
             errors.append(f"unsupported LLM_AUTH_MODE: {self.auth_mode}")
+        if self.turn_timeout_seconds <= 0:
+            errors.append("LLM_TURN_TIMEOUT_SECONDS must be greater than zero")
+        if self.connect_timeout_seconds <= 0:
+            errors.append("LLM_CONNECT_TIMEOUT_SECONDS must be greater than zero")
+        if self.read_timeout_seconds <= 0:
+            errors.append("LLM_READ_TIMEOUT_SECONDS must be greater than zero")
+        if self.max_retries < 0:
+            errors.append("LLM_MAX_RETRIES must be zero or greater")
         if self.provider in {"openai", "deepseek"}:
             if self.auth_mode != "api_key":
                 errors.append(f"LLM_AUTH_MODE=api_key is required for LLM_PROVIDER={self.provider}")
@@ -98,7 +110,7 @@ class LLMConfig:
             return False, "Gemini authentication is incomplete"
         return True, "eligible for ADK google_search"
 
-    def safe_dict(self) -> dict[str, str | bool | list[str]]:
+    def safe_dict(self) -> dict[str, str | bool | float | int | list[str]]:
         return {
             "provider": self.provider,
             "model": self.model,
@@ -111,6 +123,10 @@ class LLMConfig:
             "anthropic_api_key_configured": self.anthropic_api_key_present,
             "openai_api_key_configured": self.openai_api_key_present,
             "deepseek_api_key_configured": self.deepseek_api_key_present,
+            "turn_timeout_seconds": self.turn_timeout_seconds,
+            "connect_timeout_seconds": self.connect_timeout_seconds,
+            "read_timeout_seconds": self.read_timeout_seconds,
+            "max_retries": self.max_retries,
             "google_search_eligible": self.google_search_eligible()[0],
             "google_search_reason": self.google_search_eligible()[1],
             "validation_errors": self.validate(),
@@ -152,7 +168,27 @@ def load_llm_config(env: Mapping[str, str] | None = None) -> LLMConfig:
         anthropic_api_key_present=bool(source.get("ANTHROPIC_API_KEY", "")),
         openai_api_key_present=bool(source.get("OPENAI_API_KEY", "")),
         deepseek_api_key_present=bool(source.get("DEEPSEEK_API_KEY", "")),
+        turn_timeout_seconds=_positive_float(source.get("LLM_TURN_TIMEOUT_SECONDS"), 120.0),
+        connect_timeout_seconds=_positive_float(source.get("LLM_CONNECT_TIMEOUT_SECONDS"), 10.0),
+        read_timeout_seconds=_positive_float(source.get("LLM_READ_TIMEOUT_SECONDS"), 60.0),
+        max_retries=_non_negative_int(source.get("LLM_MAX_RETRIES"), 1),
     )
+
+
+def _positive_float(value: str | None, default: float) -> float:
+    try:
+        parsed = float(str(value or "").strip())
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _non_negative_int(value: str | None, default: int) -> int:
+    try:
+        parsed = int(str(value or "").strip())
+    except ValueError:
+        return default
+    return parsed if parsed >= 0 else default
 
 
 def _infer_google_project(source: Mapping[str, str]) -> str:

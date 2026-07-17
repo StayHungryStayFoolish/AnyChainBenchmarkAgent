@@ -62,15 +62,6 @@ PURE_METADATA_FILES = {
         "print(",
         "subprocess.",
     ],
-    "agent/workflows/requirements.py": [
-        "provider_from_config",
-        "LLMRequest",
-        "PendingQuestion",
-        "AgentGraphState",
-        "input(",
-        "print(",
-        "subprocess.",
-    ],
 }
 
 PRODUCT_TEST_FORBIDDEN = [

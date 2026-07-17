@@ -7,10 +7,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-try:
-    from .families import SUPPORTED_FAMILIES
-except ImportError:  # script execution with agent/ on sys.path
-    from onboarding.families import SUPPORTED_FAMILIES
+from agent.onboarding.families import SUPPORTED_FAMILIES
 
 # The supported families partition into two proxy-transport classes. Define the
 # REST-transport members once and derive the JSON-RPC-transport members as the

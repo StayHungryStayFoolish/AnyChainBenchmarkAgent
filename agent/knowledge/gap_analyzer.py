@@ -5,12 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-try:
-    from .framework_capabilities import load_framework_capabilities
-    from agent.onboarding.families import SUPPORTED_FAMILIES
-except ImportError:  # script execution with agent/ on sys.path
-    from knowledge.framework_capabilities import load_framework_capabilities
-    from onboarding.families import SUPPORTED_FAMILIES
+from agent.knowledge.framework_capabilities import load_framework_capabilities
+from agent.onboarding.families import SUPPORTED_FAMILIES
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -97,5 +93,5 @@ def onboarding_plan(chain: str, methods: list[str], gaps: list[dict[str, str]]) 
         steps.append("Add _meta.sync_health so block-height/sync-health monitoring can classify node health.")
     if not steps:
         steps.append("No blocking framework gaps detected. Run preflight and a fake-node smoke test next.")
-    steps.append("Validate with python3 agent/cli.py capabilities and the fake-node local closed-loop guide.")
+    steps.append("Validate with python3 -m agent.cli capabilities and the fake-node local closed-loop guide.")
     return steps

@@ -13,8 +13,9 @@ benchmark workflow itself is owned by the LangGraph Harness in
 `agent/harness/`. The Harness's own model calls are plain OpenAI-compatible
 HTTP requests for every provider (OpenAI, DeepSeek, and Gemini on Vertex
 alike) — Google ADK is used for exactly one optional capability, Gemini
-`google_search` grounding (`agent/llm/search_grounding.py`), and must not own
-product workflow state or a second conversation loop.
+`google_search` grounding for unknown-chain/protocol, custom-RPC schema, and
+sync-observe client research (`agent/llm/search_grounding.py`), and must not
+own product workflow state or a second conversation loop.
 
 ## Development Gate
 
@@ -78,6 +79,7 @@ Core groups:
 - `advanced_tuning`
 - `preflight_smoke_execution`
 - `job_monitoring`
+- `failure_recovery`
 - `error_evidence_analysis`
 - `report_artifact_analysis`
 
@@ -88,21 +90,25 @@ analysis.
 ## Main Modules
 
 - `harness/graph.py`: LangGraph runtime and checkpoint wiring.
-- `harness/groups.py`: deterministic group workflow, transitions, validation
+- `harness/coordinator.py`: deterministic group workflow, transitions, validation
   gates, and next-blocking-question selection.
 - `harness/intent.py`: typed LLM intent and free-form answer resolver.
-- `harness/state.py`: product workflow state schema and default group order.
-- `harness/nodes/`: LangGraph node boundaries for routing and execution.
+- `workflows/group_registry.py`: the single metadata authority for group order,
+  fields, questions, dependencies, invalidations, and ownership.
+- `harness/state.py`: product workflow state schema; its default group order is
+  derived from `workflows/group_registry.py`.
+- `harness/domains/`: eight domain owners plus the deterministic execution
+  runtime used after explicit approval. `harness/domains/registry.py` derives
+  its runtime owner view from `workflows/group_registry.py`.
 - `terminal/repl.py`: product terminal shell and job command integration.
 - `terminal/io.py`, `terminal/language.py`, `terminal/job_commands.py`: stable
   terminal support code.
 - `llm/search_grounding.py`: the sole `google-adk` consumer — Gemini
-  `google_search` grounding, called as a plain function from `harness/groups.py`.
+  `google_search` grounding, called as a plain function from the owning
+  chain-identity, RPC-endpoint, and sync-observe domain modules.
 - `tools/executor.py`, `tools/schema.py`: the one programmatic tool-dispatch
-  surface for `agent/cli.py tool-call`/`tool-schema` (CI and enterprise
+  surface for `python3 -m agent.cli tool-call`/`tool-schema` (CI and enterprise
   platform integration), calling the same deterministic modules directly.
-- `workflows/group_registry.py`, `workflows/requirements.py`: shared
-  requirement metadata still consumed by validators.
 - `validators/`, `planners/`, `runners/`, `analyzers/`, `knowledge/`,
   `onboarding/`: deterministic benchmark control-plane modules reused by the
   Harness and tools.
@@ -128,11 +134,8 @@ within these boundaries:
 - `llm/search_grounding.py`: the only file that may import `google.adk`; it
   must stay a plain function callable from Harness code (no persistent
   Agent/Runner, no second conversation loop, no workflow state mutation).
-- `workflows/group_registry.py` and `workflows/requirements.py`: pure metadata
-  for validators and Harness checks; no user-text parsing, no state mutation,
-  and no terminal rendering. `group_registry.py`'s `GROUP_ORDER` must be
-  imported from `harness/state.py::DEFAULT_GROUP_ORDER`, never a separately
-  hand-typed copy.
+- `workflows/group_registry.py`: pure metadata for Harness checks; no user-text
+  parsing, no state mutation, and no terminal rendering.
 
 If a future change needs product workflow control, add it to `harness/` or the
 deterministic domain modules it invokes. Do not build a second Agent/Runner
@@ -145,6 +148,18 @@ Install the Agent runtime in the isolated Python environment:
 ```bash
 bash scripts/install_agent_deps.sh --yes
 ```
+
+This default installs the core LangGraph terminal runtime only. The historical
+`.venv-adk`, `requirements-adk.txt`, and `--adk-venv` names remain compatibility
+aliases; they do not mean Google ADK is a core dependency. Install the optional
+Gemini search bridge explicitly:
+
+```bash
+bash scripts/install_agent_deps.sh --yes --with-google-search
+```
+
+DeepSeek/OpenAI/Claude and non-search Gemini operation must remain available
+when `google-adk` is absent.
 
 For interactive sessions, `prompt-toolkit` is required for reliable Ctrl+C and
 Chinese/wide-character editing. If it is missing, the launcher asks for
@@ -202,18 +217,32 @@ The live matrix drives `./bin/anychain-agent` through the same CLI path users
 run and inspects LangGraph checkpoint state. It must not read or create legacy
 `.agent/sessions/*/conversation_state.json` workflow files.
 
+The fixed matrix is not product acceptance. Follow
+`tests/agent_live/README.md` and
+`.agent/task-docs/2026-07-10-agent-handoff-for-external-ai.md` for dynamic
+dual-AI Chaos: DeepSeek runs the real CLI while Codex chooses each next user
+turn from the actual previous response. Generate the registry coverage ledger
+with `tests/agent_live/generate_harness_coverage_ledger.py`; every edge plus the
+documented high-risk sequences needs evidence before claiming completion.
+
+For local real-node and sync-observe orchestration checks, use the digest-pinned
+Geth development service through `tests/agent_live/local_evm_node.sh` inside
+Docker/Linux. It proves runtime wiring and artifacts, not mainnet catch-up
+performance or meaningful MGas/s. Host-only runs and fake-node-only runs do not
+qualify as full workflow coverage.
+
 ## CLI Tools For Automation
 
-`python3 agent/cli.py` exposes JSON commands for CI and enterprise Agent
+`python3 -m agent.cli` exposes JSON commands for CI and enterprise Agent
 platforms:
 
 ```bash
-python3 agent/cli.py adk-status
-python3 agent/cli.py capabilities
-python3 agent/cli.py doctor --format json
-python3 agent/cli.py plan --request request.json --out plan.json
-python3 agent/cli.py preflight --plan plan.json
-python3 agent/cli.py submit --plan plan.json
-python3 agent/cli.py job-status --job-id <job_id>
-python3 agent/cli.py analyze --artifacts-dir benchmark-data
+python3 -m agent.cli adk-status
+python3 -m agent.cli capabilities
+python3 -m agent.cli doctor --format json
+python3 -m agent.cli plan --request request.json --out plan.json
+python3 -m agent.cli preflight --plan plan.json
+python3 -m agent.cli submit --plan plan.json
+python3 -m agent.cli job-status --job-id <job_id>
+python3 -m agent.cli analyze --artifacts-dir benchmark-data
 ```

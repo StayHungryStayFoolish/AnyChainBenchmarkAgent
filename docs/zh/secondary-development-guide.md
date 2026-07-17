@@ -31,7 +31,7 @@ Agent 发起压测：
 -> terminal I/O shell
 -> LangGraph Harness typed intent path
 -> group workflow and checkpoint state
--> optional ADK compatibility bridge/tool call
+-> 三个限定调用点上的可选 Gemini google_search grounding 函数
 -> deterministic tool and validator gates
 -> benchmark plan
 -> preflight 与风险检查
@@ -79,7 +79,7 @@ agent_config.sh
 - `agent/knowledge/http_provider.py`：通用 HTTP adapter。
 - `agent/knowledge/loader.py`：provider 选择。
 - `agent/tools/executor.py`：暴露 `knowledge_search` 工具，查询配置的 KB provider 和本地 capability evidence。
-- `agent/cli.py`：smoke 命令和集成入口。
+- `agent.cli`（实现在 `agent/cli.py`）：smoke 命令和集成入口；使用 `python3 -m agent.cli` 调用。
 
 基本原则：
 
@@ -99,7 +99,7 @@ POST /workload/suggest
 验证：
 
 ```bash
-python3 agent/cli.py knowledge-smoke
+python3 -m agent.cli knowledge-smoke
 python3 -m unittest tests.test_agent_runtime_contract -v
 ```
 
@@ -116,7 +116,7 @@ PR 要求：
 
 开发位置：
 
-- `agent/cli.py`：JSON CLI 入口。
+- `agent.cli`（实现在 `agent/cli.py`）：JSON CLI 入口；使用 `python3 -m agent.cli` 调用。
 - `agent/tools/schema.py`：OpenAI-compatible tool catalog。
 - `agent/tools/executor.py`：稳定的 named tool execution。
 - `config/agent_config.sh`：LLM、Google auth 和可选 KB 默认配置。
@@ -124,13 +124,18 @@ PR 要求：
 - `agent/llm/search_grounding.py`：唯一使用 `google-adk` 的模块（可选的 Gemini
   `google_search` 联网检索）；其余 ADK tool wrapper 均已退役。
 
+平台 core integration 使用 `requirements-adk.txt` 中的 LangGraph runtime；该文件名
+只是兼容 alias，默认不会安装 Google ADK。只有平台明确需要 Gemini search grounding
+时，才给 `scripts/install_agent_deps.sh` 增加 `--with-google-search`。DeepSeek、OpenAI
+和 Claude integration 不得导入或依赖 `google.adk`。
+
 支持的集成模式：
 
 - 人类终端：`./bin/anychain-agent`
-- JSON CLI：`python3 agent/cli.py <command>`
-- Tool schema 导出：`python3 agent/cli.py tool-schema`
+- JSON CLI：`python3 -m agent.cli <command>`
+- Tool schema 导出：`python3 -m agent.cli tool-schema`
 - Named tool call：
-  `python3 agent/cli.py tool-call --name <tool> --arguments '<json>'`
+  `python3 -m agent.cli tool-call --name <tool> --arguments '<json>'`
 
 常用平台工具：
 
@@ -160,9 +165,9 @@ PR 要求：
 验证：
 
 ```bash
-python3 agent/cli.py tool-schema
-python3 agent/cli.py tool-call --name load_capabilities
-python3 agent/cli.py tool-call --name discover_environment
+python3 -m agent.cli tool-schema
+python3 -m agent.cli tool-call --name load_capabilities
+python3 -m agent.cli tool-call --name discover_environment
 python3 -m unittest tests.test_agent_runtime_contract -v
 ```
 
@@ -283,6 +288,17 @@ RPC method 支持不只是增加一个 method name。框架需要 request constr
 - `docs/audit/rpc-fixtures/`
 
 简单 method 使用 `param_formats`。如果需要 positional params、object params、REST path params、query params 或 request body，使用 `param_spec`。
+
+不能只根据 JSON 语法推断参数语义。零参数 method 必须保留明确的空 params；
+positional/object method 必须保留 list 顺序或 object key，并逐个确认 index/name、
+JSON wire type、区块链 semantic type 或 encoding、meaning、required/optional 和
+example。进入 catalog 前，必须使用确认后的 wire request probe 可访问的 validation
+endpoint。
+
+runtime workload scope 只作用于 job-local override：`single_replace` 选择一个已验证
+method，`mixed_replace` 删除模板 defaults，`mixed_add` 保留 defaults。所有 active
+mixed weight 都必须是正整数且总和严格为 100。这些选择都不得修改
+`config/chains/<chain>.json`。
 
 三参数 method 示例：
 

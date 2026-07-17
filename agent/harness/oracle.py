@@ -6,13 +6,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .routing import next_group_and_reason
+from .state import AgentGraphState
 
-try:
-    from agent.runners.job_manager import get_job
-except ModuleNotFoundError:  # script execution with agent/ on sys.path
-    from runners.job_manager import get_job
-
-
+from agent.runners.job_manager import get_job
 @dataclass(frozen=True)
 class NextAction:
     config_status: str
@@ -31,7 +27,7 @@ def compute_next_action(state: dict[str, Any]) -> NextAction:
     pending = state.get("pending_question") or {}
     pending_id = str(pending.get("id") or "").strip()
     pending_group = str(pending.get("group") or state.get("active_group") or "").strip()
-    latest_job_id = str(state.get("latest_job_id") or (state.get("job") or {}).get("job_id") or "").strip()
+    latest_job_id = str((state.get("job") or {}).get("job_id") or "").strip()
     execution_status = _execution_status(state)
 
     if pending_id:
@@ -51,7 +47,7 @@ def compute_next_action(state: dict[str, Any]) -> NextAction:
     # the single source of truth for "is this workflow's config complete")
     # is the only correct test here. A prior version also forced
     # config_status to "complete" whenever `execution_status` showed any job
-    # status at all -- but `job`/`latest_job_id` deliberately survive a full
+    # status at all -- but the workflow-owned `job` receipt deliberately survives a full
     # reset (`RESET_PRESERVED_KEYS`) so `analyze_report`/`status` keep
     # working for the last completed job, so that shortcut falsely reported
     # a brand-new, still-in-progress workflow as "complete" whenever any
@@ -86,16 +82,43 @@ def format_current_state(state: dict[str, Any], language: str) -> str:
     workflow_mode = state.get("workflow_mode") or _localized(language, "<未选择>", "<not selected>")
     rpc_mode = state.get("rpc_mode") or _localized(language, "<未选择>", "<not selected>")
     qps_mode = qps.get("mode") or _localized(language, "<未选择>", "<not selected>")
+    qps_overrides = qps.get("overrides") if isinstance(qps.get("overrides"), dict) else {}
+    qps_values = ", ".join(f"{key}={value}" for key, value in qps_overrides.items()) or _localized(language, "使用模式默认值", "mode defaults")
     obs_mode = observability.get("mode") or _localized(language, "<未选择>", "<not selected>")
     confirmed_keys = ", ".join(sorted(str(key) for key in confirmed.keys())) or _localized(language, "<无>", "<none>")
+    workload = state.get("workload") or {}
+    methods = [str(item) for item in workload.get("methods") or [] if str(item).strip()]
+    method_text = ", ".join(methods) or _localized(language, "<未确认>", "<not confirmed>")
+    weights = workload.get("weights") if isinstance(workload.get("weights"), dict) else {}
+    weight_text = ", ".join(f"{method}={weight}" for method, weight in weights.items()) or _localized(language, "<不适用>", "<not applicable>")
+    custom_rpc = state.get("custom_rpc") or {}
+    custom_status = str(custom_rpc.get("status") or _localized(language, "<未启用>", "<not active>"))
+    validation_endpoint = str(custom_rpc.get("validation_endpoint") or custom_rpc.get("endpoint") or "")
+    queued_requests = queued_configuration_summary(state, language)
+    workflow_goals = state.get("workflow_goals") or []
+    workflow_goal_text = ", ".join(
+        f"{item.get('target_mode')}: {item.get('goal')}"
+        for item in workflow_goals
+        if isinstance(item, dict)
+    ) or _localized(language, "<无>", "<none>")
     if str(language or "").startswith("zh"):
+        endpoint_line = f"- 自定义 RPC 验证 endpoint：`{validation_endpoint}`（仅验证证据，不覆盖最终 LOCAL_RPC_URL）\n" if validation_endpoint else ""
         return (
             "当前状态：\n"
             f"- chain: `{chain}`\n"
             f"- target_mode: `{target_mode}`\n"
             f"- workflow_mode: `{workflow_mode}`\n"
             f"- rpc_mode: `{rpc_mode}`\n"
+            f"- 实际 RPC methods：{method_text}\n"
+            f"- mixed 权重：{weight_text}\n"
+            f"- 自定义 RPC 状态：`{custom_status}`\n"
+            + endpoint_line
+            +
+            "- config/chains 原始模板：未修改；自定义 RPC 仅保存在本次运行时配置与验证证据中\n"
+            f"- 尚待执行的用户配置请求：{queued_requests}\n"
+            f"- 已保存的后续 workflow 目标：{workflow_goal_text}\n"
             f"- qps: `{qps_mode}`\n"
+            f"- QPS 生效参数：{qps_values}\n"
             f"- observability: `{obs_mode}`\n"
             f"- 已确认字段：{confirmed_keys}\n"
             f"- 配置状态：{action.config_status}\n"
@@ -103,13 +126,23 @@ def format_current_state(state: dict[str, Any], language: str) -> str:
             f"- 下一个阻塞项：{action.next_blocking_reason or '<none>'}\n"
             f"- 建议下一步：{format_recommended_next_action(action, language)}"
         )
+    endpoint_line = f"- custom RPC validation endpoint: `{validation_endpoint}` (validation evidence only; it does not replace final LOCAL_RPC_URL)\n" if validation_endpoint else ""
     return (
         "Current state:\n"
         f"- chain: `{chain}`\n"
         f"- target_mode: `{target_mode}`\n"
         f"- workflow_mode: `{workflow_mode}`\n"
         f"- rpc_mode: `{rpc_mode}`\n"
+        f"- effective RPC methods: {method_text}\n"
+        f"- mixed weights: {weight_text}\n"
+        f"- custom RPC status: `{custom_status}`\n"
+        + endpoint_line
+        +
+        "- original config/chains template: unchanged; custom RPC stays in runtime configuration and validation evidence\n"
+        f"- deferred user configuration requests: {queued_requests}\n"
+        f"- saved later workflow goals: {workflow_goal_text}\n"
         f"- qps: `{qps_mode}`\n"
+        f"- effective QPS values: {qps_values}\n"
         f"- observability: `{obs_mode}`\n"
         f"- confirmed fields: {confirmed_keys}\n"
         f"- config status: {action.config_status}\n"
@@ -117,6 +150,24 @@ def format_current_state(state: dict[str, Any], language: str) -> str:
         f"- next blocker: {action.next_blocking_reason or '<none>'}\n"
         f"- recommended next action: {format_recommended_next_action(action, language)}"
     )
+
+
+def queued_configuration_summary(state: dict[str, Any], language: str) -> str:
+    """Return user-visible deferred mutations from the durable action queue."""
+    labels: list[str] = []
+    for action in state.get("action_queue") or []:
+        action_type = str((action or {}).get("type") or "")
+        if action_type == "set_qps_mode":
+            labels.append(f"QPS={action.get('qps_mode')}")
+        elif action_type == "set_observability":
+            labels.append(f"observability={action.get('observability_mode')}")
+        elif action_type == "set_rpc_mode":
+            labels.append(f"RPC mode={action.get('rpc_mode')}")
+        elif action_type in {"choose_chain", "change_chain"}:
+            labels.append(f"chain={action.get('chain_text')}")
+        elif action_type == "choose_target_mode":
+            labels.append(f"target mode={action.get('target_mode')}")
+    return ", ".join(labels) or _localized(language, "<无>", "<none>")
 
 
 def format_current_context(state: dict[str, Any], language: str) -> str:
@@ -171,18 +222,40 @@ def format_current_context(state: dict[str, Any], language: str) -> str:
                 return "这里是在确认是否应用我从你粘贴内容中推断出的配置候选值。回复 `Y` 才会写入已确认配置；回复 `N` 会丢弃候选值。endpoint 类值仍会在后续 probe 中验证。"
             return "This asks whether to apply config candidates inferred from your pasted content. Reply `Y` to save them as confirmed config; reply `N` to discard them. Endpoint-like values are still validated later by probing."
         if str(language or "").startswith("zh"):
+            context = _pending_workflow_context(state)
             return (
                 f"当前待确认问题是 `{pending_id}`。{prompt or '它用于补齐当前流程缺失的信息。'}\n"
+                f"{context['zh']}\n"
+                "之所以回到这个问题，是因为显式跳转/配置动作完成后，fallback 会选择当前状态中最早的未完成配置组；纯咨询不会改变它。\n"
                 "你可以回答这个问题，也可以直接说要跳转到链、模式、磁盘、网络、RPC、QPS、可观测性、preflight/smoke、日志或报告分析。"
             )
+        context = _pending_workflow_context(state)
         return (
             f"The current pending question is `{pending_id}`. {prompt or 'It fills a missing item in the current flow.'}\n"
+            f"{context['en']}\n"
+            "It is current because, after explicit detours or configuration actions, fallback selects the earliest incomplete relevant group; a consultation does not change it.\n"
             "You can answer it, or ask to jump to chain, mode, disk, network, RPC, QPS, observability, preflight/smoke, logs, or report analysis."
         )
     action = compute_next_action(state)
     if str(language or "").startswith("zh"):
         return f"当前没有待确认问题。{format_recommended_next_action(action, language)}"
     return f"There is no pending question. {format_recommended_next_action(action, language)}"
+
+
+def _pending_workflow_context(state: AgentGraphState) -> dict[str, str]:
+    identity = state.get("chain_identity") or {}
+    queued = [
+        str(item.get("type") or "")
+        for item in state.get("action_queue") or []
+        if str(item.get("type") or "") not in {"greeting", "ask_capabilities", "answer_opening_question"}
+    ]
+    queued_text = ", ".join(dict.fromkeys(queued)) or "<none>"
+    target_mode = str(state.get("target_mode") or "<not selected>")
+    chain = str(identity.get("canonical") or identity.get("raw") or "<not selected>")
+    return {
+        "zh": f"当前 target mode：`{target_mode}`；链：`{chain}`；尚未执行的已请求动作：{queued_text}。",
+        "en": f"Current target mode: `{target_mode}`; chain: `{chain}`; requested actions not yet applied: {queued_text}.",
+    }
 
 
 _STARTUP_DISCOVERY_CONFIRMABLE_KEYS = (
@@ -297,6 +370,7 @@ def format_recommended_next_action(action: NextAction, language: str) -> str:
 def _group_label(group: str, language: str) -> str:
     labels = {
         "opening": ("入口选择", "opening choice"),
+        "target_mode": ("测试模式", "target mode"),
         "chain_identity": ("链和协议", "chain and protocol"),
         "provider_deployment": ("云区域和机器信息", "cloud region and machine metadata"),
         "ledger_disk": ("Ledger/data 磁盘", "ledger/data disk"),
@@ -312,6 +386,7 @@ def _group_label(group: str, language: str) -> str:
         "advanced_tuning": ("高级调优参数", "advanced tuning settings"),
         "preflight_smoke_execution": ("preflight/smoke", "preflight/smoke"),
         "job_monitoring": ("job 监控", "job monitoring"),
+        "failure_recovery": ("执行失败恢复", "execution failure recovery"),
     }
     zh, en = labels.get(group, (group, group))
     return _localized(language, zh, en)
@@ -322,6 +397,14 @@ def _reason_label(reason: str, language: str) -> str:
         return _localized(language, "补齐当前缺失信息", "fill the missing information")
     if reason.startswith("confirm "):
         field = reason.removeprefix("confirm ").strip()
+        field_labels = {
+            "target_mode": ("选择 fake-node、real-node 或 sync-observe", "choose fake-node, real-node, or sync-observe"),
+            "chain": ("确认链名", "confirm the chain"),
+            "rpc_mode": ("选择 single 或 mixed", "choose single or mixed"),
+        }
+        if field in field_labels:
+            zh, en = field_labels[field]
+            return _localized(language, zh, en)
         return _localized(language, f"确认 `{field}`", f"confirm `{field}`")
     # `routing.next_group_and_reason` emits these two as
     # f"continue ...: {internal_status_enum}" — without a label, the raw
@@ -341,6 +424,7 @@ def _reason_label(reason: str, language: str) -> str:
         "choose observability mode": ("选择是否开启或接入 Prometheus/Grafana", "choose observability mode"),
         "review advanced tuning settings": ("确认是否调整高级调优参数", "review advanced tuning settings"),
         "approve preflight/smoke": ("确认执行 preflight/smoke", "approve preflight/smoke"),
+        "resolve the current execution failure": ("查看证据并选择可执行的恢复方式", "inspect evidence and choose an executable recovery action"),
         "choose sync-observe data source": ("选择真实同步观测数据来源", "choose the sync-observe data source"),
         "acknowledge real client setup handoff": ("确认真实节点客户端准备交接", "acknowledge the real node client setup handoff"),
         "choose sync-observe data source after client setup": ("选择真实客户端准备完成后的数据来源", "choose the sync-observe data source after client setup"),
@@ -359,7 +443,7 @@ def _next_group_and_reason(state: dict[str, Any]) -> tuple[str, str]:
     """Delegate to `routing.next_group_and_reason`.
 
     This used to be an independent reimplementation of the same
-    precondition chain `groups._next_group` uses to drive live turn
+    precondition chain `routing.next_group_and_reason` uses to drive live turn
     routing. Two hand-maintained copies could (and did, in at least one
     case) disagree; see architecture audit Finding B1.
     """
@@ -373,7 +457,7 @@ def _execution_status(state: dict[str, Any]) -> str:
     preflight = state.get("preflight") or {}
     if job.get("status"):
         # `state["job"]` is a one-time snapshot written at submission time
-        # (`agent/harness/nodes/execution.py`) and never refreshed -- a
+        # (`agent/harness/domains/execution_runtime.py`) and never refreshed -- a
         # `current_config`/status-dump response could claim `job_running` for
         # a job that has actually long since finished, contradicting the
         # deterministic `status`/`jobs`/`logs` commands (which already read
@@ -387,7 +471,7 @@ def _execution_status(state: dict[str, Any]) -> str:
                 status = str(get_job(job_id).get("status") or status)
             except Exception:
                 pass
-        if status in {"running", "submitted", "completed", "failed"}:
+        if status in {"running", "submitted", "completed", "failed", "partial"}:
             return f"job_{status}" if status != "submitted" else "job_submitted"
         return status
     if smoke.get("status"):
@@ -403,7 +487,13 @@ def _execution_status(state: dict[str, Any]) -> str:
 
 
 def _pending_reason(pending: dict[str, Any]) -> str:
-    return str(pending.get("prompt") or pending.get("id") or "answer current pending question").strip()
+    # The full prompt is presentation, not state-summary metadata. Embedding it
+    # here causes current-state consultations to repeat the blocking question
+    # in the blocker line, the recommendation, and the canonical renderer.
+    field = str(pending.get("field") or "").strip()
+    question_id = str(pending.get("id") or "").strip()
+    subject = field or question_id
+    return f"confirm {subject}" if subject else "answer current pending question"
 
 
 def _answer_pending_action(pending: dict[str, Any]) -> str:

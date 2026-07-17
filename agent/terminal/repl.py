@@ -9,36 +9,38 @@ Benchmark workflow orchestration belongs to the LangGraph Harness.
 from __future__ import annotations
 
 import argparse
-import asyncio
-import importlib.util
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
-from dataclasses import asdict, dataclass, field
+import threading
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-AGENT_ROOT = REPO_ROOT / "agent"
-if str(AGENT_ROOT) not in sys.path:
-    sys.path.insert(0, str(AGENT_ROOT))
 
-from diagnostics.adk_status import adk_status  # noqa: E402
-from diagnostics.doctor import run_doctor  # noqa: E402
-from harness.graph import AnyChainGraphRuntime  # noqa: E402
-from knowledge.framework_capabilities import load_framework_capabilities  # noqa: E402
-from knowledge.framework_context import load_framework_context  # noqa: E402
-from llm.config import load_llm_config  # noqa: E402
-from llm.search_grounding import web_research_status  # noqa: E402
-from runners.job_manager import list_jobs  # noqa: E402
-from terminal.io import OutputOnlyIO, TerminalIO  # noqa: E402
-from terminal.job_commands import JobCommandHandler  # noqa: E402
-from terminal.language import detect_language, t  # noqa: E402
-from terminal.startup_state import load_startup_state  # noqa: E402
-from utils.redaction import redact  # noqa: E402
+from ..diagnostics.adk_status import adk_status
+from ..diagnostics.doctor import run_doctor
+from ..harness.graph import AnyChainGraphRuntime
+from ..harness.invariants import StateInvariantError
+from ..knowledge.framework_capabilities import load_framework_capabilities
+from ..knowledge.framework_context import load_framework_context
+from ..llm.config import load_llm_config
+from ..llm.providers import provider_runtime_errors
+from ..llm.search_grounding import web_research_status
+from ..llm.types import LLMTurnCancelledError, LLMTurnTimeoutError, llm_turn_scope
+from ..runners.job_manager import list_jobs
+from ..utils.redaction import redact
+from .io import OutputOnlyIO, TerminalIO
+from .job_commands import JobCommandHandler
+from .language import detect_language, t
+from .startup_state import load_startup_state
 
 
 DEFAULT_AGENT_SESSION_ID = "default"
@@ -57,8 +59,31 @@ class TerminalSession:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "TerminalSession":
-        allowed = {field.name for field in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
-        return cls(**{key: value for key, value in payload.items() if key in allowed})
+        question_id = str(payload.get("current_question_id") or "")
+        if question_id not in {"install_agent_runtime", "install_dependencies"}:
+            question_id = ""
+        dependencies = payload.get("pending_missing_dependencies")
+        return cls(
+            language=str(payload.get("language") or "en"),
+            current_question_id=question_id,
+            pending_missing_dependencies=(
+                [str(item) for item in dependencies if str(item)]
+                if isinstance(dependencies, list)
+                else []
+            ),
+        )
+
+    def persisted_shell_state(self) -> dict[str, Any]:
+        """Return only terminal UI and installation-consent state."""
+
+        question_id = self.current_question_id
+        if question_id not in {"install_agent_runtime", "install_dependencies"}:
+            question_id = ""
+        return {
+            "language": self.language,
+            "current_question_id": question_id,
+            "pending_missing_dependencies": list(self.pending_missing_dependencies),
+        }
 
 
 class TerminalSessionStore:
@@ -73,7 +98,10 @@ class TerminalSessionStore:
 
     def save(self, state: TerminalSession) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(asdict(state), indent=2, sort_keys=True), encoding="utf-8")
+        self.path.write_text(
+            json.dumps(state.persisted_shell_state(), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -125,31 +153,33 @@ class AnyChainTerminal:
         self._startup_state: dict[str, Any] = {}
         self._llm_config = load_llm_config()
         self._web_research_status: dict[str, Any] = {}
-        self._adk_available = False
+        self._llm_runtime_available = False
         self._job_commands = JobCommandHandler(self.state, self.io)
+        self._turn_active = False
 
     def run(self) -> int:
-        self.startup()
-        while True:
-            try:
-                text = self.io.input(self.state.language).strip()
-            except KeyboardInterrupt:
-                self.io.agent(self.state.language, t(self.state.language, "ctrl_c_exit"))
-                self.store.save(self.state)
-                return 130
-            except EOFError:
-                self.io.agent(self.state.language, t(self.state.language, "bye"))
-                self.store.save(self.state)
-                return 0
+        with _terminal_sigint_scope(self):
+            self.startup()
+            while True:
+                try:
+                    text = self.io.input(self.state.language).strip()
+                except KeyboardInterrupt:
+                    self.io.agent(self.state.language, t(self.state.language, "ctrl_c_exit"))
+                    self.store.save(self.state)
+                    return 130
+                except EOFError:
+                    self.io.agent(self.state.language, t(self.state.language, "bye"))
+                    self.store.save(self.state)
+                    return 0
 
-            if not text:
-                continue
-            if text.lower() in {"exit", "quit", "q"}:
-                self.io.agent(self.state.language, t(self.state.language, "bye"))
+                if not text:
+                    continue
+                if text.lower() in {"exit", "quit", "q"}:
+                    self.io.agent(self.state.language, t(self.state.language, "bye"))
+                    self.store.save(self.state)
+                    return 0
+                self.handle_user_text(text)
                 self.store.save(self.state)
-                return 0
-            self.handle_user_text(text)
-            self.store.save(self.state)
 
     def startup(self) -> None:
         self._llm_config = load_llm_config()
@@ -178,9 +208,7 @@ class AnyChainTerminal:
             self.io.agent(self.state.language, t(self.state.language, "llm_config_warning", errors="; ".join(errors)))
 
         status = adk_status().as_dict()
-        bridge_status = _adk_runner_status()
-        self._adk_available = bool(status.get("available") and bridge_status.get("available"))
-        self.io.agent(self.state.language, t(self.state.language, "adk", status=bridge_status.get("reason", status)))
+        self.io.agent(self.state.language, t(self.state.language, "adk", status=status.get("reason", "unknown")))
 
         self._load_framework_context()
         self._startup_doctor()
@@ -201,11 +229,15 @@ class AnyChainTerminal:
         else:
             self.io.agent(self.state.language, t(self.state.language, "job_none"))
 
-        if not self._adk_available:
+        runtime_errors = provider_runtime_errors(self._llm_config)
+        self._llm_runtime_available = not runtime_errors
+        if runtime_errors:
             self.state.current_question_id = "install_agent_runtime"
-            self.state.pending_missing_dependencies = ["google-adk"]
-            self.io.agent(self.state.language, t(self.state.language, "adk_missing_hint"))
-            self.io.agent(self.state.language, t(self.state.language, "agent_runtime_offer"))
+            self.state.pending_missing_dependencies = list(runtime_errors)
+            self.io.agent(
+                self.state.language,
+                t(self.state.language, "agent_runtime_offer", missing="; ".join(runtime_errors)),
+            )
         else:
             # `_startup_doctor` may already have set an "install_dependencies"
             # offer (missing vegeta etc.). Do not clobber it here, or the "[Y/n]"
@@ -243,31 +275,49 @@ class AnyChainTerminal:
             return
         if self._handle_pending_confirmation(lowered):
             return
-        if not self._adk_available:
-            self.io.agent(self.state.language, t(self.state.language, "adk_missing_hint"))
+        if not self._llm_runtime_available:
             self.state.current_question_id = "install_agent_runtime"
-            self.io.agent(self.state.language, t(self.state.language, "agent_runtime_offer"))
+            runtime_errors = provider_runtime_errors(self._llm_config)
+            self.io.agent(
+                self.state.language,
+                t(self.state.language, "agent_runtime_offer", missing="; ".join(runtime_errors)),
+            )
             return
 
         try:
-            self.io.agent(self.state.language, t(self.state.language, "thinking"))
-            graph_state = self._ensure_harness().invoke(
-                text,
-                language=self.state.language,
-                context={
-                    "discovery": self.state.discovery,
-                    "framework_summary": self.state.framework_summary,
-                    "latest_job_id": self.state.latest_job_id,
-                    "web_research": self._web_research_status,
-                },
-            )
-        except (KeyboardInterrupt, asyncio.CancelledError):
+            self._turn_active = True
+            with _interactive_turn_scope(self._llm_config.turn_timeout_seconds):
+                self.io.agent(self.state.language, t(self.state.language, "thinking"))
+                graph_state = self._ensure_harness().invoke(
+                    text,
+                    language=self.state.language,
+                    context={
+                        "discovery": self.state.discovery,
+                        "framework_summary": self.state.framework_summary,
+                        "web_research": self._web_research_status,
+                    },
+                )
+        except (LLMTurnCancelledError, KeyboardInterrupt):
             self.io.agent(self.state.language, t(self.state.language, "turn_cancelled"))
+            return
+        except LLMTurnTimeoutError as exc:
+            self.io.agent(
+                self.state.language,
+                t(
+                    self.state.language,
+                    "turn_timeout",
+                    timeout=self._llm_config.turn_timeout_seconds,
+                    provider=exc.provider or self._llm_config.provider,
+                    model=exc.model or self._llm_config.model,
+                ),
+            )
             return
         except Exception as exc:
             _debug_exception("harness_turn", exc)
             self.io.agent(self.state.language, _adk_error_message(self.state.language, exc))
             return
+        finally:
+            self._turn_active = False
 
         messages = graph_state.get("visible_response") or []
         if not messages:
@@ -287,38 +337,6 @@ class AnyChainTerminal:
             pass
 
     def _handle_pending_confirmation(self, lowered: str) -> bool:
-        if self.state.current_question_id == "resume_harness_session":
-            if lowered in {"1", "continue"}:
-                self.state.current_question_id = ""
-                snapshot = self._ensure_harness().snapshot()
-                pending = snapshot.get("pending_question") or {}
-                prompt = str(pending.get("prompt") or "").strip()
-                next_step = (
-                    t(self.state.language, "resume_pending_next", prompt=prompt)
-                    if prompt
-                    else t(self.state.language, "resume_no_pending_next")
-                )
-                self.io.agent(self.state.language, t(self.state.language, "resume_session_continue", next_step=next_step))
-                return True
-            if lowered in {"2", "modify", "change"}:
-                self.state.current_question_id = ""
-                self._ensure_harness().update({"pending_question": {}, "evidence_collection": {}, "active_group": "", "visible_response": []})
-                self.io.agent(self.state.language, t(self.state.language, "resume_session_modify"))
-                return True
-            if lowered in {"3", "clear", "reset", "fresh"}:
-                self.state.current_question_id = ""
-                self._ensure_harness().reset(language=self.state.language)
-                self.io.agent(self.state.language, t(self.state.language, "resume_session_clear"))
-                return True
-            if not lowered.isdigit():
-                if _is_resume_session_explanation_request(lowered):
-                    self.io.agent(self.state.language, t(self.state.language, "resume_session_explain"))
-                    return True
-                self.state.current_question_id = ""
-                self._ensure_harness().update({"pending_question": {}, "evidence_collection": {}, "active_group": "", "visible_response": []})
-                return False
-            self.io.agent(self.state.language, t(self.state.language, "resume_session_invalid"))
-            return True
         if self.state.current_question_id == "install_agent_runtime":
             if lowered in {"y", "yes", ""}:
                 self._install_agent_runtime()
@@ -355,11 +373,10 @@ class AnyChainTerminal:
         if self.session_purpose == "user" and snapshot_purpose != "user":
             return
         if snapshot.get("evidence_collection"):
-            snapshot = self._ensure_harness().update({"evidence_collection": {}})
-        if not _has_resumable_harness_state(snapshot):
-            return
-        self.state.current_question_id = "resume_harness_session"
-        self.io.agent(self.state.language, t(self.state.language, "resume_session_offer", summary=_format_harness_resume_summary(snapshot)))
+            snapshot = self._ensure_harness().clear_evidence_collection()
+        offered = self._ensure_harness().prepare_resume_offer(self.state.language)
+        for message in offered.get("visible_response") or []:
+            self.io.agent(self.state.language, str(message))
 
     def _startup_doctor(self) -> None:
         self.io.agent(self.state.language, t(self.state.language, "startup_doctor_start"))
@@ -432,8 +449,9 @@ class AnyChainTerminal:
         )
         self.state.current_question_id = ""
         self.io.agent(self.state.language, t(self.state.language, "agent_runtime_install_done", exit_code=completed.returncode))
-        self._adk_available = bool(adk_status().available and _adk_runner_status().get("available"))
-        if self._adk_available:
+        self._llm_config = load_llm_config()
+        self._llm_runtime_available = not provider_runtime_errors(self._llm_config)
+        if self._llm_runtime_available:
             self._harness = None
             self._ensure_harness()
         self._startup_doctor()
@@ -498,7 +516,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--session-purpose",
-        choices=["user", "chaos", "live-matrix", "dev"],
+        choices=["user", "chaos", "dynamic-dual-ai-chaos", "live-matrix", "dev"],
         default=os.environ.get("ANYCHAIN_AGENT_SESSION_PURPOSE", "user"),
         help="Label the runtime session so test/dev checkpoints cannot be resumed as user state.",
     )
@@ -550,68 +568,6 @@ def _format_environment_inference(env: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _has_resumable_harness_state(snapshot: dict[str, Any]) -> bool:
-    if not snapshot:
-        return False
-    identity = snapshot.get("chain_identity") or {}
-    confirmed = snapshot.get("confirmed_config") or {}
-    pending = snapshot.get("pending_question") or {}
-    pending_id = str(pending.get("id") or "").strip()
-    meaningful_pending = bool(pending) and pending_id not in {"opening_next_action"}
-    return any(
-        [
-            bool(snapshot.get("target_mode")),
-            bool(identity.get("canonical")),
-            bool(confirmed),
-            bool(snapshot.get("rpc_mode")),
-            bool(snapshot.get("qps_profile")),
-            bool(snapshot.get("observability")),
-            bool(snapshot.get("sync_observe")),
-            meaningful_pending,
-        ]
-    )
-
-
-def _format_harness_resume_summary(snapshot: dict[str, Any]) -> str:
-    identity = snapshot.get("chain_identity") or {}
-    confirmed = snapshot.get("confirmed_config") or {}
-    pending = snapshot.get("pending_question") or {}
-    qps = snapshot.get("qps_profile") or {}
-    observability = snapshot.get("observability") or {}
-    session = snapshot.get("session") or {}
-    lines = [
-        f"- session purpose: {session.get('purpose') or '<unknown>'}",
-        f"- target_mode: {snapshot.get('target_mode') or '<not selected>'}",
-        f"- workflow_mode: {snapshot.get('workflow_mode') or '<not selected>'}",
-        f"- chain: {identity.get('canonical') or '<not selected>'}",
-        f"- rpc_mode: {snapshot.get('rpc_mode') or '<not selected>'}",
-        f"- qps: {qps.get('mode') or '<not selected>'}",
-        f"- observability: {observability.get('mode') or '<not selected>'}",
-        f"- confirmed fields: {', '.join(sorted(confirmed.keys())) if confirmed else '<none>'}",
-        f"- pending question: {pending.get('id') or '<none>'}",
-    ]
-    return "\n".join(lines)
-
-
-def _is_resume_session_explanation_request(text: str) -> bool:
-    lowered = str(text or "").strip().lower()
-    if not lowered:
-        return False
-    return any(
-        marker in lowered
-        for marker in (
-            "这个",
-            "这是什么",
-            "什么意思",
-            "做什么",
-            "what is this",
-            "what does this mean",
-            "what is it",
-            "explain",
-        )
-    )
-
-
 def _known_value(value: Any) -> str:
     text = str(value or "").strip()
     if not text or text.lower() in {"unknown", "none", "null"}:
@@ -624,16 +580,6 @@ def _is_shell_command(stripped: str, lowered: str, aliases: set[str]) -> bool:
 
     normalized_aliases = {alias.lower() for alias in aliases}
     return lowered in normalized_aliases or stripped in aliases
-
-
-def _adk_runner_status() -> dict[str, Any]:
-    try:
-        if importlib.util.find_spec("google.adk.runners") is None:
-            return {"available": False, "reason": "ADK Runner is unavailable: google.adk.runners is not importable"}
-        from google.adk.runners import Runner  # type: ignore  # noqa: F401
-    except Exception as exc:
-        return {"available": False, "reason": f"ADK Runner is unavailable: {type(exc).__name__}: {exc}"}
-    return {"available": True, "reason": "ADK Runner is importable"}
 
 
 def _format_memory(value: Any) -> str:
@@ -668,10 +614,98 @@ def _debug_exception(scope: str, exc: Exception) -> None:
 
 
 def _adk_error_message(language: str, exc: Exception) -> str:
+    if isinstance(exc, StateInvariantError) or (
+        type(exc).__name__ == "StateInvariantError"
+        and type(exc).__module__.endswith("harness.invariants")
+    ):
+        return t(language, "harness_runtime_error")
     message = str(exc).lower()
     if "insufficient balance" in message or "insufficient quota" in message:
         return t(language, "llm_billing_error")
-    return t(language, "adk_runtime_error")
+    module = type(exc).__module__.casefold()
+    provider_markers = (
+        "openai",
+        "anthropic",
+        "google.api_core",
+        "google.genai",
+        "httpx",
+        "httpcore",
+        "urllib",
+    )
+    provider_message_markers = (
+        "api key",
+        "authentication",
+        "rate limit",
+        "model provider",
+        "connection error",
+        "request timeout",
+    )
+    if any(marker in module for marker in provider_markers) or any(
+        marker in message for marker in provider_message_markers
+    ):
+        return t(language, "adk_runtime_error")
+    return t(language, "harness_runtime_error")
+
+
+@contextmanager
+def _terminal_sigint_scope(app: AnyChainTerminal) -> Iterator[None]:
+    """Give one SIGINT a stable meaning for the lifetime of the interactive CLI."""
+
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.getsignal(signal.SIGINT)
+
+    def _dispatch(_signum: int, _frame: Any) -> None:
+        if app._turn_active:
+            raise LLMTurnCancelledError("active Agent turn cancelled by SIGINT")
+        raise KeyboardInterrupt()
+
+    signal.signal(signal.SIGINT, _dispatch)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+@contextmanager
+def _interactive_turn_scope(timeout_seconds: float) -> Iterator[None]:
+    """Own SIGINT/SIGALRM while one synchronous product turn is active."""
+
+    can_manage_signals = threading.current_thread() is threading.main_thread()
+    can_manage_alarm = can_manage_signals and hasattr(signal, "SIGALRM") and hasattr(signal, "setitimer")
+    if not can_manage_signals:
+        with llm_turn_scope(timeout_seconds):
+            yield
+        return
+
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    previous_sigalrm = signal.getsignal(signal.SIGALRM) if can_manage_alarm else None
+    previous_timer = signal.getitimer(signal.ITIMER_REAL) if can_manage_alarm else (0.0, 0.0)
+    started = time.monotonic()
+
+    def _cancel_turn(_signum: int, _frame: Any) -> None:
+        raise LLMTurnCancelledError("active Agent turn cancelled by SIGINT")
+
+    def _expire_turn(_signum: int, _frame: Any) -> None:
+        raise LLMTurnTimeoutError(f"Agent turn exceeded its {timeout_seconds:g}s deadline")
+
+    signal.signal(signal.SIGINT, _cancel_turn)
+    if can_manage_alarm:
+        signal.signal(signal.SIGALRM, _expire_turn)
+        signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+    try:
+        with llm_turn_scope(timeout_seconds):
+            yield
+    finally:
+        if can_manage_alarm:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_sigalrm)
+            old_delay, old_interval = previous_timer
+            if old_delay > 0:
+                remaining = max(0.000001, old_delay - (time.monotonic() - started))
+                signal.setitimer(signal.ITIMER_REAL, remaining, old_interval)
+        signal.signal(signal.SIGINT, previous_sigint)
 
 
 if __name__ == "__main__":

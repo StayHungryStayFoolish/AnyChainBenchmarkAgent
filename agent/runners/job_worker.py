@@ -7,19 +7,16 @@ import argparse
 import json
 import os
 import subprocess
-import sys
 import time
 from pathlib import Path
 
-AGENT_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(AGENT_ROOT) not in sys.path:
-    sys.path.insert(0, str(AGENT_ROOT))
 
-from runners.artifacts import write_artifact_index  # noqa: E402
-from runners.guardrails import build_benchmark_command  # noqa: E402
-from runners.job_manager import _discover_completed_artifacts  # noqa: E402
-from runners.materialize import benchmark_subprocess_env, load_runtime_env_file  # noqa: E402
+from .artifacts import write_artifact_index
+from .guardrails import build_benchmark_command
+from .job_manager import _discover_completed_artifacts
+from .materialize import benchmark_subprocess_env, load_runtime_env_file
+from .result_status import classify_benchmark_result
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -54,12 +51,13 @@ def main(argv: list[str] | None = None) -> int:
                 stderr=subprocess.STDOUT,
                 check=False,
             )
-        job["status"] = "completed" if completed.returncode == 0 else "failed"
         job["exit_code"] = completed.returncode
-        if completed.returncode != 0:
-            job["error"] = f"benchmark command exited with {completed.returncode}"
-        else:
-            job.setdefault("artifacts", {}).update(_discover_completed_artifacts(plan, env))
+        job.setdefault("artifacts", {}).update(_discover_completed_artifacts(plan, env))
+        result = classify_benchmark_result(plan, completed.returncode, job["artifacts"])
+        job["status"] = result["status"]
+        job["result_validation"] = result
+        if result["failures"]:
+            job["error"] = "; ".join(result["failures"])
     except Exception as exc:  # pragma: no cover - defensive detached worker guard
         job["status"] = "failed"
         job["error"] = str(exc)

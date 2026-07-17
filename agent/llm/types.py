@@ -2,11 +2,90 @@
 
 from __future__ import annotations
 
+import contextvars
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol
+from typing import Any, Iterator, Literal, Protocol
 
 
 MessageRole = Literal["system", "user", "assistant", "tool"]
+
+
+class LLMTurnTimeoutError(BaseException):
+    """The shared turn deadline expired and must bypass transport retries."""
+
+    def __init__(self, message: str, *, provider: str = "", model: str = "", stage: str = "turn") -> None:
+        super().__init__(message)
+        self.provider = provider
+        self.model = model
+        self.stage = stage
+
+
+class LLMTurnCancelledError(KeyboardInterrupt):
+    """The user cancelled the active Agent turn."""
+
+    def __init__(self, message: str, *, stage: str = "turn") -> None:
+        super().__init__(message)
+        self.stage = stage
+
+
+@dataclass(frozen=True)
+class LLMTurnContext:
+    deadline: float
+    timeout_seconds: float
+
+    def remaining_seconds(self) -> float:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise LLMTurnTimeoutError(f"Agent turn exceeded its {self.timeout_seconds:g}s deadline")
+        return remaining
+
+
+_TURN_CONTEXT: contextvars.ContextVar[LLMTurnContext | None] = contextvars.ContextVar(
+    "anychain_llm_turn_context",
+    default=None,
+)
+
+
+@contextmanager
+def llm_turn_scope(timeout_seconds: float) -> Iterator[LLMTurnContext]:
+    """Share one monotonic deadline across every model call in a turn."""
+
+    if timeout_seconds <= 0:
+        raise ValueError("turn timeout must be greater than zero")
+    existing = _TURN_CONTEXT.get()
+    if existing is not None:
+        yield existing
+        return
+    context = LLMTurnContext(
+        deadline=time.monotonic() + timeout_seconds,
+        timeout_seconds=timeout_seconds,
+    )
+    token = _TURN_CONTEXT.set(context)
+    try:
+        yield context
+    finally:
+        _TURN_CONTEXT.reset(token)
+
+
+def remaining_turn_seconds(default: float | None = None) -> float:
+    """Return the current turn budget, or a provider-local default."""
+
+    context = _TURN_CONTEXT.get()
+    if context is not None:
+        return context.remaining_seconds()
+    if default is None or default <= 0:
+        raise ValueError("a positive default timeout is required outside a turn scope")
+    return default
+
+
+def ensure_turn_active() -> None:
+    """Raise the typed timeout as soon as an exhausted turn reaches a boundary."""
+
+    context = _TURN_CONTEXT.get()
+    if context is not None:
+        context.remaining_seconds()
 
 
 @dataclass(frozen=True)

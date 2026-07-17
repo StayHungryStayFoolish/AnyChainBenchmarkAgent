@@ -7,10 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-try:
-    from .framework_capabilities import REPO_ROOT, load_framework_capabilities
-except ImportError:  # script execution with agent/ on sys.path
-    from knowledge.framework_capabilities import REPO_ROOT, load_framework_capabilities
+from agent.knowledge.framework_capabilities import REPO_ROOT, load_framework_capabilities
 
 
 DEFAULT_INDEX_PATH = REPO_ROOT / ".agent" / "knowledge" / "framework_index.json"
@@ -56,8 +53,8 @@ KEY_CODE_PATHS = [
 
 
 VALIDATION_COMMANDS = [
-    "python3 agent/cli.py framework-index --output /tmp/framework_index.json",
-    "python3 agent/cli.py capabilities",
+    "python3 -m agent.cli framework-index --output /tmp/framework_index.json",
+    "python3 -m agent.cli capabilities",
     "python3 tools/chain_adapters/cli.py validate-template --chain all",
     "python3 tools/fake-node/check_fixture_coverage.py --json",
     "python3 tools/fake-node/runtime_probe.py",

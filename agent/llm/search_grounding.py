@@ -20,10 +20,7 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
-try:
-    from .config import LLMConfig, load_llm_config
-except ImportError:  # script execution with agent/ on sys.path
-    from llm.config import LLMConfig, load_llm_config
+from agent.llm.config import LLMConfig, load_llm_config
 
 DEFAULT_GROUNDING_TIMEOUT_SECONDS = 20.0
 
@@ -50,7 +47,7 @@ def web_research_status(config: LLMConfig | None = None) -> WebResearchStatus:
     """Return the user-visible web research capability state.
 
     The returned `google_search_available` field name is the single source of
-    truth other modules must read (`agent/harness/groups.py`'s real-node
+    truth other modules must read (`agent/harness/coordinator.py`'s real-node
     client-setup flow, `agent/terminal/repl.py`'s startup banner). It must
     never be renamed on only one side of that contract again.
     """
@@ -59,7 +56,7 @@ def web_research_status(config: LLMConfig | None = None) -> WebResearchStatus:
     if not eligible:
         return WebResearchStatus(False, cfg.provider, cfg.model, "disabled", reason)
     try:
-        from google.adk.tools import google_search  # type: ignore  # noqa: F401
+        __import__("google.adk.tools", fromlist=["google_search"])
     except Exception as exc:
         return WebResearchStatus(False, cfg.provider, cfg.model, "disabled", f"ADK google_search unavailable: {type(exc).__name__}")
     return WebResearchStatus(True, cfg.provider, cfg.model, "adk_google_search", "enabled via ADK google_search")
@@ -121,9 +118,9 @@ def run_google_search_grounding(
         return SearchGroundingResult(available=False, query=query, error=status.reason)
 
     try:
-        from google.adk.agents import Agent  # noqa: F401
-        from google.adk.runners import InMemoryRunner  # noqa: F401
-        from google.genai import types  # noqa: F401
+        __import__("google.adk.agents", fromlist=["Agent"])
+        __import__("google.adk.runners", fromlist=["InMemoryRunner"])
+        __import__("google.genai", fromlist=["types"])
     except Exception as exc:  # pragma: no cover - optional dependency guard
         return SearchGroundingResult(available=False, query=query, error=f"ADK import failed: {type(exc).__name__}: {exc}")
 

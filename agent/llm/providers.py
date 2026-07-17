@@ -2,19 +2,17 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import socket
 from typing import Any
+from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-try:
-    from .config import LLMConfig, load_llm_config
-    from .google_auth import get_google_access_token
-    from .types import LLMMessage, LLMProvider, LLMRequest, LLMResponse
-except ImportError:  # script execution with agent/ on sys.path
-    from llm.config import LLMConfig, load_llm_config
-    from llm.google_auth import get_google_access_token
-    from llm.types import LLMMessage, LLMProvider, LLMRequest, LLMResponse
+from .config import LLMConfig, load_llm_config
+from .google_auth import get_google_access_token
+from .types import LLMTurnTimeoutError, LLMMessage, LLMProvider, LLMRequest, LLMResponse, ensure_turn_active, remaining_turn_seconds
 
 
 class OpenAIProvider:
@@ -27,11 +25,14 @@ class OpenAIProvider:
         except ImportError as exc:  # pragma: no cover - optional dependency guard
             raise RuntimeError("openai is required for LLM_PROVIDER=openai") from exc
 
-        client = OpenAI(api_key=self.config.openai_api_key or None)
-        response = client.chat.completions.create(
-            model=self.config.model,
-            messages=_openai_messages(request.messages),
-            **_openai_completion_options(self.config.model, request),
+        client = _openai_client(OpenAI, self.config, api_key=self.config.openai_api_key or None)
+        response = _openai_request(
+            self.config,
+            lambda: client.chat.completions.create(
+                model=self.config.model,
+                messages=_openai_messages(request.messages),
+                **_openai_completion_options(self.config.model, request),
+            ),
         )
         text = response.choices[0].message.content or ""
         return LLMResponse(
@@ -54,13 +55,21 @@ class DeepSeekProvider:
         except ImportError as exc:  # pragma: no cover - optional dependency guard
             raise RuntimeError("openai is required for LLM_PROVIDER=deepseek") from exc
 
-        client = OpenAI(api_key=self.config.deepseek_api_key or None, base_url="https://api.deepseek.com")
-        response = client.chat.completions.create(
-            model=self.config.model,
-            messages=_openai_messages(request.messages),
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-            tools=request.tools or None,
+        client = _openai_client(
+            OpenAI,
+            self.config,
+            api_key=self.config.deepseek_api_key or None,
+            base_url="https://api.deepseek.com",
+        )
+        response = _openai_request(
+            self.config,
+            lambda: client.chat.completions.create(
+                model=self.config.model,
+                messages=_openai_messages(request.messages),
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+                tools=request.tools or None,
+            ),
         )
         text = response.choices[0].message.content or ""
         return LLMResponse(
@@ -85,13 +94,16 @@ class VertexGeminiProvider:
 
         token = get_google_access_token(self.config)
         base_url = _vertex_openai_base_url(self.config)
-        client = OpenAI(api_key=token, base_url=base_url)
-        response = client.chat.completions.create(
-            model=f"google/{self.config.model}",
-            messages=_openai_messages(request.messages),
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-            tools=request.tools or None,
+        client = _openai_client(OpenAI, self.config, api_key=token, base_url=base_url)
+        response = _openai_request(
+            self.config,
+            lambda: client.chat.completions.create(
+                model=f"google/{self.config.model}",
+                messages=_openai_messages(request.messages),
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+                tools=request.tools or None,
+            ),
         )
         text = response.choices[0].message.content or ""
         return LLMResponse(
@@ -153,7 +165,7 @@ class GeminiAPIKeyProvider:
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"{urlparse.quote(self.config.model, safe='')}:generateContent?key={urlparse.quote(api_key, safe='')}"
         )
-        response = _post_json(url, payload, headers={})
+        response = _post_json(url, payload, headers={}, config=self.config)
         text = _gemini_text(response)
         return LLMResponse(text=text, model=self.config.model, provider=self.config.provider, raw=response)
 
@@ -178,7 +190,7 @@ class VertexClaudeProvider:
             payload["system"] = system
         if request.tools:
             payload["tools"] = request.tools
-        response = _post_json(url, payload, headers={"Authorization": f"Bearer {token}"})
+        response = _post_json(url, payload, headers={"Authorization": f"Bearer {token}"}, config=self.config)
         text = "".join(block.get("text", "") for block in response.get("content", []) if block.get("type") == "text")
         return LLMResponse(
             text=text,
@@ -216,12 +228,54 @@ class AnthropicAPIKeyProvider:
                 "x-api-key": api_key,
                 "anthropic-version": "2023-06-01",
             },
+            config=self.config,
         )
         text = "".join(block.get("text", "") for block in response.get("content", []) if block.get("type") == "text")
         return LLMResponse(text=text, model=self.config.model, provider=self.config.provider, raw=response)
 
 
-def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
+def _openai_client(client_type: Any, config: LLMConfig, **kwargs: Any) -> Any:
+    import httpx
+
+    remaining = remaining_turn_seconds(config.turn_timeout_seconds)
+    connect_timeout = min(config.connect_timeout_seconds, remaining)
+    read_timeout = min(config.read_timeout_seconds, remaining)
+    timeout = httpx.Timeout(
+        timeout=remaining,
+        connect=connect_timeout,
+        read=read_timeout,
+        write=read_timeout,
+        pool=connect_timeout,
+    )
+    return client_type(timeout=timeout, max_retries=config.max_retries, **kwargs)
+
+
+def _openai_request(config: LLMConfig, call: Any) -> Any:
+    ensure_turn_active()
+    try:
+        response = call()
+    except Exception as exc:
+        if _is_transport_timeout(exc):
+            raise LLMTurnTimeoutError(
+                f"{config.provider}/{config.model} request exceeded the active turn deadline or transport timeout",
+                provider=config.provider,
+                model=config.model,
+                stage="provider_request",
+            ) from exc
+        raise
+    ensure_turn_active()
+    return response
+
+
+def _is_transport_timeout(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    name = type(exc).__name__.casefold()
+    module = type(exc).__module__.casefold()
+    return "timeout" in name and any(marker in module for marker in ("openai", "httpx", "httpcore", "urllib"))
+
+
+def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str], config: LLMConfig) -> dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
     request_headers = {
         "Content-Type": "application/json",
@@ -233,8 +287,28 @@ def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str]) -> di
         headers=request_headers,
         method="POST",
     )
-    with urlrequest.urlopen(req, timeout=120) as response:  # nosec B310 - URL is a configured Google API endpoint
-        return json.loads(response.read().decode("utf-8"))
+    timeout = min(config.read_timeout_seconds, remaining_turn_seconds(config.turn_timeout_seconds))
+    try:
+        with urlrequest.urlopen(req, timeout=timeout) as response:  # nosec B310 - URL is a configured provider endpoint
+            payload = json.loads(response.read().decode("utf-8"))
+    except (TimeoutError, socket.timeout) as exc:
+        raise LLMTurnTimeoutError(
+            f"{config.provider}/{config.model} request exceeded the active turn deadline or transport timeout",
+            provider=config.provider,
+            model=config.model,
+            stage="provider_request",
+        ) from exc
+    except urlerror.URLError as exc:
+        if _is_transport_timeout(exc.reason if isinstance(exc.reason, BaseException) else exc):
+            raise LLMTurnTimeoutError(
+                f"{config.provider}/{config.model} request exceeded the active turn deadline or transport timeout",
+                provider=config.provider,
+                model=config.model,
+                stage="provider_request",
+            ) from exc
+        raise
+    ensure_turn_active()
+    return payload
 
 
 def provider_from_config(config: LLMConfig | None = None) -> LLMProvider:
@@ -251,6 +325,30 @@ def provider_from_config(config: LLMConfig | None = None) -> LLMProvider:
     if config.provider == "claude":
         return AnthropicAPIKeyProvider(config) if config.auth_mode == "api_key" else VertexClaudeProvider(config)
     raise ValueError(f"unsupported LLM_PROVIDER: {config.provider}")
+
+
+def provider_runtime_errors(config: LLMConfig | None = None) -> list[str]:
+    """Return configuration and import blockers for the selected provider.
+
+    Google ADK is deliberately absent from this contract. It is an optional
+    Gemini search-grounding bridge, not the runtime for ordinary Harness turns.
+    """
+
+    config = config or load_llm_config()
+    errors = list(config.validate())
+    if config.provider in {"openai", "deepseek"} or (
+        config.provider == "gemini" and config.auth_mode != "api_key"
+    ):
+        if importlib.util.find_spec("openai") is None:
+            errors.append("openai package is required for the selected provider")
+    if config.provider in {"gemini", "claude"} and config.auth_mode != "api_key":
+        try:
+            google_auth_available = importlib.util.find_spec("google.auth") is not None
+        except ModuleNotFoundError:
+            google_auth_available = False
+        if not google_auth_available:
+            errors.append("google-auth package is required for Vertex authentication")
+    return errors
 
 
 def _openai_completion_options(model: str, request: LLMRequest) -> dict[str, Any]:

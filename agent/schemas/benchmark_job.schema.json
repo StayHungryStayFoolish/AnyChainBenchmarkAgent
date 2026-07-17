@@ -6,7 +6,7 @@
   "properties": {
     "job_id": {"type": "string"},
     "plan_id": {"type": "string"},
-    "status": {"type": "string", "enum": ["pending", "running", "completed", "failed", "cancelled"]},
+    "status": {"type": "string", "enum": ["pending", "running", "completed", "partial", "failed", "cancelled"]},
     "created_at": {"type": "string"},
     "updated_at": {"type": "string"},
     "plan_file": {"type": "string"},

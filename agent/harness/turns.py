@@ -1,7 +1,7 @@
 """Turn adjudication primitives for the AnyChain Agent Harness.
 
 This module intentionally does not parse business intent. It only names the
-outer turn shape so `groups.process_turn` can keep a clear control boundary.
+outer turn shape so the compiled LangGraph keeps a clear control boundary.
 Ambiguous natural language remains the responsibility of the LLM action
 resolver and deterministic group workflows.
 """

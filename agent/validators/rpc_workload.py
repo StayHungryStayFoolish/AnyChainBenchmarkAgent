@@ -4,10 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-try:
-    from ..knowledge.framework_capabilities import load_framework_capabilities
-except ImportError:  # script execution with agent/ on sys.path
-    from knowledge.framework_capabilities import load_framework_capabilities
+from agent.knowledge.framework_capabilities import load_framework_capabilities
 
 
 def validate_rpc_workload(

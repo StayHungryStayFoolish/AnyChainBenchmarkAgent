@@ -8,32 +8,36 @@ import json
 import sys
 from pathlib import Path
 
-from analyzers.result_analyzer import analyze_job
-from analyzers.history import compare_latest, list_history
-from analyzers.artifact_qa import answer_artifact_question
-from analyzers.bottleneck_rules import diagnose_artifacts
-from diagnostics.adk_status import adk_status
-from diagnostics.doctor import run_doctor
-from discovery.environment import discover_environment
-from knowledge.gap_analyzer import analyze_capability_gap
-from knowledge.framework_capabilities import load_framework_capabilities
-from knowledge.framework_index import load_or_build_framework_index, write_framework_index
-from knowledge.loader import load_knowledge_provider, provider_status
-from llm.config import load_llm_config
-from llm.google_auth import credential_plan
-from llm.providers import provider_from_config
-from llm.search_grounding import web_research_status
-from llm.types import LLMMessage, LLMRequest
-from onboarding.chain_onboarding import generate_onboarding_package
-from onboarding.template_drafter import draft_chain_template
-from planners.preflight import run_preflight
-from planners.diff import diff_plans
-from planners.risk import score_plan_risk
-from planners.strategy_planner import generate_plan, load_json, validate_plan_shape, write_json
-from runners.job_manager import get_job, list_jobs, resume_job, submit_job, tail_job_log
-from runners.runbook import render_runbook
-from tools.executor import execute_tool, load_arguments
-from tools.schema import tool_schema
+from agent.analyzers.artifact_qa import answer_artifact_question
+from agent.analyzers.bottleneck_rules import diagnose_artifacts
+from agent.analyzers.history import compare_latest, list_history
+from agent.analyzers.result_analyzer import analyze_job
+from agent.diagnostics.adk_status import adk_status
+from agent.diagnostics.doctor import run_doctor
+from agent.discovery.environment import discover_environment
+from agent.knowledge.framework_capabilities import load_framework_capabilities
+from agent.knowledge.framework_index import load_or_build_framework_index, write_framework_index
+from agent.knowledge.gap_analyzer import analyze_capability_gap
+from agent.knowledge.loader import load_knowledge_provider, provider_status
+from agent.llm.config import load_llm_config
+from agent.llm.google_auth import credential_plan
+from agent.llm.providers import provider_from_config
+from agent.llm.search_grounding import web_research_status
+from agent.llm.types import LLMMessage, LLMRequest
+from agent.onboarding.chain_onboarding import generate_onboarding_package
+from agent.onboarding.template_drafter import draft_chain_template
+from agent.planners.diff import diff_plans
+from agent.planners.risk import score_plan_risk
+from agent.planners.strategy_planner import generate_plan, load_json, validate_plan_shape, write_json
+from agent.runners.application_service import (
+    ExecutionOperation,
+    ExecutionRequest,
+    execution_service,
+)
+from agent.runners.job_manager import DEFAULT_JOBS_DIR, get_job, list_jobs, resume_job, tail_job_log
+from agent.runners.runbook import render_runbook
+from agent.tools.executor import execute_tool, load_arguments
+from agent.tools.schema import tool_schema
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -235,7 +239,10 @@ def main(argv: list[str] | None = None) -> int:
         return _emit(payload, args.output)
 
     if args.command == "preflight":
-        return _emit(run_preflight(load_json(args.plan)), None)
+        result = execution_service.execute(
+            ExecutionRequest(operation=ExecutionOperation.PREFLIGHT, plan_file=args.plan)
+        )
+        return _emit(result.to_dict(), None)
 
     if args.command == "discover":
         payload = discover_environment()
@@ -284,24 +291,29 @@ def main(argv: list[str] | None = None) -> int:
         return _emit(diff_plans(load_json(args.old), load_json(args.new)), None)
 
     if args.command == "submit":
+        request_kwargs = {
+            "operation": ExecutionOperation.FINAL_BENCHMARK,
+            "plan_file": args.plan,
+            "approved": args.approved,
+            "mock": args.dev_lifecycle_mock,
+        }
         if args.jobs_dir:
-            payload = submit_job(args.plan, jobs_dir=args.jobs_dir, mock=args.dev_lifecycle_mock, approved=args.approved)
-        else:
-            payload = submit_job(args.plan, mock=args.dev_lifecycle_mock, approved=args.approved)
-        return _emit(payload, None)
+            request_kwargs["jobs_dir"] = args.jobs_dir
+        result = execution_service.execute(ExecutionRequest(**request_kwargs))
+        return _emit(result.to_dict(), None)
 
     if args.command == "status":
         job = get_job(args.job_id, jobs_dir=args.jobs_dir) if args.jobs_dir else get_job(args.job_id)
         return _emit(job, None)
 
     if args.command == "jobs":
-        return _emit({"jobs": list_jobs(jobs_dir=args.jobs_dir or ".agent/jobs", limit=args.limit)}, None)
+        return _emit({"jobs": list_jobs(jobs_dir=args.jobs_dir or DEFAULT_JOBS_DIR, limit=args.limit)}, None)
 
     if args.command == "logs":
-        return _emit(tail_job_log(args.job_id, jobs_dir=args.jobs_dir or ".agent/jobs", lines=args.lines), None)
+        return _emit(tail_job_log(args.job_id, jobs_dir=args.jobs_dir or DEFAULT_JOBS_DIR, lines=args.lines), None)
 
     if args.command == "resume":
-        return _emit(resume_job(args.job_id, jobs_dir=args.jobs_dir or ".agent/jobs"), None)
+        return _emit(resume_job(args.job_id, jobs_dir=args.jobs_dir or DEFAULT_JOBS_DIR), None)
 
     if args.command == "analyze":
         job = get_job(args.job_id, jobs_dir=args.jobs_dir) if args.jobs_dir else get_job(args.job_id)

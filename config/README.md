@@ -118,7 +118,7 @@ incident history, or company-specific workload guidance.
 Validate a generic HTTP adapter:
 
 ```bash
-python3 agent/cli.py knowledge-smoke --query "solana rpc methods" --chain solana
+python3 -m agent.cli knowledge-smoke --query "solana rpc methods" --chain solana
 ```
 
 ## Optional Job Notifications
@@ -134,7 +134,7 @@ Agent platform or automation runner needs a webhook after long-running jobs.
 Check the configuration without calling a model:
 
 ```bash
-python3 agent/cli.py llm-config
+python3 -m agent.cli llm-config
 ```
 
 ## Optional Chain Sample Overrides

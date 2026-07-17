@@ -20,6 +20,7 @@ trap 'cleanup' EXIT
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export SCRIPT_DIR="$REPO_ROOT"
 export BLOCKCHAIN_NODE="solana"
+export ACTIVE_CHAIN_TEMPLATE_FILE="$REPO_ROOT/config/chains/solana.json"
 export PROXY_LISTEN_PORT="18545"
 
 WORK_DIR="$(mktemp -d -t bnb-proxy-itest-XXXX)"

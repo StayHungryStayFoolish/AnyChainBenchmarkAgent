@@ -13,8 +13,8 @@ customer data, or personal credentials in shared evidence.
 Verify that `./bin/anychain-agent` behaves like a product Agent:
 
 - starts cleanly in a real terminal;
-- uses the configured LLM through the LangGraph Harness, with Google ADK only
-  as the optional Gemini/Google tool bridge;
+- uses the configured LLM through the LangGraph Harness, with Google ADK used
+  only by the optional Gemini `google_search` grounding function;
 - correctly reports the configured auth mode, including Google ADC or attached
   service-account modes when available;
 - keeps input/output stable for English and Chinese;
@@ -24,8 +24,8 @@ Verify that `./bin/anychain-agent` behaves like a product Agent:
   validation;
 - handles ambiguous answers, corrections, backtracking, and mode changes;
 - keeps long-running jobs detached and resumable;
-- uses Gemini-only ADK `google_search` only for unsupported-chain and custom-RPC
-  onboarding evidence.
+- uses Gemini-only ADK `google_search` only for unknown-chain/protocol,
+  custom-RPC schema, and sync-observe client-setup evidence.
 
 ## Required Reading
 
@@ -42,23 +42,30 @@ Read these files before testing or changing code:
 ## Environment Rules
 
 - Start from a clean checkout of the target branch and record the commit hash.
-- Use an isolated Python/ADK environment.
+- Use an isolated Python 3.10+ Agent environment. `.venv-adk` is a retained
+  compatibility path, not a statement that Google ADK is required.
 - Run `bash scripts/install_agent_deps.sh --yes` before terminal testing, or
   let the Agent request approval to install missing Agent dependencies.
 - Do not commit API keys, ADC files, service account JSON, `.agent/`, live logs,
   generated benchmark archives, or terminal recordings containing secrets.
 - Redact credentials, local usernames, hostnames, internal project IDs, and
   private endpoint URLs from shared evidence.
-- Record whether the configured model supports ADK `google_search`.
+- Install Google ADK only when search coverage is requested:
+  `bash scripts/install_agent_deps.sh --yes --with-google-search`.
+- Record whether the configured model and optional extra support ADK
+  `google_search`.
 - If Google/Gemini search is unavailable, still run all non-search terminal
   and fake-node boundaries.
 - Put local model credentials only in `config/agent_config.local.sh` or the
   execution environment. Never edit repository defaults with real secrets.
 - Do not claim that real-node execution was tested unless an approved endpoint
   was explicitly provided for that run.
-- Fake-node validation is enough for Agent CLI workflow coverage, but the
-  Agent must still collect the same machine/resource metadata it would need for
-  real-node execution.
+- Fake-node validates only the fake-node closed loop. It is not sufficient for
+  full Agent CLI workflow coverage and cannot qualify real-node,
+  sync-observe, custom-RPC live-probe, or real execution edges. The Agent must
+  still collect the machine/resource metadata required by the selected path.
+- Acceptance runs are Docker/Linux-only. A host run may be a developer check,
+  but it must not be recorded as product workflow or coverage evidence.
 
 ## Baseline Commands
 
@@ -66,8 +73,8 @@ Read these files before testing or changing code:
 git status --short --branch
 git rev-parse HEAD
 bash scripts/install_agent_deps.sh --yes
-python3 agent/cli.py adk-status
-python3 agent/cli.py llm-config
+python3 -m agent.cli adk-status
+python3 -m agent.cli llm-config
 ./bin/anychain-agent
 ```
 
@@ -248,8 +255,8 @@ Expected:
 For ADC/Gemini environments, also verify:
 
 ```bash
-python3 agent/cli.py llm-config
-python3 agent/cli.py llm-smoke --prompt 'Return JSON only: {"ok": true}'
+python3 -m agent.cli llm-config
+python3 -m agent.cli llm-smoke --prompt 'Return JSON only: {"ok": true}'
 ```
 
 Expected:
@@ -427,8 +434,19 @@ Add a custom RPC method with three parameters to a mixed workload.
 
 Expected:
 
-- Agent asks for method name, parameter contract, parameter samples,
-  request/response samples, mixed weight, and fake-node fixture plan;
+- Agent asks for method name, endpoint provenance, request/response evidence,
+  workload scope, and fixture plan;
+- zero-parameter methods preserve explicit empty params; positional and object
+  params preserve list order or object keys and individually confirm index/name,
+  JSON wire type, blockchain semantic type or encoding, meaning,
+  required/optional status, and example;
+- the endpoint is probed using the confirmed wire request before the method is
+  admitted to the versioned catalog;
+- `single_replace` selects one validated method; `mixed_replace` removes
+  defaults; `mixed_add` retains defaults; every active mixed weight is a
+  positive integer and the exact total is 100;
+- the canonical chain template remains unchanged and only a job-local runtime
+  override is materialized;
 - Agent does not claim production support before fixture recording and smoke
   validation.
 
@@ -588,6 +606,11 @@ Return a concise report with:
 - failures found and files changed;
 - tests run after fixes;
 - boundaries still untested, if any.
+
+Coverage reports must distinguish cataloged/generated from observed execution.
+Report observed pass, observed fail, not-run, externally blocked, uncovered
+pairs/triples, completed critical sequences, and hashed real job artifacts.
+Neither a PTY response nor a generated schedule/row is a passing observation.
 
 Use this report shape:
 

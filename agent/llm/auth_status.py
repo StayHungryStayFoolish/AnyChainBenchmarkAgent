@@ -7,17 +7,9 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-try:
-    from .config import load_llm_config
-    from .google_auth import credential_plan
-except ImportError:  # script execution with agent/ on sys.path
-    from llm.config import load_llm_config
-    from llm.google_auth import credential_plan
-
-try:
-    from ..runners.tool_result import tool_result as _tool_result
-except ImportError:  # script execution with agent/ on sys.path
-    from runners.tool_result import tool_result as _tool_result
+from agent.llm.config import load_llm_config
+from agent.llm.google_auth import credential_plan
+from agent.runners.tool_result import tool_result as _tool_result
 
 
 def inspect_llm_auth() -> dict[str, Any]:

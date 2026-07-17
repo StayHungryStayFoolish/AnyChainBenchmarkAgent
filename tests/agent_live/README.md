@@ -112,6 +112,35 @@ Dual-AI chaos failures must be fixed in the owning Harness group, validator,
 or terminal boundary. Do not patch failures with keyword lists, fuzzy matching,
 or terminal-side business routing.
 
+### Simulator And Evidence Boundary
+
+The repository does not define or call a Codex API. The dynamic runner accepts
+an external `Simulator` implementation that receives the complete latest Agent
+response plus one revision-bound scheduled coverage target. The external Codex
+session returns one decision, rationale, persona, goal, and exact user turn.
+`tests/agent_live/chaos_scheduler.py` writes the immutable schedule; it is
+generation intent, not execution evidence.
+
+A dynamic turn qualifies only when all of the following agree:
+
+- the schedule, authoritative ledger, and worktree revision;
+- explicit provider/model identity printed by the real CLI;
+- a baseline product runtime event and exactly one newly committed event;
+- thread, session purpose, turn indexes, and chained state fingerprints;
+- a Linux/Docker postcondition verifier that inspects committed state or job
+  artifacts independently of the PTY transport;
+- the target edge and observed coverage ids recorded by that verifier.
+
+The PTY returning a response never marks a row passed. Missing provider text,
+missing or stale events, an unknown edge, a failed assertion, or a required
+execution edge without hashed job artifacts fails the scheduled row closed.
+The schedule result remains `incomplete` or `failed`, and no passing evidence
+artifact is written.
+
+Covering-array reports expose generated rows/tuples separately from observed
+rows/tuples. Critical-sequence reports derive coverage ids from validated turn
+artifacts; simulator-supplied or invented evidence ids do not count.
+
 ## Current Coverage
 
 The matrix covers representative product paths that previously regressed:
@@ -130,6 +159,20 @@ multi-turn user-style prompts over single-step API assertions.
 
 Use the repository Docker/Linux environment. macOS is not a supported product
 runtime target for the Agent.
+
+All product acceptance, live-model, observed-coverage, and real-execution
+claims from this directory are Docker-only. Host execution may diagnose a test
+or run fast unit checks, but it cannot produce qualifying coverage evidence.
+The fixed matrix and fake-node path are regression subsets: fake-node proves
+only its closed loop and cannot qualify local real-node, custom-RPC live-probe,
+sync-observe, or final execution edges.
+
+Before reporting coverage, bind every observation to the tested worktree
+revision and report these categories separately: cataloged/generated,
+observed-pass, observed-fail, not-run, externally-blocked, uncovered pairs,
+uncovered required triples, completed critical sequences, and execution edges
+with hashed job artifacts. A generated schedule/row, simulator assertion, or
+successful PTY return is never sufficient by itself.
 
 ```bash
 docker compose exec bench bash -lc '

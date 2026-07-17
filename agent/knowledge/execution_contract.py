@@ -4,24 +4,14 @@ from __future__ import annotations
 
 from typing import Any
 
-try:
-    from .entry_contract import (
-        ENTRYPOINT_PHASES,
-        OPTIONAL_ACCOUNTS_FIELDS,
-        REAL_NODE_ENDPOINT_FIELDS,
-        RUNTIME_BASELINE_FIELDS,
-        dependency_names,
-        required_keys_for_target,
-    )
-except ImportError:  # script execution with agent/ on sys.path
-    from knowledge.entry_contract import (
-        ENTRYPOINT_PHASES,
-        OPTIONAL_ACCOUNTS_FIELDS,
-        REAL_NODE_ENDPOINT_FIELDS,
-        RUNTIME_BASELINE_FIELDS,
-        dependency_names,
-        required_keys_for_target,
-    )
+from agent.knowledge.entry_contract import (
+    ENTRYPOINT_PHASES,
+    OPTIONAL_ACCOUNTS_FIELDS,
+    REAL_NODE_ENDPOINT_FIELDS,
+    RUNTIME_BASELINE_FIELDS,
+    dependency_names,
+    required_keys_for_target,
+)
 
 
 def load_execution_contract(use_fake_node: bool | None = None) -> dict[str, Any]:

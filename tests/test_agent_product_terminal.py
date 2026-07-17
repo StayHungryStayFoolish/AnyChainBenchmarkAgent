@@ -9,6 +9,16 @@ from unittest.mock import patch
 
 
 class ProductTerminalHarnessContractTest(unittest.TestCase):
+    def test_product_launchers_use_canonical_package_modules(self) -> None:
+        repo = Path(__file__).resolve().parents[1]
+        launcher = (repo / "bin" / "anychain-agent").read_text(encoding="utf-8")
+        manager = (repo / "agent" / "runners" / "job_manager.py").read_text(encoding="utf-8")
+
+        self.assertIn('exec "$AGENT_PYTHON" -m agent.terminal.repl "$@"', launcher)
+        self.assertNotIn("agent/terminal/repl.py", launcher)
+        self.assertIn('"agent.runners.job_worker"', manager)
+        self.assertNotIn('"agent" / "runners" / "job_worker.py"', manager)
+
     def test_terminal_uses_langgraph_harness_not_retired_workflow_runtime(self) -> None:
         repo = Path(__file__).resolve().parents[1]
         text = (repo / "agent" / "terminal" / "repl.py").read_text(encoding="utf-8")
@@ -30,19 +40,11 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
         to the harness (greeting/capabilities).
         """
 
-        import sys
         import types
 
-        repo = Path(__file__).resolve().parents[1]
-        agent_root = str(repo / "agent")
-        if agent_root not in sys.path:
-            sys.path.insert(0, agent_root)
-        sys.modules.pop("utils", None)
-        sys.modules.pop("utils.redaction", None)
-
-        from terminal import repl as repl_mod
-        from terminal.io import OutputOnlyIO
-        from terminal.repl import AnyChainTerminal, TerminalSession
+        from agent.terminal import repl as repl_mod
+        from agent.terminal.io import OutputOnlyIO
+        from agent.terminal.repl import AnyChainTerminal, TerminalSession
 
         with tempfile.TemporaryDirectory() as tmpdir:
             app = AnyChainTerminal(
@@ -60,7 +62,7 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
 
             with patch.object(
                 repl_mod, "adk_status", return_value=types.SimpleNamespace(as_dict=lambda: {"available": True, "reason": "t"})
-            ), patch.object(repl_mod, "_adk_runner_status", return_value={"available": True, "reason": "t"}):
+            ), patch.object(repl_mod, "provider_runtime_errors", return_value=[]):
                 app.startup()
                 # The offer must survive startup, not be clobbered.
                 self.assertEqual(app.state.current_question_id, "install_dependencies")
@@ -68,6 +70,24 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
                 app.handle_user_text("y")
 
         self.assertTrue(installed["called"])
+
+    def test_deepseek_runtime_does_not_require_google_adk(self) -> None:
+        from agent.llm.config import LLMConfig
+        from agent.llm import providers
+
+        config = LLMConfig(
+            provider="deepseek",
+            model="deepseek-chat",
+            auth_mode="api_key",
+            deepseek_api_key="secret",
+            deepseek_api_key_present=True,
+        )
+
+        def find_spec(name: str):
+            return object() if name == "openai" else None
+
+        with patch.object(providers.importlib.util, "find_spec", side_effect=find_spec):
+            self.assertEqual(providers.provider_runtime_errors(config), [])
 
     def test_logs_command_reports_clean_error_for_missing_job(self) -> None:
         """`logs <bad-id>` must emit a clean "job not found" message, not a raw
@@ -110,12 +130,39 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
             "zh",
         )
 
+    def test_complete_english_technical_prose_switches_from_chinese(self) -> None:
+        from agent.terminal.language import detect_language
+
+        self.assertEqual(
+            detect_language(
+                "I am not sure what I can test here. Please explain the supported chains, "
+                "RPC methods, and extension options first.",
+                default="zh",
+            ),
+            "en",
+        )
+        self.assertEqual(
+            detect_language("Can you validate this endpoint and explain the response?", default="zh"),
+            "en",
+        )
+
+    def test_structured_and_pasted_inputs_preserve_chinese_language(self) -> None:
+        from agent.terminal.language import detect_language
+
+        self.assertEqual(detect_language("Y", default="zh"), "zh")
+        self.assertEqual(detect_language("eth0", default="zh"), "zh")
+        self.assertEqual(detect_language('{"jsonrpc":"2.0","method":"eth_chainId"}', default="zh"), "zh")
+        self.assertEqual(
+            detect_language("machine_type: n2-standard-16\nzone: asia-east1-c", default="zh"),
+            "zh",
+        )
+
     def test_terminal_entrypoint_routes_greeting_to_harness_opening_group(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
 
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime = AnyChainGraphRuntime(thread_id="terminal-contract", checkpoint_path=Path(tmpdir) / "checkpoint.sqlite")
-            with patch("agent.harness.groups.resolve_action_queue", return_value={"actions": [{"type": "greeting", "confidence": "high"}]}):
+            with patch("agent.harness.coordinator.resolve_action_queue", return_value={"actions": [{"type": "greeting", "confidence": "high"}]}):
                 state = runtime.invoke("Hi", language="en")
 
         self.assertEqual(state["active_group"], "opening")
@@ -127,13 +174,14 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime = AnyChainGraphRuntime(thread_id="resume-contract", checkpoint_path=Path(tmpdir) / "checkpoint.sqlite")
-            runtime.update(
+            runtime._persist_state(
                 {
                     "target_mode": "fake-node",
                     "workflow_mode": "rpc_benchmark",
                     "chain_identity": {"canonical": "bsc", "status": "confirmed"},
                     "confirmed_config": {"CLOUD_REGION": "asia-east1"},
-                    "pending_question": {"id": "CLOUD_ZONE", "prompt": "Confirm CLOUD_ZONE."},
+                    "pending_question": {"id": "CLOUD_ZONE", "group": "provider_deployment", "kind": "manual_value", "prompt": "Confirm CLOUD_ZONE."},
+                    "active_group": "provider_deployment",
                 }
             )
 
@@ -149,17 +197,8 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
             self.assertEqual(fresh["session"]["purpose"], "user")
 
     def test_terminal_passes_explicit_checkpoint_and_session_purpose_to_harness(self) -> None:
-        import sys
-
-        repo = Path(__file__).resolve().parents[1]
-        agent_root = str(repo / "agent")
-        if agent_root not in sys.path:
-            sys.path.insert(0, agent_root)
-        sys.modules.pop("utils", None)
-        sys.modules.pop("utils.redaction", None)
-
-        from terminal.io import OutputOnlyIO
-        from terminal.repl import AnyChainTerminal, TerminalSession
+        from agent.terminal.io import OutputOnlyIO
+        from agent.terminal.repl import AnyChainTerminal, TerminalSession
 
         with tempfile.TemporaryDirectory() as tmpdir:
             checkpoint = Path(tmpdir) / "isolated.sqlite"
@@ -177,18 +216,9 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
         self.assertEqual(state["session"]["purpose"], "chaos")
 
     def test_terminal_user_session_does_not_resume_live_matrix_checkpoint(self) -> None:
-        import sys
-
-        repo = Path(__file__).resolve().parents[1]
-        agent_root = str(repo / "agent")
-        if agent_root not in sys.path:
-            sys.path.insert(0, agent_root)
-        sys.modules.pop("utils", None)
-        sys.modules.pop("utils.redaction", None)
-
         from agent.harness.graph import AnyChainGraphRuntime
-        from terminal.io import TerminalIO
-        from terminal.repl import AnyChainTerminal, TerminalSession
+        from agent.terminal.io import TerminalIO
+        from agent.terminal.repl import AnyChainTerminal, TerminalSession
 
         class CapturingIO(TerminalIO):
             def __init__(self) -> None:
@@ -207,7 +237,7 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
                 checkpoint_path=checkpoint,
                 session_purpose="live-matrix",
             )
-            matrix_runtime.update(
+            matrix_runtime._persist_state(
                 {
                     "target_mode": "fake-node",
                     "workflow_mode": "rpc_benchmark",
@@ -234,119 +264,193 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             checkpoint = Path(tmpdir) / "checkpoint.sqlite"
             runtime = AnyChainGraphRuntime(thread_id="resume-modify", checkpoint_path=checkpoint)
-            runtime.update(
+            runtime._persist_state(
                 {
                     "target_mode": "fake-node",
                     "workflow_mode": "rpc_benchmark",
                     "chain_identity": {"canonical": "bsc", "status": "confirmed"},
                     "confirmed_config": {"CLOUD_REGION": "asia-east1"},
-                    "pending_question": {"id": "CLOUD_ZONE", "prompt": "Confirm CLOUD_ZONE."},
+                    "pending_question": {"id": "CLOUD_ZONE", "group": "provider_deployment", "kind": "manual_value", "prompt": "Confirm CLOUD_ZONE."},
                     "active_group": "provider_deployment",
                 }
             )
-            runtime.update({"pending_question": {}, "active_group": "", "visible_response": []})
+            runtime.prepare_resume_offer(language="en")
+            runtime.invoke("2", language="en")
 
             snapshot = runtime.snapshot()
             self.assertEqual(snapshot["confirmed_config"]["CLOUD_REGION"], "asia-east1")
             self.assertEqual(snapshot["pending_question"], {})
-            self.assertEqual(snapshot["active_group"], "")
+            self.assertEqual(snapshot["active_group"], "opening")
 
-    def test_terminal_resume_gate_allows_natural_language_goal(self) -> None:
-        import sys
-
-        repo = Path(__file__).resolve().parents[1]
-        agent_root = str(repo / "agent")
-        if agent_root not in sys.path:
-            sys.path.insert(0, agent_root)
-        sys.modules.pop("utils", None)
-        sys.modules.pop("utils.redaction", None)
-
-        from terminal.io import OutputOnlyIO
-        from terminal.repl import AnyChainTerminal, TerminalSession
-
-        session = TerminalSession(language="zh", current_question_id="resume_harness_session")
-        app = AnyChainTerminal(state=session, io=OutputOnlyIO(), session_id="resume-natural-language")
-
-        handled = app._handle_pending_confirmation("先别管之前配置，帮我分析最近一次 job 的报告和日志")
-
-        self.assertFalse(handled)
-        self.assertEqual(session.current_question_id, "")
-
-    def test_terminal_resume_gate_clears_old_pending_before_natural_language(self) -> None:
-        import sys
-
-        repo = Path(__file__).resolve().parents[1]
-        agent_root = str(repo / "agent")
-        if agent_root not in sys.path:
-            sys.path.insert(0, agent_root)
-        sys.modules.pop("utils", None)
-        sys.modules.pop("utils.redaction", None)
-
+    def test_terminal_resume_continue_restores_exact_pending_contract(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
-        from terminal.io import OutputOnlyIO
-        from terminal.repl import AnyChainTerminal, TerminalSession
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            session = TerminalSession(language="zh", current_question_id="resume_harness_session")
-            app = AnyChainTerminal(state=session, io=OutputOnlyIO(), session_id="resume-natural-language-clear")
-            runtime = AnyChainGraphRuntime(thread_id="resume-natural-language-clear", checkpoint_path=Path(tmpdir) / "checkpoint.sqlite")
-            runtime.update(
+            checkpoint = Path(tmpdir) / "checkpoint.sqlite"
+            runtime = AnyChainGraphRuntime(thread_id="resume-continue", checkpoint_path=checkpoint)
+            original = {
+                "id": "unknown_chain_identity_confirm",
+                "group": "chain_identity",
+                "kind": "numbered_choice",
+                "field": "unknown_chain_decision",
+                "prompt": "Confirm the researched chain identity.",
+                "manual_input_allowed": False,
+                "options": [
+                    {"label": "Continue", "value": "confirm", "action": {"type": "confirm_proposed_protocol"}},
+                    {"label": "Choose protocol", "value": "protocol", "action": {"type": "choose_protocol"}},
+                ],
+                "accepted_action_types": ["answer_pending", "choose_chain", "change_chain"],
+            }
+            runtime._persist_state(
                 {
-                    "target_mode": "sync-observe",
-                    "workflow_mode": "sync_observe",
-                    "chain_identity": {"canonical": "bsc", "status": "confirmed"},
-                    "confirmed_config": {"BLOCKCHAIN_NODE": "bsc"},
-                    "pending_question": {"id": "CLOUD_REGION", "group": "provider_deployment", "kind": "manual_value", "prompt": "请输入 CLOUD_REGION"},
-                    "evidence_collection": {
-                        "question": {"id": "freeform_evidence", "kind": "log_evidence"},
-                        "lines": ["Traceback (most recent call last):"],
-                    },
-                    "active_group": "provider_deployment",
+                    "target_mode": "fake-node",
+                    "workflow_mode": "rpc_benchmark",
+                    "chain_identity": {"raw": "Flow", "canonical": "flow", "status": "needs_identity_confirmation"},
+                    "pending_question": original,
+                    "active_group": "chain_identity",
                 }
             )
-            app._harness = runtime
+            runtime.prepare_resume_offer(language="en")
+            state = runtime.invoke("1", language="en")
 
-            handled = app._handle_pending_confirmation("你是谁啊")
-            snapshot = runtime.snapshot()
+        for key, value in original.items():
+            self.assertEqual(state["pending_question"].get(key), value)
+        self.assertEqual(state["active_group"], "chain_identity")
+        self.assertIn("Confirm the researched chain identity", "\n".join(state["visible_response"]))
+        self.assertEqual(state.get("resume_context"), {})
 
-        self.assertFalse(handled)
-        self.assertEqual(session.current_question_id, "")
-        self.assertEqual(snapshot["pending_question"], {})
-        self.assertEqual(snapshot["evidence_collection"], {})
-        self.assertEqual(snapshot["active_group"], "")
+    def test_terminal_resume_continue_preserves_deferred_action_queue(self) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
 
-    def test_terminal_resume_gate_explains_current_menu_without_losing_context(self) -> None:
-        import sys
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / "checkpoint.sqlite"
+            runtime = AnyChainGraphRuntime(thread_id="resume-queue", checkpoint_path=checkpoint)
+            original = {
+                "id": "custom_rpc_method",
+                "group": "endpoint_process",
+                "kind": "manual_value",
+                "field": "custom_rpc_method",
+                "prompt": "Enter the custom RPC method.",
+                "manual_input_allowed": True,
+                "queue_barrier": True,
+                "resume_action_queue": True,
+            }
+            runtime._persist_state(
+                {
+                    "target_mode": "fake-node",
+                    "workflow_mode": "rpc_benchmark",
+                    "chain_identity": {"canonical": "bsc", "status": "confirmed"},
+                    "pending_question": original,
+                    "active_group": "endpoint_process",
+                    "action_queue": [
+                        {
+                            "action_id": "obs-deferred",
+                            "type": "set_observability",
+                            "observability_mode": "disabled",
+                            "confidence": "high",
+                        }
+                    ],
+                }
+            )
+            runtime.prepare_resume_offer(language="en")
+            state = runtime.invoke("1", language="en")
 
+        for key, value in original.items():
+            self.assertEqual(state["pending_question"].get(key), value)
+        self.assertEqual(state["active_group"], "endpoint_process")
+        self.assertEqual([item["action_id"] for item in state["action_queue"]], ["obs-deferred"])
+
+    def test_terminal_resume_reset_discards_deferred_action_queue(self) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / "checkpoint.sqlite"
+            runtime = AnyChainGraphRuntime(thread_id="reset-queue", checkpoint_path=checkpoint)
+            runtime._persist_state(
+                {
+                    "target_mode": "fake-node",
+                    "workflow_mode": "rpc_benchmark",
+                    "pending_question": {
+                        "id": "custom_rpc_method",
+                        "group": "endpoint_process",
+                        "kind": "manual_value",
+                        "prompt": "Enter the custom RPC method.",
+                    },
+                    "active_group": "endpoint_process",
+                    "action_queue": [
+                        {
+                            "action_id": "obs-deferred",
+                            "type": "set_observability",
+                            "observability_mode": "disabled",
+                            "confidence": "high",
+                        }
+                    ],
+                }
+            )
+            runtime.prepare_resume_offer(language="en")
+            state = runtime.invoke("3", language="en")
+
+        self.assertEqual(state["pending_question"], {})
+        self.assertEqual(state["action_queue"], [])
+        self.assertEqual(state["target_mode"], "")
+
+    def test_harness_resume_menu_allows_a_natural_language_consultation(self) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = AnyChainGraphRuntime(thread_id="resume-natural-language", checkpoint_path=Path(tmpdir) / "checkpoint.sqlite")
+            runtime._persist_state({"target_mode": "fake-node", "workflow_mode": "rpc_benchmark", "active_group": "target_mode"})
+            runtime.prepare_resume_offer(language="zh")
+            with patch(
+                "agent.harness.coordinator.resolve_action_queue",
+                return_value={"actions": [{"type": "answer_opening_question", "topic": "identity", "confidence": "high"}]},
+            ):
+                state = runtime.invoke("你是谁", language="zh")
+
+        self.assertEqual(state["pending_question"]["id"], "resume_harness_session")
+        self.assertEqual(state["target_mode"], "fake-node")
+        self.assertIn("AnyChain Benchmark Agent", "\n".join(state["visible_response"]))
+
+    def test_invalid_checkpoint_is_quarantined_instead_of_silently_resumed(self) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = AnyChainGraphRuntime(thread_id="resume-quarantine", checkpoint_path=Path(tmpdir) / "checkpoint.sqlite")
+            runtime._persist_state(
+                {
+                    "active_group": "provider_deployment",
+                    "confirmed_config": {"CLOUD_REGION": "asia-east1"},
+                    "pending_question": {"id": "CLOUD_ZONE", "prompt": "missing owner"},
+                }
+            )
+            state = runtime.snapshot()
+
+        self.assertEqual(state["checkpoint_recovery"]["status"], "quarantined")
+        self.assertEqual(state["checkpoint_recovery"]["safe_confirmed_config"]["CLOUD_REGION"], "asia-east1")
+
+    def test_terminal_has_no_resume_workflow_branch(self) -> None:
         repo = Path(__file__).resolve().parents[1]
-        agent_root = str(repo / "agent")
-        if agent_root not in sys.path:
-            sys.path.insert(0, agent_root)
-        sys.modules.pop("utils", None)
-        sys.modules.pop("utils.redaction", None)
+        text = (repo / "agent" / "terminal" / "repl.py").read_text(encoding="utf-8")
 
-        from terminal.repl import AnyChainTerminal, TerminalSession
+        self.assertNotIn('current_question_id == "resume_harness_session"', text)
+        self.assertNotIn("_is_resume_session_explanation_request", text)
 
-        class CapturingIO:
-            def __init__(self) -> None:
-                self.messages: list[str] = []
+    def test_harness_invariant_error_is_not_reported_as_model_failure(self) -> None:
+        from agent.harness.invariants import StateInvariantError
+        from agent.terminal.repl import _adk_error_message
 
-            def input(self, language: str) -> str:
-                raise EOFError()
+        message = _adk_error_message("en", StateInvariantError("invalid pending owner"))
 
-            def agent(self, language: str, message: str) -> None:
-                self.messages.append(message)
+        self.assertIn("workflow state validation failed", message)
+        self.assertNotIn("underlying model", message)
 
-        io = CapturingIO()
-        session = TerminalSession(language="zh", current_question_id="resume_harness_session")
-        app = AnyChainTerminal(state=session, io=io, session_id="resume-explain")
+    def test_harness_programming_error_is_not_reported_as_model_failure(self) -> None:
+        from agent.terminal.repl import _adk_error_message
 
-        handled = app._handle_pending_confirmation("这个是做什么的")
+        message = _adk_error_message("en", NameError("missing runtime collaborator"))
 
-        self.assertTrue(handled)
-        self.assertEqual(session.current_question_id, "resume_harness_session")
-        self.assertIn("上次未完成", io.messages[-1])
-        self.assertIn("清空之前的配置", io.messages[-1])
+        self.assertIn("workflow state validation failed", message)
+        self.assertNotIn("underlying model", message)
 
 
 if __name__ == "__main__":

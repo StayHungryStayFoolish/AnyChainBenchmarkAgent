@@ -1,1 +1,1 @@
-"""Shared benchmark requirement matrices used by Agent validators."""
+"""Shared workflow metadata used by the Agent Harness."""

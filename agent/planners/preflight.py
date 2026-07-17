@@ -9,18 +9,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-try:
-    from ..knowledge.entry_contract import (
-        ENTRYPOINT_SCRIPTS,
-        dependency_names,
-        validate_mixed_weighted,
-    )
-except ImportError:  # script execution with agent/ on sys.path
-    from knowledge.entry_contract import (
-        ENTRYPOINT_SCRIPTS,
-        dependency_names,
-        validate_mixed_weighted,
-    )
+from agent.knowledge.entry_contract import (
+    ENTRYPOINT_SCRIPTS,
+    dependency_names,
+    validate_mixed_weighted,
+)
+from agent.validators.fixture_checks import validate_plan_fake_node_fixtures
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -58,6 +52,15 @@ def run_preflight(plan: dict[str, Any]) -> dict[str, Any]:
     checks.append(_check("fake_node_available_when_requested", fake_node_ok, str(fake_node_dir)))
     if plan.get("use_fake_node"):
         checks.append(_check("fake_node_fixtures_available", (fake_node_dir / "fixtures").is_dir(), str(fake_node_dir / "fixtures")))
+        fixture_result = validate_plan_fake_node_fixtures(plan)
+        missing = ", ".join(
+            f"{item['method']} -> {item['fixture']}" for item in fixture_result.get("missing", [])
+        )
+        checks.append(_check(
+            "effective_workload_fixtures_available",
+            bool(fixture_result.get("passed")),
+            missing or f"methods={', '.join(fixture_result.get('methods', []))}",
+        ))
 
     rpc_mode = plan.get("rpc_mode", "")
     checks.append(_check("rpc_mode_valid", rpc_mode in {"single", "mixed"} or is_sync_observe, rpc_mode))

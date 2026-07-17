@@ -11,13 +11,8 @@ _SINGLE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:/+-]+[,，;；、]?$")
 _TECHNICAL_SCALAR_RE = re.compile(
     r"^([A-Za-z_][A-Za-z0-9_.:/-]*\s*=\s*[^=,\s]+)(\s*[,，]\s*[A-Za-z_][A-Za-z0-9_.:/-]*\s*=\s*[^=,\s]+)*[,，;；]?$"
 )
-_CONFIG_FACT_RE = re.compile(
-    r"\b(region|zone|machine|machine_type|ledger|accounts|storage|network|bandwidth|iops|throughput|endpoint|qps|rpc|grafana|prometheus)\b|[A-Za-z_][A-Za-z0-9_.:/-]*\s*[:=]",
-    re.IGNORECASE,
-)
-_TECHNICAL_DOC_RE = re.compile(
-    r"\b(path parameters?|query parameters?|request|response|method|jsonrpc|rest api|endpoint|curl|headers?)\b",
-    re.IGNORECASE,
+_STRUCTURED_ASSIGNMENT_LINE_RE = re.compile(
+    r"^\s*[A-Za-z_][A-Za-z0-9_.-]*\s*[:=]\s*\S(?:.*\S)?\s*[,，;；]?$"
 )
 _TECHNICAL_PASTE_RE = re.compile(
     r"(^|\n)\s*(curl\b|--data\b|--header\b|response\s*:|request\s*:|traceback\b|file\s+\"|file\s+'|\{|\[)",
@@ -41,7 +36,10 @@ def detect_language(text: str, default: str = "en") -> str:
         return "zh"
     if default == "zh" and _TECHNICAL_SCALAR_RE.fullmatch(raw.strip()):
         return "zh"
-    if default == "zh" and (_CONFIG_FACT_RE.search(raw) or _TECHNICAL_DOC_RE.search(raw)):
+    assignment_lines = [line for line in raw.splitlines() if line.strip()]
+    if default == "zh" and assignment_lines and all(
+        _STRUCTURED_ASSIGNMENT_LINE_RE.fullmatch(line) for line in assignment_lines
+    ):
         return "zh"
     if _ASCII_ALPHA_RE.search(raw):
         return "en"
@@ -87,8 +85,8 @@ _ZH = {
     "dependency_declined": "已跳过依赖安装。后续真实 benchmark 可能仍会被 preflight 阻止。",
     "dependency_install_start": "开始安装 benchmark 依赖。这一步可能需要一些时间。",
     "dependency_install_done": "依赖安装命令完成，exit_code={exit_code}。",
-    "agent_runtime_offer": "检测到 Agent runtime 依赖缺失：google-adk。是否允许我运行 scripts/install_agent_deps.sh --yes 安装到隔离环境？[Y/n]",
-    "agent_runtime_declined": "已跳过 Agent runtime 安装。底层 LLM/ADK 能力仍不可用。",
+    "agent_runtime_offer": "检测到所选模型 provider 的 Agent runtime 依赖或配置缺失：{missing}。是否允许我运行 scripts/install_agent_deps.sh --yes 安装到隔离环境？[Y/n]",
+    "agent_runtime_declined": "已跳过 Agent runtime 安装。当前所选模型 provider 仍不可用。",
     "agent_runtime_install_start": "开始安装 Agent runtime 依赖到隔离环境。",
     "agent_runtime_install_done": "Agent runtime 安装命令完成，exit_code={exit_code}。",
     "llm_config_warning": "LLM 配置还不完整：{errors}",
@@ -103,9 +101,11 @@ _ZH = {
     "follow_done": "日志跟踪结束，job 状态：{status}",
     "unknown": "ADK 没有返回可显示内容。你可以继续描述测试目标，或输入 doctor/status/jobs 查看确定性状态。",
     "adk_runtime_error": "底层模型调用暂时失败，我不会展示内部错误。这个自然语言请求尚未完成；请重试，或输入 doctor/status/jobs 查看确定性状态。",
+    "harness_runtime_error": "Agent 工作流状态校验失败，本轮没有应用。请保留当前会话并重试；如持续出现，请运行 doctor 并提供调试日志。",
     "llm_billing_error": "底层模型服务返回余额或配额不足。自然语言 Agent 能力暂时不可用；请补充模型账户余额/配额后重试。doctor/status/jobs 这些确定性命令仍可使用。",
-    "thinking": "[thinking] 正在处理当前请求。如果超过 15 秒，你可以按 Ctrl+C 取消本轮，不会退出 Agent。",
+    "thinking": "[thinking] 正在处理当前请求。按 Ctrl+C 可取消本轮，不会退出 Agent。",
     "turn_cancelled": "已取消当前这一轮。Agent 会话仍在，你可以继续输入。",
+    "turn_timeout": "本轮因 timeout 停止，未提交本轮状态（整轮 deadline={timeout:g}s, provider={provider}, model={model}）。Agent 会话仍在，你可以重试。",
     "pasted_evidence_detected": "检测到你粘贴的是日志、旧对话或错误信息。我会把它当作 evidence 分析，不会直接写入 benchmark 配置。",
     "pasted_evidence_buffered": "已记录粘贴的日志/旧对话片段。你可以继续粘贴，或直接输入要分析的问题。",
     "pending_answer_blocked": "这条回复没有通过当前问题的校验：{blockers}",
@@ -113,7 +113,6 @@ _ZH = {
     "unbound_structural_answer": "当前没有待确认的问题，这个短回复无法绑定到任何决策。请直接说明你的目标，例如：测试 solana fake-node quick、查看 job 状态、或分析最近报告。",
     "framework_context_loaded": "已加载框架事实：{chains} chains，{families} adapter families，{methods} RPC methods，fake-node fixtures={fixtures}。",
     "ctrl_c_exit": "收到 Ctrl+C，正在退出 AnyChain Benchmark Agent。",
-    "adk_missing_hint": "注意：google-adk 当前不可用。请允许 Agent 安装隔离运行时，或先运行 bash scripts/install_agent_deps.sh --yes。",
 }
 
 
@@ -147,8 +146,8 @@ _EN = {
     "dependency_declined": "Skipped dependency installation. A real benchmark may still be blocked by preflight.",
     "dependency_install_start": "Starting benchmark dependency installation. This may take a while.",
     "dependency_install_done": "Dependency installation command completed, exit_code={exit_code}.",
-    "agent_runtime_offer": "Agent runtime dependency is missing: google-adk. Allow me to run scripts/install_agent_deps.sh --yes and install it into an isolated environment? [Y/n]",
-    "agent_runtime_declined": "Skipped Agent runtime installation. Underlying LLM/ADK capabilities remain unavailable.",
+    "agent_runtime_offer": "The selected model provider has missing Agent runtime dependencies or configuration: {missing}. Allow me to run scripts/install_agent_deps.sh --yes and install them into an isolated environment? [Y/n]",
+    "agent_runtime_declined": "Skipped Agent runtime installation. The selected model provider remains unavailable.",
     "agent_runtime_install_start": "Starting Agent runtime dependency installation into the isolated environment.",
     "agent_runtime_install_done": "Agent runtime installation command completed, exit_code={exit_code}.",
     "llm_config_warning": "LLM configuration is incomplete: {errors}",
@@ -163,9 +162,11 @@ _EN = {
     "follow_done": "Log follow finished; job status: {status}",
     "unknown": "ADK did not return displayable text. You can continue describing the benchmark goal, or type doctor/status/jobs for deterministic state.",
     "adk_runtime_error": "The underlying model call failed temporarily. Internal errors are hidden. This natural-language request was not completed; retry, or type doctor/status/jobs for deterministic state.",
+    "harness_runtime_error": "Agent workflow state validation failed and this turn was not applied. Keep the current session and retry; if it persists, run doctor and provide the debug log.",
     "llm_billing_error": "The underlying model provider reported insufficient balance or quota. Natural-language Agent capability is unavailable until the model account is funded or quota is restored. Deterministic commands such as doctor/status/jobs still work.",
-    "thinking": "[thinking] Processing the current request. If this takes more than 15 seconds, press Ctrl+C to cancel this turn without exiting the Agent.",
+    "thinking": "[thinking] Processing the current request. Press Ctrl+C to cancel this turn without exiting the Agent.",
     "turn_cancelled": "Cancelled the current turn. The Agent session is still active; you can continue.",
+    "turn_timeout": "This turn stopped on timeout without committing turn state (whole-turn deadline={timeout:g}s, provider={provider}, model={model}). The Agent session is still active; you can retry.",
     "pasted_evidence_detected": "Detected pasted logs, transcript, or error evidence. Treating it as evidence; it will not be written directly into benchmark configuration.",
     "pasted_evidence_buffered": "Buffered pasted log/transcript evidence. Continue pasting, or type the question you want me to analyze.",
     "pending_answer_blocked": "This reply did not pass validation for the current question: {blockers}",
@@ -173,5 +174,4 @@ _EN = {
     "unbound_structural_answer": "There is no active question to confirm, so this short reply cannot be bound to a decision. State the goal directly, for example: benchmark solana fake-node quick, check job status, or analyze the latest report.",
     "framework_context_loaded": "Loaded framework facts: {chains} chains, {families} adapter families, {methods} RPC methods, fake-node fixtures={fixtures}.",
     "ctrl_c_exit": "Received Ctrl+C; exiting AnyChain Benchmark Agent.",
-    "adk_missing_hint": "Note: google-adk is not available. Allow the Agent to install the isolated runtime, or run bash scripts/install_agent_deps.sh --yes first.",
 }

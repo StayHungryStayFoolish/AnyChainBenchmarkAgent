@@ -4,10 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-try:
-    from .config import LLMConfig
-except ImportError:  # script execution with agent/ on sys.path
-    from llm.config import LLMConfig
+from agent.llm.config import LLMConfig
 
 
 CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"

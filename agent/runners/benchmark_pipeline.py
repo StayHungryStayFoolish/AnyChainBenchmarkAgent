@@ -1,8 +1,8 @@
 """Shared benchmark preparation/execution pipeline.
 
 Both the CLI tool-dispatch surface (`agent/tools/executor.py`) and the
-LangGraph Harness (`agent/harness/nodes/execution.py`) call these functions
-directly, so the plan/preflight/smoke business logic lives in exactly one
+LangGraph Harness (`agent/harness/domains/execution_runtime.py`) call these
+functions directly, so the plan/preflight/smoke business logic lives in exactly one
 place. `executor.py` adds the `approved`/confirmation gate for its callers;
 the Harness calls straight in since it already gates approval itself via its
 own graph state.
@@ -10,29 +10,19 @@ own graph state.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
-try:
-    from ..diagnostics.doctor import run_doctor as _run_doctor
-    from ..discovery.environment import discover_environment as _discover_environment
-    from ..planners.preflight import run_preflight as _run_preflight
-    from ..planners.strategy_planner import generate_plan as _generate_plan
-    from ..planners.strategy_planner import write_json
-    from ..validators.config_contract import build_missing_config_questions as _build_missing_config_questions
-    from .job_manager import submit_job as _submit_job
-    from .runbook import render_runbook as _render_runbook
-    from .tool_result import tool_result as _tool_result
-except ImportError:  # script execution with agent/ on sys.path
-    from diagnostics.doctor import run_doctor as _run_doctor
-    from discovery.environment import discover_environment as _discover_environment
-    from planners.preflight import run_preflight as _run_preflight
-    from planners.strategy_planner import generate_plan as _generate_plan
-    from planners.strategy_planner import write_json
-    from validators.config_contract import build_missing_config_questions as _build_missing_config_questions
-    from runners.job_manager import submit_job as _submit_job
-    from runners.runbook import render_runbook as _render_runbook
-    from runners.tool_result import tool_result as _tool_result
+from ..diagnostics.doctor import run_doctor as _run_doctor
+from ..discovery.environment import discover_environment as _discover_environment
+from ..planners.preflight import run_preflight as _run_preflight
+from ..planners.strategy_planner import generate_plan as _generate_plan
+from ..planners.strategy_planner import write_json
+from .job_manager import submit_job as _submit_job
+from .runbook import render_runbook as _render_runbook
+from .tool_result import tool_result as _tool_result
 
 
 def prepare_benchmark_run(
@@ -72,9 +62,13 @@ def prepare_benchmark_run(
     observability_mode: str = "",
     observability_auto_stop: bool | None = None,
     workflow_type: str = "",
+    sync_observe_rpc_url: str = "",
+    sync_observe_rpc_url_ready: bool = False,
     sync_observe_stop_condition: str = "",
     sync_observe_duration_seconds: int | None = None,
     sync_observe_source: str = "",
+    node_process_identity: str = "",
+    node_prometheus_metrics_url: str = "",
     exporter_port: str = "",
     prometheus_port: str = "",
     grafana_port: str = "",
@@ -128,9 +122,13 @@ def prepare_benchmark_run(
         observability_mode=observability_mode,
         observability_auto_stop=observability_auto_stop,
         workflow_type=workflow_type,
+        sync_observe_rpc_url=sync_observe_rpc_url,
+        sync_observe_rpc_url_ready=sync_observe_rpc_url_ready,
         sync_observe_stop_condition=sync_observe_stop_condition,
         sync_observe_duration_seconds=sync_observe_duration_seconds,
         sync_observe_source=sync_observe_source,
+        node_process_identity=node_process_identity,
+        node_prometheus_metrics_url=node_prometheus_metrics_url,
         exporter_port=exporter_port,
         prometheus_port=prometheus_port,
         grafana_port=grafana_port,
@@ -142,11 +140,6 @@ def prepare_benchmark_run(
     plan = _generate_plan(request, discovery=discovery)
     preflight = _run_preflight(plan)
     runbook = _render_runbook(plan)
-    config_questions = _build_missing_config_questions(
-        _target_mode_for_plan(plan),
-        _confirmed_values_from_plan(request, plan),
-        discovery,
-    )
 
     prepared_dir = Path(output_dir)
     prepared_dir.mkdir(parents=True, exist_ok=True)
@@ -164,9 +157,6 @@ def prepare_benchmark_run(
         "doctor": doctor,
         "inferred_values": _inferred_values(plan),
         "missing_required": plan.get("required_inputs", []),
-        "questions": plan.get("required_questions", []),
-        "next_question": config_questions.get("next_question", {}),
-        "configuration_questions": config_questions,
         "requires_confirmation": plan.get("requires_confirmation", []),
         "approval_checkpoints": plan.get("approval_checkpoints", []),
     }
@@ -183,7 +173,12 @@ def prepare_benchmark_run(
     )
 
 
-def run_fake_node_smoke_benchmark(plan_file: str, jobs_dir: str = ".agent/jobs") -> dict[str, Any]:
+def run_fake_node_smoke_benchmark(
+    plan_file: str,
+    jobs_dir: str = ".agent/jobs",
+    *,
+    execution_plan: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Materialize the fake-node smoke plan and submit it as a detached job.
 
     Returns the same structured-result shape the ADK
@@ -204,11 +199,16 @@ def run_fake_node_smoke_benchmark(plan_file: str, jobs_dir: str = ".agent/jobs")
     if not smoke_root.is_absolute():
         smoke_root = repo / smoke_root
     smoke_root.mkdir(parents=True, exist_ok=True)
-    smoke_plan = _fake_node_smoke_plan(plan_path, smoke_root)
-    smoke_plan_file = smoke_root / f"{smoke_plan['plan_id']}.json"
-    write_json(smoke_plan_file, smoke_plan)
+    source_plan = dict(execution_plan) if execution_plan is not None else None
+    smoke_plan = _fake_node_smoke_plan(plan_path, smoke_root, plan=source_plan)
 
-    job = _submit_job(smoke_plan_file, jobs_dir=jobs_dir, mock=False, approved=True)
+    job = _submit_job(
+        plan_path,
+        jobs_dir=jobs_dir,
+        mock=False,
+        approved=True,
+        execution_plan=smoke_plan,
+    )
     benchmark_log = str(Path(job.get("run_dir", "")) / "benchmark.log") if job.get("run_dir") else ""
     evidence = [
         job.get("runtime_env_file", ""),
@@ -220,7 +220,8 @@ def run_fake_node_smoke_benchmark(plan_file: str, jobs_dir: str = ".agent/jobs")
         status="ok" if job.get("status") in {"completed", "running"} else "failed",
         data={
             "job": job,
-            "smoke_plan_file": str(smoke_plan_file),
+            "source_plan_file": str(plan_path),
+            "smoke_plan_file": str(job.get("plan_file") or ""),
             "isolated_output_root": str(smoke_root),
             "terminal_commands": _job_terminal_commands(job),
         },
@@ -230,25 +231,92 @@ def run_fake_node_smoke_benchmark(plan_file: str, jobs_dir: str = ".agent/jobs")
     )
 
 
-def submit_benchmark_job(plan_file: str, jobs_dir: str = ".agent/jobs") -> dict[str, Any]:
+def run_real_node_smoke_benchmark(
+    plan_file: str,
+    jobs_dir: str = ".agent/jobs",
+    *,
+    execution_plan: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Submit a safe, isolated smoke for a prepared real-node plan."""
+
+    plan_path = Path(plan_file)
+    if not plan_path.is_file():
+        return _tool_result(
+            status="blocked",
+            data={"plan_file": plan_file},
+            warnings=[f"plan file not found: {plan_file}"],
+            next_actions=["prepare_benchmark_run", "write plan file"],
+        )
+
+    repo = Path(__file__).resolve().parents[2]
+    smoke_root = Path(jobs_dir) / "real_node_smoke" / f"{plan_path.stem}_{plan_path.stat().st_mtime_ns}"
+    if not smoke_root.is_absolute():
+        smoke_root = repo / smoke_root
+    smoke_root.mkdir(parents=True, exist_ok=True)
+    source_plan = dict(execution_plan) if execution_plan is not None else None
+    smoke_plan = _real_node_smoke_plan(plan_path, smoke_root, plan=source_plan)
+
+    job = _submit_job(
+        plan_path,
+        jobs_dir=jobs_dir,
+        mock=False,
+        approved=True,
+        execution_plan=smoke_plan,
+    )
+    benchmark_log = str(Path(job.get("run_dir", "")) / "benchmark.log") if job.get("run_dir") else ""
+    return _tool_result(
+        status="ok" if job.get("status") in {"completed", "running"} else "failed",
+        data={
+            "job": job,
+            "source_plan_file": str(plan_path),
+            "smoke_plan_file": str(job.get("plan_file") or ""),
+            "isolated_output_root": str(smoke_root),
+            "terminal_commands": _job_terminal_commands(job),
+        },
+        evidence_paths=[
+            job.get("runtime_env_file", ""),
+            job.get("artifact_index", ""),
+            benchmark_log,
+            str(smoke_root / "benchmark-data"),
+        ],
+        warnings=[job.get("error", "")] if job.get("error") else [],
+        next_actions=_job_user_next_actions(job),
+    )
+
+
+def submit_benchmark_job(
+    plan_file: str,
+    jobs_dir: str = ".agent/jobs",
+    *,
+    execution_plan: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Submit a real benchmark job.
 
     Returns the same structured-result shape the ADK `submit_benchmark_job`
     tool exposes to the LLM; the ADK wrapper only adds the `approved`
     confirmation gate before calling this.
     """
-    if not Path(plan_file).is_file():
+    plan_path = Path(plan_file)
+    if not plan_path.is_file():
         return _tool_result(
             status="blocked",
             data={"plan_file": plan_file},
             warnings=[f"plan file not found: {plan_file}"],
             next_actions=["generate_benchmark_plan", "write plan file"],
         )
-    job = _submit_job(plan_file, jobs_dir=jobs_dir, mock=False, approved=True)
+    source_plan = dict(execution_plan) if execution_plan is not None else None
+    executable_plan = _isolated_execution_plan(plan_path, Path(jobs_dir), plan=source_plan)
+    job = _submit_job(
+        plan_path,
+        jobs_dir=jobs_dir,
+        mock=False,
+        approved=True,
+        execution_plan=executable_plan,
+    )
     return _tool_result(
         status="ok" if job.get("status") in {"completed", "running"} else "failed",
         data={"job": job, "terminal_commands": _job_terminal_commands(job)},
-        evidence_paths=[job.get("runtime_env_file", ""), job.get("artifact_index", "")],
+        evidence_paths=[job.get("plan_file", ""), job.get("runtime_env_file", ""), job.get("artifact_index", "")],
         warnings=[job.get("error", "")] if job.get("error") else [],
         next_actions=_job_user_next_actions(job),
     )
@@ -292,9 +360,13 @@ def _structured_request(
     observability_mode: str,
     observability_auto_stop: bool | None,
     workflow_type: str,
+    sync_observe_rpc_url: str,
+    sync_observe_rpc_url_ready: bool = False,
     sync_observe_stop_condition: str,
     sync_observe_duration_seconds: int | None,
     sync_observe_source: str,
+    node_process_identity: str = "",
+    node_prometheus_metrics_url: str,
     exporter_port: str,
     prometheus_port: str,
     grafana_port: str,
@@ -424,6 +496,16 @@ def _structured_request(
         request["run_mode"] = workflow_type
     if sync_observe_source:
         request["sync_observe_source"] = sync_observe_source
+    if sync_observe_rpc_url:
+        request["sync_observe_rpc_url"] = sync_observe_rpc_url
+        request["local_rpc_url"] = sync_observe_rpc_url
+        request["sync_observe_rpc_url_ready"] = bool(sync_observe_rpc_url_ready)
+    if node_process_identity:
+        request["node_process_identity"] = node_process_identity
+        if not request.get("blockchain_process_names"):
+            request["blockchain_process_names"] = [node_process_identity]
+    if node_prometheus_metrics_url:
+        request["node_prometheus_metrics_url"] = node_prometheus_metrics_url
     if sync_observe_stop_condition:
         request["sync_observe_stop_condition"] = sync_observe_stop_condition
     if sync_observe_duration_seconds is not None:
@@ -606,45 +688,18 @@ def _inferred_values(plan: dict[str, Any]) -> dict[str, Any]:
 def _prepare_next_actions(plan: dict[str, Any], preflight: dict[str, Any]) -> list[str]:
     if plan.get("required_inputs"):
         return ["ask user to provide missing required values", "rerun prepare_benchmark_run"]
-    if plan.get("required_questions"):
-        return ["ask user to confirm inferred values", "rerun prepare_benchmark_run with confirmations"]
     if not preflight.get("passed"):
         return ["fix preflight blockers", "rerun prepare_benchmark_run"]
     return ["ask approval for run_fake_node_smoke_benchmark", "ask approval for submit_benchmark_job"]
 
 
-def _target_mode_for_plan(plan: dict[str, Any]) -> str:
-    if plan.get("use_fake_node") is True:
-        return "fake-node"
-    if plan.get("use_fake_node") is False:
-        return "real-node"
-    return ""
-
-
-def _confirmed_values_from_plan(request: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
-    values = _inferred_values(plan)
-    values["chain"] = plan.get("chain") or request.get("chain")
-    values["rpc_mode"] = plan.get("rpc_mode") or request.get("rpc_mode")
-    if plan.get("use_fake_node") is True:
-        values["use_fake_node"] = True
-    elif plan.get("use_fake_node") is False:
-        values["use_fake_node"] = False
-    for item in list(request.get("confirmations") or plan.get("confirmed_inputs") or []):
-        values[str(item)] = True
-    qps = request.get("qps") or {}
-    if qps and all(key in qps for key in ("initial", "max", "step", "duration_seconds")):
-        values.setdefault("qps_profile_confirmed", True)
-    observability = request.get("observability") or {}
-    if observability.get("mode"):
-        values.setdefault("OBSERVABILITY_STACK_MODE", observability.get("mode"))
-    return values
-
-
-def _fake_node_smoke_plan(plan_file: Path, smoke_root: Path) -> dict[str, Any]:
-    import json
-
-    plan = json.loads(plan_file.read_text(encoding="utf-8"))
-    plan = dict(plan)
+def _fake_node_smoke_plan(
+    plan_file: Path,
+    smoke_root: Path,
+    *,
+    plan: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    plan = dict(plan) if plan is not None else json.loads(plan_file.read_text(encoding="utf-8"))
     if not smoke_root.is_absolute():
         smoke_root = Path(__file__).resolve().parents[2] / smoke_root
     smoke_output_root = (smoke_root / "benchmark-data").resolve()
@@ -657,10 +712,6 @@ def _fake_node_smoke_plan(plan_file: Path, smoke_root: Path) -> dict[str, Any]:
     plan["required_inputs"] = [
         item for item in plan.get("required_inputs", [])
         if item not in _FAKE_NODE_IGNORED_REQUIREMENTS
-    ]
-    plan["required_questions"] = [
-        item for item in plan.get("required_questions", [])
-        if item.get("id") not in _FAKE_NODE_IGNORED_REQUIREMENTS
     ]
     checklist = dict(plan.get("configuration_checklist", {}))
     if checklist:
@@ -693,6 +744,7 @@ def _fake_node_smoke_plan(plan_file: Path, smoke_root: Path) -> dict[str, Any]:
         # smoke run as a detached job, then let the terminal expose status/log
         # follow commands while the benchmark engine writes artifacts.
         "runner_mode": "detached",
+        "idempotency_key": execution.get("idempotency_key") or f"fake-node-smoke:{plan.get('plan_id', plan_file.stem)}",
     })
     plan["execution"] = execution
     advanced_defaults = dict(plan.get("advanced_defaults", {}))
@@ -716,6 +768,112 @@ def _fake_node_smoke_plan(plan_file: Path, smoke_root: Path) -> dict[str, Any]:
     artifacts.update({
         "fake_node_smoke_output_root": str(smoke_output_root),
         "fake_node_smoke_memory_dir": str(smoke_memory_dir),
+    })
+    plan["artifacts"] = artifacts
+    return plan
+
+
+def _real_node_smoke_plan(
+    plan_file: Path,
+    smoke_root: Path,
+    *,
+    plan: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Derive an isolated low-traffic plan without changing the final plan."""
+
+    import json
+
+    plan = dict(plan) if plan is not None else dict(json.loads(plan_file.read_text(encoding="utf-8")))
+    if not smoke_root.is_absolute():
+        smoke_root = Path(__file__).resolve().parents[2] / smoke_root
+    smoke_output_root = (smoke_root / "benchmark-data").resolve()
+    smoke_memory_dir = (smoke_root / "memory").resolve()
+    original_plan_id = str(plan.get("plan_id") or plan_file.stem)
+    plan["plan_id"] = f"{original_plan_id}_real_node_smoke"
+    plan["strategy"] = "smoke"
+    plan["goal"] = "smoke"
+    plan["benchmark_mode"] = "quick"
+    plan["use_fake_node"] = False
+
+    execution = dict(plan.get("execution") or {})
+    env = dict(execution.get("environment") or {})
+    env.update({
+        "QUICK_INITIAL_QPS": "1",
+        "QUICK_MAX_QPS": "1",
+        "QUICK_QPS_STEP": "1",
+        "QUICK_DURATION": "10",
+        "QPS_WARMUP_DURATION": "0",
+        "QPS_COOLDOWN": "0",
+        "BLOCKCHAIN_BENCHMARK_DATA_DIR": str(smoke_output_root),
+        "MEMORY_SHARE_DIR": str(smoke_memory_dir),
+    })
+    base_key = str(execution.get("idempotency_key") or f"real-node:{original_plan_id}")
+    execution.update({
+        "command": ["./blockchain_node_benchmark.sh", "--quick", f"--{plan.get('rpc_mode', 'single')}"],
+        "environment": env,
+        "runner_mode": "detached",
+        "idempotency_key": f"{base_key}:real-node-smoke",
+    })
+    plan["execution"] = execution
+
+    advanced_defaults = dict(plan.get("advanced_defaults") or {})
+    advanced_defaults["qps"] = {"initial": 1, "max": 1, "step": 1, "duration_seconds": 10}
+    plan["advanced_defaults"] = advanced_defaults
+    materialized = dict(plan.get("materialized_config") or {})
+    materialized.update({
+        "BLOCKCHAIN_BENCHMARK_DATA_DIR": str(smoke_output_root),
+        "MEMORY_SHARE_DIR": str(smoke_memory_dir),
+    })
+    plan["materialized_config"] = materialized
+    artifacts = dict(plan.get("artifacts") or {})
+    artifacts.update({
+        "real_node_smoke_output_root": str(smoke_output_root),
+        "real_node_smoke_memory_dir": str(smoke_memory_dir),
+    })
+    plan["artifacts"] = artifacts
+    return plan
+
+
+def _isolated_execution_plan(
+    plan_file: Path,
+    jobs_dir: Path,
+    *,
+    plan: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build final execution values; job manager owns the only written copy."""
+
+    plan_path = plan_file.resolve()
+    plan = dict(plan) if plan is not None else dict(json.loads(plan_path.read_text(encoding="utf-8")))
+    digest = hashlib.sha256(plan_path.read_bytes()).hexdigest()[:16]
+    repo = Path(__file__).resolve().parents[2]
+    root = jobs_dir / "final_benchmark" / f"{plan_path.stem}_{digest}"
+    if not root.is_absolute():
+        root = repo / root
+    output_root = (root / "benchmark-data").resolve()
+    memory_dir = (root / "memory").resolve()
+
+    execution = dict(plan.get("execution") or {})
+    env = dict(execution.get("environment") or {})
+    env.update({
+        "BLOCKCHAIN_BENCHMARK_DATA_DIR": str(output_root),
+        "MEMORY_SHARE_DIR": str(memory_dir),
+    })
+    execution.update({
+        "environment": env,
+        "idempotency_key": str(execution.get("idempotency_key") or f"benchmark:{plan_path.stem}:{digest}"),
+    })
+    plan["execution"] = execution
+    materialized = dict(plan.get("materialized_config") or {})
+    materialized.update({
+        "BLOCKCHAIN_BENCHMARK_DATA_DIR": str(output_root),
+        "MEMORY_SHARE_DIR": str(memory_dir),
+    })
+    plan["materialized_config"] = materialized
+    artifacts = dict(plan.get("artifacts") or {})
+    artifacts.update({
+        "execution_output_root": str(output_root),
+        "execution_memory_dir": str(memory_dir),
+        "source_plan_file": str(plan_path),
     })
     plan["artifacts"] = artifacts
     return plan

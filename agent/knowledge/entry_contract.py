@@ -208,10 +208,8 @@ SYNC_OBSERVE_FIELDS: tuple[RuntimeField, ...] = (
         "sync_observe_rpc_url", "SYNC_OBSERVE_RPC_URL", "sync-observe RPC endpoint",
         "The real node RPC/metrics endpoint sync-observe watches for sync/import progress and node metrics.",
         "url",
-        # Not unconditionally required: only asked when `sync_observe.source` is
-        # endpoint_only/existing_local_node/client_setup, not for demo_only — so
-        # it is intentionally excluded from `config_contract.SYNC_OBSERVE_BLOCKERS`
-        # (a static required-fields list), unlike the other three fields below.
+        # Source-specific validation owns this field because endpoint-only and
+        # local-process observation collect their evidence differently.
         required=False,
         description="Real node RPC endpoint for sync-observe to poll sync/import progress and node metrics from.",
         applies_to=("sync_observe",),

@@ -13,10 +13,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-try:
-    from .tool_result import tool_result as _tool_result
-except ImportError:  # script execution with agent/ on sys.path
-    from runners.tool_result import tool_result as _tool_result
+from agent.runners.tool_result import tool_result as _tool_result
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 

@@ -83,4 +83,4 @@ if [[ "$uses_scripted_prompt" == "0" ]] && ! has_prompt_toolkit; then
   bootstrap_agent_terminal_deps
 fi
 
-exec "$AGENT_PYTHON" agent/terminal/repl.py "$@"
+exec "$AGENT_PYTHON" -m agent.terminal.repl "$@"

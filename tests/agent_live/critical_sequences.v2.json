@@ -1,0 +1,212 @@
+{
+  "registry_id": "anychain-agent-critical-sequences",
+  "version": 2,
+  "sequences": [
+    {
+      "sequence_id": "correction-after-rejection",
+      "title": "Invalid input is rejected before a corrected value is admitted",
+      "tags": ["rejection", "correction", "multi-turn"],
+      "steps": [
+        {"step_id": "invalid-input", "coverage_ids": ["input:invalid", "transition:rejected"]},
+        {"step_id": "question-preserved", "coverage_ids": ["invariant:pending-question-preserved", "invariant:protected-field-unchanged"]},
+        {"step_id": "corrected-input", "coverage_ids": ["input:corrected", "transition:admitted"]},
+        {"step_id": "workflow-continues", "coverage_ids": ["transition:fallback"]}
+      ]
+    },
+    {
+      "sequence_id": "resume-consult-clear",
+      "title": "Resume consultation and clear without stale state",
+      "tags": ["opening", "resume", "recovery"],
+      "steps": [
+        {"step_id": "resume", "coverage_ids": ["question:opening:resume_harness_session"]},
+        {"step_id": "consult", "coverage_ids": ["action:consult"]},
+        {"step_id": "clear", "coverage_ids": ["action:reset_harness_session"]},
+        {"step_id": "fresh-mode", "coverage_ids": ["question:opening:opening_next_action"]}
+      ]
+    },
+    {
+      "sequence_id": "nested-partial-group-jumps",
+      "title": "Nested partial-group jumps return through canonical fallback",
+      "tags": ["interruption", "fallback", "configuration"],
+      "steps": [
+        {"step_id": "partial-provider", "coverage_ids": ["group:provider_deployment"]},
+        {"step_id": "jump-qps", "coverage_ids": ["action:change_group", "group:qps_profile"]},
+        {"step_id": "jump-observability", "coverage_ids": ["action:change_group", "group:observability"]},
+        {"step_id": "resume-provider", "coverage_ids": ["group:provider_deployment", "transition:fallback"]}
+      ]
+    },
+    {
+      "sequence_id": "case1-custom-rpc-runtime",
+      "title": "Supported chain custom RPC through workload and execution gate",
+      "tags": ["case1", "custom-rpc", "execution"],
+      "steps": [
+        {"step_id": "supported-chain", "coverage_ids": ["group:chain_identity", "case:1"]},
+        {"step_id": "endpoint", "coverage_ids": ["group:endpoint_process", "probe:endpoint"]},
+        {"step_id": "schema", "coverage_ids": ["group:endpoint_process", "probe:rpc-schema"]},
+        {"step_id": "workload", "coverage_ids": ["group:workload_rpc"]},
+        {"step_id": "execution", "coverage_ids": ["group:preflight_smoke_execution"]}
+      ]
+    },
+    {
+      "sequence_id": "case2-new-existing-family",
+      "title": "Unknown chain in an existing family continues into normal setup",
+      "tags": ["case2", "new-chain", "custom-rpc"],
+      "steps": [
+        {"step_id": "unknown-chain", "coverage_ids": ["group:chain_identity", "identity:unknown"]},
+        {"step_id": "family", "coverage_ids": ["group:chain_identity", "family:existing"]},
+        {"step_id": "endpoint", "coverage_ids": ["group:endpoint_process", "probe:endpoint"]},
+        {"step_id": "schema", "coverage_ids": ["group:endpoint_process", "probe:rpc-schema"]},
+        {"step_id": "normal-fallback", "coverage_ids": ["transition:fallback", "group:provider_deployment"]}
+      ]
+    },
+    {
+      "sequence_id": "case3-handoff-return",
+      "title": "Unsupported family handoff and return to a runnable path",
+      "tags": ["case3", "handoff", "return"],
+      "steps": [
+        {"step_id": "unsupported", "coverage_ids": ["group:chain_identity", "family:unsupported"]},
+        {"step_id": "evidence", "coverage_ids": ["action:analyze_evidence"]},
+        {"step_id": "handoff", "coverage_ids": ["group:secondary_development_handoff"]},
+        {"step_id": "return", "coverage_ids": ["action:choose_chain", "group:chain_identity"]}
+      ]
+    },
+    {
+      "sequence_id": "execution-failure-correct-retry",
+      "title": "Execution failure is explained, corrected, and retried once",
+      "tags": ["execution", "failure", "recovery"],
+      "steps": [
+        {"step_id": "submit", "coverage_ids": ["action:approve_preflight_smoke"]},
+        {"step_id": "failure", "coverage_ids": ["group:failure_recovery", "result:failed"]},
+        {"step_id": "correct", "coverage_ids": ["action:correct_failure"]},
+        {"step_id": "retry", "coverage_ids": ["action:retry_failure"]}
+      ]
+    },
+    {
+      "sequence_id": "repeated-back-across-partial-groups",
+      "title": "Repeated back traverses two interruption frames without replay",
+      "tags": ["back", "interruption", "state-control"],
+      "steps": [
+        {"step_id": "partial-ledger", "coverage_ids": ["group:ledger_disk", "state:partial"]},
+        {"step_id": "jump-workload", "coverage_ids": ["action:change_group", "group:workload_rpc"]},
+        {"step_id": "jump-qps", "coverage_ids": ["action:change_group", "group:qps_profile"]},
+        {"step_id": "back-one", "coverage_ids": ["action:go_back", "interruption-depth:2+"]},
+        {"step_id": "back-two", "coverage_ids": ["action:go_back", "interruption-depth:1"]},
+        {"step_id": "resume-ledger", "coverage_ids": ["group:ledger_disk", "transition:resume-partial"]}
+      ]
+    },
+    {
+      "sequence_id": "compound-mode-chain-endpoint-turn",
+      "title": "One compound turn switches mode and chain without stale endpoint binding",
+      "tags": ["compound-turn", "mode-switch", "queue"],
+      "steps": [
+        {"step_id": "manual-pending", "coverage_ids": ["pending:manual", "group:provider_deployment"]},
+        {"step_id": "compound-input", "coverage_ids": ["input:compound", "action:choose_target_mode", "action:choose_chain", "action:set_endpoint"]},
+        {"step_id": "invalidate-old", "coverage_ids": ["transition:invalidate-dependent-state"]},
+        {"step_id": "preserve-independent", "coverage_ids": ["invariant:preserve-independent-environment"]},
+        {"step_id": "canonical-next", "coverage_ids": ["transition:fallback"]}
+      ]
+    },
+    {
+      "sequence_id": "case1-custom-rpc-no-params",
+      "title": "Supported chain custom single method explicitly validates params empty",
+      "tags": ["case1", "custom-rpc", "no-params"],
+      "steps": [
+        {"step_id": "case1", "coverage_ids": ["case:1", "group:workload_rpc"]},
+        {"step_id": "request", "coverage_ids": ["evidence:request", "rpc-params:empty-array"]},
+        {"step_id": "response", "coverage_ids": ["evidence:response", "probe:rpc-schema"]},
+        {"step_id": "confirm-method", "coverage_ids": ["action:confirm_custom_rpc_method"]},
+        {"step_id": "single-weight", "coverage_ids": ["workload:custom-single", "weight-total:100"]},
+        {"step_id": "runtime", "coverage_ids": ["probe:endpoint", "group:preflight_smoke_execution"]}
+      ]
+    },
+    {
+      "sequence_id": "case1-custom-rpc-multi-params-weights",
+      "title": "Supported chain custom mixed methods validate parameter semantics and weights",
+      "tags": ["case1", "custom-rpc", "multi-param", "weights"],
+      "steps": [
+        {"step_id": "case1", "coverage_ids": ["case:1", "group:workload_rpc"]},
+        {"step_id": "multi-param-request", "coverage_ids": ["evidence:request", "rpc-params:multiple"]},
+        {"step_id": "param-contract", "coverage_ids": ["rpc-param:index-name-type-semantics"]},
+        {"step_id": "response-contract", "coverage_ids": ["evidence:response", "probe:rpc-schema", "rpc-response:shape-confirmed"]},
+        {"step_id": "weights", "coverage_ids": ["workload:custom-mixed", "weight-total:100"]},
+        {"step_id": "runtime", "coverage_ids": ["probe:endpoint", "group:preflight_smoke_execution"]}
+      ]
+    },
+    {
+      "sequence_id": "case2-custom-rpc-no-params",
+      "title": "New chain in an existing family validates a no-parameter method",
+      "tags": ["case2", "custom-rpc", "no-params"],
+      "steps": [
+        {"step_id": "identity", "coverage_ids": ["case:2", "identity:unknown"]},
+        {"step_id": "family", "coverage_ids": ["family:existing", "action:confirm_adapter_family"]},
+        {"step_id": "endpoint", "coverage_ids": ["probe:endpoint"]},
+        {"step_id": "schema", "coverage_ids": ["rpc-params:empty-array", "probe:rpc-schema"]},
+        {"step_id": "weight", "coverage_ids": ["workload:custom-single", "weight-total:100"]},
+        {"step_id": "fallback", "coverage_ids": ["transition:fallback"]}
+      ]
+    },
+    {
+      "sequence_id": "case2-custom-rpc-multi-params-weights",
+      "title": "New chain in an existing family validates split multi-parameter evidence and weights",
+      "tags": ["case2", "custom-rpc", "multi-param", "weights"],
+      "steps": [
+        {"step_id": "identity", "coverage_ids": ["case:2", "identity:unknown"]},
+        {"step_id": "family", "coverage_ids": ["family:existing", "action:confirm_adapter_family"]},
+        {"step_id": "split-request", "coverage_ids": ["evidence:split", "rpc-params:multiple"]},
+        {"step_id": "param-contract", "coverage_ids": ["rpc-param:index-name-type-semantics"]},
+        {"step_id": "split-response", "coverage_ids": ["evidence:response", "probe:rpc-schema", "rpc-response:shape-confirmed"]},
+        {"step_id": "weights", "coverage_ids": ["workload:custom-mixed", "weight-total:100"]},
+        {"step_id": "fallback", "coverage_ids": ["transition:fallback"]}
+      ]
+    },
+    {
+      "sequence_id": "case3-handoff-return-case2",
+      "title": "Unsupported family handoff returns through discovery into Case 2",
+      "tags": ["case3", "handoff", "case2", "return"],
+      "steps": [
+        {"step_id": "case3", "coverage_ids": ["case:3", "family:unsupported"]},
+        {"step_id": "handoff", "coverage_ids": ["group:secondary_development_handoff"]},
+        {"step_id": "return-chain", "coverage_ids": ["action:choose_chain", "group:chain_identity"]},
+        {"step_id": "case2", "coverage_ids": ["case:2", "family:existing"]},
+        {"step_id": "normal-setup", "coverage_ids": ["transition:fallback", "group:endpoint_process"]}
+      ]
+    },
+    {
+      "sequence_id": "partial-group-three-level-jumps",
+      "title": "Three partial groups preserve progress across nested jumps",
+      "tags": ["partial", "nested-jump", "fallback"],
+      "steps": [
+        {"step_id": "partial-disk", "coverage_ids": ["group:ledger_disk", "state:partial"]},
+        {"step_id": "partial-rpc", "coverage_ids": ["group:workload_rpc", "state:partial", "interruption-depth:1"]},
+        {"step_id": "partial-observability", "coverage_ids": ["group:observability", "state:partial", "interruption-depth:2+"]},
+        {"step_id": "complete-observability", "coverage_ids": ["group:observability", "state:completed"]},
+        {"step_id": "resume-rpc", "coverage_ids": ["group:workload_rpc", "transition:resume-partial"]},
+        {"step_id": "resume-disk", "coverage_ids": ["group:ledger_disk", "transition:resume-partial"]}
+      ]
+    },
+    {
+      "sequence_id": "session-partial-resume-modify-reset",
+      "title": "Partial session resumes, modifies one group, then resets cleanly",
+      "tags": ["session", "resume", "modify", "reset"],
+      "steps": [
+        {"step_id": "partial-resume", "coverage_ids": ["question:opening:resume_harness_session", "session:partial"]},
+        {"step_id": "modify", "coverage_ids": ["action:modify_harness_session"]},
+        {"step_id": "preserve", "coverage_ids": ["invariant:preserve-independent-confirmed-fields"]},
+        {"step_id": "reset", "coverage_ids": ["action:reset_harness_session"]},
+        {"step_id": "fresh", "coverage_ids": ["session:fresh", "question:opening:opening_next_action"]}
+      ]
+    },
+    {
+      "sequence_id": "sync-observe-never-enters-rpc-load",
+      "title": "Sync observation bypasses RPC workload, QPS, fixtures, and Vegeta",
+      "tags": ["sync-observe", "negative-invariant", "execution"],
+      "steps": [
+        {"step_id": "select-sync", "coverage_ids": ["action:choose_target_mode", "mode:sync-observe"]},
+        {"step_id": "endpoint-process", "coverage_ids": ["group:endpoint_process", "probe:endpoint"]},
+        {"step_id": "sync-config", "coverage_ids": ["group:sync_observe", "condition:selected"]},
+        {"step_id": "negative-gate", "coverage_ids": ["invariant:sync-no-rpc-workload-qps-fixture-vegeta"]},
+        {"step_id": "observe", "coverage_ids": ["action:approve_sync_observe", "artifact:sync-report"]}
+      ]
+    }
+  ]
+}

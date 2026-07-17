@@ -71,7 +71,7 @@ environment.
 
    ```bash
    source config/agent_config.sh
-   python3 agent/cli.py adk-status
+   python3 -m agent.cli adk-status
    ```
 
 6. Start the product terminal:

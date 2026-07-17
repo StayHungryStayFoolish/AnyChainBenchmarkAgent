@@ -10,6 +10,7 @@ asserts LangGraph state after the conversation. It does not read legacy
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -18,8 +19,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tests.agent_live.dynamic_dual_ai_chaos import SubprocessPtyTransport
+from agent.harness.questions import answer_fits_pending
 
 
 @dataclass(frozen=True)
@@ -27,29 +32,34 @@ class Scenario:
     name: str
     prompts: list[str]
     assert_state: Callable[[dict[str, Any], str], list[str]]
+    expected_pending_ids: tuple[str | None, ...] = ()
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run LangGraph product CLI live matrix.")
     parser.add_argument("--scenario", action="append", help="Run only the named scenario.")
+    parser.add_argument(
+        "--batch",
+        action="store_true",
+        help="Use the legacy non-interactive batch driver instead of turn-level PTY fail-fast mode.",
+    )
     args = parser.parse_args()
 
     selected = set(args.scenario or [])
     scenarios = [item for item in _scenarios() if not selected or item.name in selected]
-    failures: list[str] = []
-    for scenario in scenarios:
-        issues = _run_scenario(scenario)
-        failures.extend(f"{scenario.name}: {issue}" for issue in issues)
-
-    if failures:
-        for issue in failures:
-            print(issue)
-        return 1
+    for index, scenario in enumerate(scenarios, start=1):
+        print(f"[{index}/{len(scenarios)}] running {scenario.name}", flush=True)
+        issues = _run_scenario(scenario, turn_fail_fast=not args.batch)
+        if issues:
+            for issue in issues:
+                print(f"{scenario.name}: {issue}")
+            return 1
+        print(f"[{index}/{len(scenarios)}] passed {scenario.name}", flush=True)
     print(f"langgraph cli matrix ok ({len(scenarios)} scenarios)")
     return 0
 
 
-def _run_scenario(scenario: Scenario) -> list[str]:
+def _run_scenario(scenario: Scenario, *, turn_fail_fast: bool = True) -> list[str]:
     with tempfile.TemporaryDirectory(prefix=f"anychain-{scenario.name}-") as tmpdir:
         tmp = Path(tmpdir)
         state_file = tmp / "terminal-state.json"
@@ -59,6 +69,8 @@ def _run_scenario(scenario: Scenario) -> list[str]:
         env["ANYCHAIN_AGENT_CHECKPOINT_PATH"] = str(checkpoint)
         env["ANYCHAIN_AGENT_SESSION_ID"] = session_id
         env["ANYCHAIN_AGENT_SESSION_PURPOSE"] = "live-matrix"
+        env["ANYCHAIN_AGENT_JOBS_DIR"] = str(tmp / "jobs")
+        env["ANYCHAIN_AGENT_TURN_EVENT_FILE"] = str(tmp / "turn-events.jsonl")
         command = [
             str(REPO_ROOT / "bin" / "anychain-agent"),
             "--state-file",
@@ -70,6 +82,15 @@ def _run_scenario(scenario: Scenario) -> list[str]:
             "--session-purpose",
             "live-matrix",
         ]
+        if turn_fail_fast:
+            return _run_scenario_pty(
+                scenario,
+                command=command,
+                env=env,
+                session_id=session_id,
+                state_file=state_file,
+                checkpoint=checkpoint,
+            )
         for prompt in scenario.prompts:
             command.extend(["--prompt", prompt])
         try:
@@ -83,7 +104,11 @@ def _run_scenario(scenario: Scenario) -> list[str]:
                 timeout=300,
                 check=False,
             )
-            transcript = _transcript_header(scenario.name, session_id, state_file, checkpoint, "live-matrix") + proc.stdout
+            transcript = (
+                _transcript_header(scenario.name, session_id, state_file, checkpoint, "live-matrix")
+                + _prompt_manifest(scenario.prompts)
+                + proc.stdout
+            )
         except subprocess.TimeoutExpired as exc:
             transcript = exc.stdout or ""
             if isinstance(transcript, bytes):
@@ -99,6 +124,22 @@ def _run_scenario(scenario: Scenario) -> list[str]:
         state = _load_graph_state(session_id, checkpoint)
         issues = scenario.assert_state(state, transcript)
         if issues:
+            transcript += "\n# final graph state (diagnostic)\n" + json.dumps(
+                {
+                    key: state.get(key)
+                    for key in (
+                        "active_group",
+                        "pending_question",
+                        "action_queue",
+                        "completed_actions",
+                        "action_errors",
+                        "visible_response",
+                    )
+                },
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            ) + "\n"
             log_dir = REPO_ROOT / ".agent" / "live-matrix"
             log_dir.mkdir(parents=True, exist_ok=True)
             transcript_file = log_dir / f"{scenario.name}.transcript.txt"
@@ -107,9 +148,120 @@ def _run_scenario(scenario: Scenario) -> list[str]:
         return issues
 
 
+def _run_scenario_pty(
+    scenario: Scenario,
+    *,
+    command: list[str],
+    env: dict[str, str],
+    session_id: str,
+    state_file: Path,
+    checkpoint: Path,
+) -> list[str]:
+    """Drive one persistent product CLI and fail on the first stale answer."""
+
+    transport = SubprocessPtyTransport(command, cwd=REPO_ROOT)
+    transcript = _transcript_header(scenario.name, session_id, state_file, checkpoint, "live-matrix-pty")
+    transcript += _prompt_manifest(scenario.prompts)
+    try:
+        transport.start(env=env)
+        startup = transport.read_complete_agent_response(timeout_seconds=60)
+        transcript += startup
+        prior_state: dict[str, Any] = {}
+        for turn_index, prompt in enumerate(scenario.prompts, start=1):
+            if _is_bare_contract_answer(prompt):
+                pending = prior_state.get("pending_question") or {}
+                if not pending:
+                    return _retain_turn_failure(
+                        scenario,
+                        transcript,
+                        f"turn {turn_index} sends bare answer {prompt!r} without a pending question",
+                        state=prior_state,
+                    )
+                if not answer_fits_pending(prompt, pending):
+                    return _retain_turn_failure(
+                        scenario,
+                        transcript,
+                        f"turn {turn_index} answer {prompt!r} does not fit pending question "
+                        f"{pending.get('id')!r} ({pending.get('kind')!r})",
+                        state=prior_state,
+                    )
+            print(
+                f"    turn {turn_index}/{len(scenario.prompts)} submit {prompt[:72]!r}",
+                flush=True,
+            )
+            transport.submit_bracketed_paste(prompt)
+            response = transport.read_complete_agent_response(timeout_seconds=180)
+            transcript += f"\nUser> {prompt}\n{response}"
+            prior_state = _load_graph_state(session_id, checkpoint)
+            if scenario.expected_pending_ids:
+                expected_pending = scenario.expected_pending_ids[turn_index - 1]
+                observed_pending = str((prior_state.get("pending_question") or {}).get("id") or "") or None
+                if observed_pending != expected_pending:
+                    return _retain_turn_failure(
+                        scenario,
+                        transcript,
+                        f"turn {turn_index} expected pending {expected_pending!r}, got {observed_pending!r}",
+                        state=prior_state,
+                    )
+            print(
+                f"    turn {turn_index}/{len(scenario.prompts)} observed "
+                f"pending={(prior_state.get('pending_question') or {}).get('id')!r}",
+                flush=True,
+            )
+        issues = scenario.assert_state(prior_state, transcript)
+        if issues:
+            return _retain_turn_failure(scenario, transcript, *issues, state=prior_state)
+        return []
+    except (RuntimeError, TimeoutError) as exc:
+        return _retain_turn_failure(scenario, transcript, f"PTY failure: {exc}")
+    finally:
+        transport.close()
+
+
+def _is_bare_contract_answer(text: str) -> bool:
+    normalized = str(text or "").strip().rstrip(".)、。 ").strip().casefold()
+    return normalized in {"y", "yes", "n", "no"} or normalized.isdigit()
+
+
+def _retain_turn_failure(
+    scenario: Scenario,
+    transcript: str,
+    *issues: str,
+    state: dict[str, Any] | None = None,
+) -> list[str]:
+    log_dir = REPO_ROOT / ".agent" / "live-matrix"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    transcript_file = log_dir / f"{scenario.name}.turn-failure.transcript.txt"
+    if state:
+        transcript += "\n# final graph state (diagnostic)\n" + json.dumps(
+            {
+                key: state.get(key)
+                for key in (
+                    "active_group",
+                    "active_intent",
+                    "pending_question",
+                    "proposed_actions",
+                    "action_queue",
+                    "completed_actions",
+                    "action_errors",
+                    "turn_context",
+                    "control",
+                    "visible_response",
+                    "interruption_stack",
+                    "qps_profile",
+                    "audit_events",
+                )
+            },
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        ) + "\n"
+    transcript_file.write_text(transcript, encoding="utf-8")
+    return [*issues, f"turn-level transcript retained for this run: {transcript_file}"]
+
+
 def _load_graph_state(session_id: str, checkpoint: Path) -> dict[str, Any]:
-    sys.path.insert(0, str(REPO_ROOT / "agent"))
-    from harness.graph import AnyChainGraphRuntime
+    from agent.harness.graph import AnyChainGraphRuntime
 
     runtime = AnyChainGraphRuntime(thread_id=session_id, checkpoint_path=checkpoint)
     snapshot = runtime.graph.get_state({"configurable": {"thread_id": session_id}})
@@ -127,17 +279,25 @@ def _transcript_header(scenario: str, session_id: str, state_file: Path, checkpo
     )
 
 
+def _prompt_manifest(prompts: list[str]) -> str:
+    lines = ["# submitted user turns:"]
+    for index, prompt in enumerate(prompts, start=1):
+        lines.append(f"# turn {index}: {prompt!r}")
+    return "\n".join(lines) + "\n\n"
+
+
 def _scenarios() -> list[Scenario]:
     return [
         Scenario(
             name="unknown_chain_then_mode_jump",
-            prompts=["Hi", "1", "sola", "Y", "change to BNB", "Y", "use real-node instead", "Y", "Y"],
+            prompts=["Hi", "1", "sola", "1", "change to BNB", "Y", "use real-node instead", "Y"],
             assert_state=_assert_unknown_chain_then_mode_jump,
         ),
         Scenario(
             name="capability_detour_returns_to_benchmark",
             prompts=["你好", "1", "我需要了解支持的链、RPC 方法和扩展路径", "回到 benchmark 设置", "solana"],
             assert_state=_assert_capability_detour,
+            expected_pending_ids=("opening_next_action", "chain", "chain", "chain", "CLOUD_REGION"),
         ),
         Scenario(
             name="existing_chain_custom_rpc_replace_defaults",
@@ -162,6 +322,8 @@ def _scenarios() -> list[Scenario]:
                 "eth_blockNumber",
                 '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}',
                 "Y",
+                "Y",
+                "Y",
                 "2",
                 "2",
                 "eth_blockNumber=100",
@@ -180,9 +342,13 @@ def _scenarios() -> list[Scenario]:
                 "eth_blockNumber",
                 '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}',
                 "Y",
+                "Y",
+                "Y",
                 "1",
                 "eth_chainId",
                 '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}',
+                "Y",
+                "Y",
                 "Y",
                 "2",
                 "2",
@@ -196,11 +362,19 @@ def _scenarios() -> list[Scenario]:
                 "Hi",
                 "1",
                 "bsc",
-                "I want to configure QPS before the environment values",
+                "Visit the QPS settings without changing profile defaults before continuing with environment values",
                 "1",
                 "Y",
             ],
             assert_state=_assert_group_jump_qps_then_default_resume,
+            expected_pending_ids=(
+                "opening_next_action",
+                "chain",
+                "CLOUD_REGION",
+                "benchmark_mode",
+                "qps_profile_confirm",
+                "CLOUD_REGION",
+            ),
         ),
         Scenario(
             name="interrupted_workload_qps_then_back_to_rpc",
@@ -222,10 +396,35 @@ def _scenarios() -> list[Scenario]:
                 "single",
                 "I want to adjust QPS before choosing workload defaults",
                 "1",
-                "Y",
+                "1",
+                "5",
+                "5",
                 "go back to RPC config",
             ],
             assert_state=_assert_interrupted_workload_qps_then_back_to_rpc,
+            expected_pending_ids=(
+                "opening_next_action",
+                "chain",
+                "CLOUD_REGION",
+                "CLOUD_ZONE",
+                "MACHINE_TYPE",
+                "LEDGER_DEVICE",
+                "DATA_VOL_TYPE",
+                "DATA_VOL_SIZE",
+                "DATA_VOL_MAX_IOPS",
+                "DATA_VOL_MAX_THROUGHPUT",
+                "has_accounts_device",
+                "network_interface",
+                "NETWORK_MAX_BANDWIDTH_GBPS",
+                "rpc_mode",
+                "workload_confirm",
+                "benchmark_mode",
+                "qps_adjust_field",
+                "qps_adjust_value",
+                "qps_adjust_field",
+                "workload_confirm",
+                "workload_confirm",
+            ),
         ),
         Scenario(
             name="chain_change_decline_restores_interrupted_group",
@@ -301,6 +500,8 @@ def _scenarios() -> list[Scenario]:
             prompts=[
                 "你好",
                 "我要用 fake-node 测试 BNB，用 mixed，QPS quick，并开启本地 Grafana",
+                "1",
+                "Y",
             ],
             assert_state=_assert_multi_demand_action_queue,
         ),
@@ -359,6 +560,7 @@ NETWORK_MAX_BANDWIDTH_GBPS=100
 RPC_MODE=single
 unrelated_ticket=INC-12345""",
                 "Y",
+                "1",
             ],
             assert_state=_assert_partial_pasted_config_resumes_missing_groups,
         ),
@@ -380,6 +582,8 @@ disk:
 network:
   interface: eth0
   bandwidth_gbps: 100""",
+                "Y",
+                "1",
                 "Y",
             ],
             assert_state=_assert_single_turn_multi_group_with_pasted_config,
@@ -431,6 +635,16 @@ network:
                 "asia-east1-c",
             ],
             assert_state=_assert_language_switch_and_group_jump_preserves_state,
+            expected_pending_ids=(
+                "opening_next_action",
+                "chain",
+                "CLOUD_REGION",
+                "CLOUD_ZONE",
+                "qps_profile_confirm",
+                "CLOUD_ZONE",
+                "CLOUD_ZONE",
+                "MACHINE_TYPE",
+            ),
         ),
         Scenario(
             name="disk_pending_jump_to_qps_then_resume_disk",
@@ -587,7 +801,7 @@ def _assert_interrupted_workload_qps_then_back_to_rpc(state: dict[str, Any], tra
         issues.append(f"expected active group workload_rpc, got {state.get('active_group')}")
     if pending.get("id") != "workload_confirm":
         issues.append(f"expected workload_confirm after returning to RPC config, got {pending}")
-    if "Use the current chain template default workload for bsc" not in transcript:
+    if "Current chain template workload for `bsc`" not in transcript:
         issues.append("RPC workload question was not restored in transcript")
     return issues
 
@@ -660,11 +874,8 @@ def _assert_multi_demand_action_queue(state: dict[str, Any], transcript: str) ->
         issues.append(f"expected quick qps mode, got {qps}")
     if observability.get("mode") != "local":
         issues.append(f"expected local observability from Grafana mention, got {observability}")
-    if pending.get("id") != "qps_profile_confirm":
-        issues.append(f"expected explicit quick QPS to require default-profile confirmation, got {pending}")
-    completed = state.get("completed_actions") or []
-    if len(completed) < 3:
-        issues.append(f"expected multiple completed queued actions, got {completed}")
+    if pending.get("id") != "CLOUD_REGION":
+        issues.append(f"expected fallback to the first missing environment field after queued demands, got {pending}")
     if "默认 QPS 配置" not in transcript and "default QPS profile" not in transcript:
         issues.append("transcript did not ask for QPS default-profile confirmation")
     return issues
@@ -676,12 +887,27 @@ def _assert_multi_demand_without_explicit_target_mode(state: dict[str, Any], tra
     pending = state.get("pending_question") or {}
     if state.get("target_mode") == "real-node":
         issues.append("target mode must not default to real-node when the user only says benchmark/test")
-    if identity.get("canonical") != "bsc":
-        issues.append(f"expected bsc from BNB mention, got {identity}")
-    if pending.get("id") != "opening_next_action":
+    queue = list(state.get("action_queue") or [])
+    queued_chain = next(
+        (
+            item
+            for item in queue
+            if str(item.get("type") or "") == "choose_chain"
+            and str(item.get("chain_text") or "").casefold() == "bnb"
+        ),
+        None,
+    )
+    if identity.get("canonical") != "bsc" and queued_chain is None:
+        issues.append(f"expected BNB to be applied or durably queued, got state={identity}, queue={queue}")
+    if pending.get("id") != "target_mode_select":
         issues.append(f"expected Harness to ask target mode instead of defaulting, got {pending}")
-    if not state.get("action_queue"):
-        issues.append("expected remaining queued actions to be preserved until target mode is confirmed")
+    queued = {str(item.get("type") or "") for item in queue}
+    if state.get("rpc_mode") != "mixed" and "set_rpc_mode" not in queued:
+        issues.append(f"expected independent mixed requirement to be retained, got state={state.get('rpc_mode')!r}, queue={queued}")
+    if (state.get("qps_profile") or {}).get("mode") != "quick" and "set_qps_mode" not in queued:
+        issues.append(f"expected independent quick requirement to be retained, got state={state.get('qps_profile')}, queue={queued}")
+    if (state.get("observability") or {}).get("mode") != "local" and "set_observability" not in queued:
+        issues.append(f"expected independent observability requirement to be retained, got state={state.get('observability')}, queue={queued}")
     return issues
 
 
@@ -693,16 +919,16 @@ def _assert_capability_plus_uncertain_benchmark_goal(state: dict[str, Any], tran
         issues.append("capability summary was not shown for the support/capability part of the request")
     if "{'chain':" in transcript or '"chain":' in transcript:
         issues.append("capability summary leaked raw chain dictionaries")
-    if identity.get("canonical") != "bsc":
-        issues.append(f"expected BNB mention to be preserved as bsc, got {identity}")
+    if identity.get("canonical"):
+        issues.append(f"an uncertain possible chain must not be silently confirmed, got {identity}")
     if state.get("target_mode"):
         issues.append(f"target mode must remain unconfirmed when user says they are unsure, got {state.get('target_mode')}")
-    if pending.get("id") != "opening_next_action":
+    if pending.get("id") != "target_mode_select":
         issues.append(f"expected Harness to continue by asking target mode, got {pending}")
     completed = state.get("completed_actions") or []
     completed_types = [item.get("type") for item in completed]
-    if "ask_capabilities" not in completed_types or "choose_chain" not in completed_types:
-        issues.append(f"expected capability and chain actions to both complete, got {completed}")
+    if "request_target_mode_selection" not in completed_types:
+        issues.append(f"expected unresolved target-mode choice to remain explicit, got {completed}")
     return issues
 
 
@@ -824,10 +1050,6 @@ def _assert_first_turn_direct_goal_with_config_paste(state: dict[str, Any], tran
         issues.append(f"expected bsc from first turn BNB, got {identity}")
     if state.get("rpc_mode") != "mixed":
         issues.append(f"expected mixed from first turn, got {state.get('rpc_mode')}")
-    if (state.get("qps_profile") or {}).get("mode") != "quick":
-        issues.append(f"expected quick from first turn, got {state.get('qps_profile')}")
-    if (state.get("observability") or {}).get("mode") != "local":
-        issues.append(f"expected local observability from first turn, got {state.get('observability')}")
     for key in (
         "CLOUD_REGION",
         "CLOUD_ZONE",
@@ -843,8 +1065,11 @@ def _assert_first_turn_direct_goal_with_config_paste(state: dict[str, Any], tran
         if not confirmed.get(key):
             issues.append(f"expected first-turn pasted config to confirm {key}, got {confirmed}")
     pending = state.get("pending_question") or {}
-    if pending.get("id") != "has_accounts_device":
-        issues.append(f"expected accounts disk question after first-turn config, got {pending}")
+    if pending.get("id") != "workload_confirm":
+        issues.append(f"expected unresolved workload decision before later queued requirements, got {pending}")
+    queued_types = {str(item.get("type") or "") for item in state.get("action_queue") or []}
+    if not {"set_qps_mode", "set_observability"}.issubset(queued_types):
+        issues.append(f"expected QPS and observability requirements to remain queued, got {state.get('action_queue')}")
     if "CLOUD_REGION" not in transcript or "DATA_VOL_MAX_IOPS" not in transcript:
         issues.append("first-turn config proposal review did not show core mapped values")
     return issues
@@ -911,14 +1136,17 @@ def _assert_triple_detour_returns_to_earliest_incomplete_group(state: dict[str, 
 def _assert_pending_question_error_paste_goes_to_evidence_analysis(state: dict[str, Any], transcript: str) -> list[str]:
     issues: list[str] = []
     evidence = state.get("evidence_buffer") or []
+    collection = state.get("evidence_collection") or {}
     pending = state.get("pending_question") or {}
     confirmed = state.get("confirmed_config") or {}
-    if not evidence:
+    if not evidence and not collection.get("lines"):
         issues.append("expected pasted traceback to be captured as evidence instead of answered as current pending question")
     if confirmed.get("CLOUD_REGION") and "Traceback" in str(confirmed.get("CLOUD_REGION")):
         issues.append(f"traceback polluted CLOUD_REGION: {confirmed.get('CLOUD_REGION')!r}")
-    if pending:
-        issues.append(f"expected evidence detour to stop the turn without asking a new config question, got {pending}")
+    pending_prompt = str(pending.get("prompt") or "")
+    visible = "\n".join(str(item) for item in state.get("visible_response") or [])
+    if pending_prompt and pending_prompt in visible:
+        issues.append("expected evidence detour to preserve but not render the pending config question in the same turn")
     if "evidence" not in transcript.lower() and "证据" not in transcript:
         issues.append("transcript did not acknowledge evidence capture")
     return issues

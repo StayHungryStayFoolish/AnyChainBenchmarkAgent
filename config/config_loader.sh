@@ -445,10 +445,48 @@ resolve_mainnet_rpc_url_from_template() {
     [[ -n "$url" ]] && echo "$url"
 }
 
+job_local_chain_override_matches() {
+    local blockchain_node="${1:-${BLOCKCHAIN_NODE:-}}"
+    local override_file="${CHAIN_CONFIG_OVERRIDE_FILE:-}"
+    local blockchain_node_lower
+    blockchain_node_lower=$(echo "$blockchain_node" | tr '[:upper:]' '[:lower:]')
+    [[ -n "$blockchain_node_lower" && -n "$override_file" && -f "$override_file" ]] || return 1
+    jq -e --arg chain "$blockchain_node_lower" '
+        type == "object"
+        and (._meta.job_local_override == true)
+        and (.chain_type | type == "string")
+        and ((.chain_type | ascii_downcase) == $chain)
+        and (.rpc_methods | type == "object")
+    ' "$override_file" >/dev/null 2>&1
+}
+
+resolve_active_chain_template_file() {
+    local blockchain_node="${1:-${BLOCKCHAIN_NODE:-}}"
+    local blockchain_node_lower
+    blockchain_node_lower=$(echo "$blockchain_node" | tr '[:upper:]' '[:lower:]')
+
+    if job_local_chain_override_matches "$blockchain_node_lower"; then
+        printf '%s\n' "$CHAIN_CONFIG_OVERRIDE_FILE"
+        return 0
+    fi
+
+    local chains_dir="${CONFIG_LOADER_DIR:-$(dirname "${BASH_SOURCE[0]}")}/chains"
+    local canonical_file="$chains_dir/${blockchain_node_lower}.json"
+    if [[ -f "$canonical_file" ]]; then
+        printf '%s\n' "$canonical_file"
+        return 0
+    fi
+    return 1
+}
+
 MAINNET_RPC_URL="${MAINNET_RPC_URL:-$(resolve_mainnet_rpc_url_from_template "$BLOCKCHAIN_NODE" || true)}"
 if [[ -z "$MAINNET_RPC_URL" ]]; then
-    echo "⚠️ Warning: Unknown blockchain type '${BLOCKCHAIN_NODE}', using default Solana endpoint" >&2
-    MAINNET_RPC_URL="https://api.mainnet-beta.solana.com"
+    if job_local_chain_override_matches "$BLOCKCHAIN_NODE"; then
+        echo "ℹ️ Job-local chain override has no default MAINNET_RPC_URL; comparison remains disabled unless explicitly configured" >&2
+    else
+        echo "⚠️ Warning: Unknown blockchain type '${BLOCKCHAIN_NODE}', using default Solana endpoint" >&2
+        MAINNET_RPC_URL="https://api.mainnet-beta.solana.com"
+    fi
 fi
 
 
@@ -473,6 +511,14 @@ validate_blockchain_node() {
     local target_file="$chains_dir/${blockchain_node_lower}.json"
     if [[ -f "$target_file" ]]; then
         return 0  # Valid
+    fi
+    if job_local_chain_override_matches "$blockchain_node_lower"; then
+        return 0
+    fi
+
+    if [[ -n "${CHAIN_CONFIG_OVERRIDE_FILE:-}" ]]; then
+        echo "❌ Error: Job-local chain override is malformed or does not match BLOCKCHAIN_NODE '$blockchain_node'" >&2
+        echo "   Override: ${CHAIN_CONFIG_OVERRIDE_FILE}" >&2
     fi
 
     # Invalid blockchain type — discover known chains for diagnostic output
@@ -531,6 +577,11 @@ generate_auto_config() {
         exit 1
     fi
     blockchain_node_lower=$(echo "$blockchain_node" | tr '[:upper:]' '[:lower:]')
+    if ! ACTIVE_CHAIN_TEMPLATE_FILE="$(resolve_active_chain_template_file "$blockchain_node_lower")"; then
+        echo "❌ Error: No validated active chain template for '$blockchain_node_lower'" >&2
+        exit 1
+    fi
+    export ACTIVE_CHAIN_TEMPLATE_FILE
     echo "🎯 Starting automatic configuration generation..." >&2
     echo "   BLOCKCHAIN_NODE original value: ${BLOCKCHAIN_NODE}" >&2
     echo "   Target blockchain: $blockchain_node_lower" >&2
@@ -684,12 +735,12 @@ fi
 echo "Before calling generate_auto_config: BLOCKCHAIN_NODE=$BLOCKCHAIN_NODE" >&2
 generate_auto_config
 
-export -f get_current_rpc_methods get_param_format_from_json clear_config_cache generate_auto_config validate_config_consistency
+export -f get_current_rpc_methods get_param_format_from_json clear_config_cache generate_auto_config validate_config_consistency resolve_active_chain_template_file job_local_chain_override_matches
 export LAST_BLOCKCHAIN_NODE="${BLOCKCHAIN_NODE:-solana}"
 export ACCOUNTS_OUTPUT_FILE SINGLE_METHOD_TARGETS_FILE MIXED_METHOD_TARGETS_FILE
 export LOCAL_RPC_URL MAINNET_RPC_URL BLOCKCHAIN_NODE BLOCKCHAIN_PROCESS_NAMES RPC_MODE
 export ACCOUNT_COUNT ACCOUNT_OUTPUT_FILE ACCOUNT_MAX_SIGNATURES ACCOUNT_TX_BATCH_SIZE ACCOUNT_SEMAPHORE_LIMIT
-export CHAIN_CONFIG DEPLOYMENT_PLATFORM_DETECTED
+export CHAIN_CONFIG ACTIVE_CHAIN_TEMPLATE_FILE DEPLOYMENT_PLATFORM_DETECTED
 # Deployment mode + K8s/container paths (export for child monitor processes)
 export DEPLOYMENT_MODE DEPLOYMENT_MODE_DETECTED DEPLOYMENT_MODE_SOURCE
 export HOST_PROC HOST_SYS HOST_ROOT CGROUP_VERSION CGROUP_ROOT

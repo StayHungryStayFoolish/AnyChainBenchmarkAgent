@@ -1,11 +1,4 @@
-"""Canonical prompt wording for configuration questions.
-
-`agent/validators/config_contract.py` and `agent/planners/config_questions.py`
-used to author the same question wording independently and could (and did)
-drift apart for the same missing field (architecture audit Finding C1). This
-module is the single place that wording lives; both files call into it
-instead of hand-typing prompt strings.
-"""
+"""Canonical prompt wording for questions owned by the live Harness."""
 
 from __future__ import annotations
 

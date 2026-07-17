@@ -4,23 +4,16 @@ from __future__ import annotations
 
 import json
 import hashlib
+import re
 import time
 import uuid
 from pathlib import Path
 from typing import Any
 
-try:
-    from .chain_template_requirements import inspect_chain_template
-    from .config_checklist import build_configuration_checklist, missing_required_from_checklist
-    from .risk import score_plan_risk
-    from .config_questions import required_questions
-    from ..knowledge.entry_contract import field_specs_for
-except ImportError:  # script execution with agent/ on sys.path
-    from planners.chain_template_requirements import inspect_chain_template
-    from planners.config_checklist import build_configuration_checklist, missing_required_from_checklist
-    from planners.risk import score_plan_risk
-    from planners.config_questions import required_questions
-    from knowledge.entry_contract import field_specs_for
+from .chain_template_requirements import inspect_chain_template
+from .config_checklist import build_configuration_checklist, missing_required_from_checklist
+from .risk import score_plan_risk
+from ..knowledge.entry_contract import field_specs_for
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -105,6 +98,8 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
         "BLOCKCHAIN_NODE": chain,
         "RPC_MODE": rpc_mode,
         "LOCAL_RPC_URL": request.get("local_rpc_url", ""),
+        "SYNC_OBSERVE_RPC_URL": request.get("sync_observe_rpc_url", ""),
+        "NODE_PROMETHEUS_METRICS_URL": request.get("node_prometheus_metrics_url", ""),
         "MAINNET_RPC_URL": request.get("mainnet_rpc_url", ""),
         f"{qps_prefix}_INITIAL_QPS": str(qps.get("initial", "")),
         f"{qps_prefix}_MAX_QPS": str(qps.get("max", "")),
@@ -159,6 +154,8 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
         "EXPORTER_PORT": str(request.get("exporter_port", "")),
         "PROMETHEUS_PORT": str(request.get("prometheus_port", "")),
         "GRAFANA_PORT": str(request.get("grafana_port", "")),
+        "SYNC_OBSERVE_RPC_URL": request.get("sync_observe_rpc_url", ""),
+        "NODE_PROMETHEUS_METRICS_URL": request.get("node_prometheus_metrics_url", ""),
         "CHAIN_REST_URL": request.get("chain_rest_url", ""),
         "CHAIN_INDEXER_URL": request.get("chain_indexer_url", ""),
         "CHAIN_SIDECAR_URL": request.get("chain_sidecar_url", ""),
@@ -258,7 +255,6 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
     plan["configuration_checklist"] = checklist
     combined_required = _ordered_required_inputs(set(plan["required_inputs"]) | set(missing_required_from_checklist(checklist)))
     plan["required_inputs"] = combined_required
-    plan["required_questions"] = required_questions(plan)
     plan["risk"] = score_plan_risk(plan)
     return plan
 
@@ -386,6 +382,194 @@ def _chain_config_override(chain: str, request: dict[str, Any]) -> dict[str, Any
             rpc["single"] = methods[0]
     data["rpc_methods"] = rpc
     return data
+
+
+def materialize_custom_rpc_template(
+    *,
+    chain: str,
+    adapter_family: str,
+    rpc_mode: str,
+    workload: dict[str, Any],
+    validated_methods: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build the complete job-local template for a validated custom workload.
+
+    This works for both Case1 (overlay a canonical template) and Case2 (create
+    a complete runtime-only template for a new chain in an existing family).
+    Concrete probed params become literal ``param_spec`` values so target
+    generation sends the exact reviewed wire payload.
+    """
+
+    chain = str(chain or "").strip().lower()
+    family = str(adapter_family or "").strip().lower()
+    if not chain:
+        return {}
+    chain_file = REPO_ROOT / "config" / "chains" / f"{chain}.json"
+    has_canonical_template = chain_file.is_file()
+    template = load_json(chain_file) if has_canonical_template else {
+        "chain_type": chain,
+        "rpc_url": "LOCAL_RPC_URL",
+        "params": {},
+        "param_formats": {},
+        "param_spec": {},
+        "rpc_methods": {},
+        "_meta": {"source": "agent-job-local-case2", "adapter_family": family},
+    }
+    family = family or str((template.get("_meta") or {}).get("adapter_family") or "").strip().lower()
+    if not family:
+        return {}
+    template["chain_type"] = str(template.get("chain_type") or chain)
+    template["rpc_url"] = str(template.get("rpc_url") or "LOCAL_RPC_URL")
+    meta = dict(template.get("_meta") or {})
+    meta["adapter_family"] = family
+    meta["job_local_override"] = True
+    template["_meta"] = meta
+
+    selected = [str(method).strip() for method in workload.get("methods") or [] if str(method).strip()]
+    weights = {
+        str(method).strip(): int(weight)
+        for method, weight in (workload.get("mixed_weights") or {}).items()
+        if str(method).strip()
+    }
+    if rpc_mode == "single":
+        if len(selected) != 1:
+            return {}
+        rpc_methods = {"single": selected[0], "mixed": selected[0], "mixed_weighted": [{"method": selected[0], "weight": 100}]}
+    else:
+        if not selected or set(selected) != set(weights) or sum(weights.values()) != 100 or any(weight <= 0 for weight in weights.values()):
+            return {}
+        rpc_methods = {
+            "single": selected[0],
+            "mixed": ",".join(selected),
+            "mixed_weighted": [{"method": method, "weight": weights[method]} for method in selected],
+        }
+    contracts = {
+        str(item.get("method") or "").strip(): item
+        for item in validated_methods
+        if isinstance(item, dict) and str(item.get("method") or "").strip()
+    }
+    canonical_rpc = template.get("rpc_methods") if isinstance(template.get("rpc_methods"), dict) else {}
+    canonical_methods = {
+        str(canonical_rpc.get("single") or "").strip(),
+        *(str(method).strip() for method in str(canonical_rpc.get("mixed") or "").split(",")),
+        *(
+            str(item.get("method") or "").strip()
+            for item in canonical_rpc.get("mixed_weighted") or []
+            if isinstance(item, dict)
+        ),
+    }
+    canonical_methods.discard("")
+    contract_required = set(selected) if not has_canonical_template else set(selected) - canonical_methods
+    if any(method not in contracts for method in contract_required):
+        return {}
+
+    template["rpc_methods"] = rpc_methods
+    param_formats = dict(template.get("param_formats") or {})
+    param_spec = dict(template.get("param_spec") or {})
+    for method in selected:
+        contract = contracts.get(method)
+        if not contract:
+            continue
+        params = contract.get("params", (contract.get("schema") or {}).get("params_json"))
+        if not isinstance(params, (list, dict)):
+            return {}
+        if isinstance(params, list):
+            param_formats[method] = "no_params" if not params else "param_spec"
+            param_spec[method] = {
+                "transport": "jsonrpc_list",
+                "params": [{"literal": value} for value in params],
+            }
+        elif isinstance(params, dict):
+            param_formats[method] = "param_spec"
+            param_spec[method] = {
+                "transport": "jsonrpc_dict",
+                "fields": {name: {"literal": value} for name, value in params.items()},
+            }
+    template["param_formats"] = param_formats
+    template["param_spec"] = param_spec
+    proxy_extraction = _materialize_proxy_extraction(template, family, selected)
+    if not proxy_extraction:
+        return {}
+    template["proxy_extraction"] = proxy_extraction
+    return template
+
+
+def _materialize_proxy_extraction(
+    template: dict[str, Any],
+    family: str,
+    selected_methods: list[str],
+) -> dict[str, Any]:
+    """Complete the proxy DSL from adapter-family and validated method facts."""
+
+    existing = template.get("proxy_extraction")
+    extractors = [
+        dict(item)
+        for item in ((existing or {}).get("extractors") if isinstance(existing, dict) else []) or []
+        if isinstance(item, dict)
+    ]
+    jsonrpc_families = {"jsonrpc", "substrate", "tendermint", "bitcoin_jsonrpc"}
+    needs_jsonrpc = family in jsonrpc_families or (
+        family == "hedera_dual" and any(not method.startswith("/") for method in selected_methods)
+    )
+    if needs_jsonrpc and not any(item.get("protocol") == "json_rpc" for item in extractors):
+        extractors.append({
+            "protocol": "json_rpc",
+            "method_source": "body.method",
+            "id_source": "body.id",
+            "params_source": "body.params",
+            "url_pattern": "^/$",
+            "batch_handling": "split",
+        })
+
+    rest_methods = [method for method in selected_methods if method.startswith("/")]
+    if family in {"rest", "hedera_dual"} and rest_methods:
+        rest_extractor = next(
+            (item for item in extractors if item.get("protocol") == "rest"),
+            None,
+        )
+        if rest_extractor is None:
+            rest_extractor = {"protocol": "rest", "url_patterns": []}
+            extractors.insert(0, rest_extractor)
+        patterns = [
+            dict(item)
+            for item in rest_extractor.get("url_patterns") or []
+            if isinstance(item, dict)
+        ]
+        known_names = {str(item.get("method_name") or "") for item in patterns}
+        for method in rest_methods:
+            if method in known_names:
+                continue
+            path = method.split("?", 1)[0]
+            patterns.append({"pattern": f"^{re.escape(path)}$", "method_name": method})
+        rest_extractor["url_patterns"] = patterns
+
+    if family == "rest" and not rest_methods:
+        return {}
+    return {"extractors": extractors} if extractors else {}
+
+
+def template_requirements_from_override(chain: str, template: dict[str, Any]) -> dict[str, Any]:
+    """Return the preflight workload facts for a validated runtime template."""
+
+    rpc = template.get("rpc_methods") if isinstance(template.get("rpc_methods"), dict) else {}
+    weighted = [
+        {"method": str(item.get("method") or ""), "weight": int(item.get("weight") or 0)}
+        for item in rpc.get("mixed_weighted") or []
+        if isinstance(item, dict) and str(item.get("method") or "").strip()
+    ]
+    return {
+        "chain": chain,
+        "exists": bool(template),
+        "path": "<job-local-chain-template>",
+        "adapter_family": str((template.get("_meta") or {}).get("adapter_family") or ""),
+        "single_method": str(rpc.get("single") or ""),
+        "mixed_weighted": weighted,
+        "param_formats": dict(template.get("param_formats") or {}),
+        "param_spec_methods": sorted((template.get("param_spec") or {}).keys()),
+        "runtime_sample_variables": [],
+        "runtime_endpoint_variables": ["LOCAL_RPC_URL"],
+        "sync_health_mode": str(((template.get("_meta") or {}).get("sync_health") or {}).get("mode") or ""),
+    }
 
 
 def _ordered_required_inputs(items: set[str]) -> list[str]:
