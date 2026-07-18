@@ -239,10 +239,10 @@ platforms:
 ```bash
 python3 -m agent.cli adk-status
 python3 -m agent.cli capabilities
-python3 -m agent.cli doctor --format json
-python3 -m agent.cli plan --request request.json --out plan.json
+python3 -m agent.cli doctor --output doctor.json
+python3 -m agent.cli plan --request request.json --output plan.json
 python3 -m agent.cli preflight --plan plan.json
-python3 -m agent.cli submit --plan plan.json
-python3 -m agent.cli job-status --job-id <job_id>
-python3 -m agent.cli analyze --artifacts-dir benchmark-data
+python3 -m agent.cli submit --plan plan.json --approved
+python3 -m agent.cli status --job-id <job_id>
+python3 -m agent.cli analyze --job-id <job_id>
 ```
