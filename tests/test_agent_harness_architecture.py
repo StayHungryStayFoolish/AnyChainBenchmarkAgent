@@ -1272,6 +1272,24 @@ class HarnessQuestionContractTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             render_question(question)  # type: ignore[call-arg]
 
+    def test_manual_choice_question_has_complete_validation_at_construction(self) -> None:
+        from agent.harness.questions import choice_question
+
+        question = choice_question(
+            "chain_auxiliary_endpoints",
+            "RPC_API_KEY",
+            "Provide the API key or skip.",
+            field="RPC_API_KEY",
+            kind="manual_value",
+            manual_input_allowed=True,
+            options=[{"id": "skip", "label": "Skip", "value": "none"}],
+        )
+
+        self.assertEqual(
+            question["validation"],
+            {"value_type": "scalar_token", "max_length": 180},
+        )
+
     def test_every_registered_question_has_a_runtime_contract_scenario(self) -> None:
         from agent.workflows.group_registry import GROUP_QUESTION_ORDER
 

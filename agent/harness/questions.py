@@ -12,6 +12,13 @@ from .input_values import extract_json_values, looks_like_wire_method_identity
 from .localization import localized
 
 
+def _question_validation(kind: str, validation: dict[str, Any] | None) -> dict[str, Any]:
+    field_validation = dict(validation or {})
+    if kind == "manual_value" and not field_validation:
+        return {"value_type": "scalar_token", "max_length": 180}
+    return field_validation
+
+
 def manual_question(
     group: str,
     question_id: str,
@@ -26,9 +33,7 @@ def manual_question(
     help_text: str = "",
     completion_effect: str = "",
 ) -> dict[str, Any]:
-    field_validation = dict(validation or {})
-    if kind == "manual_value" and not field_validation:
-        field_validation = {"value_type": "scalar_token", "max_length": 180}
+    field_validation = _question_validation(kind, validation)
     return {
         "contract_version": 1,
         "id": question_id,
@@ -136,7 +141,7 @@ def choice_question(
             - {""}
         ),
         "queue_barrier": queue_barrier,
-        "validation": dict(validation or {}),
+        "validation": _question_validation(kind, validation),
         "requires_capabilities": list(requires_capabilities),
         "help_text": str(help_text or "").strip(),
         "completion_effect": str(completion_effect or "").strip(),
