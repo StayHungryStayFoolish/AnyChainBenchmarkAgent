@@ -239,12 +239,27 @@ def manual_literal_violation(value: str, question: dict[str, Any]) -> dict[str, 
     if question.get("manual_input_allowed") is not True:
         return {}
     validation = question.get("validation") or {}
-    if str(validation.get("value_type") or "") != "scalar_token":
-        return {}
     raw = _strip_scalar(value)
+    normalized = raw.casefold()
+    for index, option in enumerate(question.get("options") or [], start=1):
+        candidates = {
+            str(index).casefold(),
+            str(option.get("id") or "").strip().casefold(),
+            str(option.get("label") or "").strip().casefold(),
+            str(option.get("value") or "").strip().casefold(),
+        }
+        if normalized in candidates:
+            return {}
+    if str(question.get("kind") or "") == "yes_no" and normalized in {"y", "yes", "n", "no"}:
+        return {}
+    value_type = str(validation.get("value_type") or "")
     max_length = int(validation.get("max_length") or 180)
-    if raw and "\n" not in raw and "\r" not in raw and len(raw) > max_length and re.fullmatch(r"\S+", raw):
+    scalar_shape = bool(raw and "\n" not in raw and "\r" not in raw and re.fullmatch(r"\S+", raw))
+    if value_type == "scalar_token" and scalar_shape and len(raw) > max_length:
         return {"code": "max_length", "max_length": max_length}
+    if value_type in {"positive_number", "positive_integer"} and scalar_shape:
+        if not literal_matches_validation(raw, validation):
+            return {"code": value_type}
     return {}
 
 

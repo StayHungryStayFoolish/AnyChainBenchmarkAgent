@@ -323,10 +323,16 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
     violation = manual_literal_violation(text, pending) if pending else {}
     if violation:
         max_length = int(violation.get("max_length") or 0)
+        if violation.get("code") == "max_length":
+            message_zh = f"输入无效：该字段最多允许 {max_length} 个字符。当前问题保持不变。"
+            message_en = f"Invalid input: this field allows at most {max_length} characters. The current question remains active."
+        else:
+            message_zh = "输入无效：请输入大于 0 的数值。当前问题保持不变。"
+            message_en = "Invalid input: enter a number greater than zero. The current question remains active."
         state["visible_response"] = [_localized(
             language,
-            f"输入无效：该字段最多允许 {max_length} 个字符。当前问题保持不变。",
-            f"Invalid input: this field allows at most {max_length} characters. The current question remains active.",
+            message_zh,
+            message_en,
         ), _render_question(pending, language)]
         return _set_turn_phase(state, "compose", "pending_literal_rejected")
     if str(pending.get("id") or "") == "inferred_config_review":

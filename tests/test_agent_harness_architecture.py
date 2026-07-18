@@ -545,6 +545,28 @@ class HarnessQuestionContractTest(unittest.TestCase):
             [item.get("type") for item in result.get("proposed_actions") or []],
         )
 
+    def test_manual_numeric_choice_rejects_invalid_replacement_without_planning(self) -> None:
+        from agent.harness.questions import choice_question, manual_literal_violation
+
+        question = choice_question(
+            "ledger_disk",
+            "DATA_VOL_SIZE",
+            "Use the detected size?",
+            field="DATA_VOL_SIZE",
+            kind="yes_no",
+            manual_input_allowed=True,
+            validation={"value_type": "positive_number"},
+            options=[
+                {"label": "Y", "value": "926"},
+                {"label": "N", "value": "__manual__"},
+            ],
+        )
+
+        self.assertEqual(manual_literal_violation("not-a-number", question), {"code": "positive_number"})
+        self.assertEqual(manual_literal_violation("0", question), {"code": "positive_number"})
+        self.assertEqual(manual_literal_violation("Y", question), {})
+        self.assertEqual(manual_literal_violation("N", question), {})
+
     def test_positive_integer_contract_owns_invalid_scalars_but_not_prose_detours(self) -> None:
         from agent.harness.questions import answer_fits_pending
 
