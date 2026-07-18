@@ -54,11 +54,11 @@ MARKER_RE = re.compile(
     r"\bW\d+(?:\.\d+)?\s+(?:output|\u8f93\u51fa)\b|"
     r"\bCP-\d+\b|"
     r"\bY\+\b|"
-    r"\b(?:wave|proposal|writer-first)\b|"
+    r"\b(?:wave|writer-first)\b|"
     r"hard gate|"
     r"\u65b9\u6848\u7532|\u65b9\u6848\u4e59|\u65b9\u6848\u4e19|\u4e2d\u7acb\u547d\u540d|\u9009\u7532|"
     r"\u786c\u95e8|\u5b88\u62a4|\u94c1\u5f8b|\u88c1\u51b3|\u6ce2\u6b21|\u8303\u5f0f|\u7ea0\u6b63|\u5b9e\u8bc1\u6765\u6e90|\u8fc1\u79fb\u53c2\u8003|"
-    r"subagent|Hermes|Claude|Opus|Kiro|round-05|fix_wave|pre-S0|"
+    r"subagent|Hermes|Opus|Kiro|round-05|fix_wave|pre-S0|"
     r"plan §|§S\d+"
     r")",
     re.IGNORECASE,

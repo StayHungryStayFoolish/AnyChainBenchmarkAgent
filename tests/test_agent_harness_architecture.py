@@ -1305,7 +1305,8 @@ class HarnessStateInvariantTest(unittest.TestCase):
                 '"source_text":"What can you do?","disposition":"action","action_indexes":[0],'
                 '"reason":"capability question"}],"reason":"capability question"}'
             ),
-            SimpleNamespace(text='{"reviews":[{"action_index":0,"supported":true,"reason":"read-only capability question"}],"unit_reviews":[]}'),
+            SimpleNamespace(text='{"reviews":[{"action_index":0,"present_consultation":true,'
+                                 '"evidence_quote":"What can you do?","reason":"present capability question"}]}'),
         ]
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(_state(), "What can you do?")
@@ -1332,7 +1333,8 @@ class HarnessStateInvariantTest(unittest.TestCase):
                                  '"semantic_units":[{"unit_id":"unit-1","clause_id":"clause-1","start":0,"end":16,'
                                  '"source_text":"What can you do?","disposition":"action","action_indexes":[0],'
                                  '"reason":"capability question"}]}'),
-            SimpleNamespace(text='{"reviews":[{"action_index":0,"supported":true,"reason":"read-only capability question"}],"unit_reviews":[]}'),
+            SimpleNamespace(text='{"reviews":[{"action_index":0,"present_consultation":true,'
+                                 '"evidence_quote":"What can you do?","reason":"present capability question"}]}'),
         ]
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(_state(), "What can you do?")
@@ -1381,6 +1383,14 @@ class HarnessStateInvariantTest(unittest.TestCase):
         provider.complete.side_effect = [
             SimpleNamespace(text="not json"),
             SimpleNamespace(text=repaired),
+            SimpleNamespace(text=json.dumps({
+                "reviews": [{
+                    "action_index": 0,
+                    "present_consultation": False,
+                    "evidence_quote": "",
+                    "reason": "navigation is not consultation",
+                }],
+            })),
         ]
 
         with (
@@ -1397,7 +1407,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
         ):
             result = resolve_action_queue(_state(), text)
 
-        self.assertEqual(provider.complete.call_count, 2)
+        self.assertEqual(provider.complete.call_count, 3)
         self.assertEqual(recovery.call_count, 2)
         self.assertEqual(result["actions"][0]["type"], "change_group")
         self.assertEqual(result["actions"][0]["group"], "workload_rpc")
@@ -1443,8 +1453,9 @@ class HarnessStateInvariantTest(unittest.TestCase):
                 '"reason":"read-only state consultation"}]}'
             )),
             SimpleNamespace(text=(
-                '{"reviews":[{"action_index":0,"supported":true,'
-                '"reason":"the repaired action is a read-only state summary"}],"unit_reviews":[]}'
+                '{"reviews":[{"action_index":0,"present_consultation":true,'
+                '"evidence_quote":"summarize which chain and custom method you retained",'
+                '"reason":"present read-only state summary"}]}'
             )),
         ]
 
@@ -1487,12 +1498,16 @@ class HarnessStateInvariantTest(unittest.TestCase):
                 '{"unit_reviews":[{"unit_id":"unit-1","complete":true,'
                 '"missing_demand_quote":"","reason":"the mapped action preserves the complete request"}]}'
             )),
+            SimpleNamespace(text=(
+                '{"findings":[{"unit_id":"unit-1","status":"complete",'
+                '"missing_demands":[],"reason":"all registered owner demands are represented"}]}'
+            )),
         ]
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, "I only need one RPC method.")
 
-        self.assertEqual(provider.complete.call_count, 3)
+        self.assertEqual(provider.complete.call_count, 4)
         self.assertEqual(result["actions"][0]["type"], "set_rpc_mode")
         self.assertEqual(result["actions"][0]["rpc_mode"], "single")
 
@@ -1528,12 +1543,16 @@ class HarnessStateInvariantTest(unittest.TestCase):
                 '{"unit_reviews":[{"unit_id":"unit-1","complete":true,'
                 '"missing_demand_quote":"","reason":"the mapped action preserves the complete request"}]}'
             )),
+            SimpleNamespace(text=(
+                '{"findings":[{"unit_id":"unit-1","status":"complete",'
+                '"missing_demands":[],"reason":"all registered owner demands are represented"}]}'
+            )),
         ]
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, "Use several weighted RPC methods.")
 
-        self.assertEqual(provider.complete.call_count, 3)
+        self.assertEqual(provider.complete.call_count, 4)
         self.assertEqual(result["actions"][0]["type"], "set_rpc_mode")
         self.assertEqual(result["actions"][0]["rpc_mode"], "mixed")
 
@@ -1591,8 +1610,9 @@ class HarnessStateInvariantTest(unittest.TestCase):
                 '"action_indexes":[0],"reason":"read-only comparison"}]}'
             )),
             SimpleNamespace(text=(
-                '{"reviews":[{"action_index":0,"supported":true,'
-                '"reason":"the source asks for a read-only comparison"}],"unit_reviews":[]}'
+                '{"reviews":[{"action_index":0,"present_consultation":true,'
+                '"evidence_quote":"How do single and mixed differ?",'
+                '"reason":"present read-only comparison"}]}'
             )),
         ]
 
@@ -1627,12 +1647,16 @@ class HarnessStateInvariantTest(unittest.TestCase):
             )),
             review,
             unit_review,
+            SimpleNamespace(text=(
+                '{"findings":[{"unit_id":"unit-1","status":"complete",'
+                '"missing_demands":[],"reason":"all registered owner demands are represented"}]}'
+            )),
         ]
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(_state(), text)
 
-        self.assertEqual(provider.complete.call_count, 3)
+        self.assertEqual(provider.complete.call_count, 4)
         self.assertEqual(result["actions"][0]["type"], "rpc_catalog_command")
         self.assertEqual(result["actions"][0]["catalog_command"], "enter")
 

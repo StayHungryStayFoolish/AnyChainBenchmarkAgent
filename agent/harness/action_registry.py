@@ -180,7 +180,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
     ActionSpec(
         "request_target_mode_selection",
         "chain_rpc",
-        "Ask for a replacement target mode without discarding the current mode first.",
+        "Ask the user to select a target mode when it is unresolved, or to select a replacement without discarding the current mode first.",
         ("source_evidence",),
         execution_phase=24,
         target_group="target_mode",
@@ -192,6 +192,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         "Temporarily route to a named workflow group only for an explicit navigation request.",
         ("group", "navigation_explicit", "source_evidence"),
         50,
+        merge_identity=("group",),
         crosses_pending_barrier=True,
         required_arguments=("group", "navigation_explicit", "source_evidence"),
     ),
@@ -429,12 +430,25 @@ def normalize_action_relations(actions: list[dict[str, Any]]) -> list[dict[str, 
         if isinstance(action, dict)
     )
     output: list[dict[str, Any]] = []
+    merge_indexes: dict[tuple[Any, ...], int] = {}
     for action in actions:
         spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
         if str(action.get("type") or "") == "resume_current_flow" and interruption_owner_present:
             continue
         if spec is not None and set(spec.suppressed_by).intersection(action_types):
             continue
+        if spec is not None and spec.merge_identity:
+            merge_key = action_merge_key(action)
+            prior_index = merge_indexes.get(merge_key)
+            if prior_index is not None:
+                prior = output[prior_index]
+                for field_name in TRUSTED_ACTION_METADATA_FIELDS:
+                    if action.get(field_name) is True:
+                        prior[field_name] = True
+                if action.get("navigation_explicit") is True:
+                    prior["navigation_explicit"] = True
+                continue
+            merge_indexes[merge_key] = len(output)
         output.append(action)
     return output
 
@@ -445,6 +459,7 @@ TRUSTED_ACTION_METADATA_FIELDS = frozenset({
     "pending_option_semantic_verified",
     "chain_selection_semantic_verified",
     "target_mode_semantic_verified",
+    "group_navigation_semantic_verified",
     "_origin_text",
     "_queue_origin_group",
     "_submitted_turn_index",

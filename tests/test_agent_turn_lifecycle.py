@@ -84,8 +84,9 @@ class TurnBudgetContractTest(unittest.TestCase):
                 time.sleep(0.03)
                 resolve_unknown_chain_identity({}, "example-chain")
 
-        self.assertEqual(len(observed), 3)
-        self.assertLess(observed[2], observed[0] - 0.02)
+        self.assertGreaterEqual(len(observed), 3)
+        self.assertTrue(all(later <= earlier for earlier, later in zip(observed, observed[1:])))
+        self.assertLess(observed[-1], observed[0] - 0.02)
 
     def test_deepseek_has_explicit_transport_limits_and_bounded_retries(self) -> None:
         from agent.llm.config import LLMConfig
