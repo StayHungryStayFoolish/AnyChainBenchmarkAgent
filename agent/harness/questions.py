@@ -228,6 +228,26 @@ def literal_matches_validation(value: str, validation: dict[str, Any] | None) ->
     return False
 
 
+def manual_literal_violation(value: str, question: dict[str, Any]) -> dict[str, Any]:
+    """Return a deterministic field-contract violation, if one is certain.
+
+    Ambiguous prose is intentionally not classified here. The semantic planner
+    remains responsible for detours; this boundary only rejects input shapes
+    that cannot be legal under the declared pending contract.
+    """
+
+    if question.get("manual_input_allowed") is not True:
+        return {}
+    validation = question.get("validation") or {}
+    if str(validation.get("value_type") or "") != "scalar_token":
+        return {}
+    raw = _strip_scalar(value)
+    max_length = int(validation.get("max_length") or 180)
+    if raw and "\n" not in raw and "\r" not in raw and len(raw) > max_length and re.fullmatch(r"\S+", raw):
+        return {"code": "max_length", "max_length": max_length}
+    return {}
+
+
 def answer_fits_pending(text: str, question: dict[str, Any]) -> bool:
     """Decide whether one complete turn is a local typed answer.
 
@@ -288,6 +308,8 @@ def answer_fits_pending(text: str, question: dict[str, Any]) -> bool:
             return bool(_parse_weight_spec(str(text or "")) or _first_number_text(raw))
         if raw.casefold() in {"y", "yes", "n", "no"}:
             return False
+        if manual_literal_violation(raw, question):
+            return True
         if str(validation.get("value_type") or "") in {"positive_number", "positive_integer"}:
             # A complete scalar token belongs to the typed field contract even
             # when it is out of range or has the wrong numeric subtype. The

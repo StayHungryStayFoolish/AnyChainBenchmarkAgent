@@ -58,6 +58,7 @@ from .questions import (
     coerce_pending_answer as _coerce_answer,
     exact_answer as contract_exact_answer,
     expected_patch_for_value,
+    manual_literal_violation,
     matches_numbered_option as _matches_numbered_option,
     pending_option_value_exists as _pending_option_value_exists,
     render_question as _render_question,
@@ -319,6 +320,15 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
         return _set_turn_phase(state, "fallback", "empty_turn")
 
     pending = state.get("pending_question") or {}
+    violation = manual_literal_violation(text, pending) if pending else {}
+    if violation:
+        max_length = int(violation.get("max_length") or 0)
+        state["visible_response"] = [_localized(
+            language,
+            f"输入无效：该字段最多允许 {max_length} 个字符。当前问题保持不变。",
+            f"Invalid input: this field allows at most {max_length} characters. The current question remains active.",
+        ), _render_question(pending, language)]
+        return _set_turn_phase(state, "compose", "pending_literal_rejected")
     if str(pending.get("id") or "") == "inferred_config_review":
         merged = _merge_pending_config_proposal_from_text(state, text)
         if merged:

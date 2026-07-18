@@ -498,6 +498,53 @@ class HarnessArchitectureTest(unittest.TestCase):
 
 class HarnessQuestionContractTest(unittest.TestCase):
 
+    def test_scalar_contract_owns_overlimit_tokens_but_not_prose_detours(self) -> None:
+        from agent.harness.questions import answer_fits_pending, manual_literal_violation
+
+        question = {
+            "id": "RPC_API_KEY",
+            "group": "chain_auxiliary_endpoints",
+            "kind": "manual_value",
+            "field": "RPC_API_KEY",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "scalar_token", "max_length": 8},
+        }
+
+        self.assertTrue(answer_fits_pending("x" * 9, question))
+        self.assertEqual(
+            manual_literal_violation("x" * 9, question),
+            {"code": "max_length", "max_length": 8},
+        )
+        self.assertFalse(answer_fits_pending("please explain this field", question))
+        self.assertEqual(manual_literal_violation("please explain this field", question), {})
+
+    def test_overlimit_scalar_is_rejected_without_semantic_planning(self) -> None:
+        from agent.harness.domains.chain_rpc import question_for_chain_rpc
+        from agent.harness.state import new_state
+        from tests.agent_live.graph_turn import invoke_product_graph_turn
+
+        state = new_state("overlimit-scalar", language="en", session_purpose="coverage")
+        state["chain_identity"] = {"canonical": "litecoin", "status": "confirmed"}
+        state["active_group"] = "chain_auxiliary_endpoints"
+        state["pending_question"] = question_for_chain_rpc(
+            state,
+            "chain_auxiliary_endpoints",
+        )
+        state["last_user_input"] = "x" * 181
+
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            side_effect=AssertionError("semantic planner must not receive an invalid scalar"),
+        ):
+            result = invoke_product_graph_turn(state)
+
+        self.assertEqual(result["pending_question"]["id"], "RPC_API_KEY")
+        self.assertNotIn("RPC_API_KEY", result.get("confirmed_config") or {})
+        self.assertNotIn(
+            "clarify_unresolved",
+            [item.get("type") for item in result.get("proposed_actions") or []],
+        )
+
     def test_positive_integer_contract_owns_invalid_scalars_but_not_prose_detours(self) -> None:
         from agent.harness.questions import answer_fits_pending
 
