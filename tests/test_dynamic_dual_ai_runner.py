@@ -8,6 +8,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from typing import Mapping
+from unittest.mock import patch
 
 from tests.agent_live.chaos_scheduler import build_chaos_schedule
 from tests.agent_live.coverage_evidence import (
@@ -32,6 +33,7 @@ EDGE = {
     "question_id": "opening_next_action",
     "applicable": True,
     "real_execution_required": False,
+    "executable_scenario_ids": ["opening"],
     "evidence": {
         "dynamic_dual_ai": {
             "required": True,
@@ -231,6 +233,86 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             self.assertEqual(artifacts["real_cli"]["turn_observation"]["simulator_decision"], {})
             lane_evidence = schedule_result["targets"][0]["lane_evidence"]
             self.assertEqual(set(lane_evidence), {"dynamic_dual_ai", "real_cli"})
+
+    def test_scheduler_rejects_a_seed_scenario_owned_by_another_edge(self) -> None:
+        ledger = self._ledger()
+        with self.assertRaisesRegex(ValueError, "not authoritative for edge"):
+            build_chaos_schedule(
+                ledger,
+                revision=REVISION,
+                seed=17,
+                targets=[{
+                    "target_id": "wrong-seed",
+                    "edge_key": EDGE["edge_key"],
+                    "persona": "operator",
+                    "goal": "choose a mode",
+                    "scenario_id": "provider_detected",
+                }],
+            )
+
+    def test_seeded_runner_traverses_resume_before_exposing_target_response(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            ledger = self._ledger()
+            schedule = build_chaos_schedule(
+                ledger,
+                revision=REVISION,
+                seed=17,
+                targets=[{
+                    "target_id": "seeded-mode-turn",
+                    "edge_key": EDGE["edge_key"],
+                    "persona": "returning operator",
+                    "goal": "choose fake-node after resuming reviewed state",
+                    "scenario_id": "opening",
+                }],
+            )
+            transport = FakeTransport([
+                "Agent> Model config: provider=deepseek, model=deepseek-chat, auth=api_key\n"
+                "Agent> Previous configuration found. Continue it?",
+                "Agent> Choose a mode.\n1. fake-node\n2. real-node",
+                "Agent> Which chain do you want to test?",
+            ])
+            seen: list[SimulatorContext] = []
+
+            def simulator(context: SimulatorContext) -> SimulatorDecision:
+                seen.append(context)
+                self.assertIn("Choose a mode", context.previous_agent_response)
+                self.assertNotIn("Previous configuration", context.previous_agent_response)
+                return SimulatorDecision(
+                    user_message="Use the simulated node for this check.",
+                    persona=context.scheduled_target.persona,
+                    goal=context.scheduled_target.goal,
+                    rationale="The restored response offers fake-node.",
+                    target_coverage_ids=(context.scheduled_target.edge_key,),
+                )
+
+            runner = DynamicDualAiChaosRunner(
+                ChaosRunConfig.linux(
+                    root,
+                    session_id="contract-session",
+                ),
+                simulator,
+                ledger=ledger,
+                schedule=schedule,
+                transport=transport,
+                event_stream=FakeEventStream([
+                    self._event(1, "a" * 64, "b" * 64, "resume_harness_session"),
+                    self._event(2, "b" * 64, "c" * 64, "opening_next_action"),
+                    self._event(3, "c" * 64, "d" * 64, "chain_select"),
+                ]),
+                revision=REVISION,
+                clock_ns=OrderedClock(),
+            )
+
+            with patch(
+                "tests.agent_live.runtime_checkpoint.seed_runtime_checkpoint"
+            ) as seed_checkpoint:
+                result = runner.run()
+
+            self.assertEqual(result.execution_status, "complete")
+            self.assertEqual(transport.submitted, ["1", "Use the simulated node for this check."])
+            self.assertEqual(len(seen), 1)
+            seed_checkpoint.assert_called_once()
 
     def test_missing_provider_identity_fails_closed_without_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

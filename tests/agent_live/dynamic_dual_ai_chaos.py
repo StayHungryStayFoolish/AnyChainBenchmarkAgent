@@ -386,6 +386,20 @@ class DynamicDualAiChaosRunner:
         schedule_result_path = runtime_root / "schedule-result.json"
         env = self._isolated_environment(runtime_root)
 
+        seed_scenario_id = str(self.schedule.targets[0].scenario_id or "")
+        if seed_scenario_id:
+            from tests.agent_live.runtime_checkpoint import (
+                reviewed_scenario_state,
+                seed_runtime_checkpoint,
+            )
+
+            seed_runtime_checkpoint(
+                reviewed_scenario_state(seed_scenario_id),
+                checkpoint_path=runtime_root / "checkpoints.sqlite",
+                session_id=self.config.session_id,
+                session_purpose=self.config.session_purpose,
+            )
+
         transcript: list[tuple[str, str]] = []
         transcript_lines: list[str] = []
         evidence_paths: list[Path] = []
@@ -408,6 +422,31 @@ class DynamicDualAiChaosRunner:
             baseline_event = self.event_stream.baseline()
             self._validate_event_revision(baseline_event)
             transcript_lines.append(previous_response)
+
+            if seed_scenario_id:
+                first_target = self.schedule.targets[0]
+                first_edge = self.edge_index[first_target.edge_key]
+                expected_question = str(first_edge.get("question_id") or "")
+                if baseline_event.pending_question_id == "resume_harness_session":
+                    self.transport.submit_bracketed_paste("1")
+                    resumed_response = self.transport.read_complete_agent_response(
+                        timeout_seconds=self.config.response_timeout_seconds
+                    )
+                    resumed_event = self.event_stream.next_event(
+                        timeout_seconds=self.config.response_timeout_seconds
+                    )
+                    self._validate_event_revision(resumed_event)
+                    transcript.extend((("1", resumed_response),))
+                    transcript_lines.extend(("User> 1", resumed_response))
+                    previous_response = resumed_response
+                    previous_received_ns = self.clock_ns()
+                    baseline_event = resumed_event
+                if baseline_event.pending_question_id != expected_question:
+                    raise RuntimeError(
+                        "reviewed checkpoint did not restore the scheduled target contract: "
+                        f"expected {expected_question or '<action>'}, got "
+                        f"{baseline_event.pending_question_id or '<none>'}"
+                    )
 
             for scheduled_target in self.schedule.targets:
                 edge = self.edge_index.get(scheduled_target.edge_key)

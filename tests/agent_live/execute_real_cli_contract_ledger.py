@@ -18,10 +18,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from agent.harness.checkpoints import create_sqlite_checkpointer
-from agent.harness.graph import build_graph
-from agent.harness.invariants import validate_state
-from agent.harness.state import project_checkpoint_state
 from tests.agent_live.coverage_evidence import (
     PtyCliTurnRecord,
     TurnObservation,
@@ -42,6 +38,7 @@ from tests.agent_live.generate_harness_coverage_ledger import (
     build_ledger,
     contract_variant_hash,
 )
+from tests.agent_live.runtime_checkpoint import seed_runtime_checkpoint
 
 
 DEFAULT_OUTPUT = Path(".agent/evidence/real-cli-contracts")
@@ -86,7 +83,7 @@ def execute_edge(
         runtime_root_in_process=runtime_root,
         response_timeout_seconds=timeout_seconds,
     )
-    _seed_checkpoint(
+    seed_runtime_checkpoint(
         seed_state,
         checkpoint_path=runtime_root / "checkpoints.sqlite",
         session_id=session_id,
@@ -226,36 +223,6 @@ def _load_deterministic_reference(edge: Mapping[str, Any]) -> Mapping[str, Any]:
     if payload.get("edge_key") != edge.get("edge_key"):
         raise ValueError("real CLI seed reference belongs to another edge")
     return payload
-
-
-def _seed_checkpoint(
-    seed_state: Mapping[str, Any],
-    *,
-    checkpoint_path: Path,
-    session_id: str,
-    session_purpose: str,
-) -> None:
-    state = deepcopy(dict(seed_state))
-    state["last_user_input"] = ""
-    state["thread_id"] = session_id
-    state["session"] = {
-        "id": session_id,
-        "purpose": session_purpose,
-        "created_at": "1970-01-01T00:00:00Z",
-        "updated_at": "1970-01-01T00:00:00Z",
-    }
-    validate_state(state)
-    checkpointer = create_sqlite_checkpointer(checkpoint_path)
-    try:
-        graph = build_graph(checkpointer)
-        graph.update_state(
-            {"configurable": {"thread_id": session_id}},
-            project_checkpoint_state(state),
-        )
-    finally:
-        manager = getattr(checkpointer, "_anychain_context_manager", None)
-        if manager is not None:
-            manager.__exit__(None, None, None)
 
 
 def _runtime_environment(config: ChaosRunConfig, runtime_root: Path) -> dict[str, str]:

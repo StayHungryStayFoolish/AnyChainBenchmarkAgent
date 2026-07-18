@@ -14,7 +14,7 @@ from typing import Any, Mapping, Sequence
 from tests.agent_live.coverage_evidence import content_hash
 
 
-CHAOS_SCHEDULE_SCHEMA_VERSION = 2
+CHAOS_SCHEDULE_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -25,6 +25,7 @@ class ScheduledCoverageTarget:
     goal: str
     sequence_id: str = ""
     tuple_ids: tuple[str, ...] = ()
+    scenario_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,14 @@ def build_chaos_schedule(
         goal = str(raw.get("goal") or "").strip()
         if not persona or not goal:
             raise ValueError(f"schedule target requires persona and goal: {target_id}")
+        scenario_id = str(raw.get("scenario_id") or "").strip()
+        executable_scenarios = {
+            str(item) for item in edge.get("executable_scenario_ids") or ()
+        }
+        if scenario_id and scenario_id not in executable_scenarios:
+            raise ValueError(
+                f"schedule scenario is not authoritative for edge: {scenario_id} -> {edge_key}"
+            )
         scheduled.append(ScheduledCoverageTarget(
             target_id=target_id,
             edge_key=edge_key,
@@ -81,6 +90,7 @@ def build_chaos_schedule(
             goal=goal,
             sequence_id=str(raw.get("sequence_id") or ""),
             tuple_ids=tuple(str(item) for item in raw.get("tuple_ids") or ()),
+            scenario_id=scenario_id,
         ))
     if not scheduled:
         raise ValueError("Chaos schedule has no coverage targets")
