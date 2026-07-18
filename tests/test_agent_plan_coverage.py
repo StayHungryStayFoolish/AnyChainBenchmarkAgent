@@ -291,13 +291,22 @@ class PlanCoverageTest(unittest.TestCase):
             "chain_selection_admissions": [0],
         }
         provider = Mock()
-        provider.complete.return_value = SimpleNamespace(text=json.dumps({
-            "context_reviews": [{
-                "unit_id": "unit-2",
-                "context_only": True,
-                "reason": "no current operation requested",
-            }],
-        }))
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps({
+                "unit_reviews": [{
+                    "unit_id": "unit-1",
+                    "complete": True,
+                    "reason": "the chain request is preserved",
+                }],
+            })),
+            SimpleNamespace(text=json.dumps({
+                "context_reviews": [{
+                    "unit_id": "unit-2",
+                    "context_only": True,
+                    "reason": "no current operation requested",
+                }],
+            })),
+        ]
         state = new_state("context-admission", language="en")
         state["pending_question"] = {
             "id": "chain",
@@ -309,7 +318,7 @@ class PlanCoverageTest(unittest.TestCase):
         result = _validate_semantic_fulfillment(provider, json.dumps(payload), clauses, state)
 
         self.assertTrue(result.valid, result.errors)
-        request_payload = json.loads(provider.complete.call_args.args[0].messages[1].content)
+        request_payload = json.loads(provider.complete.call_args_list[1].args[0].messages[1].content)
         self.assertEqual(request_payload["pending_question"]["id"], "chain")
         self.assertEqual(request_payload["context_reviews"][0]["unit_id"], "unit-2")
 
@@ -2038,6 +2047,90 @@ class PlanCoverageTest(unittest.TestCase):
         review_payload = json.loads(provider.complete.call_args_list[0].args[0].messages[1].content)
         self.assertEqual([row["action_index"] for row in review_payload["reviews"]], [1])
 
+    def test_single_durable_action_unit_is_audited_for_omitted_demands(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _validate_semantic_fulfillment
+        from agent.harness.state import new_state
+
+        source = "Test BNB with mixed workload, quick QPS, and local Grafana"
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "choose_chain",
+                "chain_text": "BNB",
+                "source_evidence": source,
+            }],
+            "semantic_units": [_unit(clauses[0], 1, [0])],
+            "chain_selection_admissions": [0],
+        }
+        provider = Mock()
+        negative = {
+            "unit_reviews": [{
+                "unit_id": "unit-1",
+                "complete": False,
+                "missing_demand_quote": "mixed workload",
+                "reason": "the workload, QPS, and observability demands are omitted",
+            }],
+        }
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps(negative)),
+            SimpleNamespace(text=json.dumps(negative)),
+        ]
+
+        result = _validate_semantic_fulfillment(
+            provider,
+            json.dumps(payload),
+            clauses,
+            new_state("single-unit-completeness", language="en"),
+        )
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.incomplete_unit_ids, ("unit-1",))
+        first_request = json.loads(provider.complete.call_args_list[0].args[0].messages[1].content)
+        self.assertEqual(first_request["unit_reviews"][0]["mapped_actions"][0]["operation_index"], 0)
+
+    def test_single_durable_action_unit_passes_when_it_preserves_the_whole_request(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _validate_semantic_fulfillment
+        from agent.harness.state import new_state
+
+        source = "Test BNB"
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "choose_chain",
+                "chain_text": "BNB",
+                "source_evidence": source,
+            }],
+            "semantic_units": [_unit(clauses[0], 1, [0])],
+            "chain_selection_admissions": [0],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "unit_reviews": [{
+                "unit_id": "unit-1",
+                "complete": True,
+                "missing_demand_quote": "",
+                "reason": "the chain selection preserves the complete request",
+            }],
+        }))
+
+        result = _validate_semantic_fulfillment(
+            provider,
+            json.dumps(payload),
+            clauses,
+            new_state("single-unit-complete", language="en"),
+        )
+
+        self.assertTrue(result.valid, result.errors)
+        provider.complete.assert_called_once()
+
     def test_negative_unit_verdict_is_re_adjudicated_under_quote_contract(self) -> None:
         import json
         from types import SimpleNamespace
@@ -2482,7 +2575,7 @@ class PlanCoverageTest(unittest.TestCase):
         provider = Mock()
         provider.complete.return_value = SimpleNamespace(text=json.dumps({
             "reviews": [{"action_index": 0, "supported": True, "reason": "explicit mode change"}],
-            "unit_reviews": [],
+            "unit_reviews": [{"unit_id": "unit-1", "complete": True, "reason": "complete"}],
         }))
         state = new_state("unit-thread", language="en")
         state["pending_question"] = {
@@ -2495,7 +2588,7 @@ class PlanCoverageTest(unittest.TestCase):
         result = _validate_semantic_fulfillment(provider, json.dumps(payload), clauses, state)
 
         self.assertTrue(result.valid, result.errors)
-        review_payload = json.loads(provider.complete.call_args.args[0].messages[1].content)
+        review_payload = json.loads(provider.complete.call_args_list[0].args[0].messages[1].content)
         self.assertEqual(review_payload["pending_question"], {})
 
     def test_negative_action_purpose_review_can_reverse_a_false_negative(self) -> None:
@@ -2621,7 +2714,7 @@ class PlanCoverageTest(unittest.TestCase):
         result = _validate_semantic_fulfillment(provider, json.dumps(payload), clauses, state)
 
         self.assertTrue(result.valid, result.errors)
-        review_payload = json.loads(provider.complete.call_args.args[0].messages[1].content)
+        review_payload = json.loads(provider.complete.call_args_list[0].args[0].messages[1].content)
         self.assertEqual(review_payload["pending_question"]["id"], "target_mode_change_confirm")
         self.assertEqual(review_payload["pending_question"]["options"][0]["value"], "confirm")
 

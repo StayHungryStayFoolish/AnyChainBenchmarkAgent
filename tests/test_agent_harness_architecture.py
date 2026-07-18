@@ -1412,8 +1412,18 @@ class HarnessStateInvariantTest(unittest.TestCase):
                 '"reason":"the source asks for a read-only state summary"}]}'
             )),
             SimpleNamespace(text=(
+                '{"unit_reviews":[{"unit_id":"unit-1","complete":false,'
+                '"missing_demand_quote":"summarize which chain and custom method you retained",'
+                '"reason":"the mapped evidence mutation omits the requested summary"}]}'
+            )),
+            SimpleNamespace(text=(
                 '{"reviews":[{"action_index":0,"supported":false,'
                 '"reason":"the source does not support appending RPC evidence"}]}'
+            )),
+            SimpleNamespace(text=(
+                '{"unit_reviews":[{"unit_id":"unit-1","complete":false,'
+                '"missing_demand_quote":"summarize which chain and custom method you retained",'
+                '"reason":"the requested summary remains omitted"}]}'
             )),
             SimpleNamespace(text=(
                 '{"decisions":[{"unit_id":"unit-1","disposition":"consultation",'
@@ -1430,7 +1440,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(_state(), text)
 
-        self.assertEqual(provider.complete.call_count, 5)
+        self.assertEqual(provider.complete.call_count, 7)
         self.assertEqual(result["actions"][0]["type"], "answer_opening_question")
         self.assertEqual(result["actions"][0]["topic"], "current_config")
 
@@ -1460,14 +1470,18 @@ class HarnessStateInvariantTest(unittest.TestCase):
             )),
             SimpleNamespace(text=(
                 '{"reviews":[{"action_index":0,"supported":true,'
-                '"reason":"the source selects the displayed single-method option"}],"unit_reviews":[]}'
+                '"reason":"the source selects the displayed single-method option"}]}'
+            )),
+            SimpleNamespace(text=(
+                '{"unit_reviews":[{"unit_id":"unit-1","complete":true,'
+                '"missing_demand_quote":"","reason":"the mapped action preserves the complete request"}]}'
             )),
         ]
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, "I only need one RPC method.")
 
-        self.assertEqual(provider.complete.call_count, 2)
+        self.assertEqual(provider.complete.call_count, 3)
         self.assertEqual(result["actions"][0]["type"], "set_rpc_mode")
         self.assertEqual(result["actions"][0]["rpc_mode"], "single")
 
@@ -1497,14 +1511,18 @@ class HarnessStateInvariantTest(unittest.TestCase):
             )),
             SimpleNamespace(text=(
                 '{"reviews":[{"action_index":0,"supported":true,'
-                '"reason":"the source selects the displayed multiple-method option"}],"unit_reviews":[]}'
+                '"reason":"the source selects the displayed multiple-method option"}]}'
+            )),
+            SimpleNamespace(text=(
+                '{"unit_reviews":[{"unit_id":"unit-1","complete":true,'
+                '"missing_demand_quote":"","reason":"the mapped action preserves the complete request"}]}'
             )),
         ]
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, "Use several weighted RPC methods.")
 
-        self.assertEqual(provider.complete.call_count, 2)
+        self.assertEqual(provider.complete.call_count, 3)
         self.assertEqual(result["actions"][0]["type"], "set_rpc_mode")
         self.assertEqual(result["actions"][0]["rpc_mode"], "mixed")
 
@@ -1585,6 +1603,10 @@ class HarnessStateInvariantTest(unittest.TestCase):
             '{"reviews":[{"action_index":0,"supported":true,'
             '"reason":"the source explicitly requests entry into custom RPC setup"}]}'
         ))
+        unit_review = SimpleNamespace(text=(
+            '{"unit_reviews":[{"unit_id":"unit-1","complete":true,'
+            '"missing_demand_quote":"","reason":"the mapped action preserves the complete request"}]}'
+        ))
         provider.complete.side_effect = [
             SimpleNamespace(text=(
                 '{"actions":[{"type":"rpc_catalog_command","catalog_command":"enter"}],'
@@ -1593,13 +1615,13 @@ class HarnessStateInvariantTest(unittest.TestCase):
                 '"disposition":"action","action_indexes":[0],"reason":"custom RPC entry"}]}'
             )),
             review,
-            review,
+            unit_review,
         ]
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(_state(), text)
 
-        self.assertEqual(provider.complete.call_count, 2)
+        self.assertEqual(provider.complete.call_count, 3)
         self.assertEqual(result["actions"][0]["type"], "rpc_catalog_command")
         self.assertEqual(result["actions"][0]["catalog_command"], "enter")
 

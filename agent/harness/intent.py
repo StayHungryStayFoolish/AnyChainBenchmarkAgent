@@ -559,11 +559,10 @@ def _validate_semantic_fulfillment(
             continue
         if (
             action_units_per_clause.get(str(unit.get("clause_id") or ""), 0) == 1
-            and len(mapped) > 1
             and any(
-            (ACTION_BY_TYPE.get(str(action.get("type") or "")) is not None)
-            and ACTION_BY_TYPE[str(action.get("type") or "")].lifetime == "durable"
-            for action in mapped
+                (ACTION_BY_TYPE.get(str(action.get("type") or "")) is not None)
+                and ACTION_BY_TYPE[str(action.get("type") or "")].lifetime == "durable"
+                for action in mapped
             )
         ):
             mutation_units.append(unit)

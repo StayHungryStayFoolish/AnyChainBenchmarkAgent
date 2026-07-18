@@ -69,6 +69,73 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
             state = _commit_result(state, result, owner="chain_rpc")
         self.fail("RPC catalog domain confirmation did not reach a stable next question")
 
+    def test_unresolved_target_mode_preserves_same_turn_mutations(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.domains.orientation import opening_question
+        from agent.harness.state import new_state
+
+        state = new_state("unresolved-mode-transaction", language="en")
+        state["active_group"] = "opening"
+        state["pending_question"] = opening_question(state)
+        text = "Test BNB with mixed workload, quick QPS, and local Grafana"
+        state["last_user_input"] = text
+        actions = {"actions": [
+            {
+                "type": "choose_chain",
+                "chain_text": "BNB",
+                "source_evidence": text,
+                "chain_selection_semantic_verified": True,
+                "semantic_purpose_verified": True,
+                "confidence": "high",
+            },
+            {
+                "type": "set_rpc_mode",
+                "rpc_mode": "mixed",
+                "mutation_explicit": True,
+                "source_evidence": "mixed workload",
+                "semantic_purpose_verified": True,
+                "confidence": "high",
+            },
+            {
+                "type": "set_qps_mode",
+                "qps_mode": "quick",
+                "mutation_explicit": True,
+                "source_evidence": "quick QPS",
+                "semantic_purpose_verified": True,
+                "confidence": "high",
+            },
+            {
+                "type": "set_observability",
+                "observability_mode": "local",
+                "mutation_explicit": True,
+                "source_evidence": "local Grafana",
+                "semantic_purpose_verified": True,
+                "confidence": "high",
+            },
+        ]}
+
+        with patch("agent.harness.coordinator.resolve_action_queue", return_value=actions):
+            result = process_turn(state)
+
+        self.assertEqual(result["chain_identity"]["canonical"], "bsc")
+        self.assertEqual(result["pending_question"]["id"], "target_mode_select")
+        self.assertEqual(
+            [item["type"] for item in result["action_queue"]],
+            ["set_rpc_mode", "set_qps_mode", "set_observability"],
+        )
+        self.assertIsNone(result.get("observability_mode"))
+
+        result["last_user_input"] = "fake-node"
+        result = process_turn(result)
+
+        self.assertEqual(result["target_mode"], "fake-node")
+        self.assertEqual(result["rpc_mode"], "mixed")
+        self.assertEqual(result["pending_question"]["id"], "workload_confirm")
+        self.assertEqual(
+            [item["type"] for item in result["action_queue"]],
+            ["set_qps_mode", "set_observability"],
+        )
+
     def test_single_free_text_resolver_is_the_action_queue(self) -> None:
         """Architecture audit: the older single-action resolver generation
 
@@ -1968,8 +2035,8 @@ network:
         self.assertEqual(result["pending_question"]["id"], "target_mode_select")
         self.assertEqual((result.get("chain_identity") or {}).get("canonical"), "bsc")
         queued = {str(item.get("type") or "") for item in result.get("action_queue") or []}
-        self.assertTrue({"set_rpc_mode", "set_qps_mode"}.issubset(queued))
-        self.assertEqual((result.get("observability") or {}).get("mode"), "local")
+        self.assertTrue({"set_rpc_mode", "set_qps_mode", "set_observability"}.issubset(queued))
+        self.assertIsNone((result.get("observability") or {}).get("mode"))
 
     def test_return_to_origin_group_does_not_preempt_new_blocking_group(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
@@ -11286,6 +11353,8 @@ network:
         from agent.harness.state import new_state
 
         state = new_state("observability-alias", language="en")
+        state["target_mode"] = "fake-node"
+        state["workflow_mode"] = "rpc_benchmark"
         state["last_user_input"] = "use exporter-only"
         with patch(
             "agent.harness.coordinator.resolve_action_queue",
