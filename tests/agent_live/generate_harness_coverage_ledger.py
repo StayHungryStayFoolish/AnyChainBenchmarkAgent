@@ -82,12 +82,12 @@ RUNNER_CONTRACTS = {
         "gap": "",
     },
     "real_cli": {
-        "status": "artifact_contract_only",
-        "producer": "",
+        "status": "partial",
+        "producer": "tests/agent_live/execute_real_cli_contract_ledger.py",
         "artifact_schema": "real_cli_evidence.v3",
         "gap": (
-            "R44 defines lane applicability and validates PTY artifacts, but no single runner "
-            "currently produces evidence for every real_cli-required row."
+            "The producer covers reviewed exact/non-semantic rows and dynamic turns emit their "
+            "independent real-CLI artifacts; catalog-only and missing concrete-input rows remain open."
         ),
     },
     "dynamic_dual_ai": {
@@ -197,6 +197,8 @@ def evidence_applicability(
     if evidence_class == "real_cli":
         if edge_type == "action_transition":
             return False, "action registry rows are not direct terminal inputs"
+        if input_class == "empty_whitespace":
+            return False, "prompt-toolkit ignores whitespace without submitting a workflow turn"
         return True, "real PTY must prove terminal transport and committed workflow behavior"
 
     if evidence_class == "dynamic_dual_ai":

@@ -698,7 +698,11 @@ def _validate_turn_observation(
         raise ValueError("turn observation postcondition did not pass")
     if observation.target_edge_key not in postcondition.observed_coverage_ids:
         raise ValueError("verified postcondition did not observe the target edge")
-    if not postcondition.admitted_typed_actions:
+    rejection_expected = (
+        str(edge.get("edge_type") or "") == "manual_input"
+        and edge.get("expected_admitted") is False
+    )
+    if not postcondition.admitted_typed_actions and not rejection_expected:
         raise ValueError("verified postcondition has no admitted typed actions")
     if not postcondition.state_diff:
         raise ValueError("verified postcondition has no state diff")
@@ -753,10 +757,11 @@ def verify_runtime_postcondition(
         errors.append("runtime fingerprint chain did not advance from the baseline")
     if committed.turn_index != baseline.turn_index + 1:
         errors.append("runtime turn index did not advance exactly once")
-    admitted = tuple(item for item in committed.admitted_action_types if item)
-    if not admitted:
-        errors.append("runtime emitted no admitted typed action")
     edge_type = str(edge.get("edge_type") or "")
+    admitted = tuple(item for item in committed.admitted_action_types if item)
+    rejection_expected = edge_type == "manual_input" and edge.get("expected_admitted") is False
+    if not admitted and not rejection_expected:
+        errors.append("runtime emitted no admitted typed action")
     scheduled_action = str(edge.get("action_type") or "")
     if edge_type in {"action_transition", "question_option"} and scheduled_action and scheduled_action not in admitted:
         errors.append(f"scheduled action was not admitted: {scheduled_action}")
@@ -784,8 +789,10 @@ def verify_runtime_postcondition(
             for item in baseline.pending_contract.get("accepted_action_types") or []
             if str(item).strip()
         }
-        if not accepted.intersection(admitted):
+        if not rejection_expected and not accepted.intersection(admitted):
             errors.append("manual input admitted no action declared by the pending contract")
+        if rejection_expected and admitted and not accepted.intersection(admitted):
+            errors.append("rejected manual input admitted an unrelated action")
 
     expected = dict(edge.get("expected_postcondition") or {})
     expected_paths: list[str] = []
@@ -807,7 +814,14 @@ def verify_runtime_postcondition(
             expected_paths.append(path)
             after_hash = committed.after_value_hashes.get(path)
             before_hash = baseline.after_value_hashes.get(path)
-            if not after_hash:
+            if rejection_expected:
+                if after_hash != before_hash:
+                    errors.append(f"rejected manual input changed the destination field: {path}")
+                if committed.pending_question_id != baseline.pending_question_id:
+                    errors.append("rejected manual input did not preserve the pending question")
+                if dict(committed.pending_contract) != dict(baseline.pending_contract):
+                    errors.append("rejected manual input changed the pending contract")
+            elif not after_hash:
                 errors.append(f"manual-input postcondition was not observed: {path}")
             elif after_hash == before_hash:
                 errors.append(f"manual-input postcondition did not change: {path}")
@@ -824,6 +838,8 @@ def verify_runtime_postcondition(
         "baseline_question_id": baseline.pending_question_id,
         "committed_question_id": committed.pending_question_id,
         "expected_postcondition_paths": sorted(expected_paths),
+        "expected_admitted": edge.get("expected_admitted"),
+        "rejection_observed": bool(rejection_expected and not errors),
         "errors": errors,
     }
     return VerifiedPostcondition(

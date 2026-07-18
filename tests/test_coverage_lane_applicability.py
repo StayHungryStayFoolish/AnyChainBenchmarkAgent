@@ -56,10 +56,21 @@ class CoverageLaneApplicabilityTest(unittest.TestCase):
         self.assertTrue(contracts["deterministic"]["producer"])
         self.assertEqual(contracts["dynamic_dual_ai"]["status"], "implemented")
         self.assertTrue(contracts["dynamic_dual_ai"]["producer"])
-        for lane in ("real_cli", "real_execution"):
-            self.assertEqual(contracts[lane]["status"], "artifact_contract_only")
-            self.assertFalse(contracts[lane]["producer"])
-            self.assertTrue(contracts[lane]["gap"])
+        self.assertEqual(contracts["real_cli"]["status"], "partial")
+        self.assertTrue(contracts["real_cli"]["producer"])
+        self.assertTrue(contracts["real_cli"]["gap"])
+        self.assertEqual(contracts["real_execution"]["status"], "artifact_contract_only")
+        self.assertFalse(contracts["real_execution"]["producer"])
+        self.assertTrue(contracts["real_execution"]["gap"])
+
+    def test_whitespace_is_a_terminal_noop_not_a_committed_real_cli_turn(self) -> None:
+        edge = next(
+            edge for edge in self.ledger["edges"]
+            if edge["input_class"] == "empty_whitespace"
+            and edge["evidence"]["deterministic"]["required"]
+        )
+        self.assertFalse(edge["evidence"]["real_cli"]["required"])
+        self.assertIn("ignores whitespace", edge["evidence"]["real_cli"]["applicability_reason"])
 
     def test_matrix_separates_syntax_semantics_actions_and_side_effects(self) -> None:
         exact = next(

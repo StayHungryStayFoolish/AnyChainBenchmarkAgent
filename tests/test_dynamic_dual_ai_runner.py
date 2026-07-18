@@ -533,6 +533,56 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             " ".join(verified.details["errors"]),
         )
 
+    def test_manual_rejection_requires_unchanged_field_and_pending_contract(self) -> None:
+        edge = {
+            **EDGE,
+            "edge_key": "provider_deployment::CLOUD_REGION::empty",
+            "question_id": "CLOUD_REGION",
+            "edge_type": "manual_input",
+            "action_type": "answer_pending",
+            "expected_admitted": False,
+            "expected_postcondition": {
+                "field": "CLOUD_REGION",
+                "path": "confirmed_config.CLOUD_REGION",
+            },
+        }
+        contract = {"id": "CLOUD_REGION", "accepted_action_types": ["answer_pending"]}
+        baseline = replace(
+            self._event(1, "a" * 64, "b" * 64, "CLOUD_REGION"),
+            pending_contract=contract,
+            after_value_hashes={},
+        )
+        committed = replace(
+            self._event(2, "b" * 64, "c" * 64, "CLOUD_REGION"),
+            pending_contract=contract,
+            admitted_action_types=(),
+            state_diff_hashes={"visible_response": {"before": "", "after": "d" * 64}},
+            after_value_hashes={},
+        )
+
+        verified = verify_runtime_postcondition(edge, baseline, committed, None)  # type: ignore[arg-type]
+
+        self.assertTrue(verified.passed, verified.details)
+        self.assertTrue(verified.details["rejection_observed"])
+        self.assertEqual(verified.admitted_typed_actions, ())
+
+        changed = replace(
+            committed,
+            after_value_hashes={"confirmed_config.CLOUD_REGION": "e" * 64},
+        )
+        rejected = verify_runtime_postcondition(edge, baseline, changed, None)  # type: ignore[arg-type]
+        self.assertFalse(rejected.passed)
+        self.assertIn("changed the destination field", " ".join(rejected.details["errors"]))
+
+        advanced = replace(
+            committed,
+            pending_question_id="CLOUD_ZONE",
+            pending_contract={"id": "CLOUD_ZONE", "accepted_action_types": ["answer_pending"]},
+        )
+        rejected = verify_runtime_postcondition(edge, baseline, advanced, None)  # type: ignore[arg-type]
+        self.assertFalse(rejected.passed)
+        self.assertIn("preserve the pending question", " ".join(rejected.details["errors"]))
+
     def test_manual_chain_edge_verifies_chain_owner_state(self) -> None:
         edge = {
             **EDGE,
