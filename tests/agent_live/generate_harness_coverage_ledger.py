@@ -668,6 +668,8 @@ def build_ledger(
         variant_edges: list[dict[str, Any]] = []
         for option in contract.get("options") or []:
             action_type = str((option.get("action") or {}).get("type") or "answer_pending")
+            postcondition_overrides = variant.get("option_postcondition_overrides") or {}
+            option_id = str(option.get("id") or "")
             for input_class in ("exact_option", "natural_language_option"):
                 variant_edges.append(_new_edge(
                     group=group,
@@ -684,11 +686,9 @@ def build_ledger(
                     option=option,
                     action_type=action_type,
                     expected_postcondition=(
-                        (variant.get("option_postcondition_overrides") or {}).get(
-                            str(option.get("id") or "")
-                        )
-                        or option.get("expected_patch")
-                        or {}
+                        postcondition_overrides[option_id]
+                        if option_id in postcondition_overrides
+                        else option.get("expected_patch") or {}
                     ),
                     expected_state_relations=(
                         (variant.get("option_relation_overrides") or {}).get(

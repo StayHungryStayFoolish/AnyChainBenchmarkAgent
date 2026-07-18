@@ -809,8 +809,12 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
                 language=language,
             ),
             option_postcondition_overrides={
-                "1": {**applied, "inferred_config.pending_review": None},
-                "2": {"inferred_config.pending_review": None},
+                "1": applied,
+                "2": {},
+            },
+            option_relation_overrides={
+                "1": ({"kind": "path_absent_after", "path": "inferred_config.pending_review"},),
+                "2": ({"kind": "path_absent_after", "path": "inferred_config.pending_review"},),
             },
         )
 

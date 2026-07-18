@@ -861,6 +861,15 @@ def _verify_runtime_state_relations(
 ) -> None:
     for relation in relations:
         kind = str(relation.get("kind") or "")
+        if kind == "path_absent_after":
+            path = str(relation.get("path") or "")
+            observed = any(
+                candidate == path or candidate.startswith(f"{path}.")
+                for candidate in committed.after_value_hashes
+            )
+            if not path or observed:
+                errors.append(f"state relation path remains present: {path or '<empty>'}")
+            continue
         if kind == "path_equals_before_path":
             after_path = str(relation.get("after_path") or "")
             before_path = str(relation.get("before_path") or "")

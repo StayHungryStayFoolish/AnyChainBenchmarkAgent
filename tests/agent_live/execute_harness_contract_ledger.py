@@ -241,6 +241,11 @@ def _verify_state_relations(
 ) -> None:
     for relation in relations:
         kind = str(relation.get("kind") or "")
+        if kind == "path_absent_after":
+            path = str(relation.get("path") or "")
+            if not path or _path_exists(after, path):
+                raise AssertionError(f"state relation path still exists: {relation}")
+            continue
         if kind == "path_equals_before_path":
             after_path = str(relation.get("after_path") or "")
             before_path = str(relation.get("before_path") or "")
