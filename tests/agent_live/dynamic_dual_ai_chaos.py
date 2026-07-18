@@ -521,12 +521,53 @@ class DynamicDualAiChaosRunner:
                 )
                 evidence_path = write_evidence_artifact(artifact, evidence_dir)
                 evidence_paths.append(evidence_path)
+                lane_evidence = {
+                    "dynamic_dual_ai": {
+                        "evidence_id": artifact["evidence_id"],
+                        "evidence_path": str(evidence_path),
+                    }
+                }
+                real_cli_lane = (edge.get("evidence") or {}).get("real_cli") or {}
+                if bool(real_cli_lane.get("required")):
+                    real_cli_observation = TurnObservation(
+                        seed=observation.seed,
+                        revision=observation.revision,
+                        target_edge_key=observation.target_edge_key,
+                        target_contract_hash=observation.target_contract_hash,
+                        target_variant_hash=observation.target_variant_hash,
+                        prior_agent_response=observation.prior_agent_response,
+                        simulator_decision={},
+                        exact_user_turn=observation.exact_user_turn,
+                        provider=observation.provider,
+                        model=observation.model,
+                        before_turn_index=observation.before_turn_index,
+                        after_turn_index=observation.after_turn_index,
+                        before_state_fingerprint=observation.before_state_fingerprint,
+                        after_state_fingerprint=observation.after_state_fingerprint,
+                        pending_contract=observation.pending_contract,
+                        runtime_events=observation.runtime_events,
+                        verified_postcondition=observation.verified_postcondition,
+                    )
+                    real_cli_artifact = build_pty_cli_evidence_artifact(
+                        edge=edge,
+                        evidence_class="real_cli",
+                        revision=self.revision,
+                        turn=turn,
+                        observation=real_cli_observation,
+                    )
+                    real_cli_path = write_evidence_artifact(real_cli_artifact, evidence_dir)
+                    evidence_paths.append(real_cli_path)
+                    lane_evidence["real_cli"] = {
+                        "evidence_id": real_cli_artifact["evidence_id"],
+                        "evidence_path": str(real_cli_path),
+                    }
                 target_results.append({
                     "target_id": scheduled_target.target_id,
                     "edge_key": scheduled_target.edge_key,
                     "status": "passed",
                     "evidence_id": artifact["evidence_id"],
                     "evidence_path": str(evidence_path),
+                    "lane_evidence": lane_evidence,
                 })
                 turns.append(turn)
                 transcript.append((decision.user_message, response))

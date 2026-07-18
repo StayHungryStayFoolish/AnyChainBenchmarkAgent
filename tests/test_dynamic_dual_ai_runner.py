@@ -36,7 +36,11 @@ EDGE = {
         "dynamic_dual_ai": {
             "required": True,
             "applicability_reason": "response-driven semantic test fixture",
-        }
+        },
+        "real_cli": {
+            "required": True,
+            "applicability_reason": "same PTY turn proves terminal transport",
+        },
     },
 }
 REVISION = {"commit": "test-commit", "worktree_hash": "a" * 64}
@@ -204,18 +208,29 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             schedule_result = json.loads(result.schedule_result_path.read_text(encoding="utf-8"))
             self.assertEqual(schedule_result["execution_status"], "complete")
             self.assertEqual(schedule_result["passed_target_count"], 1)
-            artifact = json.loads(result.evidence_paths[0].read_text(encoding="utf-8"))
-            valid, reason = validate_pty_cli_evidence_artifact(
-                artifact,
-                edge=EDGE,
-                revision=REVISION,
-            )
-            self.assertTrue(valid, reason)
+            artifacts = {
+                json.loads(path.read_text(encoding="utf-8"))["evidence_class"]: json.loads(
+                    path.read_text(encoding="utf-8")
+                )
+                for path in result.evidence_paths
+            }
+            self.assertEqual(set(artifacts), {"dynamic_dual_ai", "real_cli"})
+            for artifact in artifacts.values():
+                valid, reason = validate_pty_cli_evidence_artifact(
+                    artifact,
+                    edge=EDGE,
+                    revision=REVISION,
+                )
+                self.assertTrue(valid, reason)
+            artifact = artifacts["dynamic_dual_ai"]
             self.assertEqual(artifact["turn_observation"]["seed"], 17)
             self.assertEqual(
                 artifact["turn_observation"]["verified_postcondition"]["verifier_id"],
                 "anychain.runtime-transition-proof.v1",
             )
+            self.assertEqual(artifacts["real_cli"]["turn_observation"]["simulator_decision"], {})
+            lane_evidence = schedule_result["targets"][0]["lane_evidence"]
+            self.assertEqual(set(lane_evidence), {"dynamic_dual_ai", "real_cli"})
 
     def test_missing_provider_identity_fails_closed_without_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
