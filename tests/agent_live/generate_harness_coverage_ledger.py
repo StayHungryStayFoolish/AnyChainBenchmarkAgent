@@ -124,6 +124,7 @@ def contract_variant_payload(question: Mapping[str, Any]) -> dict[str, Any]:
             "action": dict(action),
             "expected_patch": dict(option.get("expected_patch") or {}),
             "return_policy": str(option.get("return_policy") or "fallback"),
+            "semantic_action": str(option.get("semantic_action") or ""),
         })
     return {
         "contract_version": question.get("contract_version"),
@@ -301,6 +302,7 @@ def _question_contracts() -> list[dict[str, Any]]:
                 "executable_scenario_ids": [],
                 "manual_postcondition_path": "",
                 "option_postcondition_overrides": {},
+                "option_relation_overrides": {},
                 "contract": contract_variant_payload(question),
             }
         variants[key]["scenario_ids"].append(scenario_id)
@@ -309,6 +311,9 @@ def _question_contracts() -> list[dict[str, Any]]:
             variants[key]["manual_postcondition_path"] = scenario.manual_postcondition_path
             variants[key]["option_postcondition_overrides"] = deepcopy(
                 dict(scenario.option_postcondition_overrides or {})
+            )
+            variants[key]["option_relation_overrides"] = deepcopy(
+                dict(scenario.option_relation_overrides or {})
             )
     for variant in variants.values():
         variant["scenario_ids"] = sorted(set(variant["scenario_ids"]))
@@ -337,6 +342,7 @@ def _new_edge(
     applicability_reason: str = "",
     preconditions: Mapping[str, Any] | None = None,
     expected_postcondition: Mapping[str, Any] | None = None,
+    expected_state_relations: Iterable[Mapping[str, Any]] = (),
     return_policy: str = "fallback",
     executable_scenario_ids: Iterable[str] = (),
     deterministic_case_available: bool = False,
@@ -361,6 +367,7 @@ def _new_edge(
         "owner": owner,
         "preconditions": dict(preconditions or {}),
         "expected_postcondition": dict(expected_postcondition or {}),
+        "expected_state_relations": [dict(item) for item in expected_state_relations],
         "return_policy": return_policy,
         "applicable": applicable,
         "applicability_reason": applicability_reason,
@@ -674,6 +681,12 @@ def build_ledger(
                         )
                         or option.get("expected_patch")
                         or {}
+                    ),
+                    expected_state_relations=(
+                        (variant.get("option_relation_overrides") or {}).get(
+                            str(option.get("id") or "")
+                        )
+                        or ()
                     ),
                     return_policy=str(option.get("return_policy") or "fallback"),
                     applicability_reason="visible option contract",

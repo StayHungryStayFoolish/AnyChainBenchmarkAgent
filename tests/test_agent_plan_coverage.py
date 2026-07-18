@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 import sys
 
@@ -3449,6 +3450,358 @@ class PlanCoverageTest(unittest.TestCase):
         )
 
 
+class UnresolvedSemanticInventoryTest(unittest.TestCase):
+    @staticmethod
+    def _unresolved_plan(clause):
+        return {
+            "actions": [],
+            "semantic_units": [{
+                "unit_id": "compound-unit",
+                "clause_id": clause.clause_id,
+                "source_text": clause.text,
+                "disposition": "unresolved",
+                "action_indexes": [],
+                "reason": "initial planner omitted the demands",
+            }],
+        }
+
+    def test_compound_unresolved_unit_is_partitioned_without_routing(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _decompose_unresolved_semantic_units
+
+        text = "我要测试 BNB，用 mixed，QPS quick，并开启本地 Grafana"
+        clauses = segment_user_turn(text)
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "partitions": [{
+                "unit_id": "compound-unit",
+                "source_units": ["我要测试 BNB", "用 mixed", "QPS quick", "并开启本地 Grafana"],
+                "reason": "four independent configuration demands",
+            }],
+        }))
+
+        result_text, changed = _decompose_unresolved_semantic_units(
+            provider,
+            json.dumps(self._unresolved_plan(clauses[0])),
+            clauses,
+        )
+        result = json.loads(result_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(result["actions"], [])
+        self.assertEqual(
+            [unit["source_text"] for unit in result["semantic_units"]],
+            ["我要测试 BNB", "用 mixed", "QPS quick", "并开启本地 Grafana"],
+        )
+        self.assertTrue(all(unit["disposition"] == "unresolved" for unit in result["semantic_units"]))
+
+    def test_empty_planner_document_preserves_every_authoritative_clause_as_unresolved(self) -> None:
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _reconstruct_missing_semantic_units
+
+        text = "benchmark BNB and enable local Grafana\nQPS quick"
+        clauses = segment_user_turn(text)
+        provider = Mock()
+
+        result = json.loads(_reconstruct_missing_semantic_units(provider, "{}", clauses))
+
+        self.assertEqual(result["actions"], [])
+        self.assertEqual(
+            [unit["source_text"] for unit in result["semantic_units"]],
+            [clause.text for clause in clauses],
+        )
+        self.assertTrue(all(unit["disposition"] == "unresolved" for unit in result["semantic_units"]))
+        provider.complete.assert_not_called()
+
+    def test_malformed_empty_planner_output_preserves_source_without_inventing_actions(self) -> None:
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _reconstruct_missing_semantic_units
+
+        clauses = segment_user_turn("我要测试 BNB，用 mixed")
+        provider = Mock()
+
+        result = json.loads(_reconstruct_missing_semantic_units(provider, "not-json", clauses))
+
+        self.assertEqual(result["actions"], [])
+        self.assertEqual(result["semantic_units"][0]["source_text"], clauses[0].text)
+        self.assertEqual(result["semantic_units"][0]["action_indexes"], [])
+        provider.complete.assert_not_called()
+
+    def test_reordered_english_demands_use_the_same_partition_contract(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _decompose_unresolved_semantic_units
+
+        text = "Enable local Grafana, benchmark BNB, keep QPS quick, and use mixed RPC mode"
+        clauses = segment_user_turn(text)
+        anchors = ["Enable local Grafana", "benchmark BNB", "keep QPS quick", "and use mixed RPC mode"]
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "partitions": [{
+                "unit_id": "compound-unit",
+                "source_units": anchors,
+                "reason": "independent reordered demands",
+            }],
+        }))
+
+        result_text, changed = _decompose_unresolved_semantic_units(
+            provider,
+            json.dumps(self._unresolved_plan(clauses[0])),
+            clauses,
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            [unit["source_text"] for unit in json.loads(result_text)["semantic_units"]],
+            anchors,
+        )
+
+    def test_incomplete_partition_is_rejected_without_changing_the_plan(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _decompose_unresolved_semantic_units
+
+        text = "benchmark BNB and enable local Grafana"
+        clauses = segment_user_turn(text)
+        original = json.dumps(self._unresolved_plan(clauses[0]))
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "partitions": [{
+                "unit_id": "compound-unit",
+                "source_units": ["benchmark BNB", "local Grafana"],
+                "reason": "incorrectly omitted the enable instruction",
+            }],
+        }))
+
+        result_text, changed = _decompose_unresolved_semantic_units(provider, original, clauses)
+
+        self.assertFalse(changed)
+        self.assertEqual(json.loads(result_text), json.loads(original))
+        self.assertEqual(provider.complete.call_count, 2)
+
+    def test_invalid_first_partition_retries_before_owner_recovery(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _decompose_unresolved_semantic_units
+
+        text = "benchmark BNB and enable local Grafana"
+        clauses = segment_user_turn(text)
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps({
+                "partitions": [{
+                    "unit_id": "compound-unit",
+                    "source_units": ["benchmark BNB", "local Grafana"],
+                    "reason": "incomplete first attempt",
+                }],
+            })),
+            SimpleNamespace(text=json.dumps({
+                "partitions": [{
+                    "unit_id": "compound-unit",
+                    "source_units": ["benchmark BNB", "and enable local Grafana"],
+                    "reason": "complete second attempt",
+                }],
+            })),
+        ]
+
+        result_text, changed = _decompose_unresolved_semantic_units(
+            provider,
+            json.dumps(self._unresolved_plan(clauses[0])),
+            clauses,
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(provider.complete.call_count, 2)
+        self.assertEqual(
+            [unit["source_text"] for unit in json.loads(result_text)["semantic_units"]],
+            ["benchmark BNB", "and enable local Grafana"],
+        )
+
+    def test_all_invalid_partition_attempts_leave_original_plan_unchanged(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _decompose_unresolved_semantic_units
+
+        text = "benchmark BNB and enable local Grafana"
+        clauses = segment_user_turn(text)
+        original = json.dumps(self._unresolved_plan(clauses[0]))
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text="{}"),
+            SimpleNamespace(text=json.dumps({
+                "partitions": [{
+                    "unit_id": "compound-unit",
+                    "source_units": ["benchmark BNB", "local Grafana"],
+                    "reason": "still incomplete",
+                }],
+            })),
+        ]
+
+        result_text, changed = _decompose_unresolved_semantic_units(provider, original, clauses)
+
+        self.assertFalse(changed)
+        self.assertEqual(provider.complete.call_count, 2)
+        self.assertEqual(json.loads(result_text), json.loads(original))
+
+    def test_partitioned_demands_recover_through_four_registered_owners(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
+        from agent.harness.intent import (
+            _decompose_unresolved_semantic_units,
+            _recover_registry_bounded_semantic_actions,
+        )
+        from agent.harness.state import new_state
+
+        text = "我要测试 BNB，用 mixed，QPS quick，并开启本地 Grafana"
+        clauses = segment_user_turn(text)
+        partition_provider = Mock()
+        partition_provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "partitions": [{
+                "unit_id": "compound-unit",
+                "source_units": ["我要测试 BNB", "用 mixed", "QPS quick", "并开启本地 Grafana"],
+                "reason": "four independent demands",
+            }],
+        }))
+        decomposed, changed = _decompose_unresolved_semantic_units(
+            partition_provider,
+            json.dumps(self._unresolved_plan(clauses[0])),
+            clauses,
+        )
+        self.assertTrue(changed)
+
+        decisions = [
+            {
+                "unit_id": f"compound-unit.part-{index}",
+                "disposition": "owner_mutation",
+                "group": group,
+                "consultation_topic": "",
+                "target_mode": "",
+                "turn_local_action_type": "",
+                "existing_action_index": None,
+                "evidence_quote": quote,
+                "reason": "registered owner demand",
+            }
+            for index, (group, quote) in enumerate(
+                [
+                    ("chain_identity", "BNB"),
+                    ("workload_rpc", "mixed"),
+                    ("qps_profile", "QPS quick"),
+                    ("observability", "本地 Grafana"),
+                ],
+                start=1,
+            )
+        ]
+        recovery_provider = Mock()
+        recovery_provider.complete.return_value = SimpleNamespace(text=json.dumps({"decisions": decisions}))
+
+        def owned_action(_provider, group, source):
+            return {
+                "chain_identity": {"type": "choose_chain", "chain_text": "BNB", "source_evidence": source},
+                "workload_rpc": {"type": "set_rpc_mode", "rpc_mode": "mixed", "mutation_explicit": True, "source_evidence": source},
+                "qps_profile": {"type": "set_qps_mode", "qps_mode": "quick", "mutation_explicit": True, "source_evidence": source},
+                "observability": {"type": "set_observability", "observability_mode": "local", "mutation_explicit": True, "source_evidence": source},
+            }[group]
+
+        with patch("agent.harness.intent._resolve_owned_group_mutation", side_effect=owned_action):
+            recovered_text, recovered = _recover_registry_bounded_semantic_actions(
+                recovery_provider,
+                decomposed,
+                clauses,
+                new_state("compound-recovery", language="zh"),
+                text,
+            )
+        payload = json.loads(recovered_text)
+
+        self.assertTrue(recovered)
+        self.assertEqual(
+            [action["type"] for action in payload["actions"]],
+            ["choose_chain", "set_rpc_mode", "set_qps_mode", "set_observability"],
+        )
+        self.assertTrue(all(unit["disposition"] == "action" for unit in payload["semantic_units"]))
+
+    def test_unsplit_compound_unit_recovers_multiple_owner_actions_and_mode_barrier(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
+        from agent.harness.intent import _recover_registry_bounded_semantic_actions
+        from agent.harness.state import new_state
+
+        text = "我要测试 BNB，用 mixed，QPS quick，并开启本地 Grafana"
+        clauses = segment_user_turn(text)
+        decisions = [{
+            "unit_id": "compound-unit",
+            "disposition": "unresolved_target_mode",
+            "group": "",
+            "consultation_topic": "",
+            "target_mode": "",
+            "turn_local_action_type": "",
+            "existing_action_index": None,
+            "evidence_quote": "我要测试 BNB",
+            "reason": "benchmark requested without selecting its target mode",
+        }]
+        decisions.extend({
+            "unit_id": "compound-unit",
+            "disposition": "owner_mutation",
+            "group": group,
+            "consultation_topic": "",
+            "target_mode": "",
+            "turn_local_action_type": "",
+            "existing_action_index": None,
+            "evidence_quote": quote,
+            "reason": "independent registered owner demand",
+        } for group, quote in [
+            ("chain_identity", "BNB"),
+            ("workload_rpc", "mixed"),
+            ("qps_profile", "QPS quick"),
+            ("observability", "本地 Grafana"),
+        ])
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(
+            text=json.dumps({"decisions": decisions})
+        )
+
+        def owned_action(_provider, group, source):
+            return {
+                "chain_identity": {"type": "choose_chain", "chain_text": "BNB", "source_evidence": source},
+                "workload_rpc": {"type": "set_rpc_mode", "rpc_mode": "mixed", "mutation_explicit": True, "source_evidence": source},
+                "qps_profile": {"type": "set_qps_mode", "qps_mode": "quick", "mutation_explicit": True, "source_evidence": source},
+                "observability": {"type": "set_observability", "observability_mode": "local", "mutation_explicit": True, "source_evidence": source},
+            }[group]
+
+        with patch("agent.harness.intent._resolve_owned_group_mutation", side_effect=owned_action):
+            recovered_text, recovered = _recover_registry_bounded_semantic_actions(
+                provider,
+                json.dumps(self._unresolved_plan(clauses[0])),
+                clauses,
+                new_state("unsplit-compound-recovery", language="zh"),
+                text,
+            )
+        payload = json.loads(recovered_text)
+
+        self.assertTrue(recovered)
+        self.assertEqual(
+            [action["type"] for action in payload["actions"]],
+            [
+                "request_target_mode_selection",
+                "choose_chain",
+                "set_rpc_mode",
+                "set_qps_mode",
+                "set_observability",
+            ],
+        )
+        self.assertEqual(payload["semantic_units"][0]["action_indexes"], [0, 1, 2, 3, 4])
+        self.assertEqual(payload["semantic_units"][0]["disposition"], "action")
+
+
 class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
     @staticmethod
     def _provider(decisions):
@@ -3802,6 +4155,53 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
             original,
             clauses,
             new_state("recovery-conflicting-modes", language="en"),
+            user_text,
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(recovered_text, original)
+
+    def test_explicit_and_unresolved_target_mode_recovery_fail_closed(self) -> None:
+        import json
+
+        from agent.harness.intent import _recover_registry_bounded_semantic_actions
+        from agent.harness.state import new_state
+
+        user_text = "Run fake-node, although the target mode is still undecided."
+        clauses = segment_user_turn(user_text)
+        payload = {
+            "actions": [],
+            "semantic_units": [
+                self._unit(clauses[0], "unit-1", [], disposition="unresolved")
+            ],
+        }
+        provider = self._provider([
+            {
+                "unit_id": "unit-1",
+                "disposition": "explicit_target_mode",
+                "group": "",
+                "target_mode": "fake-node",
+                "consultation_topic": "",
+                "evidence_quote": "fake-node",
+                "reason": "explicit selection",
+            },
+            {
+                "unit_id": "unit-1",
+                "disposition": "unresolved_target_mode",
+                "group": "",
+                "target_mode": "",
+                "consultation_topic": "",
+                "evidence_quote": "target mode is still undecided",
+                "reason": "contradictory unresolved conclusion",
+            },
+        ])
+        original = json.dumps(payload)
+
+        recovered_text, changed = _recover_registry_bounded_semantic_actions(
+            provider,
+            original,
+            clauses,
+            new_state("recovery-explicit-unresolved-mode", language="en"),
             user_text,
         )
 

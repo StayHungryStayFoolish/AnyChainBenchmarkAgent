@@ -114,6 +114,7 @@ class ActionSpec:
     constraints: tuple[str, ...] = ()
     suppressed_by: tuple[str, ...] = ()
     semantic_recovery_source_argument: str = ""
+    pending_option_semantic: str = ""
     validator: ActionValidator | None = None
 
     @property
@@ -203,6 +204,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         lifetime="turn_local",
         required_arguments=("source_evidence",),
         suppressed_by=("change_group", "go_back"),
+        pending_option_semantic="continue_current_flow",
     ),
     ActionSpec("go_back", "coordinator", "Return to the most recent relevant interrupted group."),
     ActionSpec(

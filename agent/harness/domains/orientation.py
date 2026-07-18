@@ -70,6 +70,11 @@ def resume_question(state: AgentGraphState) -> dict[str, Any]:
                 "id": "1",
                 "label": "1",
                 "value": values[0],
+                **(
+                    {"semantic_action": "continue_current_flow"}
+                    if values[0] == "continue"
+                    else {}
+                ),
                 "expected_patch": {"checkpoint_recovery.status": "quarantined"}
                 if values[0] == "inspect_quarantine"
                 else {"pending_question": {}},

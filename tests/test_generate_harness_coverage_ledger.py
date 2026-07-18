@@ -72,6 +72,53 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
         }
         self.assertGreaterEqual(len(resume_variants), 2)
 
+    def test_resume_variants_use_saved_context_relations_not_literal_groups(self) -> None:
+        resume_edges = [
+            edge for edge in self.ledger["edges"]
+            if edge["group"] == "opening"
+            and edge["question_id"] == "resume_harness_session"
+            and edge["option_id"] == "1"
+            and edge["input_class"] == "exact_option"
+            and edge["expected_state_relations"]
+        ]
+        self.assertEqual(len(resume_edges), 2)
+        self.assertEqual(
+            {tuple(edge["catalog_scenario_ids"]) for edge in resume_edges},
+            {("resume",), ("resume_qps",)},
+        )
+        for edge in resume_edges:
+            self.assertEqual(edge["expected_postcondition"], {"resume_context": {}})
+            self.assertNotIn("chain_identity", json.dumps(edge["expected_state_relations"]))
+            self.assertNotIn("qps_profile", json.dumps(edge["expected_state_relations"]))
+            self.assertIn(
+                {
+                    "kind": "path_equals_before_path",
+                    "after_path": "action_queue",
+                    "before_path": "action_queue",
+                },
+                edge["expected_state_relations"],
+            )
+
+    def test_relation_only_postcondition_requires_both_paths_to_exist(self) -> None:
+        from tests.agent_live.execute_harness_contract_ledger import _verify_postcondition
+
+        edge = {
+            "edge_type": "question_option",
+            "expected_postcondition": {},
+            "expected_state_relations": [{
+                "kind": "path_equals_before_path",
+                "after_path": "active_group",
+                "before_path": "resume_context.active_group",
+            }],
+            "return_policy": "fallback",
+        }
+        before = {"resume_context": {"active_group": "qps_profile"}, "turn_index": 1}
+        after = {"active_group": "qps_profile", "turn_index": 2}
+
+        _verify_postcondition(edge, "1", before, after, expected_admitted=True)
+        with self.assertRaisesRegex(AssertionError, "state relation path is absent"):
+            _verify_postcondition(edge, "1", {}, after, expected_admitted=True)
+
     def test_edge_identity_ignores_volatile_scenario_session_timestamps(self) -> None:
         with patch("agent.harness.state._utc_timestamp", return_value="2026-01-01T00:00:00Z"):
             first = build_ledger(revision=self.revision)

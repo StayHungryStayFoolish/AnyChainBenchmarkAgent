@@ -761,6 +761,66 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         self.assertEqual(result["active_group"], "chain_identity")
         self.assertEqual(result["pending_question"]["id"], "chain")
         self.assertIn("哪条链", "\n".join(result.get("visible_response") or []))
+        self.assertEqual(
+            [item.get("type") for item in (result.get("turn_context") or {}).get("admitted_actions") or []],
+            ["resume_current_flow"],
+        )
+        self.assertNotIn("不像当前问题的答案", "\n".join(result.get("visible_response") or []))
+
+    def test_registered_resume_semantic_selects_the_declared_resume_option(self) -> None:
+        from agent.harness.domains.orientation import resume_question
+        from agent.harness.domains.performance import question_for_performance
+        from agent.harness.state import new_state
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+
+        state = new_state("resume-semantic", language="en")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "qps_profile": {"mode": "quick", "confirmed": False, "default_decision_made": False},
+        })
+        saved_question = question_for_performance(state, "qps_profile") or {}
+        state["resume_context"] = {
+            "active_group": "qps_profile",
+            "pending_question": saved_question,
+        }
+        deferred = [
+            {
+                "action_id": "deferred-chain",
+                "type": "choose_chain",
+                "chain_text": "BNB",
+                "source_evidence": "keep BNB",
+            },
+            {
+                "action_id": "deferred-observability",
+                "type": "set_observability",
+                "observability_mode": "local",
+                "mutation_explicit": True,
+                "source_evidence": "keep local observability",
+            },
+        ]
+        state["action_queue"] = deferred
+        state["pending_question"] = resume_question(state)
+        state["active_group"] = "opening"
+        state["last_user_input"] = "Continue the saved configuration."
+
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            return_value={"actions": [{
+                "type": "resume_current_flow",
+                "source_evidence": "Continue the saved configuration",
+                "confidence": "high",
+            }]},
+        ):
+            result = process_turn(state)
+
+        self.assertEqual(result["active_group"], "qps_profile")
+        self.assertEqual(result["pending_question"]["id"], "qps_profile_confirm")
+        self.assertEqual(result.get("resume_context"), {})
+        self.assertEqual(result.get("action_queue"), deferred)
+        admitted = (result.get("turn_context") or {}).get("admitted_actions") or []
+        self.assertTrue(admitted)
+        self.assertTrue(all(item.get("type") == "answer_pending" for item in admitted))
 
     def test_opening_menu_info_option_shows_capability_content_not_a_dead_loop(self) -> None:
         """Selecting the opening menu's 4th numbered option ("learn supported

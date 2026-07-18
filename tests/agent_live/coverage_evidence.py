@@ -795,6 +795,12 @@ def verify_runtime_postcondition(
             expected_hash = content_hash(value)
             if committed.after_value_hashes.get(str(path)) != expected_hash:
                 errors.append(f"expected postcondition was not observed: {path}")
+        _verify_runtime_state_relations(
+            tuple(edge.get("expected_state_relations") or ()),
+            baseline,
+            committed,
+            errors,
+        )
     elif edge_type == "manual_input":
         path = str(expected.get("path") or "").strip()
         if path:
@@ -829,6 +835,48 @@ def verify_runtime_postcondition(
         next_question_or_result=next_result,
         details=details,
     )
+
+
+def _verify_runtime_state_relations(
+    relations: tuple[Mapping[str, Any], ...],
+    baseline: RuntimeTurnEvent,
+    committed: RuntimeTurnEvent,
+    errors: list[str],
+) -> None:
+    for relation in relations:
+        kind = str(relation.get("kind") or "")
+        if kind == "path_equals_before_path":
+            after_path = str(relation.get("after_path") or "")
+            before_path = str(relation.get("before_path") or "")
+            if (
+                not before_path
+                or not after_path
+                or before_path not in baseline.after_value_hashes
+                or after_path not in committed.after_value_hashes
+                or baseline.after_value_hashes[before_path] != committed.after_value_hashes[after_path]
+            ):
+                errors.append(f"state relation was not observed: {after_path} <- {before_path}")
+            continue
+        if kind == "prefix_equals_before_prefix":
+            after_prefix = str(relation.get("after_prefix") or "")
+            before_prefix = str(relation.get("before_prefix") or "")
+            ignored = {str(item) for item in relation.get("ignored_suffixes") or ()}
+            before_values = {
+                path[len(before_prefix):]: value
+                for path, value in baseline.after_value_hashes.items()
+                if path == before_prefix or path.startswith(f"{before_prefix}.")
+                if path.rsplit(".", 1)[-1] not in ignored
+            }
+            after_values = {
+                path[len(after_prefix):]: value
+                for path, value in committed.after_value_hashes.items()
+                if path == after_prefix or path.startswith(f"{after_prefix}.")
+                if path.rsplit(".", 1)[-1] not in ignored
+            }
+            if not before_values or not after_values or before_values != after_values:
+                errors.append(f"state prefix relation was not observed: {after_prefix} <- {before_prefix}")
+            continue
+        errors.append(f"unsupported state relation: {kind or '<empty>'}")
 
 
 def validate_evidence_artifact(

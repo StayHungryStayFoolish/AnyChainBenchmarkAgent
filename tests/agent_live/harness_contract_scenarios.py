@@ -33,6 +33,7 @@ class QuestionScenario:
     source: str = "catalog"
     manual_postcondition_path: str = ""
     option_postcondition_overrides: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    option_relation_overrides: Mapping[str, tuple[Mapping[str, Any], ...]] = field(default_factory=dict)
 
     @property
     def executable(self) -> bool:
@@ -121,6 +122,7 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
         source: str = "reviewed_seed",
         manual_postcondition_path: str = "",
         option_postcondition_overrides: Mapping[str, Mapping[str, Any]] | None = None,
+        option_relation_overrides: Mapping[str, tuple[Mapping[str, Any], ...]] | None = None,
     ) -> None:
         if not question:
             return
@@ -133,26 +135,67 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
             source,
             manual_postcondition_path,
             deepcopy(dict(option_postcondition_overrides or {})),
+            deepcopy(dict(option_relation_overrides or {})),
         )
 
     opening_state = new_state("coverage-opening", language=language, session_purpose="coverage")
     opening = opening_question(opening_state)
     add("opening", opening_state, opening)
 
+    from agent.harness.domains.orientation import resume_question
+
+    resume_relations = {
+        "1": (
+            {
+                "kind": "path_equals_before_path",
+                "after_path": "active_group",
+                "before_path": "resume_context.active_group",
+            },
+            {
+                "kind": "prefix_equals_before_prefix",
+                "after_prefix": "pending_question",
+                "before_prefix": "resume_context.pending_question",
+                "ignored_suffixes": ["created_turn_index", "resume_action_queue"],
+            },
+            {
+                "kind": "path_equals_before_path",
+                "after_path": "action_queue",
+                "before_path": "action_queue",
+            },
+        )
+    }
     resume_state = new_state("coverage-resume", language=language, session_purpose="coverage")
     resume_state["target_mode"] = "fake-node"
-    from agent.harness.domains.orientation import resume_question
+    saved_chain_question = question_for_chain_rpc(resume_state, "chain_identity") or {}
+    resume_state["resume_context"] = {
+        "active_group": "chain_identity",
+        "pending_question": deepcopy(dict(saved_chain_question)),
+    }
     add(
         "resume",
         resume_state,
         resume_question(resume_state),
-        option_postcondition_overrides={
-            "1": {
-                "target_mode": "fake-node",
-                "active_group": "chain_identity",
-                "pending_question.id": "chain",
-            }
-        },
+        option_postcondition_overrides={"1": {"resume_context": {}}},
+        option_relation_overrides=resume_relations,
+    )
+
+    resume_qps_state = new_state("coverage-resume-qps", language=language, session_purpose="coverage")
+    resume_qps_state.update({
+        "target_mode": "fake-node",
+        "workflow_mode": "rpc_benchmark",
+        "qps_profile": {"mode": "quick", "confirmed": False, "default_decision_made": False},
+    })
+    saved_qps_question = question_for_performance(resume_qps_state, "qps_profile") or {}
+    resume_qps_state["resume_context"] = {
+        "active_group": "qps_profile",
+        "pending_question": deepcopy(dict(saved_qps_question)),
+    }
+    add(
+        "resume_qps",
+        resume_qps_state,
+        resume_question(resume_qps_state),
+        option_postcondition_overrides={"1": {"resume_context": {}}},
+        option_relation_overrides=resume_relations,
     )
 
     detected_state = new_state("coverage-provider-detected", language=language, session_purpose="coverage")

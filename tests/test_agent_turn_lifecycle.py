@@ -22,7 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class TurnBudgetContractTest(unittest.TestCase):
-    def test_repair_uses_remaining_whole_turn_budget(self) -> None:
+    def test_bounded_recovery_and_repair_use_remaining_whole_turn_budget(self) -> None:
         from agent.harness.intent import resolve_action_queue
         from agent.llm.types import LLMResponse, llm_turn_scope, remaining_turn_seconds
 
@@ -40,8 +40,10 @@ class TurnBudgetContractTest(unittest.TestCase):
             with llm_turn_scope(0.25):
                 resolve_action_queue({}, "hello")
 
-        self.assertEqual(len(observed), 2)
+        self.assertGreaterEqual(len(observed), 2)
+        self.assertLessEqual(len(observed), 8)
         self.assertLess(observed[1], observed[0] - 0.02)
+        self.assertTrue(all(later <= earlier for earlier, later in zip(observed, observed[1:])))
 
     def test_distinct_resolvers_share_the_same_turn_deadline(self) -> None:
         from agent.harness.intent import resolve_action_queue, resolve_unknown_chain_identity

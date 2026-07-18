@@ -175,6 +175,13 @@ def _recover_and_validate_semantic_actions(
 
     if validation.valid:
         return plan_text, validation
+    plan_text, decomposed = _decompose_unresolved_semantic_units(
+        provider,
+        plan_text,
+        clauses,
+    )
+    if decomposed:
+        validation = _validate_action_document(plan_text, clauses, state)
     recovered, changed = _recover_registry_bounded_semantic_actions(
         provider,
         plan_text,
@@ -198,6 +205,135 @@ def _recover_and_validate_semantic_actions(
             state,
         )
     return recovered, recovered_validation
+
+
+def _decompose_unresolved_semantic_units(
+    provider: Any,
+    plan_text: str,
+    clauses: tuple[TurnClause, ...],
+) -> tuple[str, bool]:
+    """Partition compound unresolved prose before owner-domain recovery.
+
+    This stage identifies independently actionable source spans only. It has no
+    action schema and cannot select a group, action, value, or workflow path.
+    Every proposed split must remain a complete, ordered, exact partition of
+    the original unresolved unit before the registry-bounded recovery stage can
+    see it.
+    """
+
+    payload = _parse_json_object(plan_text)
+    units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
+    candidates = [
+        unit
+        for unit in units
+        if isinstance(unit, dict)
+        and str(unit.get("disposition") or "") == "unresolved"
+        and not (unit.get("action_indexes") if isinstance(unit.get("action_indexes"), list) else [])
+        and str(unit.get("source_text") or "").strip()
+    ]
+    if not candidates:
+        return plan_text, False
+
+    replacements: dict[str, list[dict[str, Any]]] = {}
+    for _attempt in range(2):
+        replacements = _request_validated_semantic_partitions(provider, candidates)
+        if replacements:
+            break
+    if not replacements:
+        return plan_text, False
+
+    expanded: list[dict[str, Any]] = []
+    for unit in units:
+        if not isinstance(unit, dict):
+            continue
+        expanded.extend(replacements.get(str(unit.get("unit_id") or ""), [unit]))
+    candidate = dict(payload)
+    candidate["semantic_units"] = expanded
+    coverage = validate_plan_coverage(candidate, clauses)
+    if coverage.errors:
+        return plan_text, False
+    return json.dumps(candidate, ensure_ascii=False, sort_keys=True), True
+
+
+def _request_validated_semantic_partitions(
+    provider: Any,
+    candidates: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Request one partition candidate and admit only exact source proofs."""
+
+    ensure_turn_active()
+    response = provider.complete(LLMRequest(
+        messages=[
+            LLMMessage(
+                role="system",
+                content=(
+                    "Partition unresolved AnyChain prose into independently actionable semantic source units. "
+                    "Return JSON only: {partitions:[{unit_id:string,source_units:[string],reason:string}]}. "
+                    "Review every supplied unit exactly once. Split only when the source contains multiple "
+                    "independent present requests, selections, mutations, questions, navigation demands, evidence "
+                    "submissions, or execution instructions. Keep one full source unit when it expresses one demand "
+                    "or cannot be split safely. Every source_units entry must be a non-empty exact contiguous excerpt "
+                    "of source_text, in source order. Together the excerpts must cover all words; punctuation and "
+                    "whitespace between adjacent excerpts may remain between anchors. Do not classify, route, answer, "
+                    "infer defaults, name internal actions, or invent text."
+                ),
+            ),
+            LLMMessage(
+                role="user",
+                content=json.dumps({
+                    "units": [
+                        {
+                            "unit_id": str(unit.get("unit_id") or ""),
+                            "source_text": str(unit.get("source_text") or ""),
+                        }
+                        for unit in candidates
+                    ],
+                }, ensure_ascii=False, sort_keys=True),
+            ),
+        ],
+        temperature=0.0,
+        max_tokens=900,
+    ))
+    result = _parse_json_object(response.text)
+    partitions = result.get("partitions") if isinstance(result.get("partitions"), list) else []
+    by_unit = {
+        str(row.get("unit_id") or ""): row
+        for row in partitions
+        if isinstance(row, dict) and str(row.get("unit_id") or "")
+    }
+
+    replacements: dict[str, list[dict[str, Any]]] = {}
+    for unit in candidates:
+        unit_id = str(unit.get("unit_id") or "")
+        source = str(unit.get("source_text") or "")
+        row = by_unit.get(unit_id) or {}
+        anchors = row.get("source_units") if isinstance(row.get("source_units"), list) else []
+        anchors = [str(anchor) for anchor in anchors if str(anchor)]
+        if len(anchors) < 2:
+            continue
+        local_clause = TurnClause("unresolved-source", source, "prose")
+        local_units = [
+            {
+                "unit_id": f"{unit_id}.part-{index}",
+                "clause_id": local_clause.clause_id,
+                "source_text": anchor,
+                "disposition": "unresolved",
+                "action_indexes": [],
+                "reason": "independent demand awaiting registry-bounded recovery",
+            }
+            for index, anchor in enumerate(anchors, start=1)
+        ]
+        partition_check = validate_plan_coverage(
+            {"actions": [], "semantic_units": local_units},
+            (local_clause,),
+        )
+        if partition_check.errors:
+            continue
+        replacements[unit_id] = [
+            {**partition_unit, "clause_id": str(unit.get("clause_id") or "")}
+            for partition_unit in local_units
+        ]
+    return replacements
 
 
 def _apply_state_plan_policy(text: str, state: AgentGraphState) -> str:
@@ -384,7 +520,21 @@ def _reconstruct_missing_semantic_units(
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
     units = payload.get("semantic_units")
     if not actions:
-        return text
+        if isinstance(units, list) and units:
+            return text
+        payload["actions"] = []
+        payload["semantic_units"] = [
+            {
+                "unit_id": f"{clause.clause_id}-unresolved",
+                "clause_id": clause.clause_id,
+                "source_text": clause.text,
+                "disposition": "unresolved",
+                "action_indexes": [],
+                "reason": "authoritative source clause omitted by the planner",
+            }
+            for clause in clauses
+        ]
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
     if isinstance(units, list) and units:
         coverage = validate_plan_coverage(payload, clauses)
         reconstructable_prefixes = (
@@ -2380,7 +2530,13 @@ def _recover_registry_bounded_semantic_actions(
                     "existing_action_index:integer|null,"
                     "target_mode:'fake-node'|'real-node'|'sync-observe'|'',"
                     "consultation_topic:string,turn_local_action_type:string,evidence_quote:string,"
-                    "reason:string}]}. Review every supplied unit exactly once. Use navigation only when source_text "
+                    "reason:string}]}. Review every supplied unit. Return one decision for a unit with one semantic "
+                    "demand. When one unsplit unit contains multiple independent present demands, return one decision "
+                    "per demand with the same unit_id and a distinct shortest exact evidence_quote; this is required "
+                    "even when a prior partition stage did not split the prose. Multiple decisions for one unit may "
+                    "combine owner_mutation with unresolved_target_mode or one explicit_target_mode, but must not mix "
+                    "context, ambiguity, consultation, navigation, resume, or turn-local handling with configuration "
+                    "mutations. Use navigation only when source_text "
                     "explicitly asks to visit, return to, or configure one exact registered group without supplying a "
                     "more specific value change. Use owner_mutation only when it explicitly asks to change/customize a "
                     "value owned by one exact group. Use generic_resume only when it asks to resume the current workflow "
@@ -2436,95 +2592,122 @@ def _recover_registry_bounded_semantic_actions(
     ))
     result = _parse_json_object(response.text)
     decisions = result.get("decisions") if isinstance(result.get("decisions"), list) else []
-    by_unit = {
-        str(row.get("unit_id") or ""): row
-        for row in decisions
-        if isinstance(row, dict) and str(row.get("unit_id") or "")
-    }
+    by_unit: dict[str, list[dict[str, Any]]] = {}
+    for row in decisions:
+        if not isinstance(row, dict) or not str(row.get("unit_id") or ""):
+            continue
+        by_unit.setdefault(str(row["unit_id"]), []).append(row)
     known_groups = {str(row["name"]) for row in group_schema()}
     sibling_navigation_indexes = {
         int(row["action_index"])
         for row in sibling_navigations
     }
-    replacements: dict[str, dict[str, Any]] = {}
+    replacements: dict[str, list[dict[str, Any]]] = {}
     shared_navigation_indexes: dict[str, int] = {}
     context_unit_ids: set[str] = set()
     for candidate in candidates:
         unit_id = candidate["unit_id"]
         source = candidate["source_text"]
-        decision = by_unit.get(unit_id) or {}
-        disposition = str(decision.get("disposition") or "")
-        quote = str(decision.get("evidence_quote") or "").strip()
-        group = str(decision.get("group") or "").strip()
-        topic = str(decision.get("consultation_topic") or "").strip()
-        target_mode = str(decision.get("target_mode") or "").strip()
-        turn_local_action_type = str(decision.get("turn_local_action_type") or "").strip()
-        existing_action_index = decision.get("existing_action_index")
-        if not quote or quote not in source:
+        unit_decisions = by_unit.get(unit_id) or []
+        if not unit_decisions:
             return plan_text, False
-        if (
-            disposition == "shared_navigation"
-            and isinstance(existing_action_index, int)
-            and existing_action_index in sibling_navigation_indexes
-        ):
-            shared_navigation_indexes[unit_id] = existing_action_index
-            continue
-        if disposition == "context":
-            context_unit_ids.add(unit_id)
-            continue
-        if disposition == "navigation" and group in known_groups:
-            replacement = {
-                "type": "change_group",
-                "group": group,
-                "navigation_explicit": True,
-                "source_evidence": user_text,
-            }
-        elif disposition == "generic_resume" and state.get("pending_question"):
-            replacement = {
-                "type": "resume_current_flow",
-                "source_evidence": quote,
-            }
-        elif disposition == "consultation" and topic in CONSULTATION_TOPICS:
-            replacement = {
-                "type": "answer_opening_question",
-                "topic": topic,
-                "source_evidence": user_text,
-            }
-        elif disposition == "turn_local_action" and turn_local_action_type in recoverable_turn_local_by_type:
-            recovery_contract = recoverable_turn_local_by_type[turn_local_action_type]
-            replacement = {
-                "type": turn_local_action_type,
-                str(recovery_contract["source_argument"]): user_text,
-            }
-        elif disposition == "unresolved_target_mode":
-            replacement = {
-                "type": "request_target_mode_selection",
-                "source_evidence": quote,
-            }
-        elif disposition == "explicit_target_mode" and target_mode in {"fake-node", "real-node", "sync-observe"}:
-            replacement = {
-                "type": "choose_target_mode",
-                "target_mode": target_mode,
-                "target_mode_explicit": True,
-                "source_evidence": quote,
-            }
-        elif disposition == "owner_mutation" and group in known_groups:
-            replacement = _resolve_owned_group_mutation(provider, group, source)
-            if replacement is None:
+        dispositions = {str(row.get("disposition") or "") for row in unit_decisions}
+        if len(unit_decisions) > 1 and dispositions.difference({
+            "owner_mutation",
+            "explicit_target_mode",
+            "unresolved_target_mode",
+        }):
+            return plan_text, False
+        unit_replacements: list[dict[str, Any]] = []
+        seen_replacements: set[str] = set()
+        for decision in unit_decisions:
+            disposition = str(decision.get("disposition") or "")
+            quote = str(decision.get("evidence_quote") or "").strip()
+            group = str(decision.get("group") or "").strip()
+            topic = str(decision.get("consultation_topic") or "").strip()
+            target_mode = str(decision.get("target_mode") or "").strip()
+            turn_local_action_type = str(decision.get("turn_local_action_type") or "").strip()
+            existing_action_index = decision.get("existing_action_index")
+            if not quote or quote not in source:
                 return plan_text, False
-        else:
-            return plan_text, False
-        try:
-            replacements[unit_id] = validate_action_contract(replacement)
-        except ValueError:
-            return plan_text, False
+            if (
+                disposition == "shared_navigation"
+                and isinstance(existing_action_index, int)
+                and existing_action_index in sibling_navigation_indexes
+            ):
+                shared_navigation_indexes[unit_id] = existing_action_index
+                continue
+            if disposition == "context":
+                context_unit_ids.add(unit_id)
+                continue
+            if disposition == "navigation" and group in known_groups:
+                replacement = {
+                    "type": "change_group",
+                    "group": group,
+                    "navigation_explicit": True,
+                    "source_evidence": user_text,
+                }
+            elif disposition == "generic_resume" and state.get("pending_question"):
+                replacement = {
+                    "type": "resume_current_flow",
+                    "source_evidence": quote,
+                }
+            elif disposition == "consultation" and topic in CONSULTATION_TOPICS:
+                replacement = {
+                    "type": "answer_opening_question",
+                    "topic": topic,
+                    "source_evidence": user_text,
+                }
+            elif disposition == "turn_local_action" and turn_local_action_type in recoverable_turn_local_by_type:
+                recovery_contract = recoverable_turn_local_by_type[turn_local_action_type]
+                replacement = {
+                    "type": turn_local_action_type,
+                    str(recovery_contract["source_argument"]): user_text,
+                }
+            elif disposition == "unresolved_target_mode":
+                replacement = {
+                    "type": "request_target_mode_selection",
+                    "source_evidence": quote,
+                }
+            elif disposition == "explicit_target_mode" and target_mode in {"fake-node", "real-node", "sync-observe"}:
+                replacement = {
+                    "type": "choose_target_mode",
+                    "target_mode": target_mode,
+                    "target_mode_explicit": True,
+                    "source_evidence": quote,
+                }
+            elif disposition == "owner_mutation" and group in known_groups:
+                replacement = _resolve_owned_group_mutation(provider, group, quote)
+                if replacement is None:
+                    return plan_text, False
+            else:
+                return plan_text, False
+            try:
+                replacement = validate_action_contract(replacement)
+            except ValueError:
+                return plan_text, False
+            replacement_key = json.dumps(replacement, ensure_ascii=False, sort_keys=True)
+            if replacement_key in seen_replacements:
+                continue
+            seen_replacements.add(replacement_key)
+            unit_replacements.append(replacement)
+        if unit_replacements:
+            replacements[unit_id] = unit_replacements
 
     recovered_target_modes = {
         str(action.get("target_mode") or "")
-        for action in replacements.values()
+        for unit_actions in replacements.values()
+        for action in unit_actions
         if str(action.get("type") or "") == "choose_target_mode"
     }
-    if len(recovered_target_modes) > 1:
+    recovered_unresolved_target_mode = any(
+        str(action.get("type") or "") == "request_target_mode_selection"
+        for unit_actions in replacements.values()
+        for action in unit_actions
+    )
+    if len(recovered_target_modes) > 1 or (
+        recovered_target_modes and recovered_unresolved_target_mode
+    ):
         return plan_text, False
 
     filtered_text, _ = _remove_rejected_action_indexes(
@@ -2582,23 +2765,26 @@ def _recover_registry_bounded_semantic_actions(
             unit["disposition"] = "context"
             unit["reason"] = "registry-bounded non-action context recovery"
             continue
-        replacement = replacements.get(unit_id)
-        if replacement is None:
+        unit_replacements = replacements.get(unit_id)
+        if not unit_replacements:
             continue
-        action_type = str(replacement.get("type") or "")
-        merge_key = (
-            action_type,
-            str(replacement.get("group") or replacement.get("topic") or replacement.get("target_mode") or ""),
-        )
-        if action_type in shareable_action_types and merge_key in shared_indexes:
-            action_index = shared_indexes[merge_key]
-        else:
-            action_index = len(recovered_actions)
-            recovered_actions.append(replacement)
-            if action_type in shareable_action_types:
-                shared_indexes[merge_key] = action_index
+        recovered_indexes: list[int] = []
+        for replacement in unit_replacements:
+            action_type = str(replacement.get("type") or "")
+            merge_key = (
+                action_type,
+                str(replacement.get("group") or replacement.get("topic") or replacement.get("target_mode") or ""),
+            )
+            if action_type in shareable_action_types and merge_key in shared_indexes:
+                action_index = shared_indexes[merge_key]
+            else:
+                action_index = len(recovered_actions)
+                recovered_actions.append(replacement)
+                if action_type in shareable_action_types:
+                    shared_indexes[merge_key] = action_index
+            recovered_indexes.append(action_index)
         indexes = unit.get("action_indexes") if isinstance(unit.get("action_indexes"), list) else []
-        unit["action_indexes"] = [*indexes, action_index]
+        unit["action_indexes"] = list(dict.fromkeys([*indexes, *recovered_indexes]))
         unit["disposition"] = "action"
         unit["reason"] = "registry-bounded group-control recovery"
     recovered["actions"] = recovered_actions

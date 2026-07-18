@@ -101,6 +101,11 @@ def choice_question(
                 "action": {"type": action.action_type, **dict(action.arguments)},
                 "expected_patch": expected,
                 "return_policy": str(raw.get("return_policy") or "fallback"),
+                **(
+                    {"semantic_action": str(raw.get("semantic_action"))}
+                    if raw.get("semantic_action")
+                    else {}
+                ),
             }
         )
     QuestionContract(

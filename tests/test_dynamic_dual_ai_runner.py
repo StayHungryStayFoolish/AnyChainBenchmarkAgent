@@ -419,6 +419,71 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             ["confirmed_config.CLOUD_REGION"],
         )
 
+    def test_resume_edge_verifies_saved_context_relation_for_any_group(self) -> None:
+        relation = {
+            "kind": "prefix_equals_before_prefix",
+            "after_prefix": "pending_question",
+            "before_prefix": "resume_context.pending_question",
+            "ignored_suffixes": ["created_turn_index", "resume_action_queue"],
+        }
+        edge = {
+            **EDGE,
+            "edge_type": "question_option",
+            "action_type": "answer_pending",
+            "expected_postcondition": {},
+            "expected_state_relations": [
+                {
+                    "kind": "path_equals_before_path",
+                    "after_path": "active_group",
+                    "before_path": "resume_context.active_group",
+                },
+                relation,
+                {
+                    "kind": "path_equals_before_path",
+                    "after_path": "action_queue",
+                    "before_path": "action_queue",
+                },
+            ],
+        }
+        baseline = replace(
+            self._event(1, "a" * 64, "b" * 64, "resume_harness_session"),
+            after_value_hashes={
+                "resume_context.active_group": "1" * 64,
+                "resume_context.pending_question.id": "2" * 64,
+                "resume_context.pending_question.group": "1" * 64,
+                "action_queue": "7" * 64,
+            },
+        )
+        committed = replace(
+            self._event(2, "b" * 64, "c" * 64, "qps_profile_confirm"),
+            active_group="qps_profile",
+            admitted_action_types=("answer_pending",),
+            state_diff_hashes={"resume_context": {"before": "3" * 64, "after": "4" * 64}},
+            after_value_hashes={
+                "active_group": "1" * 64,
+                "pending_question.id": "2" * 64,
+                "pending_question.group": "1" * 64,
+                "pending_question.created_turn_index": "5" * 64,
+                "action_queue": "7" * 64,
+            },
+        )
+
+        verified = verify_runtime_postcondition(edge, baseline, committed, None)  # type: ignore[arg-type]
+        self.assertTrue(verified.passed, verified.details)
+
+        mismatched = replace(
+            committed,
+            after_value_hashes={**committed.after_value_hashes, "pending_question.id": "9" * 64},
+        )
+        rejected = verify_runtime_postcondition(edge, baseline, mismatched, None)  # type: ignore[arg-type]
+        self.assertFalse(rejected.passed)
+        self.assertIn("state prefix relation was not observed", " ".join(rejected.details["errors"]))
+
+        missing_before = replace(baseline, after_value_hashes={})
+        missing_rejected = verify_runtime_postcondition(edge, missing_before, committed, None)  # type: ignore[arg-type]
+        self.assertFalse(missing_rejected.passed)
+        self.assertIn("state relation was not observed", " ".join(missing_rejected.details["errors"]))
+
     def test_manual_edge_rejects_action_only_transition_without_field_mutation(self) -> None:
         edge = {
             **EDGE,

@@ -205,8 +205,10 @@ def _verify_postcondition(
             raise AssertionError(f"manual postcondition {path} was not applied: {actual!r}")
         return
     expected = dict(edge.get("expected_postcondition") or {})
+    relations = tuple(edge.get("expected_state_relations") or ())
     if edge.get("edge_type") != "question_option":
         raise AssertionError("unsupported deterministic edge type")
+    _verify_state_relations(relations, before, after)
     if expected:
         mismatches = {
             path: {"expected": value, "actual": _read_path(after, path)}
@@ -220,10 +222,46 @@ def _verify_postcondition(
             raise AssertionError("response option produced no visible response")
         if after.get("pending_question"):
             raise AssertionError("response option did not consume its pending question")
+    elif relations:
+        pass
     else:
         raise AssertionError("option edge has neither a state nor response postcondition")
     if dict(before) == dict(after):
         raise AssertionError("compiled graph turn did not change state")
+
+
+def _verify_state_relations(
+    relations: tuple[Mapping[str, Any], ...],
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+) -> None:
+    for relation in relations:
+        kind = str(relation.get("kind") or "")
+        if kind == "path_equals_before_path":
+            after_path = str(relation.get("after_path") or "")
+            before_path = str(relation.get("before_path") or "")
+            if not _path_exists(after, after_path) or not _path_exists(before, before_path):
+                raise AssertionError(f"state relation path is absent: {relation}")
+            actual = _read_path(after, after_path)
+            expected = _read_path(before, before_path)
+            if actual != expected:
+                raise AssertionError(f"state relation mismatch: {relation}")
+            continue
+        if kind == "prefix_equals_before_prefix":
+            after_prefix = str(relation.get("after_prefix") or "")
+            before_prefix = str(relation.get("before_prefix") or "")
+            if not _path_exists(after, after_prefix) or not _path_exists(before, before_prefix):
+                raise AssertionError(f"state relation prefix is absent: {relation}")
+            actual = _read_path(after, after_prefix)
+            expected = _read_path(before, before_prefix)
+            ignored = {str(item) for item in relation.get("ignored_suffixes") or ()}
+            if isinstance(actual, Mapping) and isinstance(expected, Mapping):
+                actual = {key: value for key, value in actual.items() if str(key) not in ignored}
+                expected = {key: value for key, value in expected.items() if str(key) not in ignored}
+            if actual != expected:
+                raise AssertionError(f"state relation mismatch: {relation}")
+            continue
+        raise AssertionError(f"unsupported state relation: {relation}")
 
 
 def _verify_rejection(
@@ -253,6 +291,17 @@ def _read_path(value: Mapping[str, Any], path: str) -> Any:
             return None
         current = current.get(part)
     return current
+
+
+def _path_exists(value: Mapping[str, Any], path: str) -> bool:
+    if not path:
+        return False
+    current: Any = value
+    for part in path.split("."):
+        if not isinstance(current, Mapping) or part not in current:
+            return False
+        current = current[part]
+    return True
 
 
 def main() -> int:

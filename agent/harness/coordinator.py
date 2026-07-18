@@ -652,7 +652,8 @@ def _bind_declared_option_actions(
     )
     output: list[dict[str, Any]] = []
     for action in actions:
-        if str(action.get("type") or "") == "answer_pending":
+        action_type = str(action.get("type") or "")
+        if action_type == "answer_pending":
             # A model may return the exact displayed option label/id while the
             # contract stores a typed value (for example label ``Y`` and value
             # ``True``). Resolve only against the declared option contract and
@@ -666,6 +667,25 @@ def _bind_declared_option_actions(
                 output.append(normalized)
             else:
                 output.append(action)
+            continue
+        spec = ACTION_BY_TYPE.get(action_type)
+        semantic = str(spec.pending_option_semantic if spec else "").strip()
+        declared_option = next(
+            (
+                option for option in options
+                if semantic and str(option.get("semantic_action") or "").strip() == semantic
+            ),
+            None,
+        )
+        if declared_option is not None:
+            selected = declared_option.get("value")
+            output.append({
+                "type": "answer_pending",
+                "answer": selected,
+                "selected_value": selected,
+                "source_evidence": action.get("source_evidence"),
+                "pending_option_semantic_verified": True,
+            })
             continue
         # A domain action that happens to match one displayed option is not
         # proof that the user selected that option. Keep it as a domain action
@@ -1135,40 +1155,11 @@ def _drop_conflicting_answer_actions(state: AgentGraphState, actions: list[dict[
 
 
 def _has_meaningful_queue(actions: list[dict[str, Any]]) -> bool:
-    meaningful = [item for item in actions if str(item.get("type") or "") != "unknown"]
-    if len(meaningful) > 1:
-        return True
-    queue_only_types = {
-        "greeting",
-        "set_response_language",
-        "clarify_unresolved",
-        "choose_target_mode",
-        "choose_chain",
-        "set_rpc_mode",
-        "set_qps_mode",
-        "request_qps_customization",
-        "set_qps_override",
-        "set_observability",
-        "set_sync_observe_source",
-        "clear_sync_observe_source",
-        "set_sync_observe_options",
-        "set_accounts_presence",
-        "rpc_catalog_command",
-        "secondary_handoff_command",
-        "rpc_workload_command",
-        "propose_config_values",
-        "reset_session",
-        "change_group",
-        "go_back",
-        "change_chain",
-        "choose_adapter_family",
-        "ask_capabilities",
-        "answer_opening_question",
-        "analyze_evidence",
-        "analyze_report",
-        "answer_pending",
-    }
-    return any(str(item.get("type") or "") in queue_only_types for item in meaningful)
+    return any(
+        action_type in ACTION_BY_TYPE and action_type != "unknown"
+        for item in actions
+        if (action_type := str(item.get("type") or "").strip())
+    )
 
 
 def _process_action_queue(

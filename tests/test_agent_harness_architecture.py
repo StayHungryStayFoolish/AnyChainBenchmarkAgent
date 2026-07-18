@@ -1321,7 +1321,13 @@ class HarnessStateInvariantTest(unittest.TestCase):
 
         provider = Mock()
         provider.complete.side_effect = [
-            SimpleNamespace(text="not json"),
+            SimpleNamespace(
+                text='{"actions":[{"type":"not_registered"}],'
+                '"semantic_units":[{"unit_id":"unit-1","clause_id":"clause-1",'
+                '"source_text":"What can you do?","disposition":"action",'
+                '"action_indexes":[0],"reason":"invalid action schema"}]}'
+            ),
+            SimpleNamespace(text='{"decisions":[]}'),
             SimpleNamespace(text='{"actions":[{"type":"answer_opening_question","topic":"capabilities","confidence":"high"}],'
                                  '"semantic_units":[{"unit_id":"unit-1","clause_id":"clause-1","start":0,"end":16,'
                                  '"source_text":"What can you do?","disposition":"action","action_indexes":[0],'
@@ -1331,7 +1337,12 @@ class HarnessStateInvariantTest(unittest.TestCase):
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(_state(), "What can you do?")
 
-        self.assertEqual(provider.complete.call_count, 3)
+        self.assertEqual(provider.complete.call_count, 4)
+        system_prompts = [call.args[0].messages[0].content for call in provider.complete.call_args_list]
+        self.assertEqual(
+            sum(prompt.startswith("Repair one malformed AnyChain typed action-plan response") for prompt in system_prompts),
+            1,
+        )
         self.assertEqual(result["actions"][0]["type"], "answer_opening_question")
 
     def test_repaired_plan_uses_the_same_semantic_recovery_gate(self) -> None:
