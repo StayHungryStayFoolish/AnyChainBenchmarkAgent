@@ -795,6 +795,16 @@ def verify_runtime_postcondition(
             expected_hash = content_hash(value)
             if committed.after_value_hashes.get(str(path)) != expected_hash:
                 errors.append(f"expected postcondition was not observed: {path}")
+    elif edge_type == "manual_input":
+        path = str(expected.get("path") or "").strip()
+        if path:
+            expected_paths.append(path)
+            after_hash = committed.after_value_hashes.get(path)
+            before_hash = baseline.after_value_hashes.get(path)
+            if not after_hash:
+                errors.append(f"manual-input postcondition was not observed: {path}")
+            elif after_hash == before_hash:
+                errors.append(f"manual-input postcondition did not change: {path}")
 
     next_result = dict(committed.next_result or {})
     if not next_result:

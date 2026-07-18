@@ -414,7 +414,44 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
         verified = verify_runtime_postcondition(edge, baseline, committed, None)  # type: ignore[arg-type]
 
         self.assertTrue(verified.passed, verified.details)
-        self.assertEqual(verified.details["expected_postcondition_paths"], [])
+        self.assertEqual(
+            verified.details["expected_postcondition_paths"],
+            ["confirmed_config.CLOUD_REGION"],
+        )
+
+    def test_manual_edge_rejects_action_only_transition_without_field_mutation(self) -> None:
+        edge = {
+            **EDGE,
+            "edge_key": "provider_deployment::CLOUD_REGION::manual",
+            "question_id": "CLOUD_REGION",
+            "edge_type": "manual_input",
+            "action_type": "answer_pending",
+            "expected_postcondition": {
+                "field": "CLOUD_REGION",
+                "path": "confirmed_config.CLOUD_REGION",
+            },
+        }
+        baseline = replace(
+            self._event(1, "a" * 64, "b" * 64, "CLOUD_REGION"),
+            pending_contract={
+                "id": "CLOUD_REGION",
+                "accepted_action_types": ["answer_pending"],
+            },
+        )
+        committed = replace(
+            self._event(2, "b" * 64, "c" * 64, "CLOUD_REGION"),
+            admitted_action_types=("answer_pending",),
+            state_diff_hashes={"applied_action_ids": {"before": "", "after": "d" * 64}},
+            after_value_hashes={},
+        )
+
+        verified = verify_runtime_postcondition(edge, baseline, committed, None)  # type: ignore[arg-type]
+
+        self.assertFalse(verified.passed)
+        self.assertIn(
+            "manual-input postcondition was not observed",
+            " ".join(verified.details["errors"]),
+        )
 
     def test_change_group_edge_rejects_queued_only_navigation(self) -> None:
         edge = {

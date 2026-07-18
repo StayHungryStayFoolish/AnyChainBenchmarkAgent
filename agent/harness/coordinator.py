@@ -921,7 +921,18 @@ def _action_answers_pending_contract(state: AgentGraphState, action: dict[str, A
     if str(pending.get("kind") or "") in {"numbered_choice", "yes_no"}:
         selected = action.get("selected_value")
         if not _pending_option_value_exists(selected, pending):
-            return False
+            answer = str(action.get("answer") or "").strip()
+            evidence = str(action.get("source_evidence") or "").strip()
+            user_text = str(state.get("last_user_input") or "")
+            return bool(
+                pending.get("manual_input_allowed") is True
+                and answer
+                and evidence
+                and evidence in user_text
+                and answer in evidence
+                and _answer_fits_pending(answer, pending)
+                and action.get("semantic_purpose_verified") is True
+            )
         if not (
             action.get("selection_contract_verified") is True
             or action.get("pending_option_semantic_verified") is True
@@ -2119,7 +2130,13 @@ def _dispatch_pending_action(state: AgentGraphState, action: dict[str, Any]) -> 
             ),
             owner="coordinator",
         )
-    if choice_question and not _pending_option_value_exists(selected, pending):
+    manual_choice_value = bool(
+        choice_question
+        and pending.get("manual_input_allowed") is True
+        and selected is None
+        and _answer_fits_pending(answer, pending)
+    )
+    if choice_question and not _pending_option_value_exists(selected, pending) and not manual_choice_value:
         return _apply_handler_result(
             state,
             HandlerResult(
@@ -2131,7 +2148,7 @@ def _dispatch_pending_action(state: AgentGraphState, action: dict[str, Any]) -> 
             ),
             owner="coordinator",
         )
-    return _apply_pending_answer(state, interpreted, pending)
+    return _apply_pending_answer(state, answer if manual_choice_value else interpreted, pending)
 
 
 def _action_proposal(action: dict[str, Any], confidence: str) -> ActionProposal:

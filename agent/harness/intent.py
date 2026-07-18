@@ -19,7 +19,7 @@ from .context import action_schema, build_action_resolver_prompt, group_schema, 
 from .domains.environment import extract_structured_input_candidates
 from .input_values import target_mode_evidence_matches
 from .plan_coverage import PlanCoverageResult, TurnClause, segment_user_turn, validate_plan_coverage
-from .questions import exact_answer, pending_option_value_exists
+from .questions import answer_fits_pending, exact_answer, pending_option_value_exists
 from .state import DEFAULT_GROUP_ORDER, AgentGraphState
 
 ALLOWED_GROUPS = list(DEFAULT_GROUP_ORDER)
@@ -478,6 +478,8 @@ def _validate_action_document(
         if pending_option_value_exists(selected, pending):
             continue
         answer = str(raw.get("answer") or "").strip()
+        if pending.get("manual_input_allowed") is True and answer_fits_pending(answer, pending):
+            continue
         matches, _ = exact_answer(answer, pending)
         if not matches:
             action_errors.append(
@@ -1296,6 +1298,11 @@ def _adjudicate_pending_answer_actions(
         index
         for index, action in enumerate(actions)
         if isinstance(action, dict) and str(action.get("type") or "") == "answer_pending"
+        and not (
+            pending.get("manual_input_allowed") is True
+            and not pending_option_value_exists(action.get("selected_value"), pending)
+            and answer_fits_pending(str(action.get("answer") or ""), pending)
+        )
     ]
     if not review_indexes:
         return text, False
@@ -1551,7 +1558,7 @@ def _adjudicate_manual_pending_answers(
     """Admit only direct answers to an active manual-input contract."""
 
     pending = dict(state.get("pending_question") or {})
-    if pending.get("manual_input_allowed") is not True or pending.get("options"):
+    if pending.get("manual_input_allowed") is not True:
         return text, False
     payload = _parse_json_object(text)
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
@@ -1560,6 +1567,11 @@ def _adjudicate_manual_pending_answers(
         index
         for index, action in enumerate(actions)
         if isinstance(action, dict) and str(action.get("type") or "") == "answer_pending"
+        and not pending_option_value_exists(action.get("selected_value"), pending)
+        and (
+            not pending.get("options")
+            or answer_fits_pending(str(action.get("answer") or ""), pending)
+        )
     ]
     if not review_indexes:
         return text, False

@@ -2482,6 +2482,51 @@ network:
             r2 = process_turn(r)
         self.assertEqual((r2.get("confirmed_config") or {}).get("CLOUD_REGION"), "asia-east1")
 
+    def test_choice_contract_accepts_valid_manual_replacement_atomically(self) -> None:
+        """A choice that advertises manual input must not discard its value."""
+
+        from agent.harness.coordinator import (
+            _action_answers_pending_contract,
+            _dispatch_pending_action,
+        )
+        from agent.harness.domains.environment import question_for_environment
+        from agent.harness.state import new_state
+
+        state = new_state("manual-choice", language="en")
+        state.update({
+            "target_mode": "real-node",
+            "workflow_mode": "rpc_benchmark",
+            "active_group": "ledger_disk",
+            "confirmed_config": {
+                "LEDGER_DEVICE": "vda",
+                "DATA_VOL_TYPE": "hyperdisk-balanced",
+            },
+            "discovery": {
+                "disks": {
+                    "candidates": [
+                        {"name": "vda", "size": "926.3G", "type": "disk"},
+                    ],
+                },
+            },
+        })
+        question = question_for_environment(state, "ledger_disk")
+        self.assertEqual(question["kind"], "yes_no")
+        self.assertTrue(question["manual_input_allowed"])
+        state["pending_question"] = question
+        state["last_user_input"] = "Use 1000 GiB instead."
+        action = {
+            "type": "answer_pending",
+            "answer": "1000",
+            "source_evidence": "1000",
+            "semantic_purpose_verified": True,
+        }
+
+        self.assertTrue(_action_answers_pending_contract(state, action))
+        result = _dispatch_pending_action(state, action)
+
+        self.assertEqual((result.get("confirmed_config") or {}).get("DATA_VOL_SIZE"), "1000")
+        self.assertFalse((result.get("inferred_config") or {}).get("DATA_VOL_SIZE_manual_required"))
+
     def test_optional_chain_auxiliary_field_accepts_plain_english_decline(self) -> None:
         """B.18 (known-issues.md): an optional `chain_auxiliary_endpoints`
 
