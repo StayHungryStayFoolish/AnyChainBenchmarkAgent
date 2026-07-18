@@ -22,6 +22,188 @@ def _unit(clause, index: int, action_indexes, *, disposition: str = "action", re
 
 
 class PlanCoverageTest(unittest.TestCase):
+    def test_active_pending_field_is_bound_from_config_proposal(self) -> None:
+        import json
+
+        from agent.harness.intent import _bind_active_pending_config_value
+        from agent.harness.state import new_state
+
+        state = new_state("pending-config-binding")
+        state["pending_question"] = {
+            "id": "DATA_VOL_SIZE",
+            "group": "ledger_disk",
+            "field": "DATA_VOL_SIZE",
+            "kind": "yes_no",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "positive_number"},
+            "options": [{"label": "Use detected", "value": "926"}],
+        }
+        source = "Use 1000 GiB instead."
+        payload = {
+            "actions": [{
+                "type": "propose_config_values",
+                "config_values": {"DATA_VOL_SIZE": 1000},
+                "unmapped_values": {},
+                "source_format": "natural_language",
+            }],
+            "semantic_units": [_unit(segment_user_turn(source)[0], 1, [0])],
+        }
+
+        result = json.loads(_bind_active_pending_config_value(json.dumps(payload), state, source))
+
+        self.assertEqual(result["actions"], [{
+            "type": "answer_pending",
+            "answer": "1000",
+            "selected_value": None,
+            "source_evidence": source,
+        }])
+
+    def test_active_pending_field_is_split_from_multi_field_proposal(self) -> None:
+        import json
+
+        from agent.harness.intent import _bind_active_pending_config_value
+        from agent.harness.state import new_state
+
+        state = new_state("pending-config-split")
+        state["pending_question"] = {
+            "id": "DATA_VOL_SIZE",
+            "group": "ledger_disk",
+            "field": "DATA_VOL_SIZE",
+            "kind": "yes_no",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "positive_number"},
+        }
+        source = "Use 1000 GiB and CLOUD_REGION=us-central1."
+        clause = segment_user_turn(source)[0]
+        payload = {
+            "actions": [{
+                "type": "propose_config_values",
+                "config_values": {"DATA_VOL_SIZE": 1000, "CLOUD_REGION": "us-central1"},
+                "unmapped_values": {},
+                "source_format": "natural_language",
+            }],
+            "semantic_units": [_unit(clause, 1, [0])],
+        }
+
+        result = json.loads(_bind_active_pending_config_value(json.dumps(payload), state, source))
+
+        self.assertEqual(result["actions"][0]["type"], "answer_pending")
+        self.assertEqual(result["actions"][1]["config_values"], {"CLOUD_REGION": "us-central1"})
+        self.assertEqual(result["semantic_units"][0]["action_indexes"], [0, 1])
+
+    def test_unrelated_config_proposal_does_not_answer_pending_field(self) -> None:
+        import json
+
+        from agent.harness.intent import _bind_active_pending_config_value
+        from agent.harness.state import new_state
+
+        state = new_state("pending-config-unrelated")
+        state["pending_question"] = {
+            "id": "DATA_VOL_SIZE",
+            "group": "ledger_disk",
+            "field": "DATA_VOL_SIZE",
+            "kind": "yes_no",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "positive_number"},
+        }
+        payload = {
+            "actions": [{
+                "type": "propose_config_values",
+                "config_values": {"CLOUD_REGION": "us-central1"},
+                "unmapped_values": {},
+                "source_format": "natural_language",
+            }],
+            "semantic_units": [],
+        }
+
+        original = json.dumps(payload)
+        self.assertEqual(_bind_active_pending_config_value(original, state, "Use us-central1."), original)
+
+    def test_literal_grounded_manual_answer_cannot_be_vetoed_by_reviewer(self) -> None:
+        import json
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_manual_pending_answers
+        from agent.harness.state import new_state
+
+        source = "Use 1000 GiB instead."
+        clause = segment_user_turn(source)[0]
+        state = new_state("literal-manual-admission")
+        state["pending_question"] = {
+            "id": "DATA_VOL_SIZE",
+            "group": "ledger_disk",
+            "field": "DATA_VOL_SIZE",
+            "kind": "yes_no",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "positive_number"},
+            "options": [{"label": "Y", "value": "926"}, {"label": "N", "value": "__manual__"}],
+        }
+        payload = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": "1000",
+                "selected_value": None,
+                "source_evidence": source,
+            }],
+            "semantic_units": [_unit(clause, 1, [0])],
+        }
+        provider = Mock()
+
+        result, changed = _adjudicate_manual_pending_answers(
+            provider,
+            json.dumps(payload),
+            state,
+            source,
+        )
+
+        provider.complete.assert_not_called()
+        self.assertFalse(changed)
+        self.assertEqual(json.loads(result)["pending_answer_admissions"], [0])
+
+    def test_manual_answer_not_present_in_source_still_requires_review(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_manual_pending_answers
+        from agent.harness.state import new_state
+
+        source = "Use the larger value instead."
+        clause = segment_user_turn(source)[0]
+        state = new_state("semantic-manual-review")
+        state["pending_question"] = {
+            "id": "DATA_VOL_SIZE",
+            "group": "ledger_disk",
+            "field": "DATA_VOL_SIZE",
+            "kind": "yes_no",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "positive_number"},
+            "options": [{"label": "Y", "value": "926"}, {"label": "N", "value": "__manual__"}],
+        }
+        payload = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": "1000",
+                "selected_value": None,
+                "source_evidence": source,
+            }],
+            "semantic_units": [_unit(clause, 1, [0])],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "reviews": [{
+                "action_index": 0,
+                "decision": "reject",
+                "evidence_quote": "",
+                "reason": "the normalized value is not source-grounded",
+            }]
+        }))
+
+        result, _ = _adjudicate_manual_pending_answers(provider, json.dumps(payload), state, source)
+
+        provider.complete.assert_called_once()
+        self.assertEqual(json.loads(result)["semantic_units"][0]["disposition"], "unresolved")
+
     def test_prose_context_can_coexist_with_an_owned_action(self) -> None:
         clauses = segment_user_turn(
             "Use BNB Smart Chain for this run; I may add another RPC call afterward."

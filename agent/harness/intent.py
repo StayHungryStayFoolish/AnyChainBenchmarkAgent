@@ -61,9 +61,7 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
         raw_response = _recover_omitted_chain_selection(provider, raw_response, state)
         raw_response = _apply_state_plan_policy(raw_response, state)
         raw_response = _reconcile_structured_candidate_ownership(raw_response, clauses)
-        raw_response, _ = _adjudicate_manual_pending_answers(provider, raw_response, state, text)
-        raw_response, _ = _reconcile_pending_owner_mutations(provider, raw_response, state, text)
-        raw_response, _ = _adjudicate_pending_answer_actions(provider, raw_response, state, text)
+        raw_response, _ = _adjudicate_pending_action_ownership(provider, raw_response, state, text)
         raw_response, _ = _adjudicate_group_navigation_actions(provider, raw_response, state)
         raw_response, _ = _adjudicate_chain_selection_actions(provider, raw_response, state)
         raw_response, _ = _adjudicate_target_mode_actions(provider, raw_response)
@@ -121,9 +119,7 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
             raw_response = _recover_omitted_chain_selection(provider, raw_response, state)
             raw_response = _apply_state_plan_policy(raw_response, state)
             raw_response = _reconcile_structured_candidate_ownership(raw_response, clauses)
-            raw_response, _ = _adjudicate_manual_pending_answers(provider, raw_response, state, text)
-            raw_response, _ = _reconcile_pending_owner_mutations(provider, raw_response, state, text)
-            raw_response, _ = _adjudicate_pending_answer_actions(provider, raw_response, state, text)
+            raw_response, _ = _adjudicate_pending_action_ownership(provider, raw_response, state, text)
             raw_response, _ = _adjudicate_group_navigation_actions(provider, raw_response, state)
             raw_response, _ = _adjudicate_chain_selection_actions(provider, raw_response, state)
             raw_response, _ = _adjudicate_target_mode_actions(provider, raw_response)
@@ -189,8 +185,7 @@ def _recover_and_validate_semantic_actions(
     )
     if not changed:
         return plan_text, validation
-    recovered, _ = _adjudicate_manual_pending_answers(provider, recovered, state, user_text)
-    recovered, _ = _reconcile_pending_owner_mutations(provider, recovered, state, user_text)
+    recovered, _ = _adjudicate_pending_action_ownership(provider, recovered, state, user_text)
     recovered, _ = _adjudicate_group_navigation_actions(provider, recovered, state)
     recovered, _ = _adjudicate_chain_selection_actions(provider, recovered, state)
     recovered, _ = _adjudicate_target_mode_actions(provider, recovered)
@@ -1549,6 +1544,86 @@ def _reconcile_pending_owner_mutations(
     return json.dumps(payload, ensure_ascii=False, sort_keys=True), True
 
 
+def _bind_active_pending_config_value(
+    text: str,
+    state: AgentGraphState,
+    user_text: str,
+) -> str:
+    """Bind a proposed value to the exact active field contract.
+
+    Configuration proposals normally require user review. When the proposal
+    contains the field that the active question is already asking for, that
+    value is a direct answer rather than a second configuration transaction.
+    Any other proposed fields remain in their original review action.
+    """
+
+    pending = dict(state.get("pending_question") or {})
+    field = str(pending.get("field") or "").strip()
+    if pending.get("manual_input_allowed") is not True or not field:
+        return text
+
+    payload = _parse_json_object(text)
+    actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
+    changed = False
+    for index, action in enumerate(tuple(actions)):
+        if not isinstance(action, dict) or str(action.get("type") or "") != "propose_config_values":
+            continue
+        config_values = dict(action.get("config_values") or {})
+        matching_keys = [key for key in config_values if str(key).strip().casefold() == field.casefold()]
+        if len(matching_keys) != 1:
+            continue
+        key = matching_keys[0]
+        value = config_values[key]
+        answer = str(value).strip()
+        if not answer_fits_pending(answer, pending):
+            continue
+
+        remainder = dict(action)
+        remainder_values = dict(config_values)
+        remainder_values.pop(key, None)
+        remainder["config_values"] = remainder_values
+        actions[index] = {
+            "type": "answer_pending",
+            "answer": answer,
+            "selected_value": None,
+            "source_evidence": str(user_text or "").strip(),
+        }
+        if remainder_values or remainder.get("unmapped_values"):
+            remainder_index = len(actions)
+            actions.append(remainder)
+            for unit in units:
+                if not isinstance(unit, dict):
+                    continue
+                indexes = unit.get("action_indexes")
+                if isinstance(indexes, list) and index in indexes and remainder_index not in indexes:
+                    indexes.append(remainder_index)
+        changed = True
+
+    if not changed:
+        return text
+    payload["actions"] = actions
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _adjudicate_pending_action_ownership(
+    provider: Any,
+    text: str,
+    state: AgentGraphState,
+    user_text: str,
+) -> tuple[str, bool]:
+    """Apply the single pending-contract arbitration pipeline."""
+
+    current = _bind_active_pending_config_value(text, state, user_text)
+    changed = current != text
+    current, step_changed = _adjudicate_manual_pending_answers(provider, current, state, user_text)
+    changed = changed or step_changed
+    current, step_changed = _reconcile_pending_owner_mutations(provider, current, state, user_text)
+    changed = changed or step_changed
+    current, step_changed = _adjudicate_pending_answer_actions(provider, current, state, user_text)
+    return current, changed or step_changed
+
+
 def _adjudicate_manual_pending_answers(
     provider: Any,
     text: str,
@@ -1563,7 +1638,7 @@ def _adjudicate_manual_pending_answers(
     payload = _parse_json_object(text)
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
     units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
-    review_indexes = [
+    candidate_indexes = [
         index
         for index, action in enumerate(actions)
         if isinstance(action, dict) and str(action.get("type") or "") == "answer_pending"
@@ -1573,8 +1648,18 @@ def _adjudicate_manual_pending_answers(
             or answer_fits_pending(str(action.get("answer") or ""), pending)
         )
     ]
-    if not review_indexes:
+    directly_grounded = {
+        index
+        for index in candidate_indexes
+        if _manual_answer_has_literal_source(actions[index], user_text)
+    }
+    review_indexes = [index for index in candidate_indexes if index not in directly_grounded]
+    if not review_indexes and not directly_grounded:
         return text, False
+
+    if not review_indexes:
+        payload["pending_answer_admissions"] = sorted(directly_grounded)
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True), False
 
     reviews = []
     for index in review_indexes:
@@ -1605,7 +1690,7 @@ def _adjudicate_manual_pending_answers(
         for row in rows
         if isinstance(row, dict) and isinstance(row.get("action_index"), int)
     }
-    admitted: set[int] = set()
+    admitted: set[int] = set(directly_grounded)
     rejected: set[int] = set()
     changed = False
     for review in reviews:
@@ -1638,6 +1723,20 @@ def _adjudicate_manual_pending_answers(
     if admitted or changed:
         return serialized, changed
     return text, False
+
+
+def _manual_answer_has_literal_source(action: dict[str, Any], user_text: str) -> bool:
+    """Prove that a normalized manual answer occurs in exact source evidence."""
+
+    answer = str(action.get("answer") or "").strip()
+    quote = str(action.get("source_evidence") or "").strip()
+    if not answer or not quote or quote not in str(user_text or ""):
+        return False
+    return re.search(
+        rf"(?<!\w){re.escape(answer)}(?!\w)",
+        quote,
+        flags=re.IGNORECASE,
+    ) is not None
 
 
 def _request_manual_pending_reviews(provider: Any, reviews: list[dict[str, Any]]) -> dict[str, Any]:
