@@ -669,7 +669,14 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
     for scenario_id, group, updates in chain_seeds:
         state = new_state(f"coverage-{scenario_id}", language=language, session_purpose="coverage")
         state.update(deepcopy(dict(updates)))
-        add(scenario_id, state, question_for_chain_rpc(state, group))
+        add(
+            scenario_id,
+            state,
+            question_for_chain_rpc(state, group),
+            manual_postcondition_path=(
+                "chain_identity.canonical" if scenario_id == "chain_manual" else ""
+            ),
+        )
     return scenarios
 
 

@@ -453,6 +453,35 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             " ".join(verified.details["errors"]),
         )
 
+    def test_manual_chain_edge_verifies_chain_owner_state(self) -> None:
+        edge = {
+            **EDGE,
+            "edge_key": "chain_identity::chain::manual",
+            "question_id": "chain",
+            "edge_type": "manual_input",
+            "action_type": "answer_pending",
+            "expected_postcondition": {
+                "field": "chain",
+                "path": "chain_identity.canonical",
+            },
+        }
+        baseline = replace(
+            self._event(1, "a" * 64, "b" * 64, "chain"),
+            pending_contract={"id": "chain", "accepted_action_types": ["answer_pending"]},
+        )
+        committed = replace(
+            self._event(2, "b" * 64, "c" * 64, "CLOUD_REGION"),
+            admitted_action_types=("answer_pending",),
+            state_diff_hashes={
+                "chain_identity.canonical": {"before": "", "after": "d" * 64},
+            },
+            after_value_hashes={"chain_identity.canonical": "d" * 64},
+        )
+
+        verified = verify_runtime_postcondition(edge, baseline, committed, None)  # type: ignore[arg-type]
+
+        self.assertTrue(verified.passed, verified.details)
+
     def test_change_group_edge_rejects_queued_only_navigation(self) -> None:
         edge = {
             **EDGE,
