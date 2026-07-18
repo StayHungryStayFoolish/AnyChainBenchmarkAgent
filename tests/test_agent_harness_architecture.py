@@ -905,19 +905,22 @@ class HarnessQuestionContractTest(unittest.TestCase):
             ),
             (
                 "chain_change_input",
-                lambda language: {
-                    "contract_version": 1,
-                    "id": "chain_change_input",
-                    "group": "endpoint_process",
-                    "kind": "chain",
-                    "prompt": "Enter replacement chain",
-                    "field": "chain_change_input",
-                    "manual_input_allowed": True,
-                    "options": [],
-                    "accepted_action_types": ["answer_pending", "choose_chain", "change_chain"],
-                    "queue_barrier": True,
-                    "validation": {},
-                },
+                pending_from(
+                    lambda state: apply_chain_rpc_action(
+                        {
+                            **state,
+                            "target_mode": "fake-node",
+                            "workflow_mode": "rpc_benchmark",
+                            "chain_identity": {"canonical": "bsc", "status": "confirmed"},
+                        },
+                        ActionProposal(
+                            "chain-change-input",
+                            "request_chain_selection",
+                            {},
+                            "high",
+                        ),
+                    )
+                ),
             ),
             (
                 "mainnet_review",

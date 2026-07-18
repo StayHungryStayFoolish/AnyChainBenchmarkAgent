@@ -8,11 +8,16 @@ from tests.agent_live.harness_contract_scenarios import manual_input_case, quest
 
 
 class HarnessContractScenarioTest(unittest.TestCase):
-    def test_only_reviewed_scenarios_have_seed_state(self) -> None:
+    def test_every_contract_scenario_has_one_reviewed_seed_authority(self) -> None:
         scenarios = question_scenarios("en")
-        self.assertGreaterEqual(sum(item.executable for item in scenarios), 50)
-        self.assertTrue(any(not item.executable for item in scenarios))
+        self.assertGreaterEqual(len(scenarios), 50)
+        self.assertTrue(all(item.executable for item in scenarios))
         self.assertTrue(all(item.state_fingerprint for item in scenarios))
+        self.assertEqual(len({item.scenario_id for item in scenarios}), len(scenarios))
+        self.assertEqual(
+            len({(item.scenario_id, item.state_fingerprint) for item in scenarios}),
+            len(scenarios),
+        )
         executable_ids = {item.scenario_id for item in scenarios if item.executable}
         self.assertTrue({
             "ledger_ledger_device",

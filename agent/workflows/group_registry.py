@@ -50,6 +50,7 @@ GROUPS: tuple[GroupSpec, ...] = (
         fields=("BLOCKCHAIN_NODE", "chain_identity", "secondary_handoff"),
         questions=(
             "chain",
+            "chain_change_input",
             "chain_ambiguity_confirm",
             "chain_change_confirm",
             "unknown_chain_identity_confirm",
@@ -138,7 +139,6 @@ GROUPS: tuple[GroupSpec, ...] = (
             "SYNC_OBSERVE_RPC_URL",
             "MAINNET_RPC_URL_REVIEWED",
             "BLOCKCHAIN_PROCESS_NAMES",
-            "chain_change_input",
             "custom_rpc_endpoint",
             "custom_rpc_method",
             "custom_rpc_schema_evidence",

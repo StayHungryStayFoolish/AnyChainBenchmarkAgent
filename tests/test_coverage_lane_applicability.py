@@ -67,10 +67,10 @@ class CoverageLaneApplicabilityTest(unittest.TestCase):
         edge = next(
             edge for edge in self.ledger["edges"]
             if edge["input_class"] == "empty_whitespace"
-            and edge["evidence"]["deterministic"]["required"]
         )
-        self.assertFalse(edge["evidence"]["real_cli"]["required"])
-        self.assertIn("ignores whitespace", edge["evidence"]["real_cli"]["applicability_reason"])
+        for lane in ("deterministic", "dynamic_dual_ai", "real_cli", "real_execution"):
+            self.assertFalse(edge["evidence"][lane]["required"])
+            self.assertIn("whitespace", edge["evidence"][lane]["applicability_reason"])
 
     def test_matrix_separates_syntax_semantics_actions_and_side_effects(self) -> None:
         exact = next(

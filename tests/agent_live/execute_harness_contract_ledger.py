@@ -168,7 +168,11 @@ def _execution_for_edge(
             return None
         return scenario, option_id, True
     if edge_type == "manual_input":
-        case = manual_input_case(scenario.question, str(edge.get("input_class") or ""))
+        input_class = str(edge.get("input_class") or "")
+        case = (
+            (scenario.manual_input_overrides or {}).get(input_class)
+            or manual_input_case(scenario.question, input_class)
+        )
         if case is None:
             return None
         return scenario, case.text, case.expected_admitted

@@ -34,6 +34,7 @@ class QuestionScenario:
     manual_postcondition_path: str = ""
     option_postcondition_overrides: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     option_relation_overrides: Mapping[str, tuple[Mapping[str, Any], ...]] = field(default_factory=dict)
+    manual_input_overrides: Mapping[str, "ManualInputCase"] = field(default_factory=dict)
 
     @property
     def executable(self) -> bool:
@@ -48,6 +49,9 @@ class QuestionScenario:
         if isinstance(session, dict):
             session.pop("created_at", None)
             session.pop("updated_at", None)
+        pending = stable.get("pending_question")
+        if isinstance(pending, dict):
+            pending.pop("execution_request_id", None)
         return content_hash(stable)
 
 
@@ -71,13 +75,13 @@ def question_scenarios(language: str = "en") -> list[QuestionScenario]:
     return sorted(scenarios, key=lambda item: item.scenario_id)
 
 
-def _compiled_action_question(
+def _compiled_action_state(
     state: AgentGraphState,
     action: Mapping[str, Any],
     *,
     user_text: str,
-) -> Mapping[str, Any]:
-    """Render a control-owning question through the compiled product graph."""
+) -> AgentGraphState:
+    """Return the graph-owned state that rendered a control question."""
 
     prepared = deepcopy(dict(state))
     prepared["last_user_input"] = user_text
@@ -89,7 +93,7 @@ def _compiled_action_question(
     question = dict(result.get("pending_question") or {})
     if not question:
         raise AssertionError(f"compiled action produced no pending question: {action}")
-    return question
+    return result
 
 
 def manual_input_case(question: Mapping[str, Any], input_class: str) -> ManualInputCase | None:
@@ -99,11 +103,26 @@ def manual_input_case(question: Mapping[str, Any], input_class: str) -> ManualIn
     value_type = str(validation.get("value_type") or "")
     if input_class == "valid_literal":
         value = _valid_literal(validation)
+        option_ids = {str(item.get("id") or "") for item in question.get("options") or []}
+        if value in option_ids and value_type in {"positive_number", "positive_integer"}:
+            value = "7"
         return ManualInputCase(input_class, value, True) if value is not None else None
     if input_class == "trimmed_whitespace_punctuation" and value_type == "scalar_token":
         return ManualInputCase(input_class, "  n2-standard-16,  ", True)
-    if input_class == "empty_whitespace":
-        return ManualInputCase(input_class, "   ", False)
+    if (
+        input_class == "invalid_literal"
+        and value_type == "scalar_token"
+        and int(validation.get("max_length") or 0) > 0
+    ):
+        return ManualInputCase(
+            input_class,
+            "x" * (int(validation["max_length"]) + 1),
+            False,
+        )
+    if input_class == "invalid_literal" and value_type in {"positive_number", "positive_integer"}:
+        return ManualInputCase(input_class, "not-a-number", False)
+    if input_class == "trimmed_whitespace_punctuation" and value_type in {"positive_number", "positive_integer"}:
+        return ManualInputCase(input_class, "  7  ", True)
     if input_class == "out_of_range_numeric" and value_type in {"positive_number", "positive_integer"}:
         return ManualInputCase(input_class, "0", False)
     if input_class == "structured_json_yaml_env_curl" and value_type == "json":
@@ -123,6 +142,7 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
         manual_postcondition_path: str = "",
         option_postcondition_overrides: Mapping[str, Mapping[str, Any]] | None = None,
         option_relation_overrides: Mapping[str, tuple[Mapping[str, Any], ...]] | None = None,
+        manual_input_overrides: Mapping[str, ManualInputCase] | None = None,
     ) -> None:
         if not question:
             return
@@ -136,6 +156,7 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
             manual_postcondition_path,
             deepcopy(dict(option_postcondition_overrides or {})),
             deepcopy(dict(option_relation_overrides or {})),
+            deepcopy(dict(manual_input_overrides or {})),
         )
 
     opening_state = new_state("coverage-opening", language=language, session_purpose="coverage")
@@ -724,7 +745,7 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
 
 
 def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
-    """Construct contracts that are known but not yet safe deterministic turns."""
+    """Construct reviewed runtime variants not reached by the default seeds."""
 
     from agent.harness.domains.chain_identity import _chain_ambiguity_question
     from agent.harness.domains.chain_rpc_questions import _target_change_scope_question
@@ -733,26 +754,64 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
 
     output: dict[str, QuestionScenario] = {}
 
-    def catalog(scenario_id: str, question: Mapping[str, Any] | None) -> None:
+    def catalog(
+        scenario_id: str,
+        state: AgentGraphState,
+        question: Mapping[str, Any] | None,
+        *,
+        manual_postcondition_path: str = "",
+        option_postcondition_overrides: Mapping[str, Mapping[str, Any]] | None = None,
+        option_relation_overrides: Mapping[str, tuple[Mapping[str, Any], ...]] | None = None,
+        manual_input_overrides: Mapping[str, ManualInputCase] | None = None,
+    ) -> None:
         if question:
+            seed = deepcopy(state)
+            seed["active_group"] = str(question.get("group") or seed.get("active_group") or "opening")
+            seed["pending_question"] = deepcopy(dict(question))
             output[scenario_id] = QuestionScenario(
                 scenario_id,
                 deepcopy(dict(question)),
-                source="catalog_only",
+                seed,
+                source="reviewed_variant_seed",
+                manual_postcondition_path=manual_postcondition_path,
+                option_postcondition_overrides=deepcopy(
+                    dict(option_postcondition_overrides or {})
+                ),
+                option_relation_overrides=deepcopy(dict(option_relation_overrides or {})),
+                manual_input_overrides=deepcopy(dict(manual_input_overrides or {})),
             )
 
     state = new_state("catalog-resume-quarantine", language=language, session_purpose="coverage")
     state["checkpoint_recovery"] = {"status": "quarantined", "reason": "partial"}
-    catalog("resume_quarantine", resume_question(state))
+    catalog("resume_quarantine", state, resume_question(state))
 
-    for group in ("provider_deployment", "ledger_disk", "accounts_disk", "network"):
+    inferred_values = {
+        "provider_deployment": {"CLOUD_REGION": "test-region"},
+        "ledger_disk": {"LEDGER_DEVICE": "vda"},
+        "accounts_disk": {"has_accounts_device": False},
+        "network": {"NETWORK_INTERFACE": "eth0"},
+    }
+    for group, config_values in inferred_values.items():
+        proposal = {"config_values": dict(config_values)}
+        review_state = new_state(
+            f"catalog-inferred-{group}", language=language, session_purpose="coverage"
+        )
+        review_state["inferred_config"] = {"pending_review": deepcopy(proposal)}
+        applied = {
+            f"confirmed_config.{key}": value for key, value in config_values.items()
+        }
         catalog(
             f"inferred_config_{group}",
+            review_state,
             config_proposal_review_question(
                 group,
-                {"config_values": {"CLOUD_REGION": "test-region"}},
+                proposal,
                 language=language,
             ),
+            option_postcondition_overrides={
+                "1": {**applied, "inferred_config.pending_review": None},
+                "2": {"inferred_config.pending_review": None},
+            },
         )
 
     state = new_state("catalog-ledger-size", language=language, session_purpose="coverage")
@@ -760,11 +819,16 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
     state["discovery"] = {
         "disks": {"candidates": [{"name": "vda", "size": "100G", "type": "disk"}]}
     }
-    catalog("ledger_size_inference", question_for_environment(state, "ledger_disk"))
+    catalog(
+        "ledger_size_inference",
+        state,
+        question_for_environment(state, "ledger_disk"),
+        manual_postcondition_path="confirmed_config.DATA_VOL_SIZE",
+    )
 
     state = new_state("catalog-target-mode-change", language=language, session_purpose="coverage")
     state.update({"target_mode": "fake-node", "active_group": "qps_profile"})
-    catalog("target_mode_change", _compiled_action_question(
+    state = _compiled_action_state(
         state,
         {
             "type": "choose_target_mode",
@@ -774,12 +838,13 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
             "confidence": "high",
         },
         user_text="switch to real-node",
-    ))
+    )
+    catalog("target_mode_change", state, state.get("pending_question"))
 
     state = new_state("catalog-unknown-chain", language=language, session_purpose="coverage")
     state["target_mode"] = "fake-node"
     state["workflow_mode"] = "rpc_benchmark"
-    catalog("unknown_chain_identity", _compiled_action_question(
+    state = _compiled_action_state(
         state,
         {
             "type": "choose_chain",
@@ -790,7 +855,8 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
             "confidence": "high",
         },
         user_text="test sola",
-    ))
+    )
+    catalog("unknown_chain_identity", state, state.get("pending_question"))
 
     state = new_state("catalog-chain-change", language=language, session_purpose="coverage")
     state.update({
@@ -798,7 +864,7 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
         "workflow_mode": "rpc_benchmark",
         "chain_identity": {"canonical": "bsc", "status": "confirmed"},
     })
-    catalog("chain_change", _compiled_action_question(
+    state = _compiled_action_state(
         state,
         {
             "type": "change_chain",
@@ -807,11 +873,13 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
             "confidence": "high",
         },
         user_text="change chain to ethereum",
-    ))
+    )
+    catalog("chain_change", state, state.get("pending_question"))
 
     state = new_state("catalog-chain-ambiguity", language=language, session_purpose="coverage")
     catalog(
         "chain_ambiguity",
+        state,
         _chain_ambiguity_question(state, "bsc", {"chain_candidates": ["bsc", "ethereum"]}),
     )
 
@@ -844,22 +912,31 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
     for scenario_id, updates in endpoint_states:
         state = new_state(f"catalog-{scenario_id}", language=language, session_purpose="coverage")
         state.update(deepcopy(updates))
-        catalog(scenario_id, question_for_chain_rpc(state, "endpoint_process"))
+        catalog(scenario_id, state, question_for_chain_rpc(state, "endpoint_process"))
 
+    state = new_state("catalog-chain-change-input", language=language, session_purpose="coverage")
+    state.update({
+        "target_mode": "fake-node",
+        "workflow_mode": "rpc_benchmark",
+        "chain_identity": {"canonical": "bsc", "status": "confirmed"},
+        "rpc_mode": "single",
+        "workload": {"confirmed": True},
+    })
+    state = _compiled_action_state(
+        state,
+        {"type": "request_chain_selection", "source_evidence": "change chain"},
+        user_text="change chain",
+    )
     catalog(
         "chain_change_input",
-        {
-            "contract_version": 1,
-            "id": "chain_change_input",
-            "group": "endpoint_process",
-            "kind": "chain",
-            "prompt": "Enter replacement chain",
-            "field": "chain_change_input",
-            "manual_input_allowed": True,
-            "options": [],
-            "accepted_action_types": ["answer_pending", "choose_chain", "change_chain"],
-            "queue_barrier": True,
-            "validation": {},
+        state,
+        state.get("pending_question"),
+        manual_postcondition_path="chain_identity.change_candidate.canonical",
+        manual_input_overrides={
+            "valid_literal": ManualInputCase("valid_literal", "solana", True),
+            "trimmed_whitespace_punctuation": ManualInputCase(
+                "trimmed_whitespace_punctuation", "  solana  ", True
+            ),
         },
     )
 
@@ -870,11 +947,15 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
         "endpoint_evidence": {"local_rpc_url_ready": True},
         "confirmed_config": {"BLOCKCHAIN_PROCESS_NAMES": "node"},
     })
-    catalog("mainnet_review", question_for_chain_rpc(state, "endpoint_process"))
+    catalog("mainnet_review", state, question_for_chain_rpc(state, "endpoint_process"))
 
     state = new_state("catalog-chain-api-key", language=language, session_purpose="coverage")
     state["chain_identity"] = {"canonical": "litecoin", "status": "confirmed"}
-    catalog("chain_auxiliary_api_key", question_for_chain_rpc(state, "chain_auxiliary_endpoints"))
+    catalog(
+        "chain_auxiliary_api_key",
+        state,
+        question_for_chain_rpc(state, "chain_auxiliary_endpoints"),
+    )
 
     validated = [{"method": "eth_blockNumber"}, {"method": "eth_gasPrice"}]
     catalog_envelope = {
@@ -903,7 +984,7 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
             },
             **deepcopy(extra),
         }
-        catalog(scenario_id, question_for_chain_rpc(state, "endpoint_process"))
+        catalog(scenario_id, state, question_for_chain_rpc(state, "endpoint_process"))
 
     new_chain_statuses = (
         ("new_chain_existing_family_needs_endpoint", "existing_family_needs_endpoint", {}),
@@ -935,10 +1016,17 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
         state["endpoint_evidence"] = {
             "candidate_endpoint_ready": status != "existing_family_needs_endpoint"
         }
-        catalog(scenario_id, question_for_chain_rpc(state, "endpoint_process"))
+        catalog(scenario_id, state, question_for_chain_rpc(state, "endpoint_process"))
 
     state = new_state("catalog-target-change-scope", language=language, session_purpose="coverage")
-    catalog("target_change_scope", _target_change_scope_question(state))
+    state.update({
+        "target_mode": "fake-node",
+        "workflow_mode": "rpc_benchmark",
+        "chain_identity": {"canonical": "bsc", "status": "confirmed"},
+        "rpc_mode": "single",
+        "workload": {"confirmed": True},
+    })
+    catalog("target_change_scope", state, _target_change_scope_question(state))
 
     complete_config = {
         "CLOUD_REGION": "test-region",
@@ -965,7 +1053,7 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
         "observability": {"mode": "disabled"},
         "advanced_tuning": {"confirmed": True},
     })
-    catalog("execution", question_for_execution(state, "preflight_smoke_execution"))
+    catalog("execution", state, question_for_execution(state, "preflight_smoke_execution"))
     return output
 
 

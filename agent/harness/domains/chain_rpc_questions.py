@@ -195,6 +195,12 @@ def _chain_question(state: AgentGraphState) -> dict[str, Any]:
 def _target_change_scope_question(state: AgentGraphState) -> dict[str, Any]:
     language = str(state.get("language") or "en")
     zh = language.startswith("zh")
+    preserved = {
+        "target_mode": state.get("target_mode") or "",
+        "chain_identity.canonical": (state.get("chain_identity") or {}).get("canonical") or "",
+        "rpc_mode": state.get("rpc_mode") or "",
+        "workload.confirmed": bool((state.get("workload") or {}).get("confirmed")),
+    }
     return _choice(
         "workload_rpc",
         "target_change_scope",
@@ -203,7 +209,13 @@ def _target_change_scope_question(state: AgentGraphState) -> dict[str, Any]:
         [
             _action_option("chain", "更换链" if zh else "Change chain", "chain", "request_chain_selection", {"pending_question.id": "chain_change_input"}),
             _action_option("target_mode", "更换 fake-node / real-node / sync-observe 模式" if zh else "Change fake-node / real-node / sync-observe mode", "target_mode", "request_target_mode_selection", {"pending_question.id": "target_mode_select"}),
-            _action_option("cancel", "取消，返回 workload" if zh else "Cancel and return to workload", "cancel", "cancel_target_change", {"pending_question.id": "workload_confirm"}),
+            _action_option(
+                "cancel",
+                "取消更改，保留当前 workload 并继续" if zh else "Cancel the change, keep the current workload, and continue",
+                "cancel",
+                "cancel_target_change",
+                preserved,
+            ),
         ],
     )
 

@@ -318,6 +318,60 @@ class TerminalDeadlineContractTest(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "posix", "PTY/SIGINT coverage requires POSIX")
 class InteractiveSignalContractTest(unittest.TestCase):
+    def test_whitespace_bracketed_paste_is_a_terminal_noop(self) -> None:
+        script = textwrap.dedent(
+            """
+            from agent.terminal.repl import AnyChainTerminal, TerminalSession
+            from agent.terminal.io import TerminalIO
+
+            class CountingHarness:
+                def __init__(self):
+                    self.calls = 0
+
+                def invoke(self, *args, **kwargs):
+                    self.calls += 1
+                    return {"visible_response": [f"HARNESS_CALLS={self.calls}"]}
+
+            class App(AnyChainTerminal):
+                def startup(self):
+                    self._llm_runtime_available = True
+                    self.harness = CountingHarness()
+                    self.io.agent(self.state.language, "READY")
+
+                def _ensure_harness(self):
+                    return self.harness
+
+            raise SystemExit(App(state=TerminalSession(language="en"), io=TerminalIO()).run())
+            """
+        )
+        pid, fd = pty.fork()
+        if pid == 0:  # pragma: no cover - child process
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(REPO_ROOT)
+            os.execve(sys.executable, [sys.executable, "-c", script], env)
+
+        transcript = bytearray()
+        try:
+            self._read_until(fd, transcript, b"User>", timeout=10)
+            transcript.clear()
+            os.write(fd, b"\x1b[200~   \x1b[201~\r")
+            self._read_until(fd, transcript, b"User>", timeout=10)
+            self.assertNotIn(b"HARNESS_CALLS", transcript)
+
+            transcript.clear()
+            os.write(fd, b"hello\r")
+            self._read_until(fd, transcript, b"HARNESS_CALLS=1", timeout=10)
+            self.assertNotIn(b"HARNESS_CALLS=2", transcript)
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
     def test_busy_sigint_cancels_turn_then_idle_sigint_exits(self) -> None:
         script = textwrap.dedent(
             """

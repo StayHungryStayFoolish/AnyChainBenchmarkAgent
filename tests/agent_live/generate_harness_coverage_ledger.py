@@ -267,6 +267,8 @@ def _manual_class_applicability(question: Mapping[str, Any], input_class: str) -
     value_type = str(validation.get("value_type") or "")
     kind = str(question.get("kind") or "")
     input_mode = str(validation.get("input_mode") or "")
+    if input_class == "empty_whitespace":
+        return False, "prompt-toolkit ignores whitespace without submitting a workflow turn"
     if input_class == "out_of_range_numeric":
         applies = value_type in {"positive_number", "positive_integer"}
         return applies, "numeric validation contract" if applies else "question is not numeric"
@@ -305,6 +307,7 @@ def _question_contracts() -> list[dict[str, Any]]:
                 "manual_postcondition_path": "",
                 "option_postcondition_overrides": {},
                 "option_relation_overrides": {},
+                "manual_input_overrides": {},
                 "contract": contract_variant_payload(question),
             }
         variants[key]["scenario_ids"].append(scenario_id)
@@ -316,6 +319,9 @@ def _question_contracts() -> list[dict[str, Any]]:
             )
             variants[key]["option_relation_overrides"] = deepcopy(
                 dict(scenario.option_relation_overrides or {})
+            )
+            variants[key]["manual_input_overrides"] = deepcopy(
+                dict(scenario.manual_input_overrides or {})
             )
     for variant in variants.values():
         variant["scenario_ids"] = sorted(set(variant["scenario_ids"]))
@@ -696,7 +702,10 @@ def build_ledger(
         if contract.get("manual_input_allowed"):
             for input_class in MANUAL_INPUT_CLASSES:
                 applicable, reason = _manual_class_applicability(contract, input_class)
-                concrete_case = manual_input_case(contract, input_class)
+                concrete_case = (
+                    (variant.get("manual_input_overrides") or {}).get(input_class)
+                    or manual_input_case(contract, input_class)
+                )
                 variant_edges.append(_new_edge(
                     group=group,
                     question_id=variant["question_id"],
