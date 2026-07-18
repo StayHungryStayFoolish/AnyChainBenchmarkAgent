@@ -9,6 +9,10 @@ run directly with `bash` or `python3`.
 Use these sets when validating changes:
 
 ```bash
+# Complete ordinary Python regression suite. This runner permits local test
+# servers but fails if a test attempts to contact an external service or LLM.
+python3 tests/run_offline_python_suite.py
+
 # Chain template, RPC target generation, fake-node coverage, and sync health.
 python3 tests/test_chain_template_proxy_extraction.py
 python3 tests/test_chain_adapters.py
