@@ -226,6 +226,7 @@ def _recover_and_validate_semantic_actions(
         plan_text,
         state,
         validation,
+        clauses,
     )
     if pending_semantic_changed:
         validation = _validate_action_document(plan_text, clauses, state)
@@ -740,6 +741,7 @@ def _recover_declared_pending_option_semantics(
     plan_text: str,
     state: AgentGraphState,
     validation: PlanCoverageResult | None = None,
+    clauses: tuple[TurnClause, ...] = (),
 ) -> tuple[str, bool]:
     """Recover unresolved units through the complete active pending contract.
 
@@ -783,6 +785,7 @@ def _recover_declared_pending_option_semantics(
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
     units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
     invalid_indexes = set((validation or PlanCoverageResult(False, (), ())).rejected_action_indexes)
+
     candidates = []
     for unit in units:
         if not isinstance(unit, dict):
@@ -867,6 +870,9 @@ def _recover_declared_pending_option_semantics(
                     "manual_matches:[{unit_id:string,answer:string,evidence_quote:string,reason:string}],"
                     "contexts:[{unit_id:string,supports_unit_id:string,evidence_quote:string,reason:string}]}. "
                     "A match is valid only when source_text semantically selects exactly one available option. "
+                    "Interpret all units in the complete user turn together before deciding: one unit may select "
+                    "an option while sibling units reject alternatives or explain that same selection. Return a "
+                    "context row for every such supporting sibling so the complete turn remains accounted for. "
                     "A manual_match is valid only when manual_input_allowed=true and source_text directly supplies "
                     "one value requested by the displayed field and validation contract. Put only that normalized "
                     "source-supplied value in answer; never copy a value from state, the prompt, or an option. "
@@ -895,6 +901,7 @@ def _recover_declared_pending_option_semantics(
                 },
                 "available_options": available,
                 "admitted_anchors": anchors,
+                "complete_turn": [clause.as_dict() for clause in clauses],
                 "units": candidates,
             }, ensure_ascii=False, sort_keys=True)),
         ],
@@ -2944,6 +2951,7 @@ def _adjudicate_pending_answer_actions(
             "selected_option_label": str((option or {}).get("label") or ""),
             "selected_option_value": selected,
             "allows_unresolved_target_mode": target_mode_menu,
+            "complete_source": str(user_text or ""),
             "source_units": [
                 str(unit.get("source_text") or "")
                 for unit in units
@@ -3760,8 +3768,10 @@ def _request_pending_answer_reviews(
         "evidence_quote:string,reason:string}]}. Include each key exactly once in every row. "
     )
     rules = (
-        "Review every supplied row exactly once. Use select_option only when source_units explicitly select, "
-        "request, or answer the displayed option in the context of the displayed question. Use "
+        "Review every supplied row exactly once. Interpret source_units in the context of complete_source. Use "
+        "select_option only when the complete source consistently selects, requests, or answers the displayed "
+        "option in the context of the displayed question. A local source unit does not prove the proposed option "
+        "when another part of complete_source selects a different displayed option. Use "
         "unresolved_target_mode only when allows_unresolved_target_mode=true and the source has a benchmark or "
         "synchronization-observation goal but explicitly leaves the displayed target mode undecided. Otherwise use "
         "reject. Topical relation is insufficient. A greeting, identity question, help request, explanation request, "
@@ -3846,8 +3856,10 @@ def _adjudicate_rejected_pending_answer_reviews(
                     "{reviews:[{action_index:integer,decision:'select_option'|'reject',"
                     "evidence_quote:string,reason:string}]}. Review every row exactly once. Compare the complete "
                     "source_units with the displayed question and the exact proposed option label and value. "
-                    "select_option means the source semantically answers the question by accepting, rejecting, "
-                    "choosing, or requesting that proposed option. Natural-language answers are valid and do not "
+                    "Interpret source_units in the context of complete_source. select_option means the complete "
+                    "source consistently answers the question by accepting, rejecting, choosing, or requesting "
+                    "that proposed option. Reject when another part of complete_source selects a different displayed "
+                    "option. Natural-language answers are valid and do not "
                     "need to repeat the option ID, number, label, Y, or N. Topical discussion, help, explanation, "
                     "confusion, or a question about the option is reject. Never select a different value and never "
                     "infer from workflow state or defaults. select_option requires the shortest non-empty exact "

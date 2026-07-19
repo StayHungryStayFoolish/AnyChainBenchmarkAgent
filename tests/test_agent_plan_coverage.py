@@ -1566,6 +1566,87 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertEqual(json.loads(result)["pending_answer_admissions"], [0])
         self.assertEqual(provider.complete.call_count, 2)
 
+    def test_pending_review_rejects_local_no_when_complete_turn_selects_other_option(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_pending_answer_actions
+        from agent.harness.state import new_state
+
+        source = (
+            "No. Sola is a different real blockchain, not Solana. "
+            "Take the path where we identify its protocol family."
+        )
+        clauses = segment_user_turn(source)
+        state = new_state("pending-complete-turn-conflict", language="en")
+        state["pending_question"] = {
+            "id": "unknown_chain_identity_confirm",
+            "group": "chain_identity",
+            "kind": "numbered_choice",
+            "prompt": "Use the suggested chain?",
+            "options": [
+                {
+                    "label": "Use `solana`",
+                    "value": "confirm_known_chain",
+                    "action": {"type": "answer_pending", "answer": "confirm_known_chain"},
+                },
+                {
+                    "label": "No, re-enter chain name",
+                    "value": "reenter_chain",
+                    "action": {"type": "answer_pending", "answer": "reenter_chain"},
+                },
+                {
+                    "label": "This is another real chain; choose protocol",
+                    "value": "choose_protocol",
+                    "action": {"type": "answer_pending", "answer": "choose_protocol"},
+                },
+            ],
+        }
+        payload = json.dumps({
+            "actions": [{
+                "type": "answer_pending",
+                "answer": "reenter_chain",
+                "selected_value": "reenter_chain",
+                "source_evidence": "No.",
+            }],
+            "semantic_units": [
+                {
+                    "unit_id": f"unit-{index}",
+                    "clause_id": clause.clause_id,
+                    "source_text": clause.text,
+                    "disposition": "action" if index == 1 else "context",
+                    "action_indexes": [0] if index == 1 else [],
+                    "reason": "planner classification",
+                }
+                for index, clause in enumerate(clauses, start=1)
+            ],
+        })
+        provider = Mock()
+
+        def reject(request):
+            request_payload = json.loads(request.messages[-1].content)
+            review = request_payload["reviews"][0]
+            self.assertEqual(review["source_units"], ["No."])
+            self.assertEqual(review["complete_source"], source)
+            return SimpleNamespace(text=json.dumps({
+                "reviews": [{
+                    "action_index": 0,
+                    "decision": "reject",
+                    "evidence_quote": "",
+                    "reason": "the complete turn selects the different protocol option",
+                }],
+            }))
+
+        provider.complete.side_effect = reject
+        result, changed = _adjudicate_pending_answer_actions(provider, payload, state, source)
+        document = json.loads(result)
+
+        self.assertTrue(changed)
+        self.assertEqual(document["actions"], [])
+        self.assertEqual(document.get("pending_answer_admissions", []), [])
+        self.assertEqual(provider.complete.call_count, 2)
+
     def test_malformed_negative_pending_readjudication_remains_rejected(self) -> None:
         import json
         from types import SimpleNamespace
@@ -6935,6 +7016,170 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
             provider,
             original,
             state,
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(recovered_text, original)
+
+    def test_declared_pending_semantic_recovers_joint_multi_clause_answer(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.state import new_state
+
+        source = (
+            "No, I really do mean a separate chain named sola. "
+            "It is not Solana; continue by determining its protocol family."
+        )
+        clauses = segment_user_turn(source)
+        self.assertEqual(len(clauses), 3)
+        payload = {
+            "actions": [],
+            "semantic_units": [
+                {
+                    "unit_id": "unit-1",
+                    "clause_id": clauses[0].clause_id,
+                    "source_text": clauses[0].text,
+                    "disposition": "unresolved",
+                    "action_indexes": [],
+                },
+                {
+                    "unit_id": "unit-2",
+                    "clause_id": clauses[1].clause_id,
+                    "source_text": clauses[1].text,
+                    "disposition": "unresolved",
+                    "action_indexes": [],
+                },
+                {
+                    "unit_id": "unit-3",
+                    "clause_id": clauses[2].clause_id,
+                    "source_text": clauses[2].text,
+                    "disposition": "unresolved",
+                    "action_indexes": [],
+                },
+            ],
+        }
+        state = new_state("pending-complete-split-clause", language="en")
+        state["pending_question"] = {
+            "id": "unknown_chain_identity_confirm",
+            "prompt": "Use the suggested chain?",
+            "options": [
+                {"id": "known", "value": "confirm_known_chain", "action": {"type": "answer_pending"}},
+                {"id": "protocol", "value": "choose_protocol", "action": {"type": "answer_pending"}},
+            ],
+        }
+        provider = Mock()
+
+        def complete(request):
+            request_payload = json.loads(request.messages[-1].content)
+            self.assertEqual(request_payload["complete_turn"], [clause.as_dict() for clause in clauses])
+            self.assertEqual(len(request_payload["units"]), 3)
+            return SimpleNamespace(text=json.dumps({
+                "matches": [{
+                    "unit_id": "unit-3",
+                    "option_id": "protocol",
+                    "evidence_quote": "continue by determining its protocol family",
+                    "reason": "the complete clause selects protocol discovery",
+                }],
+                "contexts": [
+                    {
+                        "unit_id": "unit-1",
+                        "supports_unit_id": "unit-3",
+                        "evidence_quote": "separate chain named sola",
+                        "reason": "rules out the suggested chain",
+                    },
+                    {
+                        "unit_id": "unit-2",
+                        "supports_unit_id": "unit-3",
+                        "evidence_quote": "not Solana",
+                        "reason": "rules out the suggested chain",
+                    },
+                ],
+            }))
+
+        provider.complete.side_effect = complete
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            PlanCoverageResult(
+                valid=False,
+                errors=("three unresolved clauses",),
+                unresolved_clauses=tuple(clause.text for clause in clauses),
+            ),
+            clauses,
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(len(recovered["semantic_units"]), 3)
+        self.assertEqual(
+            [unit["disposition"] for unit in recovered["semantic_units"]],
+            ["context", "context", "action"],
+        )
+        self.assertEqual(recovered["semantic_units"][2]["action_indexes"], [0])
+        self.assertEqual(recovered["actions"], [{
+            "type": "answer_pending",
+            "answer": "choose_protocol",
+            "selected_value": "choose_protocol",
+            "source_evidence": "continue by determining its protocol family",
+        }])
+
+    def test_declared_pending_semantic_keeps_ambiguous_split_clause_unresolved(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.state import new_state
+
+        source = "Use the suggested chain. Or maybe treat it as another chain; I am not sure."
+        clauses = segment_user_turn(source)
+        self.assertGreater(len(clauses), 1)
+        original = json.dumps({
+            "actions": [],
+            "semantic_units": [
+                {
+                    "unit_id": "unit-1",
+                    "clause_id": clauses[0].clause_id,
+                    "source_text": clauses[0].text,
+                    "disposition": "unresolved",
+                    "action_indexes": [],
+                },
+                {
+                    "unit_id": "unit-2",
+                    "clause_id": clauses[1].clause_id,
+                    "source_text": clauses[1].text,
+                    "disposition": "unresolved",
+                    "action_indexes": [],
+                },
+            ],
+        })
+        state = new_state("pending-ambiguous-split-clause", language="en")
+        state["pending_question"] = {
+            "id": "unknown_chain_identity_confirm",
+            "options": [
+                {"id": "known", "value": "confirm_known_chain", "action": {"type": "answer_pending"}},
+                {"id": "protocol", "value": "choose_protocol", "action": {"type": "answer_pending"}},
+            ],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({}))
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            original,
+            state,
+            PlanCoverageResult(
+                valid=False,
+                errors=("ambiguous unresolved units",),
+                unresolved_clauses=tuple(clause.text for clause in clauses),
+            ),
+            clauses,
         )
 
         self.assertFalse(changed)
