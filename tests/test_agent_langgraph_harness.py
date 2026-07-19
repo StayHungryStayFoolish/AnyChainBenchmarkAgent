@@ -1319,7 +1319,9 @@ disk:
         self.assertNotIn("CLOUD_REGION", result["confirmed_config"])
         self.assertNotIn("LEDGER_DEVICE", result["confirmed_config"])
         self.assertIn("CLOUD_REGION", result["visible_response"][0])
-        self.assertIn("disk.ledger", result["visible_response"][0])
+        proposal = result["inferred_config"]["pending_review"]
+        self.assertEqual(proposal["config_values"]["LEDGER_DEVICE"], "vda")
+        self.assertEqual(proposal["unmapped_values"], {})
 
         result["last_user_input"] = "Y"
         result = process_turn(result)
@@ -1647,6 +1649,41 @@ network:
         self.assertIsNotNone(proposal)
         self.assertEqual(proposal["config_values"]["CLOUD_REGION"], "asia-east1")
         self.assertEqual(proposal["unmapped_values"]["team.custom_limit"], "42")
+
+    def test_nested_structured_config_leaf_maps_once_and_preserves_unknown_sibling(self) -> None:
+        from agent.harness.domains.environment import (
+            build_config_proposal,
+            extract_structured_input_candidates,
+        )
+
+        candidates = extract_structured_input_candidates(
+            "environment:\n"
+            "  CLOUD_REGION: asia-east1\n"
+            "  team_ticket: INC-12345"
+        )
+
+        self.assertEqual(candidates["config_values"], {"CLOUD_REGION": "asia-east1"})
+        self.assertEqual(candidates["unmapped_values"], {"environment.team_ticket": "INC-12345"})
+
+        proposal = build_config_proposal({
+            "config_values": {"CLOUD_REGION": "asia-east1"},
+            "unmapped_values": {
+                "environment.CLOUD_REGION": "must-not-override",
+                "environment.team_ticket": "INC-12345",
+            },
+        })
+        self.assertEqual(proposal["config_values"], {"CLOUD_REGION": "asia-east1"})
+        self.assertEqual(proposal["unmapped_values"], {"environment.team_ticket": "INC-12345"})
+
+    def test_nested_json_config_leaf_uses_same_schema_resolution(self) -> None:
+        from agent.harness.domains.environment import extract_structured_input_candidates
+
+        candidates = extract_structured_input_candidates(
+            '{"deployment":{"NETWORK_INTERFACE":"eth0"}}'
+        )
+
+        self.assertEqual(candidates["config_values"], {"NETWORK_INTERFACE": "eth0"})
+        self.assertEqual(candidates["unmapped_values"], {})
 
     def test_structured_candidates_separate_workflow_and_unknown_fields(self) -> None:
         from agent.harness.domains.environment import extract_structured_input_candidates

@@ -128,6 +128,27 @@ def _is_workflow_dimension_key(key: Any) -> bool:
     return leaf in WORKFLOW_DIMENSION_FIELDS
 
 
+def _mapped_config_field(key: Any) -> str:
+    """Resolve a known config field from a full structured path or its leaf."""
+
+    text = str(key or "").strip()
+    if not text:
+        return ""
+    allowed = CONFIRMABLE_CONFIG_FIELDS | PROPOSED_ENDPOINT_FIELDS | SPECIAL_CONFIG_FIELDS
+    normalized = text.upper()
+    alias = _CONFIG_ALIASES.get(text.lower().replace("-", "_"))
+    if normalized in allowed:
+        return normalized
+    if alias:
+        return alias
+    leaf = text.rsplit(".", 1)[-1]
+    normalized_leaf = leaf.upper()
+    leaf_alias = _CONFIG_ALIASES.get(leaf.lower().replace("-", "_"))
+    if normalized_leaf in allowed:
+        return normalized_leaf
+    return leaf_alias or ""
+
+
 def _is_structured_config_key(key: Any) -> bool:
     """Return whether a key has JSON/YAML/env field structure.
 
@@ -170,6 +191,12 @@ def build_config_proposal(action: dict[str, Any]) -> dict[str, Any]:
     if isinstance(raw_unmapped, dict):
         for key, value in raw_unmapped.items():
             text_key = str(key or "").strip()
+            mapped_key = _mapped_config_field(text_key)
+            if mapped_key:
+                final_key, final_value = normalize_proposed_config_value(mapped_key, value)
+                if final_key and final_value not in {"", None}:
+                    config_values.setdefault(final_key, final_value)
+                continue
             if (
                 text_key
                 and _is_structured_config_key(text_key)
@@ -598,12 +625,10 @@ def classify_flat_input_values(
     config_values: dict[str, Any] = {}
     workflow_values: dict[str, Any] = {}
     unmapped: dict[str, Any] = {}
-    allowed = CONFIRMABLE_CONFIG_FIELDS | PROPOSED_ENDPOINT_FIELDS | SPECIAL_CONFIG_FIELDS
     for raw_key, value in flattened.items():
         key = str(raw_key or "").strip()
         normalized = key.upper()
-        alias = _CONFIG_ALIASES.get(key.lower().replace("-", "_"))
-        mapped_key = normalized if normalized in allowed else alias
+        mapped_key = _mapped_config_field(key)
         scalar = _strip_scalar(str(value)).strip().strip("\"'")
         if not scalar:
             continue
