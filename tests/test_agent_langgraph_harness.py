@@ -8158,6 +8158,164 @@ network:
         self.assertEqual(result.get("qps_profile"), {})
         self.assertIn("Provide schema evidence", "\n".join(result.get("visible_response") or []))
 
+    def test_custom_rpc_catalog_intake_precedes_unresolved_target_mode(self) -> None:
+        from agent.harness.coordinator import _process_action_queue
+        from agent.harness.state import new_state
+
+        state = new_state("custom-rpc-before-target-mode", language="en")
+        state["active_group"] = "endpoint_process"
+        state["chain_identity"] = {
+            "raw": "bsc",
+            "canonical": "bsc",
+            "adapter_family": "jsonrpc",
+            "status": "confirmed",
+            "case": "known",
+        }
+        state["custom_rpc"] = {
+            "status": "needs_method",
+            "endpoint": "https://example.invalid/rpc",
+            "endpoint_ready": True,
+        }
+        state["pending_question"] = {
+            "id": "custom_rpc_method",
+            "group": "endpoint_process",
+            "kind": "manual_value",
+            "field": "custom_rpc_method",
+            "prompt": "Enter the custom RPC method name to validate.",
+            "manual_input_allowed": True,
+            "queue_barrier": True,
+            "validation": {"input_mode": "rpc_method_or_schema_evidence"},
+        }
+
+        result = _process_action_queue(
+            state,
+            [
+                {
+                    "type": "rpc_catalog_command",
+                    "catalog_command": "set_method",
+                    "rpc_method": "eth_accounts",
+                    "source_evidence": "Use eth_accounts for this one.",
+                    "_plan_index": 0,
+                },
+                {
+                    "type": "request_target_mode_selection",
+                    "source_evidence": "I have not selected a target mode yet.",
+                    "_plan_index": 1,
+                },
+            ],
+            "Use eth_accounts for this one.",
+        )
+
+        self.assertEqual((result.get("custom_rpc") or {}).get("status"), "needs_schema_evidence")
+        self.assertEqual(
+            ((result.get("custom_rpc") or {}).get("catalog") or {}).get("draft", {}).get("method"),
+            "eth_accounts",
+        )
+        self.assertEqual((result.get("pending_question") or {}).get("id"), "custom_rpc_schema_evidence")
+        self.assertFalse(result.get("target_mode"))
+        self.assertEqual(
+            [row.get("type") for row in result.get("action_queue") or []],
+            ["request_target_mode_selection"],
+        )
+
+    def test_new_chain_catalog_intake_precedes_unresolved_target_mode(self) -> None:
+        from agent.harness.coordinator import _process_action_queue
+        from agent.harness.state import new_state
+
+        state = new_state("new-chain-rpc-before-target-mode", language="en")
+        state["active_group"] = "endpoint_process"
+        state["chain_identity"] = {
+            "raw": "flow",
+            "canonical": "flow",
+            "adapter_family": "jsonrpc",
+            "status": "existing_family_needs_method",
+            "case": "case2",
+        }
+        state["endpoint_evidence"] = {
+            "candidate_endpoint": "https://example.invalid/rpc",
+            "candidate_endpoint_ready": True,
+        }
+        state["pending_question"] = {
+            "id": "new_chain_method",
+            "group": "endpoint_process",
+            "kind": "manual_value",
+            "field": "new_chain_method",
+            "prompt": "Enter the RPC method name to validate.",
+            "manual_input_allowed": True,
+            "queue_barrier": True,
+            "validation": {"input_mode": "rpc_method_or_schema_evidence"},
+        }
+
+        result = _process_action_queue(
+            state,
+            [
+                {
+                    "type": "rpc_catalog_command",
+                    "catalog_command": "set_method",
+                    "rpc_method": "eth_blockNumber",
+                    "source_evidence": "Use eth_blockNumber.",
+                    "_plan_index": 0,
+                },
+                {
+                    "type": "request_target_mode_selection",
+                    "source_evidence": "Target mode is still undecided.",
+                    "_plan_index": 1,
+                },
+            ],
+            "Use eth_blockNumber.",
+        )
+
+        self.assertEqual(result["chain_identity"]["status"], "existing_family_needs_schema_evidence")
+        self.assertEqual(
+            ((result.get("custom_rpc") or {}).get("catalog") or {}).get("draft", {}).get("method"),
+            "eth_blockNumber",
+        )
+        self.assertEqual((result.get("pending_question") or {}).get("id"), "new_chain_schema_evidence")
+        self.assertFalse(result.get("target_mode"))
+        self.assertEqual(
+            [row.get("type") for row in result.get("action_queue") or []],
+            ["request_target_mode_selection"],
+        )
+
+    def test_custom_rpc_workload_selection_still_waits_for_target_mode(self) -> None:
+        from agent.harness.action_registry import ACTION_BY_TYPE
+        from agent.harness.coordinator import _process_action_queue
+        from agent.harness.state import new_state
+
+        state = new_state("custom-rpc-workload-before-target-mode", language="en")
+        state["active_group"] = "endpoint_process"
+        state["chain_identity"] = {
+            "raw": "bsc",
+            "canonical": "bsc",
+            "adapter_family": "jsonrpc",
+            "status": "confirmed",
+            "case": "known",
+        }
+
+        result = _process_action_queue(
+            state,
+            [
+                {
+                    "type": "rpc_workload_command",
+                    "workload_scope": "single_replace",
+                    "finish_methods": True,
+                    "_plan_index": 0,
+                },
+                {
+                    "type": "request_target_mode_selection",
+                    "source_evidence": "Target mode is still undecided.",
+                    "_plan_index": 1,
+                },
+            ],
+            "Use only the validated method.",
+        )
+
+        self.assertIn("target_mode", ACTION_BY_TYPE["rpc_workload_command"].requires_capabilities)
+        self.assertEqual((result.get("pending_question") or {}).get("id"), "target_mode_select")
+        self.assertEqual([row.get("type") for row in result.get("action_queue") or []], ["rpc_workload_command"])
+        self.assertNotIn("rpc_workload_command", [row.get("type") for row in result.get("completed_actions") or []])
+        self.assertFalse(result.get("target_mode"))
+
     def test_start_custom_rpc_reentry_resumes_from_existing_endpoint_and_method(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
         from agent.harness.state import new_state

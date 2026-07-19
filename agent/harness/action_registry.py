@@ -265,7 +265,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         40,
         "endpoint_process",
         preserve_pending=True,
-        requires_capabilities=("target_mode", "chain_identity"),
+        requires_capabilities=("chain_identity",),
         required_arguments=("catalog_command",),
         constraints=(
             "set_endpoint requires only rpc_endpoint; set_method requires only rpc_method; append_evidence requires only rpc_schema_evidence; enter accepts no payload",
