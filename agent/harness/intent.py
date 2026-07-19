@@ -15,6 +15,7 @@ from .action_registry import (
     ACTION_SPECS,
     CONSULTATION_TOPICS,
     TRUSTED_ACTION_METADATA_FIELDS,
+    lifecycle_rejected_action_indexes,
     validate_action_contract,
 )
 from .context import action_schema, build_action_resolver_prompt, group_schema, workflow_snapshot
@@ -1300,6 +1301,21 @@ def _apply_state_plan_policy(text: str, state: AgentGraphState) -> str:
 
     payload = _parse_json_object(text)
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    lifecycle_rejected = lifecycle_rejected_action_indexes(
+        state,
+        [action if isinstance(action, dict) else {} for action in actions],
+    )
+    if lifecycle_rejected:
+        text, _changed = _remove_rejected_action_indexes(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            lifecycle_rejected,
+            reason=(
+                "operation is incompatible with the active target-mode lifecycle; "
+                "answer the active typed question or explicitly change target mode first"
+            ),
+        )
+        payload = _parse_json_object(text)
+        actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
     identity = state.get("chain_identity") or {}
     if identity.get("case") != "case3" or identity.get("adapter_family") != "unsupported":
         return text
@@ -4855,7 +4871,7 @@ def _action_plan_repair_prompt() -> str:
         "When an active evidence collection exists and validation reports an omitted pause/suspend or resume demand, add the registered evidence-collection lifecycle action and retain every independent navigation or configuration action from the same turn."
         "When validation rejects request_qps_customization because the source only asks to visit or configure the QPS area before another area, replace it with change_group(qps_profile) and exact source_evidence; do not leave that representable navigation unresolved."
         "When adjacent clauses reject the current mutually exclusive workflow and explicitly select a replacement, one choose_target_mode action for the replacement may preserve both clauses. Map both semantic units to that same action index; do not invent a cancellation action or leave the rejection unresolved."
-        "Never add answer_pending merely because a pending question exists. Add it only when the exact source text actually answers that typed question contract."
+        "Never add answer_pending merely because a pending question exists. Add it only when the exact source text actually answers that typed question contract. When validation rejects an operation as incompatible with the active target-mode lifecycle and the same source supplies a value for the active typed question, preserve that value with answer_pending; never retry the incompatible operation."
     )
 
 

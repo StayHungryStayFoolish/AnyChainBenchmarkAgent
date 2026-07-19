@@ -2326,6 +2326,90 @@ class HarnessStateInvariantTest(unittest.TestCase):
         })
         self.assertEqual(accepted["chain_text"], "LocalEvmDemo")
 
+    def test_sync_observe_rejects_rpc_catalog_until_ordered_mode_change(self) -> None:
+        from agent.harness.action_registry import lifecycle_rejected_action_indexes
+
+        state = {"target_mode": "sync-observe", "workflow_mode": "sync_observe"}
+        catalog = {
+            "type": "rpc_catalog_command",
+            "catalog_command": "set_endpoint",
+            "rpc_endpoint": "http://geth-dev:8545",
+        }
+        self.assertEqual(lifecycle_rejected_action_indexes(state, [catalog]), (0,))
+
+        ordered = [
+            {
+                "type": "choose_target_mode",
+                "target_mode": "real-node",
+                "target_mode_explicit": True,
+                "source_evidence": "switch to real-node",
+            },
+            catalog,
+        ]
+        self.assertEqual(lifecycle_rejected_action_indexes(state, ordered), ())
+
+        reversed_order = [catalog, ordered[0]]
+        self.assertEqual(lifecycle_rejected_action_indexes(state, reversed_order), (0,))
+
+    def test_sync_observe_catalog_plan_fails_closed_before_dispatch(self) -> None:
+        from agent.harness.coordinator import _validate_action_plan
+        from agent.harness.invariants import StateInvariantError
+        from agent.harness.state import new_state
+
+        state = new_state("sync-catalog-boundary", language="en")
+        state["target_mode"] = "sync-observe"
+        state["workflow_mode"] = "sync_observe"
+        state["pending_question"] = {
+            "contract_version": 1,
+            "id": "SYNC_OBSERVE_RPC_URL",
+            "group": "endpoint_process",
+            "kind": "url",
+            "field": "SYNC_OBSERVE_RPC_URL",
+            "manual_input_allowed": True,
+            "accepted_action_types": ["answer_pending"],
+            "options": [],
+            "validation": {},
+        }
+        with self.assertRaisesRegex(StateInvariantError, "target-mode lifecycle"):
+            _validate_action_plan(state, [{
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_endpoint",
+                "rpc_endpoint": "http://geth-dev:8545",
+                "source_evidence": "http://geth-dev:8545",
+            }])
+
+    def test_intent_policy_removes_sync_observe_catalog_mutation_for_repair(self) -> None:
+        import json
+
+        from agent.harness.intent import _apply_state_plan_policy
+        from agent.harness.state import new_state
+
+        state = new_state("sync-intent-boundary", language="en")
+        state["target_mode"] = "sync-observe"
+        state["workflow_mode"] = "sync_observe"
+        payload = {
+            "actions": [{
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_endpoint",
+                "rpc_endpoint": "http://geth-dev:8545",
+                "source_evidence": "Use http://geth-dev:8545 for sync observation.",
+            }],
+            "semantic_units": [{
+                "unit_id": "u1",
+                "clause_id": "c1",
+                "source_text": "Use http://geth-dev:8545 for sync observation.",
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "endpoint selection",
+            }],
+        }
+
+        result = json.loads(_apply_state_plan_policy(json.dumps(payload), state))
+
+        self.assertEqual(result["actions"], [])
+        self.assertEqual(result["semantic_units"][0]["disposition"], "unresolved")
+        self.assertIn("target-mode lifecycle", result["semantic_units"][0]["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

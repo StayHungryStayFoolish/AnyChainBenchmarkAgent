@@ -19,7 +19,7 @@ from .oracle import (
 )
 from .routing import chain_identity_confirmed, next_group_and_reason
 from .turns import adjudicate_turn
-from .action_registry import ACTION_BY_TYPE, action_crosses_pending_barrier, action_execution_phase, action_is_turn_local, action_merge_key, assign_action_ids, compile_legacy_custom_rpc_action, merge_semantic_actions, normalize_action_relations, validate_action_contract
+from .action_registry import ACTION_BY_TYPE, action_crosses_pending_barrier, action_execution_phase, action_is_turn_local, action_merge_key, assign_action_ids, compile_legacy_custom_rpc_action, lifecycle_rejected_action_indexes, merge_semantic_actions, normalize_action_relations, validate_action_contract
 from .contracts import ActionProposal, CheckpointCommand, HandlerResult, RecoveryCommand
 from .localization import localized as _localized
 from .domains.orientation import completed_group_status
@@ -728,6 +728,15 @@ def _validate_action_plan(state: AgentGraphState, actions: list[dict[str, Any]])
     prepared = normalize_action_relations(
         _bind_declared_option_actions(state, [dict(item) for item in actions])
     )
+    lifecycle_rejected = lifecycle_rejected_action_indexes(state, prepared)
+    if lifecycle_rejected:
+        rejected_types = ", ".join(
+            str(prepared[index].get("type") or "unknown")
+            for index in lifecycle_rejected
+        )
+        raise StateInvariantError(
+            f"actions incompatible with active target-mode lifecycle: {rejected_types}"
+        )
     for item in prepared:
         if (
             item.get("pending_option_semantic_verified") is True

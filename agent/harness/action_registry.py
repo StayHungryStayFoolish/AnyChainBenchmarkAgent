@@ -124,6 +124,7 @@ class ActionSpec:
     pending_option_semantic: str = ""
     option_navigation_groups: tuple[str, ...] = ()
     pending_option_admission: bool = True
+    incompatible_target_modes: tuple[str, ...] = ()
     validator: ActionValidator | None = None
 
     @property
@@ -270,6 +271,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         constraints=(
             "set_endpoint requires only rpc_endpoint; set_method requires only rpc_method; append_evidence requires only rpc_schema_evidence; enter accepts no payload",
         ),
+        incompatible_target_modes=("sync-observe",),
         validator=_validate_rpc_catalog_command,
     ),
     ActionSpec(
@@ -475,6 +477,33 @@ CONSULTATION_TOPIC_ALIASES: Mapping[str, str] = {
 STATE_AUDIT_TOPICS = frozenset({"current_config", "current_context", "next_action", "execution_status"})
 
 ACTION_BY_TYPE = {spec.action_type: spec for spec in ACTION_SPECS}
+
+
+def lifecycle_rejected_action_indexes(
+    state: Mapping[str, Any],
+    actions: list[dict[str, Any]],
+) -> tuple[int, ...]:
+    """Return actions incompatible with the ordered target-mode transaction.
+
+    Target-mode changes take effect in action order. This lets one explicit
+    transaction leave a workflow and then use its newly compatible actions,
+    while preventing a domain action from mutating state owned by the current
+    workflow before that transition occurs.
+    """
+
+    target_mode = normalize_target_mode(state.get("target_mode"))
+    rejected: list[int] = []
+    for index, action in enumerate(actions):
+        action_type = str(action.get("type") or "")
+        if action_type == "choose_target_mode":
+            replacement = normalize_target_mode(action.get("target_mode"))
+            if replacement:
+                target_mode = replacement
+            continue
+        spec = ACTION_BY_TYPE.get(action_type)
+        if spec is not None and target_mode in spec.incompatible_target_modes:
+            rejected.append(index)
+    return tuple(rejected)
 
 
 def normalize_action_relations(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
