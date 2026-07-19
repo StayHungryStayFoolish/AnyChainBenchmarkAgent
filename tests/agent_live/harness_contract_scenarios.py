@@ -699,6 +699,8 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
             "workload_single",
             "workload_rpc",
             {
+                "target_mode": "fake-node",
+                "workflow_mode": "rpc_benchmark",
                 "rpc_mode": "single",
                 "chain_identity": {"canonical": "bsc", "status": "confirmed"},
             },
@@ -707,6 +709,8 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
             "workload_mixed",
             "workload_rpc",
             {
+                "target_mode": "fake-node",
+                "workflow_mode": "rpc_benchmark",
                 "rpc_mode": "mixed",
                 "chain_identity": {"canonical": "bsc", "status": "confirmed"},
             },

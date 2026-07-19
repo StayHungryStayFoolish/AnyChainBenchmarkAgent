@@ -644,15 +644,25 @@ def _recover_declared_pending_option_semantics(
         for spec in ACTION_SPECS
         if spec.pending_option_semantic
     }
-    available = [
-        {
-            "semantic_action": str(option.get("semantic_action") or ""),
+    available = []
+    for index, option in enumerate(options, start=1):
+        semantic = str(option.get("semantic_action") or "")
+        raw_declared = option.get("action")
+        declared = dict(raw_declared) if isinstance(raw_declared, dict) else {}
+        if semantic in semantic_specs:
+            declared = {"type": semantic_specs[semantic].action_type}
+        elif not declared:
+            continue
+        action_type = str(declared.get("type") or "answer_pending")
+        if action_type not in ACTION_BY_TYPE:
+            continue
+        available.append({
+            "option_id": str(option.get("id") or index),
+            "label": str(option.get("label") or option.get("value") or ""),
+            "semantic_action": semantic,
             "value": option.get("value"),
-            "action_type": semantic_specs[str(option.get("semantic_action") or "")].action_type,
-        }
-        for option in options
-        if str(option.get("semantic_action") or "") in semantic_specs
-    ]
+            "declared_action": declared or {"type": "answer_pending"},
+        })
     if not available:
         return plan_text, False
 
@@ -686,7 +696,7 @@ def _recover_declared_pending_option_semantics(
                 content=(
                     "Adjudicate unresolved source units only against semantic options declared by the active "
                     "AnyChain pending question. Return JSON only: "
-                    "{matches:[{unit_id:string,semantic_action:string,evidence_quote:string,reason:string}]}. "
+                    "{matches:[{unit_id:string,option_id:string,evidence_quote:string,reason:string}]}. "
                     "A match is valid only when source_text semantically selects exactly one available option. "
                     "Preservation constraints or restated saved values may support the selected option but must not "
                     "be treated as separate mutations unless the source explicitly requests changing them. Do not "
@@ -710,21 +720,28 @@ def _recover_declared_pending_option_semantics(
     result = _parse_json_object(response.text)
     matches = result.get("matches") if isinstance(result.get("matches"), list) else []
     candidate_sources = {row["unit_id"]: row["source_text"] for row in candidates}
-    available_by_semantic = {row["semantic_action"]: row for row in available}
-    accepted: dict[str, tuple[str, str]] = {}
+    available_by_id = {row["option_id"]: row for row in available}
+    available_by_semantic = {
+        row["semantic_action"]: row
+        for row in available
+        if row["semantic_action"]
+    }
+    accepted: dict[str, tuple[dict[str, Any], str]] = {}
     for match in matches:
         if not isinstance(match, dict):
             return plan_text, False
         unit_id = str(match.get("unit_id") or "")
+        option_id = str(match.get("option_id") or "")
         semantic = str(match.get("semantic_action") or "")
         quote = str(match.get("evidence_quote") or "").strip()
         source = candidate_sources.get(unit_id, "")
-        if not source or semantic not in available_by_semantic or not quote or quote not in source:
+        selected = available_by_id.get(option_id) or available_by_semantic.get(semantic)
+        if not source or selected is None or not quote or quote not in source:
             return plan_text, False
         prior = accepted.get(unit_id)
-        if prior is not None and prior[0] != semantic:
+        if prior is not None and prior[0]["option_id"] != selected["option_id"]:
             return plan_text, False
-        accepted[unit_id] = (semantic, quote)
+        accepted[unit_id] = (selected, quote)
     if not accepted:
         return plan_text, False
 
@@ -735,11 +752,31 @@ def _recover_declared_pending_option_semantics(
         match = accepted.get(str(unit.get("unit_id") or ""))
         if match is None:
             continue
-        semantic, quote = match
-        action_type = str(available_by_semantic[semantic]["action_type"])
-        action = validate_action_contract({"type": action_type, "source_evidence": quote})
-        action_index = len(recovered_actions)
-        recovered_actions.append(action)
+        selected, quote = match
+        declared = dict(selected["declared_action"])
+        if str(declared.get("type") or "answer_pending") == "answer_pending":
+            action = validate_action_contract({
+                "type": "answer_pending",
+                "answer": selected["value"],
+                "selected_value": selected["value"],
+                "source_evidence": quote,
+            })
+        else:
+            action = _materialize_pending_option_action(declared, quote)
+            if action is None:
+                return plan_text, False
+        action_index = next(
+            (
+                index
+                for index, existing in enumerate(recovered_actions)
+                if index not in invalid_indexes
+                and _same_declared_pending_effect(existing, action)
+            ),
+            -1,
+        )
+        if action_index < 0:
+            action_index = len(recovered_actions)
+            recovered_actions.append(action)
         existing = unit.get("action_indexes") if isinstance(unit.get("action_indexes"), list) else []
         unit["action_indexes"] = list(dict.fromkeys([*existing, action_index]))
         unit["disposition"] = "action"
@@ -747,6 +784,22 @@ def _recover_declared_pending_option_semantics(
     payload["actions"] = recovered_actions
     payload["semantic_units"] = units
     return json.dumps(payload, ensure_ascii=False, sort_keys=True), True
+
+
+def _same_declared_pending_effect(existing: dict[str, Any], candidate: dict[str, Any]) -> bool:
+    """Compare one registered effect without treating evidence text as identity."""
+
+    action_type = str(candidate.get("type") or "")
+    if str(existing.get("type") or "") != action_type:
+        return False
+    spec = ACTION_BY_TYPE.get(action_type)
+    if spec is None:
+        return False
+    effect_arguments = tuple(
+        key for key in spec.allowed_arguments
+        if key != "source_evidence"
+    )
+    return all(existing.get(key) == candidate.get(key) for key in effect_arguments)
 
 
 def _decompose_unresolved_semantic_units(
@@ -2111,7 +2164,7 @@ def _adjudicate_pending_answer_actions(
     state: AgentGraphState,
     user_text: str,
 ) -> tuple[str, bool]:
-    """Keep semantic menu answers from impersonating exact option matches."""
+    """Admit semantic selections through the declared pending-option effect."""
 
     pending = dict(state.get("pending_question") or {})
     options = [item for item in pending.get("options") or [] if isinstance(item, dict)]
@@ -2125,16 +2178,33 @@ def _adjudicate_pending_answer_actions(
     payload.pop("pending_answer_admissions", None)
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
     units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
-    review_indexes = [
-        index
-        for index, action in enumerate(actions)
-        if isinstance(action, dict) and str(action.get("type") or "") == "answer_pending"
-        and not (
-            pending.get("manual_input_allowed") is True
-            and not pending_option_value_exists(action.get("selected_value"), pending)
-            and answer_fits_pending(str(action.get("answer") or ""), pending)
-        )
-    ]
+    option_by_index: dict[int, dict[str, Any]] = {}
+    review_indexes: list[int] = []
+    for index, action in enumerate(actions):
+        if not isinstance(action, dict):
+            continue
+        action_type = str(action.get("type") or "")
+        if action_type == "answer_pending":
+            if (
+                pending.get("manual_input_allowed") is True
+                and not pending_option_value_exists(action.get("selected_value"), pending)
+                and answer_fits_pending(str(action.get("answer") or ""), pending)
+            ):
+                continue
+            option = next(
+                (item for item in options if item.get("value") == action.get("selected_value")),
+                None,
+            )
+        else:
+            option = _matching_pending_option(action, state) or None
+            if option is None:
+                continue
+            spec = ACTION_BY_TYPE.get(action_type)
+            if spec is not None and not spec.pending_option_admission:
+                continue
+        review_indexes.append(index)
+        if option is not None:
+            option_by_index[index] = option
     if not review_indexes:
         return text, False
 
@@ -2152,8 +2222,12 @@ def _adjudicate_pending_answer_actions(
         and option_action_types <= {"choose_target_mode", "answer_opening_question"}
     )
     for index in review_indexes:
-        selected = actions[index].get("selected_value")
-        option = next((item for item in options if item.get("value") == selected), None)
+        option = option_by_index.get(index)
+        selected = (
+            actions[index].get("selected_value")
+            if str(actions[index].get("type") or "") == "answer_pending"
+            else (option or {}).get("value")
+        )
         if option is None and not target_mode_menu:
             invalid_indexes[index] = "the proposed value is not a declared pending option"
             continue
@@ -2215,7 +2289,7 @@ def _adjudicate_pending_answer_actions(
                     row.get("reason") or "source does not select the proposed pending option"
                 )
             else:
-                option = next(
+                option = option_by_index.get(index) or next(
                     (
                         item
                         for item in options
@@ -2231,8 +2305,10 @@ def _adjudicate_pending_answer_actions(
                 if materialized is None:
                     invalid_indexes[index] = "the registered pending option effect is not a valid typed action"
                     continue
-                actions[index] = materialized
-                transformed_indexes.add(index)
+                if actions[index] != materialized:
+                    actions[index] = materialized
+                    transformed_indexes.add(index)
+                admitted_indexes.add(index)
     payload["actions"] = actions
     if admitted_indexes:
         payload["pending_answer_admissions"] = sorted(admitted_indexes)
@@ -2277,20 +2353,21 @@ def _reconcile_pending_owner_mutations(
     state: AgentGraphState,
     user_text: str,
 ) -> tuple[str, bool]:
-    """Separate a pending-option answer from a same-group owner mutation.
+    """Separate a declared pending-option effect from a competing mutation.
 
     A model may restate an already selected owner value while the user is
     actually accepting or rejecting the derived values displayed by the
-    active question. Only durable mutations owned by that exact pending group
-    are reviewed here. The reviewer can bind one declared option or preserve
-    the mutation; it cannot invent a third operation.
+    active question. It may also propose a semantically similar cross-group
+    navigation instead of the typed effect declared by a displayed option.
+    Every competing durable action is therefore reviewed at the same ownership
+    boundary. The reviewer can bind one declared option or preserve the
+    independently requested mutation; it cannot invent a third operation.
     """
 
     pending = dict(state.get("pending_question") or {})
     options = [item for item in pending.get("options") or [] if isinstance(item, dict)]
-    pending_group = str(pending.get("group") or "")
     accepted_types = {str(item) for item in pending.get("accepted_action_types") or []}
-    if not options or not pending_group:
+    if not options:
         return text, False
 
     payload = _parse_json_object(text)
@@ -2306,8 +2383,7 @@ def _reconcile_pending_owner_mutations(
             spec is None
             or action_type in accepted_types
             or spec.lifetime != "durable"
-            or not spec.mutation_dimension
-            or spec.target_group != pending_group
+            or not _action_competes_with_pending_options(action, pending, options)
         ):
             continue
         source_units = [
@@ -2328,10 +2404,15 @@ def _reconcile_pending_owner_mutations(
             "action_index": index,
             "question": str(pending.get("prompt") or ""),
             "declared_options": [
-                {"label": item.get("label"), "value": item.get("value")}
-                for item in options
+                {
+                    "option_id": str(item.get("id") or option_index),
+                    "label": item.get("label"),
+                    "value": item.get("value"),
+                    "declared_action": item.get("action"),
+                }
+                for option_index, item in enumerate(options, start=1)
             ],
-            "proposed_owner_mutation": action,
+            "proposed_competing_action": action,
             "source_text": source,
         })
     if not reviews:
@@ -2357,27 +2438,85 @@ def _reconcile_pending_owner_mutations(
             rejected_indexes.add(index)
             continue
         selected = row.get("selected_option_value")
-        if not pending_option_value_exists(selected, pending) or not quote or quote not in user_text:
+        selected_option = next(
+            (item for item in options if item.get("value") == selected),
+            None,
+        )
+        if selected_option is None or not quote or quote not in user_text:
             rejected_indexes.add(index)
             continue
-        actions[index] = {
-            "type": "answer_pending",
-            "answer": selected,
-            "selected_value": selected,
-            "source_evidence": quote,
-        }
+        declared = (
+            dict(selected_option.get("action"))
+            if isinstance(selected_option.get("action"), dict)
+            else {"type": "answer_pending", "answer": selected}
+        )
+        if str(declared.get("type") or "answer_pending") == "answer_pending":
+            actions[index] = {
+                "type": "answer_pending",
+                "answer": declared.get("answer", selected),
+                "selected_value": selected,
+                "source_evidence": quote,
+            }
+        else:
+            compiled = _materialize_pending_option_action(declared, quote)
+            if compiled is None:
+                rejected_indexes.add(index)
+                continue
+            actions[index] = compiled
         changed = True
     if rejected_indexes:
         payload["actions"] = actions
         return _remove_rejected_action_indexes(
             json.dumps(payload, ensure_ascii=False, sort_keys=True),
             tuple(sorted(rejected_indexes)),
-            reason="the source neither answered the active pending contract nor requested the proposed owner mutation",
+            reason="the source neither selected the active pending option nor requested the competing mutation",
         )
     if not changed:
         return text, False
     payload["actions"] = actions
     return json.dumps(payload, ensure_ascii=False, sort_keys=True), True
+
+
+def _action_competes_with_pending_options(
+    action: dict[str, Any],
+    pending: dict[str, Any],
+    options: list[dict[str, Any]],
+) -> bool:
+    """Return whether registry ownership permits pending-option arbitration."""
+
+    action_type = str(action.get("type") or "")
+    spec = ACTION_BY_TYPE.get(action_type)
+    if spec is None:
+        return False
+    pending_group = str(pending.get("group") or "")
+    if (
+        pending_group
+        and spec.target_group == pending_group
+        and bool(spec.mutation_dimension)
+    ):
+        return True
+
+    for option in options:
+        declared = option.get("action")
+        if not isinstance(declared, dict):
+            continue
+        declared_spec = ACTION_BY_TYPE.get(str(declared.get("type") or ""))
+        if declared_spec is None:
+            continue
+        if (
+            spec.mutation_dimension
+            and declared_spec.mutation_dimension
+            and spec.mutation_dimension == declared_spec.mutation_dimension
+        ):
+            return True
+        if action_type == "change_group":
+            destination = str(action.get("group") or "")
+            if destination and (
+                destination == declared_spec.target_group
+                or destination in declared_spec.option_navigation_groups
+            ):
+                return True
+    return False
 
 
 def _adjudicate_pending_action_ownership(
@@ -2569,7 +2708,7 @@ def _request_manual_pending_reviews(provider: Any, reviews: list[dict[str, Any]]
 
 
 def _request_pending_owner_reviews(provider: Any, reviews: list[dict[str, Any]]) -> dict[str, Any]:
-    """Return one finite ownership decision for each same-group mutation."""
+    """Return one finite ownership decision for each competing durable action."""
 
     system = (
         "Return JSON only: {reviews:[{action_index:integer,"
@@ -2577,8 +2716,10 @@ def _request_pending_owner_reviews(provider: Any, reviews: list[dict[str, Any]])
         "selected_option_value:any,evidence_quote:string,reason:string}]}. Include every key exactly once and "
         "review every row exactly once. select_pending_option means the source explicitly accepts or rejects one "
         "declared option in the displayed question, even if it also restates the already selected owner value. "
-        "keep_owner_mutation means the source explicitly requests the proposed new owner mutation instead of "
-        "answering the displayed question. reject means neither interpretation is source-grounded. Never infer a "
+        "keep_owner_mutation means the source explicitly requests proposed_competing_action as a detour or separate "
+        "mutation instead of selecting a displayed option. A navigation action that merely approximates one displayed "
+        "option is not an independent detour: select that option so its declared_action remains authoritative. reject "
+        "means neither interpretation is source-grounded. Never infer a "
         "default from workflow state. For select_pending_option, selected_option_value must equal one declared "
         "option value and evidence_quote must be the shortest exact source_text excerpt proving that choice. For "
         "the other decisions selected_option_value must be null; reject uses an empty quote."

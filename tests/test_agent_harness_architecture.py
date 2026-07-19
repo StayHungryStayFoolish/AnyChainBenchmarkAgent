@@ -1581,6 +1581,11 @@ class HarnessStateInvariantTest(unittest.TestCase):
                 '"action_indexes":[0],"reason":"single workload"}]}'
             )),
             SimpleNamespace(text=(
+                '{"reviews":[{"action_index":0,"decision":"select_option",'
+                '"evidence_quote":"I only need one RPC method.",'
+                '"reason":"the source selects the declared single-method option"}]}'
+            )),
+            SimpleNamespace(text=(
                 '{"reviews":[{"action_index":0,"supported":true,'
                 '"reason":"the source selects the displayed single-method option"}]}'
             )),
@@ -1597,9 +1602,10 @@ class HarnessStateInvariantTest(unittest.TestCase):
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, "I only need one RPC method.")
 
-        self.assertEqual(provider.complete.call_count, 4)
+        self.assertEqual(provider.complete.call_count, 5)
         self.assertEqual(result["actions"][0]["type"], "set_rpc_mode")
         self.assertEqual(result["actions"][0]["rpc_mode"], "single")
+        self.assertTrue(result["actions"][0]["pending_option_semantic_verified"])
 
     def test_semantic_admission_uses_registered_pending_effect_for_prose_mixed_mode(self) -> None:
         from types import SimpleNamespace
@@ -1626,6 +1632,11 @@ class HarnessStateInvariantTest(unittest.TestCase):
                 '"action_indexes":[0],"reason":"mixed workload"}]}'
             )),
             SimpleNamespace(text=(
+                '{"reviews":[{"action_index":0,"decision":"select_option",'
+                '"evidence_quote":"Use several weighted RPC methods.",'
+                '"reason":"the source selects the declared multiple-method option"}]}'
+            )),
+            SimpleNamespace(text=(
                 '{"reviews":[{"action_index":0,"supported":true,'
                 '"reason":"the source selects the displayed multiple-method option"}]}'
             )),
@@ -1642,9 +1653,10 @@ class HarnessStateInvariantTest(unittest.TestCase):
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, "Use several weighted RPC methods.")
 
-        self.assertEqual(provider.complete.call_count, 4)
+        self.assertEqual(provider.complete.call_count, 5)
         self.assertEqual(result["actions"][0]["type"], "set_rpc_mode")
         self.assertEqual(result["actions"][0]["rpc_mode"], "mixed")
+        self.assertTrue(result["actions"][0]["pending_option_semantic_verified"])
 
     def test_semantic_admission_keeps_ambiguous_rpc_mode_unresolved(self) -> None:
         from types import SimpleNamespace

@@ -115,6 +115,8 @@ class ActionSpec:
     suppressed_by: tuple[str, ...] = ()
     semantic_recovery_source_argument: str = ""
     pending_option_semantic: str = ""
+    option_navigation_groups: tuple[str, ...] = ()
+    pending_option_admission: bool = True
     validator: ActionValidator | None = None
 
     @property
@@ -163,6 +165,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         allows_followup_actions=True,
         lifetime="turn_local",
         required_arguments=("topic",),
+        pending_option_admission=False,
     ),
     ActionSpec("choose_target_mode", "chain_rpc", "Select fake-node, real-node, or sync-observe only when the user explicitly requests that mutation.", ("target_mode", "target_mode_explicit", "source_evidence"), 10, "target_mode", mutation_dimension="target_mode", provides_capabilities=("target_mode",), required_arguments=("target_mode", "target_mode_explicit", "source_evidence")),
     ActionSpec("choose_chain", "chain_rpc", "Select a chain when none is confirmed, or expose multiple candidates without choosing silently.", ("chain_text", "chain_candidates", "source_evidence", "chain_exists", "canonical_chain_name", "adapter_family", "possible_known_chain", "evidence_summary"), 20, "chain_identity", mutation_dimension="chain", provides_capabilities=("chain_identity",), required_arguments=("source_evidence",), validator=_validate_chain_selection),
@@ -286,7 +289,12 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
     ),
     ActionSpec("use_default_workload", "chain_rpc", "Accept the active chain template workload.", execution_phase=40, requires_capabilities=("target_mode", "chain_identity")),
     ActionSpec("configure_workload_weights", "chain_rpc", "Configure mixed weights for the active template or custom methods.", execution_phase=40, requires_capabilities=("target_mode", "chain_identity")),
-    ActionSpec("request_target_change", "chain_rpc", "Open a typed choice for changing the chain or target mode."),
+    ActionSpec(
+        "request_target_change",
+        "chain_rpc",
+        "Open a typed choice for changing the chain or target mode.",
+        option_navigation_groups=("chain_identity", "target_mode"),
+    ),
     ActionSpec("cancel_target_change", "chain_rpc", "Return to workload configuration without changing chain or target mode."),
     ActionSpec("set_qps_mode", "performance", "Select quick, standard, or intensive profile. Do not use set_qps_override unless concrete numeric values were supplied.", ("qps_mode", "mutation_explicit", "source_evidence"), 50, "qps_profile", preserve_pending=True, mutation_dimension="qps_profile", requires_capabilities=("target_mode",), crosses_pending_barrier=True, required_arguments=("qps_mode", "mutation_explicit", "source_evidence")),
     ActionSpec("request_qps_customization", "performance", "Enter QPS customization when the user wants to adjust the selected profile but has not supplied every numeric value yet.", ("qps_fields", "source_evidence"), 50, "qps_profile", preserve_pending=True, mutation_dimension="qps_profile", requires_capabilities=("target_mode",), crosses_pending_barrier=True, requires_specific_change=True, required_arguments=("source_evidence",)),

@@ -195,7 +195,13 @@ def validate_plan_coverage(
                 errors.append(f"invalid scope constraint for {unit_id}: {scope_constraint}")
             else:
                 _validate_consultation_scope(unit_id, mapped_actions, errors)
-        _validate_literal_anchors(unit_id, source_text, mapped_actions, errors)
+        _validate_literal_anchors(
+            unit_id,
+            source_text,
+            mapped_actions,
+            errors,
+            input_shape=expected[clause_id].input_shape,
+        )
 
     for clause_id, clause in expected.items():
         units = sorted(units_by_clause[clause_id], key=lambda item: int(item["start"]))
@@ -400,7 +406,19 @@ def _validate_literal_anchors(
     source_text: str,
     actions: Sequence[Mapping[str, Any]],
     errors: list[str],
+    *,
+    input_shape: str,
 ) -> None:
+    """Protect exact facts in atomic data without interpreting prose roles.
+
+    Whether a literal in prose is selected, rejected, illustrative, or merely
+    contextual is a semantic admission decision. Structured request/evidence
+    blocks have no such conversational role ambiguity and remain fail-closed
+    here before any action can be admitted.
+    """
+
+    if input_shape != "structured":
+        return
     serialized = json.dumps(list(actions), ensure_ascii=False, sort_keys=True, default=str)
     for raw_url in _URL_RE.findall(source_text):
         url = raw_url.rstrip(".,;，；。)")

@@ -781,7 +781,25 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
         command_text = " ".join(config.command)
         self.assertIn("ANYCHAIN_AGENT_CHECKPOINT_PATH=/workspace/.agent/dynamic-chaos/isolated-session/checkpoints.sqlite", command_text)
         self.assertIn("ANYCHAIN_AGENT_JOBS_DIR=/workspace/.agent/dynamic-chaos/isolated-session/jobs", command_text)
-        self.assertEqual(config.command[-2:], ("bench", "./bin/anychain-agent"))
+        self.assertEqual(config.command[-6:], (
+            "bench",
+            "./bin/anychain-agent",
+            "--state-file",
+            "/workspace/.agent/dynamic-chaos/isolated-session/terminal-session.json",
+            "--language",
+            "en",
+        ))
+
+    def test_runner_sets_independent_linux_terminal_state(self) -> None:
+        root = Path("/tmp/anychain-chaos-contract")
+        config = ChaosRunConfig.linux(root, session_id="isolated-session")
+
+        self.assertEqual(config.command[-4:], (
+            "--state-file",
+            "/tmp/anychain-chaos-contract/.agent/dynamic-chaos/isolated-session/terminal-session.json",
+            "--language",
+            "en",
+        ))
 
     def test_bracketed_paste_preserves_multiline_unicode_as_one_submission(self) -> None:
         message = "请分析：\n```json\n{\"method\":\"eth_call\",\"params\":[]}\n```"

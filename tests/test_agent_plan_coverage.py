@@ -1342,7 +1342,7 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(json.loads(result)["actions"], [action])
 
-    def test_pending_owner_reconciliation_ignores_other_groups(self) -> None:
+    def test_pending_owner_reconciliation_preserves_explicit_other_group_detour(self) -> None:
         import json
         from unittest.mock import Mock
 
@@ -1374,6 +1374,280 @@ class PlanCoverageTest(unittest.TestCase):
         })
 
         result, changed = _reconcile_pending_owner_mutations(provider, payload, state, source)
+
+        self.assertFalse(changed)
+        self.assertEqual(result, payload)
+        provider.complete.assert_not_called()
+
+    def test_pending_owner_reconciliation_preserves_independent_compound_demands(self) -> None:
+        import json
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _reconcile_pending_owner_mutations
+        from agent.harness.state import new_state
+
+        source = "Use fake-node for BNB with mixed, quick, and local observability."
+        state = new_state("unit-thread", language="en")
+        state["pending_question"] = {
+            "id": "opening_next_action",
+            "group": "opening",
+            "kind": "numbered_choice",
+            "prompt": "Choose what to do.",
+            "accepted_action_types": ["choose_target_mode", "answer_opening_question"],
+            "options": [{
+                "id": "fake",
+                "label": "Start fake-node benchmark",
+                "value": "fake-node",
+                "action": {
+                    "type": "choose_target_mode",
+                    "target_mode": "fake-node",
+                    "target_mode_explicit": True,
+                },
+            }],
+        }
+        actions = [
+            {
+                "type": "choose_target_mode",
+                "target_mode": "fake-node",
+                "target_mode_explicit": True,
+                "source_evidence": "fake-node",
+            },
+            {
+                "type": "choose_chain",
+                "chain_text": "BNB",
+                "source_evidence": "BNB",
+            },
+            {
+                "type": "set_rpc_mode",
+                "rpc_mode": "mixed",
+                "mutation_explicit": True,
+                "source_evidence": "mixed",
+            },
+            {
+                "type": "set_qps_mode",
+                "qps_mode": "quick",
+                "mutation_explicit": True,
+                "source_evidence": "quick",
+            },
+            {
+                "type": "set_observability",
+                "observability_mode": "local",
+                "mutation_explicit": True,
+                "source_evidence": "local observability",
+            },
+        ]
+        payload = json.dumps({"actions": actions, "semantic_units": []})
+        provider = Mock()
+
+        result, changed = _reconcile_pending_owner_mutations(provider, payload, state, source)
+
+        self.assertFalse(changed)
+        self.assertEqual(json.loads(result)["actions"], actions)
+        provider.complete.assert_not_called()
+
+    def test_pending_option_contract_replaces_similar_cross_group_navigation(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _reconcile_pending_owner_mutations
+        from agent.harness.state import new_state
+
+        source = "Take me to the choice for changing the chain or target mode."
+        state = new_state("unit-thread", language="en")
+        state["pending_question"] = {
+            "id": "workload_confirm",
+            "group": "workload_rpc",
+            "kind": "numbered_choice",
+            "prompt": "Review the current workload.",
+            "accepted_action_types": [
+                "answer_pending",
+                "request_target_change",
+                "rpc_catalog_command",
+                "use_default_workload",
+            ],
+            "options": [
+                {
+                    "id": "change_target",
+                    "label": "Change chain or target mode",
+                    "value": "change_target",
+                    "action": {"type": "request_target_change"},
+                },
+            ],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "reviews": [{
+                "action_index": 0,
+                "decision": "select_pending_option",
+                "selected_option_value": "change_target",
+                "evidence_quote": source,
+                "reason": "the source selects the displayed typed option",
+            }],
+        }))
+        payload = json.dumps({
+            "actions": [{
+                "type": "change_group",
+                "group": "target_mode",
+                "navigation_explicit": True,
+                "source_evidence": source,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": source,
+                "disposition": "action",
+                "action_indexes": [0],
+            }],
+        })
+
+        result, changed = _reconcile_pending_owner_mutations(provider, payload, state, source)
+
+        self.assertTrue(changed)
+        self.assertEqual(json.loads(result)["actions"], [{
+            "type": "request_target_change",
+        }])
+
+    def test_pending_option_contract_preserves_explicit_cross_group_detour(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _reconcile_pending_owner_mutations
+        from agent.harness.state import new_state
+
+        source = "Do not choose that menu option; open target-mode settings directly."
+        state = new_state("unit-thread", language="en")
+        state["pending_question"] = {
+            "id": "workload_confirm",
+            "group": "workload_rpc",
+            "kind": "numbered_choice",
+            "prompt": "Review the current workload.",
+            "accepted_action_types": ["answer_pending", "request_target_change"],
+            "options": [{
+                "id": "change_target",
+                "label": "Change chain or target mode",
+                "value": "change_target",
+                "action": {"type": "request_target_change"},
+            }],
+        }
+        action = {
+            "type": "change_group",
+            "group": "target_mode",
+            "navigation_explicit": True,
+            "source_evidence": source,
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "reviews": [{
+                "action_index": 0,
+                "decision": "keep_owner_mutation",
+                "selected_option_value": None,
+                "evidence_quote": source,
+                "reason": "the source rejects the option and requests a direct detour",
+            }],
+        }))
+        payload = json.dumps({
+            "actions": [action],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": source,
+                "disposition": "action",
+                "action_indexes": [0],
+            }],
+        })
+
+        result, changed = _reconcile_pending_owner_mutations(provider, payload, state, source)
+
+        self.assertFalse(changed)
+        self.assertEqual(json.loads(result)["actions"], [action])
+
+    def test_declared_typed_option_effect_receives_pending_admission(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_pending_answer_actions
+        from agent.harness.state import new_state
+
+        source = "Take me to the choice for changing the chain or target mode."
+        state = new_state("unit-thread", language="en")
+        state["pending_question"] = {
+            "id": "workload_confirm",
+            "group": "workload_rpc",
+            "kind": "numbered_choice",
+            "prompt": "Review the current workload.",
+            "accepted_action_types": ["answer_pending", "request_target_change"],
+            "options": [{
+                "id": "change_target",
+                "label": "Change chain or target mode",
+                "value": "change_target",
+                "action": {"type": "request_target_change"},
+            }],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "reviews": [{
+                "action_index": 0,
+                "decision": "select_option",
+                "evidence_quote": source,
+                "reason": "the source selects the declared option",
+            }],
+        }))
+        payload = json.dumps({
+            "actions": [{
+                "type": "request_target_change",
+                "source_evidence": source,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": source,
+                "disposition": "action",
+                "action_indexes": [0],
+            }],
+        })
+
+        result, changed = _adjudicate_pending_answer_actions(provider, payload, state, source)
+
+        self.assertTrue(changed)
+        document = json.loads(result)
+        self.assertEqual(document["actions"], [{"type": "request_target_change"}])
+        self.assertEqual(document["pending_answer_admissions"], [0])
+
+    def test_consultation_option_remains_owned_by_consultation_admission(self) -> None:
+        import json
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_pending_answer_actions
+        from agent.harness.state import new_state
+
+        source = "I need to know which chains and RPC methods are supported first."
+        state = new_state("unit-thread", language="en")
+        state["pending_question"] = {
+            "id": "opening_next_action",
+            "group": "opening",
+            "kind": "numbered_choice",
+            "prompt": "What would you like me to help with?",
+            "options": [{
+                "id": "info",
+                "label": "Learn supported chains and RPC methods",
+                "value": "info",
+                "action": {"type": "answer_opening_question", "topic": "capabilities"},
+            }],
+        }
+        payload = json.dumps({
+            "actions": [{
+                "type": "answer_opening_question",
+                "topic": "capabilities",
+                "source_evidence": source,
+            }],
+            "semantic_units": [],
+        })
+        provider = Mock()
+
+        result, changed = _adjudicate_pending_answer_actions(provider, payload, state, source)
 
         self.assertFalse(changed)
         self.assertEqual(result, payload)
@@ -3756,8 +4030,8 @@ class PlanCoverageTest(unittest.TestCase):
             "and verify this inventory:\ndevice: vda\nsize_gib: 926",
         )
 
-    def test_url_must_be_present_in_mapped_action(self) -> None:
-        clauses = segment_user_turn("Validate http://geth-dev:8545.")
+    def test_structured_url_must_be_present_in_mapped_action(self) -> None:
+        clauses = segment_user_turn('{"LOCAL_RPC_URL":"http://geth-dev:8545"}')
         result = validate_plan_coverage(
             {
                 "actions": [{"type": "propose_config_values", "LOCAL_RPC_URL": "http://wrong:8545"}],
@@ -3768,23 +4042,131 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertFalse(result.valid)
         self.assertTrue(any("URL" in error for error in result.errors))
 
-    def test_explicit_wire_method_must_be_owned_by_mapped_action(self) -> None:
+    def test_structured_wire_method_must_be_owned_by_mapped_action(self) -> None:
         clauses = segment_user_turn(
-            "Set target mode to fake-node, chain to BSC, and start custom RPC setup for eth_getBalance."
+            '{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":[]}'
         )
-        actions = [
-            {"type": "choose_target_mode", "target_mode": "fake-node"},
-            {"type": "choose_chain", "chain_text": "BSC"},
-            {"type": "rpc_catalog_command", "catalog_command": "enter"},
-        ]
+        actions = [{"type": "rpc_catalog_command", "catalog_command": "enter"}]
 
         result = validate_plan_coverage(
-            {"actions": actions, "semantic_units": [_unit(clauses[0], 1, [0, 1, 2])]},
+            {"actions": actions, "semantic_units": [_unit(clauses[0], 1, [0])]},
             clauses,
         )
 
         self.assertFalse(result.valid)
         self.assertTrue(any("eth_getBalance" in error for error in result.errors))
+
+    def test_prose_wire_literal_role_is_deferred_to_semantic_admission(self) -> None:
+        clauses = segment_user_turn(
+            "Use my own RPC method instead of eth_getBalance."
+        )
+        actions = [{"type": "rpc_catalog_command", "catalog_command": "enter"}]
+
+        result = validate_plan_coverage(
+            {"actions": actions, "semantic_units": [_unit(clauses[0], 1, [0])]},
+            clauses,
+        )
+
+        self.assertTrue(result.valid, result.errors)
+
+    def test_semantic_admission_rejects_named_method_demand_laundered_as_entry(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _validate_semantic_fulfillment
+        from agent.harness.state import new_state
+
+        clauses = segment_user_turn("Add eth_accounts as my custom RPC method.")
+        payload = {
+            "actions": [{
+                "type": "rpc_catalog_command",
+                "catalog_command": "enter",
+                "source_evidence": clauses[0].text,
+            }],
+            "semantic_units": [_unit(clauses[0], 1, [0])],
+        }
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps({
+                "reviews": [{
+                    "action_index": 0,
+                    "supported": True,
+                    "reason": "the source requests custom-RPC intake",
+                }],
+            })),
+            SimpleNamespace(text=json.dumps({
+                "unit_reviews": [{
+                    "unit_id": "unit-1",
+                    "complete": False,
+                    "missing_demand_quote": "eth_accounts",
+                    "reason": "the named wire method is not preserved",
+                }],
+            })),
+            SimpleNamespace(text=json.dumps({
+                "unit_reviews": [{
+                    "unit_id": "unit-1",
+                    "complete": False,
+                    "missing_demand_quote": "eth_accounts",
+                    "reason": "independent review confirms the omission",
+                }],
+            })),
+        ]
+
+        result = _validate_semantic_fulfillment(
+            provider,
+            json.dumps(payload),
+            clauses,
+            new_state("named-method-demand", language="en"),
+        )
+
+        self.assertFalse(result.valid)
+        self.assertTrue(any("independent review confirms the omission" in error for error in result.errors))
+
+    def test_semantic_admission_accepts_replaced_default_as_contextual_literal(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _validate_semantic_fulfillment
+        from agent.harness.state import new_state
+
+        clauses = segment_user_turn(
+            "Keep this single, but use my own RPC method instead of eth_getBalance."
+        )
+        payload = {
+            "actions": [{
+                "type": "rpc_catalog_command",
+                "catalog_command": "enter",
+                "source_evidence": clauses[0].text,
+            }],
+            "semantic_units": [_unit(clauses[0], 1, [0])],
+        }
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps({
+                "reviews": [{
+                    "action_index": 0,
+                    "supported": True,
+                    "reason": "the source selects custom-RPC intake",
+                }],
+            })),
+            SimpleNamespace(text=json.dumps({
+                "unit_reviews": [{
+                    "unit_id": "unit-1",
+                    "complete": True,
+                    "missing_demand_quote": "",
+                    "reason": "the old default is comparison context, not a selected method",
+                }],
+            })),
+        ]
+
+        result = _validate_semantic_fulfillment(
+            provider,
+            json.dumps(payload),
+            clauses,
+            new_state("replaced-default-literal", language="en"),
+        )
+
+        self.assertTrue(result.valid, result.errors)
 
     def test_environment_yaml_keys_are_not_rpc_wire_methods(self) -> None:
         clauses = segment_user_turn(
@@ -5160,6 +5542,120 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
 
         self.assertFalse(changed)
         self.assertEqual(recovered_text, original)
+
+    def test_declared_pending_option_recovers_registered_domain_effect(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.state import new_state
+
+        user_text = "Keep single mode, but use my own RPC method instead of the default."
+        clauses = segment_user_turn(user_text)
+        payload = {
+            "actions": [],
+            "semantic_units": [self._unit(clauses[0], "unit-1", [], disposition="unresolved")],
+        }
+        state = new_state("pending-domain-option", language="en")
+        state["pending_question"] = {
+            "id": "workload_confirm",
+            "prompt": "Choose the default workload or add a custom RPC method.",
+            "options": [
+                {
+                    "id": "default",
+                    "label": "Use defaults",
+                    "value": "default",
+                    "action": {"type": "use_default_workload"},
+                },
+                {
+                    "id": "custom_rpc",
+                    "label": "Add custom RPC method",
+                    "value": "custom_rpc",
+                    "action": {"type": "rpc_catalog_command", "catalog_command": "enter"},
+                },
+            ],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "matches": [{
+                "unit_id": "unit-1",
+                "option_id": "custom_rpc",
+                "evidence_quote": "use my own RPC method instead of the default",
+                "reason": "selects the declared custom RPC option",
+            }],
+        }))
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(recovered["actions"], [{
+            "type": "rpc_catalog_command",
+            "catalog_command": "enter",
+            "source_evidence": "use my own RPC method instead of the default",
+        }])
+        self.assertEqual(recovered["semantic_units"][0]["action_indexes"], [0])
+
+    def test_declared_pending_option_reuses_existing_equivalent_domain_effect(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.state import new_state
+
+        user_text = "Use my own RPC method instead of the displayed default."
+        clauses = segment_user_turn(user_text)
+        payload = {
+            "actions": [{
+                "type": "rpc_catalog_command",
+                "catalog_command": "enter",
+                "source_evidence": "Use my own RPC method",
+            }],
+            "semantic_units": [self._unit(clauses[0], "unit-1", [0])],
+        }
+        state = new_state("pending-domain-option-idempotent", language="en")
+        state["pending_question"] = {
+            "id": "workload_confirm",
+            "options": [{
+                "id": "custom_rpc",
+                "label": "Add custom RPC method",
+                "value": "custom_rpc",
+                "action": {"type": "rpc_catalog_command", "catalog_command": "enter"},
+            }],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "matches": [{
+                "unit_id": "unit-1",
+                "option_id": "custom_rpc",
+                "evidence_quote": "Use my own RPC method",
+                "reason": "selects the declared custom RPC option",
+            }],
+        }))
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            PlanCoverageResult(
+                valid=False,
+                errors=("semantic unit incomplete",),
+                unresolved_clauses=(),
+                incomplete_unit_ids=("unit-1",),
+            ),
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(len(recovered["actions"]), 1)
+        self.assertEqual(recovered["semantic_units"][0]["action_indexes"], [0])
 
     def test_ambiguous_unit_fails_closed_without_rewriting_siblings(self) -> None:
         import json

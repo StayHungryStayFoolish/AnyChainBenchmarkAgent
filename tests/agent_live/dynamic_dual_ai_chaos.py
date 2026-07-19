@@ -114,7 +114,14 @@ class ChaosRunConfig:
         command: list[str] = ["docker", "compose", "exec"]
         for name, value in container_env.items():
             command.extend(("-e", f"{name}={value}"))
-        command.extend((service, "./bin/anychain-agent"))
+        command.extend((
+            service,
+            "./bin/anychain-agent",
+            "--state-file",
+            str(container_runtime / "terminal-session.json"),
+            "--language",
+            "en",
+        ))
         return cls(
             repo_root=root,
             command=tuple(command),
@@ -137,7 +144,13 @@ class ChaosRunConfig:
         runtime = root / ".agent" / "dynamic-chaos" / session_id
         return cls(
             repo_root=root,
-            command=(str(root / "bin" / "anychain-agent"),),
+            command=(
+                str(root / "bin" / "anychain-agent"),
+                "--state-file",
+                str(runtime / "terminal-session.json"),
+                "--language",
+                "en",
+            ),
             session_id=session_id,
             runtime_root=runtime,
             runtime_root_in_process=runtime,

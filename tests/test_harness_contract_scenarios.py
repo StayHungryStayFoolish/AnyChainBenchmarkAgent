@@ -39,6 +39,17 @@ class HarnessContractScenarioTest(unittest.TestCase):
         self.assertIsNone(manual_input_case(scenario.question, "natural_language_answer"))
         self.assertIsNone(manual_input_case(scenario.question, "multiline_prose"))
 
+    def test_workload_scenarios_include_reachable_upstream_prerequisites(self) -> None:
+        scenarios = {item.scenario_id: item for item in question_scenarios("en")}
+
+        for scenario_id, rpc_mode in (("workload_single", "single"), ("workload_mixed", "mixed")):
+            state = dict(scenarios[scenario_id].seed_state or {})
+            self.assertEqual(state.get("target_mode"), "fake-node")
+            self.assertEqual(state.get("workflow_mode"), "rpc_benchmark")
+            self.assertEqual(state.get("rpc_mode"), rpc_mode)
+            self.assertEqual((state.get("chain_identity") or {}).get("status"), "confirmed")
+            self.assertEqual((state.get("pending_question") or {}).get("id"), "workload_confirm")
+
 
 if __name__ == "__main__":
     unittest.main()
