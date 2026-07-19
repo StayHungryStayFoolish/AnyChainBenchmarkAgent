@@ -765,8 +765,10 @@ def _recover_declared_pending_option_semantics(
         declared = dict(raw_declared) if isinstance(raw_declared, dict) else {}
         if semantic in semantic_specs:
             declared = {"type": semantic_specs[semantic].action_type}
-        elif not declared:
+        elif semantic and not declared:
             continue
+        elif not declared:
+            declared = {"type": "answer_pending"}
         action_type = str(declared.get("type") or "answer_pending")
         if action_type not in ACTION_BY_TYPE:
             continue
@@ -859,56 +861,72 @@ def _recover_declared_pending_option_semantics(
     if len({row["option_id"] for row in anchors}) > 1:
         return plan_text, False
 
-    response = provider.complete(LLMRequest(
-        messages=[
-            LLMMessage(
+    adjudication_contract = (
+        "Adjudicate unresolved source units only against the complete contract declared by the active "
+        "AnyChain pending question. Return JSON only: "
+        "{matches:[{unit_id:string,option_id:string,evidence_quote:string,reason:string}],"
+        "manual_matches:[{unit_id:string,answer:string,evidence_quote:string,reason:string}],"
+        "contexts:[{unit_id:string,supports_unit_id:string,evidence_quote:string,reason:string}]}. "
+        "A match is valid only when source_text semantically selects exactly one available option. "
+        "A direct imperative or natural-language paraphrase that asks the Agent to perform one "
+        "displayed option's declared effect counts as selecting that option; the user does not need "
+        "to repeat the option label or number. "
+        "Interpret all units in the complete user turn together before deciding: one unit may select "
+        "an option while sibling units reject alternatives or explain that same selection. Return a "
+        "context row for every such supporting sibling so the complete turn remains accounted for. "
+        "A manual_match is valid only when manual_input_allowed=true and source_text directly supplies "
+        "one value requested by the displayed field and validation contract. Put only that normalized "
+        "source-supplied value in answer; never copy a value from state, the prompt, or an option. "
+        "Preservation constraints or restated saved values may support the selected option but must not "
+        "be treated as separate mutations unless the source explicitly requests changing them. Do not "
+        "match a question, explanation request, contradiction, ambiguity, or a request for another "
+        "option. evidence_quote must be a non-empty exact substring of source_text that proves the "
+        "selection or manual value. An admitted_anchor is a read-only option binding already admitted "
+        "by its dedicated owner; do not repeat or replace it in matches/manual_matches. A context row "
+        "is valid only when its unit solely frames, explains, defers an unselected alternative, or "
+        "rules out alternatives in direct support of one matched unit or admitted_anchor in this turn. "
+        "It must contain no independent present request, saved future workflow goal, question, mutation, "
+        "evidence submission, or value. supports_unit_id must name that matched unit or admitted_anchor. "
+        "Omit units that do not safely satisfy one of these contracts. Never invent an option or value."
+    )
+    adjudication_payload = json.dumps({
+        "pending_question": {
+            "id": str(pending.get("id") or ""),
+            "prompt": str(pending.get("prompt") or ""),
+            "field": str(pending.get("field") or ""),
+            "kind": str(pending.get("kind") or ""),
+            "validation": pending.get("validation") or {},
+            "manual_input_allowed": manual_allowed,
+        },
+        "available_options": available,
+        "admitted_anchors": anchors,
+        "complete_turn": [clause.as_dict() for clause in clauses],
+        "units": candidates,
+    }, ensure_ascii=False, sort_keys=True)
+    result: dict[str, Any] = {}
+    for attempt in range(2):
+        messages = [LLMMessage(role="system", content=adjudication_contract)]
+        if attempt:
+            messages.append(LLMMessage(
                 role="system",
                 content=(
-                    "Adjudicate unresolved source units only against the complete contract declared by the active "
-                    "AnyChain pending question. Return JSON only: "
-                    "{matches:[{unit_id:string,option_id:string,evidence_quote:string,reason:string}],"
-                    "manual_matches:[{unit_id:string,answer:string,evidence_quote:string,reason:string}],"
-                    "contexts:[{unit_id:string,supports_unit_id:string,evidence_quote:string,reason:string}]}. "
-                    "A match is valid only when source_text semantically selects exactly one available option. "
-                    "Interpret all units in the complete user turn together before deciding: one unit may select "
-                    "an option while sibling units reject alternatives or explain that same selection. Return a "
-                    "context row for every such supporting sibling so the complete turn remains accounted for. "
-                    "A manual_match is valid only when manual_input_allowed=true and source_text directly supplies "
-                    "one value requested by the displayed field and validation contract. Put only that normalized "
-                    "source-supplied value in answer; never copy a value from state, the prompt, or an option. "
-                    "Preservation constraints or restated saved values may support the selected option but must not "
-                    "be treated as separate mutations unless the source explicitly requests changing them. Do not "
-                    "match a question, explanation request, contradiction, ambiguity, or a request for another "
-                    "option. evidence_quote must be a non-empty exact substring of source_text that proves the "
-                    "selection or manual value. An admitted_anchor is a read-only option binding already admitted "
-                    "by its dedicated owner; do not repeat or replace it in matches/manual_matches. A context row "
-                    "is valid only when its unit solely frames, explains, "
-                    "defers an unselected alternative, or rules out alternatives in direct support of one matched "
-                    "unit or admitted_anchor in this turn. It must contain no independent present request, saved "
-                    "future workflow goal, question, mutation, evidence submission, or value. supports_unit_id must "
-                    "name that matched unit or admitted_anchor. "
-                    "Omit units that do not safely satisfy one of these contracts. Never invent an option or value."
+                    "The first adjudication found no safe binding. Re-evaluate the complete turn once, including "
+                    "imperative paraphrases of displayed option effects. Return a binding only when exactly one "
+                    "declared option or one allowed manual value is unambiguous; otherwise return empty arrays."
                 ),
-            ),
-            LLMMessage(role="user", content=json.dumps({
-                "pending_question": {
-                    "id": str(pending.get("id") or ""),
-                    "prompt": str(pending.get("prompt") or ""),
-                    "field": str(pending.get("field") or ""),
-                    "kind": str(pending.get("kind") or ""),
-                    "validation": pending.get("validation") or {},
-                    "manual_input_allowed": manual_allowed,
-                },
-                "available_options": available,
-                "admitted_anchors": anchors,
-                "complete_turn": [clause.as_dict() for clause in clauses],
-                "units": candidates,
-            }, ensure_ascii=False, sort_keys=True)),
-        ],
-        temperature=0.0,
-        max_tokens=500,
-    ))
-    result = _parse_json_object(response.text)
+            ))
+        messages.append(LLMMessage(role="user", content=adjudication_payload))
+        response = provider.complete(LLMRequest(
+            messages=messages,
+            temperature=0.0,
+            max_tokens=500,
+        ))
+        result = _parse_json_object(response.text)
+        if any(
+            isinstance(result.get(key), list) and bool(result.get(key))
+            for key in ("matches", "manual_matches")
+        ):
+            break
     matches = result.get("matches") if isinstance(result.get("matches"), list) else []
     manual_matches = (
         result.get("manual_matches")

@@ -13,6 +13,7 @@ from unittest.mock import patch
 from tests.agent_live.chaos_scheduler import build_chaos_schedule
 from tests.agent_live.coverage_evidence import (
     RuntimeTurnEvent,
+    content_hash,
     load_valid_evidence_reference,
     validate_pty_diagnostic_artifact,
     validate_pty_cli_evidence_artifact,
@@ -320,6 +321,82 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             self.assertEqual(transport.submitted, ["1", "Use the simulated node for this check."])
             self.assertEqual(len(seen), 1)
             seed_checkpoint.assert_called_once()
+
+    def test_seeded_runner_exposes_resume_when_resume_is_the_scheduled_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            resume_edge = {
+                **EDGE,
+                "edge_key": "opening::resume_harness_session::variant::natural_language_option::option:3",
+                "question_id": "resume_harness_session",
+                "edge_type": "question_option",
+                "action_type": "answer_pending",
+                "option_id": "3",
+                "option_value": "reset",
+                "expected_postcondition": {"confirmed_config": {}},
+                "executable_scenario_ids": ["resume_qps"],
+            }
+            ledger = {"revision": REVISION, "edges": [resume_edge]}
+            schedule = build_chaos_schedule(
+                ledger,
+                revision=REVISION,
+                seed=18,
+                targets=[{
+                    "target_id": "resume-reset-turn",
+                    "edge_key": resume_edge["edge_key"],
+                    "persona": "returning operator",
+                    "goal": "discard the partial configuration in natural language",
+                    "scenario_id": "resume_qps",
+                }],
+            )
+            transport = FakeTransport([
+                "Agent> Model config: provider=deepseek, model=deepseek-chat, auth=api_key\n"
+                "Agent> Previous configuration found. Continue, modify, or clear it?",
+                "Agent> Previous configuration cleared. Choose a target mode.",
+            ])
+            seen: list[SimulatorContext] = []
+
+            def simulator(context: SimulatorContext) -> SimulatorDecision:
+                seen.append(context)
+                self.assertIn("Continue, modify, or clear", context.previous_agent_response)
+                return SimulatorDecision(
+                    user_message="Discard that partial setup and let me start clean.",
+                    persona=context.scheduled_target.persona,
+                    goal=context.scheduled_target.goal,
+                    rationale="The live startup response offers clearing the saved session.",
+                    target_coverage_ids=(context.scheduled_target.edge_key,),
+                )
+
+            committed = replace(
+                self._event(2, "b" * 64, "c" * 64, "opening_next_action"),
+                admitted_action_types=("answer_pending",),
+                state_diff_hashes={"confirmed_config": {"before": "1" * 64, "after": "2" * 64}},
+                after_value_hashes={"confirmed_config": content_hash({})},
+                next_result={"kind": "question", "question_id": "opening_next_action"},
+            )
+            runner = DynamicDualAiChaosRunner(
+                ChaosRunConfig.linux(root, session_id="contract-session"),
+                simulator,
+                ledger=ledger,
+                schedule=schedule,
+                transport=transport,
+                event_stream=FakeEventStream([
+                    self._event(1, "a" * 64, "b" * 64, "resume_harness_session"),
+                    committed,
+                ]),
+                revision=REVISION,
+                clock_ns=OrderedClock(),
+            )
+
+            with patch("tests.agent_live.runtime_checkpoint.seed_runtime_checkpoint"):
+                result = runner.run()
+
+            self.assertEqual(result.execution_status, "complete")
+            self.assertEqual(
+                transport.submitted,
+                ["Discard that partial setup and let me start clean."],
+            )
+            self.assertEqual(len(seen), 1)
 
     def test_seeded_action_runner_uses_product_modification_waiting_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

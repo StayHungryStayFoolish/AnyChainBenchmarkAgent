@@ -144,7 +144,7 @@ confirm or provide a value.
 
 ```mermaid
 flowchart TD
-  C["LangGraph checkpoint"] --> S["ANYCHAIN_AGENT_CHECKPOINT_PATH<br/>default .agent/checkpoints/agent.sqlite"]
+  C["LangGraph checkpoint"] --> S["ANYCHAIN_AGENT_CHECKPOINT_PATH<br/>default .agent/langgraph/checkpoints.sqlite"]
   T["Terminal session state"] --> TS["--state-file JSON"]
   P["Plan"] --> E[".agent/jobs/job_id/runtime.env"]
   J["Job metadata"] --> M[".agent/jobs/job_id/job.json"]

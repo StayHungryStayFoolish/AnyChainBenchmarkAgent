@@ -7185,6 +7185,99 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(recovered_text, original)
 
+    def test_declared_pending_semantic_retries_empty_adjudication_for_imperative_paraphrase(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.state import new_state
+
+        user_text = "Discard that partial setup and let me start clean."
+        clauses = segment_user_turn(user_text)
+        payload = {
+            "actions": [],
+            "semantic_units": [self._unit(clauses[0], "unit-1", [], disposition="unresolved")],
+        }
+        state = new_state("pending-imperative-retry", language="en")
+        state["pending_question"] = {
+            "id": "resume_harness_session",
+            "prompt": "Resume the saved configuration?",
+            "options": [
+                {"id": "continue", "value": "continue", "semantic_action": "continue_current_flow"},
+                {"id": "modify", "value": "modify"},
+                {"id": "reset", "label": "Clear and start over", "value": "reset"},
+            ],
+        }
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps({"matches": [], "manual_matches": [], "contexts": []})),
+            SimpleNamespace(text=json.dumps({
+                "matches": [{
+                    "unit_id": "unit-1",
+                    "option_id": "reset",
+                    "evidence_quote": "Discard that partial setup and let me start clean",
+                    "reason": "imperative paraphrase selects the declared reset effect",
+                }],
+            })),
+        ]
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            clauses=clauses,
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(provider.complete.call_count, 2)
+        self.assertEqual(recovered["actions"], [{
+            "type": "answer_pending",
+            "answer": "reset",
+            "selected_value": "reset",
+            "source_evidence": "Discard that partial setup and let me start clean",
+        }])
+
+    def test_declared_pending_semantic_second_empty_adjudication_remains_unresolved(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.state import new_state
+
+        user_text = "Maybe continue, or clear it; I have not decided."
+        clauses = segment_user_turn(user_text)
+        original = json.dumps({
+            "actions": [],
+            "semantic_units": [self._unit(clauses[0], "unit-1", [], disposition="unresolved")],
+        })
+        state = new_state("pending-ambiguous-retry", language="en")
+        state["pending_question"] = {
+            "id": "resume_harness_session",
+            "options": [
+                {"id": "continue", "value": "continue", "semantic_action": "continue_current_flow"},
+                {"id": "reset", "value": "reset"},
+            ],
+        }
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps({})),
+            SimpleNamespace(text=json.dumps({"matches": [], "manual_matches": [], "contexts": []})),
+        ]
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            original,
+            state,
+            clauses=clauses,
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(recovered_text, original)
+        self.assertEqual(provider.complete.call_count, 2)
+
     def test_declared_pending_option_recovers_registered_domain_effect(self) -> None:
         import json
         from types import SimpleNamespace

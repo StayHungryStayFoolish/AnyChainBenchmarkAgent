@@ -453,7 +453,10 @@ class DynamicDualAiChaosRunner:
                 first_target = self.schedule.targets[0]
                 first_edge = self.edge_index[first_target.edge_key]
                 expected_question = str(first_edge.get("question_id") or "")
-                if baseline_event.pending_question_id == "resume_harness_session":
+                if (
+                    baseline_event.pending_question_id == "resume_harness_session"
+                    and expected_question != "resume_harness_session"
+                ):
                     resume_choice = (
                         "2"
                         if str(first_edge.get("edge_type") or "") == "action_transition"
