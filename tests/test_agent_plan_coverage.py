@@ -23,6 +23,39 @@ def _unit(clause, index: int, action_indexes, *, disposition: str = "action", re
 
 
 class PlanCoverageTest(unittest.TestCase):
+    def test_same_group_navigation_cannot_replace_the_active_pending_answer(self) -> None:
+        from agent.harness.intent import _validate_action_document
+        from agent.harness.state import new_state
+
+        source = "先测币安智能链，Ethereum 后面再说。"
+        clause = segment_user_turn(source)[0]
+        state = new_state("same-group-navigation")
+        state["active_group"] = "chain_identity"
+        state["pending_question"] = {
+            "id": "chain_ambiguity_confirm",
+            "group": "chain_identity",
+            "kind": "numbered_choice",
+            "options": [
+                {"id": "bsc", "value": {"chain_choice": "bsc"}},
+                {"id": "ethereum", "value": {"chain_choice": "ethereum"}},
+            ],
+        }
+        payload = {
+            "actions": [{
+                "type": "change_group",
+                "group": "chain_identity",
+                "navigation_explicit": True,
+                "source_evidence": source,
+            }],
+            "semantic_units": [_unit(clause, 1, [0])],
+        }
+
+        result = _validate_action_document(json.dumps(payload), (clause,), state)
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.rejected_action_indexes, (0,))
+        self.assertIn("without answering it", " ".join(result.errors))
+
     def test_pending_arbitration_preserves_an_atomic_config_review_proposal(self) -> None:
         from unittest.mock import Mock
 
@@ -104,6 +137,194 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(json.loads(result)["pending_answer_admissions"], [0])
 
+    def test_literal_grounding_cannot_turn_a_question_into_a_manual_url_value(self) -> None:
+        import json
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_pending_action_ownership
+        from agent.harness.state import new_state
+
+        source = "What kind of synchronization endpoint do I need here?"
+        state = new_state("manual-url-question", language="en")
+        state["pending_question"] = {
+            "id": "SYNC_OBSERVE_RPC_URL",
+            "group": "sync_observe",
+            "kind": "manual_value",
+            "field": "SYNC_OBSERVE_RPC_URL",
+            "prompt": "Enter the synchronization RPC endpoint.",
+            "manual_input_allowed": True,
+            "options": [],
+            "validation": {"value_type": "url"},
+        }
+        payload = json.dumps({
+            "actions": [{
+                "type": "answer_pending",
+                "answer": source,
+                "source_evidence": source,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "source_text": source,
+                "disposition": "action",
+                "action_indexes": [0],
+            }],
+        })
+        provider = Mock()
+        provider.complete.return_value = type("Response", (), {"text": json.dumps({
+            "reviews": [{
+                "action_index": 0,
+                "decision": "reject",
+                "evidence_quote": "",
+                "reason": "the source is a question, not a URL value",
+            }],
+        })})()
+
+        result, changed = _adjudicate_pending_action_ownership(
+            provider,
+            payload,
+            state,
+            source,
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(json.loads(result)["actions"], [])
+        provider.complete.assert_called_once()
+
+    def test_existing_target_returns_field_question_to_registered_consultation(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_target_mode_selection_requests
+        from agent.harness.state import new_state
+
+        source = "What kind of synchronization endpoint do I need here?"
+        state = new_state("target-intake-reject", language="en")
+        state["target_mode"] = "sync-observe"
+        state["pending_question"] = {
+            "id": "SYNC_OBSERVE_RPC_URL",
+            "group": "sync_observe",
+            "field": "SYNC_OBSERVE_RPC_URL",
+            "prompt": "Enter the synchronization RPC endpoint.",
+        }
+        payload = json.dumps({
+            "actions": [{
+                "type": "request_target_mode_selection",
+                "source_evidence": source,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "source_text": source,
+                "disposition": "action",
+                "action_indexes": [0],
+            }],
+        })
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "reviews": [{
+                "action_index": 0,
+                "decision": "consultation",
+                "consultation_topic": "config_explanation",
+                "consultation_subject": "SYNC_OBSERVE_RPC_URL",
+                "evidence_quote": source,
+                "reason": "the source asks about the active endpoint field",
+            }],
+        }))
+
+        result, changed = _adjudicate_target_mode_selection_requests(
+            provider,
+            payload,
+            state,
+            source,
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(json.loads(result)["actions"], [{
+            "type": "answer_opening_question",
+            "topic": "config_explanation",
+            "subject": "SYNC_OBSERVE_RPC_URL",
+            "source_evidence": source,
+        }])
+        self.assertEqual(json.loads(result)["consultation_admissions"], [0])
+
+    def test_existing_target_rejects_unrelated_mode_intake_without_registered_replacement(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_target_mode_selection_requests
+        from agent.harness.state import new_state
+
+        source = "This sentence is unrelated."
+        state = new_state("target-intake-unrelated", language="en")
+        state["target_mode"] = "sync-observe"
+        payload = json.dumps({
+            "actions": [{
+                "type": "request_target_mode_selection",
+                "source_evidence": source,
+            }],
+        })
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "reviews": [{
+                "action_index": 0,
+                "decision": "reject",
+                "consultation_topic": "",
+                "consultation_subject": "",
+                "evidence_quote": "",
+                "reason": "unrelated content",
+            }],
+        }))
+
+        result, changed = _adjudicate_target_mode_selection_requests(
+            provider,
+            payload,
+            state,
+            source,
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(json.loads(result)["actions"], [])
+
+    def test_existing_target_allows_explicit_replacement_mode_intake(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_target_mode_selection_requests
+        from agent.harness.state import new_state
+
+        source = "I want to reconsider sync-observe and choose another target mode."
+        state = new_state("target-intake-replace", language="en")
+        state["target_mode"] = "sync-observe"
+        payload = json.dumps({
+            "actions": [{
+                "type": "request_target_mode_selection",
+                "source_evidence": source,
+            }],
+        })
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "reviews": [{
+                "action_index": 0,
+                "decision": "admit",
+                "consultation_topic": "",
+                "consultation_subject": "",
+                "evidence_quote": "reconsider sync-observe and choose another target mode",
+                "reason": "the source explicitly requests replacement mode intake",
+            }],
+        }))
+
+        result, changed = _adjudicate_target_mode_selection_requests(
+            provider,
+            payload,
+            state,
+            source,
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(json.loads(result)["target_mode_selection_admissions"], [0])
+
     def test_manual_answer_not_present_in_source_still_requires_review(self) -> None:
         import json
         from types import SimpleNamespace
@@ -174,6 +395,24 @@ class PlanCoverageTest(unittest.TestCase):
         result = validate_plan_coverage(payload, clauses)
 
         self.assertTrue(result.valid, result.errors)
+
+    def test_omitted_explicit_deferred_goal_fails_plan_completeness(self) -> None:
+        clauses = segment_user_turn(
+            "Observe BSC sync now. Benchmark its real RPC capacity later."
+        )
+        payload = {
+            "actions": [{
+                "type": "choose_target_mode",
+                "target_mode": "sync-observe",
+                "source_evidence": clauses[0].text,
+            }],
+            "semantic_units": [_unit(clauses[0], 1, [0])],
+        }
+
+        result = validate_plan_coverage(payload, clauses)
+
+        self.assertFalse(result.valid)
+        self.assertIn("missing semantic units for clause-2", "\n".join(result.errors))
 
     def test_context_requires_reason_and_cannot_own_actions(self) -> None:
         clauses = segment_user_turn("I may add another RPC call afterward.")
@@ -668,6 +907,58 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(json.loads(result)["consultation_admissions"], [0, 1, 2])
 
+    def test_consultation_admission_repairs_wrong_topic_to_active_field_owner(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_consultation_actions
+        from agent.harness.state import new_state
+
+        source = "What kind of synchronization endpoint do I need here?"
+        state = new_state("consultation-topic-owner", language="en")
+        state["pending_question"] = {
+            "id": "SYNC_OBSERVE_RPC_URL",
+            "field": "SYNC_OBSERVE_RPC_URL",
+            "prompt": "Enter the synchronization RPC endpoint.",
+        }
+        payload = json.dumps({
+            "actions": [{
+                "type": "answer_opening_question",
+                "topic": "current_config",
+                "source_evidence": source,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "source_text": source,
+                "disposition": "action",
+                "action_indexes": [0],
+            }],
+        })
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "reviews": [{
+                "action_index": 0,
+                "present_consultation": True,
+                "topic_matches": False,
+                "replacement_topic": "config_explanation",
+                "replacement_subject": "SYNC_OBSERVE_RPC_URL",
+                "evidence_quote": source,
+                "reason": "the source asks what the active endpoint field requires",
+            }],
+        }))
+
+        result, changed = _adjudicate_consultation_actions(provider, payload, state)
+
+        self.assertTrue(changed)
+        self.assertEqual(json.loads(result)["actions"], [{
+            "type": "answer_opening_question",
+            "topic": "config_explanation",
+            "subject": "SYNC_OBSERVE_RPC_URL",
+            "source_evidence": source,
+        }])
+        self.assertEqual(json.loads(result)["consultation_admissions"], [0])
+
     def test_future_only_consultation_candidate_is_removed_without_dropping_sibling_mode_intake(self) -> None:
         import json
         from types import SimpleNamespace
@@ -790,6 +1081,310 @@ class PlanCoverageTest(unittest.TestCase):
             [{"type": "request_target_mode_selection", "source_evidence": source}],
         )
         provider.complete.assert_called_once()
+
+    def test_holistic_target_mode_contract_rejects_ambiguous_current_and_future_split(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_target_mode_actions
+
+        source = "Maybe fake-node or sync-observe; I am not sure which one."
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "decision": "unresolved",
+            "current_action_index": None,
+            "deferred_action_indexes": [],
+            "evidence_quote": source,
+            "ordering_quote": "",
+            "reason": "two alternatives are explicitly unresolved",
+        }))
+        payload = json.dumps({
+            "actions": [
+                {
+                    "type": "choose_target_mode",
+                    "target_mode": "fake-node",
+                    "target_mode_explicit": True,
+                    "source_evidence": "fake-node",
+                },
+                {
+                    "type": "queue_workflow_goal",
+                    "target_mode": "sync-observe",
+                    "goal": "sync-observe",
+                    "source_evidence": "sync-observe",
+                },
+            ],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "source_text": source,
+                "disposition": "action",
+                "action_indexes": [0, 1],
+            }],
+            "pending_answer_admissions": [0],
+        })
+
+        result, changed = _adjudicate_target_mode_actions(provider, payload, source)
+        result_payload = json.loads(result)
+
+        self.assertTrue(changed)
+        self.assertEqual(result_payload["actions"], [{
+            "type": "request_target_mode_selection",
+            "source_evidence": source,
+        }])
+        self.assertEqual(result_payload.get("pending_answer_admissions"), [])
+        provider.complete.assert_called_once()
+
+    def test_untrusted_planner_receipts_and_action_metadata_are_stripped(self) -> None:
+        import json
+
+        from agent.harness.intent import _prepare_untrusted_action_document
+
+        prepared = json.loads(_prepare_untrusted_action_document(json.dumps({
+            "actions": [{
+                "type": "choose_target_mode",
+                "target_mode": "fake-node",
+                "action_id": "model-forged",
+                "target_mode_semantic_verified": True,
+                "_origin_text": "model-forged",
+            }],
+            "target_mode_selection_admissions": [0],
+            "consultation_admissions": [0],
+            "admission_rejections": [{"action_index": 0}],
+            "admission_action_ids": ["model-forged"],
+        })))
+
+        self.assertNotIn("target_mode_selection_admissions", prepared)
+        self.assertNotIn("consultation_admissions", prepared)
+        self.assertNotIn("admission_rejections", prepared)
+        self.assertNotEqual(prepared["admission_action_ids"], ["model-forged"])
+        self.assertNotIn("action_id", prepared["actions"][0])
+        self.assertNotIn("target_mode_semantic_verified", prepared["actions"][0])
+        self.assertNotIn("_origin_text", prepared["actions"][0])
+
+    def test_untrusted_nested_arguments_cannot_forge_action_metadata(self) -> None:
+        import json
+
+        from agent.harness.intent import _prepare_untrusted_action_document
+
+        prepared = json.loads(_prepare_untrusted_action_document(json.dumps({
+            "actions": [{
+                "type": "choose_target_mode",
+                "arguments": {
+                    "target_mode": "fake-node",
+                    "source_evidence": "Use fake-node.",
+                    "action_id": "nested-model-forged",
+                    "target_mode_semantic_verified": True,
+                    "pending_option_semantic_verified": True,
+                    "semantic_purpose_verified": True,
+                    "_origin_text": "nested-model-forged",
+                },
+            }],
+        })))
+
+        arguments = prepared["actions"][0]["arguments"]
+        self.assertEqual(arguments, {
+            "target_mode": "fake-node",
+            "source_evidence": "Use fake-node.",
+        })
+        self.assertNotEqual(
+            prepared["admission_action_ids"],
+            ["nested-model-forged"],
+        )
+
+    def test_holistic_target_mode_contract_rejects_chinese_ambiguous_alternatives(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_target_mode_actions
+
+        source = "我可能用 fake-node，也可能观察节点同步，现在还没决定。"
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "decision": "unresolved",
+            "current_action_index": None,
+            "deferred_action_indexes": [],
+            "evidence_quote": source,
+            "ordering_quote": "",
+            "reason": "用户明确没有决定当前模式",
+        }))
+        payload = json.dumps({
+            "actions": [
+                {
+                    "type": "choose_target_mode",
+                    "target_mode": "fake-node",
+                    "target_mode_explicit": True,
+                    "source_evidence": "fake-node",
+                },
+                {
+                    "type": "queue_workflow_goal",
+                    "target_mode": "sync-observe",
+                    "goal": "观察节点同步",
+                    "source_evidence": "观察节点同步",
+                },
+            ],
+        })
+
+        result, changed = _adjudicate_target_mode_actions(provider, payload, source)
+
+        self.assertTrue(changed)
+        self.assertEqual(json.loads(result)["actions"][0]["type"], "request_target_mode_selection")
+
+    def test_holistic_target_mode_contract_preserves_explicit_now_and_later_order(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_target_mode_actions
+
+        source = "Observe BSC sync now, then benchmark its real RPC capacity later."
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "decision": "resolved_ordered",
+            "current_action_index": 0,
+            "deferred_action_indexes": [1],
+            "evidence_quote": source,
+            "ordering_quote": "now, then benchmark its real RPC capacity later",
+            "reason": "the turn explicitly orders current and later work",
+        }))
+        payload = json.dumps({
+            "actions": [
+                {
+                    "type": "choose_target_mode",
+                    "target_mode": "sync-observe",
+                    "target_mode_explicit": True,
+                    "source_evidence": "Observe BSC sync now",
+                },
+                {
+                    "type": "queue_workflow_goal",
+                    "target_mode": "real-node",
+                    "goal": "benchmark its real RPC capacity later",
+                    "source_evidence": "benchmark its real RPC capacity later",
+                },
+            ],
+        })
+
+        result, changed = _adjudicate_target_mode_actions(provider, payload, source)
+
+        self.assertFalse(changed)
+        self.assertEqual(
+            [item["type"] for item in json.loads(result)["actions"]],
+            ["choose_target_mode", "queue_workflow_goal"],
+        )
+        self.assertEqual(json.loads(result)["target_mode_selection_admissions"], [0, 1])
+        provider.complete.assert_called_once()
+
+    def test_holistic_target_mode_contract_does_not_queue_a_comparison(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_target_mode_actions
+
+        source = "Use real-node; I only mentioned fake-node for comparison."
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "decision": "resolved_ordered",
+            "current_action_index": 0,
+            "deferred_action_indexes": [],
+            "evidence_quote": source,
+            "ordering_quote": "",
+            "reason": "real-node is selected and fake-node is only compared",
+        }))
+        payload = json.dumps({
+            "actions": [
+                {
+                    "type": "choose_target_mode",
+                    "target_mode": "real-node",
+                    "target_mode_explicit": True,
+                    "source_evidence": "Use real-node",
+                },
+                {
+                    "type": "queue_workflow_goal",
+                    "target_mode": "fake-node",
+                    "goal": "fake-node",
+                    "source_evidence": "fake-node for comparison",
+                },
+            ],
+        })
+
+        result, changed = _adjudicate_target_mode_actions(provider, payload, source)
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            [item["type"] for item in json.loads(result)["actions"]],
+            ["choose_target_mode"],
+        )
+        self.assertEqual(json.loads(result)["target_mode_selection_admissions"], [0])
+        provider.complete.assert_called_once()
+
+    def test_holistic_target_mode_contract_invalid_verdict_fails_closed_without_clarification(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_target_mode_actions
+
+        source = "Maybe fake-node or sync-observe; I am not sure which one."
+        payload = json.dumps({
+            "actions": [
+                {
+                    "type": "choose_target_mode",
+                    "target_mode": "fake-node",
+                    "source_evidence": "fake-node",
+                },
+                {
+                    "type": "queue_workflow_goal",
+                    "target_mode": "sync-observe",
+                    "goal": "sync-observe",
+                    "source_evidence": "sync-observe",
+                },
+            ],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "source_text": source,
+                "disposition": "action",
+                "action_indexes": [0, 1],
+            }],
+        })
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "decision": "unresolved",
+            "current_action_index": None,
+            "deferred_action_indexes": [],
+            "evidence_quote": "not an exact quote",
+            "ordering_quote": "",
+        }))
+
+        result, changed = _adjudicate_target_mode_actions(provider, payload, source)
+        parsed = json.loads(result)
+
+        self.assertTrue(changed)
+        self.assertEqual(parsed["actions"], [])
+        self.assertEqual(parsed["semantic_units"][0]["disposition"], "unresolved")
+        self.assertNotIn("request_target_mode_selection", json.dumps(parsed))
+
+    def test_holistic_target_mode_contract_missing_verdict_fails_closed(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_target_mode_actions
+
+        source = "Use real-node now and fake-node later."
+        payload = json.dumps({
+            "actions": [
+                {"type": "choose_target_mode", "target_mode": "real-node", "source_evidence": "real-node now"},
+                {"type": "queue_workflow_goal", "target_mode": "fake-node", "goal": "later", "source_evidence": "fake-node later"},
+            ],
+        })
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text="{}")
+
+        result, changed = _adjudicate_target_mode_actions(provider, payload, source)
+
+        self.assertTrue(changed)
+        self.assertEqual(json.loads(result)["actions"], [])
 
     def test_unresolved_semantic_answer_to_target_menu_becomes_mode_intake(self) -> None:
         import json
@@ -1437,13 +2032,160 @@ class PlanCoverageTest(unittest.TestCase):
             },
         ]
         payload = json.dumps({"actions": actions, "semantic_units": []})
+        from types import SimpleNamespace
+
         provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "reviews": [{
+                "action_index": 0,
+                "decision": "select_pending_option",
+                "selected_option_value": "fake-node",
+                "evidence_quote": "fake-node",
+                "reason": "selects the displayed target mode",
+            }],
+        }))
 
         result, changed = _reconcile_pending_owner_mutations(provider, payload, state, source)
 
-        self.assertFalse(changed)
+        self.assertTrue(changed)
         self.assertEqual(json.loads(result)["actions"], actions)
-        provider.complete.assert_not_called()
+        self.assertEqual(json.loads(result)["pending_answer_admissions"], [0])
+
+    def test_pending_owner_rechecks_negative_exact_declared_effect(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _reconcile_pending_owner_mutations
+        from agent.harness.state import new_state
+
+        source = (
+            "Plans changed: don't generate benchmark traffic. "
+            "I only want to watch an already-running real node catch up to chain head."
+        )
+        state = new_state("unit-thread", language="en")
+        state["pending_question"] = {
+            "id": "target_mode_select",
+            "group": "target_mode",
+            "kind": "numbered_choice",
+            "prompt": "Choose the target mode.",
+            "accepted_action_types": ["choose_target_mode"],
+            "options": [{
+                "id": "sync-observe",
+                "label": "sync-observe",
+                "value": "sync-observe",
+                "action": {
+                    "type": "choose_target_mode",
+                    "target_mode": "sync-observe",
+                    "target_mode_explicit": True,
+                },
+            }],
+        }
+        action = {
+            "type": "choose_target_mode",
+            "target_mode": "sync-observe",
+            "target_mode_explicit": True,
+            "source_evidence": "watch an already-running real node catch up to chain head",
+        }
+        payload = json.dumps({
+            "actions": [action],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": source,
+                "disposition": "action",
+                "action_indexes": [0],
+            }],
+        })
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps({
+                "reviews": [{
+                    "action_index": 0,
+                    "decision": "reject",
+                    "selected_option_value": None,
+                    "evidence_quote": "",
+                    "reason": "first reviewer missed the natural-language meaning",
+                }],
+            })),
+            SimpleNamespace(text=json.dumps({
+                "reviews": [{
+                    "action_index": 0,
+                    "decision": "select_pending_option",
+                    "selected_option_value": "sync-observe",
+                    "evidence_quote": "watch an already-running real node catch up to chain head",
+                    "reason": "the requested no-load catch-up observation selects sync-observe",
+                }],
+            })),
+        ]
+
+        result, changed = _reconcile_pending_owner_mutations(provider, payload, state, source)
+
+        self.assertTrue(changed)
+        self.assertEqual(json.loads(result)["actions"], [action])
+        self.assertEqual(json.loads(result)["pending_answer_admissions"], [0])
+        self.assertEqual(provider.complete.call_count, 2)
+
+    def test_pending_owner_second_review_still_rejects_unrelated_exact_effect(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _reconcile_pending_owner_mutations
+        from agent.harness.state import new_state
+
+        source = "Before I decide, explain whether this mode changes the report format."
+        state = new_state("unit-thread", language="en")
+        state["pending_question"] = {
+            "id": "target_mode_select",
+            "group": "target_mode",
+            "kind": "numbered_choice",
+            "prompt": "Choose the target mode.",
+            "accepted_action_types": ["choose_target_mode"],
+            "options": [{
+                "id": "sync-observe",
+                "label": "sync-observe",
+                "value": "sync-observe",
+                "action": {
+                    "type": "choose_target_mode",
+                    "target_mode": "sync-observe",
+                    "target_mode_explicit": True,
+                },
+            }],
+        }
+        payload = json.dumps({
+            "actions": [{
+                "type": "choose_target_mode",
+                "target_mode": "sync-observe",
+                "target_mode_explicit": True,
+                "source_evidence": source,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": source,
+                "disposition": "action",
+                "action_indexes": [0],
+            }],
+        })
+        rejection = SimpleNamespace(text=json.dumps({
+            "reviews": [{
+                "action_index": 0,
+                "decision": "reject",
+                "selected_option_value": None,
+                "evidence_quote": "",
+                "reason": "the source asks a question and makes no selection",
+            }],
+        }))
+        provider = Mock()
+        provider.complete.side_effect = [rejection, rejection]
+
+        result, changed = _reconcile_pending_owner_mutations(provider, payload, state, source)
+
+        self.assertTrue(changed)
+        self.assertEqual(json.loads(result)["actions"], [])
+        self.assertNotIn("pending_answer_admissions", json.loads(result))
+        self.assertEqual(provider.complete.call_count, 2)
 
     def test_pending_option_contract_replaces_similar_cross_group_navigation(self) -> None:
         import json
@@ -1877,6 +2619,102 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertEqual(filtered["semantic_units"][0]["action_indexes"], [0, 1])
         self.assertEqual(filtered["semantic_units"][0]["disposition"], "action")
         self.assertEqual(filtered["admission_rejections"][0]["action_type"], "choose_target_mode")
+        self.assertTrue(filtered["admission_rejections"][0]["admission_action_id"])
+        self.assertEqual(filtered["admission_rejections"][0]["stage_action_index"], 0)
+        self.assertNotIn("action_index", filtered["admission_rejections"][0])
+
+    def test_sequential_rejections_preserve_distinct_admission_action_ids(self) -> None:
+        import json
+
+        from agent.harness.intent import _remove_rejected_action_indexes
+
+        payload = json.dumps({
+            "actions": [
+                {"type": "choose_target_mode", "target_mode": "fake-node"},
+                {"type": "select_chain", "chain": "bsc"},
+                {"type": "select_rpc_mode", "rpc_mode": "single"},
+            ],
+        })
+        after_first, _ = _remove_rejected_action_indexes(payload, (0,), reason="first gate")
+        first = json.loads(after_first)
+        retained_id = first["admission_action_ids"][0]
+        after_second, _ = _remove_rejected_action_indexes(after_first, (0,), reason="second gate")
+        second = json.loads(after_second)
+
+        self.assertNotEqual(
+            second["admission_rejections"][0]["admission_action_id"],
+            second["admission_rejections"][1]["admission_action_id"],
+        )
+        self.assertEqual(second["admission_rejections"][1]["admission_action_id"], retained_id)
+        self.assertEqual([row["stage_action_index"] for row in second["admission_rejections"]], [0, 0])
+
+    def test_readded_identical_action_does_not_reuse_rejected_admission_id(self) -> None:
+        import json
+
+        from agent.harness.intent import _remove_rejected_action_indexes
+
+        action = {"type": "choose_target_mode", "target_mode": "fake-node"}
+        first_text, _ = _remove_rejected_action_indexes(
+            json.dumps({"actions": [action]}),
+            (0,),
+            reason="first attempt",
+        )
+        first = json.loads(first_text)
+        first_id = first["admission_rejections"][0]["admission_action_id"]
+        first["actions"] = [action]
+        second_text, _ = _remove_rejected_action_indexes(
+            json.dumps(first),
+            (0,),
+            reason="second attempt",
+        )
+        second = json.loads(second_text)
+
+        self.assertNotEqual(
+            first_id,
+            second["admission_rejections"][1]["admission_action_id"],
+        )
+
+    def test_owner_receipt_does_not_skip_compound_unit_inventory(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _challenge_registry_action_inventory
+
+        cases = (
+            (
+                "consultation_admissions",
+                {"type": "answer_opening_question", "topic": "capabilities"},
+            ),
+            (
+                "pending_answer_admissions",
+                {"type": "answer_pending", "answer": "bsc", "selected_value": "bsc"},
+            ),
+        )
+        for receipt_key, action in cases:
+            with self.subTest(receipt_key=receipt_key):
+                provider = Mock()
+                provider.complete.return_value = SimpleNamespace(text="{}")
+                payload = json.dumps({
+                    "actions": [action],
+                    receipt_key: [0],
+                    "semantic_units": [{
+                        "unit_id": "unit-compound",
+                        "source_text": "Use BSC, and also change the QPS profile.",
+                        "disposition": "action",
+                        "action_indexes": [0],
+                    }],
+                })
+
+                result, changed, incomplete = _challenge_registry_action_inventory(
+                    provider,
+                    payload,
+                )
+
+                self.assertFalse(changed)
+                self.assertEqual(result, payload)
+                self.assertEqual(incomplete, ("unit-compound",))
+                self.assertEqual(provider.complete.call_count, 2)
 
     def test_generic_group_navigation_becomes_resume_current_flow(self) -> None:
         import json
@@ -1965,6 +2803,8 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertEqual(_valid_group_navigation_admissions(payload, actions), {})
 
     def test_navigation_receipt_bypasses_duplicate_generic_purpose_review(self) -> None:
+        import json
+        from types import SimpleNamespace
         from unittest.mock import Mock
 
         from agent.harness.intent import _validate_semantic_fulfillment
@@ -1989,6 +2829,14 @@ class PlanCoverageTest(unittest.TestCase):
             }],
         }
         provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "unit_reviews": [{
+                "unit_id": "unit-1",
+                "complete": True,
+                "missing_demand_quote": "",
+                "reason": "the source requests only navigation",
+            }],
+        }))
 
         result = _validate_semantic_fulfillment(
             provider,
@@ -1998,7 +2846,53 @@ class PlanCoverageTest(unittest.TestCase):
         )
 
         self.assertTrue(result.valid, result.errors)
-        provider.complete.assert_not_called()
+        provider.complete.assert_called_once()
+
+    def test_navigation_receipt_does_not_hide_a_concrete_destination_value(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _validate_semantic_fulfillment
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.state import new_state
+
+        text = "Pause this paste and let me configure quick QPS first."
+        clauses = segment_user_turn(text)
+        payload = {
+            "actions": [{
+                "type": "change_group",
+                "group": "qps_profile",
+                "navigation_explicit": True,
+                "source_evidence": text,
+            }],
+            "semantic_units": [_unit(clauses[0], 1, [0])],
+            "group_navigation_admissions": [{
+                "action_index": 0,
+                "group": "qps_profile",
+                "source_evidence": text,
+                "destination_quote": "QPS",
+            }],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "unit_reviews": [{
+                "unit_id": "unit-1",
+                "complete": False,
+                "missing_demand_quote": "quick",
+                "reason": "the concrete QPS mode is not represented",
+            }],
+        }))
+
+        result = _validate_semantic_fulfillment(
+            provider,
+            json.dumps(payload),
+            clauses,
+            new_state("navigation-value-omission", language="en"),
+        )
+
+        self.assertFalse(result.valid)
+        self.assertIn("semantic unit unit-1 fulfilment failed", "\n".join(result.errors))
 
     def test_explicit_group_navigation_is_retained(self) -> None:
         import json
@@ -2741,6 +3635,115 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertEqual([action["type"] for action in recovered["actions"]], ["set_rpc_mode", "choose_chain"])
         self.assertEqual(recovered["semantic_units"][0]["action_indexes"], [0, 1])
 
+    def test_registry_inventory_audits_complete_units_without_rejudging_pending_action(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _challenge_registry_action_inventory
+
+        source = (
+            "Plans changed: don't generate benchmark traffic. "
+            "I only want to watch an already-running real node catch up to chain head."
+        )
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "choose_target_mode",
+                "target_mode": "sync-observe",
+                "target_mode_explicit": True,
+                "source_evidence": clauses[1].text,
+            }],
+            "pending_answer_admissions": [0],
+            "semantic_units": [
+                _unit(clauses[0], 1, [0]),
+                _unit(clauses[1], 2, [0]),
+            ],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "findings": [
+                {
+                    "unit_id": "unit-1",
+                    "status": "complete",
+                    "missing_demands": [],
+                    "reason": "the admitted mode also preserves the no-traffic constraint",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "status": "complete",
+                    "missing_demands": [],
+                    "reason": "the admitted mode preserves the observation goal",
+                },
+            ],
+        }))
+
+        result_text, changed, incomplete = _challenge_registry_action_inventory(
+            provider,
+            json.dumps(payload),
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(incomplete, ())
+        self.assertEqual(json.loads(result_text), payload)
+        provider.complete.assert_called_once()
+
+    def test_registry_inventory_still_audits_independent_sibling_of_pending_answer(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _challenge_registry_action_inventory
+
+        source = "Watch the node catch up. Also switch the QPS profile to quick."
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "choose_target_mode",
+                "target_mode": "sync-observe",
+                "target_mode_explicit": True,
+                "source_evidence": clauses[0].text,
+            }, {
+                "type": "set_qps_mode",
+                "qps_mode": "quick",
+                "mutation_explicit": True,
+                "source_evidence": clauses[1].text,
+            }],
+            "pending_answer_admissions": [0],
+            "semantic_units": [
+                _unit(clauses[0], 1, [0]),
+                _unit(clauses[1], 2, [1]),
+            ],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "findings": [
+                {
+                    "unit_id": "unit-1",
+                    "status": "complete",
+                    "missing_demands": [],
+                    "reason": "the admitted observation goal is represented",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "status": "complete",
+                    "missing_demands": [],
+                    "reason": "the independent QPS request is represented",
+                },
+            ],
+        }))
+
+        result_text, changed, incomplete = _challenge_registry_action_inventory(
+            provider,
+            json.dumps(payload),
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(incomplete, ())
+        self.assertEqual(json.loads(result_text), payload)
+        request = json.loads(provider.complete.call_args.args[0].messages[1].content)
+        self.assertEqual([row["unit_id"] for row in request["units"]], ["unit-1", "unit-2"])
+
     def test_registry_inventory_does_not_duplicate_an_existing_typed_action(self) -> None:
         import json
         from types import SimpleNamespace
@@ -2875,6 +3878,47 @@ class PlanCoverageTest(unittest.TestCase):
 
         self.assertEqual(result_plan, plan)
         self.assertIs(result_validation, validation)
+
+    def test_inventory_wrapper_fails_closed_for_incomplete_owner_admitted_unit(self) -> None:
+        import json
+        from unittest.mock import Mock, patch
+
+        from agent.harness.intent import _challenge_and_validate_registry_inventory
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.state import new_state
+
+        plan = json.dumps({
+            "actions": [{
+                "type": "answer_pending",
+                "answer": "bsc",
+                "selected_value": "bsc",
+                "source_evidence": "Use BSC and change QPS too",
+            }],
+            "pending_answer_admissions": [0],
+            "semantic_units": [{
+                "unit_id": "unit-owner",
+                "source_text": "Use BSC and change QPS too",
+                "disposition": "action",
+                "action_indexes": [0],
+            }],
+        })
+        validation = PlanCoverageResult(True, (), ())
+        with patch(
+            "agent.harness.intent._challenge_registry_action_inventory",
+            return_value=(plan, False, ("unit-owner",)),
+        ):
+            result_plan, result_validation = _challenge_and_validate_registry_inventory(
+                Mock(),
+                plan,
+                (),
+                new_state("inventory-owner-fail-closed"),
+                "Use BSC and change QPS too",
+                validation,
+            )
+
+        self.assertEqual(result_plan, plan)
+        self.assertFalse(result_validation.valid)
+        self.assertEqual(result_validation.incomplete_unit_ids, ("unit-owner",))
 
     def test_inventory_wrapper_never_bypasses_an_initially_invalid_plan(self) -> None:
         from unittest.mock import Mock, patch
@@ -3535,13 +4579,16 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertIn("replacement", purpose)
         self.assertNotIn("Ask for a replacement target mode", purpose)
 
-    def test_consultation_actions_require_source_purpose_review(self) -> None:
+    def test_consultation_and_analysis_actions_require_source_purpose_review(self) -> None:
         from agent.harness.intent import _requires_semantic_fulfillment_review
 
-        self.assertTrue(_requires_semantic_fulfillment_review({
-            "type": "answer_opening_question",
-            "topic": "config_explanation",
-        }))
+        for action in (
+            {"type": "answer_opening_question", "topic": "config_explanation"},
+            {"type": "analyze_evidence", "evidence": "Traceback"},
+            {"type": "analyze_report", "subject": "latency"},
+        ):
+            with self.subTest(action_type=action["type"]):
+                self.assertTrue(_requires_semantic_fulfillment_review(action))
 
     def test_explicit_group_navigation_does_not_require_destination_values(self) -> None:
         import json
@@ -3563,10 +4610,19 @@ class PlanCoverageTest(unittest.TestCase):
             "semantic_units": [_unit(clauses[0], 1, [0])],
         }
         provider = Mock()
-        provider.complete.return_value = SimpleNamespace(text=json.dumps({
-            "reviews": [{"action_index": 0, "supported": True, "reason": "explicit navigation"}],
-            "unit_reviews": [],
-        }))
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps({
+                "reviews": [{"action_index": 0, "supported": True, "reason": "explicit navigation"}],
+            })),
+            SimpleNamespace(text=json.dumps({
+                "unit_reviews": [{
+                    "unit_id": "unit-1",
+                    "complete": True,
+                    "missing_demand_quote": "",
+                    "reason": "navigation intentionally opens later typed intake",
+                }],
+            })),
+        ]
         state = new_state("unit-thread", language="en")
         state["pending_question"] = {
             "id": "CLOUD_REGION",
@@ -3578,7 +4634,7 @@ class PlanCoverageTest(unittest.TestCase):
         result = _validate_semantic_fulfillment(provider, json.dumps(payload), clauses, state)
 
         self.assertTrue(result.valid, result.errors)
-        provider.complete.assert_called_once()
+        self.assertEqual(provider.complete.call_count, 2)
 
     def test_specific_qps_adjustment_cannot_be_laundered_as_group_navigation(self) -> None:
         import json
@@ -5656,6 +6712,428 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual(len(recovered["actions"]), 1)
         self.assertEqual(recovered["semantic_units"][0]["action_indexes"], [0])
+
+    def test_declared_pending_option_replaces_rejected_planner_action(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.state import new_state
+
+        source = "这两个都不是，我重新把链名输一遍。"
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "request_chain_selection",
+                "chain_candidates": ["bsc", "ethereum"],
+                "source_evidence": source,
+            }],
+            "semantic_units": [self._unit(clauses[0], "unit-1", [0])],
+        }
+        state = new_state("pending-replace-invalid", language="zh")
+        state["pending_question"] = {
+            "id": "chain_ambiguity_confirm",
+            "prompt": "请选择链。",
+            "options": [
+                {
+                    "id": "bsc",
+                    "label": "bsc",
+                    "value": "bsc",
+                    "action": {"type": "answer_pending", "answer": "bsc"},
+                },
+                {
+                    "id": "reenter",
+                    "label": "重新输入",
+                    "value": "reenter",
+                    "action": {"type": "answer_pending", "answer": "reenter"},
+                },
+            ],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "matches": [{
+                "unit_id": "unit-1",
+                "option_id": "reenter",
+                "evidence_quote": "重新把链名输一遍",
+                "reason": "selects the declared re-entry option",
+            }],
+        }))
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            PlanCoverageResult(
+                valid=False,
+                errors=("wrong operation",),
+                unresolved_clauses=(),
+                rejected_action_indexes=(0,),
+                incomplete_unit_ids=("unit-1",),
+            ),
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(recovered["actions"], [{
+            "type": "answer_pending",
+            "answer": "reenter",
+            "selected_value": "reenter",
+            "source_evidence": "重新把链名输一遍",
+        }])
+        self.assertEqual(recovered["semantic_units"][0]["action_indexes"], [0])
+
+    def test_declared_pending_contract_recovers_manual_value_from_prose(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.state import new_state
+
+        source = "Use http://geth-dev:8545 as the real endpoint for this observation."
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_endpoint",
+                "rpc_endpoint": "http://geth-dev:8545",
+                "source_evidence": source,
+            }],
+            "semantic_units": [self._unit(clauses[0], "unit-1", [0])],
+        }
+        state = new_state("pending-manual-recovery", language="en")
+        state["pending_question"] = {
+            "id": "SYNC_OBSERVE_RPC_URL",
+            "group": "endpoint_process",
+            "prompt": "Provide the real sync-observe endpoint.",
+            "field": "SYNC_OBSERVE_RPC_URL",
+            "kind": "url",
+            "manual_input_allowed": True,
+            "validation": {},
+            "options": [],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "manual_matches": [{
+                "unit_id": "unit-1",
+                "answer": "http://geth-dev:8545",
+                "evidence_quote": "http://geth-dev:8545",
+                "reason": "directly supplies the requested URL",
+            }],
+        }))
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            PlanCoverageResult(
+                valid=False,
+                errors=("wrong pending owner",),
+                unresolved_clauses=(),
+                rejected_action_indexes=(0,),
+                incomplete_unit_ids=("unit-1",),
+            ),
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(recovered["actions"], [{
+            "type": "answer_pending",
+            "answer": "http://geth-dev:8545",
+            "source_evidence": "http://geth-dev:8545",
+        }])
+
+    def test_declared_pending_contract_can_bind_supporting_context(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.state import new_state
+
+        source = "Plans changed: don't generate benchmark traffic. I only want to watch the node catch up."
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [],
+            "semantic_units": [
+                self._unit(clauses[0], "unit-context", [], disposition="unresolved"),
+                self._unit(clauses[1], "unit-choice", [], disposition="unresolved"),
+            ],
+        }
+        state = new_state("pending-context-recovery", language="en")
+        state["pending_question"] = {
+            "id": "target_mode_select",
+            "prompt": "Choose the target mode.",
+            "options": [{
+                "id": "sync",
+                "label": "sync-observe",
+                "value": "sync-observe",
+                "action": {
+                    "type": "choose_target_mode",
+                    "target_mode": "sync-observe",
+                    "target_mode_explicit": True,
+                },
+            }],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "matches": [{
+                "unit_id": "unit-choice",
+                "option_id": "sync",
+                "evidence_quote": "watch the node catch up",
+                "reason": "selects sync observation",
+            }],
+            "contexts": [{
+                "unit_id": "unit-context",
+                "supports_unit_id": "unit-choice",
+                "evidence_quote": "don't generate benchmark traffic",
+                "reason": "rules out load generation in support of sync observation",
+            }],
+        }))
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            PlanCoverageResult(
+                valid=False,
+                errors=("unresolved clauses",),
+                unresolved_clauses=tuple(clause.text for clause in clauses),
+                incomplete_unit_ids=("unit-context", "unit-choice"),
+            ),
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(recovered["actions"][0]["type"], "choose_target_mode")
+        self.assertEqual(recovered["semantic_units"][0]["disposition"], "context")
+        self.assertEqual(recovered["semantic_units"][1]["action_indexes"], [0])
+
+    def test_declared_pending_contract_binds_context_to_admitted_sibling(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.state import new_state
+
+        source = "Plans changed: don't generate benchmark traffic. I only want to watch the node catch up."
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "choose_target_mode",
+                "target_mode": "sync-observe",
+                "target_mode_explicit": True,
+                "source_evidence": "watch the node catch up",
+            }],
+            "target_mode_selection_admissions": [0],
+            "semantic_units": [
+                self._unit(clauses[0], "unit-context", [], disposition="unresolved"),
+                self._unit(clauses[1], "unit-choice", [0]),
+            ],
+        }
+        state = new_state("pending-context-anchor", language="en")
+        state["pending_question"] = {
+            "id": "target_mode_select",
+            "prompt": "Choose the target mode.",
+            "options": [{
+                "id": "sync-observe",
+                "label": "sync-observe",
+                "value": "sync-observe",
+                "action": {
+                    "type": "choose_target_mode",
+                    "target_mode": "sync-observe",
+                    "target_mode_explicit": True,
+                },
+            }],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "contexts": [{
+                "unit_id": "unit-context",
+                "supports_unit_id": "unit-choice",
+                "evidence_quote": "don't generate benchmark traffic",
+                "reason": "rules out load generation for the admitted observation mode",
+            }],
+        }))
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            PlanCoverageResult(
+                valid=False,
+                errors=("unresolved clause",),
+                unresolved_clauses=(clauses[0].text,),
+                incomplete_unit_ids=("unit-context",),
+            ),
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(recovered["actions"], payload["actions"])
+        self.assertEqual(recovered["semantic_units"][0]["disposition"], "context")
+        self.assertEqual(recovered["semantic_units"][1]["action_indexes"], [0])
+
+    def test_declared_pending_contract_does_not_bind_unrelated_text_to_anchor(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.state import new_state
+
+        source = "Watch the node catch up. Also explain the previous report."
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "choose_target_mode",
+                "target_mode": "sync-observe",
+                "target_mode_explicit": True,
+                "source_evidence": "Watch the node catch up",
+            }],
+            "target_mode_selection_admissions": [0],
+            "semantic_units": [
+                self._unit(clauses[0], "unit-choice", [0]),
+                self._unit(clauses[1], "unit-independent", [], disposition="unresolved"),
+            ],
+        }
+        state = new_state("pending-context-anchor-negative", language="en")
+        state["pending_question"] = {
+            "id": "target_mode_select",
+            "prompt": "Choose the target mode.",
+            "options": [{
+                "id": "sync-observe",
+                "label": "sync-observe",
+                "value": "sync-observe",
+                "action": {
+                    "type": "choose_target_mode",
+                    "target_mode": "sync-observe",
+                    "target_mode_explicit": True,
+                },
+            }],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({}))
+        original = json.dumps(payload)
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            original,
+            state,
+            PlanCoverageResult(
+                valid=False,
+                errors=("unresolved clause",),
+                unresolved_clauses=(clauses[1].text,),
+                incomplete_unit_ids=("unit-independent",),
+            ),
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(recovered_text, original)
+
+    def test_declared_pending_contract_reconciles_deferred_conflicting_option(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.state import new_state
+
+        source = "Test BSC first. Leave Ethereum for later."
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [
+                {
+                    "type": "answer_pending",
+                    "answer": "bsc",
+                    "source_evidence": "Test BSC first",
+                },
+                {
+                    "type": "answer_pending",
+                    "answer": "ethereum",
+                    "source_evidence": "Ethereum",
+                },
+            ],
+            "semantic_units": [
+                self._unit(clauses[0], "unit-bsc", [0]),
+                self._unit(clauses[1], "unit-ethereum", [1]),
+            ],
+        }
+        state = new_state("pending-conflict-recovery", language="en")
+        state["pending_question"] = {
+            "id": "chain_ambiguity_confirm",
+            "prompt": "Choose the chain to test first.",
+            "options": [
+                {
+                    "id": "bsc",
+                    "label": "bsc",
+                    "value": "bsc",
+                    "action": {"type": "answer_pending", "answer": "bsc"},
+                },
+                {
+                    "id": "ethereum",
+                    "label": "ethereum",
+                    "value": "ethereum",
+                    "action": {"type": "answer_pending", "answer": "ethereum"},
+                },
+            ],
+        }
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps({
+                "matches": [
+                    {
+                        "unit_id": "unit-bsc",
+                        "option_id": "bsc",
+                        "evidence_quote": "BSC",
+                    },
+                    {
+                        "unit_id": "unit-ethereum",
+                        "option_id": "ethereum",
+                        "evidence_quote": "Ethereum",
+                    },
+                ],
+            })),
+            SimpleNamespace(text=json.dumps({
+                "selected_unit_id": "unit-bsc",
+                "selected_option_id": "bsc",
+                "evidence_quote": "BSC",
+                "contexts": [{
+                    "unit_id": "unit-ethereum",
+                    "evidence_quote": "Leave Ethereum for later",
+                    "reason": "defers the unselected alternative",
+                }],
+                "ambiguous": False,
+            })),
+        ]
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            PlanCoverageResult(
+                valid=False,
+                errors=("conflicting options",),
+                unresolved_clauses=(),
+                rejected_action_indexes=(0, 1),
+                incomplete_unit_ids=("unit-bsc", "unit-ethereum"),
+            ),
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertFalse(changed)
+        self.assertEqual(len(recovered["actions"]), 2)
+        self.assertEqual(recovered["semantic_units"][0]["action_indexes"], [0])
+        self.assertEqual(recovered["semantic_units"][1]["disposition"], "action")
+        self.assertEqual(recovered["semantic_units"][1]["action_indexes"], [1])
 
     def test_ambiguous_unit_fails_closed_without_rewriting_siblings(self) -> None:
         import json

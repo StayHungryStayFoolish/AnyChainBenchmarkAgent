@@ -25,6 +25,7 @@ from ..transitions import (
     invalidate_for_rpc_mode_change,
     invalidate_for_target_mode,
     mark_group_reconfigured,
+    record_group_invalidations,
 )
 
 from agent.knowledge.chain_identity import canonicalize_chain_scalar, repo_chain_names
@@ -656,8 +657,7 @@ def apply_chain_rpc_action(state: AgentGraphState, action: ActionProposal) -> Ha
     _set_control(next_state, 'active_group', "endpoint_process")
     previous_pending = deepcopy(next_state.get("pending_question") or {})
     _set_control(next_state, 'pending_question', {})
-    _invalidate_execution(next_state)
-    _invalidate_groups(next_state, "endpoint_process", "workload_rpc", "target_samples_fixtures", "preflight_smoke_execution")
+    record_group_invalidations(next_state, "endpoint_process", "workload_rpc")
     if endpoint:
         _apply_endpoint_answer(next_state, "custom_rpc_endpoint", arguments.get("rpc_endpoint") or endpoint)
         if custom.get("status") == "probe_failed":
@@ -906,7 +906,7 @@ def apply_chain_rpc_answer(
         if field:
             next_state.setdefault("confirmed_config", {})[field] = normalize_scalar(value)
             mark_group_reconfigured(next_state, group)
-            _invalidate_groups(next_state, "preflight_smoke_execution")
+            record_group_invalidations(next_state, group)
             return _answer_result(state, next_state)
     return HandlerResult(blocker=f"unsupported chain/RPC question: {question_id}")
 

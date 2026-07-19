@@ -18,7 +18,11 @@ from ..intent import extract_rpc_schema_from_evidence
 from ..localization import localized
 from ..questions import render_question
 from ..state import AgentGraphState
-from ..transitions import invalidate_for_endpoint_change, invalidate_rpc_catalog_endpoint_evidence
+from ..transitions import (
+    invalidate_for_endpoint_change,
+    invalidate_rpc_catalog_endpoint_evidence,
+    record_group_invalidations,
+)
 
 from agent.llm.search_grounding import run_google_search_grounding
 from agent.validators.endpoint_probe import (
@@ -58,6 +62,16 @@ def _apply_endpoint_answer(state: AgentGraphState, question_id: str, value: Any)
     identity = state.setdefault("chain_identity", {})
     chain = normalize_scalar(identity.get("canonical") or identity.get("raw"))
     family = _adapter_family(state)
+    confirmed = state.setdefault("confirmed_config", {})
+    previous_endpoint = normalize_scalar(
+        confirmed.get("LOCAL_RPC_URL")
+        if question_id == "LOCAL_RPC_URL"
+        else confirmed.get("SYNC_OBSERVE_RPC_URL")
+        if question_id == "SYNC_OBSERVE_RPC_URL"
+        else (state.get("custom_rpc") or {}).get("endpoint")
+        if question_id == "custom_rpc_endpoint"
+        else (state.get("endpoint_evidence") or {}).get("candidate_endpoint")
+    )
     if question_id == "LOCAL_RPC_URL":
         contracts = _selected_custom_contracts(state)
         if contracts:
@@ -104,6 +118,8 @@ def _apply_endpoint_answer(state: AgentGraphState, question_id: str, value: Any)
             refresh_catalog_projection(state)
         evidence.pop("last_failure_record", None)
         state.setdefault("confirmed_config", {})["LOCAL_RPC_URL"] = endpoint
+        if endpoint != previous_endpoint:
+            record_group_invalidations(state, "endpoint_process")
         _set_control(state, 'visible_response', [localized(language, f"LOCAL_RPC_URL 验证通过。证据：{result.get('evidence_file') or '<none>'}。", f"LOCAL_RPC_URL validation passed. Evidence: {result.get('evidence_file') or '<none>'}.")])
         return
     if question_id == "SYNC_OBSERVE_RPC_URL":
@@ -114,6 +130,8 @@ def _apply_endpoint_answer(state: AgentGraphState, question_id: str, value: Any)
             _set_control(state, 'visible_response', [localized(language, f"sync-observe endpoint 验证失败：{result.get('error') or result.get('status')}。证据：{result.get('evidence_file') or '<none>'}。请提供真实可访问的节点 RPC endpoint。", f"Sync-observe endpoint validation failed: {result.get('error') or result.get('status')}. Evidence: {result.get('evidence_file') or '<none>'}. Provide a real reachable node RPC endpoint.")])
             return
         state.setdefault("confirmed_config", {})["SYNC_OBSERVE_RPC_URL"] = endpoint
+        if endpoint != previous_endpoint:
+            record_group_invalidations(state, "endpoint_process")
         evidence.pop("last_failure_record", None)
         _set_control(state, 'visible_response', [localized(language, f"sync-observe endpoint 验证通过。证据：{result.get('evidence_file') or '<none>'}。", f"Sync-observe endpoint validation passed. Evidence: {result.get('evidence_file') or '<none>'}.")])
         return
@@ -131,6 +149,8 @@ def _apply_endpoint_answer(state: AgentGraphState, question_id: str, value: Any)
             _set_control(state, 'visible_response', [localized(language, f"endpoint 验证失败：{result.get('error') or result.get('status')}。证据：{result.get('evidence_file') or '<none>'}。请提供可访问的 HTTP RPC endpoint。", f"Endpoint validation failed: {result.get('error') or result.get('status')}. Evidence: {result.get('evidence_file') or '<none>'}. Provide a reachable HTTP RPC endpoint.")])
             return
         ensure_catalog(state)
+        if endpoint != previous_endpoint:
+            record_group_invalidations(state, "endpoint_process")
         custom["status"] = "needs_schema_evidence" if draft_view(state).get("method") else "needs_method"
         evidence.pop("last_failure_record", None)
         _set_control(state, 'visible_response', [localized(language, f"endpoint 验证通过。证据：{result.get('evidence_file') or '<none>'}。这个 endpoint 只作为自定义 RPC method/schema 验证证据，不会自动作为最终压测的 LOCAL_RPC_URL。", f"Endpoint validation passed. Evidence: {result.get('evidence_file') or '<none>'}. This endpoint is stored only as custom RPC method/schema validation evidence and will not automatically become the final benchmark LOCAL_RPC_URL.")])
@@ -147,6 +167,8 @@ def _apply_endpoint_answer(state: AgentGraphState, question_id: str, value: Any)
         _set_control(state, 'visible_response', [localized(language, f"新链 endpoint 验证失败：{result.get('error') or result.get('status')}。证据：{result.get('evidence_file') or '<none>'}。请提供可访问的 endpoint。", f"New-chain endpoint validation failed: {result.get('error') or result.get('status')}. Evidence: {result.get('evidence_file') or '<none>'}. Provide a reachable endpoint.")])
         return
     identity["status"] = "existing_family_needs_method"
+    if endpoint != previous_endpoint:
+        record_group_invalidations(state, "endpoint_process")
     ensure_catalog(state)
     evidence.pop("last_failure_record", None)
     _set_control(state, 'visible_response', [localized(language, f"新链 endpoint 验证通过。证据：{result.get('evidence_file') or '<none>'}。", f"New-chain endpoint validation passed. Evidence: {result.get('evidence_file') or '<none>'}.")])

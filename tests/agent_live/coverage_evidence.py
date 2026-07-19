@@ -12,12 +12,20 @@ from typing import Any, Iterable, Mapping
 
 from agent.harness.coverage_events import state_diff_between
 from agent.harness.runtime_identity import repository_revision
+from agent.utils.redaction import redact
 
 
 ARTIFACT_SCHEMA_VERSION = 3
 CLI_ARTIFACT_SCHEMA_VERSION = 3
 REAL_EXECUTION_ARTIFACT_SCHEMA_VERSION = 1
 TURN_OBSERVATION_SCHEMA_VERSION = 1
+PTY_DIAGNOSTIC_SCHEMA_VERSION = 1
+PTY_DIAGNOSTIC_STATUSES = {
+    "failed_attempt": frozenset({
+        "verification_pending", "verification_error", "postcondition_failed",
+    }),
+    "interruption": frozenset({"interrupted"}),
+}
 EXECUTION_EVIDENCE_CLASSES = frozenset(
     {"deterministic", "real_cli", "dynamic_dual_ai", "real_execution"}
 )
@@ -128,6 +136,30 @@ class DynamicTurnSelection:
     selected_at_ns: int
     simulator: str = "codex"
     selection_mode: str = "response_driven"
+
+
+@dataclass(frozen=True)
+class PtyDiagnosticRecord:
+    """Non-qualifying diagnostic for one completed PTY boundary.
+
+    Diagnostics are intentionally separate from coverage evidence.  A failed
+    attempt may contain the just-completed turn; an interruption may contain
+    only the last boundary that was fully observed before transport failed.
+    """
+
+    diagnostic_kind: str
+    verification_status: str
+    target_id: str
+    target_edge_key: str
+    revision: Mapping[str, str]
+    session_id: str
+    reason: str
+    last_complete_response: str
+    last_complete_event: RuntimeTurnEvent
+    completed_turn: PtyCliTurnRecord | None = None
+    dynamic_selection: DynamicTurnSelection | None = None
+    verified_postcondition: VerifiedPostcondition | None = None
+    schema_version: int = PTY_DIAGNOSTIC_SCHEMA_VERSION
 
 
 def canonical_json(value: Any) -> str:
@@ -296,6 +328,292 @@ def write_evidence_artifact(artifact: Mapping[str, Any], directory: str | Path) 
         encoding="utf-8",
     )
     return target
+
+
+def build_pty_diagnostic_artifact(record: PtyDiagnosticRecord) -> dict[str, Any]:
+    """Build a redacted, tamper-evident record that can never satisfy a lane.
+
+    The caller writes a ``verification_pending`` failed-attempt record before
+    invoking the postcondition verifier.  It removes that record after a pass
+    or replaces it with ``postcondition_failed`` details after a failure.
+    """
+
+    if record.diagnostic_kind not in {"failed_attempt", "interruption"}:
+        raise ValueError("PTY diagnostic kind is invalid")
+    if record.verification_status not in PTY_DIAGNOSTIC_STATUSES[record.diagnostic_kind]:
+        raise ValueError("PTY diagnostic verification status is invalid")
+    required = {
+        "target_id": record.target_id,
+        "target_edge_key": record.target_edge_key,
+        "revision.commit": record.revision.get("commit"),
+        "revision.worktree_hash": record.revision.get("worktree_hash"),
+        "session_id": record.session_id,
+        "reason": record.reason,
+        "last_complete_response": record.last_complete_response,
+    }
+    missing = sorted(name for name, value in required.items() if not str(value or "").strip())
+    if missing:
+        raise ValueError(f"PTY diagnostic identity is missing: {', '.join(missing)}")
+    _validate_runtime_event(record.last_complete_event)
+    if dict(record.last_complete_event.revision) != dict(record.revision):
+        raise ValueError("PTY diagnostic runtime revision mismatch")
+    if record.last_complete_event.thread_id != record.session_id:
+        raise ValueError("PTY diagnostic runtime event belongs to another session")
+    if record.diagnostic_kind == "failed_attempt" and record.completed_turn is None:
+        raise ValueError("failed-attempt diagnostic requires a completed turn")
+    if record.dynamic_selection is not None and record.completed_turn is None:
+        raise ValueError("PTY diagnostic selection requires a completed turn")
+    if record.completed_turn is not None:
+        _validate_pty_turn_record(record.completed_turn)
+        if record.completed_turn.session_id != record.session_id:
+            raise ValueError("PTY diagnostic turn belongs to another session")
+    if record.dynamic_selection is not None:
+        _validate_dynamic_selection(record.completed_turn, record.dynamic_selection)  # type: ignore[arg-type]
+    if record.verification_status == "postcondition_failed":
+        if record.verified_postcondition is None or record.verified_postcondition.passed:
+            raise ValueError("postcondition-failed diagnostic requires a failed verification")
+    elif record.verified_postcondition is not None:
+        raise ValueError("PTY diagnostic carries a postcondition before verification failed")
+
+    safe_response = str(redact(record.last_complete_response))
+    safe_event = redact(_runtime_event_payload(record.last_complete_event))
+    safe_turn = (
+        _redacted_pty_turn_payload(record.completed_turn)
+        if record.completed_turn is not None
+        else None
+    )
+    safe_selection = (
+        _redacted_dynamic_selection_payload(record.dynamic_selection)
+        if record.dynamic_selection is not None
+        else None
+    )
+    safe_postcondition = (
+        redact(_verified_postcondition_payload(record.verified_postcondition))
+        if record.verified_postcondition is not None
+        else None
+    )
+    body: dict[str, Any] = {
+        "artifact_type": "pty_diagnostic",
+        "schema_version": record.schema_version,
+        "diagnostic_kind": record.diagnostic_kind,
+        "verification_status": record.verification_status,
+        "qualifying_evidence": False,
+        "target_id": record.target_id,
+        "target_edge_key": record.target_edge_key,
+        "revision": dict(record.revision),
+        "session_id": record.session_id,
+        "reason": str(redact(record.reason)),
+        "last_complete_boundary": {
+            "agent_response": safe_response,
+            "agent_response_hash": content_hash(safe_response),
+            "runtime_event": safe_event,
+            "runtime_event_hash": content_hash(safe_event),
+            "completed_turn": safe_turn,
+            "completed_turn_hash": content_hash(safe_turn) if safe_turn is not None else "",
+            "dynamic_selection": safe_selection,
+            "dynamic_selection_hash": (
+                content_hash(safe_selection) if safe_selection is not None else ""
+            ),
+            "verified_postcondition": safe_postcondition,
+            "verified_postcondition_hash": (
+                content_hash(safe_postcondition) if safe_postcondition is not None else ""
+            ),
+        },
+        "content_redacted": True,
+        "created_at": _utc_timestamp(),
+    }
+    body["diagnostic_id"] = content_hash(body)
+    body["artifact_hash"] = content_hash(body)
+    return body
+
+
+def write_pty_diagnostic_artifact(
+    artifact: Mapping[str, Any],
+    directory: str | Path,
+) -> Path:
+    """Atomically persist a validated diagnostic outside evidence lanes."""
+
+    valid, reason = validate_pty_diagnostic_artifact(artifact)
+    if not valid:
+        raise ValueError(f"invalid PTY diagnostic artifact: {reason}")
+    target_dir = Path(directory)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"{artifact['diagnostic_id']}.json"
+    temporary = target.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(dict(artifact), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(target)
+    return target
+
+
+def validate_pty_diagnostic_artifact(artifact: Mapping[str, Any]) -> tuple[bool, str]:
+    """Validate diagnostics while keeping them ineligible for pass evidence."""
+
+    if artifact.get("artifact_type") != "pty_diagnostic":
+        return False, "artifact is not a PTY diagnostic"
+    if artifact.get("schema_version") != PTY_DIAGNOSTIC_SCHEMA_VERSION:
+        return False, "unsupported PTY diagnostic schema"
+    if artifact.get("qualifying_evidence") is not False:
+        return False, "PTY diagnostic must not qualify as evidence"
+    kind = str(artifact.get("diagnostic_kind") or "")
+    status = str(artifact.get("verification_status") or "")
+    if kind not in PTY_DIAGNOSTIC_STATUSES or status not in PTY_DIAGNOSTIC_STATUSES[kind]:
+        return False, "PTY diagnostic kind or status is invalid"
+    required_text = (
+        "target_id", "target_edge_key", "session_id", "reason", "created_at",
+        "diagnostic_id", "artifact_hash",
+    )
+    if any(not str(artifact.get(name) or "").strip() for name in required_text):
+        return False, "PTY diagnostic identity is incomplete"
+    revision = artifact.get("revision")
+    if not isinstance(revision, Mapping):
+        return False, "PTY diagnostic revision is invalid"
+    if not str(revision.get("commit") or "").strip() or not _is_sha256(
+        str(revision.get("worktree_hash") or "")
+    ):
+        return False, "PTY diagnostic revision identity is invalid"
+    boundary = artifact.get("last_complete_boundary")
+    if not isinstance(boundary, Mapping):
+        return False, "PTY diagnostic has no complete boundary"
+    response = boundary.get("agent_response")
+    event = boundary.get("runtime_event")
+    if not isinstance(response, str) or not response.strip() or not isinstance(event, Mapping):
+        return False, "PTY diagnostic complete boundary is invalid"
+    if content_hash(response) != str(boundary.get("agent_response_hash") or ""):
+        return False, "PTY diagnostic response hash mismatch"
+    if content_hash(event) != str(boundary.get("runtime_event_hash") or ""):
+        return False, "PTY diagnostic runtime-event hash mismatch"
+    try:
+        runtime_event_values = dict(event)
+        runtime_event_values["action_queue_types"] = tuple(
+            runtime_event_values.get("action_queue_types") or ()
+        )
+        runtime_event_values["admitted_action_types"] = tuple(
+            runtime_event_values.get("admitted_action_types") or ()
+        )
+        runtime_event_values["admitted_action_targets"] = tuple(
+            dict(item) for item in runtime_event_values.get("admitted_action_targets") or ()
+        )
+        runtime_event = RuntimeTurnEvent(**runtime_event_values)
+        _validate_runtime_event(runtime_event)
+    except (TypeError, ValueError) as exc:
+        return False, f"PTY diagnostic runtime event is invalid: {exc}"
+    if runtime_event.thread_id != str(artifact.get("session_id") or ""):
+        return False, "PTY diagnostic runtime event belongs to another session"
+    if dict(runtime_event.revision) != dict(revision):
+        return False, "PTY diagnostic runtime revision mismatch"
+    completed_turn = boundary.get("completed_turn")
+    if kind == "failed_attempt" and not isinstance(completed_turn, Mapping):
+        return False, "failed-attempt diagnostic has no completed turn"
+    for value_name, hash_name in (
+        ("completed_turn", "completed_turn_hash"),
+        ("dynamic_selection", "dynamic_selection_hash"),
+        ("verified_postcondition", "verified_postcondition_hash"),
+    ):
+        value = boundary.get(value_name)
+        observed_hash = str(boundary.get(hash_name) or "")
+        if value is None:
+            if observed_hash:
+                return False, f"PTY diagnostic {value_name} hash is unexpected"
+        elif content_hash(value) != observed_hash:
+            return False, f"PTY diagnostic {value_name} hash mismatch"
+    typed_turn: PtyCliTurnRecord | None = None
+    if isinstance(completed_turn, Mapping):
+        try:
+            turn_values = dict(completed_turn)
+            for derived in (
+                "previous_response_hash", "user_message_hash", "agent_response_hash",
+            ):
+                turn_values.pop(derived, None)
+            typed_turn = PtyCliTurnRecord(**turn_values)
+            _validate_pty_turn_record(typed_turn)
+        except (TypeError, ValueError) as exc:
+            return False, f"PTY diagnostic completed turn is invalid: {exc}"
+        if typed_turn.session_id != str(artifact.get("session_id") or ""):
+            return False, "PTY diagnostic completed turn belongs to another session"
+        if typed_turn.turn_index != runtime_event.turn_index:
+            return False, "PTY diagnostic turn and runtime boundary disagree"
+        if typed_turn.agent_response != response:
+            return False, "PTY diagnostic response and completed turn disagree"
+    raw_selection = boundary.get("dynamic_selection")
+    if raw_selection is not None:
+        if typed_turn is None or not isinstance(raw_selection, Mapping):
+            return False, "PTY diagnostic dynamic selection has no completed turn"
+        try:
+            selection_values = dict(raw_selection)
+            selection_values["target_coverage_ids"] = tuple(
+                selection_values.get("target_coverage_ids") or ()
+            )
+            _validate_dynamic_selection(
+                typed_turn,
+                DynamicTurnSelection(**selection_values),
+            )
+        except (TypeError, ValueError) as exc:
+            return False, f"PTY diagnostic dynamic selection is invalid: {exc}"
+    if status == "postcondition_failed":
+        postcondition = boundary.get("verified_postcondition")
+        if not isinstance(postcondition, Mapping) or postcondition.get("passed") is not False:
+            return False, "failed diagnostic has no failed postcondition"
+    elif boundary.get("verified_postcondition") is not None:
+        return False, "PTY diagnostic has an unexpected postcondition"
+    if artifact.get("content_redacted") is not True:
+        return False, "PTY diagnostic does not declare redaction"
+    unsigned = dict(artifact)
+    artifact_hash = str(unsigned.pop("artifact_hash", ""))
+    if content_hash(unsigned) != artifact_hash:
+        return False, "PTY diagnostic artifact hash mismatch"
+    identity = dict(unsigned)
+    diagnostic_id = str(identity.pop("diagnostic_id", ""))
+    if content_hash(identity) != diagnostic_id:
+        return False, "PTY diagnostic id mismatch"
+    return True, ""
+
+
+def _runtime_event_payload(event: RuntimeTurnEvent) -> dict[str, Any]:
+    payload = asdict(event)
+    payload["action_queue_types"] = list(event.action_queue_types)
+    payload["admitted_action_types"] = list(event.admitted_action_types)
+    payload["admitted_action_targets"] = [dict(item) for item in event.admitted_action_targets]
+    return payload
+
+
+def _redacted_pty_turn_payload(turn: PtyCliTurnRecord) -> dict[str, Any]:
+    previous_response = str(redact(turn.previous_agent_response))
+    user_message = str(redact(turn.user_message))
+    agent_response = str(redact(turn.agent_response))
+    payload = asdict(turn)
+    payload.update({
+        "previous_agent_response": previous_response,
+        "user_message": user_message,
+        "agent_response": agent_response,
+        "transcript_hash": pty_transcript_hash(
+            session_id=turn.session_id,
+            turn_index=turn.turn_index,
+            previous_agent_response=previous_response,
+            user_message=user_message,
+            agent_response=agent_response,
+        ),
+    })
+    payload["previous_response_hash"] = content_hash(previous_response)
+    payload["user_message_hash"] = content_hash(user_message)
+    payload["agent_response_hash"] = content_hash(agent_response)
+    return payload
+
+
+def _redacted_dynamic_selection_payload(selection: DynamicTurnSelection) -> dict[str, Any]:
+    payload = redact(asdict(selection))
+    payload["target_coverage_ids"] = list(selection.target_coverage_ids)
+    return payload
+
+
+def _verified_postcondition_payload(postcondition: VerifiedPostcondition) -> dict[str, Any]:
+    payload = asdict(postcondition)
+    payload["observed_coverage_ids"] = list(postcondition.observed_coverage_ids)
+    payload["admitted_typed_actions"] = list(postcondition.admitted_typed_actions)
+    payload["job_artifacts"] = [dict(item) for item in postcondition.job_artifacts]
+    return payload
 
 
 def build_pty_cli_evidence_artifact(
@@ -829,6 +1147,21 @@ def verify_runtime_postcondition(
                 errors.append(f"manual-input postcondition was not observed: {path}")
             elif after_hash == before_hash:
                 errors.append(f"manual-input postcondition did not change: {path}")
+        expected_next_ids = {
+            str(item).strip()
+            for item in expected.get("next_question_ids") or []
+            if str(item).strip()
+        }
+        if (
+            not rejection_expected
+            and expected_next_ids
+            and committed.pending_question_id not in expected_next_ids
+        ):
+            errors.append(
+                "manual input reached an unexpected next question: "
+                f"{committed.pending_question_id or '<none>'}; "
+                f"expected one of {sorted(expected_next_ids)}"
+            )
 
     next_result = dict(committed.next_result or {})
     if not next_result:
@@ -1121,6 +1454,8 @@ def load_valid_evidence_reference(
             edge=edge,
             revision=revision,
         )
+    elif artifact.get("artifact_type") == "pty_diagnostic":
+        return None, "PTY diagnostic artifacts never qualify as coverage evidence"
     else:
         valid, reason = validate_evidence_artifact(artifact, edge=edge, revision=revision)
     return (artifact, "") if valid else (None, reason)

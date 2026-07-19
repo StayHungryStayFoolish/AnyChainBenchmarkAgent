@@ -13,6 +13,7 @@ from tempfile import TemporaryDirectory
 from tests.agent_live.generate_harness_coverage_ledger import (
     EVIDENCE_CLASSES,
     MANUAL_INPUT_CLASSES,
+    RUNNER_CONTRACTS,
     build_ledger,
     contract_variant_hash,
     derive_overall_status,
@@ -43,6 +44,58 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
         self.assertEqual(summary["action_only_transitions"], len(ACTION_SPECS))
         self.assertIn("job_monitoring:real_node_smoke_confirm", self.ledger["runtime_only_questions"])
         self.assertIn("job_monitoring:real_node_final_benchmark_confirm", self.ledger["runtime_only_questions"])
+
+    def test_custom_rpc_manual_edges_use_canonical_owner_and_declared_successors(self) -> None:
+        expected = {
+            "custom_rpc_method": (
+                "custom_rpc.catalog.draft.method",
+                {"custom_rpc_schema_evidence", "custom_rpc_schema_confirm"},
+            ),
+            "custom_rpc_schema_evidence": (
+                "custom_rpc.catalog.last_transition.command",
+                {
+                    "custom_rpc_parameter_confirm",
+                    "custom_rpc_schema_confirm",
+                    "custom_rpc_response_confirm",
+                },
+            ),
+            "new_chain_method": (
+                "custom_rpc.catalog.draft.method",
+                {"new_chain_schema_evidence", "new_chain_schema_confirm"},
+            ),
+            "new_chain_schema_evidence": (
+                "custom_rpc.catalog.last_transition.command",
+                {
+                    "new_chain_parameter_confirm",
+                    "new_chain_schema_confirm",
+                    "new_chain_response_confirm",
+                },
+            ),
+        }
+        for question_id, (path, next_ids) in expected.items():
+            edges = [
+                edge
+                for edge in self.ledger["edges"]
+                if edge["edge_type"] == "manual_input"
+                and edge["question_id"] == question_id
+            ]
+            self.assertTrue(edges, question_id)
+            for edge in edges:
+                postcondition = edge["expected_postcondition"]
+                self.assertEqual(postcondition["path"], path)
+                self.assertEqual(set(postcondition["next_question_ids"]), next_ids)
+                self.assertTrue(edge["executable_scenario_ids"])
+
+    def test_real_execution_contract_names_the_linux_producer(self) -> None:
+        contract = RUNNER_CONTRACTS["real_execution"]
+        self.assertEqual(contract["status"], "implemented")
+        self.assertEqual(
+            contract["producer"],
+            "tests/agent_live/execute_real_execution_ledger.py",
+        )
+        self.assertEqual(contract["artifact_schema"], "real_execution_evidence.v1")
+        self.assertEqual(contract["gap"], "")
+        self.assertEqual(self.ledger["runner_contracts"]["real_execution"], contract)
 
     def test_semantic_coordinator_actions_have_only_matching_runtime_seeds(self) -> None:
         expected = {

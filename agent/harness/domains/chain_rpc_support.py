@@ -15,6 +15,7 @@ from ..input_values import (
 from ..localization import localized
 from ..routing import next_group_and_reason
 from ..state import AgentGraphState
+from ..transitions import record_group_invalidations
 
 from agent.knowledge.framework_capabilities import load_framework_capabilities
 from agent.planners import question_prompts
@@ -351,8 +352,8 @@ def _handoff_stops(state: AgentGraphState) -> bool:
     return (state.get("chain_identity") or {}).get("status") in {"unsupported_family_handoff", "needs_review_handoff"}
 
 
-def _invalidate_execution(state: AgentGraphState) -> None:
-    _invalidate_groups(state, "preflight_smoke_execution")
+def _invalidate_execution(state: AgentGraphState, changed_group: str = "workload_rpc") -> None:
+    record_group_invalidations(state, changed_group)
 
 
 def _invalidate_groups(state: AgentGraphState, *groups: str) -> None:

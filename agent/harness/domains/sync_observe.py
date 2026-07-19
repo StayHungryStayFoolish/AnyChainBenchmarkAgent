@@ -16,6 +16,7 @@ from ..state import AgentGraphState
 from ..sync_observe_contract import REAL_SYNC_SOURCES, SyncObserveRequest
 
 from agent.llm.search_grounding import run_google_search_grounding
+from agent.workflows.group_registry import invalidation_targets
 SYNC_OBSERVE_GROUPS = {"sync_observe"}
 REAL_SOURCES = set(REAL_SYNC_SOURCES)
 
@@ -169,7 +170,7 @@ def apply_sync_observe_action(state: AgentGraphState, action: ActionProposal) ->
         return HandlerResult(
             delta=StateDelta.set_values({"sync_observe": sync}),
             consumed_action_ids=(action.action_id,),
-            invalidated_groups=("sync_observe", "preflight_smoke_execution"),
+            invalidated_groups=invalidation_targets("sync_observe"),
             clear_pending=True,
             next_group="sync_observe",
             completion="in_progress",
@@ -190,7 +191,7 @@ def apply_sync_observe_action(state: AgentGraphState, action: ActionProposal) ->
         return HandlerResult(
             delta=StateDelta.set_values({"sync_observe": sync}),
             consumed_action_ids=(action.action_id,),
-            invalidated_groups=("sync_observe", "preflight_smoke_execution"),
+            invalidated_groups=invalidation_targets("sync_observe"),
             clear_pending=True,
             next_group="sync_observe",
             completion="in_progress",
@@ -210,7 +211,7 @@ def apply_sync_observe_action(state: AgentGraphState, action: ActionProposal) ->
             "sync_observe": sync,
         }),
         consumed_action_ids=(action.action_id,),
-        invalidated_groups=("sync_observe", "preflight_smoke_execution"),
+        invalidated_groups=invalidation_targets("sync_observe"),
         clear_pending=True,
         next_group="endpoint_process" if source in REAL_SOURCES else "sync_observe",
         visible_result=_client_setup_guidance(state) if source == "client_setup" else "",

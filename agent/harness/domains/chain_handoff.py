@@ -8,8 +8,9 @@ from ..input_values import normalize_scalar
 from ..localization import localized
 from ..questions import render_question
 from ..state import AgentGraphState
+from ..transitions import mark_group_reconfigured, record_group_invalidations
 from .chain_rpc_questions import _case3_evidence_question
-from .chain_rpc_support import _invalidate_execution, _next_group, _set_control
+from .chain_rpc_support import _next_group, _set_control
 from .rpc_catalog import catalog_method_names, draft_view, validated_contracts_view
 
 def _promote_case2_endpoint(state: AgentGraphState) -> None:
@@ -30,7 +31,11 @@ def _promote_case2_endpoint(state: AgentGraphState) -> None:
     if method and not (state.get("workload") or {}).get("confirmed"):
         state["rpc_mode"] = "single"
         state["workload"] = {"confirmed": True, "choice": "new_chain_verified_method", "methods": [method], "replace_defaults": True, "job_local_override": True}
-    _invalidate_execution(state)
+    record_group_invalidations(state, "target_mode")
+    # This atomic promotion supplies fresh endpoint and workload state for the
+    # new mode. They are not stale dependents to clear at commit time.
+    mark_group_reconfigured(state, "endpoint_process")
+    mark_group_reconfigured(state, "workload_rpc")
     _set_control(state, 'active_group', _next_group(state))
     _set_control(state, 'visible_response', [localized(state.get("language", "en"), "已切换到 real-node 路径，并把已验证 endpoint/method 作为本次 job-local workload override 继续；不会修改 config/chains 原始模板。", "Switched to the real-node path and will continue with the verified endpoint/method as a job-local workload override; config/chains templates are not modified.")])
 

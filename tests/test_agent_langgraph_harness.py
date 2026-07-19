@@ -1157,7 +1157,18 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         # Still routes to stale-evidence analysis when there's no job reference —
         # existing behavior for a genuine follow-up about the pasted evidence.
         state["last_user_input"] = "分析一下这个原因"
-        no_job_result = process_turn(state)
+        with (
+            patch("agent.harness.coordinator.resolve_action_queue", return_value={"actions": [{
+                "type": "analyze_evidence",
+                "evidence": state["evidence_buffer"][-1]["text"],
+                "confidence": "high",
+            }]}),
+            patch(
+                "agent.harness.domains.analysis.analyze_evidence_with_model",
+                return_value="connection refused",
+            ),
+        ):
+            no_job_result = process_turn(state)
         self.assertIn("connection refused", "\n".join(no_job_result.get("visible_response") or []))
 
         # A turn naming "the latest job" must fall through to normal routing
@@ -9224,15 +9235,26 @@ network:
         }]
         state["last_user_input"] = "这是什么意思？下一步怎么修？"
 
-        with patch("agent.harness.intent.provider_from_config") as provider:
-            provider.return_value.complete.return_value.text = (
-                "证据显示 endpoint probe failed。观察事实：RuntimeError。"
-                "下一步应验证 endpoint、协议族与 request/params。证据预览已由 Harness 保存。"
-            )
+        with (
+            patch("agent.harness.coordinator.resolve_action_queue", return_value={"actions": [{
+                "type": "analyze_evidence",
+                "evidence": state["evidence_buffer"][-1]["text"],
+                "confidence": "high",
+            }]}),
+            patch(
+                "agent.harness.domains.analysis.analyze_evidence_with_model",
+                return_value=(
+                    "证据显示 endpoint probe failed。观察事实：RuntimeError。"
+                    "下一步应验证 endpoint、协议族与 request/params。"
+                ),
+            ),
+        ):
             result = process_turn(state)
 
         text = "\n".join(result.get("visible_response") or [])
-        self.assertEqual(result["active_group"], "error_evidence_analysis")
+        # Evidence analysis is a turn-local consultation. It must not steal
+        # workflow ownership from the group that will handle the next turn.
+        self.assertEqual(result["active_group"], "opening")
         self.assertIn("endpoint probe failed", text)
         self.assertIn("下一步", text)
         self.assertNotIn("测试前需要准备什么", text)
@@ -9284,6 +9306,229 @@ network:
         self.assertEqual(result["evidence_collection"]["lines"], ["Traceback (most recent call last):"])
         self.assertIn("还没有收到新的日志内容", text)
         self.assertNotIn("检测到最近 job", text)
+
+    def test_question_during_evidence_collection_is_analyzed_without_becoming_evidence(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("evidence-question", language="zh")
+        original_lines = ["Traceback (most recent call last):", "RuntimeError: endpoint probe failed"]
+        state["evidence_collection"] = {
+            "question": {"id": "freeform_evidence", "kind": "log_evidence"},
+            "lines": list(original_lines),
+            "language": "zh",
+        }
+        state["last_user_input"] = "这是什么意思，应该怎么修？"
+        with (
+            patch("agent.harness.coordinator.resolve_action_queue", return_value={"actions": [{
+                "type": "analyze_evidence",
+                "evidence": "\n".join(original_lines),
+                "question": state["last_user_input"],
+                "confidence": "high",
+            }]}),
+            patch(
+                "agent.harness.domains.analysis.analyze_evidence_with_model",
+                return_value="endpoint probe failed，需要校验 endpoint。",
+            ),
+        ):
+            result = process_turn(state)
+
+        self.assertEqual(result["evidence_collection"]["lines"], original_lines)
+        self.assertNotIn(state["last_user_input"], result["evidence_collection"]["lines"])
+        self.assertIn("endpoint probe failed", "\n".join(result.get("visible_response") or []))
+
+    def test_current_context_during_evidence_collection_reports_redacted_buffer(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("evidence-current-context", language="en")
+        original_lines = ["curl https://rpc.example/v1/abcdefghijklmnopqrstuvwxyz123456"]
+        state["evidence_collection"] = {
+            "question": {"id": "new_chain_schema_evidence", "kind": "evidence"},
+            "lines": list(original_lines),
+            "language": "en",
+        }
+        state["last_user_input"] = "Before I continue, what have you collected so far?"
+        with patch("agent.harness.coordinator.resolve_action_queue", return_value={"actions": [{
+            "type": "answer_opening_question",
+            "topic": "current_context",
+            "source_evidence": "what have you collected so far?",
+            "confidence": "medium",
+        }]}):
+            result = process_turn(state)
+
+        text = "\n".join(result.get("visible_response") or [])
+        self.assertEqual(result["evidence_collection"]["lines"], original_lines)
+        self.assertIn("1 saved line", text)
+        self.assertIn("***REDACTED***", text)
+        self.assertNotIn("abcdefghijklmnopqrstuvwxyz123456", text)
+
+    def test_navigation_during_evidence_collection_preserves_collected_lines(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("evidence-navigation", language="zh")
+        original_lines = ["request:", '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[]}']
+        state["evidence_collection"] = {
+            "question": {"id": "freeform_evidence", "kind": "log_evidence"},
+            "lines": list(original_lines),
+            "language": "zh",
+        }
+        state["last_user_input"] = "先去配置 QPS"
+        with patch("agent.harness.coordinator.resolve_action_queue", return_value={"actions": [
+            {
+                "type": "pause_evidence_collection",
+                "source_evidence": state["last_user_input"],
+                "confidence": "high",
+            },
+            {
+                "type": "change_group",
+                "group": "qps_profile",
+                "navigation_explicit": True,
+                "source_evidence": state["last_user_input"],
+                "confidence": "high",
+            },
+        ]}):
+            result = process_turn(state)
+
+        self.assertEqual(result["evidence_collection"]["lines"], original_lines)
+        self.assertEqual(result["evidence_collection"]["status"], "paused")
+        self.assertEqual(result["active_group"], "qps_profile")
+        self.assertEqual((result.get("pending_question") or {}).get("group"), "qps_profile")
+
+    def test_paused_evidence_collection_resumes_only_through_typed_action(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("evidence-resume", language="en")
+        original_lines = ["request:", '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[]}']
+        state["evidence_collection"] = {
+            "question": {"id": "new_chain_schema_evidence", "kind": "evidence"},
+            "lines": list(original_lines),
+            "language": "en",
+            "status": "paused",
+        }
+        state["last_user_input"] = "Resume the evidence paste now."
+        with patch("agent.harness.coordinator.resolve_action_queue", return_value={"actions": [{
+            "type": "resume_evidence_collection",
+            "source_evidence": state["last_user_input"],
+            "confidence": "high",
+        }]}):
+            result = process_turn(state)
+
+        self.assertEqual(result["evidence_collection"]["lines"], original_lines)
+        self.assertEqual(result["evidence_collection"]["status"], "active")
+        self.assertIn("Resumed evidence collection", "\n".join(result.get("visible_response") or []))
+
+    def test_evidence_detour_commits_qps_value_without_analysis_overlay(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.state import new_state
+
+        source = "Pause this paste and let me configure quick QPS first."
+        state = new_state("evidence-qps-detour", language="en")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "active_group": "workload_rpc",
+            "last_user_input": source,
+            "evidence_collection": {
+                "question": {"id": "new_chain_schema_evidence", "kind": "evidence"},
+                "lines": ["curl --location http://fake-node:19000 \\"],
+                "language": "en",
+                "status": "active",
+            },
+        })
+        with patch("agent.harness.coordinator.resolve_action_queue", return_value={"actions": [
+            {
+                "type": "pause_evidence_collection",
+                "source_evidence": "Pause this paste",
+                "confidence": "high",
+            },
+            {
+                "type": "change_group",
+                "group": "qps_profile",
+                "navigation_explicit": True,
+                "source_evidence": "configure quick QPS first",
+                "confidence": "high",
+            },
+            {
+                "type": "set_qps_mode",
+                "qps_mode": "quick",
+                "mutation_explicit": True,
+                "source_evidence": "quick QPS",
+                "confidence": "high",
+            },
+        ]}):
+            result = process_turn(state)
+
+        self.assertEqual(result["qps_profile"]["mode"], "quick")
+        self.assertEqual(result["active_group"], "qps_profile")
+        self.assertEqual(result["evidence_collection"]["status"], "paused")
+        self.assertEqual(result["evidence_collection"]["lines"], state["evidence_collection"]["lines"])
+        self.assertNotIn("Observed Facts", "\n".join(result.get("visible_response") or []))
+
+    def test_blank_turn_does_not_append_or_resume_a_paused_collection(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("evidence-paused-blank", language="en")
+        state["evidence_collection"] = {
+            "question": {"id": "freeform_evidence", "kind": "log_evidence"},
+            "lines": ["Traceback"],
+            "language": "en",
+            "status": "paused",
+        }
+        state["last_user_input"] = ""
+
+        result = process_turn(state)
+
+        self.assertEqual(result["evidence_collection"]["lines"], ["Traceback"])
+        self.assertEqual(result["evidence_collection"]["status"], "paused")
+        self.assertNotIn("Continue pasting", "\n".join(result.get("visible_response") or []))
+
+    def test_explicit_evidence_collection_cancel_discards_only_collection(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("evidence-cancel", language="en")
+        state["confirmed_config"] = {"CLOUD_REGION": "us-east1"}
+        state["evidence_collection"] = {
+            "question": {"id": "freeform_evidence", "kind": "log_evidence"},
+            "lines": ["Traceback (most recent call last):"],
+            "language": "en",
+        }
+        state["last_user_input"] = "Cancel this evidence collection."
+        with patch("agent.harness.coordinator.resolve_action_queue", return_value={"actions": [{
+            "type": "cancel_evidence_collection",
+            "source_evidence": state["last_user_input"],
+            "confidence": "high",
+        }]}):
+            result = process_turn(state)
+
+        self.assertEqual(result["evidence_collection"], {})
+        self.assertEqual(result["confirmed_config"], {"CLOUD_REGION": "us-east1"})
+
+    def test_unrelated_greeting_during_evidence_collection_is_not_appended(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("evidence-greeting", language="en")
+        original_lines = ["Traceback (most recent call last):"]
+        state["evidence_collection"] = {
+            "question": {"id": "freeform_evidence", "kind": "log_evidence"},
+            "lines": list(original_lines),
+            "language": "en",
+        }
+        state["last_user_input"] = "Hello, who are you?"
+        with patch("agent.harness.coordinator.resolve_action_queue", return_value={"actions": [{
+            "type": "greeting",
+            "source_evidence": state["last_user_input"],
+            "confidence": "high",
+        }]}):
+            result = process_turn(state)
+
+        self.assertEqual(result["evidence_collection"]["lines"], original_lines)
+        self.assertNotIn(state["last_user_input"], result["evidence_collection"]["lines"])
 
     def test_intent_provider_failure_does_not_pollute_stale_log_evidence_collection(self) -> None:
         from unittest.mock import patch
@@ -9342,11 +9587,25 @@ network:
         self.assertIn("多行 RPC 证据", "\n".join(first["visible_response"]))
 
         first["last_user_input"] = '--data \'{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}\''
-        second = process_turn(first)
+        with patch("agent.harness.coordinator.resolve_action_queue", return_value={"actions": [{
+            "type": "append_evidence_collection",
+            "evidence": first["last_user_input"],
+            "source_evidence": first["last_user_input"],
+            "confidence": "high",
+        }]}):
+            second = process_turn(first)
         self.assertTrue(second["evidence_collection"]["lines"])
 
         second["last_user_input"] = 'response: {"jsonrpc":"2.0","id":1,"result":"0x10"}'
-        with patch("agent.harness.domains.rpc_endpoint.extract_rpc_schema_from_evidence") as extract:
+        with (
+            patch("agent.harness.coordinator.resolve_action_queue", return_value={"actions": [{
+                "type": "append_evidence_collection",
+                "evidence": second["last_user_input"],
+                "source_evidence": second["last_user_input"],
+                "confidence": "high",
+            }]}),
+            patch("agent.harness.domains.rpc_endpoint.extract_rpc_schema_from_evidence") as extract,
+        ):
             extract.return_value = {
                 "status": "draft",
                 "evidence_kind": "jsonrpc_request",
@@ -10959,6 +11218,96 @@ network:
 
         self.assertEqual(result.get("target_mode"), "")
         self.assertEqual((result.get("pending_question") or {}).get("id"), "opening_next_action")
+
+    def test_semantic_target_mode_selection_uses_the_declared_pending_option(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("semantic-target-mode", language="en")
+        state["active_group"] = "target_mode"
+        state["pending_question"] = {
+            "id": "target_mode_select",
+            "group": "target_mode",
+            "kind": "numbered_choice",
+            "field": "target_mode",
+            "options": [
+                {
+                    "id": mode,
+                    "label": mode,
+                    "value": mode,
+                    "action": {
+                        "type": "choose_target_mode",
+                        "target_mode": mode,
+                        "target_mode_explicit": True,
+                    },
+                }
+                for mode in ("fake-node", "real-node", "sync-observe")
+            ],
+            "accepted_action_types": ["answer_pending", "choose_target_mode"],
+            "queue_barrier": True,
+        }
+        state["last_user_input"] = (
+            "Plans changed: do not generate traffic. Watch the running node catch up to chain head."
+        )
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            return_value={"actions": [{
+                "type": "choose_target_mode",
+                "target_mode": "sync-observe",
+                "target_mode_explicit": True,
+                "source_evidence": "Watch the running node catch up to chain head.",
+                "pending_option_semantic_verified": True,
+                "semantic_purpose_verified": True,
+                "confidence": "medium",
+            }]},
+        ):
+            result = process_turn(state)
+
+        self.assertEqual(result.get("target_mode"), "sync-observe")
+        admitted = (result.get("turn_context") or {}).get("admitted_actions") or []
+        self.assertIn("choose_target_mode", {item.get("type") for item in admitted})
+
+    def test_semantic_target_mode_selection_cannot_escape_the_pending_contract(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("semantic-target-mode-invalid", language="en")
+        state["active_group"] = "target_mode"
+        state["pending_question"] = {
+            "id": "target_mode_select",
+            "group": "target_mode",
+            "kind": "numbered_choice",
+            "field": "target_mode",
+            "options": [{
+                "id": "fake-node",
+                "label": "fake-node",
+                "value": "fake-node",
+                "action": {
+                    "type": "choose_target_mode",
+                    "target_mode": "fake-node",
+                    "target_mode_explicit": True,
+                },
+            }],
+            "accepted_action_types": ["answer_pending", "choose_target_mode"],
+            "queue_barrier": True,
+        }
+        state["last_user_input"] = "Watch a running node catch up."
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            return_value={"actions": [{
+                "type": "choose_target_mode",
+                "target_mode": "sync-observe",
+                "target_mode_explicit": True,
+                "source_evidence": "Watch a running node catch up.",
+                "pending_option_semantic_verified": True,
+                "semantic_purpose_verified": True,
+                "confidence": "medium",
+            }]},
+        ):
+            result = process_turn(state)
+
+        self.assertEqual(result.get("target_mode"), "")
+        self.assertEqual((result.get("pending_question") or {}).get("id"), "target_mode_select")
 
     def test_model_blank_selected_value_does_not_hide_manual_answer(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn

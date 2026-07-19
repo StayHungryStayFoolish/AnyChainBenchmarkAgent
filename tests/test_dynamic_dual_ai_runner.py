@@ -13,6 +13,8 @@ from unittest.mock import patch
 from tests.agent_live.chaos_scheduler import build_chaos_schedule
 from tests.agent_live.coverage_evidence import (
     RuntimeTurnEvent,
+    load_valid_evidence_reference,
+    validate_pty_diagnostic_artifact,
     validate_pty_cli_evidence_artifact,
     verify_runtime_postcondition,
 )
@@ -204,6 +206,7 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             result = runner.run()
 
             self.assertEqual(result.execution_status, "complete")
+            self.assertEqual(result.diagnostic_paths, ())
             self.assertEqual(transport.submitted, ["I only want a safe dry run first."])
             self.assertEqual(len(seen), 1)
             self.assertTrue(transport.closed)
@@ -233,6 +236,10 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             self.assertEqual(artifacts["real_cli"]["turn_observation"]["simulator_decision"], {})
             lane_evidence = schedule_result["targets"][0]["lane_evidence"]
             self.assertEqual(set(lane_evidence), {"dynamic_dual_ai", "real_cli"})
+            self.assertEqual(
+                list((root / ".agent/dynamic-chaos/contract-session/diagnostics").glob("*.json")),
+                [],
+            )
 
     def test_scheduler_rejects_a_seed_scenario_owned_by_another_edge(self) -> None:
         ledger = self._ledger()
@@ -468,6 +475,18 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "without a new committed"):
                 runner.run()
             self.assertEqual(list((root / ".agent/dynamic-chaos/contract-session/evidence").glob("*.json")), [])
+            diagnostics = list(
+                (root / ".agent/dynamic-chaos/contract-session/diagnostics").glob("*.json")
+            )
+            self.assertEqual(len(diagnostics), 1)
+            diagnostic = json.loads(diagnostics[0].read_text(encoding="utf-8"))
+            valid, reason = validate_pty_diagnostic_artifact(diagnostic)
+            self.assertTrue(valid, reason)
+            self.assertEqual(diagnostic["diagnostic_kind"], "interruption")
+            boundary = diagnostic["last_complete_boundary"]
+            self.assertIn("Model config", boundary["agent_response"])
+            self.assertNotIn("Returned, but no runtime event", boundary["agent_response"])
+            self.assertIsNone(boundary["completed_turn"])
 
     def test_failed_postcondition_fails_closed_after_event_advancement(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -475,13 +494,13 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             ledger = self._ledger()
             transport = FakeTransport([
                 "Agent> Model config: provider=deepseek, model=deepseek-chat, auth=api_key\nReady.",
-                "Agent> Next question.",
+                "Agent> Authorization: Bearer super-secret-token. Next question.",
             ])
 
             runner = DynamicDualAiChaosRunner(
                 ChaosRunConfig.linux(root, session_id="contract-session"),
                 lambda context: SimulatorDecision(
-                    user_message="fake node",
+                    user_message="https://rpc.example/abcdefghijklmnopqrstuvwxyz123456",
                     persona=context.scheduled_target.persona,
                     goal=context.scheduled_target.goal,
                     rationale="Response offered a mode.",
@@ -499,8 +518,24 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 ]),
                 revision=REVISION,
             )
-            with self.assertRaisesRegex(ValueError, "postcondition did not pass"):
-                runner.run()
+            observed_pending: list[dict] = []
+
+            def verify_after_durable_boundary(*args: object) -> object:
+                diagnostics = list(
+                    (root / ".agent/dynamic-chaos/contract-session/diagnostics").glob("*.json")
+                )
+                self.assertEqual(len(diagnostics), 1)
+                pending = json.loads(diagnostics[0].read_text(encoding="utf-8"))
+                self.assertEqual(pending["verification_status"], "verification_pending")
+                observed_pending.append(pending)
+                return verify_runtime_postcondition(*args)  # type: ignore[arg-type]
+
+            with patch(
+                "tests.agent_live.dynamic_dual_ai_chaos.verify_runtime_postcondition",
+                side_effect=verify_after_durable_boundary,
+            ):
+                with self.assertRaisesRegex(ValueError, "postcondition did not pass"):
+                    runner.run()
             result = json.loads(
                 (root / ".agent/dynamic-chaos/contract-session/schedule-result.json").read_text(
                     encoding="utf-8"
@@ -508,6 +543,112 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             )
             self.assertEqual(result["targets"][0]["status"], "failed")
             self.assertEqual(result["passed_target_count"], 0)
+            self.assertEqual(len(observed_pending), 1)
+            diagnostics = list(
+                (root / ".agent/dynamic-chaos/contract-session/diagnostics").glob("*.json")
+            )
+            self.assertEqual(len(diagnostics), 1)
+            diagnostic = json.loads(diagnostics[0].read_text(encoding="utf-8"))
+            valid, reason = validate_pty_diagnostic_artifact(diagnostic)
+            self.assertTrue(valid, reason)
+            self.assertEqual(diagnostic["diagnostic_kind"], "failed_attempt")
+            self.assertEqual(diagnostic["verification_status"], "postcondition_failed")
+            self.assertFalse(diagnostic["qualifying_evidence"])
+            boundary = diagnostic["last_complete_boundary"]
+            self.assertEqual(
+                boundary["completed_turn"]["user_message"],
+                "https://rpc.example/***REDACTED***",
+            )
+            self.assertIn("Bearer ***REDACTED***", boundary["completed_turn"]["agent_response"])
+            self.assertNotIn("super-secret-token", diagnostics[0].read_text(encoding="utf-8"))
+            self.assertFalse(boundary["verified_postcondition"]["passed"])
+            qualifying, rejection = load_valid_evidence_reference(
+                str(diagnostics[0]), edge=EDGE, revision=REVISION
+            )
+            self.assertIsNone(qualifying)
+            self.assertIn("never qualify", rejection)
+            self.assertEqual(
+                list((root / ".agent/dynamic-chaos/contract-session/evidence").glob("*.json")),
+                [],
+            )
+
+    def test_later_transport_failure_preserves_only_the_prior_complete_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            ledger = self._ledger()
+            schedule = build_chaos_schedule(
+                ledger,
+                revision=REVISION,
+                seed=23,
+                targets=[
+                    {
+                        "target_id": "first-complete",
+                        "edge_key": EDGE["edge_key"],
+                        "persona": "operator",
+                        "goal": "complete one observed turn",
+                    },
+                    {
+                        "target_id": "second-interrupted",
+                        "edge_key": EDGE["edge_key"],
+                        "persona": "operator",
+                        "goal": "exercise a later transport interruption",
+                    },
+                ],
+            )
+            transport = FakeTransport([
+                "Agent> Model config: provider=deepseek, model=deepseek-chat, auth=api_key\nReady.",
+                "Agent> First complete response.",
+                "Agent> Second response without a committed event.",
+            ])
+
+            def simulator(context: SimulatorContext) -> SimulatorDecision:
+                return SimulatorDecision(
+                    user_message=f"turn-{context.turn_index}",
+                    persona=context.scheduled_target.persona,
+                    goal=context.scheduled_target.goal,
+                    rationale="The current response determines this live turn.",
+                    target_coverage_ids=(context.scheduled_target.edge_key,),
+                )
+
+            runner = DynamicDualAiChaosRunner(
+                ChaosRunConfig.linux(root, session_id="contract-session"),
+                simulator,
+                ledger=ledger,
+                schedule=schedule,
+                transport=transport,
+                event_stream=FakeEventStream([
+                    self._event(1, "a" * 64, "b" * 64, "opening_next_action"),
+                    self._event(2, "b" * 64, "c" * 64, "chain_select"),
+                ]),
+                revision=REVISION,
+                clock_ns=OrderedClock(),
+            )
+            with self.assertRaisesRegex(RuntimeError, "without a new committed"):
+                runner.run()
+
+            diagnostics = list(
+                (root / ".agent/dynamic-chaos/contract-session/diagnostics").glob("*.json")
+            )
+            self.assertEqual(len(diagnostics), 1)
+            diagnostic = json.loads(diagnostics[0].read_text(encoding="utf-8"))
+            valid, reason = validate_pty_diagnostic_artifact(diagnostic)
+            self.assertTrue(valid, reason)
+            boundary = diagnostic["last_complete_boundary"]
+            self.assertEqual(boundary["completed_turn"]["user_message"], "turn-2")
+            self.assertEqual(
+                boundary["completed_turn"]["agent_response"],
+                "Agent> First complete response.",
+            )
+            serialized = diagnostics[0].read_text(encoding="utf-8")
+            self.assertNotIn("turn-3", serialized)
+            self.assertNotIn("Second response without a committed event", serialized)
+            schedule_result = json.loads(
+                (root / ".agent/dynamic-chaos/contract-session/schedule-result.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(schedule_result["passed_target_count"], 1)
+            self.assertEqual(schedule_result["targets"][1]["status"], "failed")
 
     def test_action_edge_rejects_an_unrelated_admitted_action(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -594,6 +735,47 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             verified.details["expected_postcondition_paths"],
             ["confirmed_config.CLOUD_REGION"],
         )
+
+    def test_manual_input_edge_requires_a_declared_successor_question(self) -> None:
+        edge = {
+            **EDGE,
+            "edge_key": "endpoint_process::custom_rpc_method::variant::free_text::action:answer_pending",
+            "question_id": "custom_rpc_method",
+            "edge_type": "manual_input",
+            "action_type": "answer_pending",
+            "expected_postcondition": {
+                "field": "custom_rpc_method",
+                "path": "custom_rpc.catalog.draft.method",
+                "next_question_ids": [
+                    "custom_rpc_schema_evidence",
+                    "custom_rpc_schema_confirm",
+                ],
+            },
+        }
+        baseline = replace(
+            self._event(1, "a" * 64, "b" * 64, "custom_rpc_method"),
+            pending_contract={
+                "id": "custom_rpc_method",
+                "accepted_action_types": ["answer_pending"],
+            },
+            after_value_hashes={"custom_rpc.catalog.draft.method": "1" * 64},
+        )
+        committed = replace(
+            self._event(2, "b" * 64, "c" * 64, "benchmark_mode"),
+            admitted_action_types=("answer_pending",),
+            state_diff_hashes={
+                "custom_rpc.catalog.draft.method": {
+                    "before": "1" * 64,
+                    "after": "2" * 64,
+                }
+            },
+            after_value_hashes={"custom_rpc.catalog.draft.method": "2" * 64},
+        )
+
+        verified = verify_runtime_postcondition(edge, baseline, committed, None)  # type: ignore[arg-type]
+
+        self.assertFalse(verified.passed)
+        self.assertIn("unexpected next question", " ".join(verified.details["errors"]))
 
     def test_resume_edge_verifies_saved_context_relation_for_any_group(self) -> None:
         relation = {

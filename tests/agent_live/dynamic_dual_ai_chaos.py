@@ -22,16 +22,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
+from agent.utils.redaction import redact
 from tests.agent_live.coverage_evidence import (
     DynamicTurnSelection,
+    PtyDiagnosticRecord,
     PtyCliTurnRecord,
     RuntimeTurnEvent,
     TurnObservation,
     build_pty_cli_evidence_artifact,
+    build_pty_diagnostic_artifact,
     pty_transcript_hash,
     repository_revision,
     verify_runtime_postcondition,
     write_evidence_artifact,
+    write_pty_diagnostic_artifact,
 )
 from tests.agent_live.chaos_scheduler import (
     ChaosSchedule,
@@ -163,6 +167,7 @@ class ChaosRunResult:
     session_id: str
     transcript_path: Path
     evidence_paths: tuple[Path, ...]
+    diagnostic_paths: tuple[Path, ...]
     turns: tuple[PtyCliTurnRecord, ...]
     schedule_path: Path
     schedule_result_path: Path
@@ -394,6 +399,7 @@ class DynamicDualAiChaosRunner:
         )).resolve()
         runtime_root.mkdir(parents=True, exist_ok=True)
         evidence_dir = runtime_root / "evidence"
+        diagnostic_dir = runtime_root / "diagnostics"
         transcript_path = runtime_root / "transcript.txt"
         schedule_path = write_chaos_schedule(self.schedule, runtime_root / "schedule.json")
         schedule_result_path = runtime_root / "schedule-result.json"
@@ -416,9 +422,14 @@ class DynamicDualAiChaosRunner:
         transcript: list[tuple[str, str]] = []
         transcript_lines: list[str] = []
         evidence_paths: list[Path] = []
+        diagnostic_paths: list[Path] = []
         turns: list[PtyCliTurnRecord] = []
         target_results: list[dict[str, Any]] = []
         execution_status = "incomplete"
+        last_complete_response = ""
+        last_complete_event: RuntimeTurnEvent | None = None
+        last_complete_turn: PtyCliTurnRecord | None = None
+        last_complete_selection: DynamicTurnSelection | None = None
 
         self.transport.start(env=env)
         try:
@@ -435,6 +446,8 @@ class DynamicDualAiChaosRunner:
             baseline_event = self.event_stream.baseline()
             self._validate_event_revision(baseline_event)
             transcript_lines.append(previous_response)
+            last_complete_response = previous_response
+            last_complete_event = baseline_event
 
             if seed_scenario_id:
                 first_target = self.schedule.targets[0]
@@ -459,6 +472,10 @@ class DynamicDualAiChaosRunner:
                     previous_response = resumed_response
                     previous_received_ns = self.clock_ns()
                     baseline_event = resumed_event
+                    last_complete_response = resumed_response
+                    last_complete_event = resumed_event
+                    last_complete_turn = None
+                    last_complete_selection = None
                 if baseline_event.pending_question_id != expected_question:
                     raise RuntimeError(
                         "reviewed checkpoint did not restore the scheduled target contract: "
@@ -528,18 +545,111 @@ class DynamicDualAiChaosRunner:
                     target_coverage_ids=tuple(decision.target_coverage_ids),
                     selected_at_ns=selected_at_ns,
                 )
-                verified_postcondition = verify_runtime_postcondition(
-                    edge,
-                    baseline_event,
-                    committed_event,
-                    turn,
+                turns.append(turn)
+                transcript.append((decision.user_message, response))
+                transcript_lines.extend((f"User> {decision.user_message}", response))
+                last_complete_response = response
+                last_complete_event = committed_event
+                last_complete_turn = turn
+                last_complete_selection = selection
+
+                pending_diagnostic = build_pty_diagnostic_artifact(
+                    PtyDiagnosticRecord(
+                        diagnostic_kind="failed_attempt",
+                        verification_status="verification_pending",
+                        target_id=scheduled_target.target_id,
+                        target_edge_key=scheduled_target.edge_key,
+                        revision=self.revision,
+                        session_id=self.config.session_id,
+                        reason="completed PTY boundary awaiting postcondition verification",
+                        last_complete_response=response,
+                        last_complete_event=committed_event,
+                        completed_turn=turn,
+                        dynamic_selection=selection,
+                    )
                 )
+                pending_diagnostic_path = write_pty_diagnostic_artifact(
+                    pending_diagnostic,
+                    diagnostic_dir,
+                )
+                try:
+                    verified_postcondition = verify_runtime_postcondition(
+                        edge,
+                        baseline_event,
+                        committed_event,
+                        turn,
+                    )
+                except Exception as exc:
+                    pending_diagnostic_path.unlink(missing_ok=True)
+                    verification_error = build_pty_diagnostic_artifact(
+                        PtyDiagnosticRecord(
+                            diagnostic_kind="failed_attempt",
+                            verification_status="verification_error",
+                            target_id=scheduled_target.target_id,
+                            target_edge_key=scheduled_target.edge_key,
+                            revision=self.revision,
+                            session_id=self.config.session_id,
+                            reason=f"{type(exc).__name__}: {exc}",
+                            last_complete_response=response,
+                            last_complete_event=committed_event,
+                            completed_turn=turn,
+                            dynamic_selection=selection,
+                        )
+                    )
+                    verification_error_path = write_pty_diagnostic_artifact(
+                        verification_error,
+                        diagnostic_dir,
+                    )
+                    diagnostic_paths.append(verification_error_path)
+                    target_results.append({
+                        "target_id": scheduled_target.target_id,
+                        "edge_key": scheduled_target.edge_key,
+                        "status": "failed",
+                        "reason": str(redact(f"{type(exc).__name__}: {exc}")),
+                        "diagnostic_path": str(verification_error_path),
+                        "diagnostic_id": verification_error["diagnostic_id"],
+                    })
+                    raise
                 if not verified_postcondition.passed:
                     errors = verified_postcondition.details.get("errors") or ()
-                    raise ValueError(
+                    failure_reason = (
                         "turn observation postcondition did not pass: "
                         + "; ".join(str(item) for item in errors)
                     )
+                    pending_diagnostic_path.unlink(missing_ok=True)
+                    failed_diagnostic = build_pty_diagnostic_artifact(
+                        PtyDiagnosticRecord(
+                            diagnostic_kind="failed_attempt",
+                            verification_status="postcondition_failed",
+                            target_id=scheduled_target.target_id,
+                            target_edge_key=scheduled_target.edge_key,
+                            revision=self.revision,
+                            session_id=self.config.session_id,
+                            reason=failure_reason,
+                            last_complete_response=response,
+                            last_complete_event=committed_event,
+                            completed_turn=turn,
+                            dynamic_selection=selection,
+                            verified_postcondition=verified_postcondition,
+                        )
+                    )
+                    failed_diagnostic_path = write_pty_diagnostic_artifact(
+                        failed_diagnostic,
+                        diagnostic_dir,
+                    )
+                    diagnostic_paths.append(failed_diagnostic_path)
+                    target_results.append({
+                        "target_id": scheduled_target.target_id,
+                        "edge_key": scheduled_target.edge_key,
+                        "status": "failed",
+                        "reason": str(redact(failure_reason)),
+                        "diagnostic_path": str(failed_diagnostic_path),
+                        "diagnostic_id": failed_diagnostic["diagnostic_id"],
+                    })
+                    raise ValueError(
+                        failure_reason
+                    )
+                pending_diagnostic_path.unlink(missing_ok=True)
                 observation = TurnObservation(
                     seed=self.schedule.seed,
                     revision=self.revision,
@@ -626,9 +736,6 @@ class DynamicDualAiChaosRunner:
                     "evidence_path": str(evidence_path),
                     "lane_evidence": lane_evidence,
                 })
-                turns.append(turn)
-                transcript.append((decision.user_message, response))
-                transcript_lines.extend((f"User> {decision.user_message}", response))
                 previous_response = response
                 previous_received_ns = response_received_ns
                 baseline_event = committed_event
@@ -641,12 +748,41 @@ class DynamicDualAiChaosRunner:
                     None,
                 )
                 if pending is not None:
-                    target_results.append({
+                    interruption_reason = (
+                        f"{type(exc).__name__}: PTY/runtime boundary interrupted before completion"
+                    )
+                    failed_result = {
                         "target_id": pending.target_id,
                         "edge_key": pending.edge_key,
                         "status": "failed",
-                        "reason": f"{type(exc).__name__}: {exc}",
-                    })
+                        "reason": interruption_reason,
+                    }
+                    if last_complete_event is not None and last_complete_response:
+                        interruption = build_pty_diagnostic_artifact(
+                            PtyDiagnosticRecord(
+                                diagnostic_kind="interruption",
+                                verification_status="interrupted",
+                                target_id=pending.target_id,
+                                target_edge_key=pending.edge_key,
+                                revision=self.revision,
+                                session_id=self.config.session_id,
+                                reason=interruption_reason,
+                                last_complete_response=last_complete_response,
+                                last_complete_event=last_complete_event,
+                                completed_turn=last_complete_turn,
+                                dynamic_selection=last_complete_selection,
+                            )
+                        )
+                        interruption_path = write_pty_diagnostic_artifact(
+                            interruption,
+                            diagnostic_dir,
+                        )
+                        diagnostic_paths.append(interruption_path)
+                        failed_result.update({
+                            "diagnostic_path": str(interruption_path),
+                            "diagnostic_id": interruption["diagnostic_id"],
+                        })
+                    target_results.append(failed_result)
             raise
         finally:
             self.transport.close()
@@ -671,6 +807,7 @@ class DynamicDualAiChaosRunner:
             session_id=self.config.session_id,
             transcript_path=transcript_path,
             evidence_paths=tuple(evidence_paths),
+            diagnostic_paths=tuple(diagnostic_paths),
             turns=tuple(turns),
             schedule_path=schedule_path,
             schedule_result_path=schedule_result_path,

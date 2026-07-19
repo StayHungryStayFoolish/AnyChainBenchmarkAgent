@@ -59,9 +59,12 @@ class CoverageLaneApplicabilityTest(unittest.TestCase):
         self.assertEqual(contracts["real_cli"]["status"], "partial")
         self.assertTrue(contracts["real_cli"]["producer"])
         self.assertTrue(contracts["real_cli"]["gap"])
-        self.assertEqual(contracts["real_execution"]["status"], "artifact_contract_only")
-        self.assertFalse(contracts["real_execution"]["producer"])
-        self.assertTrue(contracts["real_execution"]["gap"])
+        self.assertEqual(contracts["real_execution"]["status"], "implemented")
+        self.assertEqual(
+            contracts["real_execution"]["producer"],
+            "tests/agent_live/execute_real_execution_ledger.py",
+        )
+        self.assertFalse(contracts["real_execution"]["gap"])
 
     def test_whitespace_is_a_terminal_noop_not_a_committed_real_cli_turn(self) -> None:
         edge = next(

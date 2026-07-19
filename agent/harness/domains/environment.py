@@ -11,8 +11,10 @@ from ..contracts import ActionProposal, HandlerResult, StateDelta
 from ..localization import localized
 from ..questions import choice_question, manual_question, normalize_scalar
 from ..state import AgentGraphState
+from ..transitions import record_group_invalidations
 
 from agent.planners import question_prompts
+from agent.workflows.group_registry import group_for_field, invalidation_targets
 ENVIRONMENT_GROUPS = {"provider_deployment", "ledger_disk", "accounts_disk", "network"}
 
 CONFIRMABLE_CONFIG_FIELDS = {
@@ -208,7 +210,7 @@ def apply_environment_action(state: AgentGraphState, action: ActionProposal) -> 
         return HandlerResult(
             delta=StateDelta.between(state, next_state),
             consumed_action_ids=(action.action_id,),
-            invalidated_groups=("preflight_smoke_execution",),
+            invalidated_groups=invalidation_targets("accounts_disk"),
             reconfigured_groups=("accounts_disk",),
             clear_pending=True,
             next_group="accounts_disk",
@@ -760,6 +762,8 @@ def _apply_config_values(
                     sync_options["sync_observe_duration_seconds"] = duration_seconds
             except (TypeError, ValueError):
                 invalid[key] = scalar
+    for changed_group in sorted({group_for_field(key) for key in applied} - {""}):
+        record_group_invalidations(state, changed_group)
     return {
         "applied": applied,
         "endpoint_proposals": endpoint_saved,
@@ -983,8 +987,9 @@ def apply_environment_answer(state: AgentGraphState, question: dict[str, Any], v
         next_state.setdefault("inferred_config", {}).pop(f"{prefix}_VOL_SIZE_manual_required", None)
     invalidated = set(next_state.get("invalidated_groups") or [])
     invalidated.discard(group)
-    invalidated.add("preflight_smoke_execution")
     next_state["invalidated_groups"] = sorted(invalidated)
+    record_group_invalidations(next_state, group)
+    invalidated = set(next_state.get("invalidated_groups") or [])
     return HandlerResult(
         delta=StateDelta.between(state, next_state),
         invalidated_groups=tuple(sorted(invalidated - set(state.get("invalidated_groups") or []))),

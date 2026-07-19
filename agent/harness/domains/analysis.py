@@ -39,16 +39,12 @@ __all__ = [
     "evidence_help_response",
     "finish_evidence_collection",
     "is_evidence_completion_command",
-    "is_multiline_paste",
-    "looks_like_evidence_analysis_request",
-    "looks_like_evidence_fragment",
-    "looks_like_job_specific_reference",
-    "looks_like_pasted_evidence",
     "non_empty_evidence_lines",
     "prompt_evidence_collection_waiting",
+    "pause_evidence_collection",
     "report_artifact_entry_result",
+    "resume_evidence_collection",
     "should_start_evidence_collection",
-    "should_try_routing_during_evidence_collection",
     "start_evidence_collection",
 ]
 
@@ -73,6 +69,25 @@ class EvidenceCollectionOutcome:
 def apply_analysis_action(state: AgentGraphState, action: ActionProposal) -> HandlerResult:
     """Apply one evidence/report action without choosing another workflow group."""
 
+    if action.action_type == "append_evidence_collection":
+        if not state.get("evidence_collection"):
+            return HandlerResult(blocker="append evidence requires an active evidence collection")
+        return continue_evidence_collection(
+            state,
+            str(action.arguments.get("evidence") or ""),
+            state.get("evidence_collection") or {},
+        ).result
+    if action.action_type == "finish_evidence_collection":
+        if not state.get("evidence_collection"):
+            return HandlerResult(blocker="finish evidence requires an active evidence collection")
+        return finish_evidence_collection(state, state.get("evidence_collection") or {}).result
+    if action.action_type == "pause_evidence_collection":
+        return pause_evidence_collection(state)
+    if action.action_type == "resume_evidence_collection":
+        return resume_evidence_collection(state)
+    if action.action_type == "cancel_evidence_collection":
+        return cancel_evidence_collection(state)
+
     if action.action_type == "analyze_report":
         report_context = dict(state.get("report_context") or {})
         job_id = str(action.arguments.get("job_id") or "").strip()
@@ -96,6 +111,9 @@ def apply_analysis_action(state: AgentGraphState, action: ActionProposal) -> Han
         )
     if action.action_type == "analyze_evidence":
         evidence = str(action.arguments.get("evidence") or "").strip()
+        collecting = state.get("evidence_collection") or {}
+        if collecting:
+            evidence = "\n".join(str(item) for item in collecting.get("lines") or [] if str(item).strip())
         if not evidence:
             return HandlerResult(
                 consumed_action_ids=(action.action_id,),
@@ -104,9 +122,10 @@ def apply_analysis_action(state: AgentGraphState, action: ActionProposal) -> Han
                 stop_after_response=True,
             )
         evidence_buffer = [dict(item) for item in list(state.get("evidence_buffer") or [])]
-        evidence_buffer.append({"text": evidence})
+        if not collecting:
+            evidence_buffer.append({"text": evidence})
         return HandlerResult(
-            delta=StateDelta.set_values({"evidence_buffer": evidence_buffer}),
+            delta=StateDelta.set_values({"evidence_buffer": evidence_buffer}) if not collecting else StateDelta(),
             consumed_action_ids=(action.action_id,),
             visible_result=analyze_evidence_with_model(
                 state,
@@ -150,6 +169,7 @@ def start_evidence_collection(
         "question": dict(pending),
         "lines": lines,
         "language": str(state.get("language") or "en"),
+        "status": "active",
     }
     if evidence_collection_complete(lines):
         return finish_evidence_collection(state, collecting)
@@ -181,10 +201,8 @@ def continue_evidence_collection(
     raw = str(text or "").rstrip("\n")
     question = active.get("question") if isinstance(active.get("question"), dict) else {}
     language = str(active.get("language") or state.get("language") or "en")
-    normalized = {"question": dict(question), "lines": lines, "language": language}
+    normalized = {"question": dict(question), "lines": lines, "language": language, "status": "active"}
 
-    if str(question.get("id") or "") == "freeform_evidence" and looks_like_evidence_analysis_request(raw):
-        return finish_evidence_collection(state, normalized, analysis_requested=True)
     if is_evidence_completion_command(raw):
         return finish_evidence_collection(state, normalized)
 
@@ -217,7 +235,7 @@ def prompt_evidence_collection_waiting(
     question = active.get("question") if isinstance(active.get("question"), dict) else {}
     lines = [str(item) for item in list(active.get("lines") or []) if str(item).strip()]
     language = str(active.get("language") or state.get("language") or "en")
-    normalized = {"question": dict(question), "lines": lines, "language": language}
+    normalized = {"question": dict(question), "lines": lines, "language": language, "status": "active"}
     if str(question.get("id") or "") == "freeform_evidence":
         response = localized(
             language,
@@ -318,6 +336,40 @@ def cancel_evidence_collection(state: AgentGraphState) -> HandlerResult:
     )
 
 
+def pause_evidence_collection(state: AgentGraphState) -> HandlerResult:
+    """Suspend collection transport while preserving its buffered evidence."""
+
+    collecting = dict(state.get("evidence_collection") or {})
+    if not collecting:
+        return HandlerResult(blocker="pause evidence requires an active evidence collection")
+    collecting["status"] = "paused"
+    return HandlerResult(
+        delta=StateDelta.set_values({"evidence_collection": collecting}),
+        completion="completed",
+    )
+
+
+def resume_evidence_collection(state: AgentGraphState) -> HandlerResult:
+    """Reactivate a preserved collection without changing its original question."""
+
+    collecting = dict(state.get("evidence_collection") or {})
+    if not collecting or str(collecting.get("status") or "active") != "paused":
+        return HandlerResult(blocker="resume evidence requires a paused evidence collection")
+    collecting["status"] = "active"
+    language = str(collecting.get("language") or state.get("language") or "en")
+    lines = [str(item) for item in collecting.get("lines") or []]
+    return HandlerResult(
+        delta=StateDelta.set_values({"evidence_collection": collecting}),
+        visible_result=localized(
+            language,
+            f"已恢复证据收集，当前保留 {len(lines)} 行。请继续粘贴，完成后输入 `END`。",
+            f"Resumed evidence collection with {len(lines)} saved line(s). Continue pasting, or type `END` when done.",
+        ),
+        completion="in_progress",
+        stop_after_response=True,
+    )
+
+
 def non_empty_evidence_lines(text: str) -> list[str]:
     """Split an initial paste into non-empty evidence lines."""
 
@@ -341,29 +393,6 @@ def is_evidence_completion_command(text: str) -> bool:
     return str(text or "").strip().upper() in {"END", "DONE", "结束"}
 
 
-def looks_like_evidence_analysis_request(text: str) -> bool:
-    lowered = str(text or "").strip().lower()
-    if not lowered:
-        return False
-    return any(
-        token in lowered
-        for token in (
-            "什么意思",
-            "什么原因",
-            "分析",
-            "怎么修",
-            "修复",
-            "下一步",
-            "why",
-            "what does",
-            "what means",
-            "explain",
-            "fix",
-            "next step",
-        )
-    )
-
-
 def analyze_inline_evidence_result(state: AgentGraphState, text: str) -> HandlerResult:
     """Analyze one complete evidence-bearing question without opening paste mode."""
 
@@ -377,80 +406,6 @@ def analyze_inline_evidence_result(state: AgentGraphState, text: str) -> Handler
         completion="completed",
         stop_after_response=True,
     )
-
-
-def looks_like_job_specific_reference(text: str) -> bool:
-    """Keep saved evidence follow-ups from swallowing job/report analysis."""
-
-    raw = str(text or "")
-    return bool(JOB_ID_RE.search(raw) or "job" in raw.lower())
-
-
-def looks_like_pasted_evidence(text: str) -> bool:
-    """Return whether text carries structural log/error evidence.
-
-    A failure word in ordinary conversation is not evidence.  Evidence mode is
-    intentionally reserved for recognizable output shapes so questions about a
-    failed job, retry, or recovery continue through normal intent resolution.
-    """
-
-    lowered = str(text or "").lower()
-    return any(
-        token in lowered
-        for token in (
-            "traceback",
-            "runtimeerror",
-            "error:",
-            "exception:",
-            "caused by:",
-            "stack trace",
-            "agent>",
-            "user>",
-        )
-    )
-
-
-def is_multiline_paste(text: str) -> bool:
-    return len([line for line in str(text or "").splitlines() if line.strip()]) >= 3
-
-
-def looks_like_evidence_fragment(text: str, question: Mapping[str, Any]) -> bool:
-    raw = str(text or "")
-    lowered = raw.lower()
-    if str(question.get("id") or "") == "freeform_evidence":
-        if looks_like_pasted_evidence(raw):
-            return True
-        return bool(
-            raw.startswith((" ", "\t"))
-            or re.search(r'\bfile\s+"[^"]+",\s+line\s+\d+', lowered)
-            or re.search(r"\b(?:caused by|during handling|traceback|stack trace)\b", lowered)
-        )
-    return any(
-        marker in lowered
-        for marker in (
-            "curl ",
-            "--data",
-            "--header",
-            "jsonrpc",
-            '"method"',
-            "'method'",
-            '"params"',
-            "'params'",
-            "response:",
-            "result",
-            "http://",
-            "https://",
-        )
-    )
-
-
-def should_try_routing_during_evidence_collection(text: str, collecting: Mapping[str, Any]) -> bool:
-    """Identify navigation candidates without performing or mutating routing."""
-
-    question = collecting.get("question") if isinstance(collecting.get("question"), dict) else {}
-    if str(question.get("id") or "") == "freeform_evidence" and looks_like_evidence_analysis_request(text):
-        return False
-    return not looks_like_evidence_fragment(text, question) and not evidence_collection_complete(non_empty_evidence_lines(text))
 
 
 def evidence_help_response(state: AgentGraphState) -> str:

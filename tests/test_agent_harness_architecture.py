@@ -74,6 +74,143 @@ def _commit_result(
 
 
 class HarnessArchitectureTest(unittest.TestCase):
+    def test_chain_rpc_invalidations_commit_cross_domain_state_once_at_coordinator(self) -> None:
+        from agent.harness.domains.chain_rpc_support import _domain_result
+        from agent.harness.transitions import (
+            invalidate_for_chain_change,
+            invalidate_for_rpc_mode_change,
+            invalidate_for_target_mode,
+        )
+
+        execution_state = {
+            "plan": {"status": "ready"},
+            "plan_file": "/tmp/plan.json",
+            "preflight": {"passed": True},
+            "smoke": {"passed": True},
+            "final_benchmark": {"status": "completed"},
+            "job": {"job_id": "job-old", "status": "completed"},
+        }
+        cases = (
+            (
+                "chain_change",
+                lambda state: invalidate_for_chain_change(state, new_chain="ethereum"),
+                {},
+            ),
+            (
+                "target_mode_change",
+                lambda state: (
+                    state.update(target_mode="sync-observe", workflow_mode="sync_observe"),
+                    invalidate_for_target_mode(state, previous_mode="real-node"),
+                ),
+                {"qps_profile": {}},
+            ),
+            (
+                "rpc_mode_change",
+                lambda state: (
+                    invalidate_for_rpc_mode_change(state),
+                    state.update(rpc_mode="mixed"),
+                ),
+                {},
+            ),
+        )
+        for name, mutate, expected in cases:
+            with self.subTest(case=name):
+                original = _state(
+                    target_mode="real-node",
+                    workflow_mode="rpc_benchmark",
+                    chain_identity={"canonical": "bsc", "status": "confirmed"},
+                    rpc_mode="single",
+                    workload={"confirmed": True, "methods": ["eth_blockNumber"]},
+                    qps_profile={"mode": "quick"},
+                    sync_observe={"source": "existing_local_node"},
+                    confirmed_config={"CLOUD_REGION": "asia-east1"},
+                    interruption_stack=[{"group": "network", "reason": "user_jump"}],
+                    **execution_state,
+                )
+                changed = deepcopy(original)
+                mutate(changed)
+
+                # Domain transitions declare cross-domain invalidations without
+                # writing execution/performance/sync-owned roots themselves.
+                for key, value in execution_state.items():
+                    self.assertEqual(changed[key], value)
+                if name == "target_mode_change":
+                    self.assertEqual(changed["qps_profile"], {"mode": "quick"})
+                    self.assertEqual(changed["sync_observe"], {"source": "existing_local_node"})
+
+                committed = _commit_result(
+                    original,
+                    _domain_result(original, changed),
+                    owner="chain_rpc",
+                )
+
+                for key in execution_state:
+                    self.assertIn(committed.get(key), ({}, ""))
+                for key, value in expected.items():
+                    self.assertEqual(committed.get(key), value)
+                self.assertEqual(committed["confirmed_config"]["CLOUD_REGION"], "asia-east1")
+                self.assertEqual(committed["interruption_stack"], [{"group": "network", "reason": "user_jump"}])
+
+    def test_endpoint_and_qps_changes_use_registry_invalidation_at_commit_boundary(self) -> None:
+        from agent.harness.contracts import ActionProposal
+        from agent.harness.domains.chain_rpc import apply_chain_rpc_answer
+        from agent.harness.domains.performance import apply_performance_action
+
+        execution = {
+            "plan": {"status": "ready"},
+            "plan_file": "/tmp/old-plan.json",
+            "preflight": {"passed": True},
+            "smoke": {"passed": True},
+            "final_benchmark": {"status": "completed"},
+            "job": {"job_id": "job-old", "status": "completed"},
+        }
+        endpoint_state = _state(
+            target_mode="real-node",
+            workflow_mode="rpc_benchmark",
+            chain_identity={"canonical": "bsc", "status": "confirmed", "adapter_family": "jsonrpc"},
+            confirmed_config={
+                "CLOUD_REGION": "asia-east1",
+                "LOCAL_RPC_URL": "http://old.invalid",
+            },
+            **execution,
+        )
+        endpoint_question = {
+            "id": "LOCAL_RPC_URL",
+            "group": "endpoint_process",
+            "field": "LOCAL_RPC_URL",
+        }
+        probe = {"ready": True, "status": "ready", "evidence_file": "/tmp/probe.json"}
+        with patch("agent.harness.domains.rpc_endpoint.validate_rpc_endpoint", return_value=probe):
+            endpoint_result = apply_chain_rpc_answer(
+                endpoint_state,
+                endpoint_question,
+                "http://new.invalid",
+                "http://new.invalid",
+            )
+        endpoint_committed = _commit_result(endpoint_state, endpoint_result, owner="chain_rpc")
+        self.assertEqual(endpoint_committed["confirmed_config"]["LOCAL_RPC_URL"], "http://new.invalid")
+        self.assertEqual(endpoint_committed["confirmed_config"]["CLOUD_REGION"], "asia-east1")
+        for key in execution:
+            self.assertIn(endpoint_committed.get(key), ({}, ""))
+
+        qps_state = _state(
+            target_mode="real-node",
+            workflow_mode="rpc_benchmark",
+            chain_identity={"canonical": "bsc", "status": "confirmed"},
+            qps_profile={"mode": "standard", "confirmed": True},
+            confirmed_config={"CLOUD_REGION": "asia-east1"},
+            **execution,
+        )
+        qps_result = apply_performance_action(
+            qps_state,
+            ActionProposal("qps-change", "set_qps_mode", {"qps_mode": "quick"}, "high"),
+        )
+        qps_committed = _commit_result(qps_state, qps_result, owner="performance")
+        self.assertEqual(qps_committed["qps_profile"]["mode"], "quick")
+        self.assertEqual(qps_committed["confirmed_config"]["CLOUD_REGION"], "asia-east1")
+        for key in execution:
+            self.assertIn(qps_committed.get(key), ({}, ""))
+
     def test_config_proposal_contract_accepts_explicit_source_evidence(self) -> None:
         from agent.harness.action_registry import validate_action_contract
 
@@ -1395,13 +1532,15 @@ class HarnessStateInvariantTest(unittest.TestCase):
                 '"source_text":"What can you do?","disposition":"action","action_indexes":[0],'
                 '"reason":"capability question"}],"reason":"capability question"}'
             ),
-            SimpleNamespace(text='{"reviews":[{"action_index":0,"present_consultation":true,'
+            SimpleNamespace(text='{"reviews":[{"action_index":0,"present_consultation":true,"topic_matches":true,'
                                  '"evidence_quote":"What can you do?","reason":"present capability question"}]}'),
+            SimpleNamespace(text='{"findings":[{"unit_id":"unit-1","status":"complete",'
+                                 '"missing_demands":[],"reason":"consultation preserves the complete request"}]}'),
         ]
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(_state(), "What can you do?")
 
-        self.assertEqual(provider.complete.call_count, 2)
+        self.assertEqual(provider.complete.call_count, 3)
         self.assertEqual(result["actions"][0]["type"], "answer_opening_question")
 
     def test_free_form_planner_allows_one_schema_repair_then_semantic_admission(self) -> None:
@@ -1423,13 +1562,15 @@ class HarnessStateInvariantTest(unittest.TestCase):
                                  '"semantic_units":[{"unit_id":"unit-1","clause_id":"clause-1","start":0,"end":16,'
                                  '"source_text":"What can you do?","disposition":"action","action_indexes":[0],'
                                  '"reason":"capability question"}]}'),
-            SimpleNamespace(text='{"reviews":[{"action_index":0,"present_consultation":true,'
+            SimpleNamespace(text='{"reviews":[{"action_index":0,"present_consultation":true,"topic_matches":true,'
                                  '"evidence_quote":"What can you do?","reason":"present capability question"}]}'),
+            SimpleNamespace(text='{"findings":[{"unit_id":"unit-1","status":"complete",'
+                                 '"missing_demands":[],"reason":"consultation preserves the complete request"}]}'),
         ]
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(_state(), "What can you do?")
 
-        self.assertEqual(provider.complete.call_count, 4)
+        self.assertEqual(provider.complete.call_count, 5)
         system_prompts = [call.args[0].messages[0].content for call in provider.complete.call_args_list]
         self.assertEqual(
             sum(prompt.startswith("Repair one malformed AnyChain typed action-plan response") for prompt in system_prompts),
@@ -1543,16 +1684,20 @@ class HarnessStateInvariantTest(unittest.TestCase):
                 '"reason":"read-only state consultation"}]}'
             )),
             SimpleNamespace(text=(
-                '{"reviews":[{"action_index":0,"present_consultation":true,'
+                '{"reviews":[{"action_index":0,"present_consultation":true,"topic_matches":true,'
                 '"evidence_quote":"summarize which chain and custom method you retained",'
                 '"reason":"present read-only state summary"}]}'
+            )),
+            SimpleNamespace(text=(
+                '{"findings":[{"unit_id":"unit-1","status":"complete",'
+                '"missing_demands":[],"reason":"the summary action preserves the request"}]}'
             )),
         ]
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(_state(), text)
 
-        self.assertEqual(provider.complete.call_count, 7)
+        self.assertEqual(provider.complete.call_count, 8)
         self.assertEqual(result["actions"][0]["type"], "answer_opening_question")
         self.assertEqual(result["actions"][0]["topic"], "current_config")
 
@@ -1581,17 +1726,10 @@ class HarnessStateInvariantTest(unittest.TestCase):
                 '"action_indexes":[0],"reason":"single workload"}]}'
             )),
             SimpleNamespace(text=(
-                '{"reviews":[{"action_index":0,"decision":"select_option",'
+                '{"reviews":[{"action_index":0,"decision":"select_pending_option",'
+                '"selected_option_value":"single",'
                 '"evidence_quote":"I only need one RPC method.",'
                 '"reason":"the source selects the declared single-method option"}]}'
-            )),
-            SimpleNamespace(text=(
-                '{"reviews":[{"action_index":0,"supported":true,'
-                '"reason":"the source selects the displayed single-method option"}]}'
-            )),
-            SimpleNamespace(text=(
-                '{"unit_reviews":[{"unit_id":"unit-1","complete":true,'
-                '"missing_demand_quote":"","reason":"the mapped action preserves the complete request"}]}'
             )),
             SimpleNamespace(text=(
                 '{"findings":[{"unit_id":"unit-1","status":"complete",'
@@ -1602,7 +1740,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, "I only need one RPC method.")
 
-        self.assertEqual(provider.complete.call_count, 5)
+        self.assertEqual(provider.complete.call_count, 3)
         self.assertEqual(result["actions"][0]["type"], "set_rpc_mode")
         self.assertEqual(result["actions"][0]["rpc_mode"], "single")
         self.assertTrue(result["actions"][0]["pending_option_semantic_verified"])
@@ -1632,17 +1770,10 @@ class HarnessStateInvariantTest(unittest.TestCase):
                 '"action_indexes":[0],"reason":"mixed workload"}]}'
             )),
             SimpleNamespace(text=(
-                '{"reviews":[{"action_index":0,"decision":"select_option",'
+                '{"reviews":[{"action_index":0,"decision":"select_pending_option",'
+                '"selected_option_value":"mixed",'
                 '"evidence_quote":"Use several weighted RPC methods.",'
                 '"reason":"the source selects the declared multiple-method option"}]}'
-            )),
-            SimpleNamespace(text=(
-                '{"reviews":[{"action_index":0,"supported":true,'
-                '"reason":"the source selects the displayed multiple-method option"}]}'
-            )),
-            SimpleNamespace(text=(
-                '{"unit_reviews":[{"unit_id":"unit-1","complete":true,'
-                '"missing_demand_quote":"","reason":"the mapped action preserves the complete request"}]}'
             )),
             SimpleNamespace(text=(
                 '{"findings":[{"unit_id":"unit-1","status":"complete",'
@@ -1653,7 +1784,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, "Use several weighted RPC methods.")
 
-        self.assertEqual(provider.complete.call_count, 5)
+        self.assertEqual(provider.complete.call_count, 3)
         self.assertEqual(result["actions"][0]["type"], "set_rpc_mode")
         self.assertEqual(result["actions"][0]["rpc_mode"], "mixed")
         self.assertTrue(result["actions"][0]["pending_option_semantic_verified"])
@@ -1712,9 +1843,13 @@ class HarnessStateInvariantTest(unittest.TestCase):
                 '"action_indexes":[0],"reason":"read-only comparison"}]}'
             )),
             SimpleNamespace(text=(
-                '{"reviews":[{"action_index":0,"present_consultation":true,'
+                '{"reviews":[{"action_index":0,"present_consultation":true,"topic_matches":true,'
                 '"evidence_quote":"How do single and mixed differ?",'
                 '"reason":"present read-only comparison"}]}'
+            )),
+            SimpleNamespace(text=(
+                '{"findings":[{"unit_id":"unit-1","status":"complete",'
+                '"missing_demands":[],"reason":"comparison preserves the complete request"}]}'
             )),
         ]
 

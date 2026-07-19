@@ -35,14 +35,14 @@ from .domains.chain_rpc import apply_chain_rpc_action
 from .domains.analysis import (
     JOB_ID_RE,
     EvidenceCollectionOutcome,
-    analyze_saved_evidence_result,
     cancel_evidence_collection,
     continue_evidence_collection,
-    looks_like_evidence_analysis_request,
-    looks_like_job_specific_reference,
+    finish_evidence_collection,
+    pause_evidence_collection,
+    resume_evidence_collection,
+    is_evidence_completion_command,
     prompt_evidence_collection_waiting,
     should_start_evidence_collection,
-    should_try_routing_during_evidence_collection,
     start_evidence_collection,
 )
 from .domains.execution import reconcile_execution_state
@@ -304,17 +304,12 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
         if not text:
             state = _apply_handler_result(state, prompt_evidence_collection_waiting(state, collecting), owner="analysis")
             return _set_turn_phase(state, "compose", "evidence_waiting")
-        if should_try_routing_during_evidence_collection(text, collecting):
-            saved_collection = dict(collecting)
-            state = _apply_handler_result(state, cancel_evidence_collection(state), owner="analysis")
-            state["evidence_collection"] = saved_collection
-            state.setdefault("turn_context", {})["saved_evidence_collection"] = saved_collection
-            return _set_turn_phase(state, "plan", "possible_evidence_detour")
-        outcome = continue_evidence_collection(state, text, collecting)
-        state = _apply_evidence_outcome(state, outcome)
-        if state.pop("_stop_after_response", False) or state.get("pending_question"):
-            return _set_turn_phase(state, "compose", "evidence_collected")
-        return _set_turn_phase(state, "fallback", "evidence_collected")
+        if is_evidence_completion_command(text):
+            state = _apply_evidence_outcome(state, continue_evidence_collection(state, text, collecting))
+            if state.pop("_stop_after_response", False) or state.get("pending_question"):
+                return _set_turn_phase(state, "compose", "evidence_collected")
+            return _set_turn_phase(state, "fallback", "evidence_collected")
+        return _set_turn_phase(state, "plan", "typed_evidence_collection_turn")
 
     if turn_kind == "empty":
         return _set_turn_phase(state, "fallback", "empty_turn")
@@ -344,10 +339,6 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
     if direct_assignments:
         state = _apply_handler_result(state, apply_direct_config_assignments(state, direct_assignments), owner="environment")
         return _set_turn_phase(state, "fallback", "direct_assignments")
-
-    if state.get("evidence_buffer") and looks_like_evidence_analysis_request(text) and not looks_like_job_specific_reference(text):
-        state = _apply_handler_result(state, analyze_saved_evidence_result(state, text), owner="analysis")
-        return _set_turn_phase(state, "compose", "saved_evidence_analysis")
 
     if pending and str(pending.get("kind") or "") == "evidence" and should_start_evidence_collection(text):
         state = _apply_evidence_outcome(state, start_evidence_collection(state, text, pending))
@@ -710,6 +701,25 @@ def _bind_declared_option_actions(
     return output
 
 
+def _action_matches_declared_pending_option(
+    state: AgentGraphState,
+    action: Mapping[str, Any],
+) -> bool:
+    """Verify a semantic selection against the active typed option contract."""
+
+    pending = state.get("pending_question") or {}
+    for option in pending.get("options") or []:
+        declared = option.get("action") if isinstance(option, Mapping) else None
+        if not isinstance(declared, Mapping):
+            continue
+        if all(
+            key == "type" or action.get(key) == value
+            for key, value in declared.items()
+        ):
+            return True
+    return False
+
+
 def _validate_action_plan(state: AgentGraphState, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Validate typed plan semantics without reinterpreting user language."""
     if not actions:
@@ -717,6 +727,12 @@ def _validate_action_plan(state: AgentGraphState, actions: list[dict[str, Any]])
     prepared = normalize_action_relations(
         _bind_declared_option_actions(state, [dict(item) for item in actions])
     )
+    for item in prepared:
+        if (
+            item.get("pending_option_semantic_verified") is True
+            and _action_matches_declared_pending_option(state, item)
+        ):
+            item["selection_contract_verified"] = True
     identity = state.get("chain_identity") or {}
     if identity.get("case") == "case3" and identity.get("adapter_family") == "unsupported":
         # An unsupported-family handoff cannot also mutate the RPC catalog.
@@ -974,18 +990,6 @@ def _action_answers_pending_contract(state: AgentGraphState, action: dict[str, A
             or action.get("pending_option_semantic_verified") is True
         ):
             return False
-        declared = action_for_value(pending, selected)
-        if (
-            str(declared.get("type") or "") == "choose_target_mode"
-            and action.get("selection_contract_verified") is not True
-        ):
-            target_mode = declared.get("target_mode") or declared.get("value")
-            if not target_mode_evidence_matches(
-                target_mode,
-                action.get("source_evidence"),
-                state.get("last_user_input"),
-            ):
-                return False
         return True
     selected = action.get("selected_value")
     if isinstance(selected, str) and not selected.strip():
@@ -1972,6 +1976,10 @@ def _apply_group_invalidation_state(
         state["rpc_mode"] = ""
     if "target_samples_fixtures" in invalidated:
         state["fixture_evidence"] = {}
+    if "qps_profile" in invalidated:
+        state["qps_profile"] = {}
+    if "sync_observe" in invalidated:
+        state["sync_observe"] = {}
     if "endpoint_process" in invalidated:
         evidence = state.setdefault("endpoint_evidence", {})
         evidence.pop("local_rpc_url_ready", None)
@@ -2052,6 +2060,24 @@ def _apply_queue_action(state: AgentGraphState, action: dict[str, Any], text: st
     owner = spec.owner if spec else ""
     if action_type == "answer_pending":
         return _dispatch_pending_action(state, action)
+    if action_type == "append_evidence_collection":
+        outcome = continue_evidence_collection(
+            state,
+            str(action.get("evidence") or origin_text),
+            state.get("evidence_collection") or {},
+        )
+        return _apply_evidence_outcome(state, outcome)
+    if action_type == "finish_evidence_collection":
+        return _apply_evidence_outcome(
+            state,
+            finish_evidence_collection(state, state.get("evidence_collection") or {}),
+        )
+    if action_type == "pause_evidence_collection":
+        return _apply_handler_result(state, pause_evidence_collection(state), owner="analysis")
+    if action_type == "resume_evidence_collection":
+        return _apply_handler_result(state, resume_evidence_collection(state), owner="analysis")
+    if action_type == "cancel_evidence_collection":
+        return _apply_handler_result(state, cancel_evidence_collection(state), owner="analysis")
     runtime = COORDINATOR_RUNTIME if owner == "coordinator" else DOMAIN_RUNTIME.get(owner)
     if runtime is not None:
         domain_action = dict(action)

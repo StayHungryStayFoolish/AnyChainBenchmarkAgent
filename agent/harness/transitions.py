@@ -40,7 +40,7 @@ def invalidate_for_chain_change(state: AgentGraphState, *, new_chain: str = "") 
 
     custom_rpc = _catalog_for_chain(state, new_chain=new_chain)
     state["rpc_mode"] = ""
-    for key in ("workload", "endpoint_evidence", "fixture_evidence", "preflight", "smoke", "final_benchmark", "job"):
+    for key in ("workload", "endpoint_evidence", "fixture_evidence"):
         state[key] = {}
     state["custom_rpc"] = custom_rpc
     _clear_effective_custom_rpc_workload(state)
@@ -59,7 +59,7 @@ def invalidate_for_chain_change(state: AgentGraphState, *, new_chain: str = "") 
         "RPC_API_KEY",
     ):
         confirmed.pop(field, None)
-    _record_invalidations(state, *invalidation_targets("chain_identity"))
+    record_group_invalidations(state, "chain_identity")
 
 
 def invalidate_for_target_mode(state: AgentGraphState, previous_mode: str = "") -> None:
@@ -72,16 +72,11 @@ def invalidate_for_target_mode(state: AgentGraphState, previous_mode: str = "") 
     target_mode = str(state.get("target_mode") or "")
     workflow_mode = str(state.get("workflow_mode") or "")
     confirmed = state.setdefault("confirmed_config", {})
-    state["preflight"] = {}
-    state["smoke"] = {}
-    state["final_benchmark"] = {}
-    state["job"] = {}
     if workflow_mode == "sync_observe":
         state["rpc_mode"] = ""
         state["workload"] = {}
         state["custom_rpc"] = {}
         state["fixture_evidence"] = {}
-        state["qps_profile"] = {}
         # A benchmark endpoint is not automatically a valid sync metrics
         # source. Sync-observe validates its own RPC/metrics evidence.
         evidence = state.setdefault("endpoint_evidence", {})
@@ -89,7 +84,6 @@ def invalidate_for_target_mode(state: AgentGraphState, previous_mode: str = "") 
             evidence.pop(key, None)
         confirmed.pop("MAINNET_RPC_URL_REVIEWED", None)
     else:
-        state["sync_observe"] = {}
         evidence = state.setdefault("endpoint_evidence", {})
         for key in ("sync_rpc_url_ready", "sync_rpc_url_probe"):
             evidence.pop(key, None)
@@ -100,7 +94,7 @@ def invalidate_for_target_mode(state: AgentGraphState, previous_mode: str = "") 
                 evidence.pop(key, None)
             for field in ("LOCAL_RPC_URL", "MAINNET_RPC_URL", "MAINNET_RPC_URL_REVIEWED", "BLOCKCHAIN_PROCESS_NAMES"):
                 confirmed.pop(field, None)
-    _record_invalidations(state, *invalidation_targets("target_mode"))
+    record_group_invalidations(state, "target_mode")
 
 
 def invalidate_for_rpc_mode_change(state: AgentGraphState) -> None:
@@ -114,11 +108,7 @@ def invalidate_for_rpc_mode_change(state: AgentGraphState) -> None:
     state["workload"] = {}
     _clear_effective_custom_rpc_workload(state)
     state["fixture_evidence"] = {}
-    state["preflight"] = {}
-    state["smoke"] = {}
-    state["final_benchmark"] = {}
-    state["job"] = {}
-    _record_invalidations(state, *invalidation_targets("workload_rpc"))
+    record_group_invalidations(state, "workload_rpc")
 
 
 def invalidate_for_endpoint_change(
@@ -287,6 +277,20 @@ def mark_group_reconfiguring(state: AgentGraphState, group: str) -> None:
 
     if group:
         state.setdefault("group_states", {}).setdefault(group, {})["status"] = "reconfiguring"
+
+
+def record_group_invalidations(
+    state: AgentGraphState,
+    changed_group: str,
+    *additional_groups: str,
+) -> None:
+    """Declare registry-owned dependents invalid after one group changes."""
+
+    _record_invalidations(
+        state,
+        *invalidation_targets(changed_group),
+        *additional_groups,
+    )
 
 
 def _record_invalidations(state: AgentGraphState, *groups: str) -> None:

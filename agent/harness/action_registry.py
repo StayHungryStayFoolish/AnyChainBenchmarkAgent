@@ -90,6 +90,13 @@ def _validate_sync_observe_options(action: Mapping[str, Any]) -> None:
         raise ValueError("sync_observe_duration_seconds is valid only for duration stop condition")
 
 
+def _validate_evidence_collection_append(action: Mapping[str, Any]) -> None:
+    evidence = str(action.get("evidence") or "")
+    source = str(action.get("source_evidence") or "")
+    if not evidence.strip() or not source.strip() or evidence not in source:
+        raise ValueError("append_evidence_collection requires exact current-turn evidence")
+
+
 @dataclass(frozen=True)
 class ActionSpec:
     action_type: str
@@ -335,10 +342,56 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         merge_sequence_fields=("conflicts",),
     ),
     ActionSpec(
+        "append_evidence_collection",
+        "analysis",
+        "Append the current user-supplied evidence fragment to an active evidence collection; never use this for questions, navigation, corrections, or unrelated conversation.",
+        ("evidence", "source_evidence"),
+        execution_phase=4,
+        crosses_pending_barrier=True,
+        required_arguments=("evidence", "source_evidence"),
+        validator=_validate_evidence_collection_append,
+    ),
+    ActionSpec(
+        "finish_evidence_collection",
+        "analysis",
+        "Finish the active evidence collection only when the user explicitly says the evidence block is complete.",
+        ("source_evidence",),
+        execution_phase=4,
+        crosses_pending_barrier=True,
+        required_arguments=("source_evidence",),
+    ),
+    ActionSpec(
+        "pause_evidence_collection",
+        "analysis",
+        "Pause and preserve the active evidence collection only when the user explicitly requests a temporary detour.",
+        ("source_evidence",),
+        execution_phase=3,
+        crosses_pending_barrier=True,
+        required_arguments=("source_evidence",),
+    ),
+    ActionSpec(
+        "resume_evidence_collection",
+        "analysis",
+        "Resume a paused evidence collection only when the user explicitly asks to continue that collection.",
+        ("source_evidence",),
+        execution_phase=3,
+        crosses_pending_barrier=True,
+        required_arguments=("source_evidence",),
+    ),
+    ActionSpec(
+        "cancel_evidence_collection",
+        "analysis",
+        "Discard the active evidence collection only when the user explicitly cancels it.",
+        ("source_evidence",),
+        execution_phase=4,
+        crosses_pending_barrier=True,
+        required_arguments=("source_evidence",),
+    ),
+    ActionSpec(
         "analyze_evidence",
         "analysis",
         "Analyze pasted or previously collected logs/errors/evidence without becoming a deferred workflow command.",
-        ("evidence",),
+        ("evidence", "question"),
         execution_phase=5,
         lifetime="turn_local",
         turn_local_result_roots=("evidence_buffer",),
@@ -509,6 +562,7 @@ ACTION_ARGUMENT_SCHEMAS: dict[str, Mapping[str, Any]] = {
     "navigation_explicit": {"type": "boolean"},
     "observability_mode": {"type": "string", "enum": ["disabled", "local", "exporter"]},
     "possible_known_chain": {"type": "string", "minLength": 1},
+    "question": {"type": "string", "minLength": 1},
     "qps_fields": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1},
     "qps_mode": {"type": "string", "enum": ["quick", "standard", "intensive"]},
     "qps_overrides": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 1}, "minProperties": 1},

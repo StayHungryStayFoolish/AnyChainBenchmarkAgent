@@ -77,6 +77,7 @@ def workflow_snapshot(state: AgentGraphState) -> dict[str, Any]:
         "sync_observe": state.get("sync_observe") or {},
         "confirmed_config": state.get("confirmed_config") or {},
         "inferred_config": state.get("inferred_config") or {},
+        "evidence_collection": _planner_evidence_collection(state.get("evidence_collection") or {}),
         "invalidated_groups": state.get("invalidated_groups") or [],
         "interruption_stack": state.get("interruption_stack") or [],
         "action_queue": state.get("action_queue") or [],
@@ -85,6 +86,21 @@ def workflow_snapshot(state: AgentGraphState) -> dict[str, Any]:
         "current_job": state.get("job") or {},
         "framework_summary": _planner_framework_summary(state.get("framework_summary") or {}),
         "web_research": _planner_web_research(state.get("web_research") or {}),
+    }
+
+
+def _planner_evidence_collection(collection: dict[str, Any]) -> dict[str, Any]:
+    if not collection:
+        return {}
+    question = collection.get("question") if isinstance(collection.get("question"), dict) else {}
+    lines = [str(item) for item in collection.get("lines") or []]
+    return {
+        "active": str(collection.get("status") or "active") == "active",
+        "status": str(collection.get("status") or "active"),
+        "question_id": str(question.get("id") or ""),
+        "question_group": str(question.get("group") or ""),
+        "line_count": len(lines),
+        "collected_text": "\n".join(lines),
     }
 
 
@@ -164,6 +180,7 @@ def build_action_resolver_prompt() -> str:
         "answer_opening_question with topic=config_explanation and subject equal to the pending question field or id; do not classify it as general requirements. "
         "Use propose_config_values for explicit mixed natural language, YAML, JSON, env, shell, or tabular configuration and include unmapped/conflicting values. structured_candidates are deterministic syntax facts scoped to one clause, not executable actions: copy their config_values and unmapped_values into propose_config_values when the user asks to configure or review that block, and include that complete clause as source_evidence. A request in the same turn to review/apply the supplied partial configuration and then ask for remaining required values is processing scope owned by that same propose_config_values action; map that clause to the proposal, do not emit resume_current_flow, and do not mark it unresolved. The review gate still runs before fallback asks for missing fields. Map every structured_candidates.workflow_values entry to its real typed workflow owner (for example RPC_MODE to set_rpc_mode) instead of placing it in environment config. One structured clause may map to several owner actions. Never silently omit an unmapped value. Do not propose a value that the user labels as an example, sample, documentation value, rejected value, or not selected. "
         "Use analyze_evidence only when the user asks to interpret supplied or previously collected logs/errors/output; include the supplied block as evidence. A configuration paste that asks to configure or review values is propose_config_values plus its other mutations/consultations, not evidence analysis. Use analyze_report for real job/artifact questions. "
+        "When workflow_state.evidence_collection.active is true, classify the current turn semantically like every other turn. Use append_evidence_collection only for a current-turn evidence fragment and copy that exact fragment into evidence and source_evidence. Use finish_evidence_collection or cancel_evidence_collection only for an explicit completion or cancellation request. An explicit demand to pause or suspend collection requires pause_evidence_collection; navigation alone does not preserve that independent demand. Emit the pause together with any requested navigation/configuration actions. An explicit return to a paused collection uses resume_evidence_collection. Questions about collected content use analyze_evidence; navigation, corrections, status, and configuration requests use their normal typed actions. A semantic detour must not append the utterance or discard already collected lines. "
         "Put each action's allowed arguments directly beside type; never wrap them in an arguments object. "
         "Never express workflow behavior in prose. Follow action_schema exactly for each action; fields not declared there are rejected. "
         "Return an object with actions, semantic_units, and optional document-level conflicts and reason. semantic_units must account for every supplied clause. Each row is {unit_id, clause_id, source_text, disposition:'action'|'context'|'unresolved', action_indexes:[zero-based action indexes], optional scope_constraint:'consultation_only', reason}. Use disposition action when typed actions preserve that exact unit. Use context only for prose that supplies background or a tentative future possibility but contains no present request, answer, question, selection, mutation, navigation, or execution instruction; context has no action indexes or scope constraint and requires a reason. Structured input can never be context. Context is independently audited and cannot authorize itself. Use unresolved with an empty action_indexes list when safe interpretation is unavailable. Every URL, exact wire RPC method, or concrete value claimed as preserved must occur in the mapped owning action. A full-clause unit may map several independent typed actions when that is the only lossless contiguous partition; it may not hide an omitted request. Never silently omit source text."

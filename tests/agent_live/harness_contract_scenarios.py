@@ -35,6 +35,7 @@ class QuestionScenario:
     option_postcondition_overrides: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     option_relation_overrides: Mapping[str, tuple[Mapping[str, Any], ...]] = field(default_factory=dict)
     manual_input_overrides: Mapping[str, "ManualInputCase"] = field(default_factory=dict)
+    manual_next_question_ids: tuple[str, ...] = ()
 
     @property
     def executable(self) -> bool:
@@ -214,6 +215,7 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
         *,
         source: str = "reviewed_seed",
         manual_postcondition_path: str = "",
+        manual_next_question_ids: tuple[str, ...] = (),
         option_postcondition_overrides: Mapping[str, Mapping[str, Any]] | None = None,
         option_relation_overrides: Mapping[str, tuple[Mapping[str, Any], ...]] | None = None,
         manual_input_overrides: Mapping[str, ManualInputCase] | None = None,
@@ -223,14 +225,15 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
         state["active_group"] = str(question.get("group") or state.get("active_group") or "opening")
         state["pending_question"] = deepcopy(dict(question))
         scenarios[scenario_id] = QuestionScenario(
-            scenario_id,
-            deepcopy(dict(question)),
-            deepcopy(state),
-            source,
-            manual_postcondition_path,
-            deepcopy(dict(option_postcondition_overrides or {})),
-            deepcopy(dict(option_relation_overrides or {})),
-            deepcopy(dict(manual_input_overrides or {})),
+            scenario_id=scenario_id,
+            question=deepcopy(dict(question)),
+            seed_state=deepcopy(state),
+            source=source,
+            manual_postcondition_path=manual_postcondition_path,
+            option_postcondition_overrides=deepcopy(dict(option_postcondition_overrides or {})),
+            option_relation_overrides=deepcopy(dict(option_relation_overrides or {})),
+            manual_input_overrides=deepcopy(dict(manual_input_overrides or {})),
+            manual_next_question_ids=tuple(manual_next_question_ids),
         )
 
     opening_state = new_state("coverage-opening", language=language, session_purpose="coverage")
@@ -838,6 +841,7 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
         question: Mapping[str, Any] | None,
         *,
         manual_postcondition_path: str = "",
+        manual_next_question_ids: tuple[str, ...] = (),
         option_postcondition_overrides: Mapping[str, Mapping[str, Any]] | None = None,
         option_relation_overrides: Mapping[str, tuple[Mapping[str, Any], ...]] | None = None,
         manual_input_overrides: Mapping[str, ManualInputCase] | None = None,
@@ -857,6 +861,7 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
                 ),
                 option_relation_overrides=deepcopy(dict(option_relation_overrides or {})),
                 manual_input_overrides=deepcopy(dict(manual_input_overrides or {})),
+                manual_next_question_ids=tuple(manual_next_question_ids),
             )
 
     state = new_state("catalog-resume-quarantine", language=language, session_purpose="coverage")
@@ -1051,11 +1056,19 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
         (
             "custom_needs_schema_evidence",
             "needs_schema_evidence",
-            {"endpoint_ready": True, "method": "eth_blockNumber"},
+            {
+                "endpoint_ready": True,
+                "draft": {
+                    "contract_version": 1,
+                    "phase": "evidence",
+                    "method": "eth_blockNumber",
+                },
+            },
         ),
         ("custom_needs_weights", "needs_weights", {"validated_methods": validated}),
     )
     for scenario_id, status, extra in custom_statuses:
+        runtime_extra = {key: value for key, value in extra.items() if key != "draft"}
         state = new_state(f"catalog-{scenario_id}", language=language, session_purpose="coverage")
         state["chain_identity"] = {"canonical": "bsc", "status": "confirmed"}
         state["custom_rpc"] = {
@@ -1063,10 +1076,33 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
             "catalog": {
                 **deepcopy(catalog_envelope),
                 "methods": deepcopy(extra.get("validated_methods") or []),
+                **(
+                    {"draft": deepcopy(extra["draft"])}
+                    if isinstance(extra.get("draft"), dict)
+                    else {}
+                ),
             },
-            **deepcopy(extra),
+            **deepcopy(runtime_extra),
         }
-        catalog(scenario_id, state, question_for_chain_rpc(state, "endpoint_process"))
+        manual_path = ""
+        next_ids: tuple[str, ...] = ()
+        if scenario_id == "custom_needs_method":
+            manual_path = "custom_rpc.catalog.draft.method"
+            next_ids = ("custom_rpc_schema_evidence", "custom_rpc_schema_confirm")
+        elif scenario_id == "custom_needs_schema_evidence":
+            manual_path = "custom_rpc.catalog.last_transition.command"
+            next_ids = (
+                "custom_rpc_parameter_confirm",
+                "custom_rpc_schema_confirm",
+                "custom_rpc_response_confirm",
+            )
+        catalog(
+            scenario_id,
+            state,
+            question_for_chain_rpc(state, "endpoint_process"),
+            manual_postcondition_path=manual_path,
+            manual_next_question_ids=next_ids,
+        )
 
     new_chain_statuses = (
         ("new_chain_existing_family_needs_endpoint", "existing_family_needs_endpoint", {}),
@@ -1074,7 +1110,14 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
         (
             "new_chain_existing_family_needs_schema_evidence",
             "existing_family_needs_schema_evidence",
-            {"candidate_method": "eth_blockNumber"},
+            {
+                "candidate_method": "eth_blockNumber",
+                "draft": {
+                    "contract_version": 1,
+                    "phase": "evidence",
+                    "method": "eth_blockNumber",
+                },
+            },
         ),
         (
             "new_chain_existing_family_needs_weights",
@@ -1083,22 +1126,46 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
         ),
     )
     for scenario_id, status, extra in new_chain_statuses:
+        runtime_extra = {key: value for key, value in extra.items() if key != "draft"}
         state = new_state(f"catalog-{scenario_id}", language=language, session_purpose="coverage")
         state["chain_identity"] = {
             "canonical": "new-chain",
             "status": status,
-            **deepcopy(extra),
+            **deepcopy(runtime_extra),
         }
         state["custom_rpc"] = {
             "catalog": {
                 **deepcopy(catalog_envelope),
                 "methods": deepcopy(extra.get("validated_methods") or []),
+                **(
+                    {"draft": deepcopy(extra["draft"])}
+                    if isinstance(extra.get("draft"), dict)
+                    else {}
+                ),
             }
         }
         state["endpoint_evidence"] = {
             "candidate_endpoint_ready": status != "existing_family_needs_endpoint"
         }
-        catalog(scenario_id, state, question_for_chain_rpc(state, "endpoint_process"))
+        manual_path = ""
+        next_ids: tuple[str, ...] = ()
+        if scenario_id == "new_chain_existing_family_needs_method":
+            manual_path = "custom_rpc.catalog.draft.method"
+            next_ids = ("new_chain_schema_evidence", "new_chain_schema_confirm")
+        elif scenario_id == "new_chain_existing_family_needs_schema_evidence":
+            manual_path = "custom_rpc.catalog.last_transition.command"
+            next_ids = (
+                "new_chain_parameter_confirm",
+                "new_chain_schema_confirm",
+                "new_chain_response_confirm",
+            )
+        catalog(
+            scenario_id,
+            state,
+            question_for_chain_rpc(state, "endpoint_process"),
+            manual_postcondition_path=manual_path,
+            manual_next_question_ids=next_ids,
+        )
 
     state = new_state("catalog-target-change-scope", language=language, session_purpose="coverage")
     state.update({

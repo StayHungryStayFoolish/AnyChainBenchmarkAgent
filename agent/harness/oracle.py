@@ -9,6 +9,7 @@ from .routing import next_group_and_reason
 from .state import AgentGraphState
 
 from agent.runners.job_manager import get_job
+from agent.utils.redaction import redact
 @dataclass(frozen=True)
 class NextAction:
     config_status: str
@@ -182,6 +183,31 @@ def queued_configuration_summary(state: dict[str, Any], language: str) -> str:
 
 
 def format_current_context(state: dict[str, Any], language: str) -> str:
+    collecting = state.get("evidence_collection") or {}
+    if collecting:
+        lines = [str(item) for item in collecting.get("lines") or [] if str(item).strip()]
+        question = collecting.get("question") if isinstance(collecting.get("question"), dict) else {}
+        source = "\n".join(lines)
+        preview = str(redact(source))
+        if len(preview) > 600:
+            preview = preview[:600].rstrip() + "..."
+        collection_id = str(question.get("id") or "evidence")
+        status = str(collecting.get("status") or "active")
+        if str(language or "").startswith("zh"):
+            return (
+                f"当前 `{collection_id}` 证据收集状态为 `{status}`，已保存 {len(lines)} 行；尚未结束或应用到配置。\n"
+                f"脱敏预览：\n{preview or '<无>'}\n"
+                "你可以继续粘贴，输入 `END` 完成，明确取消，询问这些内容的含义，或跳转到其他配置组；"
+                "咨询和跳转不会被写入证据，也不会丢失已保存行。"
+            )
+        return (
+            f"An `{collection_id}` evidence collection is `{status}` with {len(lines)} saved line(s); "
+            "it has not been finished or applied to configuration.\n"
+            f"Redacted preview:\n{preview or '<none>'}\n"
+            "Continue pasting, type `END` to finish, explicitly cancel, ask what the content means, "
+            "or jump to another configuration group. Consultations and navigation are not appended "
+            "and do not discard saved lines."
+        )
     pending = state.get("pending_question") or {}
     if pending:
         pending_id = str(pending.get("id") or "").strip()

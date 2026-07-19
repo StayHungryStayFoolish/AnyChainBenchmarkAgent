@@ -11,6 +11,7 @@ from ..localization import localized
 from ..questions import choice_question, manual_question, normalize_scalar
 from ..state import AgentGraphState
 from ..input_values import normalize_observability_mode
+from ..transitions import record_group_invalidations
 
 from agent.planners import question_prompts
 PERFORMANCE_GROUPS = {"qps_profile", "observability", "advanced_tuning"}
@@ -241,8 +242,8 @@ def _apply_performance_answer_state(
             tuning.pop("adjust_field", None)
     invalidated = set(state.get("invalidated_groups") or [])
     invalidated.discard(group)
-    invalidated.add("preflight_smoke_execution")
     state["invalidated_groups"] = sorted(invalidated)
+    record_group_invalidations(state, group)
     return state, visible, False
 
 
@@ -356,8 +357,9 @@ def apply_performance_action(state: AgentGraphState, action: ActionProposal) -> 
         return HandlerResult(blocker=f"unsupported performance action: {action.action_type}")
     invalidated = set(next_state.get("invalidated_groups") or [])
     invalidated.discard(next_group)
-    invalidated.add("preflight_smoke_execution")
     next_state["invalidated_groups"] = sorted(invalidated)
+    record_group_invalidations(next_state, next_group)
+    invalidated = set(next_state.get("invalidated_groups") or [])
     return HandlerResult(
         delta=StateDelta.between(state, next_state),
         consumed_action_ids=(action.action_id,),

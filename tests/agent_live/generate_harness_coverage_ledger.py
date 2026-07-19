@@ -100,13 +100,10 @@ RUNNER_CONTRACTS = {
         "gap": "",
     },
     "real_execution": {
-        "status": "artifact_contract_only",
-        "producer": "",
+        "status": "implemented",
+        "producer": "tests/agent_live/execute_real_execution_ledger.py",
         "artifact_schema": "real_execution_evidence.v1",
-        "gap": (
-            "R44 provides a strict producer/validator contract for Linux/Docker job evidence; "
-            "a runner that submits and observes every required action is not implemented in R44."
-        ),
+        "gap": "",
     },
 }
 
@@ -308,6 +305,7 @@ def _question_contracts() -> list[dict[str, Any]]:
                 "scenario_ids": [],
                 "executable_scenario_ids": [],
                 "manual_postcondition_path": "",
+                "manual_next_question_ids": [],
                 "option_postcondition_overrides": {},
                 "option_relation_overrides": {},
                 "manual_input_overrides": {},
@@ -317,6 +315,9 @@ def _question_contracts() -> list[dict[str, Any]]:
         if scenario.executable:
             variants[key]["executable_scenario_ids"].append(scenario_id)
             variants[key]["manual_postcondition_path"] = scenario.manual_postcondition_path
+            variants[key]["manual_next_question_ids"] = list(
+                scenario.manual_next_question_ids
+            )
             variants[key]["option_postcondition_overrides"] = deepcopy(
                 dict(scenario.option_postcondition_overrides or {})
             )
@@ -729,6 +730,9 @@ def build_ledger(
                         "field": contract.get("field") or "",
                         "path": variant.get("manual_postcondition_path")
                         or f"confirmed_config.{contract.get('field') or ''}",
+                        "next_question_ids": list(
+                            variant.get("manual_next_question_ids") or []
+                        ),
                     },
                     deterministic_case_available=concrete_case is not None,
                     expected_admitted=(

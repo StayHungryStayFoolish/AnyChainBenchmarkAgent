@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Any
@@ -13,6 +14,7 @@ from .action_registry import (
     ACTION_BY_TYPE,
     ACTION_SPECS,
     CONSULTATION_TOPICS,
+    TRUSTED_ACTION_METADATA_FIELDS,
     validate_action_contract,
 )
 from .context import action_schema, build_action_resolver_prompt, group_schema, workflow_snapshot
@@ -31,6 +33,16 @@ ADAPTER_FAMILIES = list(SUPPORTED_FAMILIES)
 ADAPTER_FAMILY_HINT_ENUM = "|".join(ADAPTER_FAMILIES + ["unsupported", "unknown"])
 
 ALLOWED_ACTION_TYPES = [spec.action_type for spec in ACTION_SPECS]
+
+_ADMISSION_RECEIPT_KEYS = frozenset({
+    "pending_answer_admissions",
+    "chain_selection_admissions",
+    "target_mode_selection_admissions",
+    "consultation_admissions",
+    "group_navigation_admissions",
+    "admission_rejections",
+    "admission_action_ids",
+})
 
 GROUP_NAVIGATION_SEMANTIC_POLICY = (
     "A group-navigation purpose is supported when the source asks to visit, return to, or configure a named "
@@ -65,15 +77,15 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
                 max_tokens=1800,
             )
         )
-        raw_response = str(response.text or "")
+        raw_response = _prepare_untrusted_action_document(str(response.text or ""))
         raw_response = _recover_omitted_chain_selection(provider, raw_response, state)
         raw_response = _apply_state_plan_policy(raw_response, state)
         raw_response = _reconcile_structured_candidate_ownership(raw_response, clauses)
         raw_response, _ = _adjudicate_pending_action_ownership(provider, raw_response, state, text)
         raw_response, _ = _adjudicate_group_navigation_actions(provider, raw_response, state)
         raw_response, _ = _adjudicate_chain_selection_actions(provider, raw_response, state)
-        raw_response, _ = _adjudicate_target_mode_actions(provider, raw_response)
-        raw_response, _ = _adjudicate_consultation_actions(provider, raw_response)
+        raw_response, _ = _adjudicate_target_mode_actions(provider, raw_response, text)
+        raw_response, _ = _adjudicate_consultation_actions(provider, raw_response, state)
         raw_response = _reconstruct_missing_semantic_units(
             provider,
             raw_response,
@@ -127,7 +139,7 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
                     max_tokens=1800,
                 )
             )
-            raw_response = str(repair.text or "")
+            raw_response = _prepare_untrusted_action_document(str(repair.text or ""))
             raw_response = _reconstruct_missing_semantic_units(
                 provider,
                 raw_response,
@@ -139,8 +151,8 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
             raw_response, _ = _adjudicate_pending_action_ownership(provider, raw_response, state, text)
             raw_response, _ = _adjudicate_group_navigation_actions(provider, raw_response, state)
             raw_response, _ = _adjudicate_chain_selection_actions(provider, raw_response, state)
-            raw_response, _ = _adjudicate_target_mode_actions(provider, raw_response)
-            raw_response, _ = _adjudicate_consultation_actions(provider, raw_response)
+            raw_response, _ = _adjudicate_target_mode_actions(provider, raw_response, text)
+            raw_response, _ = _adjudicate_consultation_actions(provider, raw_response, state)
             validation = _validate_action_document(raw_response, clauses, state)
             if validation.valid:
                 validation = _validate_semantic_fulfillment(
@@ -231,8 +243,8 @@ def _recover_and_validate_semantic_actions(
     recovered, _ = _adjudicate_pending_action_ownership(provider, recovered, state, user_text)
     recovered, _ = _adjudicate_group_navigation_actions(provider, recovered, state)
     recovered, _ = _adjudicate_chain_selection_actions(provider, recovered, state)
-    recovered, _ = _adjudicate_target_mode_actions(provider, recovered)
-    recovered, _ = _adjudicate_consultation_actions(provider, recovered)
+    recovered, _ = _adjudicate_target_mode_actions(provider, recovered, user_text)
+    recovered, _ = _adjudicate_consultation_actions(provider, recovered, state)
     recovered_validation = _validate_action_document(recovered, clauses, state)
     if recovered_validation.valid:
         recovered_validation = _validate_semantic_fulfillment(
@@ -269,33 +281,85 @@ def _challenge_and_validate_registry_inventory(
         plan_text,
     )
     if incomplete:
+        owner_incomplete = tuple(
+            unit_id for unit_id in incomplete
+            if unit_id in _owner_admitted_unit_ids(plan_text)
+        )
+        if owner_incomplete:
+            return plan_text, PlanCoverageResult(
+                valid=False,
+                errors=tuple(
+                    f"owner-admitted semantic unit completeness audit failed: {unit_id}"
+                    for unit_id in owner_incomplete
+                ),
+                unresolved_clauses=(),
+                incomplete_unit_ids=owner_incomplete,
+            )
         # This challenger is an additive defense-in-depth audit. Its own
         # incomplete response cannot revoke a plan that already passed the
-        # authoritative structural and semantic admission gates. The low-level
-        # challenger still fails closed by admitting no candidate action.
+        # authoritative gates unless the affected unit relied on an owner
+        # receipt that exempted duplicate purpose review.
         return plan_text, validation
     if not changed:
         return plan_text, validation
     challenged, _ = _adjudicate_pending_action_ownership(provider, challenged, state, user_text)
     challenged, _ = _adjudicate_group_navigation_actions(provider, challenged, state)
     challenged, _ = _adjudicate_chain_selection_actions(provider, challenged, state)
-    challenged, _ = _adjudicate_target_mode_actions(provider, challenged)
-    challenged, _ = _adjudicate_consultation_actions(provider, challenged)
+    challenged, _ = _adjudicate_target_mode_actions(provider, challenged, user_text)
+    challenged, _ = _adjudicate_consultation_actions(provider, challenged, state)
     result = _validate_action_document(challenged, clauses, state)
     if result.valid:
         result = _validate_semantic_fulfillment(provider, challenged, clauses, state)
     return challenged, result
 
 
+def _owner_admitted_unit_ids(plan_text: str) -> set[str]:
+    """Return units whose mapped effects rely entirely on owner receipts."""
+
+    payload = _parse_json_object(plan_text)
+    actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    admitted = {
+        int(index)
+        for key in ("pending_answer_admissions", "consultation_admissions")
+        for index in payload.get(key, [])
+        if isinstance(index, int) and 0 <= index < len(actions)
+    }
+    units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
+    return {
+        str(unit.get("unit_id") or "")
+        for unit in units
+        if isinstance(unit, dict)
+        and str(unit.get("unit_id") or "")
+        and (unit.get("action_indexes") if isinstance(unit.get("action_indexes"), list) else [])
+        and all(
+            isinstance(index, int) and index in admitted
+            for index in unit.get("action_indexes") or []
+        )
+    }
+
+
 def _challenge_registry_action_inventory(
     provider: Any,
     plan_text: str,
 ) -> tuple[str, bool, tuple[str, ...]]:
-    """Compare durable source units with the registered group action inventory."""
+    """Compare unowned durable units with the registered action inventory.
+
+    A pending-contract admission is already the semantic owner's decision for
+    every source unit represented solely by that admitted action. Re-auditing
+    the same unit here would create a second owner that can veto the pending
+    contract. Independent sibling units remain candidates and are still
+    challenged normally.
+    """
 
     payload = _parse_json_object(plan_text)
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
     units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
+    owner_admissions = {
+        int(index)
+        for key in ("pending_answer_admissions", "consultation_admissions")
+        for index in payload.get(key, [])
+        if isinstance(index, int) and 0 <= index < len(actions)
+    }
     navigation_admissions = _valid_group_navigation_admissions(payload, actions)
     candidates: list[dict[str, Any]] = []
     for unit in units:
@@ -307,7 +371,8 @@ def _challenge_registry_action_inventory(
             if isinstance(index, int) and 0 <= index < len(actions) and isinstance(actions[index], dict)
         ]
         mapped = [actions[index] for index in indexes]
-        if not any(
+        owner_owned_unit = bool(indexes) and all(index in owner_admissions for index in indexes)
+        if not owner_owned_unit and not any(
             ACTION_BY_TYPE.get(str(action.get("type") or "")) is not None
             and ACTION_BY_TYPE[str(action.get("type") or "")].lifetime == "durable"
             for action in mapped
@@ -635,7 +700,13 @@ def _recover_declared_pending_option_semantics(
     state: AgentGraphState,
     validation: PlanCoverageResult | None = None,
 ) -> tuple[str, bool]:
-    """Recover unresolved units only through declared pending-option semantics."""
+    """Recover unresolved units through the complete active pending contract.
+
+    The pending question is the sole semantic owner of its declared options and
+    manual-value contract. Recovery may compile one source-grounded answer and
+    classify prose that only supports that answer as context; it cannot invent
+    another action, value, or workflow destination.
+    """
 
     pending = dict(state.get("pending_question") or {})
     options = [item for item in pending.get("options") or [] if isinstance(item, dict)]
@@ -663,7 +734,8 @@ def _recover_declared_pending_option_semantics(
             "value": option.get("value"),
             "declared_action": declared or {"type": "answer_pending"},
         })
-    if not available:
+    manual_allowed = pending.get("manual_input_allowed") is True
+    if not available and not manual_allowed:
         return plan_text, False
 
     payload = _parse_json_object(plan_text)
@@ -685,8 +757,62 @@ def _recover_declared_pending_option_semantics(
             continue
         source = str(unit.get("source_text") or "")
         if source:
-            candidates.append({"unit_id": str(unit.get("unit_id") or ""), "source_text": source})
+            candidates.append({
+                "unit_id": str(unit.get("unit_id") or ""),
+                "clause_id": str(unit.get("clause_id") or ""),
+                "source_text": source,
+            })
     if not candidates:
+        return plan_text, False
+
+    admitted_indexes = {
+        int(index)
+        for key in (
+            "pending_answer_admissions",
+            "chain_selection_admissions",
+            "target_mode_selection_admissions",
+        )
+        for index in payload.get(key, [])
+        if isinstance(index, int) and 0 <= index < len(actions)
+    }
+    candidate_ids = {row["unit_id"] for row in candidates}
+    anchors: list[dict[str, Any]] = []
+    for unit in units:
+        if not isinstance(unit, dict):
+            continue
+        unit_id = str(unit.get("unit_id") or "")
+        if not unit_id or unit_id in candidate_ids:
+            continue
+        indexes = [
+            index
+            for index in unit.get("action_indexes") or []
+            if isinstance(index, int)
+            and index in admitted_indexes
+            and index not in invalid_indexes
+            and isinstance(actions[index], dict)
+        ]
+        if len(indexes) != 1:
+            continue
+        action = actions[indexes[0]]
+        source = str(unit.get("source_text") or "")
+        evidence_quote = str(action.get("source_evidence") or "").strip()
+        selected = next(
+            (
+                option
+                for option in available
+                if _same_declared_pending_effect(action, dict(option["declared_action"]))
+            ),
+            None,
+        )
+        if selected is None or not source or not evidence_quote or evidence_quote not in source:
+            continue
+        anchors.append({
+            "unit_id": unit_id,
+            "option_id": str(selected["option_id"]),
+            "source_text": source,
+            "evidence_quote": evidence_quote,
+        })
+    if len({row["option_id"] for row in anchors}) > 1:
         return plan_text, False
 
     response = provider.complete(LLMRequest(
@@ -694,23 +820,40 @@ def _recover_declared_pending_option_semantics(
             LLMMessage(
                 role="system",
                 content=(
-                    "Adjudicate unresolved source units only against semantic options declared by the active "
+                    "Adjudicate unresolved source units only against the complete contract declared by the active "
                     "AnyChain pending question. Return JSON only: "
-                    "{matches:[{unit_id:string,option_id:string,evidence_quote:string,reason:string}]}. "
+                    "{matches:[{unit_id:string,option_id:string,evidence_quote:string,reason:string}],"
+                    "manual_matches:[{unit_id:string,answer:string,evidence_quote:string,reason:string}],"
+                    "contexts:[{unit_id:string,supports_unit_id:string,evidence_quote:string,reason:string}]}. "
                     "A match is valid only when source_text semantically selects exactly one available option. "
+                    "A manual_match is valid only when manual_input_allowed=true and source_text directly supplies "
+                    "one value requested by the displayed field and validation contract. Put only that normalized "
+                    "source-supplied value in answer; never copy a value from state, the prompt, or an option. "
                     "Preservation constraints or restated saved values may support the selected option but must not "
                     "be treated as separate mutations unless the source explicitly requests changing them. Do not "
                     "match a question, explanation request, contradiction, ambiguity, or a request for another "
                     "option. evidence_quote must be a non-empty exact substring of source_text that proves the "
-                    "selection. Omit units that do not safely select one option. Never invent an option or value."
+                    "selection or manual value. An admitted_anchor is a read-only option binding already admitted "
+                    "by its dedicated owner; do not repeat or replace it in matches/manual_matches. A context row "
+                    "is valid only when its unit solely frames, explains, "
+                    "defers an unselected alternative, or rules out alternatives in direct support of one matched "
+                    "unit or admitted_anchor in this turn. It must contain no independent present request, saved "
+                    "future workflow goal, question, mutation, evidence submission, or value. supports_unit_id must "
+                    "name that matched unit or admitted_anchor. "
+                    "Omit units that do not safely satisfy one of these contracts. Never invent an option or value."
                 ),
             ),
             LLMMessage(role="user", content=json.dumps({
                 "pending_question": {
                     "id": str(pending.get("id") or ""),
                     "prompt": str(pending.get("prompt") or ""),
+                    "field": str(pending.get("field") or ""),
+                    "kind": str(pending.get("kind") or ""),
+                    "validation": pending.get("validation") or {},
+                    "manual_input_allowed": manual_allowed,
                 },
                 "available_options": available,
+                "admitted_anchors": anchors,
                 "units": candidates,
             }, ensure_ascii=False, sort_keys=True)),
         ],
@@ -719,6 +862,12 @@ def _recover_declared_pending_option_semantics(
     ))
     result = _parse_json_object(response.text)
     matches = result.get("matches") if isinstance(result.get("matches"), list) else []
+    manual_matches = (
+        result.get("manual_matches")
+        if isinstance(result.get("manual_matches"), list)
+        else []
+    )
+    contexts = result.get("contexts") if isinstance(result.get("contexts"), list) else []
     candidate_sources = {row["unit_id"]: row["source_text"] for row in candidates}
     available_by_id = {row["option_id"]: row for row in available}
     available_by_semantic = {
@@ -742,48 +891,258 @@ def _recover_declared_pending_option_semantics(
         if prior is not None and prior[0]["option_id"] != selected["option_id"]:
             return plan_text, False
         accepted[unit_id] = (selected, quote)
-    if not accepted:
+    accepted_manual: dict[str, tuple[str, str]] = {}
+    if not manual_allowed and manual_matches:
+        return plan_text, False
+    for match in manual_matches:
+        if not isinstance(match, dict):
+            return plan_text, False
+        unit_id = str(match.get("unit_id") or "")
+        answer = str(match.get("answer") or "").strip()
+        quote = str(match.get("evidence_quote") or "").strip()
+        source = candidate_sources.get(unit_id, "")
+        if (
+            not source
+            or unit_id in accepted
+            or unit_id in accepted_manual
+            or not answer
+            or not quote
+            or quote not in source
+            or not answer_fits_pending(answer, pending)
+            or not _manual_answer_has_literal_source(
+                {"answer": answer, "source_evidence": quote},
+                source,
+            )
+        ):
+            return plan_text, False
+        accepted_manual[unit_id] = (answer, quote)
+    accepted_context: dict[str, str] = {}
+    if anchors and (accepted or accepted_manual):
+        # The pending owner has already admitted the only answer this contract
+        # permits. Recovery may classify unresolved siblings as context, but
+        # cannot create or replace the answer.
+        return plan_text, False
+    if accepted and accepted_manual:
+        # One pending contract can produce one answer only. A planner may not
+        # combine an option selection with a separate manual value.
+        return plan_text, False
+    selected_option_ids = {
+        str(selected["option_id"])
+        for selected, _quote in accepted.values()
+    }
+    if len(selected_option_ids) > 1:
+        reconciled = _reconcile_pending_single_choice_matches(
+            provider,
+            pending=pending,
+            available=available,
+            accepted=accepted,
+            candidate_sources=candidate_sources,
+        )
+        if reconciled is None:
+            return plan_text, False
+        accepted, conflict_context = reconciled
+        accepted_context.update(conflict_context)
+    manual_answers = {answer for answer, _quote in accepted_manual.values()}
+    if len(manual_answers) > 1:
+        return plan_text, False
+    accepted_unit_ids = set(accepted) | set(accepted_manual) | {
+        row["unit_id"] for row in anchors
+    }
+    for row in contexts:
+        if not isinstance(row, dict):
+            return plan_text, False
+        unit_id = str(row.get("unit_id") or "")
+        supports = str(row.get("supports_unit_id") or "")
+        quote = str(row.get("evidence_quote") or "").strip()
+        source = candidate_sources.get(unit_id, "")
+        if (
+            not source
+            or unit_id in accepted_unit_ids
+            or unit_id in accepted_context
+            or supports not in accepted_unit_ids
+            or not quote
+            or quote not in source
+        ):
+            return plan_text, False
+        accepted_context[unit_id] = quote
+    if not (accepted or accepted_manual or accepted_context):
         return plan_text, False
 
     recovered_actions = [dict(item) for item in actions if isinstance(item, dict)]
+    replaced_indexes: set[int] = set()
     for unit in units:
         if not isinstance(unit, dict):
             continue
-        match = accepted.get(str(unit.get("unit_id") or ""))
-        if match is None:
+        unit_id = str(unit.get("unit_id") or "")
+        if unit_id in accepted_context:
+            replaced_indexes.update(
+                index
+                for index in unit.get("action_indexes") or []
+                if isinstance(index, int)
+            )
+            unit["action_indexes"] = []
+            unit["disposition"] = "context"
+            unit["reason"] = "declared pending-contract support context"
             continue
-        selected, quote = match
-        declared = dict(selected["declared_action"])
-        if str(declared.get("type") or "answer_pending") == "answer_pending":
+        match = accepted.get(unit_id)
+        manual_match = accepted_manual.get(unit_id)
+        if match is None and manual_match is None:
+            continue
+        if manual_match is not None:
+            answer, quote = manual_match
             action = validate_action_contract({
                 "type": "answer_pending",
-                "answer": selected["value"],
-                "selected_value": selected["value"],
+                "answer": answer,
                 "source_evidence": quote,
             })
         else:
-            action = _materialize_pending_option_action(declared, quote)
-            if action is None:
-                return plan_text, False
+            selected, quote = match
+            declared = dict(selected["declared_action"])
+            if str(declared.get("type") or "answer_pending") == "answer_pending":
+                action = validate_action_contract({
+                    "type": "answer_pending",
+                    "answer": selected["value"],
+                    "selected_value": selected["value"],
+                    "source_evidence": quote,
+                })
+            else:
+                action = _materialize_pending_option_action(declared, quote)
+                if action is None:
+                    return plan_text, False
+        existing_indexes = [
+            index
+            for index in unit.get("action_indexes") or []
+            if isinstance(index, int) and 0 <= index < len(recovered_actions)
+        ]
         action_index = next(
             (
                 index
-                for index, existing in enumerate(recovered_actions)
-                if index not in invalid_indexes
-                and _same_declared_pending_effect(existing, action)
+                for index in existing_indexes
+                for existing in [recovered_actions[index]]
+                if _same_declared_pending_effect(existing, action)
             ),
             -1,
         )
         if action_index < 0:
             action_index = len(recovered_actions)
             recovered_actions.append(action)
-        existing = unit.get("action_indexes") if isinstance(unit.get("action_indexes"), list) else []
-        unit["action_indexes"] = list(dict.fromkeys([*existing, action_index]))
+        replaced_indexes.update(index for index in existing_indexes if index != action_index)
+        unit["action_indexes"] = [action_index]
         unit["disposition"] = "action"
-        unit["reason"] = "declared pending-option semantic recovery"
+        unit["reason"] = "declared pending-contract semantic recovery"
     payload["actions"] = recovered_actions
     payload["semantic_units"] = units
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True), True
+    referenced_indexes = {
+        index
+        for unit in units
+        if isinstance(unit, dict)
+        for index in (unit.get("action_indexes") or [])
+        if isinstance(index, int)
+    }
+    removable = tuple(sorted(replaced_indexes - referenced_indexes))
+    recovered_text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    if removable:
+        recovered_text, _ = _remove_rejected_action_indexes(
+            recovered_text,
+            removable,
+            reason="replaced by the active pending-contract owner",
+        )
+    return recovered_text, True
+
+
+def _reconcile_pending_single_choice_matches(
+    provider: Any,
+    *,
+    pending: dict[str, Any],
+    available: list[dict[str, Any]],
+    accepted: dict[str, tuple[dict[str, Any], str]],
+    candidate_sources: dict[str, str],
+) -> tuple[dict[str, tuple[dict[str, Any], str]], dict[str, str]] | None:
+    """Resolve conflicting option matches under one single-answer contract.
+
+    A single pending question cannot commit two different options. The model
+    may retain one primary selection only when every other conflicting match is
+    solely a source-grounded qualifier, exclusion, or deferred alternative for
+    that selection. Otherwise the turn remains unresolved.
+    """
+
+    response = provider.complete(LLMRequest(
+        messages=[
+            LLMMessage(
+                role="system",
+                content=(
+                    "Resolve conflicting matches for one single-answer AnyChain pending question. "
+                    "Return JSON only: {selected_unit_id:string,selected_option_id:string,"
+                    "evidence_quote:string,contexts:[{unit_id:string,relationship:'qualifier'|'exclusion',"
+                    "evidence_quote:string,reason:string}],"
+                    "ambiguous:boolean}. Select exactly one unit only when it expresses the present answer. "
+                    "Every other conflicting unit must be listed as context only when it solely qualifies, "
+                    "or rules out an unselected alternative in direct support of that present answer. "
+                    "A context cannot contain another present choice, independent request, saved workflow goal, "
+                    "deferred/future request, question, or mutation. A future request must remain unresolved for "
+                    "the workflow-goal owner; never classify it as context. evidence_quote must be a non-empty "
+                    "exact substring of that unit. "
+                    "If any conflicting unit cannot be safely classified this way, set ambiguous=true and do not "
+                    "select an answer. Never invent an option, value, or context."
+                ),
+            ),
+            LLMMessage(role="user", content=json.dumps({
+                "pending_question": {
+                    "id": str(pending.get("id") or ""),
+                    "prompt": str(pending.get("prompt") or ""),
+                },
+                "available_options": available,
+                "conflicting_matches": [
+                    {
+                        "unit_id": unit_id,
+                        "source_text": candidate_sources[unit_id],
+                        "option_id": str(selected["option_id"]),
+                        "prior_evidence_quote": quote,
+                    }
+                    for unit_id, (selected, quote) in accepted.items()
+                ],
+            }, ensure_ascii=False, sort_keys=True)),
+        ],
+        temperature=0.0,
+        max_tokens=400,
+    ))
+    result = _parse_json_object(response.text)
+    if result.get("ambiguous") is not False:
+        return None
+    selected_unit_id = str(result.get("selected_unit_id") or "")
+    selected_option_id = str(result.get("selected_option_id") or "")
+    selected_quote = str(result.get("evidence_quote") or "").strip()
+    selected_match = accepted.get(selected_unit_id)
+    selected_source = candidate_sources.get(selected_unit_id, "")
+    if (
+        selected_match is None
+        or str(selected_match[0]["option_id"]) != selected_option_id
+        or not selected_quote
+        or selected_quote not in selected_source
+    ):
+        return None
+    expected_context_ids = set(accepted) - {selected_unit_id}
+    context_rows = result.get("contexts") if isinstance(result.get("contexts"), list) else []
+    context: dict[str, str] = {}
+    for row in context_rows:
+        if not isinstance(row, dict):
+            return None
+        unit_id = str(row.get("unit_id") or "")
+        relationship = str(row.get("relationship") or "")
+        quote = str(row.get("evidence_quote") or "").strip()
+        source = candidate_sources.get(unit_id, "")
+        if (
+            unit_id not in expected_context_ids
+            or unit_id in context
+            or relationship not in {"qualifier", "exclusion"}
+            or not quote
+            or quote not in source
+        ):
+            return None
+        context[unit_id] = quote
+    if set(context) != expected_context_ids:
+        return None
+    return {selected_unit_id: (selected_match[0], selected_quote)}, context
 
 
 def _same_declared_pending_effect(existing: dict[str, Any], candidate: dict[str, Any]) -> bool:
@@ -1214,6 +1573,13 @@ def _validate_action_document(
     if not isinstance(payload.get("actions"), list):
         return validate_plan_coverage({}, clauses)
     action_errors: list[str] = []
+    rejected_action_indexes: set[int] = set()
+    pending = dict((state or {}).get("pending_question") or {})
+    pending_admissions = {
+        int(index)
+        for index in payload.get("pending_answer_admissions", [])
+        if isinstance(index, int)
+    }
     for index, raw in enumerate(payload["actions"]):
         if not isinstance(raw, dict):
             action_errors.append(f"action {index} is not an object")
@@ -1222,10 +1588,22 @@ def _validate_action_document(
             validate_action_contract(raw)
         except ValueError as exc:
             action_errors.append(f"action {index} contract invalid: {exc}")
+            rejected_action_indexes.add(index)
+            continue
+        if (
+            pending
+            and not pending_admissions
+            and str(raw.get("type") or "") == "change_group"
+            and str(raw.get("group") or "") == str(pending.get("group") or "")
+        ):
+            action_errors.append(
+                f"action {index} navigates to the group already owned by active pending question "
+                f"{pending.get('id')!r} without answering it"
+            )
+            rejected_action_indexes.add(index)
             continue
         if str(raw.get("type") or "") != "answer_pending" or state is None:
             continue
-        pending = dict(state.get("pending_question") or {})
         if not pending:
             action_errors.append(f"action {index} answer_pending has no active question")
             continue
@@ -1243,6 +1621,7 @@ def _validate_action_document(
                 f"action {index} answer_pending does not select an exact declared option "
                 f"for pending question {pending.get('id')!r}"
             )
+            rejected_action_indexes.add(index)
     coverage = validate_plan_coverage(payload, clauses)
     if not action_errors:
         return coverage
@@ -1250,6 +1629,11 @@ def _validate_action_document(
         valid=False,
         errors=tuple([*action_errors, *coverage.errors]),
         unresolved_clauses=coverage.unresolved_clauses,
+        rejected_action_indexes=tuple(sorted({
+            *coverage.rejected_action_indexes,
+            *rejected_action_indexes,
+        })),
+        incomplete_unit_ids=coverage.incomplete_unit_ids,
     )
 
 
@@ -1320,15 +1704,15 @@ def _validate_semantic_fulfillment(
         if not isinstance(unit, dict):
             continue
         indexes = unit.get("action_indexes") if isinstance(unit.get("action_indexes"), list) else []
+        if indexes and all(index in pending_admissions for index in indexes):
+            # The active pending contract already proved the exact option/value
+            # binding. Generic mutation completeness must not veto its owner.
+            continue
         mapped = [
             actions[index]
             for index in indexes
             if isinstance(index, int) and 0 <= index < len(actions) and isinstance(actions[index], dict)
         ]
-        if len(mapped) == 1 and str(mapped[0].get("type") or "") == "change_group":
-            # Navigation is complete at this boundary; the destination group
-            # owns its subsequent field intake.
-            continue
         if (
             action_units_per_clause.get(str(unit.get("clause_id") or ""), 0) == 1
             and any(
@@ -1871,6 +2255,8 @@ def _attach_semantic_admission_receipts(text: str) -> str:
     """
 
     payload = _parse_json_object(text)
+    payload.pop("admission_action_ids", None)
+    payload.pop("admission_rejections", None)
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
     pending_admissions = {
         int(index)
@@ -1906,16 +2292,194 @@ def _attach_semantic_admission_receipts(text: str) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
-def _adjudicate_target_mode_actions(provider: Any, text: str) -> tuple[str, bool]:
+def _adjudicate_target_mode_turn(
+    provider: Any,
+    text: str,
+    user_text: str,
+) -> tuple[str, bool]:
+    """Resolve mutually exclusive target-mode proposals as one turn contract.
+
+    Per-action evidence is insufficient when a planner maps alternatives to
+    separate current/deferred mutations. This gate owns only conflicts and
+    queued goals; ordinary single selections continue through the narrower
+    target-mode evidence gate below.
+    """
+
+    payload = _parse_json_object(text)
+    actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    target_indexes = [
+        index
+        for index, action in enumerate(actions)
+        if isinstance(action, dict)
+        and str(action.get("type") or "") in {"choose_target_mode", "queue_workflow_goal"}
+    ]
+    if len(target_indexes) < 2:
+        return text, False
+
+    units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
+    complete_source = str(user_text or "").strip() or "\n".join(
+        str(unit.get("source_text") or "")
+        for unit in units
+        if isinstance(unit, dict) and str(unit.get("source_text") or "")
+    )
+    response = provider.complete(LLMRequest(
+        messages=[
+            LLMMessage(
+                role="system",
+                content=(
+                    "Adjudicate one AnyChain turn containing mutually exclusive target-mode proposals. Return JSON "
+                    "only: {decision:'resolved_ordered'|'unresolved'|'unrelated',current_action_index:integer|null,"
+                    "deferred_action_indexes:[integer],evidence_quote:string,ordering_quote:string,reason:string}. "
+                    "Use the complete_source as the authority and evaluate all proposals together. resolved_ordered "
+                    "requires exactly one presently selected choose_target_mode action. deferred_action_indexes may "
+                    "contain queue_workflow_goal actions only when complete_source explicitly orders them after the "
+                    "current goal or says they are later/deferred/follow-up work. Merely mentioning, comparing, or "
+                    "being uncertain between modes is not temporal ordering. unresolved means the user has not made "
+                    "one current choice, including alternatives joined by uncertainty; it requires null current and "
+                    "no deferred indexes. unrelated means no target-mode decision is requested. evidence_quote must "
+                    "be the shortest exact complete_source excerpt proving the overall decision. ordering_quote must "
+                    "be an exact excerpt proving temporal order whenever deferred indexes are non-empty, otherwise "
+                    "it must be empty. Never infer order from proposal action types, array order, workflow state, or "
+                    "defaults, and never reinterpret an alternative as a future goal."
+                ),
+            ),
+            LLMMessage(role="user", content=json.dumps({
+                "complete_source": complete_source,
+                "proposals": [
+                    {
+                        "action_index": index,
+                        "action_type": actions[index].get("type"),
+                        "target_mode": actions[index].get("target_mode"),
+                        "goal": actions[index].get("goal"),
+                        "source_evidence": actions[index].get("source_evidence"),
+                    }
+                    for index in target_indexes
+                ],
+            }, ensure_ascii=False, sort_keys=True)),
+        ],
+        temperature=0.0,
+        max_tokens=350,
+    ))
+    result = _parse_json_object(response.text)
+    decision = str(result.get("decision") or "")
+    current_index = result.get("current_action_index")
+    deferred = result.get("deferred_action_indexes")
+    evidence_quote = str(result.get("evidence_quote") or "").strip()
+    ordering_quote = str(result.get("ordering_quote") or "").strip()
+    choose_indexes = {
+        index for index in target_indexes
+        if str(actions[index].get("type") or "") == "choose_target_mode"
+    }
+    queue_indexes = set(target_indexes) - choose_indexes
+    valid_deferred = (
+        isinstance(deferred, list)
+        and len(deferred) == len(set(deferred))
+        and all(isinstance(index, int) and index in queue_indexes for index in deferred)
+    )
+    valid_quote = bool(evidence_quote and evidence_quote in complete_source)
+    resolved = bool(
+        decision == "resolved_ordered"
+        and isinstance(current_index, int)
+        and current_index in choose_indexes
+        and valid_deferred
+        and valid_quote
+        and (
+            (deferred and ordering_quote and ordering_quote in complete_source)
+            or (not deferred and not ordering_quote)
+        )
+    )
+    unresolved = bool(
+        decision == "unresolved"
+        and current_index is None
+        and deferred == []
+        and valid_quote
+        and not ordering_quote
+    )
+    unrelated = bool(
+        decision == "unrelated"
+        and current_index is None
+        and deferred == []
+        and valid_quote
+        and not ordering_quote
+    )
+
+    if resolved:
+        keep = {int(current_index), *(int(index) for index in deferred)}
+        existing_admissions = {
+            int(index)
+            for index in payload.get("target_mode_selection_admissions", [])
+            if isinstance(index, int) and 0 <= index < len(actions)
+        }
+        payload["target_mode_selection_admissions"] = sorted(
+            (existing_admissions - set(target_indexes)) | keep
+        )
+        rejected = tuple(index for index in target_indexes if index not in keep)
+        admitted_text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        if not rejected:
+            return admitted_text, False
+        return _remove_rejected_action_indexes(
+            admitted_text,
+            rejected,
+            reason="the holistic target-mode contract did not select or defer this proposal",
+        )
+
+    if unresolved:
+        replacement_index = min(choose_indexes or set(target_indexes))
+        actions = list(actions)
+        actions[replacement_index] = {
+            "type": "request_target_mode_selection",
+            "source_evidence": evidence_quote or complete_source,
+        }
+        payload["actions"] = actions
+        for key in ("pending_answer_admissions", "target_mode_selection_admissions"):
+            admissions = payload.get(key)
+            if isinstance(admissions, list):
+                payload[key] = [
+                    index for index in admissions
+                    if isinstance(index, int) and index not in target_indexes
+                ]
+        rejected = tuple(index for index in target_indexes if index != replacement_index)
+        replaced = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        if rejected:
+            replaced, _ = _remove_rejected_action_indexes(
+                replaced,
+                rejected,
+                reason="the complete turn leaves the target mode unresolved",
+            )
+        return replaced, True
+
+    reason = (
+        "the complete turn does not request a target-mode mutation"
+        if unrelated
+        else "the holistic target-mode verdict was missing or invalid"
+    )
+    return _remove_rejected_action_indexes(text, tuple(target_indexes), reason=reason)
+
+
+def _adjudicate_target_mode_actions(
+    provider: Any,
+    text: str,
+    user_text: str = "",
+) -> tuple[str, bool]:
     """Retain explicit workflow selections and stage unresolved mode intake.
 
     This adjudicator is deliberately separate from general action-purpose
     review. It receives no workflow state from which it could infer a default.
     """
 
+    text, holistic_changed = _adjudicate_target_mode_turn(provider, text, user_text)
     payload = _parse_json_object(text)
-    payload.pop("target_mode_selection_admissions", None)
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    pending_admissions = {
+        int(index)
+        for index in payload.get("pending_answer_admissions", [])
+        if isinstance(index, int) and 0 <= index < len(actions)
+    }
+    target_mode_admissions = {
+        int(index)
+        for index in payload.get("target_mode_selection_admissions", [])
+        if isinstance(index, int) and 0 <= index < len(actions)
+    }
     semantic_units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
     authoritative_sources = {
         index: "\n".join(
@@ -1942,15 +2506,20 @@ def _adjudicate_target_mode_actions(provider: Any, text: str) -> tuple[str, bool
         index
         for index, action in enumerate(actions)
         if isinstance(action, dict)
+        and index not in pending_admissions
+        and index not in target_mode_admissions
         and str(action.get("type") or "") in {"choose_target_mode", "queue_workflow_goal"}
-        and not target_mode_evidence_matches(
-            action.get("target_mode"),
-            action.get("source_evidence"),
-            authoritative_sources.get(index, ""),
+        and (
+            str(action.get("type") or "") == "queue_workflow_goal"
+            or not target_mode_evidence_matches(
+                action.get("target_mode"),
+                action.get("source_evidence"),
+                authoritative_sources.get(index, ""),
+            )
         )
     ]
     if not review_indexes:
-        return text, False
+        return text, holistic_changed
     response = provider.complete(LLMRequest(
         messages=[
             LLMMessage(
@@ -1962,6 +2531,8 @@ def _adjudicate_target_mode_actions(provider: Any, text: str) -> tuple[str, bool
                     "Review every row once and judge both facts independently. explicit=true only when "
                     "source_evidence itself selects the proposed "
                     "fake-node, real-node, or sync-observe workflow, including a clear natural-language equivalent. "
+                    "For queue_workflow_goal, explicit=true additionally requires source_evidence to say the mode is "
+                    "later, deferred, next, or otherwise ordered after a current goal; naming another mode alone is false. "
                     "unresolved_selection=true only when source_evidence has a benchmark or synchronization-observation "
                     "goal but explicitly leaves the target mode undecided, including uncertainty between named modes. "
                     "A generic request to test/benchmark a chain, select RPC/QPS/monitoring settings, run quickly, "
@@ -2039,16 +2610,22 @@ def _adjudicate_target_mode_actions(provider: Any, text: str) -> tuple[str, bool
             tuple(rejected),
             reason="; ".join(sorted(set(rejected.values()))),
         )
-        return repaired, changed or removed
+        return repaired, holistic_changed or changed or removed
     if changed:
         return json.dumps(payload, ensure_ascii=False, sort_keys=True), True
     if admitted_indexes:
-        payload["target_mode_selection_admissions"] = sorted(admitted_indexes)
-        return json.dumps(payload, ensure_ascii=False, sort_keys=True), False
-    return text, False
+        payload["target_mode_selection_admissions"] = sorted(
+            target_mode_admissions | admitted_indexes
+        )
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True), holistic_changed
+    return text, holistic_changed
 
 
-def _adjudicate_consultation_actions(provider: Any, text: str) -> tuple[str, bool]:
+def _adjudicate_consultation_actions(
+    provider: Any,
+    text: str,
+    state: AgentGraphState | None = None,
+) -> tuple[str, bool]:
     """Admit source-grounded read-only consultations at one narrow boundary."""
 
     payload = _parse_json_object(text)
@@ -2091,8 +2668,9 @@ def _adjudicate_consultation_actions(provider: Any, text: str) -> tuple[str, boo
                 role="system",
                 content=(
                     "Verify registered read-only consultation requests. Return JSON only: "
-                    "{reviews:[{action_index:integer,present_consultation:boolean,evidence_quote:string,"
-                    "reason:string}]}. Return every supplied action_index exactly once. "
+                    "{reviews:[{action_index:integer,present_consultation:boolean,topic_matches:boolean,"
+                    "replacement_topic:string,replacement_subject:string,evidence_quote:string,reason:string}]}. "
+                    "Return every supplied action_index exactly once. "
                     "present_consultation=true only when the exact source asks for or presently wants the "
                     "information named by consultation_topic. A present consultation may be a direct question, "
                     "an indirect question, or a declarative desire to see, know, understand, list, explain, "
@@ -2100,15 +2678,30 @@ def _adjudicate_consultation_actions(provider: Any, text: str) -> tuple[str, boo
                     "A possible future activity can coexist with a present information request. "
                     "Set false for hypothetical future-only prose, topical background, or a source that requests "
                     "only a mutation/navigation/execution action. evidence_quote must be the shortest non-empty "
-                    "exact excerpt that proves a true consultation, and empty when false. Do not route, repair, "
-                    "rename, or infer an operation."
+                    "exact excerpt that proves a true consultation, and empty when false. "
+                    + (
+                        "topic_matches=true only when consultation_topic and consultation_subject fulfill that exact "
+                        "request. If consultation is present but the proposed topic is wrong, set topic_matches=false "
+                        "and choose one replacement_topic from allowed_consultation_topics. For a question about the "
+                        "active pending field or prompt, use config_explanation and set replacement_subject to that "
+                        "field or id. A matching topic uses empty replacement fields. Never invent a topic."
+                        if state is not None
+                        else "For a present consultation set topic_matches=true and use empty replacement fields."
+                    )
                 ),
             ),
             LLMMessage(role="user", content=json.dumps({
+                "allowed_consultation_topics": sorted(CONSULTATION_TOPICS),
+                "active_pending": {
+                    "id": str(((state or {}).get("pending_question") or {}).get("id") or ""),
+                    "field": str(((state or {}).get("pending_question") or {}).get("field") or ""),
+                    "prompt": str(((state or {}).get("pending_question") or {}).get("prompt") or ""),
+                },
                 "reviews": [
                     {
                         "action_index": index,
                         "consultation_topic": actions[index].get("topic"),
+                        "consultation_subject": actions[index].get("subject"),
                         "source_text": source_by_index[index],
                     }
                     for index in review_indexes
@@ -2132,6 +2725,8 @@ def _adjudicate_consultation_actions(provider: Any, text: str) -> tuple[str, boo
         by_index[index] = row
     admitted: list[int] = []
     rejected: dict[int, str] = {}
+    changed = False
+    actions = list(actions)
     for index in review_indexes:
         row = by_index.get(index) if counts.get(index) == 1 else None
         quote = str((row or {}).get("evidence_quote") or "").strip()
@@ -2141,12 +2736,38 @@ def _adjudicate_consultation_actions(provider: Any, text: str) -> tuple[str, boo
             and quote
             and quote in source_by_index[index]
         ):
-            admitted.append(index)
-            continue
+            if state is None or row.get("topic_matches") is True:
+                admitted.append(index)
+                continue
+            replacement_topic = str(row.get("replacement_topic") or "").strip()
+            replacement_subject = str(row.get("replacement_subject") or "").strip()
+            pending = dict((state or {}).get("pending_question") or {})
+            if replacement_topic in CONSULTATION_TOPICS and (
+                replacement_topic != "config_explanation"
+                or replacement_subject in {
+                    str(pending.get("field") or ""),
+                    str(pending.get("id") or ""),
+                }
+            ):
+                replacement = {
+                    "type": "answer_opening_question",
+                    "topic": replacement_topic,
+                    "subject": replacement_subject,
+                    "source_evidence": quote,
+                }
+                try:
+                    actions[index] = validate_action_contract(replacement)
+                except ValueError:
+                    rejected[index] = "consultation topic repair violated the registered action contract"
+                    continue
+                admitted.append(index)
+                changed = True
+                continue
         rejected[index] = str(
             (row or {}).get("reason")
             or "no structurally complete source-grounded consultation receipt"
         )
+    payload["actions"] = actions
     payload["consultation_admissions"] = admitted
     if rejected:
         repaired, removed = _remove_rejected_action_indexes(
@@ -2154,8 +2775,8 @@ def _adjudicate_consultation_actions(provider: Any, text: str) -> tuple[str, boo
             tuple(rejected),
             reason="; ".join(sorted(set(rejected.values()))),
         )
-        return repaired, removed
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True), False
+        return repaired, changed or removed
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True), changed
 
 
 def _adjudicate_pending_answer_actions(
@@ -2175,13 +2796,22 @@ def _adjudicate_pending_answer_actions(
         return text, False
 
     payload = _parse_json_object(text)
-    payload.pop("pending_answer_admissions", None)
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    existing_admissions = {
+        int(index)
+        for index in payload.get("pending_answer_admissions", [])
+        if isinstance(index, int) and 0 <= index < len(actions)
+    }
     units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
     option_by_index: dict[int, dict[str, Any]] = {}
     review_indexes: list[int] = []
     for index, action in enumerate(actions):
         if not isinstance(action, dict):
+            continue
+        if index in existing_admissions:
+            # A prior step in the same pending-owner pipeline has already
+            # bound this action to the displayed contract. Re-adjudicating it
+            # here would create a second authority over the same selection.
             continue
         action_type = str(action.get("type") or "")
         if action_type == "answer_pending":
@@ -2210,7 +2840,7 @@ def _adjudicate_pending_answer_actions(
 
     reviews: list[dict[str, Any]] = []
     invalid_indexes: dict[int, str] = {}
-    admitted_indexes: set[int] = set()
+    admitted_indexes: set[int] = set(existing_admissions)
     transformed_indexes: set[int] = set()
     option_action_types = {
         str((item.get("action") or {}).get("type") or "")
@@ -2379,9 +3009,14 @@ def _reconcile_pending_owner_mutations(
             continue
         action_type = str(action.get("type") or "")
         spec = ACTION_BY_TYPE.get(action_type)
+        matches_declared_option = any(
+            isinstance(item.get("action"), dict)
+            and _same_declared_pending_effect(action, dict(item["action"]))
+            for item in options
+        )
         if (
             spec is None
-            or action_type in accepted_types
+            or (action_type in accepted_types and not matches_declared_option)
             or spec.lifetime != "durable"
             or not _action_competes_with_pending_options(action, pending, options)
         ):
@@ -2413,6 +3048,7 @@ def _reconcile_pending_owner_mutations(
                 for option_index, item in enumerate(options, start=1)
             ],
             "proposed_competing_action": action,
+            "proposed_matches_declared_effect": matches_declared_option,
             "source_text": source,
         })
     if not reviews:
@@ -2420,12 +3056,22 @@ def _reconcile_pending_owner_mutations(
 
     result = _request_pending_owner_reviews(provider, reviews)
     rows = result.get("reviews") if isinstance(result.get("reviews"), list) else []
+    rows = _adjudicate_rejected_pending_owner_reviews(
+        provider,
+        reviews=reviews,
+        first_rows=rows,
+    )
     by_index = {
         row.get("action_index"): row
         for row in rows
         if isinstance(row, dict) and isinstance(row.get("action_index"), int)
     }
     changed = False
+    admitted_indexes = {
+        int(index)
+        for index in payload.get("pending_answer_admissions", [])
+        if isinstance(index, int) and 0 <= index < len(actions)
+    }
     rejected_indexes: set[int] = set()
     for review in reviews:
         index = int(review["action_index"])
@@ -2463,7 +3109,10 @@ def _reconcile_pending_owner_mutations(
                 rejected_indexes.add(index)
                 continue
             actions[index] = compiled
+        admitted_indexes.add(index)
         changed = True
+    if admitted_indexes:
+        payload["pending_answer_admissions"] = sorted(admitted_indexes)
     if rejected_indexes:
         payload["actions"] = actions
         return _remove_rejected_action_indexes(
@@ -2534,7 +3183,158 @@ def _adjudicate_pending_action_ownership(
     current, step_changed = _reconcile_pending_owner_mutations(provider, current, state, user_text)
     changed = changed or step_changed
     current, step_changed = _adjudicate_pending_answer_actions(provider, current, state, user_text)
+    changed = changed or step_changed
+    current, step_changed = _adjudicate_target_mode_selection_requests(
+        provider,
+        current,
+        state,
+        user_text,
+    )
     return current, changed or step_changed
+
+
+def _adjudicate_target_mode_selection_requests(
+    provider: Any,
+    text: str,
+    state: AgentGraphState,
+    user_text: str,
+) -> tuple[str, bool]:
+    """Admit target-mode intake only through its current-state contract."""
+
+    payload = _parse_json_object(text)
+    actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    review_indexes = [
+        index
+        for index, action in enumerate(actions)
+        if isinstance(action, dict)
+        and str(action.get("type") or "") == "request_target_mode_selection"
+    ]
+    if not review_indexes:
+        return text, False
+    current_target = str(state.get("target_mode") or "")
+    pending = dict(state.get("pending_question") or {})
+    response = provider.complete(LLMRequest(
+        messages=[
+            LLMMessage(
+                role="system",
+                content=(
+                    "Adjudicate AnyChain target-mode intake against current typed state. Return JSON only: "
+                    "{reviews:[{action_index:integer,decision:'admit'|'consultation'|'reject',"
+                    "consultation_topic:string,consultation_subject:string,evidence_quote:string,reason:string}]}. Review "
+                    "every supplied row exactly once. When current_target is empty, admit only if complete_source "
+                    "expresses a concrete benchmark/synchronization goal whose target mode is genuinely unresolved, "
+                    "or explicitly asks to compare or select target modes. When current_target is non-empty, admit "
+                    "only if complete_source explicitly asks to reconsider, change, or replace that current mode. "
+                    "A question, explanation request, value, correction, or help request owned by another active "
+                    "pending field is not target-mode intake. Use consultation only when complete_source instead asks "
+                    "one read-only question represented by allowed_consultation_topics. For a question about the active "
+                    "pending field, use config_explanation and set consultation_subject to that field or question id. "
+                    "Do not infer intent from action type, workflow state, missing endpoints, or defaults. admit and "
+                    "consultation require the shortest exact complete_source excerpt proving the decision; reject "
+                    "requires an empty evidence_quote, empty consultation_topic, and empty consultation_subject."
+                ),
+            ),
+            LLMMessage(role="user", content=json.dumps({
+                "complete_source": str(user_text or ""),
+                "current_target": current_target,
+                "active_pending": {
+                    "id": str(pending.get("id") or ""),
+                    "group": str(pending.get("group") or ""),
+                    "field": str(pending.get("field") or ""),
+                    "prompt": str(pending.get("prompt") or ""),
+                },
+                "allowed_consultation_topics": sorted(CONSULTATION_TOPICS),
+                "reviews": [
+                    {
+                        "action_index": index,
+                        "source_evidence": actions[index].get("source_evidence"),
+                    }
+                    for index in review_indexes
+                ],
+            }, ensure_ascii=False, sort_keys=True)),
+        ],
+        temperature=0.0,
+        max_tokens=350,
+    ))
+    result = _parse_json_object(response.text)
+    rows = result.get("reviews") if isinstance(result.get("reviews"), list) else []
+    counts: dict[int, int] = {}
+    by_index: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("action_index"), int):
+            continue
+        index = int(row["action_index"])
+        decision = str(row.get("decision") or "")
+        if index not in review_indexes or decision not in {"admit", "consultation", "reject"}:
+            continue
+        quote = str(row.get("evidence_quote") or "").strip()
+        topic = str(row.get("consultation_topic") or "").strip()
+        subject = str(row.get("consultation_subject") or "").strip()
+        if decision in {"admit", "consultation"}:
+            if not quote or quote not in str(user_text or ""):
+                continue
+        if decision == "consultation":
+            if topic not in CONSULTATION_TOPICS:
+                continue
+            if topic == "config_explanation" and subject not in {
+                str(pending.get("field") or ""),
+                str(pending.get("id") or ""),
+            }:
+                continue
+        elif topic or subject:
+            continue
+        if decision == "reject" and quote:
+            continue
+        counts[index] = counts.get(index, 0) + 1
+        by_index[index] = row
+    admitted = {
+        index
+        for index in review_indexes
+        if counts.get(index) == 1 and by_index[index].get("decision") == "admit"
+    }
+    consultations = {
+        index: by_index[index]
+        for index in review_indexes
+        if counts.get(index) == 1 and by_index[index].get("decision") == "consultation"
+    }
+    if consultations:
+        actions = list(actions)
+        for index, row in consultations.items():
+            actions[index] = {
+                "type": "answer_opening_question",
+                "topic": str(row.get("consultation_topic") or ""),
+                "subject": str(row.get("consultation_subject") or ""),
+                "source_evidence": str(row.get("evidence_quote") or ""),
+            }
+        payload["actions"] = actions
+        payload["consultation_admissions"] = sorted({
+            *(
+                int(index)
+                for index in payload.get("consultation_admissions", [])
+                if isinstance(index, int) and 0 <= index < len(actions)
+            ),
+            *consultations,
+        })
+        text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    rejected = tuple(
+        index for index in review_indexes
+        if index not in admitted and index not in consultations
+    )
+    existing = {
+        int(index)
+        for index in payload.get("target_mode_selection_admissions", [])
+        if isinstance(index, int) and 0 <= index < len(actions)
+    }
+    if admitted:
+        payload["target_mode_selection_admissions"] = sorted(existing | admitted)
+        text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    if rejected:
+        return _remove_rejected_action_indexes(
+            text,
+            rejected,
+            reason="the complete turn does not satisfy target-mode intake for the current typed state",
+        )
+    return text, bool(consultations)
 
 
 def _adjudicate_manual_pending_answers(
@@ -2556,15 +3356,12 @@ def _adjudicate_manual_pending_answers(
         for index, action in enumerate(actions)
         if isinstance(action, dict) and str(action.get("type") or "") == "answer_pending"
         and not pending_option_value_exists(action.get("selected_value"), pending)
-        and (
-            not pending.get("options")
-            or answer_fits_pending(str(action.get("answer") or ""), pending)
-        )
     ]
     directly_grounded = {
         index
         for index in candidate_indexes
-        if _manual_answer_has_literal_source(actions[index], user_text)
+        if answer_fits_pending(str(actions[index].get("answer") or ""), pending)
+        and _manual_answer_has_literal_source(actions[index], user_text)
     }
     review_indexes = [index for index in candidate_indexes if index not in directly_grounded]
     if not review_indexes and not directly_grounded:
@@ -2768,6 +3565,108 @@ def _request_pending_owner_reviews(provider: Any, reviews: list[dict[str, Any]])
         if complete:
             return result
     return {"reviews": []}
+
+
+def _adjudicate_rejected_pending_owner_reviews(
+    provider: Any,
+    *,
+    reviews: list[dict[str, Any]],
+    first_rows: list[Any],
+) -> list[Any]:
+    """Recheck negative pending-owner verdicts without adding operations."""
+
+    review_by_index = {
+        int(item["action_index"]): item
+        for item in reviews
+        if isinstance(item, dict) and isinstance(item.get("action_index"), int)
+    }
+    first_by_index = {
+        int(item["action_index"]): item
+        for item in first_rows
+        if isinstance(item, dict) and isinstance(item.get("action_index"), int)
+    }
+    negative = [
+        review_by_index[index]
+        for index in review_by_index
+        if str(first_by_index.get(index, {}).get("decision") or "")
+        != "select_pending_option"
+        and review_by_index[index].get("proposed_matches_declared_effect") is True
+    ]
+    if not negative:
+        return first_rows
+
+    response = provider.complete(LLMRequest(
+        messages=[
+            LLMMessage(
+                role="system",
+                content=(
+                    "Adjudicate only negative decisions for actions whose typed effect exactly matches one option "
+                    "declared by the active AnyChain pending question. Return JSON only: "
+                    "{reviews:[{action_index:integer,decision:'select_pending_option'|'keep_owner_mutation'|'reject',"
+                    "selected_option_value:any,evidence_quote:string,reason:string}]}. Review every supplied row once. "
+                    "The structural effect match is not semantic proof. Select the pending option only when source_text "
+                    "presently chooses or requests that displayed option by name or clear natural-language meaning. "
+                    "Use keep_owner_mutation only when source_text instead requests the proposed action as an independent "
+                    "detour outside the displayed option. Use reject for questions, explanations, unrelated text, "
+                    "contradictions, or genuine ambiguity. A selection requires the exact declared option value and the "
+                    "shortest non-empty exact source_text quote proving it. Other decisions use null selected value; "
+                    "reject uses an empty quote. Never invent or replace an operation."
+                ),
+            ),
+            LLMMessage(role="user", content=json.dumps({
+                "reviews": negative,
+                "negative_first_verdicts": [
+                    first_by_index[int(item["action_index"])]
+                    for item in negative
+                    if int(item["action_index"]) in first_by_index
+                ],
+            }, ensure_ascii=False, sort_keys=True)),
+        ],
+        temperature=0.0,
+        max_tokens=450,
+    ))
+    result = _parse_json_object(response.text)
+    returned = result.get("reviews") if isinstance(result.get("reviews"), list) else []
+    replacements: dict[int, dict[str, Any]] = {}
+    counts: dict[int, int] = {}
+    for row in returned:
+        if not isinstance(row, dict) or not isinstance(row.get("action_index"), int):
+            continue
+        index = int(row["action_index"])
+        review = review_by_index.get(index)
+        if review is None or review not in negative:
+            continue
+        decision = str(row.get("decision") or "")
+        quote = str(row.get("evidence_quote") or "").strip()
+        selected = row.get("selected_option_value")
+        values = [item.get("value") for item in review.get("declared_options") or []]
+        valid = (
+            decision == "select_pending_option"
+            and selected in values
+            and bool(quote)
+            and quote in str(review.get("source_text") or "")
+        ) or (
+            decision == "keep_owner_mutation"
+            and selected is None
+            and bool(quote)
+            and quote in str(review.get("source_text") or "")
+        ) or (
+            decision == "reject"
+            and selected is None
+            and not quote
+        )
+        if not valid:
+            continue
+        counts[index] = counts.get(index, 0) + 1
+        replacements[index] = row
+    return [
+        replacements.get(int(row.get("action_index")), row)
+        if isinstance(row, dict)
+        and isinstance(row.get("action_index"), int)
+        and counts.get(int(row["action_index"])) == 1
+        else row
+        for row in first_rows
+    ]
 
 
 def _request_pending_answer_reviews(
@@ -3793,6 +4692,7 @@ def _remove_rejected_action_indexes(
         return text, False
     payload = _parse_json_object(text)
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    admission_action_ids = _ensure_admission_action_ids(payload)
     rejected_types = {
         index: str(actions[index].get("type") or "unknown")
         for index in rejected
@@ -3806,6 +4706,11 @@ def _remove_rejected_action_indexes(
         old_to_new[old_index] = len(retained)
         retained.append(action)
     payload["actions"] = retained
+    payload["admission_action_ids"] = [
+        admission_action_ids[index]
+        for index in range(len(actions))
+        if index in old_to_new
+    ]
     for admission_key in (
         "pending_answer_admissions",
         "chain_selection_admissions",
@@ -3840,11 +4745,13 @@ def _remove_rejected_action_indexes(
             unit["reason"] = reason
     payload.setdefault("admission_rejections", []).extend(
         {
-            "action_index": index,
+            "admission_action_id": admission_action_ids[index],
+            "stage_action_index": index,
             "action_type": rejected_types.get(index, "unknown"),
             "reason": reason,
         }
         for index in sorted(rejected)
+        if 0 <= index < len(admission_action_ids)
     )
     return json.dumps(payload, ensure_ascii=False, sort_keys=True), True
 
@@ -3852,7 +4759,7 @@ def _remove_rejected_action_indexes(
 def _requires_semantic_fulfillment_review(action: dict[str, Any]) -> bool:
     action_type = str(action.get("type") or "")
     spec = ACTION_BY_TYPE.get(action_type)
-    if action_type == "answer_opening_question":
+    if action_type in {"answer_opening_question", "analyze_evidence", "analyze_report"}:
         return True
     if action_type == "rpc_catalog_command":
         return True
@@ -3909,6 +4816,8 @@ def _semantic_fulfillment_prompt(*, review_kind: str = "both") -> str:
         "evidence. An explicit statement that a named/current RPC method has no parameters, "
         "describes one or more parameter meanings/types, or describes its response/result is new schema evidence. "
         "For unit_reviews, source_text is the exact unit under review. related_source_units contains only other units in the same turn that share at least one mapped operation; it is relationship context, not permission to ignore an independent demand. A source_text that is purely introductory, trailing, format, provenance, or temporal framing for those related units is complete when the shared mapped operations preserve the related request. If source_text contains its own selection, mutation, consultation, contradiction, correction, value, or evidence demand, that demand must still be represented by mapped_actions. Each mapped_actions row contains an opaque operation index, source-grounded arguments, and its authoritative declared_purpose. Judge whether the set of declared purposes preserves every explicit demand; do not require fields that a declared purpose intentionally collects in later typed questions. Review the proposed operations as one ordered transaction: an earlier purpose that selects a source-grounded wire method may establish the draft referenced by a later evidence-ingestion purpose, but pre-existing workflow state alone cannot. "
+        "A registered operation performs the effect stated by its authoritative declared_purpose. Never require operation_arguments to repeat, simulate, or prove that effect; arguments carry only source-selected values and evidence required by that operation. In particular, a lifecycle command may legitimately have only source evidence as its argument while its declared purpose defines the state transition. "
+        "When an active evidence collection exists, an explicit source demand to pause or suspend that collection is independent from navigation or configuration and requires a purpose that pauses while preserving it. Navigation alone is incomplete for that demand. An explicit request to resume a paused collection likewise requires a resume purpose. "
         "A custom-RPC-entry purpose is supported when the source explicitly asks to start, add, supply, or configure a custom RPC method workflow. It intentionally carries no endpoint, method identity, or schema payload; requiring those facts at entry would skip later typed collection questions. A discussion-only question about whether custom RPC is possible does not support entry. "
         "A read-only consultation purpose is supported only when the source asks for an answer, explanation, comparison, status, preparation guidance, or similar information. It is not supported when the source explicitly requests only a selection, mutation, navigation, execution, or evidence-ingestion operation. "
         + GROUP_NAVIGATION_SEMANTIC_POLICY
@@ -3943,6 +4852,7 @@ def _action_plan_repair_prompt() -> str:
         "When validation_errors report a missing exact wire RPC method, add the owning rpc_catalog_command set_method action with that exact method; citing the whole sentence as source_evidence on another action does not preserve it."
         "When validation rejects set_method because its method came only from workflow state while a schema-evidence question is active, replace it with rpc_catalog_command append_evidence and copy the exact user description into rpc_schema_evidence; do not require the user to repeat the already-active draft method."
         "When validation reports an incomplete semantic unit, preserve its existing valid actions and add every missing typed action explicitly required by that unit; do not replace the unit with a clarification when action_schema can represent the request."
+        "When an active evidence collection exists and validation reports an omitted pause/suspend or resume demand, add the registered evidence-collection lifecycle action and retain every independent navigation or configuration action from the same turn."
         "When validation rejects request_qps_customization because the source only asks to visit or configure the QPS area before another area, replace it with change_group(qps_profile) and exact source_evidence; do not leave that representable navigation unresolved."
         "When adjacent clauses reject the current mutually exclusive workflow and explicitly select a replacement, one choose_target_mode action for the replacement may preserve both clauses. Map both semantic units to that same action index; do not invent a cancellation action or leave the rejection unresolved."
         "Never add answer_pending merely because a pending question exists. Add it only when the exact source text actually answers that typed question contract."
@@ -4323,6 +5233,65 @@ def _rpc_schema_payload(state: AgentGraphState, evidence: str, *, method_hint: s
         "adapter_family": identity.get("adapter_family") or "",
         "web_research": state.get("web_research") or {},
     }
+
+
+def _prepare_untrusted_action_document(text: str) -> str:
+    """Remove model-forged control receipts and assign Harness identities."""
+
+    payload = _parse_json_object(text)
+    for key in _ADMISSION_RECEIPT_KEYS:
+        payload.pop(key, None)
+    actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    cleaned: list[Any] = []
+    for raw in actions:
+        if not isinstance(raw, dict):
+            cleaned.append(raw)
+            continue
+        action = dict(raw)
+        action.pop("action_id", None)
+        for key in tuple(action):
+            if key in TRUSTED_ACTION_METADATA_FIELDS or str(key).startswith("_"):
+                action.pop(key, None)
+        arguments = action.get("arguments")
+        if isinstance(arguments, dict):
+            action["arguments"] = {
+                key: value
+                for key, value in arguments.items()
+                if key != "action_id"
+                and key not in TRUSTED_ACTION_METADATA_FIELDS
+                and not str(key).startswith("_")
+            }
+        cleaned.append(action)
+    if isinstance(payload.get("actions"), list):
+        payload["actions"] = cleaned
+    _ensure_admission_action_ids(payload)
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _ensure_admission_action_ids(payload: dict[str, Any]) -> list[str]:
+    """Return stable Harness-only ids aligned with the current action list."""
+
+    actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    existing = payload.get("admission_action_ids")
+    ids = [str(value) for value in existing] if isinstance(existing, list) else []
+    reserved = {
+        str(row.get("admission_action_id") or "")
+        for row in payload.get("admission_rejections", [])
+        if isinstance(row, dict) and str(row.get("admission_action_id") or "")
+    }
+    if len(ids) > len(actions) or any(not value for value in ids) or len(ids) != len(set(ids)):
+        ids = []
+    for index in range(len(ids), len(actions)):
+        canonical = json.dumps(actions[index], ensure_ascii=False, sort_keys=True, default=str)
+        seed = f"{index}:{canonical}"
+        candidate = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:20]
+        suffix = 0
+        while candidate in ids or candidate in reserved:
+            suffix += 1
+            candidate = hashlib.sha256(f"{seed}:{suffix}".encode("utf-8")).hexdigest()[:20]
+        ids.append(candidate)
+    payload["admission_action_ids"] = ids
+    return ids
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:

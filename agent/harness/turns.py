@@ -41,7 +41,7 @@ def adjudicate_turn(state: dict[str, Any], text: str) -> TurnAdjudication:
     collecting = state.get("evidence_collection") or {}
     pending_id = str(pending.get("id") or "").strip()
     pending_kind = str(pending.get("kind") or "").strip()
-    if collecting:
+    if collecting and str(collecting.get("status") or "active") == "active":
         return TurnAdjudication(
             kind="evidence_continuation",
             has_pending_question=bool(pending),
