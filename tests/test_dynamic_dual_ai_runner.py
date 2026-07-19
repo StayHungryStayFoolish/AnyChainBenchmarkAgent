@@ -314,6 +314,85 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             self.assertEqual(len(seen), 1)
             seed_checkpoint.assert_called_once()
 
+    def test_seeded_action_runner_uses_product_modification_waiting_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            action_edge = {
+                **EDGE,
+                "edge_key": "@action_only/coordinator::::variant::action_only_transition::action:queue_workflow_goal",
+                "edge_type": "action_transition",
+                "question_id": "",
+                "action_type": "queue_workflow_goal",
+                "executable_scenario_ids": ["action_queue_workflow_goal"],
+                "expected_postcondition": {},
+            }
+            ledger = {"revision": REVISION, "edges": [action_edge]}
+            schedule = build_chaos_schedule(
+                ledger,
+                revision=REVISION,
+                seed=177,
+                targets=[{
+                    "target_id": "seeded-action-turn",
+                    "edge_key": action_edge["edge_key"],
+                    "persona": "operator with a later workflow goal",
+                    "goal": "save sync-observe for after the current benchmark",
+                    "scenario_id": "action_queue_workflow_goal",
+                }],
+            )
+            transport = FakeTransport([
+                "Agent> Model config: provider=deepseek, model=deepseek-chat, auth=api_key\n"
+                "Agent> Previous configuration found. Continue it?",
+                "Agent> Confirmed values were kept. Name the area to modify.",
+                "Agent> Saved sync-observe as a later workflow goal.",
+            ])
+            seen: list[SimulatorContext] = []
+
+            def simulator(context: SimulatorContext) -> SimulatorDecision:
+                seen.append(context)
+                self.assertIn("Name the area to modify", context.previous_agent_response)
+                self.assertNotIn("Previous configuration", context.previous_agent_response)
+                return SimulatorDecision(
+                    user_message="Finish this benchmark first, then observe node synchronization.",
+                    persona=context.scheduled_target.persona,
+                    goal=context.scheduled_target.goal,
+                    rationale="The operator explicitly defers sync-observe until later.",
+                    target_coverage_ids=(context.scheduled_target.edge_key,),
+                )
+
+            startup = self._event(1, "a" * 64, "b" * 64, "resume_harness_session")
+            waiting = replace(
+                self._event(2, "b" * 64, "c" * 64, ""),
+                admitted_action_types=("answer_pending",),
+                state_diff_hashes={"pending_question": {"before": "a" * 64, "after": "b" * 64}},
+                next_result={"kind": "result", "status": "waiting_for_modification"},
+            )
+            committed = replace(
+                self._event(3, "c" * 64, "d" * 64, ""),
+                admitted_action_types=("queue_workflow_goal",),
+                state_diff_hashes={"workflow_goals": {"before": "a" * 64, "after": "b" * 64}},
+                next_result={"kind": "result", "status": "workflow_goal_queued"},
+            )
+            runner = DynamicDualAiChaosRunner(
+                ChaosRunConfig.linux(root, session_id="contract-session"),
+                simulator,
+                ledger=ledger,
+                schedule=schedule,
+                transport=transport,
+                event_stream=FakeEventStream([startup, waiting, committed]),
+                revision=REVISION,
+                clock_ns=OrderedClock(),
+            )
+
+            with patch("tests.agent_live.runtime_checkpoint.seed_runtime_checkpoint"):
+                result = runner.run()
+
+            self.assertEqual(result.execution_status, "complete")
+            self.assertEqual(
+                transport.submitted,
+                ["2", "Finish this benchmark first, then observe node synchronization."],
+            )
+            self.assertEqual(len(seen), 1)
+
     def test_missing_provider_identity_fails_closed_without_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

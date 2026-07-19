@@ -441,7 +441,12 @@ class DynamicDualAiChaosRunner:
                 first_edge = self.edge_index[first_target.edge_key]
                 expected_question = str(first_edge.get("question_id") or "")
                 if baseline_event.pending_question_id == "resume_harness_session":
-                    self.transport.submit_bracketed_paste("1")
+                    resume_choice = (
+                        "2"
+                        if str(first_edge.get("edge_type") or "") == "action_transition"
+                        else "1"
+                    )
+                    self.transport.submit_bracketed_paste(resume_choice)
                     resumed_response = self.transport.read_complete_agent_response(
                         timeout_seconds=self.config.response_timeout_seconds
                     )
@@ -449,8 +454,8 @@ class DynamicDualAiChaosRunner:
                         timeout_seconds=self.config.response_timeout_seconds
                     )
                     self._validate_event_revision(resumed_event)
-                    transcript.extend((("1", resumed_response),))
-                    transcript_lines.extend(("User> 1", resumed_response))
+                    transcript.extend(((resume_choice, resumed_response),))
+                    transcript_lines.extend((f"User> {resume_choice}", resumed_response))
                     previous_response = resumed_response
                     previous_received_ns = self.clock_ns()
                     baseline_event = resumed_event

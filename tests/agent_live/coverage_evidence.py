@@ -678,7 +678,11 @@ def _validate_turn_observation(
         raise ValueError("PTY after fingerprint was not observed from the committed event")
     if dict(observation.pending_contract) != dict(baseline.pending_contract):
         raise ValueError("pending contract is not bound to the baseline runtime event")
-    if not baseline.pending_question_id:
+    edge_type = str(edge.get("edge_type") or "")
+    if edge_type == "action_transition":
+        if baseline.pending_question_id or baseline.pending_contract:
+            raise ValueError("action-only baseline unexpectedly has a pending contract")
+    elif not baseline.pending_question_id:
         raise ValueError("baseline runtime event has no pending contract")
     if dynamic_selection is not None:
         if dict(observation.simulator_decision) != {
