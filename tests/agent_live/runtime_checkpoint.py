@@ -10,15 +10,21 @@ from agent.harness.checkpoints import create_sqlite_checkpointer
 from agent.harness.graph import build_graph
 from agent.harness.invariants import validate_state
 from agent.harness.state import project_checkpoint_state
-from tests.agent_live.harness_contract_scenarios import question_scenarios
+from tests.agent_live.harness_contract_scenarios import (
+    action_transition_scenarios,
+    question_scenarios,
+)
 
 
 def reviewed_scenario_state(scenario_id: str) -> Mapping[str, Any]:
     """Return a copy of one executable state from the authoritative registry."""
 
-    scenarios = {item.scenario_id: item for item in question_scenarios("en")}
+    scenarios = {
+        item.scenario_id: item
+        for item in [*question_scenarios("en"), *action_transition_scenarios("en")]
+    }
     scenario = scenarios.get(str(scenario_id))
-    if scenario is None or scenario.seed_state is None:
+    if scenario is None or not scenario.seed_state:
         raise ValueError(f"dynamic target requires an executable scenario: {scenario_id}")
     return deepcopy(dict(scenario.seed_state))
 

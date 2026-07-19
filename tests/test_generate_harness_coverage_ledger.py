@@ -18,6 +18,7 @@ from tests.agent_live.generate_harness_coverage_ledger import (
     derive_overall_status,
     execution_exit_code,
 )
+from tests.agent_live.chaos_scheduler import build_chaos_schedule
 from tests.agent_live.coverage_evidence import build_evidence_artifact, write_evidence_artifact
 from tests.agent_live.coverage_evidence import COMPILED_GRAPH_RUNNER
 from agent.harness.coverage_events import capture_coverage_events, observe_compiled_graph_turn
@@ -42,6 +43,45 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
         self.assertEqual(summary["action_only_transitions"], len(ACTION_SPECS))
         self.assertIn("job_monitoring:real_node_smoke_confirm", self.ledger["runtime_only_questions"])
         self.assertIn("job_monitoring:real_node_final_benchmark_confirm", self.ledger["runtime_only_questions"])
+
+    def test_semantic_coordinator_actions_have_only_matching_runtime_seeds(self) -> None:
+        expected = {
+            "change_group": "action_change_group",
+            "go_back": "action_go_back",
+            "queue_workflow_goal": "action_queue_workflow_goal",
+            "activate_next_workflow_goal": "action_activate_next_workflow_goal",
+            "discard_next_workflow_goal": "action_discard_next_workflow_goal",
+        }
+        action_edges = {
+            edge["action_type"]: edge
+            for edge in self.ledger["edges"]
+            if edge["edge_type"] == "action_transition"
+        }
+        for action_type, scenario_id in expected.items():
+            edge = action_edges[action_type]
+            self.assertEqual(edge["question_id"], "")
+            self.assertEqual(edge["catalog_scenario_ids"], [scenario_id])
+            self.assertEqual(edge["executable_scenario_ids"], [scenario_id])
+        for action_type, edge in action_edges.items():
+            if action_type not in expected:
+                self.assertEqual(edge["executable_scenario_ids"], [])
+
+        schedule = build_chaos_schedule(
+            self.ledger,
+            revision=self.revision,
+            seed=177,
+            targets=[
+                {
+                    "target_id": f"semantic-{action_type}",
+                    "edge_key": action_edges[action_type]["edge_key"],
+                    "persona": "response-driven operator",
+                    "goal": f"exercise {action_type} from its reviewed state",
+                    "scenario_id": scenario_id,
+                }
+                for action_type, scenario_id in expected.items()
+            ],
+        )
+        self.assertEqual(len(schedule.targets), len(expected))
 
     def test_variant_identity_is_unique_and_ignores_localized_presentation(self) -> None:
         edge_keys = [edge["edge_key"] for edge in self.ledger["edges"]]

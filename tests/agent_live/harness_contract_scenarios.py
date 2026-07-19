@@ -62,6 +62,80 @@ class ManualInputCase:
     expected_admitted: bool
 
 
+@dataclass(frozen=True)
+class ActionTransitionScenario:
+    """Reviewed seed for a coordinator action without a pending question."""
+
+    scenario_id: str
+    action_type: str
+    seed_state: Mapping[str, Any]
+
+
+def action_transition_scenarios(language: str = "en") -> list[ActionTransitionScenario]:
+    """Return minimal valid seeds for semantic coordinator transitions."""
+
+    def base(suffix: str) -> AgentGraphState:
+        state = new_state(
+            f"coverage-action-{suffix}",
+            language=language,
+            session_purpose="coverage",
+        )
+        state["target_mode"] = "fake-node"
+        state["workflow_mode"] = "rpc_benchmark"
+        state["chain_identity"] = {
+            "raw": "bsc",
+            "canonical": "bsc",
+            "status": "confirmed",
+        }
+        return state
+
+    change_group = base("change-group")
+
+    go_back = base("go-back")
+    go_back["active_group"] = "qps_profile"
+    go_back["group_history"] = ["workload_rpc"]
+
+    queue_goal = base("queue-workflow-goal")
+
+    queued_goal = {
+        "target_mode": "sync-observe",
+        "goal": "observe node synchronization after the current benchmark",
+        "source_evidence": "run sync-observe after this benchmark",
+    }
+    activate_goal = base("activate-workflow-goal")
+    activate_goal["workflow_goals"] = [deepcopy(queued_goal)]
+
+    discard_goal = base("discard-workflow-goal")
+    discard_goal["workflow_goals"] = [deepcopy(queued_goal)]
+
+    scenarios = [
+        ActionTransitionScenario("action_change_group", "change_group", change_group),
+        ActionTransitionScenario("action_go_back", "go_back", go_back),
+        ActionTransitionScenario(
+            "action_queue_workflow_goal",
+            "queue_workflow_goal",
+            queue_goal,
+        ),
+        ActionTransitionScenario(
+            "action_activate_next_workflow_goal",
+            "activate_next_workflow_goal",
+            activate_goal,
+        ),
+        ActionTransitionScenario(
+            "action_discard_next_workflow_goal",
+            "discard_next_workflow_goal",
+            discard_goal,
+        ),
+    ]
+    scenario_ids = [item.scenario_id for item in scenarios]
+    action_types = [item.action_type for item in scenarios]
+    if len(scenario_ids) != len(set(scenario_ids)):
+        raise AssertionError("action-transition scenario registry has duplicate ids")
+    if len(action_types) != len(set(action_types)):
+        raise AssertionError("action-transition scenario registry has duplicate action types")
+    return sorted(scenarios, key=lambda item: item.scenario_id)
+
+
 def question_scenarios(language: str = "en") -> list[QuestionScenario]:
     """Return the standalone reviewed catalog plus executable seed states."""
 

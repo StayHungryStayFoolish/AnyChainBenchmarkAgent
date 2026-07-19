@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import unittest
 
-from tests.agent_live.harness_contract_scenarios import manual_input_case, question_scenarios
+from agent.harness.invariants import validate_state
+from tests.agent_live.harness_contract_scenarios import (
+    action_transition_scenarios,
+    manual_input_case,
+    question_scenarios,
+)
+from tests.agent_live.runtime_checkpoint import reviewed_scenario_state
 
 
 class HarnessContractScenarioTest(unittest.TestCase):
@@ -49,6 +55,34 @@ class HarnessContractScenarioTest(unittest.TestCase):
             self.assertEqual(state.get("rpc_mode"), rpc_mode)
             self.assertEqual((state.get("chain_identity") or {}).get("status"), "confirmed")
             self.assertEqual((state.get("pending_question") or {}).get("id"), "workload_confirm")
+
+    def test_semantic_coordinator_actions_have_independent_reviewed_seeds(self) -> None:
+        scenarios = action_transition_scenarios("en")
+        self.assertEqual(len(scenarios), 5)
+        self.assertEqual(len({item.scenario_id for item in scenarios}), len(scenarios))
+        self.assertEqual(len({item.action_type for item in scenarios}), len(scenarios))
+        self.assertEqual(
+            {item.action_type for item in scenarios},
+            {
+                "change_group",
+                "go_back",
+                "queue_workflow_goal",
+                "activate_next_workflow_goal",
+                "discard_next_workflow_goal",
+            },
+        )
+        for scenario in scenarios:
+            state = dict(scenario.seed_state)
+            self.assertFalse(state.get("pending_question"))
+            validate_state(state)  # type: ignore[arg-type]
+            resolved = dict(reviewed_scenario_state(scenario.scenario_id))
+            self.assertFalse(resolved.get("pending_question"))
+            self.assertEqual(resolved.get("target_mode"), state.get("target_mode"))
+            self.assertEqual(resolved.get("workflow_mode"), state.get("workflow_mode"))
+            self.assertEqual(resolved.get("active_group"), state.get("active_group"))
+            self.assertEqual(resolved.get("group_history"), state.get("group_history"))
+            self.assertEqual(resolved.get("workflow_goals"), state.get("workflow_goals"))
+            validate_state(resolved)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

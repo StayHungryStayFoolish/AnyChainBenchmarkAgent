@@ -28,8 +28,11 @@ from tests.agent_live.coverage_evidence import (
     load_valid_evidence_reference,
     repository_revision,
 )
-from tests.agent_live.harness_contract_scenarios import question_scenarios
-from tests.agent_live.harness_contract_scenarios import manual_input_case
+from tests.agent_live.harness_contract_scenarios import (
+    action_transition_scenarios,
+    manual_input_case,
+    question_scenarios,
+)
 
 
 EVIDENCE_CLASSES = (
@@ -768,6 +771,10 @@ def build_ledger(
             "status": _aggregate_status(variant_edges),
         })
 
+    action_scenario_ids: dict[str, list[str]] = defaultdict(list)
+    for scenario in action_transition_scenarios("en"):
+        action_scenario_ids[scenario.action_type].append(scenario.scenario_id)
+
     action_rows: list[dict[str, Any]] = []
     for spec in ACTION_SPECS:
         action_group = spec.target_group or f"@action_only/{spec.owner}"
@@ -807,6 +814,8 @@ def build_ledger(
                 "target_group": spec.target_group,
                 "provides_capabilities": list(spec.provides_capabilities),
             },
+            scenario_ids=action_scenario_ids.get(spec.action_type, ()),
+            executable_scenario_ids=action_scenario_ids.get(spec.action_type, ()),
         )
         edges.append(edge)
         action_rows.append({
