@@ -2764,6 +2764,95 @@ class PlanCoverageTest(unittest.TestCase):
         }])
         self.assertEqual(result["semantic_units"][0]["action_indexes"], [0])
 
+    def test_backward_navigation_replaces_incorrect_generic_resume(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_group_navigation_actions
+
+        source = "Actually, take me back one step, but keep the values I already confirmed."
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "reviews": [{
+                "action_index": 0,
+                "destination_named": False,
+                "destination_quote": "",
+                "backward_navigation": True,
+                "backward_quote": "take me back one step",
+                "generic_resume": False,
+                "resume_quote": "",
+                "specific_change_requested": False,
+                "specific_change_quote": "",
+                "reason": "the source requests the previous workflow step",
+            }],
+        }))
+        payload = {
+            "actions": [{
+                "type": "resume_current_flow",
+                "source_evidence": source,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": source,
+                "disposition": "action",
+                "action_indexes": [0],
+            }],
+        }
+
+        result_text, changed = _adjudicate_group_navigation_actions(
+            provider,
+            json.dumps(payload),
+            {"pending_question": {"id": "qps_profile_confirm"}},
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(json.loads(result_text)["actions"], [{"type": "go_back"}])
+
+    def test_chinese_backward_navigation_uses_semantic_unit_as_evidence(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_group_navigation_actions
+
+        source = "回到上一步，保留已经确认的配置"
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "reviews": [{
+                "action_index": 0,
+                "destination_named": False,
+                "destination_quote": "",
+                "backward_navigation": True,
+                "backward_quote": "回到上一步",
+                "generic_resume": False,
+                "resume_quote": "",
+                "specific_change_requested": False,
+                "specific_change_quote": "",
+                "reason": "previous step requested",
+            }],
+        }))
+        payload = {
+            "actions": [{"type": "go_back"}],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": source,
+                "disposition": "action",
+                "action_indexes": [0],
+            }],
+        }
+
+        result_text, changed = _adjudicate_group_navigation_actions(
+            provider,
+            json.dumps(payload),
+            {"pending_question": {"id": "benchmark_mode"}},
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(json.loads(result_text)["actions"], [{"type": "go_back"}])
+
     def test_navigation_receipt_suppresses_only_same_scope_inventory_reinterpretation(self) -> None:
         from agent.harness.intent import _duplicates_admitted_group_navigation
 

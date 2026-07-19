@@ -3910,6 +3910,7 @@ def _adjudicate_group_navigation_actions(
     payload = _parse_json_object(text)
     payload.pop("group_navigation_admissions", None)
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
     review_indexes: list[int] = []
     review_specs: dict[int, Any] = {}
     for index, action in enumerate(actions):
@@ -3917,24 +3918,41 @@ def _adjudicate_group_navigation_actions(
             continue
         action_type = str(action.get("type") or "")
         spec = ACTION_BY_TYPE.get(action_type)
-        if action_type == "change_group" or (spec and spec.requires_specific_change):
+        if action_type in {"change_group", "go_back", "resume_current_flow"} or (
+            spec and spec.requires_specific_change
+        ):
             review_indexes.append(index)
             review_specs[index] = spec
     if not review_indexes:
         return text, False
 
     has_pending_question = bool(state.get("pending_question"))
-    review_payload = [
-        {
+    review_payload = []
+    source_by_index: dict[int, str] = {}
+    for index in review_indexes:
+        source_units = [
+            str(unit.get("source_text") or "")
+            for unit in units
+            if isinstance(unit, dict)
+            and index in (
+                unit.get("action_indexes")
+                if isinstance(unit.get("action_indexes"), list)
+                else []
+            )
+            and str(unit.get("source_text") or "")
+        ]
+        source = " ".join(source_units).strip() or str(
+            actions[index].get("source_evidence") or ""
+        ).strip()
+        source_by_index[index] = source
+        review_payload.append({
             "action_index": index,
             "proposed_group": (
                 actions[index].get("group")
                 or getattr(review_specs.get(index), "target_group", "")
             ),
-            "source_evidence": actions[index].get("source_evidence"),
-        }
-        for index in review_indexes
-    ]
+            "source_evidence": source,
+        })
     response = provider.complete(LLMRequest(
         messages=[
             LLMMessage(
@@ -3942,7 +3960,7 @@ def _adjudicate_group_navigation_actions(
                 content=(
                     "Adjudicate AnyChain workflow-group navigation. Return JSON only: "
                     "{reviews:[{action_index:integer,destination_named:boolean,destination_quote:string,"
-                    "generic_resume:boolean,resume_quote:string,specific_change_requested:boolean,"
+                    "backward_navigation:boolean,backward_quote:string,generic_resume:boolean,resume_quote:string,specific_change_requested:boolean,"
                     "specific_change_quote:string,reason:string}]}. Review every row exactly once. "
                     "destination_named is true only when source_evidence itself identifies the proposed destination "
                     "configuration area through its registered name, field, question, or a clear natural-language "
@@ -3951,7 +3969,11 @@ def _adjudicate_group_navigation_actions(
                     "settings, or workflow, never identify a subgroup by themselves; they require a subgroup-specific "
                     "modifier such as QPS/profile, RPC/workload, disk/storage, chain, endpoint, or observability. "
                     "generic_resume is true only when the source asks to resume/return to benchmark or configuration "
-                    "work without identifying one exact registered area. Therefore a source that names QPS settings, "
+                    "work in the forward direction without identifying one exact registered area. backward_navigation "
+                    "is true only when the source asks to go back to the previous/recent workflow step without naming "
+                    "one exact registered area. A request to keep confirmed values while going back is still backward "
+                    "navigation, not generic resume. generic_resume and backward_navigation are mutually exclusive. "
+                    "Therefore a source that names QPS settings, "
                     "RPC workload, observability, disk, chain, or another exact area is destination_named=true and "
                     "generic_resume=false. specific_change_requested is true when the source explicitly asks to alter, "
                     "customize, override, replace, enable, disable, add, or remove a value/default owned by the proposed "
@@ -4012,8 +4034,9 @@ def _adjudicate_group_navigation_actions(
         proposed_group = str(
             actions[index].get("group") or getattr(spec, "target_group", "") or ""
         )
-        source = str(actions[index].get("source_evidence") or "")
+        source = source_by_index.get(index, "")
         destination_quote = str(row.get("destination_quote") or "").strip()
+        backward_quote = str(row.get("backward_quote") or "").strip()
         resume_quote = str(row.get("resume_quote") or "").strip()
         specific_change_quote = str(row.get("specific_change_quote") or "").strip()
         reason = str(row.get("reason") or "group navigation was not explicit in source evidence")
@@ -4021,6 +4044,11 @@ def _adjudicate_group_navigation_actions(
             row.get("destination_named") is True
             and destination_quote
             and destination_quote in source
+        )
+        backward_navigation = bool(
+            row.get("backward_navigation") is True
+            and backward_quote
+            and backward_quote in source
         )
         generic_resume = bool(
             row.get("generic_resume") is True
@@ -4067,6 +4095,11 @@ def _adjudicate_group_navigation_actions(
                 "source_evidence": source,
                 "destination_quote": destination_quote,
             })
+            continue
+        if backward_navigation:
+            if action_type != "go_back":
+                actions[index] = {"type": "go_back"}
+                changed = True
             continue
         if generic_resume and has_pending_question:
             actions[index] = {

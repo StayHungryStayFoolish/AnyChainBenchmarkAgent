@@ -86,6 +86,31 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
                 self.assertEqual(set(postcondition["next_question_ids"]), next_ids)
                 self.assertTrue(edge["executable_scenario_ids"])
 
+    def test_structured_environment_paste_enters_review_gate(self) -> None:
+        for question_id, field in (
+            ("CLOUD_REGION", "CLOUD_REGION"),
+            ("network_interface", "NETWORK_INTERFACE"),
+        ):
+            edges = [
+                edge
+                for edge in self.ledger["edges"]
+                if edge["edge_type"] == "manual_input"
+                and edge["question_id"] == question_id
+                and edge["input_class"] == "structured_json_yaml_env_curl"
+            ]
+            self.assertTrue(edges, question_id)
+            for edge in edges:
+                self.assertEqual(edge["action_type"], "propose_config_values")
+                self.assertTrue(edge["interrupts_pending_contract"])
+                self.assertEqual(
+                    edge["expected_postcondition"]["path"],
+                    f"inferred_config.pending_review.config_values.{field}",
+                )
+                self.assertEqual(
+                    edge["expected_postcondition"]["next_question_ids"],
+                    ["inferred_config_review"],
+                )
+
     def test_real_execution_contract_names_the_linux_producer(self) -> None:
         contract = RUNNER_CONTRACTS["real_execution"]
         self.assertEqual(contract["status"], "implemented")

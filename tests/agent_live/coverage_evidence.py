@@ -1111,8 +1111,19 @@ def verify_runtime_postcondition(
             for item in baseline.pending_contract.get("accepted_action_types") or []
             if str(item).strip()
         }
-        if not rejection_expected and not accepted.intersection(admitted):
+        interrupts_pending = bool(edge.get("interrupts_pending_contract"))
+        if (
+            not rejection_expected
+            and not interrupts_pending
+            and not accepted.intersection(admitted)
+        ):
             errors.append("manual input admitted no action declared by the pending contract")
+        if (
+            not rejection_expected
+            and scheduled_action
+            and scheduled_action not in admitted
+        ):
+            errors.append(f"scheduled manual-input action was not admitted: {scheduled_action}")
         if rejection_expected and admitted and not accepted.intersection(admitted):
             errors.append("rejected manual input admitted an unrelated action")
 

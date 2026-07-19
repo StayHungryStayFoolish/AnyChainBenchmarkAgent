@@ -33,6 +33,7 @@ from tests.agent_live.harness_contract_scenarios import (
     manual_input_case,
     question_scenarios,
 )
+from agent.harness.domains.environment import CONFIRMABLE_CONFIG_FIELDS
 
 
 EVIDENCE_CLASSES = (
@@ -359,6 +360,7 @@ def _new_edge(
     executable_scenario_ids: Iterable[str] = (),
     deterministic_case_available: bool = False,
     expected_admitted: bool | None = None,
+    interrupts_pending_contract: bool = False,
 ) -> dict[str, Any]:
     execution_required = (
         edge_type == "action_transition" and action_type in REAL_EXECUTION_ACTIONS
@@ -387,6 +389,7 @@ def _new_edge(
         "executable_scenario_ids": sorted(set(executable_scenario_ids)),
         "deterministic_case_available": bool(deterministic_case_available),
         "expected_admitted": expected_admitted,
+        "interrupts_pending_contract": bool(interrupts_pending_contract),
         "deterministic_test_id": "",
         "fixed_cli_scenario_id": "",
         "dynamic_chaos_round_id": "",
@@ -710,6 +713,25 @@ def build_ledger(
                     (variant.get("manual_input_overrides") or {}).get(input_class)
                     or manual_input_case(contract, input_class)
                 )
+                field = str(contract.get("field") or "")
+                structured_config_interrupt = (
+                    input_class == "structured_json_yaml_env_curl"
+                    and field.upper() in CONFIRMABLE_CONFIG_FIELDS
+                )
+                action_type = (
+                    "propose_config_values" if structured_config_interrupt else "answer_pending"
+                )
+                postcondition_path = (
+                    f"inferred_config.pending_review.config_values.{field.upper()}"
+                    if structured_config_interrupt
+                    else variant.get("manual_postcondition_path")
+                    or f"confirmed_config.{field}"
+                )
+                next_question_ids = (
+                    ["inferred_config_review"]
+                    if structured_config_interrupt
+                    else list(variant.get("manual_next_question_ids") or [])
+                )
                 variant_edges.append(_new_edge(
                     group=group,
                     question_id=variant["question_id"],
@@ -717,27 +739,25 @@ def build_ledger(
                     contract_hash=variant["contract_hash"],
                     state_fingerprint=variant["state_fingerprint"],
                     input_class=input_class,
-                    option_or_action="action:answer_pending",
+                    option_or_action=f"action:{action_type}",
                     edge_type="manual_input",
                     owner=owner,
                     scenario_ids=variant["scenario_ids"],
                     executable_scenario_ids=variant["executable_scenario_ids"],
-                    action_type="answer_pending",
+                    action_type=action_type,
                     applicable=applicable,
                     applicability_reason=reason,
                     preconditions={"validation": contract.get("validation") or {}},
                     expected_postcondition={
-                        "field": contract.get("field") or "",
-                        "path": variant.get("manual_postcondition_path")
-                        or f"confirmed_config.{contract.get('field') or ''}",
-                        "next_question_ids": list(
-                            variant.get("manual_next_question_ids") or []
-                        ),
+                        "field": field,
+                        "path": postcondition_path,
+                        "next_question_ids": next_question_ids,
                     },
                     deterministic_case_available=concrete_case is not None,
                     expected_admitted=(
                         concrete_case.expected_admitted if concrete_case is not None else None
                     ),
+                    interrupts_pending_contract=structured_config_interrupt,
                 ))
         edges.extend(variant_edges)
         option_views = []
