@@ -280,6 +280,7 @@ def _challenge_and_validate_registry_inventory(
     challenged, changed, incomplete = _challenge_registry_action_inventory(
         provider,
         plan_text,
+        state,
     )
     if incomplete:
         owner_incomplete = tuple(
@@ -342,14 +343,15 @@ def _owner_admitted_unit_ids(plan_text: str) -> set[str]:
 def _challenge_registry_action_inventory(
     provider: Any,
     plan_text: str,
+    state: AgentGraphState | None = None,
 ) -> tuple[str, bool, tuple[str, ...]]:
-    """Compare unowned durable units with the registered action inventory.
+    """Audit action-unit completeness without reopening owner decisions.
 
     A pending-contract admission is already the semantic owner's decision for
-    every source unit represented solely by that admitted action. Re-auditing
-    the same unit here would create a second owner that can veto the pending
-    contract. Independent sibling units remain candidates and are still
-    challenged normally.
+    its declared option effect. The inventory challenger may identify an
+    independent sibling demand in the same source unit, but it receives the
+    complete declared option contract and cannot reinterpret that effect as a
+    missing mutation. Independent action units remain candidates as usual.
     """
 
     payload = _parse_json_object(plan_text)
@@ -360,6 +362,12 @@ def _challenge_registry_action_inventory(
         for key in ("pending_answer_admissions", "consultation_admissions")
         for index in payload.get(key, [])
         if isinstance(index, int) and 0 <= index < len(actions)
+    }
+    pending_option_by_action_index = {
+        index: option
+        for index in owner_admissions
+        for option in [_matching_pending_option(actions[index], state)]
+        if option
     }
     navigation_admissions = _valid_group_navigation_admissions(payload, actions)
     candidates: list[dict[str, Any]] = []
@@ -391,6 +399,33 @@ def _challenge_registry_action_inventory(
                         ACTION_BY_TYPE[str(action.get("type") or "")].purpose,
                     ),
                     "group_navigation_admission": navigation_admissions.get(index),
+                    "owner_admission": (
+                        "pending_option"
+                        if index in pending_option_by_action_index
+                        else "consultation"
+                        if index in owner_admissions
+                        else ""
+                    ),
+                    "declared_pending_option": (
+                        {
+                            "question_id": str(
+                                ((state or {}).get("pending_question") or {}).get("id") or ""
+                            ),
+                            "question_prompt": str(
+                                ((state or {}).get("pending_question") or {}).get("prompt") or ""
+                            ),
+                            "label": str(pending_option_by_action_index[index].get("label") or ""),
+                            "value": pending_option_by_action_index[index].get("value"),
+                            "declared_action": dict(
+                                pending_option_by_action_index[index].get("action") or {}
+                            ),
+                            "expected_patch": dict(
+                                pending_option_by_action_index[index].get("expected_patch") or {}
+                            ),
+                        }
+                        if index in pending_option_by_action_index
+                        else {}
+                    ),
                 }
                 for index, action in zip(indexes, mapped)
                 if str(action.get("type") or "") in ACTION_BY_TYPE
@@ -423,6 +458,11 @@ def _challenge_registry_action_inventory(
                         "it qualifies a requested setting owned by another group. Do not require "
                         "values intentionally collected by a represented intake operation. Do not invent, repair, "
                         "rename, or propose internal actions, and do not report informational framing as a demand."
+                        " An operation with owner_admission=pending_option is already the authoritative selection "
+                        "of its declared_pending_option. Treat the option label, declared action, and expected patch "
+                        "as represented by that operation; do not report a restatement or consequence of that "
+                        "selected option as missing. Still report any independent present demand in the same source "
+                        "unit that is not covered by the declared option effect."
                         + GROUP_NAVIGATION_SEMANTIC_POLICY
                     ),
                 ),

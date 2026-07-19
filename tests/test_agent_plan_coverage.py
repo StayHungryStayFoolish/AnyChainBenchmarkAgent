@@ -3641,6 +3641,7 @@ class PlanCoverageTest(unittest.TestCase):
         from unittest.mock import Mock
 
         from agent.harness.intent import _challenge_registry_action_inventory
+        from agent.harness.state import new_state
 
         source = (
             "Plans changed: don't generate benchmark traffic. "
@@ -3677,16 +3678,185 @@ class PlanCoverageTest(unittest.TestCase):
                 },
             ],
         }))
+        state = new_state("inventory-pending-owner", language="en")
+        state["pending_question"] = {
+            "id": "target_mode_select",
+            "prompt": "Choose the target mode.",
+            "options": [{
+                "id": "sync-observe",
+                "label": "Observe a real node catching up without benchmark traffic",
+                "value": "sync-observe",
+                "action": {
+                    "type": "choose_target_mode",
+                    "target_mode": "sync-observe",
+                    "target_mode_explicit": True,
+                },
+                "expected_patch": {
+                    "target_mode": "sync-observe",
+                    "workflow_mode": "sync_observe",
+                },
+            }],
+        }
 
         result_text, changed, incomplete = _challenge_registry_action_inventory(
             provider,
             json.dumps(payload),
+            state,
         )
 
         self.assertFalse(changed)
         self.assertEqual(incomplete, ())
         self.assertEqual(json.loads(result_text), payload)
         provider.complete.assert_called_once()
+        request = json.loads(provider.complete.call_args.args[0].messages[1].content)
+        represented = request["units"][0]["represented_actions"][0]
+        self.assertEqual(represented["owner_admission"], "pending_option")
+        self.assertEqual(
+            represented["declared_pending_option"]["declared_action"]["type"],
+            "choose_target_mode",
+        )
+        self.assertEqual(
+            represented["declared_pending_option"]["expected_patch"]["workflow_mode"],
+            "sync_observe",
+        )
+
+    def test_registry_inventory_exposes_failure_recovery_option_effect(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _challenge_registry_action_inventory
+        from agent.harness.state import new_state
+
+        source = "我先修正出错的 endpoint 配置，然后重新验证。"
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{"type": "correct_failure"}],
+            "pending_answer_admissions": [0],
+            "semantic_units": [_unit(clauses[0], 1, [0])],
+        }
+        state = new_state("inventory-recovery-owner", language="zh")
+        state["pending_question"] = {
+            "id": "failure_recovery_action",
+            "prompt": "请选择下一步。",
+            "options": [{
+                "id": "1",
+                "label": "修正受影响的配置并重新验证",
+                "value": "correct",
+                "action": {"type": "correct_failure"},
+                "expected_patch": {"failure_recovery.status": "correcting"},
+            }],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "findings": [{
+                "unit_id": "unit-1",
+                "status": "complete",
+                "missing_demands": [],
+                "reason": "the declared recovery option covers correction and revalidation",
+            }],
+        }))
+
+        result_text, changed, incomplete = _challenge_registry_action_inventory(
+            provider,
+            json.dumps(payload, ensure_ascii=False),
+            state,
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(incomplete, ())
+        self.assertEqual(json.loads(result_text), payload)
+        request = json.loads(provider.complete.call_args.args[0].messages[1].content)
+        represented = request["units"][0]["represented_actions"][0]
+        self.assertEqual(represented["owner_admission"], "pending_option")
+        self.assertEqual(represented["declared_pending_option"], {
+            "declared_action": {"type": "correct_failure"},
+            "expected_patch": {"failure_recovery.status": "correcting"},
+            "label": "修正受影响的配置并重新验证",
+            "question_id": "failure_recovery_action",
+            "question_prompt": "请选择下一步。",
+            "value": "correct",
+        })
+
+    def test_registry_inventory_recovers_demand_outside_pending_option_effect(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _challenge_registry_action_inventory
+        from agent.harness.state import new_state
+
+        source = "Use BSC for this benchmark, and set the QPS mode to quick."
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": "bsc",
+                "selected_value": "bsc",
+                "source_evidence": "Use BSC",
+            }],
+            "pending_answer_admissions": [0],
+            "semantic_units": [_unit(clauses[0], 1, [0])],
+        }
+        state = new_state("inventory-owner-independent-demand", language="en")
+        state["pending_question"] = {
+            "id": "chain_ambiguity_confirm",
+            "prompt": "Choose the chain.",
+            "options": [{
+                "id": "bsc",
+                "label": "BNB Smart Chain",
+                "value": "bsc",
+                "action": {"type": "answer_pending", "answer": "bsc"},
+                "expected_patch": {"chain_identity.canonical": "bsc"},
+            }],
+        }
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps({
+                "findings": [{
+                    "unit_id": "unit-1",
+                    "status": "missing",
+                    "missing_demands": [{
+                        "group": "qps_profile",
+                        "evidence_quote": "set the QPS mode to quick",
+                        "reason": "the QPS request is independent of the selected chain option",
+                    }],
+                    "reason": "one independent demand is not represented",
+                }],
+            })),
+            SimpleNamespace(text=json.dumps({
+                "reviews": [{
+                    "demand_id": "unit-1:0",
+                    "direct_unrepresented": True,
+                    "evidence_quote": "set the QPS mode to quick",
+                    "reason": "the source directly requests quick QPS and no action preserves it",
+                }],
+            })),
+            SimpleNamespace(text=json.dumps({
+                "action": {
+                    "type": "set_qps_mode",
+                    "qps_mode": "quick",
+                    "mutation_explicit": True,
+                    "source_evidence": "set the QPS mode to quick",
+                },
+                "reason": "the QPS owner can represent the quoted demand",
+            })),
+        ]
+
+        recovered_text, changed, incomplete = _challenge_registry_action_inventory(
+            provider,
+            json.dumps(payload),
+            state,
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(incomplete, ())
+        self.assertEqual(
+            [action["type"] for action in recovered["actions"]],
+            ["answer_pending", "set_qps_mode"],
+        )
+        self.assertEqual(recovered["semantic_units"][0]["action_indexes"], [0, 1])
 
     def test_registry_inventory_still_audits_independent_sibling_of_pending_answer(self) -> None:
         import json
