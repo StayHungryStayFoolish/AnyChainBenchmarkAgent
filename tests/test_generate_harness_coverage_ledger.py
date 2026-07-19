@@ -49,7 +49,12 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
         expected = {
             "custom_rpc_method": (
                 "custom_rpc.catalog.draft.method",
-                {"custom_rpc_schema_evidence", "custom_rpc_schema_confirm"},
+                {
+                    "custom_rpc_parameter_confirm",
+                    "custom_rpc_schema_evidence",
+                    "custom_rpc_schema_confirm",
+                    "custom_rpc_response_confirm",
+                },
             ),
             "custom_rpc_schema_evidence": (
                 "custom_rpc.catalog.last_transition.command",
@@ -61,7 +66,12 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
             ),
             "new_chain_method": (
                 "custom_rpc.catalog.draft.method",
-                {"new_chain_schema_evidence", "new_chain_schema_confirm"},
+                {
+                    "new_chain_parameter_confirm",
+                    "new_chain_schema_evidence",
+                    "new_chain_schema_confirm",
+                    "new_chain_response_confirm",
+                },
             ),
             "new_chain_schema_evidence": (
                 "custom_rpc.catalog.last_transition.command",

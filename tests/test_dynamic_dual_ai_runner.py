@@ -747,8 +747,10 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 "field": "custom_rpc_method",
                 "path": "custom_rpc.catalog.draft.method",
                 "next_question_ids": [
+                    "custom_rpc_parameter_confirm",
                     "custom_rpc_schema_evidence",
                     "custom_rpc_schema_confirm",
+                    "custom_rpc_response_confirm",
                 ],
             },
         }

@@ -1088,7 +1088,12 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
         next_ids: tuple[str, ...] = ()
         if scenario_id == "custom_needs_method":
             manual_path = "custom_rpc.catalog.draft.method"
-            next_ids = ("custom_rpc_schema_evidence", "custom_rpc_schema_confirm")
+            next_ids = (
+                "custom_rpc_parameter_confirm",
+                "custom_rpc_schema_evidence",
+                "custom_rpc_schema_confirm",
+                "custom_rpc_response_confirm",
+            )
         elif scenario_id == "custom_needs_schema_evidence":
             manual_path = "custom_rpc.catalog.last_transition.command"
             next_ids = (
@@ -1151,7 +1156,12 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
         next_ids: tuple[str, ...] = ()
         if scenario_id == "new_chain_existing_family_needs_method":
             manual_path = "custom_rpc.catalog.draft.method"
-            next_ids = ("new_chain_schema_evidence", "new_chain_schema_confirm")
+            next_ids = (
+                "new_chain_parameter_confirm",
+                "new_chain_schema_evidence",
+                "new_chain_schema_confirm",
+                "new_chain_response_confirm",
+            )
         elif scenario_id == "new_chain_existing_family_needs_schema_evidence":
             manual_path = "custom_rpc.catalog.last_transition.command"
             next_ids = (
