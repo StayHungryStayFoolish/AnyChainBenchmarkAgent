@@ -32,6 +32,7 @@ from .domains.environment import (
     parse_known_config_assignments,
 )
 from .domains.chain_rpc import apply_chain_rpc_action
+from .domains.chain_rpc_support import is_existing_family_lifecycle
 from .domains.analysis import (
     JOB_ID_RE,
     EvidenceCollectionOutcome,
@@ -944,10 +945,7 @@ def _ensure_action_prerequisites(state: AgentGraphState, actions: list[dict[str,
     chain_required = {"set_rpc_mode", "rpc_workload_command", "use_default_workload", "configure_workload_weights"}
     chain_confirmed = chain_identity_confirmed(state)
     identity = state.get("chain_identity") or {}
-    catalog_continues_case2 = (
-        identity.get("case") == "case2"
-        and str(identity.get("status") or "").startswith("existing_family_")
-    )
+    catalog_continues_case2 = is_existing_family_lifecycle(identity)
     needs_chain_prerequisite = bool(action_types & chain_required) or (
         "rpc_catalog_command" in action_types and not catalog_continues_case2
     )

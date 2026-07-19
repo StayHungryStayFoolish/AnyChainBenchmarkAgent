@@ -92,6 +92,14 @@ def _case_dict(state: AgentGraphState, case: str) -> dict[str, Any]:
     return state.setdefault("chain_identity", {}) if case == "new_chain" else state.setdefault("custom_rpc", {})
 
 
+def is_existing_family_lifecycle(identity: Any) -> bool:
+    """Return whether chain identity is inside the authoritative Case 2 lifecycle."""
+
+    if not isinstance(identity, dict):
+        return False
+    return normalize_scalar(identity.get("status")).startswith("existing_family_")
+
+
 def _jsonrpc_draft(method: str, params: Any) -> dict[str, Any]:
     return {
         "status": "draft",

@@ -75,7 +75,7 @@ __all__ = [
 from .chain_handoff import (_prepare_case2_handoff, _prepare_case3_handoff, _promote_case2_endpoint, _record_case3_evidence)
 from .chain_identity import (_apply_chain_candidate, _apply_chain_change_decision, _apply_unknown_chain_decision, _chain_ambiguity_question, _confirm_custom_rpc_family, _enter_case_for_adapter_family, _identity_confirmation_question, _origin_text, _preserve_same_chain, _request_chain_change, _request_target_mode_change, _resolution_from_arguments, _target_mode_is_explicit)
 from .chain_rpc_questions import (_action_option, _adapter_family_question, _answer_option, _case3_evidence_question, _chain_question, _choice, _endpoint_validation_question, _mainnet_review_question, _target_change_scope_question, _target_mode_selection_question)
-from .chain_rpc_support import (_adapter_family, _answer_result, _chain_confirmed, _chain_rpc_draft, _handoff_stops, _invalidate_execution, _invalidate_groups, _next_group, _result, _set_control, _workload_default_prompt)
+from .chain_rpc_support import (_adapter_family, _answer_result, _chain_confirmed, _chain_rpc_draft, _handoff_stops, _invalidate_execution, _invalidate_groups, _next_group, _result, _set_control, _workload_default_prompt, is_existing_family_lifecycle)
 from .rpc_endpoint import (
     _apply_endpoint_answer,
     _apply_method_answer,
@@ -588,7 +588,7 @@ def apply_chain_rpc_action(state: AgentGraphState, action: ActionProposal) -> Ha
     if not evidence:
         evidence = schema_evidence_from_turn_text(origin_text, method_hint=method)
     identity = next_state.setdefault("chain_identity", {})
-    if identity.get("case") == "case2" and str(identity.get("status") or "").startswith("existing_family_"):
+    if is_existing_family_lifecycle(identity):
         previous_pending = deepcopy(next_state.get("pending_question") or {})
         _set_control(next_state, 'pending_question', {})
         if endpoint and identity.get("status") == "existing_family_needs_endpoint":

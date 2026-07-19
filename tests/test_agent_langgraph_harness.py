@@ -8229,7 +8229,6 @@ network:
             "canonical": "flow",
             "adapter_family": "jsonrpc",
             "status": "existing_family_needs_method",
-            "case": "case2",
         }
         state["endpoint_evidence"] = {
             "candidate_endpoint": "https://example.invalid/rpc",
@@ -8271,6 +8270,7 @@ network:
             "eth_blockNumber",
         )
         self.assertEqual((result.get("pending_question") or {}).get("id"), "new_chain_schema_evidence")
+        self.assertNotIn("change_group", [row.get("type") for row in result.get("completed_actions") or []])
         self.assertFalse(result.get("target_mode"))
         self.assertEqual(
             [row.get("type") for row in result.get("action_queue") or []],
