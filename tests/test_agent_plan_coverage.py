@@ -3548,6 +3548,88 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertIs(rows[0]["complete"], True)
         self.assertEqual(provider.complete.call_count, 1)
 
+    def test_pending_owner_binds_answer_only_to_heterogeneous_declared_option(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_pending_answer_actions
+        from agent.harness.state import new_state
+
+        source = "这两个都不是，我重新输入正确的链名。"
+        state = new_state("pending-heterogeneous-options", language="zh")
+        state["pending_question"] = {
+            "id": "chain_ambiguity_confirm",
+            "group": "chain_identity",
+            "kind": "numbered_choice",
+            "prompt": "请选择链。",
+            "options": [
+                {
+                    "id": "bsc",
+                    "label": "bsc",
+                    "value": {"chain_choice": "bsc"},
+                    "action": {
+                        "type": "answer_pending",
+                        "answer": {"chain_choice": "bsc"},
+                    },
+                },
+                {
+                    "id": "reenter",
+                    "label": "重新输入链名",
+                    "value": "reenter_chain",
+                    "action": {"type": "answer_pending", "answer": "reenter_chain"},
+                },
+            ],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "reviews": [{
+                "action_index": 0,
+                "decision": "select_option",
+                "evidence_quote": "重新输入正确的链名",
+                "reason": "the source selects the declared re-entry option",
+            }],
+        }))
+        payload = json.dumps({
+            "actions": [{
+                "type": "answer_pending",
+                "answer": "reenter_chain",
+                "source_evidence": source,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": source,
+                "disposition": "action",
+                "action_indexes": [0],
+            }],
+        })
+
+        result, changed = _adjudicate_pending_answer_actions(provider, payload, state, source)
+        admitted = json.loads(result)
+
+        self.assertTrue(changed)
+        self.assertEqual(admitted["pending_answer_admissions"], [0])
+        self.assertEqual(admitted["actions"][0]["answer"], "reenter_chain")
+        self.assertEqual(admitted["actions"][0]["selected_value"], "reenter_chain")
+
+    def test_explicit_selected_value_remains_authoritative_over_answer_fallback(self) -> None:
+        from agent.harness.intent import _declared_option_for_pending_answer
+
+        pending = {
+            "options": [
+                {"id": "bsc", "value": {"chain_choice": "bsc"}},
+                {"id": "reenter", "value": "reenter_chain"},
+            ],
+        }
+        option = _declared_option_for_pending_answer({
+            "type": "answer_pending",
+            "answer": "reenter_chain",
+            "selected_value": {"chain_choice": "bsc"},
+        }, pending)
+
+        self.assertEqual(option["id"], "bsc")
+
     def test_negative_unit_adjudication_requires_an_exact_omitted_demand_quote(self) -> None:
         import json
         from types import SimpleNamespace

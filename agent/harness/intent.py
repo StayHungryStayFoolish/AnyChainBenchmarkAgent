@@ -2268,8 +2268,7 @@ def _matching_pending_option(
     options = [item for item in pending.get("options") or [] if isinstance(item, dict)]
     action_type = str(action.get("type") or "")
     if action_type == "answer_pending":
-        selected = action.get("selected_value")
-        return next((item for item in options if item.get("value") == selected), {})
+        return _declared_option_for_pending_answer(action, pending)
     for option in options:
         declared = option.get("action")
         if not isinstance(declared, dict) or str(declared.get("type") or "") != action_type:
@@ -2280,6 +2279,35 @@ def _matching_pending_option(
         ):
             return option
     return {}
+
+
+def _declared_option_for_pending_answer(
+    action: dict[str, Any],
+    pending: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve one answer action against the exact typed option contract.
+
+    The planner may express a declared option through ``answer`` without
+    repeating it in ``selected_value``. An explicitly supplied selected value
+    remains authoritative, including when it conflicts with ``answer``; the
+    fallback therefore applies only when that field is absent or null.
+    """
+
+    if str(action.get("type") or "") != "answer_pending":
+        return {}
+    selected = (
+        action.get("selected_value")
+        if "selected_value" in action and action.get("selected_value") is not None
+        else action.get("answer")
+    )
+    return next(
+        (
+            item
+            for item in pending.get("options") or []
+            if isinstance(item, dict) and item.get("value") == selected
+        ),
+        {},
+    )
 
 
 def _semantic_operation_arguments(action: dict[str, Any]) -> dict[str, Any]:
@@ -2873,14 +2901,11 @@ def _adjudicate_pending_answer_actions(
         if action_type == "answer_pending":
             if (
                 pending.get("manual_input_allowed") is True
-                and not pending_option_value_exists(action.get("selected_value"), pending)
+                and not _declared_option_for_pending_answer(action, pending)
                 and answer_fits_pending(str(action.get("answer") or ""), pending)
             ):
                 continue
-            option = next(
-                (item for item in options if item.get("value") == action.get("selected_value")),
-                None,
-            )
+            option = _declared_option_for_pending_answer(action, pending) or None
         else:
             option = _matching_pending_option(action, state) or None
             if option is None:
@@ -2909,11 +2934,7 @@ def _adjudicate_pending_answer_actions(
     )
     for index in review_indexes:
         option = option_by_index.get(index)
-        selected = (
-            actions[index].get("selected_value")
-            if str(actions[index].get("type") or "") == "answer_pending"
-            else (option or {}).get("value")
-        )
+        selected = (option or {}).get("value")
         if option is None and not target_mode_menu:
             invalid_indexes[index] = "the proposed value is not a declared pending option"
             continue
@@ -2949,6 +2970,7 @@ def _adjudicate_pending_answer_actions(
         }
         for review in reviews:
             index = int(review["action_index"])
+            selected = review.get("selected_option_value")
             row = by_index.get(index) or {}
             decision = str(row.get("decision") or "").strip()
             quote = str(row.get("evidence_quote") or "").strip()
@@ -2979,12 +3001,13 @@ def _adjudicate_pending_answer_actions(
                     (
                         item
                         for item in options
-                        if item.get("value") == actions[index].get("selected_value")
+                        if item.get("value") == selected
                     ),
                     None,
                 )
                 declared = dict((option or {}).get("action") or {})
                 if str(declared.get("type") or "") in {"", "answer_pending"}:
+                    actions[index]["selected_value"] = (option or {}).get("value")
                     admitted_indexes.add(index)
                     continue
                 materialized = _materialize_pending_option_action(declared, quote)
@@ -3411,7 +3434,7 @@ def _adjudicate_manual_pending_answers(
         index
         for index, action in enumerate(actions)
         if isinstance(action, dict) and str(action.get("type") or "") == "answer_pending"
-        and not pending_option_value_exists(action.get("selected_value"), pending)
+        and not _declared_option_for_pending_answer(action, pending)
     ]
     directly_grounded = {
         index
