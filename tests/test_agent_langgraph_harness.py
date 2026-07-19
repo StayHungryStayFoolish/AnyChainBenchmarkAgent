@@ -11267,7 +11267,11 @@ network:
 
         result = _process_action_queue(
             state,
-            [{"type": "activate_next_workflow_goal", "confidence": "high"}],
+            [{
+                "type": "activate_next_workflow_goal",
+                "source_evidence": "start the saved later goal",
+                "confidence": "high",
+            }],
             "start the saved later goal",
         )
 
@@ -11275,6 +11279,71 @@ network:
         self.assertEqual(result["workflow_goals"], [])
         self.assertEqual((result.get("pending_question") or {}).get("id"), "target_mode_change_confirm")
         self.assertEqual((result.get("target_mode_change_candidate") or ""), "real-node")
+
+    def test_resume_summary_exposes_saved_workflow_goal(self) -> None:
+        from agent.harness.domains.orientation import resume_summary
+        from agent.harness.state import new_state
+
+        state = new_state("saved-goal-resume-summary", language="en")
+        state["workflow_goals"] = [{
+            "target_mode": "sync-observe",
+            "goal": "observe synchronization after the benchmark",
+            "source_evidence": "then observe synchronization",
+        }]
+
+        summary = resume_summary(state)
+
+        self.assertIn(
+            "deferred requests: sync-observe: observe synchronization after the benchmark",
+            summary,
+        )
+
+    def test_discarding_saved_workflow_goal_removes_only_the_oldest(self) -> None:
+        from agent.harness.coordinator import _process_action_queue
+        from agent.harness.state import new_state
+
+        state = new_state("discard-workflow-goal", language="en")
+        state["workflow_goals"] = [
+            {
+                "target_mode": "sync-observe",
+                "goal": "observe synchronization",
+                "source_evidence": "then observe synchronization",
+            },
+            {
+                "target_mode": "real-node",
+                "goal": "benchmark real RPC capacity",
+                "source_evidence": "then benchmark real RPC capacity",
+            },
+        ]
+
+        result = _process_action_queue(
+            state,
+            [{
+                "type": "discard_next_workflow_goal",
+                "source_evidence": "remove the saved synchronization follow-up",
+                "confidence": "high",
+            }],
+            "remove the saved synchronization follow-up",
+        )
+
+        self.assertEqual(result["workflow_goals"], [state["workflow_goals"][1]])
+        self.assertIn("Removed the oldest saved workflow goal", "\n".join(result.get("visible_response") or []))
+
+    def test_saved_workflow_goal_transitions_require_current_turn_evidence(self) -> None:
+        from agent.harness.action_registry import validate_action_contract
+
+        for action_type in (
+            "activate_next_workflow_goal",
+            "discard_next_workflow_goal",
+        ):
+            with self.subTest(action_type=action_type):
+                with self.assertRaisesRegex(ValueError, "source_evidence"):
+                    validate_action_contract({"type": action_type})
+                validated = validate_action_contract({
+                    "type": action_type,
+                    "source_evidence": "the saved follow-up",
+                })
+                self.assertEqual(validated["source_evidence"], "the saved follow-up")
 
     def test_saved_workflow_goal_is_resumable_and_visible_in_status(self) -> None:
         from agent.harness.domains.orientation import has_resumable_configuration

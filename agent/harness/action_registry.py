@@ -223,14 +223,20 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
     ActionSpec(
         "activate_next_workflow_goal",
         "coordinator",
-        "Activate the oldest explicitly queued workflow goal through normal target-mode confirmation and invalidation.",
+        "Activate the oldest explicitly queued workflow goal when the user explicitly asks to start, continue, or advance to that saved/deferred follow-up. Do not use request_target_mode_selection or choose_target_mode for a referenced queued goal.",
+        ("source_evidence",),
         execution_phase=10,
+        required_arguments=("source_evidence",),
+        constraints=("workflow_goals must contain at least one saved goal",),
     ),
     ActionSpec(
         "discard_next_workflow_goal",
         "coordinator",
-        "Discard only the oldest explicitly queued workflow goal.",
+        "Discard only the oldest explicitly queued workflow goal when the user explicitly cancels or removes that saved/deferred follow-up.",
+        ("source_evidence",),
         execution_phase=10,
+        required_arguments=("source_evidence",),
+        constraints=("workflow_goals must contain at least one saved goal",),
     ),
     ActionSpec(
         "set_rpc_mode",

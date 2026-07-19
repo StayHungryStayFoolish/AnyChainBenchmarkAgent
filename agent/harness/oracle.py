@@ -153,7 +153,7 @@ def format_current_state(state: dict[str, Any], language: str) -> str:
 
 
 def queued_configuration_summary(state: dict[str, Any], language: str) -> str:
-    """Return user-visible deferred mutations from the durable action queue."""
+    """Return user-visible deferred mutations and mutually exclusive goals."""
     labels: list[str] = []
     for action in state.get("action_queue") or []:
         action_type = str((action or {}).get("type") or "")
@@ -167,6 +167,17 @@ def queued_configuration_summary(state: dict[str, Any], language: str) -> str:
             labels.append(f"chain={action.get('chain_text')}")
         elif action_type == "choose_target_mode":
             labels.append(f"target mode={action.get('target_mode')}")
+    for goal in state.get("workflow_goals") or []:
+        if not isinstance(goal, dict):
+            continue
+        target_mode = str(goal.get("target_mode") or "").strip()
+        description = str(goal.get("goal") or "").strip()
+        if target_mode:
+            labels.append(
+                f"{target_mode}: {description}"
+                if description
+                else target_mode
+            )
     return ", ".join(labels) or _localized(language, "<无>", "<none>")
 
 
