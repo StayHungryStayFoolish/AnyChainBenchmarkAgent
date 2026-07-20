@@ -97,6 +97,28 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
                 self.assertEqual(set(postcondition["next_question_ids"]), next_ids)
                 self.assertTrue(edge["executable_scenario_ids"])
 
+    def test_domain_manual_evidence_paths_come_from_question_contracts(self) -> None:
+        expected = {
+            "custom_rpc_endpoint": "custom_rpc.endpoint",
+            "new_chain_endpoint": "endpoint_evidence.candidate_endpoint",
+            "case3_protocol_evidence": "secondary_handoff.evidence",
+            "chain": "chain_identity.canonical",
+            "chain_change_input": "chain_identity.change_candidate.canonical",
+            "SYNC_OBSERVE_RPC_URL": "endpoint_evidence.sync_rpc_url_ready",
+        }
+        for question_id, path in expected.items():
+            edges = [
+                edge
+                for edge in self.ledger["edges"]
+                if edge["edge_type"] == "manual_input"
+                and edge["question_id"] == question_id
+            ]
+            self.assertTrue(edges, question_id)
+            self.assertTrue(all(
+                edge["expected_postcondition"]["path"] == path
+                for edge in edges
+            ), question_id)
+
     def test_structured_environment_paste_enters_review_gate(self) -> None:
         for question_id, field in (
             ("CLOUD_REGION", "CLOUD_REGION"),

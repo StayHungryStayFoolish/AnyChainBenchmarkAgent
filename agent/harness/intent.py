@@ -879,6 +879,19 @@ def _recover_declared_pending_option_semantics(
         if isinstance(index, int) and 0 <= index < len(actions)
     }
 
+    clause_shapes = {clause.clause_id: clause.input_shape for clause in clauses}
+    accepted_pending_types = {
+        str(item).strip()
+        for item in pending.get("accepted_action_types") or []
+        if str(item).strip()
+    }
+    accepted_pending_types.update(
+        str((option.get("action") or {}).get("type") or "").strip()
+        for option in options
+        if isinstance(option.get("action"), dict)
+    )
+    accepted_pending_types.add("answer_pending")
+    accepted_pending_types.discard("")
     candidates = []
     for unit in units:
         if not isinstance(unit, dict):
@@ -900,6 +913,23 @@ def _recover_declared_pending_option_semantics(
             and _action_requires_pending_owner(actions[index], state, pending, options)
             for index in indexes
         )
+        mapped_action_types = {
+            str(actions[index].get("type") or "")
+            for index in indexes
+            if isinstance(index, int)
+            and 0 <= index < len(actions)
+            and isinstance(actions[index], dict)
+        }
+        undeclared_mutations = {
+            action_type
+            for action_type in mapped_action_types - accepted_pending_types
+            if (ACTION_BY_TYPE.get(action_type) is not None)
+            and bool(ACTION_BY_TYPE[action_type].mutation_dimension)
+        }
+        prose_owner_review = (
+            clause_shapes.get(str(unit.get("clause_id") or ""), "prose") == "prose"
+            and bool(undeclared_mutations)
+        )
         if (
             str(unit.get("disposition") or "") != "unresolved"
             and not any(index in invalid_indexes for index in indexes)
@@ -908,6 +938,7 @@ def _recover_declared_pending_option_semantics(
             )
             and not clarification_owned
             and not pending_owned
+            and not prose_owner_review
         ):
             continue
         source = str(unit.get("source_text") or "")
@@ -996,7 +1027,7 @@ def _recover_declared_pending_option_semantics(
         "select_option is valid only when the complete turn semantically selects exactly one available option. "
         "A direct imperative or natural-language paraphrase that asks the Agent to perform one displayed "
         "option's declared effect counts as selecting that option. The user need not repeat its label or number. "
-        "A supporting unit may select the option, reject alternatives, explain the selection, or commit to the "
+        "A supporting unit may select the option, reject alternatives, explain why the selected option is needed, or commit to the "
         "immediate continuation that the selected option's declared effect necessarily opens. Such a continuation "
         "is support, not a second mutation. manual_value is valid only when manual_input_allowed=true and the "
         "complete turn directly supplies one value requested by the displayed field and validation contract. "
@@ -1149,6 +1180,14 @@ def _recover_declared_pending_option_semantics(
     recovered_actions = [dict(item) for item in actions if isinstance(item, dict)]
     replaced_indexes: set[int] = set()
     newly_admitted_indexes: set[int] = set()
+    support_action_indexes = {
+        index
+        for unit in units
+        if isinstance(unit, dict)
+        and str(unit.get("unit_id") or "") in accepted_context
+        for index in unit.get("action_indexes") or []
+        if isinstance(index, int)
+    }
     for unit in units:
         if not isinstance(unit, dict):
             continue
@@ -1211,6 +1250,7 @@ def _recover_declared_pending_option_semantics(
             if index == action_index
             or (
                 index not in invalid_indexes
+                and index not in support_action_indexes
                 and str(recovered_actions[index].get("type") or "") != "clarify_unresolved"
                 and not _action_requires_pending_owner(
                     recovered_actions[index],

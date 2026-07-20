@@ -1223,12 +1223,6 @@ def verify_runtime_postcondition(
             and not accepted.intersection(admitted)
         ):
             errors.append("manual input admitted no action declared by the pending contract")
-        if (
-            not rejection_expected
-            and scheduled_action
-            and scheduled_action not in admitted
-        ):
-            errors.append(f"scheduled manual-input action was not admitted: {scheduled_action}")
         if rejection_expected and admitted and not accepted.intersection(admitted):
             errors.append("rejected manual input admitted an unrelated action")
 

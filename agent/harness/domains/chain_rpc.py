@@ -130,6 +130,7 @@ def question_for_chain_rpc(state: AgentGraphState, group: str) -> dict[str, Any]
                 ),
                 field="LOCAL_RPC_URL",
                 kind="url",
+                evidence_path="endpoint_evidence.local_rpc_url_ready",
             )
         if state.get("target_mode") == "real-node" and not confirmed.get("BLOCKCHAIN_PROCESS_NAMES"):
             return manual_question(
@@ -142,6 +143,7 @@ def question_for_chain_rpc(state: AgentGraphState, group: str) -> dict[str, Any]
                 ),
                 field="BLOCKCHAIN_PROCESS_NAMES",
                 validation={"value_type": "bounded_text", "max_length": 512},
+                evidence_path="confirmed_config.BLOCKCHAIN_PROCESS_NAMES",
             )
         if state.get("target_mode") == "real-node" and not confirmed.get("MAINNET_RPC_URL_REVIEWED"):
             return _mainnet_review_question(state, sync_observe=False)
@@ -160,6 +162,7 @@ def question_for_chain_rpc(state: AgentGraphState, group: str) -> dict[str, Any]
                 ),
                 field="SYNC_OBSERVE_RPC_URL",
                 kind="url",
+                evidence_path="endpoint_evidence.sync_rpc_url_ready",
             )
         if (
             state.get("workflow_mode") == "sync_observe"
@@ -176,6 +179,7 @@ def question_for_chain_rpc(state: AgentGraphState, group: str) -> dict[str, Any]
                 ),
                 field="BLOCKCHAIN_PROCESS_NAMES",
                 validation={"value_type": "bounded_text", "max_length": 512},
+                evidence_path="confirmed_config.BLOCKCHAIN_PROCESS_NAMES",
             )
         if (
             state.get("workflow_mode") == "sync_observe"
@@ -520,6 +524,7 @@ def apply_chain_rpc_action(state: AgentGraphState, action: ActionProposal) -> Ha
             field="chain_change_input",
             accepted_action_types=("choose_chain", "change_chain"),
             queue_barrier=True,
+            evidence_path="chain_identity.change_candidate.canonical",
         ))
         _set_control(next_state, 'visible_response', [render_question(next_state["pending_question"], next_state.get("language", "en"))])
         return _result(state, next_state, action, completion="blocked")

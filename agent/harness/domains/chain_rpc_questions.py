@@ -38,6 +38,7 @@ def _endpoint_validation_question(state: AgentGraphState) -> dict[str, Any] | No
             accepted_action_types=("rpc_catalog_command",),
             queue_barrier=True,
             requires_capabilities=("chain_identity",),
+            evidence_path="custom_rpc.endpoint",
         )
     if custom.get("status") == "needs_method" and not draft_view(state).get("method"):
         return manual_question(
@@ -89,7 +90,7 @@ def _endpoint_validation_question(state: AgentGraphState) -> dict[str, Any] | No
         return _weights_question(state, "custom_rpc")
     evidence = state.get("endpoint_evidence") or {}
     if identity.get("status") == "existing_family_needs_endpoint" and not evidence.get("candidate_endpoint_ready"):
-        return manual_question("endpoint_process", "new_chain_endpoint", localized(language, "请提供可访问的 RPC endpoint，用于验证该新链和 RPC method。", "Provide a reachable RPC endpoint to validate this new chain and RPC methods."), field="new_chain_endpoint", kind="url", accepted_action_types=("rpc_catalog_command",), queue_barrier=True, requires_capabilities=("chain_identity",))
+        return manual_question("endpoint_process", "new_chain_endpoint", localized(language, "请提供可访问的 RPC endpoint，用于验证该新链和 RPC method。", "Provide a reachable RPC endpoint to validate this new chain and RPC methods."), field="new_chain_endpoint", kind="url", accepted_action_types=("rpc_catalog_command",), queue_barrier=True, requires_capabilities=("chain_identity",), evidence_path="endpoint_evidence.candidate_endpoint")
     if identity.get("status") == "existing_family_needs_method":
         return manual_question(
             "endpoint_process",
@@ -207,6 +208,7 @@ def _chain_question(state: AgentGraphState) -> dict[str, Any]:
         kind="chain",
         accepted_action_types=("choose_chain", "change_chain"),
         queue_barrier=True,
+        evidence_path="chain_identity.canonical",
     )
 
 
@@ -312,6 +314,7 @@ def _case3_evidence_question(state: AgentGraphState) -> dict[str, Any]:
         field="case3_protocol_evidence",
         kind="evidence",
         accepted_action_types=("secondary_handoff_command",),
+        evidence_path="secondary_handoff.evidence",
     )
 
 

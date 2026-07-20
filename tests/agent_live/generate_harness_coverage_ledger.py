@@ -135,6 +135,7 @@ def contract_variant_payload(question: Mapping[str, Any]) -> dict[str, Any]:
         "queue_barrier": bool(question.get("queue_barrier")),
         "validation": dict(question.get("validation") or {}),
         "requires_capabilities": sorted(str(item) for item in question.get("requires_capabilities") or []),
+        "evidence_path": str(question.get("evidence_path") or ""),
         "options": options,
     }
 
@@ -747,7 +748,8 @@ def build_ledger(
                 postcondition_path = (
                     f"inferred_config.pending_review.config_values.{field.upper()}"
                     if structured_config_interrupt
-                    else variant.get("manual_postcondition_path")
+                    else contract.get("evidence_path")
+                    or variant.get("manual_postcondition_path")
                     or f"confirmed_config.{field}"
                 )
                 next_question_ids = (

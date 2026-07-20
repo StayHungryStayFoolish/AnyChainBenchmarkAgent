@@ -32,6 +32,7 @@ def manual_question(
     requires_capabilities: tuple[str, ...] = (),
     help_text: str = "",
     completion_effect: str = "",
+    evidence_path: str = "",
 ) -> dict[str, Any]:
     field_validation = _question_validation(kind, validation)
     return {
@@ -49,6 +50,7 @@ def manual_question(
         "requires_capabilities": list(requires_capabilities),
         "help_text": str(help_text or "").strip(),
         "completion_effect": str(completion_effect or "").strip(),
+        "evidence_path": str(evidence_path or "").strip(),
     }
 
 
@@ -67,6 +69,7 @@ def choice_question(
     requires_capabilities: tuple[str, ...] = (),
     help_text: str = "",
     completion_effect: str = "",
+    evidence_path: str = "",
 ) -> dict[str, Any]:
     contracts: list[OptionContract] = []
     rendered: list[dict[str, Any]] = []
@@ -145,6 +148,7 @@ def choice_question(
         "requires_capabilities": list(requires_capabilities),
         "help_text": str(help_text or "").strip(),
         "completion_effect": str(completion_effect or "").strip(),
+        "evidence_path": str(evidence_path or "").strip(),
     }
 
 

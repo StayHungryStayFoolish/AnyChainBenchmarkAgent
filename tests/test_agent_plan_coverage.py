@@ -8072,6 +8072,119 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         self.assertEqual(provider.complete.call_count, 0)
         self.assertEqual(recovered["actions"][0]["type"], "rpc_catalog_command")
 
+    def test_pending_url_owner_replaces_unrelated_mode_action_from_supporting_prose(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.state import new_state
+
+        source = (
+            "The local Geth endpoint is http://geth-dev:8545.\n"
+            "Use it for sync observation and verify it first."
+        )
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "choose_target_mode",
+                "target_mode": "sync-observe",
+                "target_mode_explicit": True,
+                "source_evidence": "sync observation",
+            }],
+            "semantic_units": [
+                self._unit(clauses[0], "unit-1", [0]),
+                self._unit(clauses[1], "unit-2", [0]),
+            ],
+        }
+        state = new_state("pending-url-owner", language="en")
+        state["pending_question"] = {
+            "id": "SYNC_OBSERVE_RPC_URL",
+            "group": "endpoint_process",
+            "field": "SYNC_OBSERVE_RPC_URL",
+            "kind": "url",
+            "manual_input_allowed": True,
+            "accepted_action_types": ["answer_pending"],
+            "options": [],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "decision": "manual_value",
+            "option_id": "",
+            "answer": "http://geth-dev:8545",
+            "evidence_quote": "http://geth-dev:8545",
+            "supporting_unit_ids": ["unit-1", "unit-2"],
+            "independent_unit_ids": [],
+            "reason": "the second sentence scopes validation of the supplied URL",
+        }))
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider, json.dumps(payload), state, clauses=clauses, user_text=source
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertEqual([item["type"] for item in recovered["actions"]], ["answer_pending"])
+        self.assertEqual(recovered["actions"][0]["answer"], "http://geth-dev:8545")
+
+    def test_pending_option_accepts_explanation_for_declared_domain_action(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.state import new_state
+
+        source = "The defaults do not include the call I need. Add a custom RPC method."
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "clarify_unresolved",
+                "clauses": [clause.text for clause in clauses],
+                "reason": "unresolved",
+            }],
+            "semantic_units": [
+                self._unit(clauses[0], "unit-1", [0]),
+                self._unit(clauses[1], "unit-2", [0]),
+            ],
+        }
+        state = new_state("pending-option-explanation", language="en")
+        state["pending_question"] = {
+            "id": "workload_confirm",
+            "group": "workload_rpc",
+            "field": "workload_choice",
+            "manual_input_allowed": False,
+            "accepted_action_types": ["answer_pending", "rpc_catalog_command"],
+            "options": [{
+                "id": "custom_rpc",
+                "label": "Add custom RPC method",
+                "value": "custom_rpc",
+                "action": {"type": "rpc_catalog_command", "catalog_command": "enter"},
+            }],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "decision": "select_option",
+            "option_id": "custom_rpc",
+            "answer": "",
+            "evidence_quote": "Add a custom RPC method",
+            "supporting_unit_ids": ["unit-1", "unit-2"],
+            "independent_unit_ids": [],
+            "reason": "the first sentence explains why the declared option is needed",
+        }))
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider, json.dumps(payload), state, clauses=clauses, user_text=source
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(recovered["actions"], [{
+            "type": "rpc_catalog_command",
+            "catalog_command": "enter",
+            "source_evidence": "Add a custom RPC method",
+        }])
+
     def test_declared_pending_owner_replaces_competing_effect_and_keeps_independent_sibling(self) -> None:
         import json
         from types import SimpleNamespace
