@@ -878,7 +878,10 @@ def _validate_real_cli_provenance(
     execution_case: Mapping[str, Any],
     seed_receipt: Mapping[str, Any],
 ) -> None:
-    from tests.agent_live.harness_contract_scenarios import canonical_scenario_state
+    from tests.agent_live.harness_contract_scenarios import (
+        canonical_question_contract,
+        canonical_scenario_state,
+    )
     from tests.agent_live.reviewed_execution_cases import reviewed_execution_case
 
     resolved = reviewed_execution_case(edge)
@@ -902,7 +905,7 @@ def _validate_real_cli_provenance(
         "session_id": turn.session_id,
         "session_purpose": str(observation.runtime_events[0].session_purpose),
         "pending_question_id": str(scenario.question.get("id") or ""),
-        "pending_contract_hash": content_hash(scenario.question),
+        "pending_contract_hash": content_hash(canonical_question_contract(scenario.question)),
     }
     mismatches = {
         key: {"expected": value, "actual": receipt.get(key)}

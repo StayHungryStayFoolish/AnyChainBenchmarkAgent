@@ -15,6 +15,7 @@ from agent.harness.state import project_checkpoint_state
 from tests.agent_live.coverage_evidence import content_hash
 from tests.agent_live.harness_contract_scenarios import (
     action_transition_scenarios,
+    canonical_question_contract,
     canonical_scenario_state,
     question_scenarios,
 )
@@ -113,5 +114,5 @@ def seed_runtime_checkpoint(
         session_id=session_id,
         session_purpose=session_purpose,
         pending_question_id=str(question.get("id") or ""),
-        pending_contract_hash=content_hash(question),
+        pending_contract_hash=content_hash(canonical_question_contract(question)),
     )

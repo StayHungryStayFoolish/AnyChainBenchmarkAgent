@@ -25,6 +25,14 @@ from tests.agent_live.coverage_evidence import content_hash
 from tests.agent_live.graph_turn import invoke_product_graph_turn
 
 
+def canonical_question_contract(question: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove runtime identity while preserving the complete question contract."""
+
+    stable = deepcopy(dict(question))
+    stable.pop("execution_request_id", None)
+    return stable
+
+
 def canonical_scenario_state(seed_state: Mapping[str, Any]) -> dict[str, Any]:
     """Remove runtime-generated identity fields from a reviewed scenario seed."""
 
@@ -35,7 +43,7 @@ def canonical_scenario_state(seed_state: Mapping[str, Any]) -> dict[str, Any]:
         session.pop("updated_at", None)
     pending = stable.get("pending_question")
     if isinstance(pending, dict):
-        pending.pop("execution_request_id", None)
+        stable["pending_question"] = canonical_question_contract(pending)
     return stable
 
 

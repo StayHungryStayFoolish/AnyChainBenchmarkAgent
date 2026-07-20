@@ -17,7 +17,10 @@ from tests.agent_live.coverage_evidence import (
     pty_transcript_hash,
 )
 from tests.agent_live.generate_harness_coverage_ledger import build_ledger
-from tests.agent_live.harness_contract_scenarios import canonical_scenario_state
+from tests.agent_live.harness_contract_scenarios import (
+    canonical_question_contract,
+    canonical_scenario_state,
+)
 from tests.agent_live.reviewed_execution_cases import (
     REACHABLE_RPC_URL_ENV,
     reviewed_execution_case,
@@ -62,6 +65,23 @@ class ReviewedExecutionCaseTest(unittest.TestCase):
             content_hash(canonical_scenario_state(first)),
             content_hash(canonical_scenario_state(second)),
         )
+
+    def test_canonical_question_contract_excludes_only_execution_identity(self) -> None:
+        scenario = reviewed_scenario("execution")
+        first = deepcopy(dict(scenario.question))
+        second = deepcopy(first)
+        first["execution_request_id"] = "first-runtime-id"
+        second["execution_request_id"] = "second-runtime-id"
+        self.assertEqual(
+            content_hash(canonical_question_contract(first)),
+            content_hash(canonical_question_contract(second)),
+        )
+        second["options"][0]["return_policy"] = "changed-policy"
+        self.assertNotEqual(
+            content_hash(canonical_question_contract(first)),
+            content_hash(canonical_question_contract(second)),
+        )
+
     def test_unreviewed_invalid_cross_product_is_not_applicable(self) -> None:
         for question_id in ("chain", "case3_protocol_evidence"):
             edge = next(
@@ -118,8 +138,27 @@ class ReviewedExecutionCaseTest(unittest.TestCase):
         self.assertEqual(receipt.scenario_id, "opening")
         self.assertEqual(receipt.session_id, "receipt-session")
         self.assertEqual(receipt.pending_question_id, scenario.question["id"])
+        self.assertEqual(
+            receipt.pending_contract_hash,
+            content_hash(canonical_question_contract(scenario.question)),
+        )
         self.assertEqual(len(receipt.checkpoint_sha256), 64)
         self.assertEqual(len(receipt.receipt_hash), 64)
+
+        execution = reviewed_scenario("execution")
+        with TemporaryDirectory() as tmpdir:
+            execution_receipt = seed_runtime_checkpoint(
+                execution.seed_state,
+                checkpoint_path=Path(tmpdir) / "checkpoint.sqlite",
+                session_id="execution-receipt-session",
+                session_purpose="real-cli-coverage",
+                scenario_id=execution.scenario_id,
+                scenario_state_fingerprint=execution.state_fingerprint,
+            )
+        self.assertEqual(
+            execution_receipt.pending_contract_hash,
+            content_hash(canonical_question_contract(execution.question)),
+        )
 
     def test_real_cli_provenance_rejects_wrong_case_scenario_and_receipt_hash(self) -> None:
         edge = next(
