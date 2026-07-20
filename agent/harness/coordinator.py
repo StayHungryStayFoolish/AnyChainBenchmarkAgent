@@ -13,6 +13,7 @@ from .intent import (
     ALLOWED_GROUPS,
     resolve_action_queue,
 )
+from .plan_coverage import segment_user_turn
 from .oracle import (
     compute_next_action,
     format_recommended_next_action,
@@ -26,6 +27,8 @@ from .domains.orientation import completed_group_status
 from .domains.environment import (
     apply_inferred_config_review,
     config_proposal_review_question,
+    extract_structured_input_candidates,
+    extract_structured_config_proposal,
     merge_config_proposal_from_text,
     is_assignment_only_config_text,
     parse_known_config_assignments,
@@ -336,8 +339,22 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
         if merged:
             return _set_turn_phase(merged, "compose", "merged_config_proposal")
 
+    input_clauses = segment_user_turn(text)
+    structured_candidates = (
+        extract_structured_input_candidates(text)
+        if input_clauses
+        and all(clause.input_shape == "structured" for clause in input_clauses)
+        else None
+    )
+    structured_proposal = (
+        extract_structured_config_proposal(text)
+        if structured_candidates
+        and not structured_candidates.get("workflow_values")
+        else None
+    )
     direct_assignments = parse_known_config_assignments(text) if is_assignment_only_config_text(text) else {}
-    if direct_assignments:
+    proposal = structured_proposal
+    if proposal is None and direct_assignments:
         proposal = {
             "type": "propose_config_values",
             "source_format": "structured",
@@ -345,6 +362,7 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
             "unmapped_values": {},
             "reason": "explicit configuration assignment",
         }
+    if proposal and proposal.get("config_values"):
         state = _apply_handler_result(
             state,
             propose_config_assignments_for_review(state, proposal),

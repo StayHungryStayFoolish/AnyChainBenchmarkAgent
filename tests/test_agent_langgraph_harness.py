@@ -1425,6 +1425,82 @@ network:
             {"ACCOUNTS_DEVICE": "/dev/nvme1n1"},
         )
 
+    def test_standalone_yaml_config_uses_the_same_review_transaction(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("yaml-pending-review", language="en")
+        state["active_group"] = "provider_deployment"
+        state["pending_question"] = {
+            "id": "CLOUD_REGION",
+            "group": "provider_deployment",
+            "field": "CLOUD_REGION",
+            "kind": "manual_value",
+            "prompt": "Enter the cloud region.",
+            "manual_input_allowed": True,
+            "contract_version": 1,
+        }
+        state["last_user_input"] = "CLOUD_REGION: us-1\nCLOUD_ZONE: us-1-z"
+
+        result = process_turn(state)
+
+        self.assertEqual(result["pending_question"]["id"], "inferred_config_review")
+        self.assertEqual(
+            result["inferred_config"]["pending_review"]["config_values"],
+            {"CLOUD_REGION": "us-1", "CLOUD_ZONE": "us-1-z"},
+        )
+        self.assertNotIn("CLOUD_REGION", result["confirmed_config"])
+
+    def test_mixed_prose_and_structured_config_reaches_the_semantic_planner(self) -> None:
+        from unittest.mock import patch
+
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("mixed-structured-planner", language="en")
+        state["active_group"] = "provider_deployment"
+        state["pending_question"] = {
+            "id": "CLOUD_REGION",
+            "group": "provider_deployment",
+            "field": "CLOUD_REGION",
+            "kind": "manual_value",
+            "prompt": "Enter the cloud region.",
+            "manual_input_allowed": True,
+            "contract_version": 1,
+        }
+        state["last_user_input"] = 'Use these values, then explain fake-node.\n{"CLOUD_REGION":"us-1"}'
+
+        with patch("agent.harness.coordinator.resolve_action_queue") as resolver:
+            resolver.return_value = {
+                "actions": [{
+                    "type": "answer_opening_question",
+                    "topic": "mode_comparison",
+                    "source_evidence": "explain fake-node",
+                    "confidence": "high",
+                }]
+            }
+            result = process_turn(state)
+
+        resolver.assert_called_once()
+        self.assertNotIn("CLOUD_REGION", result["confirmed_config"])
+
+    def test_standalone_json_rpc_payload_is_not_captured_as_configuration(self) -> None:
+        from unittest.mock import patch
+
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("json-rpc-not-config", language="en")
+        state["active_group"] = "workload_rpc"
+        state["last_user_input"] = '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}'
+
+        with patch("agent.harness.coordinator.resolve_action_queue") as resolver:
+            resolver.return_value = {"actions": []}
+            result = process_turn(state)
+
+        resolver.assert_called_once()
+        self.assertNotEqual((result.get("pending_question") or {}).get("id"), "inferred_config_review")
+
     def test_qps_override_and_accounts_presence_can_be_set_from_one_freeform_turn(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
         from agent.harness.state import new_state
