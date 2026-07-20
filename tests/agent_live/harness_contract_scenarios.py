@@ -473,6 +473,11 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
     )
     for scenario_id, group, updates in performance_seeds:
         state = new_state(f"coverage-{scenario_id}", language=language, session_purpose="coverage")
+        if group == "qps_profile":
+            state.update({
+                "target_mode": "fake-node",
+                "workflow_mode": "rpc_benchmark",
+            })
         state.update(deepcopy(updates))
         manual_path = {
             "qps_adjust_value": "qps_profile.overrides.INITIAL_QPS",

@@ -634,6 +634,20 @@ class HarnessArchitectureTest(unittest.TestCase):
 
 
 class HarnessQuestionContractTest(unittest.TestCase):
+    def test_executable_qps_scenarios_include_rpc_workflow_prerequisites(self) -> None:
+        from tests.agent_live.harness_contract_scenarios import question_scenarios
+
+        qps_scenarios = {
+            scenario.scenario_id: scenario
+            for scenario in question_scenarios("en")
+            if scenario.scenario_id in {"qps_confirm", "qps_adjust", "qps_adjust_value"}
+        }
+
+        self.assertEqual(set(qps_scenarios), {"qps_confirm", "qps_adjust", "qps_adjust_value"})
+        for scenario in qps_scenarios.values():
+            self.assertEqual(scenario.seed_state.get("target_mode"), "fake-node")
+            self.assertEqual(scenario.seed_state.get("workflow_mode"), "rpc_benchmark")
+
 
     def test_scalar_contract_owns_overlimit_tokens_but_not_prose_detours(self) -> None:
         from agent.harness.questions import answer_fits_pending, manual_literal_violation
