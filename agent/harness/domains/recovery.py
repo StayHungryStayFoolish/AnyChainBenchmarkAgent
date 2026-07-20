@@ -79,8 +79,7 @@ def apply_recovery_action(state: AgentGraphState, action: ActionProposal) -> Han
 
     if action.action_type == "inspect_failure":
         recovery["selected_action"] = "inspect_failure"
-        deterministic = render_failure_summary(record, str(next_state.get("language") or "en"))
-        responses = [deterministic]
+        responses: list[str] = []
         if record.get("llm_analysis_useful"):
             advisory = analyze_evidence_with_model(
                 next_state,
@@ -92,11 +91,13 @@ def apply_recovery_action(state: AgentGraphState, action: ActionProposal) -> Han
                 ),
             )
             responses.append(advisory)
+        next_question = question_for_recovery(next_state, "failure_recovery")
         return HandlerResult(
             delta=StateDelta.between(state, next_state),
             consumed_action_ids=(action.action_id,),
             visible_results=tuple(responses),
             clear_pending=True,
+            pending_question=next_question,
             next_group="failure_recovery",
             completion="in_progress",
             stop_after_response=True,

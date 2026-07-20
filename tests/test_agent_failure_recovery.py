@@ -214,6 +214,7 @@ class FailureRecoveryTest(unittest.TestCase):
 
     def test_inspection_uses_llm_only_as_advisory_and_keeps_state(self) -> None:
         from agent.harness.contracts import ActionProposal
+        from agent.harness.coordinator import _apply_handler_result
         from agent.harness.domains.recovery import apply_recovery_action
         from agent.harness.failures import build_failure_record
         from agent.harness.state import new_state
@@ -225,11 +226,16 @@ class FailureRecoveryTest(unittest.TestCase):
         )}
         with patch("agent.harness.domains.recovery.analyze_evidence_with_model", return_value="advisory") as analyze:
             result = apply_recovery_action(state, ActionProposal("inspect", "inspect_failure"))
-        inspected = self._commit_domain_delta(state, result, owner="recovery")
+        inspected = _apply_handler_result(state, result, owner="recovery")
         analyze.assert_called_once()
         self.assertEqual(inspected["confirmed_config"], state["confirmed_config"])
         self.assertEqual(inspected["failure_recovery"]["status"], "pending")
-        self.assertEqual(result.visible_results[-1], "advisory")
+        self.assertEqual(result.visible_results, ("advisory",))
+        final_response = "\n".join(inspected["visible_response"])
+        self.assertEqual(final_response.count("Execution recovery:"), 1)
+        self.assertEqual(final_response.count("exit 2"), 1)
+        self.assertIn("advisory", final_response)
+        self.assertIn("Inspect failure evidence and diagnostics", final_response)
 
     def test_cancel_preserves_failure_and_configuration_without_rerun(self) -> None:
         from agent.harness.contracts import ActionProposal
