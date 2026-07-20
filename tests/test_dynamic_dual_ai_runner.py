@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Mapping
 from unittest.mock import patch
 
@@ -855,6 +856,59 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
 
         self.assertFalse(verified.passed)
         self.assertIn("unexpected next question", " ".join(verified.details["errors"]))
+
+    def test_structured_review_edge_rejects_silently_lost_source_keys(self) -> None:
+        edge = {
+            **EDGE,
+            "edge_key": "provider_deployment::CLOUD_REGION::structured::action:propose_config_values",
+            "question_id": "CLOUD_REGION",
+            "edge_type": "manual_input",
+            "action_type": "propose_config_values",
+            "expected_postcondition": {},
+        }
+        baseline = replace(
+            self._event(1, "a" * 64, "b" * 64, "CLOUD_REGION"),
+            pending_contract={
+                "id": "CLOUD_REGION",
+                "accepted_action_types": ["answer_pending", "propose_config_values"],
+            },
+        )
+        committed = replace(
+            self._event(2, "b" * 64, "c" * 64, "inferred_config_review"),
+            admitted_action_types=("propose_config_values",),
+            state_diff_hashes={
+                "inferred_config.pending_review": {"before": "", "after": "d" * 64},
+            },
+            after_value_hashes={
+                "inferred_config.pending_review.config_values.CLOUD_REGION": "d" * 64,
+            },
+        )
+        turn = SimpleNamespace(
+            user_message="CLOUD_REGION=us-central1\nowner_ticket=INC-4821",
+            agent_response="Apply CLOUD_REGION?",
+        )
+
+        verified = verify_runtime_postcondition(edge, baseline, committed, turn)  # type: ignore[arg-type]
+
+        self.assertFalse(verified.passed)
+        self.assertIn(
+            "structured review silently lost source key: OWNER_TICKET",
+            verified.details["errors"],
+        )
+        self.assertEqual(
+            verified.details["structured_review_keys"],
+            ["CLOUD_REGION", "OWNER_TICKET"],
+        )
+
+        complete = replace(
+            committed,
+            after_value_hashes={
+                **committed.after_value_hashes,
+                "inferred_config.pending_review.unmapped_values.OWNER_TICKET": "e" * 64,
+            },
+        )
+        accepted = verify_runtime_postcondition(edge, baseline, complete, turn)  # type: ignore[arg-type]
+        self.assertTrue(accepted.passed, accepted.details)
 
     def test_resume_edge_verifies_saved_context_relation_for_any_group(self) -> None:
         relation = {

@@ -1179,7 +1179,6 @@ def verify_runtime_postcondition(
     with a callback that simply declares the scheduled edge successful.
     """
 
-    del turn
     errors: list[str] = []
     if committed.before_fingerprint != baseline.after_fingerprint:
         errors.append("runtime fingerprint chain did not advance from the baseline")
@@ -1235,6 +1234,25 @@ def verify_runtime_postcondition(
 
     expected = dict(edge.get("expected_postcondition") or {})
     expected_paths: list[str] = []
+    structured_review_keys: list[str] = []
+    if scheduled_action == "propose_config_values" and turn is not None:
+        from agent.harness.domains.environment import extract_structured_input_candidates
+
+        candidates = extract_structured_input_candidates(turn.user_message) or {}
+        structured_paths = {
+            **{
+                str(key): f"inferred_config.pending_review.config_values.{key}"
+                for key in (candidates.get("config_values") or {})
+            },
+            **{
+                str(key): f"inferred_config.pending_review.unmapped_values.{key}"
+                for key in (candidates.get("unmapped_values") or {})
+            },
+        }
+        for key, path in structured_paths.items():
+            structured_review_keys.append(key)
+            if not _path_value_hashes(committed.after_value_hashes, path):
+                errors.append(f"structured review silently lost source key: {key}")
     if edge_type == "question_option":
         for path, value in expected.items():
             expected_paths.append(str(path))
@@ -1306,6 +1324,7 @@ def verify_runtime_postcondition(
         "committed_question_id": committed.pending_question_id,
         "expected_postcondition_paths": sorted(expected_paths),
         "expected_admitted": edge.get("expected_admitted"),
+        "structured_review_keys": sorted(structured_review_keys),
         "rejection_observed": bool(rejection_expected and not errors),
         "errors": errors,
     }

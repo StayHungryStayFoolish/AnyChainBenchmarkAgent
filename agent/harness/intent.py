@@ -130,6 +130,13 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
             text,
             validation,
         )
+        raw_response, validation = _finalize_structured_syntax_authority(
+            provider,
+            raw_response,
+            clauses,
+            state,
+            validation,
+        )
         if not validation.valid:
             ensure_turn_active()
             repair = provider.complete(
@@ -204,6 +211,13 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
                 clauses,
                 state,
                 text,
+                validation,
+            )
+            raw_response, validation = _finalize_structured_syntax_authority(
+                provider,
+                raw_response,
+                clauses,
+                state,
                 validation,
             )
         if not validation.valid:
@@ -294,6 +308,37 @@ def _recover_and_validate_semantic_actions(
         recovered_validation,
     )
     return recovered, recovered_validation
+
+
+def _finalize_structured_syntax_authority(
+    provider: Any,
+    plan_text: str,
+    clauses: tuple[TurnClause, ...],
+    state: AgentGraphState,
+    validation: PlanCoverageResult,
+) -> tuple[str, PlanCoverageResult]:
+    """Restore lossless structured facts after all model-backed recovery.
+
+    Inventory challenges and bounded semantic recovery may replace an action
+    document that was canonicalized earlier in the pipeline. Syntax-derived
+    structured candidates are immutable facts once the model has assigned the
+    clause to a configuration proposal, so replay their ownership at the final
+    admission boundary and validate the resulting transaction again.
+    """
+
+    canonical = _reconcile_structured_candidate_ownership(plan_text, clauses, state)
+    canonical = _remove_empty_config_proposals(canonical)
+    if canonical == plan_text:
+        return plan_text, validation
+    canonical_validation = _validate_action_document(canonical, clauses, state)
+    if canonical_validation.valid:
+        canonical_validation = _validate_semantic_fulfillment(
+            provider,
+            canonical,
+            clauses,
+            state,
+        )
+    return canonical, canonical_validation
 
 
 def _challenge_and_validate_registry_inventory(

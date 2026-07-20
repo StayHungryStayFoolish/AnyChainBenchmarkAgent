@@ -4923,6 +4923,56 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertEqual(reconciled["semantic_units"][0]["disposition"], "action")
         self.assertEqual(reconciled["semantic_units"][0]["action_indexes"], [0])
 
+    def test_final_structured_authority_restores_facts_lost_by_model_recovery(self) -> None:
+        import json
+        from unittest.mock import Mock, patch
+
+        from agent.harness.intent import _finalize_structured_syntax_authority
+        from agent.harness.plan_coverage import PlanCoverageResult, segment_user_turn
+        from agent.harness.state import new_state
+
+        source = (
+            "CLOUD_PROVIDER=gcp\n"
+            "CLOUD_REGION=us-central1\n"
+            "CLOUD_ZONE=us-central1-a\n"
+            "owner_ticket=INC-4821"
+        )
+        clause = segment_user_turn(source)[0]
+        model_replacement = {
+            "actions": [{
+                "type": "propose_config_values",
+                "config_values": {
+                    "CLOUD_REGION": "us-central1",
+                    "CLOUD_ZONE": "us-central1-a",
+                },
+                "unmapped_values": {},
+                "source_format": "env",
+                "source_evidence": source,
+            }],
+            "semantic_units": [_unit(clause, 1, [0])],
+        }
+        valid = PlanCoverageResult(True, (), ())
+
+        with patch("agent.harness.intent._validate_semantic_fulfillment", return_value=valid):
+            finalized_text, validation = _finalize_structured_syntax_authority(
+                Mock(),
+                json.dumps(model_replacement),
+                (clause,),
+                new_state("final-structured-authority", language="en"),
+                valid,
+            )
+
+        finalized = json.loads(finalized_text)
+        self.assertTrue(validation.valid, validation.errors)
+        self.assertEqual(finalized["actions"][0]["config_values"], {
+            "CLOUD_REGION": "us-central1",
+            "CLOUD_ZONE": "us-central1-a",
+        })
+        self.assertEqual(finalized["actions"][0]["unmapped_values"], {
+            "CLOUD_PROVIDER": "gcp",
+            "OWNER_TICKET": "INC-4821",
+        })
+
     def test_missing_semantic_units_are_reconstructed_without_changing_actions(self) -> None:
         import json
         from types import SimpleNamespace
