@@ -19,7 +19,7 @@ from .action_registry import (
     validate_action_contract,
 )
 from .context import action_schema, build_action_resolver_prompt, group_schema, workflow_snapshot
-from .domains.environment import extract_structured_input_candidates
+from .domains.environment import CONFIRMABLE_CONFIG_FIELDS, extract_structured_input_candidates
 from .input_values import target_mode_evidence_matches
 from .plan_coverage import PlanCoverageResult, TurnClause, segment_user_turn, validate_plan_coverage
 from .questions import answer_fits_pending, exact_answer, pending_option_value_exists
@@ -914,8 +914,11 @@ def _recover_declared_pending_option_semantics(
         "is support, not a second mutation. manual_value is valid only when manual_input_allowed=true and the "
         "complete turn directly supplies one value requested by the displayed field and validation contract. "
         "Put only that normalized source-supplied value in answer; never copy a value from state, the prompt, or "
-        "an option. Preservation constraints or restated saved values may support a selection but are not separate "
-        "mutations. Do not select from a question, explanation request, contradiction, ambiguity, or a request for "
+        "an option. A unit that only limits where or how that same supplied manual value may be applied, without "
+        "requesting another state change, is supporting context for manual_value rather than an independent action. "
+        "Preservation constraints or restated saved values may support a selection but are not separate mutations. "
+        "A constraint that requests any additional mutation, navigation, or conflicting value remains independent. "
+        "Do not select from a question, explanation request, contradiction, ambiguity, or a request for "
         "another option. evidence_quote must be a non-empty exact substring of complete_turn_text that proves the "
         "selection or manual value. An admitted_anchor is a read-only binding already admitted by its dedicated "
         "owner; a new selection may only agree with it. supporting_unit_ids must contain every candidate unit used "
@@ -3304,7 +3307,114 @@ def _adjudicate_pending_action_ownership(
         state,
         user_text,
     )
+    changed = changed or step_changed
+    current, step_changed = _merge_pending_manual_answer_into_config_proposal(current, state)
     return current, changed or step_changed
+
+
+def _merge_pending_manual_answer_into_config_proposal(
+    text: str,
+    state: AgentGraphState,
+) -> tuple[str, bool]:
+    """Keep one mixed-format config turn as one review transaction.
+
+    A structured or mixed-format clause may legitimately produce both a
+    configuration proposal and the direct answer to the currently owned
+    manual field.  Executing those as separate queue entries is unsafe: the
+    proposal installs its review question before the old answer is consumed.
+    Fold the admitted answer into the proposal while the original clause and
+    admission receipts are still available.
+    """
+
+    pending = dict(state.get("pending_question") or {})
+    pending_field = str(pending.get("field") or "").strip().upper()
+    if (
+        pending.get("manual_input_allowed") is not True
+        or pending_field not in CONFIRMABLE_CONFIG_FIELDS
+    ):
+        return text, False
+
+    payload = _parse_json_object(text)
+    actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
+    admitted_answers = {
+        int(index)
+        for index in payload.get("pending_answer_admissions", [])
+        if isinstance(index, int)
+        and 0 <= index < len(actions)
+        and isinstance(actions[index], dict)
+        and str(actions[index].get("type") or "") == "answer_pending"
+    }
+    proposal_indexes = {
+        index
+        for index, action in enumerate(actions)
+        if isinstance(action, dict)
+        and str(action.get("type") or "") == "propose_config_values"
+    }
+    if not admitted_answers or not proposal_indexes:
+        return text, False
+
+    clause_actions: dict[str, set[int]] = {}
+    for unit in units:
+        if not isinstance(unit, dict):
+            continue
+        clause_id = str(unit.get("clause_id") or "")
+        clause_actions.setdefault(clause_id, set()).update(
+            index
+            for index in unit.get("action_indexes") or []
+            if isinstance(index, int) and 0 <= index < len(actions)
+        )
+
+    merged_answers: set[int] = set()
+    for answer_index in sorted(admitted_answers):
+        answer_action = actions[answer_index]
+        answer = str(answer_action.get("answer") or "").strip()
+        if not answer or not answer_fits_pending(answer, pending):
+            continue
+        owners = {
+            proposal_index
+            for indexes in clause_actions.values()
+            if answer_index in indexes
+            for proposal_index in (indexes & proposal_indexes)
+        }
+        if len(owners) != 1:
+            continue
+        proposal_index = next(iter(owners))
+        proposal = actions[proposal_index]
+        config_values = dict(proposal.get("config_values") or {})
+        existing = next(
+            (
+                value
+                for key, value in config_values.items()
+                if str(key).strip().upper() == pending_field
+            ),
+            None,
+        )
+        if existing is not None and existing != "" and str(existing).strip() != answer:
+            continue
+        config_values[pending_field] = answer
+        proposal["config_values"] = config_values
+        for unit in units:
+            if not isinstance(unit, dict):
+                continue
+            indexes = unit.get("action_indexes") if isinstance(unit.get("action_indexes"), list) else []
+            if answer_index not in indexes:
+                continue
+            unit["action_indexes"] = list(dict.fromkeys(
+                proposal_index if index == answer_index else index
+                for index in indexes
+            ))
+            unit["reason"] = "atomic configuration review owns the active manual field"
+        merged_answers.add(answer_index)
+
+    if not merged_answers:
+        return text, False
+    payload["actions"] = actions
+    payload["semantic_units"] = units
+    return _remove_action_indexes(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        tuple(sorted(merged_answers)),
+    )
 
 
 def _adjudicate_target_mode_selection_requests(
@@ -4838,21 +4948,41 @@ def _remove_rejected_action_indexes(
 ) -> tuple[str, bool]:
     """Remove rejected siblings while preserving semantic-unit ownership."""
 
-    rejected = set(rejected_indexes)
-    if not rejected:
+    return _remove_action_indexes(
+        text,
+        rejected_indexes,
+        rejection_reason=reason,
+    )
+
+
+def _remove_action_indexes(
+    text: str,
+    removed_indexes: tuple[int, ...],
+    *,
+    rejection_reason: str = "",
+) -> tuple[str, bool]:
+    """Compact actions and every index-bearing receipt after removal.
+
+    ``rejection_reason`` is present only when an admission gate rejected the
+    action. Transaction normalization uses the same index-safe compaction
+    without creating false rejection evidence.
+    """
+
+    removed = set(removed_indexes)
+    if not removed:
         return text, False
     payload = _parse_json_object(text)
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
     admission_action_ids = _ensure_admission_action_ids(payload)
-    rejected_types = {
+    removed_types = {
         index: str(actions[index].get("type") or "unknown")
-        for index in rejected
+        for index in removed
         if 0 <= index < len(actions) and isinstance(actions[index], dict)
     }
     old_to_new: dict[int, int] = {}
     retained: list[dict[str, Any]] = []
     for old_index, action in enumerate(actions):
-        if old_index in rejected:
+        if old_index in removed:
             continue
         old_to_new[old_index] = len(retained)
         retained.append(action)
@@ -4893,17 +5023,18 @@ def _remove_rejected_action_indexes(
         unit["action_indexes"] = [old_to_new[index] for index in indexes if index in old_to_new]
         if not unit["action_indexes"] and str(unit.get("disposition") or "") == "action":
             unit["disposition"] = "unresolved"
-            unit["reason"] = reason
-    payload.setdefault("admission_rejections", []).extend(
-        {
-            "admission_action_id": admission_action_ids[index],
-            "stage_action_index": index,
-            "action_type": rejected_types.get(index, "unknown"),
-            "reason": reason,
-        }
-        for index in sorted(rejected)
-        if 0 <= index < len(admission_action_ids)
-    )
+            unit["reason"] = rejection_reason or "action removed during transaction normalization"
+    if rejection_reason:
+        payload.setdefault("admission_rejections", []).extend(
+            {
+                "admission_action_id": admission_action_ids[index],
+                "stage_action_index": index,
+                "action_type": removed_types.get(index, "unknown"),
+                "reason": rejection_reason,
+            }
+            for index in sorted(removed)
+            if 0 <= index < len(admission_action_ids)
+        )
     return json.dumps(payload, ensure_ascii=False, sort_keys=True), True
 
 

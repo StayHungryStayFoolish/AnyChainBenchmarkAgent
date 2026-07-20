@@ -23,6 +23,177 @@ def _unit(clause, index: int, action_indexes, *, disposition: str = "action", re
 
 
 class PlanCoverageTest(unittest.TestCase):
+    def test_rpc_mode_coverage_scenario_has_required_workflow_prerequisites(self) -> None:
+        from tests.agent_live.harness_contract_scenarios import question_scenarios
+
+        scenario = next(row for row in question_scenarios("en") if row.scenario_id == "rpc_mode")
+
+        self.assertEqual(scenario.seed_state["target_mode"], "fake-node")
+        self.assertEqual(scenario.seed_state["workflow_mode"], "rpc_benchmark")
+
+    def test_sync_observe_endpoint_question_explains_process_and_rpc_roles(self) -> None:
+        from agent.harness.domains.chain_rpc import question_for_chain_rpc
+        from agent.harness.state import new_state
+
+        for language, expected in (
+            ("en", ("resource attribution", "sync height and health")),
+            ("zh", ("资源归因", "同步高度和健康状态")),
+        ):
+            state = new_state(f"sync-endpoint-{language}", language=language)
+            state.update({
+                "target_mode": "sync-observe",
+                "workflow_mode": "sync_observe",
+                "sync_observe": {"source": "existing_local_node"},
+                "endpoint_evidence": {},
+            })
+
+            question = question_for_chain_rpc(state, "endpoint_process")
+
+            self.assertEqual(question["id"], "SYNC_OBSERVE_RPC_URL")
+            for fragment in expected:
+                self.assertIn(fragment, question["prompt"])
+
+    def test_same_clause_manual_field_is_folded_into_atomic_config_review(self) -> None:
+        from agent.harness.intent import _merge_pending_manual_answer_into_config_proposal
+        from agent.harness.state import new_state
+
+        source = "interface: eth0\nlink_speed_gbps: 100\nUse 100 Gbps as the maximum bandwidth."
+        clause = segment_user_turn(source)[0]
+        state = new_state("atomic-pending-config")
+        state["pending_question"] = {
+            "id": "NETWORK_MAX_BANDWIDTH_GBPS",
+            "group": "network",
+            "field": "NETWORK_MAX_BANDWIDTH_GBPS",
+            "kind": "manual_value",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "positive_number"},
+        }
+        payload = {
+            "actions": [
+                {
+                    "type": "propose_config_values",
+                    "config_values": {"NETWORK_INTERFACE": "eth0"},
+                    "unmapped_values": {"LINK_SPEED_GBPS": 100},
+                    "source_format": "structured",
+                    "source_evidence": source,
+                },
+                {
+                    "type": "answer_pending",
+                    "answer": "100",
+                    "source_evidence": "100 Gbps",
+                },
+            ],
+            "semantic_units": [_unit(clause, 1, [0, 1])],
+            "pending_answer_admissions": [1],
+        }
+
+        result_text, changed = _merge_pending_manual_answer_into_config_proposal(
+            json.dumps(payload),
+            state,
+        )
+        result = json.loads(result_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(len(result["actions"]), 1)
+        self.assertEqual(
+            result["actions"][0]["config_values"],
+            {"NETWORK_INTERFACE": "eth0", "NETWORK_MAX_BANDWIDTH_GBPS": "100"},
+        )
+        self.assertEqual(result["semantic_units"][0]["action_indexes"], [0])
+        self.assertEqual(result["pending_answer_admissions"], [])
+        self.assertNotIn("admission_rejections", result)
+
+    def test_atomic_config_review_does_not_hide_a_conflicting_value(self) -> None:
+        from agent.harness.intent import _merge_pending_manual_answer_into_config_proposal
+        from agent.harness.state import new_state
+
+        source = "NETWORK_MAX_BANDWIDTH_GBPS=50\nUse 100 Gbps instead."
+        clause = segment_user_turn(source)[0]
+        state = new_state("conflicting-pending-config")
+        state["pending_question"] = {
+            "id": "NETWORK_MAX_BANDWIDTH_GBPS",
+            "group": "network",
+            "field": "NETWORK_MAX_BANDWIDTH_GBPS",
+            "kind": "manual_value",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "positive_number"},
+        }
+        payload = {
+            "actions": [
+                {
+                    "type": "propose_config_values",
+                    "config_values": {"NETWORK_MAX_BANDWIDTH_GBPS": "50"},
+                    "unmapped_values": {},
+                    "source_format": "structured",
+                    "source_evidence": source,
+                },
+                {"type": "answer_pending", "answer": "100", "source_evidence": "100 Gbps"},
+            ],
+            "semantic_units": [_unit(clause, 1, [0, 1])],
+            "pending_answer_admissions": [1],
+        }
+
+        result_text, changed = _merge_pending_manual_answer_into_config_proposal(
+            json.dumps(payload),
+            state,
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(json.loads(result_text), payload)
+
+    def test_manual_value_scope_constraint_is_owned_by_the_pending_contract(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.state import new_state
+
+        source = "The API key is chaos-test-key-4821. Apply it only to this run without changing the chain template."
+        clauses = segment_user_turn(source)
+        state = new_state("manual-value-scope")
+        state["pending_question"] = {
+            "id": "RPC_API_KEY",
+            "group": "chain_auxiliary_endpoints",
+            "field": "RPC_API_KEY",
+            "kind": "manual_value",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "scalar_token"},
+        }
+        payload = {
+            "actions": [],
+            "semantic_units": [
+                _unit(clauses[0], 1, [], disposition="unresolved", reason="unresolved"),
+                _unit(clauses[1], 2, [], disposition="unresolved", reason="unresolved"),
+            ],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "decision": "manual_value",
+            "option_id": "",
+            "answer": "chaos-test-key-4821",
+            "evidence_quote": "chaos-test-key-4821",
+            "supporting_unit_ids": ["unit-1", "unit-2"],
+            "independent_unit_ids": [],
+            "reason": "the second sentence only scopes the supplied value",
+        }))
+
+        result_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            clauses=clauses,
+            user_text=source,
+        )
+        result = json.loads(result_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(result["actions"], [{
+            "type": "answer_pending",
+            "answer": "chaos-test-key-4821",
+            "source_evidence": "chaos-test-key-4821",
+        }])
+        self.assertEqual(result["semantic_units"][1]["disposition"], "context")
+
     def test_same_group_navigation_cannot_replace_the_active_pending_answer(self) -> None:
         from agent.harness.intent import _validate_action_document
         from agent.harness.state import new_state

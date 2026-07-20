@@ -154,8 +154,8 @@ def question_for_chain_rpc(state: AgentGraphState, group: str) -> dict[str, Any]
                 "SYNC_OBSERVE_RPC_URL",
                 localized(
                     language,
-                    "请提供用于 sync-observe 的真实节点 RPC endpoint。fake-node 不提供真实同步/import metrics，因此这里必须验证真实 endpoint。",
-                    "Provide a real node RPC endpoint for sync-observe. fake-node cannot provide real sync/import metrics, so this endpoint must be probed.",
+                    "已选择的本地节点进程用于 CPU、线程和资源归因；还需要一个可访问的真实节点 RPC endpoint，用于观测同步高度和健康状态。fake-node 不提供真实同步/import metrics，因此该 endpoint 必须验证。",
+                    "The selected local node process is used for CPU, thread, and resource attribution. A reachable real-node RPC endpoint is still required to observe sync height and health. fake-node does not provide real sync/import metrics, so the endpoint must be probed.",
                 ),
                 field="SYNC_OBSERVE_RPC_URL",
                 kind="url",
