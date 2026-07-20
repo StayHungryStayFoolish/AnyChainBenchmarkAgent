@@ -6958,12 +6958,12 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         }
         provider = Mock()
         provider.complete.return_value = SimpleNamespace(text=json.dumps({
-            "matches": [{
-                "unit_id": "unit-1",
-                "semantic_action": "continue_current_flow",
-                "evidence_quote": "Continue the saved setup",
-                "reason": "selects the declared continuation option",
-            }],
+            "decision": "select_option",
+            "option_id": "1",
+            "evidence_quote": "Continue the saved setup",
+            "supporting_unit_ids": ["unit-1"],
+            "independent_unit_ids": [],
+            "reason": "selects the declared continuation option",
         }))
 
         recovered_text, changed = _recover_declared_pending_option_semantics(
@@ -7078,26 +7078,12 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
             self.assertEqual(request_payload["complete_turn"], [clause.as_dict() for clause in clauses])
             self.assertEqual(len(request_payload["units"]), 3)
             return SimpleNamespace(text=json.dumps({
-                "matches": [{
-                    "unit_id": "unit-3",
-                    "option_id": "protocol",
-                    "evidence_quote": "continue by determining its protocol family",
-                    "reason": "the complete clause selects protocol discovery",
-                }],
-                "contexts": [
-                    {
-                        "unit_id": "unit-1",
-                        "supports_unit_id": "unit-3",
-                        "evidence_quote": "separate chain named sola",
-                        "reason": "rules out the suggested chain",
-                    },
-                    {
-                        "unit_id": "unit-2",
-                        "supports_unit_id": "unit-3",
-                        "evidence_quote": "not Solana",
-                        "reason": "rules out the suggested chain",
-                    },
-                ],
+                "decision": "select_option",
+                "option_id": "protocol",
+                "evidence_quote": "continue by determining its protocol family",
+                "supporting_unit_ids": ["unit-1", "unit-2", "unit-3"],
+                "independent_unit_ids": [],
+                "reason": "the complete turn selects protocol discovery",
             }))
 
         provider.complete.side_effect = complete
@@ -7127,6 +7113,91 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
             "selected_value": "choose_protocol",
             "source_evidence": "continue by determining its protocol family",
         }])
+
+    def test_declared_pending_owner_treats_declared_correction_continuation_as_support(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.state import new_state
+
+        source = (
+            "No, that response contract is incomplete. "
+            "Let me provide the correct response evidence."
+        )
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "clarify_unresolved",
+                "clauses": [clause.text for clause in clauses],
+                "reason": "planner did not bind the finite option",
+            }],
+            "semantic_units": [
+                self._unit(clause, f"unit-{index}", [0], disposition="unresolved")
+                for index, clause in enumerate(clauses, start=1)
+            ],
+        }
+        state = new_state("pending-response-correction", language="en")
+        state["pending_question"] = {
+            "id": "custom_rpc_response_confirm",
+            "group": "endpoint_process",
+            "kind": "yes_no",
+            "manual_input_allowed": False,
+            "options": [
+                {
+                    "id": "yes",
+                    "label": "Y",
+                    "value": True,
+                    "action": {"type": "answer_pending", "answer": True},
+                },
+                {
+                    "id": "no",
+                    "label": "N",
+                    "value": False,
+                    "action": {"type": "answer_pending", "answer": False},
+                },
+            ],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "decision": "select_option",
+            "option_id": "no",
+            "evidence_quote": "No, that response contract is incomplete",
+            "supporting_unit_ids": ["unit-1", "unit-2"],
+            "independent_unit_ids": [],
+            "reason": "rejects the observed contract and commits to its correction flow",
+        }))
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            PlanCoverageResult(
+                valid=False,
+                errors=("unresolved finite option",),
+                unresolved_clauses=tuple(clause.text for clause in clauses),
+                rejected_action_indexes=(0,),
+                incomplete_unit_ids=("unit-1", "unit-2"),
+            ),
+            clauses,
+            source,
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(recovered["actions"], [{
+            "type": "answer_pending",
+            "answer": False,
+            "selected_value": False,
+            "source_evidence": "No, that response contract is incomplete",
+        }])
+        self.assertEqual(recovered["pending_answer_admissions"], [0])
+        self.assertEqual(
+            [unit["disposition"] for unit in recovered["semantic_units"]],
+            ["action", "context"],
+        )
 
     def test_declared_pending_semantic_keeps_ambiguous_split_clause_unresolved(self) -> None:
         import json
@@ -7210,14 +7281,14 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         }
         provider = Mock()
         provider.complete.side_effect = [
-            SimpleNamespace(text=json.dumps({"matches": [], "manual_matches": [], "contexts": []})),
+            SimpleNamespace(text=json.dumps({})),
             SimpleNamespace(text=json.dumps({
-                "matches": [{
-                    "unit_id": "unit-1",
-                    "option_id": "reset",
-                    "evidence_quote": "Discard that partial setup and let me start clean",
-                    "reason": "imperative paraphrase selects the declared reset effect",
-                }],
+                "decision": "select_option",
+                "option_id": "reset",
+                "evidence_quote": "Discard that partial setup and let me start clean",
+                "supporting_unit_ids": ["unit-1"],
+                "independent_unit_ids": [],
+                "reason": "imperative paraphrase selects the declared reset effect",
             })),
         ]
 
@@ -7312,12 +7383,12 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         }
         provider = Mock()
         provider.complete.return_value = SimpleNamespace(text=json.dumps({
-            "matches": [{
-                "unit_id": "unit-1",
-                "option_id": "custom_rpc",
-                "evidence_quote": "use my own RPC method instead of the default",
-                "reason": "selects the declared custom RPC option",
-            }],
+            "decision": "select_option",
+            "option_id": "custom_rpc",
+            "evidence_quote": "use my own RPC method instead of the default",
+            "supporting_unit_ids": ["unit-1"],
+            "independent_unit_ids": [],
+            "reason": "selects the declared custom RPC option",
         }))
 
         recovered_text, changed = _recover_declared_pending_option_semantics(
@@ -7366,12 +7437,12 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         }
         provider = Mock()
         provider.complete.return_value = SimpleNamespace(text=json.dumps({
-            "matches": [{
-                "unit_id": "unit-1",
-                "option_id": "custom_rpc",
-                "evidence_quote": "Use my own RPC method",
-                "reason": "selects the declared custom RPC option",
-            }],
+            "decision": "select_option",
+            "option_id": "custom_rpc",
+            "evidence_quote": "Use my own RPC method",
+            "supporting_unit_ids": ["unit-1"],
+            "independent_unit_ids": [],
+            "reason": "selects the declared custom RPC option",
         }))
 
         recovered_text, changed = _recover_declared_pending_option_semantics(
@@ -7472,12 +7543,12 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         }
         provider = Mock()
         provider.complete.return_value = SimpleNamespace(text=json.dumps({
-            "matches": [{
-                "unit_id": "unit-1",
-                "option_id": "single_replace",
-                "evidence_quote": "Use my custom method",
-                "reason": "selects the declared custom method option",
-            }],
+            "decision": "select_option",
+            "option_id": "single_replace",
+            "evidence_quote": "Use my custom method",
+            "supporting_unit_ids": ["unit-1"],
+            "independent_unit_ids": [],
+            "reason": "selects the declared custom method option",
         }))
 
         recovered_text, changed = _recover_declared_pending_option_semantics(
@@ -7536,12 +7607,12 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         }
         provider = Mock()
         provider.complete.return_value = SimpleNamespace(text=json.dumps({
-            "matches": [{
-                "unit_id": "unit-1",
-                "option_id": "reenter",
-                "evidence_quote": "重新把链名输一遍",
-                "reason": "selects the declared re-entry option",
-            }],
+            "decision": "select_option",
+            "option_id": "reenter",
+            "evidence_quote": "重新把链名输一遍",
+            "supporting_unit_ids": ["unit-1"],
+            "independent_unit_ids": [],
+            "reason": "selects the declared re-entry option",
         }))
 
         recovered_text, changed = _recover_declared_pending_option_semantics(
@@ -7600,12 +7671,12 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         }
         provider = Mock()
         provider.complete.return_value = SimpleNamespace(text=json.dumps({
-            "manual_matches": [{
-                "unit_id": "unit-1",
-                "answer": "http://geth-dev:8545",
-                "evidence_quote": "http://geth-dev:8545",
-                "reason": "directly supplies the requested URL",
-            }],
+            "decision": "manual_value",
+            "answer": "http://geth-dev:8545",
+            "evidence_quote": "http://geth-dev:8545",
+            "supporting_unit_ids": ["unit-1"],
+            "independent_unit_ids": [],
+            "reason": "directly supplies the requested URL",
         }))
 
         recovered_text, changed = _recover_declared_pending_option_semantics(
@@ -7664,18 +7735,12 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         }
         provider = Mock()
         provider.complete.return_value = SimpleNamespace(text=json.dumps({
-            "matches": [{
-                "unit_id": "unit-choice",
-                "option_id": "sync",
-                "evidence_quote": "watch the node catch up",
-                "reason": "selects sync observation",
-            }],
-            "contexts": [{
-                "unit_id": "unit-context",
-                "supports_unit_id": "unit-choice",
-                "evidence_quote": "don't generate benchmark traffic",
-                "reason": "rules out load generation in support of sync observation",
-            }],
+            "decision": "select_option",
+            "option_id": "sync",
+            "evidence_quote": "watch the node catch up",
+            "supporting_unit_ids": ["unit-context", "unit-choice"],
+            "independent_unit_ids": [],
+            "reason": "selects sync observation and rules out load generation",
         }))
 
         recovered_text, changed = _recover_declared_pending_option_semantics(
@@ -7737,12 +7802,12 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         }
         provider = Mock()
         provider.complete.return_value = SimpleNamespace(text=json.dumps({
-            "contexts": [{
-                "unit_id": "unit-context",
-                "supports_unit_id": "unit-choice",
-                "evidence_quote": "don't generate benchmark traffic",
-                "reason": "rules out load generation for the admitted observation mode",
-            }],
+            "decision": "select_option",
+            "option_id": "sync-observe",
+            "evidence_quote": "don't generate benchmark traffic",
+            "supporting_unit_ids": ["unit-context"],
+            "independent_unit_ids": [],
+            "reason": "supports the already admitted observation mode",
         }))
 
         recovered_text, changed = _recover_declared_pending_option_semantics(
@@ -8212,14 +8277,12 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         }
         provider = Mock()
         provider.complete.return_value = SimpleNamespace(text=json.dumps({
-            "matches": [],
-            "manual_matches": [{
-                "unit_id": "unit-1",
-                "answer": "/dev/nvme1n1",
-                "evidence_quote": "/dev/nvme1n1",
-                "reason": "directly supplies the requested device",
-            }],
-            "contexts": [],
+            "decision": "manual_value",
+            "answer": "/dev/nvme1n1",
+            "evidence_quote": "/dev/nvme1n1",
+            "supporting_unit_ids": ["unit-1"],
+            "independent_unit_ids": [],
+            "reason": "directly supplies the requested device",
         }))
 
         recovered_text, changed = _recover_declared_pending_option_semantics(

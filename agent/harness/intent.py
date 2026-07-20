@@ -87,6 +87,7 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
             raw_response,
             state,
             clauses=clauses,
+            user_text=text,
         )
         raw_response, _ = _adjudicate_pending_action_ownership(provider, raw_response, state, text)
         raw_response, _ = _adjudicate_group_navigation_actions(provider, raw_response, state)
@@ -160,6 +161,7 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
                 raw_response,
                 state,
                 clauses=clauses,
+                user_text=text,
             )
             raw_response, _ = _adjudicate_pending_action_ownership(provider, raw_response, state, text)
             raw_response, _ = _adjudicate_group_navigation_actions(provider, raw_response, state)
@@ -238,6 +240,7 @@ def _recover_and_validate_semantic_actions(
         state,
         validation,
         clauses,
+        user_text,
     )
     if pending_semantic_changed:
         validation = _validate_action_document(plan_text, clauses, state)
@@ -755,6 +758,7 @@ def _recover_declared_pending_option_semantics(
     state: AgentGraphState,
     validation: PlanCoverageResult | None = None,
     clauses: tuple[TurnClause, ...] = (),
+    user_text: str = "",
 ) -> tuple[str, bool]:
     """Recover unresolved units through the complete active pending contract.
 
@@ -893,33 +897,32 @@ def _recover_declared_pending_option_semantics(
     if len({row["option_id"] for row in anchors}) > 1:
         return plan_text, False
 
+    complete_turn_text = str(user_text or "").strip() or " ".join(
+        clause.text for clause in clauses
+    ).strip() or " ".join(row["source_text"] for row in candidates).strip()
     adjudication_contract = (
-        "Adjudicate unresolved source units only against the complete contract declared by the active "
-        "AnyChain pending question. Return JSON only: "
-        "{matches:[{unit_id:string,option_id:string,evidence_quote:string,reason:string}],"
-        "manual_matches:[{unit_id:string,answer:string,evidence_quote:string,reason:string}],"
-        "contexts:[{unit_id:string,supports_unit_id:string,evidence_quote:string,reason:string}]}. "
-        "A match is valid only when source_text semantically selects exactly one available option. "
-        "A direct imperative or natural-language paraphrase that asks the Agent to perform one "
-        "displayed option's declared effect counts as selecting that option; the user does not need "
-        "to repeat the option label or number. "
-        "Interpret all units in the complete user turn together before deciding: one unit may select "
-        "an option while sibling units reject alternatives or explain that same selection. Return a "
-        "context row for every such supporting sibling so the complete turn remains accounted for. "
-        "A manual_match is valid only when manual_input_allowed=true and source_text directly supplies "
-        "one value requested by the displayed field and validation contract. Put only that normalized "
-        "source-supplied value in answer; never copy a value from state, the prompt, or an option. "
-        "Preservation constraints or restated saved values may support the selected option but must not "
-        "be treated as separate mutations unless the source explicitly requests changing them. Do not "
-        "match a question, explanation request, contradiction, ambiguity, or a request for another "
-        "option. evidence_quote must be a non-empty exact substring of source_text that proves the "
-        "selection or manual value. An admitted_anchor is a read-only option binding already admitted "
-        "by its dedicated owner; do not repeat or replace it in matches/manual_matches. A context row "
-        "is valid only when its unit solely frames, explains, defers an unselected alternative, or "
-        "rules out alternatives in direct support of one matched unit or admitted_anchor in this turn. "
-        "It must contain no independent present request, saved future workflow goal, question, mutation, "
-        "evidence submission, or value. supports_unit_id must name that matched unit or admitted_anchor. "
-        "Omit units that do not safely satisfy one of these contracts. Never invent an option or value."
+        "Adjudicate the complete user turn against only the finite contract declared by the active "
+        "AnyChain pending question. Decide ownership before assigning individual semantic units. "
+        "Return JSON only: {decision:'select_option'|'manual_value'|'no_selection'|'ambiguous',"
+        "option_id:string,answer:string,evidence_quote:string,supporting_unit_ids:[string],"
+        "independent_unit_ids:[string],reason:string}. "
+        "select_option is valid only when the complete turn semantically selects exactly one available option. "
+        "A direct imperative or natural-language paraphrase that asks the Agent to perform one displayed "
+        "option's declared effect counts as selecting that option. The user need not repeat its label or number. "
+        "A supporting unit may select the option, reject alternatives, explain the selection, or commit to the "
+        "immediate continuation that the selected option's declared effect necessarily opens. Such a continuation "
+        "is support, not a second mutation. manual_value is valid only when manual_input_allowed=true and the "
+        "complete turn directly supplies one value requested by the displayed field and validation contract. "
+        "Put only that normalized source-supplied value in answer; never copy a value from state, the prompt, or "
+        "an option. Preservation constraints or restated saved values may support a selection but are not separate "
+        "mutations. Do not select from a question, explanation request, contradiction, ambiguity, or a request for "
+        "another option. evidence_quote must be a non-empty exact substring of complete_turn_text that proves the "
+        "selection or manual value. An admitted_anchor is a read-only binding already admitted by its dedicated "
+        "owner; a new selection may only agree with it. supporting_unit_ids must contain every candidate unit used "
+        "solely for this finite decision. independent_unit_ids must contain every remaining candidate unit with a "
+        "separate present request, group jump, question, mutation, or evidence payload for unrestricted planning. "
+        "The two lists must be disjoint and partition all candidate units. Use no_selection when the turn does not "
+        "answer the pending question, and ambiguous when it supports competing answers. Never invent an option or value."
     )
     adjudication_payload = json.dumps({
         "pending_question": {
@@ -932,6 +935,7 @@ def _recover_declared_pending_option_semantics(
         },
         "available_options": available,
         "admitted_anchors": anchors,
+        "complete_turn_text": complete_turn_text,
         "complete_turn": [clause.as_dict() for clause in clauses],
         "units": candidates,
     }, ensure_ascii=False, sort_keys=True)
@@ -942,9 +946,8 @@ def _recover_declared_pending_option_semantics(
             messages.append(LLMMessage(
                 role="system",
                 content=(
-                    "The first adjudication found no safe binding. Re-evaluate the complete turn once, including "
-                    "imperative paraphrases of displayed option effects. Return a binding only when exactly one "
-                    "declared option or one allowed manual value is unambiguous; otherwise return empty arrays."
+                    "The first adjudication was malformed. Re-evaluate the complete turn once. Return one declared "
+                    "decision and a complete partition of candidate unit ids; do not omit the decision field."
                 ),
             ))
         messages.append(LLMMessage(role="user", content=adjudication_payload))
@@ -954,117 +957,79 @@ def _recover_declared_pending_option_semantics(
             max_tokens=500,
         ))
         result = _parse_json_object(response.text)
-        if any(
-            isinstance(result.get(key), list) and bool(result.get(key))
-            for key in ("matches", "manual_matches")
-        ):
+        if str(result.get("decision") or "") in {
+            "select_option", "manual_value", "no_selection", "ambiguous"
+        }:
             break
-    matches = result.get("matches") if isinstance(result.get("matches"), list) else []
-    manual_matches = (
-        result.get("manual_matches")
-        if isinstance(result.get("manual_matches"), list)
-        else []
-    )
-    contexts = result.get("contexts") if isinstance(result.get("contexts"), list) else []
+    decision = str(result.get("decision") or "")
+    if decision in {"no_selection", "ambiguous"}:
+        return plan_text, False
+    if decision not in {"select_option", "manual_value"}:
+        return plan_text, False
     candidate_sources = {row["unit_id"]: row["source_text"] for row in candidates}
     available_by_id = {row["option_id"]: row for row in available}
-    available_by_semantic = {
-        row["semantic_action"]: row
-        for row in available
-        if row["semantic_action"]
-    }
-    accepted: dict[str, tuple[dict[str, Any], str]] = {}
-    for match in matches:
-        if not isinstance(match, dict):
-            return plan_text, False
-        unit_id = str(match.get("unit_id") or "")
-        option_id = str(match.get("option_id") or "")
-        semantic = str(match.get("semantic_action") or "")
-        quote = str(match.get("evidence_quote") or "").strip()
-        source = candidate_sources.get(unit_id, "")
-        selected = available_by_id.get(option_id) or available_by_semantic.get(semantic)
-        if not source or selected is None or not quote or quote not in source:
-            return plan_text, False
-        prior = accepted.get(unit_id)
-        if prior is not None and prior[0]["option_id"] != selected["option_id"]:
-            return plan_text, False
-        accepted[unit_id] = (selected, quote)
-    accepted_manual: dict[str, tuple[str, str]] = {}
-    if not manual_allowed and manual_matches:
+    supporting_ids = result.get("supporting_unit_ids")
+    independent_ids = result.get("independent_unit_ids")
+    if not isinstance(supporting_ids, list) or not isinstance(independent_ids, list):
         return plan_text, False
-    for match in manual_matches:
-        if not isinstance(match, dict):
+    supporting = {str(item) for item in supporting_ids}
+    independent = {str(item) for item in independent_ids}
+    all_candidate_ids = set(candidate_sources)
+    if (
+        not supporting
+        or supporting & independent
+        or supporting | independent != all_candidate_ids
+        or not supporting <= all_candidate_ids
+    ):
+        return plan_text, False
+    quote = str(result.get("evidence_quote") or "").strip()
+    if (
+        not quote
+        or quote not in complete_turn_text
+        or not any(quote in candidate_sources[unit_id] for unit_id in supporting)
+    ):
+        return plan_text, False
+    owner_unit_id = next(
+        unit_id for unit_id in supporting if quote in candidate_sources[unit_id]
+    )
+    accepted: dict[str, tuple[dict[str, Any], str]] = {}
+    accepted_manual: dict[str, tuple[str, str]] = {}
+    accepted_context: dict[str, str] = {}
+    if decision == "select_option":
+        selected = available_by_id.get(str(result.get("option_id") or ""))
+        if selected is None:
             return plan_text, False
-        unit_id = str(match.get("unit_id") or "")
-        answer = str(match.get("answer") or "").strip()
-        quote = str(match.get("evidence_quote") or "").strip()
-        source = candidate_sources.get(unit_id, "")
+        anchor_options = {row["option_id"] for row in anchors}
+        if anchor_options and anchor_options != {selected["option_id"]}:
+            return plan_text, False
+        if anchor_options:
+            accepted_context.update({unit_id: candidate_sources[unit_id] for unit_id in supporting})
+        else:
+            accepted[owner_unit_id] = (selected, quote)
+            accepted_context.update({
+                unit_id: candidate_sources[unit_id]
+                for unit_id in supporting
+                if unit_id != owner_unit_id
+            })
+    else:
+        answer = str(result.get("answer") or "").strip()
         if (
-            not source
-            or unit_id in accepted
-            or unit_id in accepted_manual
+            not manual_allowed
+            or anchors
             or not answer
-            or not quote
-            or quote not in source
             or not answer_fits_pending(answer, pending)
             or not _manual_answer_has_literal_source(
                 {"answer": answer, "source_evidence": quote},
-                source,
+                candidate_sources[owner_unit_id],
             )
         ):
             return plan_text, False
-        accepted_manual[unit_id] = (answer, quote)
-    accepted_context: dict[str, str] = {}
-    if anchors and (accepted or accepted_manual):
-        # The pending owner has already admitted the only answer this contract
-        # permits. Recovery may classify unresolved siblings as context, but
-        # cannot create or replace the answer.
-        return plan_text, False
-    if accepted and accepted_manual:
-        # One pending contract can produce one answer only. A planner may not
-        # combine an option selection with a separate manual value.
-        return plan_text, False
-    selected_option_ids = {
-        str(selected["option_id"])
-        for selected, _quote in accepted.values()
-    }
-    if len(selected_option_ids) > 1:
-        reconciled = _reconcile_pending_single_choice_matches(
-            provider,
-            pending=pending,
-            available=available,
-            accepted=accepted,
-            candidate_sources=candidate_sources,
-        )
-        if reconciled is None:
-            return plan_text, False
-        accepted, conflict_context = reconciled
-        accepted_context.update(conflict_context)
-    manual_answers = {answer for answer, _quote in accepted_manual.values()}
-    if len(manual_answers) > 1:
-        return plan_text, False
-    accepted_unit_ids = set(accepted) | set(accepted_manual) | {
-        row["unit_id"] for row in anchors
-    }
-    for row in contexts:
-        if not isinstance(row, dict):
-            return plan_text, False
-        unit_id = str(row.get("unit_id") or "")
-        supports = str(row.get("supports_unit_id") or "")
-        quote = str(row.get("evidence_quote") or "").strip()
-        source = candidate_sources.get(unit_id, "")
-        if (
-            not source
-            or unit_id in accepted_unit_ids
-            or unit_id in accepted_context
-            or supports not in accepted_unit_ids
-            or not quote
-            or quote not in source
-        ):
-            return plan_text, False
-        accepted_context[unit_id] = quote
-    if not (accepted or accepted_manual or accepted_context):
-        return plan_text, False
+        accepted_manual[owner_unit_id] = (answer, quote)
+        accepted_context.update({
+            unit_id: candidate_sources[unit_id]
+            for unit_id in supporting
+            if unit_id != owner_unit_id
+        })
 
     recovered_actions = [dict(item) for item in actions if isinstance(item, dict)]
     replaced_indexes: set[int] = set()
@@ -1188,101 +1153,6 @@ def _action_requires_pending_owner(
     if str(action.get("type") or "") == "answer_pending":
         return False
     return _action_competes_with_pending_options(action, pending, options)
-
-
-def _reconcile_pending_single_choice_matches(
-    provider: Any,
-    *,
-    pending: dict[str, Any],
-    available: list[dict[str, Any]],
-    accepted: dict[str, tuple[dict[str, Any], str]],
-    candidate_sources: dict[str, str],
-) -> tuple[dict[str, tuple[dict[str, Any], str]], dict[str, str]] | None:
-    """Resolve conflicting option matches under one single-answer contract.
-
-    A single pending question cannot commit two different options. The model
-    may retain one primary selection only when every other conflicting match is
-    solely a source-grounded qualifier, exclusion, or deferred alternative for
-    that selection. Otherwise the turn remains unresolved.
-    """
-
-    response = provider.complete(LLMRequest(
-        messages=[
-            LLMMessage(
-                role="system",
-                content=(
-                    "Resolve conflicting matches for one single-answer AnyChain pending question. "
-                    "Return JSON only: {selected_unit_id:string,selected_option_id:string,"
-                    "evidence_quote:string,contexts:[{unit_id:string,relationship:'qualifier'|'exclusion',"
-                    "evidence_quote:string,reason:string}],"
-                    "ambiguous:boolean}. Select exactly one unit only when it expresses the present answer. "
-                    "Every other conflicting unit must be listed as context only when it solely qualifies, "
-                    "or rules out an unselected alternative in direct support of that present answer. "
-                    "A context cannot contain another present choice, independent request, saved workflow goal, "
-                    "deferred/future request, question, or mutation. A future request must remain unresolved for "
-                    "the workflow-goal owner; never classify it as context. evidence_quote must be a non-empty "
-                    "exact substring of that unit. "
-                    "If any conflicting unit cannot be safely classified this way, set ambiguous=true and do not "
-                    "select an answer. Never invent an option, value, or context."
-                ),
-            ),
-            LLMMessage(role="user", content=json.dumps({
-                "pending_question": {
-                    "id": str(pending.get("id") or ""),
-                    "prompt": str(pending.get("prompt") or ""),
-                },
-                "available_options": available,
-                "conflicting_matches": [
-                    {
-                        "unit_id": unit_id,
-                        "source_text": candidate_sources[unit_id],
-                        "option_id": str(selected["option_id"]),
-                        "prior_evidence_quote": quote,
-                    }
-                    for unit_id, (selected, quote) in accepted.items()
-                ],
-            }, ensure_ascii=False, sort_keys=True)),
-        ],
-        temperature=0.0,
-        max_tokens=400,
-    ))
-    result = _parse_json_object(response.text)
-    if result.get("ambiguous") is not False:
-        return None
-    selected_unit_id = str(result.get("selected_unit_id") or "")
-    selected_option_id = str(result.get("selected_option_id") or "")
-    selected_quote = str(result.get("evidence_quote") or "").strip()
-    selected_match = accepted.get(selected_unit_id)
-    selected_source = candidate_sources.get(selected_unit_id, "")
-    if (
-        selected_match is None
-        or str(selected_match[0]["option_id"]) != selected_option_id
-        or not selected_quote
-        or selected_quote not in selected_source
-    ):
-        return None
-    expected_context_ids = set(accepted) - {selected_unit_id}
-    context_rows = result.get("contexts") if isinstance(result.get("contexts"), list) else []
-    context: dict[str, str] = {}
-    for row in context_rows:
-        if not isinstance(row, dict):
-            return None
-        unit_id = str(row.get("unit_id") or "")
-        relationship = str(row.get("relationship") or "")
-        quote = str(row.get("evidence_quote") or "").strip()
-        source = candidate_sources.get(unit_id, "")
-        if (
-            unit_id not in expected_context_ids
-            or unit_id in context
-            or relationship not in {"qualifier", "exclusion"}
-            or not quote
-            or quote not in source
-        ):
-            return None
-        context[unit_id] = quote
-    if set(context) != expected_context_ids:
-        return None
-    return {selected_unit_id: (selected_match[0], selected_quote)}, context
 
 
 def _same_declared_pending_effect(existing: dict[str, Any], candidate: dict[str, Any]) -> bool:
