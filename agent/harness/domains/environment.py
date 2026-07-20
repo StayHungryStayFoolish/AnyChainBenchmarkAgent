@@ -924,6 +924,7 @@ def question_for_environment(state: AgentGraphState, group: str) -> dict[str, An
                     field=env_key,
                     kind="yes_no",
                     manual_input_allowed=True,
+                    validation={"value_type": "scalar_token"},
                     options=[
                         {"label": "Y", "value": detected},
                         {"label": "N", "value": "__manual__", "expected_patch": {f"inferred_config.{env_key}_manual_required": True}},

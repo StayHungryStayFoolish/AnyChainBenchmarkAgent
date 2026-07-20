@@ -141,6 +141,7 @@ def question_for_chain_rpc(state: AgentGraphState, group: str) -> dict[str, Any]
                     "Enter the real node process name or command-line fragment for resource attribution.",
                 ),
                 field="BLOCKCHAIN_PROCESS_NAMES",
+                validation={"value_type": "bounded_text", "max_length": 512},
             )
         if state.get("target_mode") == "real-node" and not confirmed.get("MAINNET_RPC_URL_REVIEWED"):
             return _mainnet_review_question(state, sync_observe=False)
@@ -174,6 +175,7 @@ def question_for_chain_rpc(state: AgentGraphState, group: str) -> dict[str, Any]
                     "Enter the node process name or command-line fragment for sync-observe CPU/thread attribution.",
                 ),
                 field="BLOCKCHAIN_PROCESS_NAMES",
+                validation={"value_type": "bounded_text", "max_length": 512},
             )
         if (
             state.get("workflow_mode") == "sync_observe"

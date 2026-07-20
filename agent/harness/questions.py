@@ -212,6 +212,12 @@ def literal_matches_validation(value: str, validation: dict[str, Any] | None) ->
         return len(raw) <= int(contract.get("max_length") or 180) and bool(
             re.fullmatch(r"[A-Za-z0-9_./:@+\\=-]+", raw)
         )
+    if value_type == "bounded_text":
+        # Multi-word text requires semantic ownership before it becomes a
+        # value. A single token can still use the deterministic fast path.
+        return len(raw) <= int(contract.get("max_length") or 512) and bool(
+            re.fullmatch(r"[A-Za-z0-9_./:@+\\=-]+", raw)
+        )
     if value_type == "positive_number":
         return bool(re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", raw)) and float(raw) > 0
     if value_type == "positive_integer":
@@ -226,6 +232,34 @@ def literal_matches_validation(value: str, validation: dict[str, Any] | None) ->
             str(item).strip().casefold() for item in contract.get("values") or []
         }
     return False
+
+
+def value_satisfies_pending_contract(value: Any, question: dict[str, Any]) -> bool:
+    """Validate one value already extracted for the active typed owner.
+
+    This is deliberately separate from ``answer_fits_pending``. The latter
+    decides whether an entire raw terminal turn is safe for deterministic
+    dispatch; this function validates a source-grounded value after semantic
+    planning has isolated it from surrounding prose.
+    """
+
+    raw = _strip_scalar(str(value or ""))
+    if not raw:
+        return False
+    if pending_option_value_exists(value, question):
+        return True
+    if question.get("manual_input_allowed") is not True:
+        return False
+    validation = question.get("validation") or {}
+    if str(validation.get("value_type") or "") == "bounded_text":
+        max_length = int(validation.get("max_length") or 512)
+        return bool(
+            len(raw) <= max_length
+            and "\n" not in raw
+            and "\r" not in raw
+            and all(character.isprintable() for character in raw)
+        )
+    return answer_fits_pending(raw, question)
 
 
 def manual_literal_violation(value: str, question: dict[str, Any]) -> dict[str, Any]:

@@ -877,6 +877,113 @@ class HarnessQuestionContractTest(unittest.TestCase):
         self.assertTrue(literal_matches_validation("geth", question["validation"]))
         self.assertFalse(literal_matches_validation("geth node\nmore evidence", question["validation"]))
 
+    def test_process_question_separates_raw_turn_routing_from_extracted_value_validation(self) -> None:
+        from agent.harness.domains.chain_rpc import question_for_chain_rpc
+        from agent.harness.questions import (
+            answer_fits_pending,
+            value_satisfies_pending_contract,
+        )
+
+        state = _state(
+            "en",
+            target_mode="real-node",
+            chain_identity={"canonical": "bsc", "status": "confirmed"},
+            endpoint_evidence={"local_rpc_url_ready": True},
+        )
+        question = question_for_chain_rpc(state, "endpoint_process")
+
+        self.assertEqual(question["id"], "BLOCKCHAIN_PROCESS_NAMES")
+        self.assertEqual(question["validation"]["value_type"], "bounded_text")
+        self.assertTrue(answer_fits_pending("geth", question))
+        self.assertFalse(answer_fits_pending("Match command line: geth --networkid 1337", question))
+        self.assertTrue(value_satisfies_pending_contract("geth --networkid 1337", question))
+        self.assertFalse(value_satisfies_pending_contract("geth\nsecond command", question))
+        self.assertFalse(value_satisfies_pending_contract("geth\x7f--networkid", question))
+        self.assertFalse(value_satisfies_pending_contract("x" * 513, question))
+
+    def test_detected_provider_question_declares_manual_override_grammar(self) -> None:
+        from agent.harness.domains.environment import question_for_environment
+        from agent.harness.questions import value_satisfies_pending_contract
+
+        for detected_key, field in (
+            ("region", "CLOUD_REGION"),
+            ("zone", "CLOUD_ZONE"),
+            ("machine_type", "MACHINE_TYPE"),
+        ):
+            confirmed = {
+                "CLOUD_REGION": "test-region",
+                "CLOUD_ZONE": "test-zone",
+                "MACHINE_TYPE": "test-machine",
+            }
+            confirmed.pop(field)
+            state = _state(
+                "en",
+                confirmed_config=confirmed,
+                discovery={"cloud": {detected_key: f"detected-{detected_key}"}},
+            )
+            question = question_for_environment(state, "provider_deployment")
+            self.assertEqual(question["id"], field)
+            self.assertEqual(question["validation"], {"value_type": "scalar_token"})
+            self.assertTrue(value_satisfies_pending_contract("replacement-value", question))
+            self.assertFalse(value_satisfies_pending_contract("replacement value", question))
+
+    def test_model_pending_admission_uses_extracted_value_contract(self) -> None:
+        from agent.harness.coordinator import (
+            _action_answers_pending_contract,
+            _dispatch_pending_action,
+        )
+        from agent.harness.domains.chain_rpc import question_for_chain_rpc
+        from agent.harness.domains.environment import question_for_environment
+
+        process_state = _state(
+            "en",
+            target_mode="real-node",
+            chain_identity={"canonical": "bsc", "status": "confirmed"},
+            endpoint_evidence={"local_rpc_url_ready": True},
+        )
+        process_state["pending_question"] = question_for_chain_rpc(
+            process_state,
+            "endpoint_process",
+        )
+        process_state["last_user_input"] = (
+            "The node runs under geth.\nMatch command line: geth --networkid 1337"
+        )
+        process_action = {
+            "type": "answer_pending",
+            "answer": "geth --networkid 1337",
+            "source_evidence": "Match command line: geth --networkid 1337",
+            "semantic_purpose_verified": True,
+            "pending_option_semantic_verified": True,
+        }
+        self.assertTrue(_action_answers_pending_contract(process_state, process_action))
+        process_result = _dispatch_pending_action(process_state, process_action)
+        self.assertEqual(
+            process_result["confirmed_config"]["BLOCKCHAIN_PROCESS_NAMES"],
+            "geth --networkid 1337",
+        )
+
+        region_state = _state(
+            "en",
+            discovery={"cloud": {"region": "test-region"}},
+        )
+        region_state["pending_question"] = question_for_environment(
+            region_state,
+            "provider_deployment",
+        )
+        region_state["last_user_input"] = (
+            "Do not use the detected region.\nSet CLOUD_REGION=us-central1 instead."
+        )
+        region_action = {
+            "type": "answer_pending",
+            "answer": "us-central1",
+            "source_evidence": "Set CLOUD_REGION=us-central1 instead.",
+            "semantic_purpose_verified": True,
+            "pending_option_semantic_verified": True,
+        }
+        self.assertTrue(_action_answers_pending_contract(region_state, region_action))
+        region_result = _dispatch_pending_action(region_state, region_action)
+        self.assertEqual(region_result["confirmed_config"]["CLOUD_REGION"], "us-central1")
+
     def _question_cases(self) -> list[tuple[str, Callable[[str], dict[str, Any] | None]]]:
         from agent.harness.contracts import ActionProposal
         from agent.harness.domains.chain_rpc import question_for_chain_rpc

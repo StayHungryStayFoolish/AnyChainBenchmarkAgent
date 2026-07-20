@@ -59,6 +59,7 @@ from .questions import (
     manual_literal_violation,
     matches_numbered_option as _matches_numbered_option,
     pending_option_value_exists as _pending_option_value_exists,
+    value_satisfies_pending_contract as _value_satisfies_pending_contract,
     render_question as _render_question,
 )
 from .input_values import normalize_target_mode, target_mode_evidence_matches
@@ -981,7 +982,7 @@ def _action_answers_pending_contract(state: AgentGraphState, action: dict[str, A
                 and evidence
                 and evidence in user_text
                 and answer in evidence
-                and _answer_fits_pending(answer, pending)
+                and _value_satisfies_pending_contract(answer, pending)
                 and action.get("semantic_purpose_verified") is True
             )
         if not (
@@ -1016,7 +1017,7 @@ def _action_answers_pending_contract(state: AgentGraphState, action: dict[str, A
         answer
         and (
             declared_option
-            or _answer_fits_pending(answer, pending)
+            or _value_satisfies_pending_contract(answer, pending)
         )
     )
 
@@ -2153,7 +2154,7 @@ def _dispatch_pending_action(state: AgentGraphState, action: dict[str, Any]) -> 
         )
     if not choice_question and not (
         _pending_option_value_exists(selected, pending)
-        or _answer_fits_pending(interpreted, pending)
+        or _value_satisfies_pending_contract(interpreted, pending)
     ):
         return _apply_handler_result(
             state,
@@ -2170,7 +2171,7 @@ def _dispatch_pending_action(state: AgentGraphState, action: dict[str, Any]) -> 
         choice_question
         and pending.get("manual_input_allowed") is True
         and selected is None
-        and _answer_fits_pending(answer, pending)
+        and _value_satisfies_pending_contract(answer, pending)
     )
     if choice_question and not _pending_option_value_exists(selected, pending) and not manual_choice_value:
         return _apply_handler_result(
@@ -2191,6 +2192,7 @@ def _dispatch_pending_action(state: AgentGraphState, action: dict[str, Any]) -> 
         source_text if declared_selection else answer,
         pending,
         selected_value=selected if declared_selection else _UNSET_PENDING_VALUE,
+        manual_value=answer if not declared_selection else _UNSET_PENDING_VALUE,
     )
 
 
@@ -2493,6 +2495,7 @@ def _apply_pending_answer(
     question: PendingQuestion,
     *,
     selected_value: Any = _UNSET_PENDING_VALUE,
+    manual_value: Any = _UNSET_PENDING_VALUE,
 ) -> AgentGraphState:
     group = str(question.get("group") or "")
     question_id = str(question.get("id") or "")
@@ -2500,6 +2503,10 @@ def _apply_pending_answer(
         if not _pending_option_value_exists(selected_value, question):
             return state
         value = selected_value
+    elif manual_value is not _UNSET_PENDING_VALUE:
+        if not _value_satisfies_pending_contract(manual_value, question):
+            return state
+        value = manual_value
     elif question.get("contract_version") == 1:
         matched, value = contract_exact_answer(text, question)
         if not matched:

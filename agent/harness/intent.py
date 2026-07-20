@@ -22,7 +22,12 @@ from .context import action_schema, build_action_resolver_prompt, group_schema, 
 from .domains.environment import CONFIRMABLE_CONFIG_FIELDS, extract_structured_input_candidates
 from .input_values import target_mode_evidence_matches
 from .plan_coverage import PlanCoverageResult, TurnClause, segment_user_turn, validate_plan_coverage
-from .questions import answer_fits_pending, exact_answer, pending_option_value_exists
+from .questions import (
+    answer_fits_pending,
+    exact_answer,
+    pending_option_value_exists,
+    value_satisfies_pending_contract,
+)
 from .state import DEFAULT_GROUP_ORDER, AgentGraphState
 
 ALLOWED_GROUPS = list(DEFAULT_GROUP_ORDER)
@@ -956,7 +961,7 @@ def _recover_declared_pending_option_semantics(
             if (
                 manual_allowed
                 and str(action.get("type") or "") == "answer_pending"
-                and answer_fits_pending(answer, pending)
+                and value_satisfies_pending_contract(answer, pending)
                 and _manual_answer_has_literal_source(action, source)
             ):
                 manual_anchors.append({
@@ -1118,7 +1123,7 @@ def _recover_declared_pending_option_semantics(
             not manual_allowed
             or anchors
             or not answer
-            or not answer_fits_pending(answer, pending)
+            or not value_satisfies_pending_contract(answer, pending)
         ):
             return plan_text, False
         if manual_anchors:
@@ -1703,7 +1708,7 @@ def _normalize_prose_pending_field_proposal(
     answer = str(normalized_values[pending_field]).strip()
     if (
         not answer
-        or not answer_fits_pending(answer, pending)
+        or not value_satisfies_pending_contract(answer, pending)
         or re.search(
             rf"(?<!\w){re.escape(answer)}(?!\w)",
             str(user_text or ""),
@@ -1968,7 +1973,7 @@ def _validate_action_document(
         if pending_option_value_exists(selected, pending):
             continue
         answer = str(raw.get("answer") or "").strip()
-        if pending.get("manual_input_allowed") is True and answer_fits_pending(answer, pending):
+        if pending.get("manual_input_allowed") is True and value_satisfies_pending_contract(answer, pending):
             continue
         matches, _ = exact_answer(answer, pending)
         if not matches:
@@ -3201,7 +3206,7 @@ def _adjudicate_pending_answer_actions(
             if (
                 pending.get("manual_input_allowed") is True
                 and not _declared_option_for_pending_answer(action, pending)
-                and answer_fits_pending(str(action.get("answer") or ""), pending)
+                and value_satisfies_pending_contract(str(action.get("answer") or ""), pending)
             ):
                 continue
             option = _declared_option_for_pending_answer(action, pending) or None
@@ -3623,7 +3628,7 @@ def _merge_pending_manual_answer_into_config_proposal(
     for answer_index in sorted(admitted_answers):
         answer_action = actions[answer_index]
         answer = str(answer_action.get("answer") or "").strip()
-        if not answer or not answer_fits_pending(answer, pending):
+        if not answer or not value_satisfies_pending_contract(answer, pending):
             continue
         if len(proposal_indexes) != 1:
             continue
@@ -3832,7 +3837,7 @@ def _adjudicate_manual_pending_answers(
     directly_grounded = {
         index
         for index in candidate_indexes
-        if answer_fits_pending(str(actions[index].get("answer") or ""), pending)
+        if value_satisfies_pending_contract(str(actions[index].get("answer") or ""), pending)
         and _manual_answer_has_literal_source(actions[index], user_text)
     }
     review_indexes = [index for index in candidate_indexes if index not in directly_grounded]
