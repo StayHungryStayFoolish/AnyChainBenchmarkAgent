@@ -632,6 +632,26 @@ class HarnessArchitectureTest(unittest.TestCase):
         self.assertIn("LocalEvmDemo", question["prompt"])
         self.assertIn("ethereum", question["prompt"])
 
+    def test_structured_configuration_has_no_pre_planner_admission_path(self) -> None:
+        from agent.harness.coordinator import adjudicate_turn_step
+
+        inputs = (
+            "CLOUD_PROVIDER=gcp\nCLOUD_REGION=us-central1\n"
+            "CLOUD_ZONE=us-central1-a\nowner_ticket=INC-4821",
+            "CLOUD_REGION=us-central1",
+        )
+        for text in inputs:
+            with self.subTest(text=text):
+                state = _state()
+                state["turn_context"] = {"kind": "free_text", "text": text}
+                state["proposed_actions"] = []
+
+                result = adjudicate_turn_step(state)
+
+                self.assertEqual(result["control"]["phase"], "plan")
+                self.assertEqual(result["control"]["reason"], "semantic_input")
+                self.assertEqual(result["proposed_actions"], [])
+
 
 class HarnessQuestionContractTest(unittest.TestCase):
     def test_executable_qps_scenarios_include_rpc_workflow_prerequisites(self) -> None:

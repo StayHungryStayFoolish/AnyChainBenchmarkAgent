@@ -13,7 +13,6 @@ from .intent import (
     ALLOWED_GROUPS,
     resolve_action_queue,
 )
-from .plan_coverage import segment_user_turn
 from .oracle import (
     compute_next_action,
     format_recommended_next_action,
@@ -27,11 +26,7 @@ from .domains.orientation import completed_group_status
 from .domains.environment import (
     apply_inferred_config_review,
     config_proposal_review_question,
-    extract_structured_input_candidates,
-    extract_structured_config_proposal,
     merge_config_proposal_from_text,
-    is_assignment_only_config_text,
-    parse_known_config_assignments,
 )
 from .domains.chain_rpc import apply_chain_rpc_action
 from .domains.chain_rpc_support import is_existing_family_lifecycle
@@ -337,33 +332,6 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
         merged = _merge_pending_config_proposal_from_text(state, text)
         if merged:
             return _set_turn_phase(merged, "compose", "merged_config_proposal")
-
-    input_clauses = segment_user_turn(text)
-    structured_candidates = (
-        extract_structured_input_candidates(text)
-        if input_clauses
-        and all(clause.input_shape == "structured" for clause in input_clauses)
-        else None
-    )
-    structured_proposal = (
-        extract_structured_config_proposal(text)
-        if structured_candidates
-        and not structured_candidates.get("workflow_values")
-        else None
-    )
-    direct_assignments = parse_known_config_assignments(text) if is_assignment_only_config_text(text) else {}
-    proposal = structured_proposal
-    if proposal is None and direct_assignments:
-        proposal = {
-            "type": "propose_config_values",
-            "source_format": "mixed",
-            "config_values": direct_assignments,
-            "unmapped_values": {},
-            "reason": "explicit configuration assignment",
-        }
-    if proposal and proposal.get("config_values"):
-        state["proposed_actions"] = [proposal]
-        return _set_turn_phase(state, "admit", "structured_config_proposal")
 
     if pending and str(pending.get("kind") or "") == "evidence" and should_start_evidence_collection(text):
         state = _apply_evidence_outcome(state, start_evidence_collection(state, text, pending))
