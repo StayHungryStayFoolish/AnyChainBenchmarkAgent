@@ -11,6 +11,12 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
 from agent.harness.runtime_identity import repository_revision
 from agent.runners.application_service import (
     BenchmarkExecutionService,
@@ -25,8 +31,6 @@ from tests.agent_live.coverage_evidence import (
 )
 from tests.agent_live.generate_harness_coverage_ledger import build_ledger
 
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
 TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "partial", "cancelled"})
 EXECUTION_CASES = (
     ("approve_preflight_smoke", "preflight_smoke", ExecutionOperation.REAL_NODE_SMOKE),

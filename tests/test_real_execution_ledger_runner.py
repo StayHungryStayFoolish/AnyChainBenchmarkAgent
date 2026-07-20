@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +14,22 @@ from tests.agent_live.execute_real_execution_ledger import (
 
 
 class RealExecutionLedgerRunnerTest(unittest.TestCase):
+    def test_direct_script_entrypoint_loads_repository_modules(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(repo_root / "tests/agent_live/execute_real_execution_ledger.py"),
+                "--help",
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--plan", result.stdout)
+
     def test_edge_lookup_requires_one_applicable_execution_edge(self) -> None:
         edge = {
             "action_type": "approve_preflight_smoke",
