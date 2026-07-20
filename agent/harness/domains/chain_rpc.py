@@ -131,6 +131,7 @@ def question_for_chain_rpc(state: AgentGraphState, group: str) -> dict[str, Any]
                 field="LOCAL_RPC_URL",
                 kind="url",
                 evidence_path="endpoint_evidence.local_rpc_url_ready",
+                rejection_evidence_value=False,
             )
         if state.get("target_mode") == "real-node" and not confirmed.get("BLOCKCHAIN_PROCESS_NAMES"):
             return manual_question(
@@ -163,6 +164,7 @@ def question_for_chain_rpc(state: AgentGraphState, group: str) -> dict[str, Any]
                 field="SYNC_OBSERVE_RPC_URL",
                 kind="url",
                 evidence_path="endpoint_evidence.sync_rpc_url_ready",
+                rejection_evidence_value=False,
             )
         if (
             state.get("workflow_mode") == "sync_observe"

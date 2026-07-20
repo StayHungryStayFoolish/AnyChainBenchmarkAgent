@@ -1059,6 +1059,59 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
         self.assertFalse(rejected.passed)
         self.assertIn("preserve the pending question", " ".join(rejected.details["errors"]))
 
+    def test_manual_rejection_can_record_question_declared_negative_evidence(self) -> None:
+        edge = {
+            **EDGE,
+            "edge_key": "endpoint_process::SYNC_OBSERVE_RPC_URL::unreachable",
+            "question_id": "SYNC_OBSERVE_RPC_URL",
+            "edge_type": "manual_input",
+            "action_type": "answer_pending",
+            "expected_admitted": False,
+            "expected_postcondition": {
+                "field": "SYNC_OBSERVE_RPC_URL",
+                "path": "endpoint_evidence.sync_rpc_url_ready",
+                "rejection_value": False,
+            },
+        }
+        contract = {
+            "id": "SYNC_OBSERVE_RPC_URL",
+            "accepted_action_types": ["answer_pending"],
+            "evidence_path": "endpoint_evidence.sync_rpc_url_ready",
+            "rejection_evidence_value": False,
+        }
+        baseline = replace(
+            self._event(1, "a" * 64, "b" * 64, "SYNC_OBSERVE_RPC_URL"),
+            pending_contract=contract,
+            after_value_hashes={},
+        )
+        committed = replace(
+            self._event(2, "b" * 64, "c" * 64, "SYNC_OBSERVE_RPC_URL"),
+            pending_contract=contract,
+            admitted_action_types=(),
+            state_diff_hashes={
+                "endpoint_evidence.sync_rpc_url_ready": {
+                    "before": "",
+                    "after": "d" * 64,
+                }
+            },
+            after_value_hashes={
+                "endpoint_evidence.sync_rpc_url_ready": content_hash(False),
+            },
+        )
+
+        verified = verify_runtime_postcondition(edge, baseline, committed, None)  # type: ignore[arg-type]
+        self.assertTrue(verified.passed, verified.details)
+
+        wrong_value = replace(
+            committed,
+            after_value_hashes={
+                "endpoint_evidence.sync_rpc_url_ready": content_hash(True),
+            },
+        )
+        rejected = verify_runtime_postcondition(edge, baseline, wrong_value, None)  # type: ignore[arg-type]
+        self.assertFalse(rejected.passed)
+        self.assertIn("declared evidence", " ".join(rejected.details["errors"]))
+
     def test_manual_chain_edge_verifies_chain_owner_state(self) -> None:
         edge = {
             **EDGE,

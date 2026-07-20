@@ -1269,7 +1269,15 @@ def verify_runtime_postcondition(
             after_hashes = _path_value_hashes(committed.after_value_hashes, path)
             before_hashes = _path_value_hashes(baseline.after_value_hashes, path)
             if rejection_expected:
-                if after_hashes != before_hashes:
+                if "rejection_value" in expected and not _postcondition_value_matches(
+                    committed.after_value_hashes,
+                    path,
+                    expected["rejection_value"],
+                ):
+                    errors.append(
+                        f"rejected manual input did not record declared evidence: {path}"
+                    )
+                elif "rejection_value" not in expected and after_hashes != before_hashes:
                     errors.append(f"rejected manual input changed the destination field: {path}")
                 if committed.pending_question_id != baseline.pending_question_id:
                     errors.append("rejected manual input did not preserve the pending question")

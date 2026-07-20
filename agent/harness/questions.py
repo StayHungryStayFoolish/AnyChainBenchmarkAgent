@@ -33,6 +33,7 @@ def manual_question(
     help_text: str = "",
     completion_effect: str = "",
     evidence_path: str = "",
+    rejection_evidence_value: Any = None,
 ) -> dict[str, Any]:
     field_validation = _question_validation(kind, validation)
     return {
@@ -51,6 +52,11 @@ def manual_question(
         "help_text": str(help_text or "").strip(),
         "completion_effect": str(completion_effect or "").strip(),
         "evidence_path": str(evidence_path or "").strip(),
+        **(
+            {"rejection_evidence_value": rejection_evidence_value}
+            if rejection_evidence_value is not None
+            else {}
+        ),
     }
 
 
@@ -70,6 +76,7 @@ def choice_question(
     help_text: str = "",
     completion_effect: str = "",
     evidence_path: str = "",
+    rejection_evidence_value: Any = None,
 ) -> dict[str, Any]:
     contracts: list[OptionContract] = []
     rendered: list[dict[str, Any]] = []
@@ -149,6 +156,11 @@ def choice_question(
         "help_text": str(help_text or "").strip(),
         "completion_effect": str(completion_effect or "").strip(),
         "evidence_path": str(evidence_path or "").strip(),
+        **(
+            {"rejection_evidence_value": rejection_evidence_value}
+            if rejection_evidence_value is not None
+            else {}
+        ),
     }
 
 

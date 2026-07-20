@@ -136,6 +136,11 @@ def contract_variant_payload(question: Mapping[str, Any]) -> dict[str, Any]:
         "validation": dict(question.get("validation") or {}),
         "requires_capabilities": sorted(str(item) for item in question.get("requires_capabilities") or []),
         "evidence_path": str(question.get("evidence_path") or ""),
+        **(
+            {"rejection_evidence_value": question["rejection_evidence_value"]}
+            if "rejection_evidence_value" in question
+            else {}
+        ),
         "options": options,
     }
 
@@ -777,6 +782,11 @@ def build_ledger(
                         "field": field,
                         "path": postcondition_path,
                         "next_question_ids": next_question_ids,
+                        **(
+                            {"rejection_value": contract["rejection_evidence_value"]}
+                            if "rejection_evidence_value" in contract
+                            else {}
+                        ),
                     },
                     deterministic_case_available=concrete_case is not None,
                     expected_admitted=(

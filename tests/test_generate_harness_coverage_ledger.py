@@ -119,6 +119,23 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
                 for edge in edges
             ), question_id)
 
+    def test_endpoint_rejection_evidence_is_declared_by_question_contract(self) -> None:
+        for question_id in ("LOCAL_RPC_URL", "SYNC_OBSERVE_RPC_URL"):
+            edge = next(
+                item for item in self.ledger["edges"]
+                if item["question_id"] == question_id
+                and item["input_class"] == "unreachable_or_mismatched_url"
+            )
+            self.assertFalse(edge["expected_admitted"])
+            self.assertIs(edge["expected_postcondition"]["rejection_value"], False)
+
+        ordinary = next(
+            item for item in self.ledger["edges"]
+            if item["question_id"] == "ACCOUNTS_VOL_MAX_IOPS"
+            and item["expected_admitted"] is False
+        )
+        self.assertNotIn("rejection_value", ordinary["expected_postcondition"])
+
     def test_structured_environment_paste_enters_review_gate(self) -> None:
         for question_id, field in (
             ("CLOUD_REGION", "CLOUD_REGION"),
