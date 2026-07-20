@@ -82,6 +82,7 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
         raw_response = _recover_omitted_chain_selection(provider, raw_response, state)
         raw_response = _apply_state_plan_policy(raw_response, state)
         raw_response = _reconcile_structured_candidate_ownership(raw_response, clauses, state)
+        raw_response = _remove_empty_config_proposals(raw_response)
         raw_response = _normalize_prose_pending_field_proposal(
             raw_response,
             state,
@@ -162,6 +163,7 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
             raw_response = _recover_omitted_chain_selection(provider, raw_response, state)
             raw_response = _apply_state_plan_policy(raw_response, state)
             raw_response = _reconcile_structured_candidate_ownership(raw_response, clauses, state)
+            raw_response = _remove_empty_config_proposals(raw_response)
             raw_response = _normalize_prose_pending_field_proposal(
                 raw_response,
                 state,
@@ -871,6 +873,7 @@ def _recover_declared_pending_option_semantics(
     admitted_indexes = preexisting_admitted_indexes
     candidate_ids = {row["unit_id"] for row in candidates}
     anchors: list[dict[str, Any]] = []
+    manual_anchors: list[dict[str, Any]] = []
     for unit in units:
         if not isinstance(unit, dict):
             continue
@@ -890,15 +893,35 @@ def _recover_declared_pending_option_semantics(
         action = actions[indexes[0]]
         source = str(unit.get("source_text") or "")
         evidence_quote = str(action.get("source_evidence") or "").strip()
+        declared_option = _declared_option_for_pending_answer(action, pending)
         selected = next(
             (
                 option
                 for option in available
-                if _same_declared_pending_effect(action, dict(option["declared_action"]))
+                if (
+                    declared_option
+                    and option.get("value") == declared_option.get("value")
+                )
+                or _same_declared_pending_effect(action, dict(option["declared_action"]))
             ),
             None,
         )
-        if selected is None or not source or not evidence_quote or evidence_quote not in source:
+        if selected is None:
+            answer = str(action.get("answer") or "").strip()
+            if (
+                manual_allowed
+                and str(action.get("type") or "") == "answer_pending"
+                and answer_fits_pending(answer, pending)
+                and _manual_answer_has_literal_source(action, source)
+            ):
+                manual_anchors.append({
+                    "unit_id": unit_id,
+                    "answer": answer,
+                    "source_text": source,
+                    "evidence_quote": evidence_quote,
+                })
+            continue
+        if not source or not evidence_quote or evidence_quote not in source:
             continue
         anchors.append({
             "unit_id": unit_id,
@@ -907,6 +930,8 @@ def _recover_declared_pending_option_semantics(
             "evidence_quote": evidence_quote,
         })
     if len({row["option_id"] for row in anchors}) > 1:
+        return plan_text, False
+    if len({row["answer"] for row in manual_anchors}) > 1:
         return plan_text, False
 
     complete_turn_text = str(user_text or "").strip() or " ".join(
@@ -932,8 +957,11 @@ def _recover_declared_pending_option_semantics(
         "A constraint that requests any additional mutation, navigation, or conflicting value remains independent. "
         "Do not select from a question, explanation request, contradiction, ambiguity, or a request for "
         "another option. evidence_quote must be a non-empty exact substring of complete_turn_text that proves the "
-        "selection or manual value. An admitted_anchor is a read-only binding already admitted by its dedicated "
-        "owner; a new selection may only agree with it. supporting_unit_ids must contain every candidate unit used "
+        "selection or manual value. An admitted_anchor is a read-only option binding already admitted by its "
+        "dedicated owner; a new selection may only agree with it. An admitted_manual_anchor is an already admitted "
+        "source-grounded manual "
+        "value; manual_value may only agree with its answer, and scope-only candidate units may support it without "
+        "creating another mutation. supporting_unit_ids must contain every candidate unit used "
         "solely for this finite decision. independent_unit_ids must contain every remaining candidate unit with a "
         "separate present request, group jump, question, mutation, or evidence payload for unrestricted planning. "
         "The two lists must be disjoint and partition all candidate units. Use no_selection when the turn does not "
@@ -950,6 +978,7 @@ def _recover_declared_pending_option_semantics(
         },
         "available_options": available,
         "admitted_anchors": anchors,
+        "admitted_manual_anchors": manual_anchors,
         "complete_turn_text": complete_turn_text,
         "complete_turn": [clause.as_dict() for clause in clauses],
         "units": candidates,
@@ -998,21 +1027,31 @@ def _recover_declared_pending_option_semantics(
     ):
         return plan_text, False
     quote = str(result.get("evidence_quote") or "").strip()
+    quote_candidate_owner = next(
+        (
+            unit_id
+            for unit_id in supporting
+            if quote and quote in candidate_sources[unit_id]
+        ),
+        "",
+    )
+    quote_is_anchor = any(
+        quote and quote in str(anchor.get("source_text") or "")
+        for anchor in (*anchors, *manual_anchors)
+    )
     if (
         not quote
         or quote not in complete_turn_text
-        or not any(quote in candidate_sources[unit_id] for unit_id in supporting)
+        or (not quote_candidate_owner and not quote_is_anchor)
     ):
         return plan_text, False
-    owner_unit_id = next(
-        unit_id for unit_id in supporting if quote in candidate_sources[unit_id]
-    )
+    owner_unit_id = quote_candidate_owner
     accepted: dict[str, tuple[dict[str, Any], str]] = {}
     accepted_manual: dict[str, tuple[str, str]] = {}
     accepted_context: dict[str, str] = {}
     if decision == "select_option":
         selected = available_by_id.get(str(result.get("option_id") or ""))
-        if selected is None:
+        if selected is None or manual_anchors:
             return plan_text, False
         anchor_options = {row["option_id"] for row in anchors}
         if anchor_options and anchor_options != {selected["option_id"]}:
@@ -1020,6 +1059,8 @@ def _recover_declared_pending_option_semantics(
         if anchor_options:
             accepted_context.update({unit_id: candidate_sources[unit_id] for unit_id in supporting})
         else:
+            if not owner_unit_id:
+                return plan_text, False
             accepted[owner_unit_id] = (selected, quote)
             accepted_context.update({
                 unit_id: candidate_sources[unit_id]
@@ -1033,18 +1074,27 @@ def _recover_declared_pending_option_semantics(
             or anchors
             or not answer
             or not answer_fits_pending(answer, pending)
-            or not _manual_answer_has_literal_source(
-                {"answer": answer, "source_evidence": quote},
-                candidate_sources[owner_unit_id],
-            )
         ):
             return plan_text, False
-        accepted_manual[owner_unit_id] = (answer, quote)
-        accepted_context.update({
-            unit_id: candidate_sources[unit_id]
-            for unit_id in supporting
-            if unit_id != owner_unit_id
-        })
+        if manual_anchors:
+            if {row["answer"] for row in manual_anchors} != {answer}:
+                return plan_text, False
+            accepted_context.update({
+                unit_id: candidate_sources[unit_id]
+                for unit_id in supporting
+            })
+        else:
+            if not owner_unit_id or not _manual_answer_has_literal_source(
+                {"answer": answer, "source_evidence": quote},
+                candidate_sources[owner_unit_id],
+            ):
+                return plan_text, False
+            accepted_manual[owner_unit_id] = (answer, quote)
+            accepted_context.update({
+                unit_id: candidate_sources[unit_id]
+                for unit_id in supporting
+                if unit_id != owner_unit_id
+            })
 
     recovered_actions = [dict(item) for item in actions if isinstance(item, dict)]
     replaced_indexes: set[int] = set()
@@ -1623,6 +1673,26 @@ def _normalize_prose_pending_field_proposal(
     }
     payload["actions"] = actions
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _remove_empty_config_proposals(text: str) -> str:
+    """Remove proposal actions that own no mapped, unmapped, or conflicting fact."""
+
+    payload = _parse_json_object(text)
+    actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    empty_indexes = tuple(
+        index
+        for index, action in enumerate(actions)
+        if isinstance(action, dict)
+        and str(action.get("type") or "") == "propose_config_values"
+        and not action.get("config_values")
+        and not action.get("unmapped_values")
+        and not action.get("conflicts")
+    )
+    if not empty_indexes:
+        return text
+    normalized, _ = _remove_action_indexes(text, empty_indexes)
+    return normalized
 
 
 def _reconstruct_missing_semantic_units(

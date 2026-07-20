@@ -7435,6 +7435,69 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
 
         self.assertEqual(json.loads(normalized), payload)
 
+    def test_empty_config_proposal_cannot_steal_direct_pending_answer(self) -> None:
+        from agent.harness.intent import _remove_empty_config_proposals
+
+        payload = {
+            "actions": [
+                {
+                    "type": "answer_pending",
+                    "answer": "run-secret-4821",
+                    "source_evidence": "run-secret-4821",
+                },
+                {
+                    "type": "propose_config_values",
+                    "config_values": {},
+                    "unmapped_values": {},
+                    "conflicts": [],
+                    "source_evidence": "Use it only for this run.",
+                },
+            ],
+            "semantic_units": [
+                {
+                    "unit_id": "clause-1",
+                    "clause_id": "clause-1",
+                    "source_text": "The credential is run-secret-4821.",
+                    "disposition": "action",
+                    "action_indexes": [0],
+                    "reason": "answers the pending field",
+                },
+                {
+                    "unit_id": "clause-2",
+                    "clause_id": "clause-2",
+                    "source_text": "Use it only for this run.",
+                    "disposition": "action",
+                    "action_indexes": [1],
+                    "reason": "planner attached an empty proposal",
+                },
+            ],
+        }
+
+        normalized = json.loads(_remove_empty_config_proposals(json.dumps(payload)))
+
+        self.assertEqual(normalized["actions"], [payload["actions"][0]])
+        self.assertEqual(normalized["semantic_units"][0]["action_indexes"], [0])
+        self.assertEqual(normalized["semantic_units"][1]["action_indexes"], [])
+        self.assertEqual(normalized["semantic_units"][1]["disposition"], "unresolved")
+
+    def test_nonempty_config_proposal_is_not_removed(self) -> None:
+        from agent.harness.intent import _remove_empty_config_proposals
+
+        payload = {
+            "actions": [{
+                "type": "propose_config_values",
+                "config_values": {"NETWORK_INTERFACE": "eth0"},
+                "unmapped_values": {},
+                "conflicts": [],
+            }],
+            "semantic_units": [],
+        }
+
+        self.assertEqual(
+            json.loads(_remove_empty_config_proposals(json.dumps(payload))),
+            payload,
+        )
+
     def test_declared_pending_semantic_rejects_unregistered_match(self) -> None:
         import json
         from types import SimpleNamespace
@@ -8822,6 +8885,70 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
             "source_evidence": "/dev/nvme1n1",
         }])
         self.assertEqual(recovered["semantic_units"][0]["action_indexes"], [0])
+
+    def test_declared_pending_semantic_attaches_scope_to_admitted_manual_anchor(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.state import new_state
+
+        source = (
+            "The credential is run-secret-4821.\n"
+            "Use it only for this run without changing the saved template."
+        )
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": "run-secret-4821",
+                "source_evidence": "run-secret-4821",
+            }],
+            "pending_answer_admissions": [0],
+            "semantic_units": [
+                _unit(clauses[0], 1, [0]),
+                {
+                    **_unit(clauses[1], 2, []),
+                    "disposition": "unresolved",
+                },
+            ],
+        }
+        state = new_state("manual-anchor-scope", language="en")
+        state["pending_question"] = {
+            "id": "RUNTIME_CREDENTIAL",
+            "group": "chain_auxiliary_endpoints",
+            "field": "RUNTIME_CREDENTIAL",
+            "kind": "manual_value",
+            "prompt": "Enter the runtime credential.",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "scalar_token", "max_length": 180},
+            "options": [],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "decision": "manual_value",
+            "answer": "run-secret-4821",
+            "evidence_quote": "run-secret-4821",
+            "supporting_unit_ids": ["unit-2"],
+            "independent_unit_ids": [],
+            "reason": "the second unit only scopes the admitted value",
+        }))
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            clauses=clauses,
+            user_text=source,
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(recovered["actions"], payload["actions"])
+        self.assertEqual(recovered["pending_answer_admissions"], [0])
+        self.assertEqual(recovered["semantic_units"][0]["action_indexes"], [0])
+        self.assertEqual(recovered["semantic_units"][1]["disposition"], "context")
+        self.assertEqual(recovered["semantic_units"][1]["action_indexes"], [])
 
     def test_structured_pending_config_assignment_is_owned_by_review_proposal(self) -> None:
         from agent.harness.intent import _reconcile_structured_candidate_ownership
