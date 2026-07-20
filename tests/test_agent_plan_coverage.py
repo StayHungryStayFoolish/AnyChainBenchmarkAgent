@@ -284,6 +284,128 @@ class PlanCoverageTest(unittest.TestCase):
             self.assertEqual(question["id"], "SYNC_OBSERVE_RPC_URL")
             for fragment in expected:
                 self.assertIn(fragment, question["prompt"])
+            self.assertTrue(question["completion_effect"])
+            self.assertIn(
+                "探测" if language == "zh" else "probe",
+                question["completion_effect"],
+            )
+
+    def test_every_probe_owned_endpoint_question_declares_completion_effect(self) -> None:
+        from tests.agent_live.harness_contract_scenarios import question_scenarios
+
+        expected = {
+            "LOCAL_RPC_URL",
+            "SYNC_OBSERVE_RPC_URL",
+            "custom_rpc_endpoint",
+            "new_chain_endpoint",
+        }
+        questions = {
+            str(scenario.question.get("id") or ""): scenario.question
+            for scenario in question_scenarios("en")
+            if str(scenario.question.get("id") or "") in expected
+        }
+
+        self.assertEqual(set(questions), expected)
+        for question_id, question in questions.items():
+            with self.subTest(question_id=question_id):
+                self.assertIn("probe", str(question.get("completion_effect") or ""))
+
+    def test_pending_completion_effect_is_available_to_context_admission(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _validate_semantic_fulfillment
+        from agent.harness.state import new_state
+
+        source = (
+            "The syncing node is reachable inside Docker.\n"
+            "Use http://geth-dev:8545 as its observation RPC endpoint.\n"
+            "Please validate it before continuing."
+        )
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": "http://geth-dev:8545",
+                "source_evidence": "http://geth-dev:8545",
+            }],
+            "semantic_units": [
+                _unit(clauses[0], 1, [], disposition="context", reason="endpoint provenance"),
+                _unit(clauses[1], 2, [0]),
+                _unit(clauses[2], 3, [], disposition="context", reason="declared completion scope"),
+            ],
+            "pending_answer_admissions": [0],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "context_reviews": [
+                {"unit_id": "unit-1", "context_only": True, "reason": "provenance"},
+                {"unit_id": "unit-3", "context_only": True, "reason": "the probe is the declared completion effect"},
+            ],
+        }))
+        state = new_state("pending-completion-context", language="en")
+        state["pending_question"] = {
+            "id": "SYNC_OBSERVE_RPC_URL",
+            "field": "SYNC_OBSERVE_RPC_URL",
+            "kind": "url",
+            "manual_input_allowed": True,
+            "options": [],
+            "completion_effect": "Probe this endpoint and record validation evidence before continuing.",
+        }
+
+        result = _validate_semantic_fulfillment(provider, json.dumps(payload), clauses, state)
+
+        self.assertTrue(result.valid, result.errors)
+        request = json.loads(provider.complete.call_args.args[0].messages[1].content)
+        self.assertEqual(
+            request["pending_question"]["completion_effect"],
+            state["pending_question"]["completion_effect"],
+        )
+
+    def test_unrelated_request_remains_outside_pending_completion_effect(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _validate_semantic_fulfillment
+        from agent.harness.state import new_state
+
+        clauses = segment_user_turn("Use http://geth-dev:8545. Also switch the benchmark to fake-node.")
+        payload = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": "http://geth-dev:8545",
+                "source_evidence": "http://geth-dev:8545",
+            }],
+            "semantic_units": [
+                _unit(clauses[0], 1, [0]),
+                _unit(clauses[1], 2, [], disposition="context", reason="claimed completion scope"),
+            ],
+            "pending_answer_admissions": [0],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "context_reviews": [{
+                "unit_id": "unit-2",
+                "context_only": False,
+                "reason": "target-mode change is not the endpoint probe completion effect",
+            }],
+        }))
+        state = new_state("pending-completion-reject", language="en")
+        state["pending_question"] = {
+            "id": "SYNC_OBSERVE_RPC_URL",
+            "field": "SYNC_OBSERVE_RPC_URL",
+            "kind": "url",
+            "manual_input_allowed": True,
+            "options": [],
+            "completion_effect": "Probe this endpoint and record validation evidence before continuing.",
+        }
+
+        result = _validate_semantic_fulfillment(provider, json.dumps(payload), clauses, state)
+
+        self.assertFalse(result.valid)
+        self.assertIn("context semantic unit unit-2 admission failed", "\n".join(result.errors))
 
     def test_same_clause_manual_field_is_folded_into_atomic_config_review(self) -> None:
         from agent.harness.intent import _merge_pending_manual_answer_into_config_proposal
@@ -5191,6 +5313,7 @@ class PlanCoverageTest(unittest.TestCase):
                 json.dumps(model_replacement),
                 (clause,),
                 new_state("final-structured-authority", language="en"),
+                source,
                 valid,
             )
 
@@ -5204,6 +5327,104 @@ class PlanCoverageTest(unittest.TestCase):
             "CLOUD_PROVIDER": "gcp",
             "OWNER_TICKET": "INC-4821",
         })
+
+    def test_final_input_authority_restores_prose_pending_owner_after_model_recovery(self) -> None:
+        import json
+        from unittest.mock import Mock, patch
+
+        from agent.harness.intent import _finalize_structured_syntax_authority
+        from agent.harness.plan_coverage import PlanCoverageResult, segment_user_turn
+        from agent.harness.state import new_state
+
+        source = (
+            "The node is exposed at http://geth-dev:8545.\n"
+            "Treat that as LOCAL_RPC_URL, but probe it before trust."
+        )
+        clauses = segment_user_turn(source)
+        model_replacement = {
+            "actions": [{
+                "type": "propose_config_values",
+                "config_values": {"LOCAL_RPC_URL": "http://geth-dev:8545"},
+                "unmapped_values": {},
+                "conflicts": [],
+                "source_format": "mixed",
+                "source_evidence": source,
+            }],
+            "semantic_units": [
+                _unit(clauses[0], 1, [0]),
+                _unit(clauses[1], 2, [0]),
+            ],
+        }
+        state = new_state("final-prose-owner", language="en")
+        state["pending_question"] = {
+            "id": "LOCAL_RPC_URL",
+            "group": "endpoint_process",
+            "field": "LOCAL_RPC_URL",
+            "kind": "url",
+            "manual_input_allowed": True,
+            "options": [],
+        }
+        valid = PlanCoverageResult(True, (), ())
+
+        with patch("agent.harness.intent._validate_semantic_fulfillment", return_value=valid):
+            finalized_text, validation = _finalize_structured_syntax_authority(
+                Mock(),
+                json.dumps(model_replacement),
+                clauses,
+                state,
+                source,
+                valid,
+            )
+
+        finalized = json.loads(finalized_text)
+        self.assertTrue(validation.valid, validation.errors)
+        self.assertEqual(finalized["actions"], [{
+            "type": "answer_pending",
+            "answer": "http://geth-dev:8545",
+            "source_evidence": "http://geth-dev:8545",
+        }])
+
+    def test_final_input_authority_keeps_multifield_prose_proposal_for_review(self) -> None:
+        import json
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _finalize_structured_syntax_authority
+        from agent.harness.plan_coverage import PlanCoverageResult, segment_user_turn
+        from agent.harness.state import new_state
+
+        source = "Use http://geth-dev:8545 and set the region to us-west-2."
+        clauses = segment_user_turn(source)
+        proposal = {
+            "actions": [{
+                "type": "propose_config_values",
+                "config_values": {
+                    "LOCAL_RPC_URL": "http://geth-dev:8545",
+                    "CLOUD_REGION": "us-west-2",
+                },
+                "unmapped_values": {},
+                "conflicts": [],
+                "source_format": "prose",
+                "source_evidence": source,
+            }],
+            "semantic_units": [_unit(clauses[0], 1, [0])],
+        }
+        state = new_state("final-multifield-owner", language="en")
+        state["pending_question"] = {
+            "id": "LOCAL_RPC_URL",
+            "group": "endpoint_process",
+            "field": "LOCAL_RPC_URL",
+            "kind": "url",
+            "manual_input_allowed": True,
+            "options": [],
+        }
+        valid = PlanCoverageResult(True, (), ())
+
+        finalized_text, validation = _finalize_structured_syntax_authority(
+            Mock(), json.dumps(proposal), clauses, state, source, valid
+        )
+
+        self.assertTrue(validation.valid)
+        self.assertEqual(json.loads(finalized_text)["actions"], proposal["actions"])
 
     def test_missing_semantic_units_are_reconstructed_without_changing_actions(self) -> None:
         import json

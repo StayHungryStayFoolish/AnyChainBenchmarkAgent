@@ -74,7 +74,7 @@ __all__ = [
 
 from .chain_handoff import (_prepare_case2_handoff, _prepare_case3_handoff, _promote_case2_endpoint, _record_case3_evidence)
 from .chain_identity import (_apply_chain_candidate, _apply_chain_change_decision, _apply_unknown_chain_decision, _chain_ambiguity_question, _confirm_custom_rpc_family, _enter_case_for_adapter_family, _identity_confirmation_question, _origin_text, _preserve_same_chain, _request_chain_change, _request_target_mode_change, _resolution_from_arguments, _target_mode_is_explicit)
-from .chain_rpc_questions import (_action_option, _adapter_family_question, _answer_option, _case3_evidence_question, _chain_question, _choice, _endpoint_validation_question, _mainnet_review_question, _target_change_scope_question, _target_mode_selection_question)
+from .chain_rpc_questions import (_action_option, _adapter_family_question, _answer_option, _case3_evidence_question, _chain_question, _choice, _endpoint_probe_completion, _endpoint_validation_question, _mainnet_review_question, _target_change_scope_question, _target_mode_selection_question)
 from .chain_rpc_support import (_adapter_family, _answer_result, _chain_confirmed, _chain_rpc_draft, _handoff_stops, _invalidate_execution, _invalidate_groups, _next_group, _result, _set_control, _workload_default_prompt, is_existing_family_lifecycle)
 from .rpc_endpoint import (
     _apply_endpoint_answer,
@@ -132,6 +132,7 @@ def question_for_chain_rpc(state: AgentGraphState, group: str) -> dict[str, Any]
                 kind="url",
                 evidence_path="endpoint_evidence.local_rpc_url_ready",
                 rejection_evidence_value=False,
+                completion_effect=_endpoint_probe_completion(language),
             )
         if state.get("target_mode") == "real-node" and not confirmed.get("BLOCKCHAIN_PROCESS_NAMES"):
             return manual_question(
@@ -165,6 +166,7 @@ def question_for_chain_rpc(state: AgentGraphState, group: str) -> dict[str, Any]
                 kind="url",
                 evidence_path="endpoint_evidence.sync_rpc_url_ready",
                 rejection_evidence_value=False,
+                completion_effect=_endpoint_probe_completion(language),
             )
         if (
             state.get("workflow_mode") == "sync_observe"

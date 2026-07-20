@@ -19,7 +19,10 @@ from .action_registry import (
     validate_action_contract,
 )
 from .context import action_schema, build_action_resolver_prompt, group_schema, workflow_snapshot
-from .domains.environment import CONFIRMABLE_CONFIG_FIELDS, extract_structured_input_candidates
+from .domains.environment import (
+    CONFIG_PROPOSAL_FIELDS,
+    extract_structured_input_candidates,
+)
 from .input_values import target_mode_evidence_matches
 from .plan_coverage import PlanCoverageResult, TurnClause, segment_user_turn, validate_plan_coverage
 from .questions import (
@@ -140,6 +143,7 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
             raw_response,
             clauses,
             state,
+            text,
             validation,
         )
         if not validation.valid:
@@ -223,6 +227,7 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
                 raw_response,
                 clauses,
                 state,
+                text,
                 validation,
             )
         if not validation.valid:
@@ -320,19 +325,28 @@ def _finalize_structured_syntax_authority(
     plan_text: str,
     clauses: tuple[TurnClause, ...],
     state: AgentGraphState,
+    user_text: str,
     validation: PlanCoverageResult,
 ) -> tuple[str, PlanCoverageResult]:
-    """Restore lossless structured facts after all model-backed recovery.
+    """Restore deterministic input ownership after all model-backed recovery.
 
     Inventory challenges and bounded semantic recovery may replace an action
     document that was canonicalized earlier in the pipeline. Syntax-derived
     structured candidates are immutable facts once the model has assigned the
-    clause to a configuration proposal, so replay their ownership at the final
-    admission boundary and validate the resulting transaction again.
+    clause to a configuration proposal. A prose-only proposal for exactly the
+    active manual field likewise belongs to that finite pending owner. Replay
+    both contracts at the final admission boundary and validate the resulting
+    transaction again.
     """
 
     canonical = _reconcile_structured_candidate_ownership(plan_text, clauses, state)
     canonical = _remove_empty_config_proposals(canonical)
+    canonical = _normalize_prose_pending_field_proposal(
+        canonical,
+        state,
+        clauses,
+        user_text,
+    )
     if canonical == plan_text:
         return plan_text, validation
     canonical_validation = _validate_action_document(canonical, clauses, state)
@@ -1723,7 +1737,7 @@ def _normalize_prose_pending_field_proposal(
     pending_field = str(pending.get("field") or "").strip().upper()
     if (
         pending.get("manual_input_allowed") is not True
-        or pending_field not in CONFIRMABLE_CONFIG_FIELDS
+        or pending_field not in CONFIG_PROPOSAL_FIELDS
         or not clauses
         or any(clause.input_shape != "prose" for clause in clauses)
     ):
@@ -2205,6 +2219,7 @@ def _validate_semantic_fulfillment(
             "id": str(pending.get("id") or ""),
             "field": str(pending.get("field") or ""),
             "kind": str(pending.get("kind") or ""),
+            "completion_effect": str(pending.get("completion_effect") or ""),
             "options": [
                 {
                     "id": str(option.get("id") or ""),
@@ -3673,7 +3688,7 @@ def _merge_pending_manual_answer_into_config_proposal(
     pending_field = str(pending.get("field") or "").strip().upper()
     if (
         pending.get("manual_input_allowed") is not True
-        or pending_field not in CONFIRMABLE_CONFIG_FIELDS
+        or pending_field not in CONFIG_PROPOSAL_FIELDS
     ):
         return text, False
 
@@ -5441,7 +5456,7 @@ def _semantic_fulfillment_prompt(*, review_kind: str = "both") -> str:
         )
     return (
         output_contract
-        + "For context_reviews, context_only is true only when source_text is prose containing background, provenance, or a tentative future possibility and contains no present request, answer, question, selection, correction, contradiction, mutation, navigation, evidence submission, or execution instruction. A statement that answers the supplied pending_question is not context. input_shape must be prose. planner_reason is untrusted and cannot establish the verdict. Missing or ambiguous intent is false. "
+        + "For context_reviews, context_only is true only when source_text is prose containing background, provenance, a tentative future possibility, or processing scope that requests only an inevitable completion_effect explicitly declared by the supplied pending_question for the same pending answer. Such declared completion scope adds no independent operation. Without a non-empty matching completion_effect, a present request, answer, question, selection, correction, contradiction, mutation, navigation, evidence submission, or execution instruction is not context. A request involving another value, endpoint, target, validation subject, group, or effect is independent and therefore false. A statement that answers the supplied pending_question is not context. input_shape must be prose. planner_reason is untrusted and cannot establish the verdict. Missing or ambiguous intent is false. "
         "Operations are opaque, already-registered Harness operations. Internal operation names are intentionally absent because registration, lifecycle, ordering, and choose-versus-change selection are deterministic Harness responsibilities. Never infer or discuss an internal operation name and never reject a purpose on registry or lifecycle grounds. Decide only whether the exact source_units "
         "semantically and explicitly support the declared purpose and its supplied arguments. Workflow state "
         "and a pending question are context, never user evidence. For unit_reviews, ignore pending_question entirely: "

@@ -18,6 +18,17 @@ from agent.validators.rpc_workload import default_workload
 from .chain_rpc_support import _case_dict, _schema_confirmation_prompt, _weight_example
 from .rpc_catalog import catalog_method_names, draft_view, next_parameter_to_confirm
 
+
+def _endpoint_probe_completion(language: str) -> str:
+    """Describe the runtime-owned validation that follows endpoint intake."""
+
+    return localized(
+        language,
+        "提交后，Agent 会先对该 endpoint 执行低速探测并记录验证证据；验证成功后才继续，失败时会保留失败证据并要求更正。",
+        "After submission, the Agent will run a low-rate probe and record validation evidence for this endpoint. It continues only after validation succeeds; a failure is retained as evidence and the endpoint must be corrected.",
+    )
+
+
 def _endpoint_validation_question(state: AgentGraphState) -> dict[str, Any] | None:
     language = str(state.get("language") or "en")
     custom = state.get("custom_rpc") or {}
@@ -39,6 +50,7 @@ def _endpoint_validation_question(state: AgentGraphState) -> dict[str, Any] | No
             queue_barrier=True,
             requires_capabilities=("chain_identity",),
             evidence_path="custom_rpc.endpoint",
+            completion_effect=_endpoint_probe_completion(language),
         )
     if custom.get("status") == "needs_method" and not draft_view(state).get("method"):
         return manual_question(
@@ -90,7 +102,22 @@ def _endpoint_validation_question(state: AgentGraphState) -> dict[str, Any] | No
         return _weights_question(state, "custom_rpc")
     evidence = state.get("endpoint_evidence") or {}
     if identity.get("status") == "existing_family_needs_endpoint" and not evidence.get("candidate_endpoint_ready"):
-        return manual_question("endpoint_process", "new_chain_endpoint", localized(language, "请提供可访问的 RPC endpoint，用于验证该新链和 RPC method。", "Provide a reachable RPC endpoint to validate this new chain and RPC methods."), field="new_chain_endpoint", kind="url", accepted_action_types=("rpc_catalog_command",), queue_barrier=True, requires_capabilities=("chain_identity",), evidence_path="endpoint_evidence.candidate_endpoint")
+        return manual_question(
+            "endpoint_process",
+            "new_chain_endpoint",
+            localized(
+                language,
+                "请提供可访问的 RPC endpoint，用于验证该新链和 RPC method。",
+                "Provide a reachable RPC endpoint to validate this new chain and RPC methods.",
+            ),
+            field="new_chain_endpoint",
+            kind="url",
+            accepted_action_types=("rpc_catalog_command",),
+            queue_barrier=True,
+            requires_capabilities=("chain_identity",),
+            evidence_path="endpoint_evidence.candidate_endpoint",
+            completion_effect=_endpoint_probe_completion(language),
+        )
     if identity.get("status") == "existing_family_needs_method":
         return manual_question(
             "endpoint_process",

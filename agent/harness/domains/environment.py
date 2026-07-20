@@ -48,6 +48,9 @@ SPECIAL_CONFIG_FIELDS = {
     "SYNC_OBSERVE_STOP_CONDITION",
     "SYNC_OBSERVE_DURATION_SECONDS",
 }
+CONFIG_PROPOSAL_FIELDS = (
+    CONFIRMABLE_CONFIG_FIELDS | PROPOSED_ENDPOINT_FIELDS | SPECIAL_CONFIG_FIELDS
+)
 WORKFLOW_DIMENSION_FIELDS = {
     "CHAIN",
     "BLOCKCHAIN_NODE",
@@ -134,7 +137,7 @@ def _mapped_config_field(key: Any) -> str:
     text = str(key or "").strip()
     if not text:
         return ""
-    allowed = CONFIRMABLE_CONFIG_FIELDS | PROPOSED_ENDPOINT_FIELDS | SPECIAL_CONFIG_FIELDS
+    allowed = CONFIG_PROPOSAL_FIELDS
     normalized = text.upper()
     alias = _CONFIG_ALIASES.get(text.lower().replace("-", "_"))
     if normalized in allowed:
@@ -170,7 +173,7 @@ def build_config_proposal(action: dict[str, Any]) -> dict[str, Any]:
     raw_values = action.get("config_values") if isinstance(action.get("config_values"), dict) else {}
     config_values: dict[str, Any] = {}
     unmapped: dict[str, Any] = {}
-    allowed = CONFIRMABLE_CONFIG_FIELDS | PROPOSED_ENDPOINT_FIELDS | SPECIAL_CONFIG_FIELDS
+    allowed = CONFIG_PROPOSAL_FIELDS
     for key, value in raw_values.items():
         normalized_key = str(key or "").strip().upper()
         mapped_key, mapped_value = normalize_proposed_config_value(normalized_key, value)
@@ -668,7 +671,7 @@ def parse_known_config_assignments(text: str) -> dict[str, Any]:
     """Parse only explicit known AnyChain assignments from terminal input."""
 
     values: dict[str, Any] = {}
-    allowed = CONFIRMABLE_CONFIG_FIELDS | PROPOSED_ENDPOINT_FIELDS | SPECIAL_CONFIG_FIELDS
+    allowed = CONFIG_PROPOSAL_FIELDS
     for raw_line in str(text or "").splitlines():
         line = raw_line.strip()
         if not line:
