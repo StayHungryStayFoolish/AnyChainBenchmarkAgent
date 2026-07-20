@@ -82,6 +82,12 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
         raw_response = _recover_omitted_chain_selection(provider, raw_response, state)
         raw_response = _apply_state_plan_policy(raw_response, state)
         raw_response = _reconcile_structured_candidate_ownership(raw_response, clauses, state)
+        raw_response = _normalize_prose_pending_field_proposal(
+            raw_response,
+            state,
+            clauses,
+            text,
+        )
         raw_response, _ = _recover_declared_pending_option_semantics(
             provider,
             raw_response,
@@ -156,6 +162,12 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
             raw_response = _recover_omitted_chain_selection(provider, raw_response, state)
             raw_response = _apply_state_plan_policy(raw_response, state)
             raw_response = _reconcile_structured_candidate_ownership(raw_response, clauses, state)
+            raw_response = _normalize_prose_pending_field_proposal(
+                raw_response,
+                state,
+                clauses,
+                text,
+            )
             raw_response, _ = _recover_declared_pending_option_semantics(
                 provider,
                 raw_response,
@@ -1550,6 +1562,66 @@ def _reconcile_structured_candidate_ownership(
 
     if not changed:
         return text
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _normalize_prose_pending_field_proposal(
+    text: str,
+    state: AgentGraphState,
+    clauses: tuple[TurnClause, ...],
+    user_text: str,
+) -> str:
+    """Compile a prose-supplied pending scalar back to its finite owner."""
+
+    pending = dict(state.get("pending_question") or {})
+    pending_field = str(pending.get("field") or "").strip().upper()
+    if (
+        pending.get("manual_input_allowed") is not True
+        or pending_field not in CONFIRMABLE_CONFIG_FIELDS
+        or not clauses
+        or any(clause.input_shape != "prose" for clause in clauses)
+    ):
+        return text
+
+    payload = _parse_json_object(text)
+    actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    proposal_indexes = [
+        index
+        for index, action in enumerate(actions)
+        if isinstance(action, dict)
+        and str(action.get("type") or "") == "propose_config_values"
+    ]
+    if len(proposal_indexes) != 1:
+        return text
+    proposal_index = proposal_indexes[0]
+    proposal = actions[proposal_index]
+    config_values = dict(proposal.get("config_values") or {})
+    normalized_values = {
+        str(key).strip().upper(): value for key, value in config_values.items()
+    }
+    if (
+        set(normalized_values) != {pending_field}
+        or proposal.get("unmapped_values")
+        or proposal.get("conflicts")
+    ):
+        return text
+    answer = str(normalized_values[pending_field]).strip()
+    if (
+        not answer
+        or not answer_fits_pending(answer, pending)
+        or re.search(
+            rf"(?<!\w){re.escape(answer)}(?!\w)",
+            str(user_text or ""),
+            flags=re.IGNORECASE,
+        ) is None
+    ):
+        return text
+    actions[proposal_index] = {
+        "type": "answer_pending",
+        "answer": answer,
+        "source_evidence": answer,
+    }
+    payload["actions"] = actions
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 

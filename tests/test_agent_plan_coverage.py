@@ -7353,6 +7353,88 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         }])
         self.assertEqual(recovered["semantic_units"][0]["action_indexes"], [0])
 
+    def test_single_pending_field_proposal_from_prose_compiles_to_pending_answer(self) -> None:
+        from agent.harness.intent import _normalize_prose_pending_field_proposal
+        from agent.harness.state import new_state
+
+        source = (
+            "The credential is run-secret-4821.\n"
+            "Use it only for this run without changing the saved template."
+        )
+        clauses = segment_user_turn(source)
+        state = new_state("prose-pending-proposal")
+        state["pending_question"] = {
+            "id": "RPC_API_KEY",
+            "field": "RPC_API_KEY",
+            "kind": "manual_value",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "scalar_token", "max_length": 180},
+        }
+        payload = {
+            "actions": [{
+                "type": "propose_config_values",
+                "config_values": {"RPC_API_KEY": "run-secret-4821"},
+                "unmapped_values": {},
+                "conflicts": [],
+                "source_format": "mixed",
+                "source_evidence": clauses[-1].text,
+            }],
+            "semantic_units": [
+                _unit(clause, index, [0])
+                for index, clause in enumerate(clauses, start=1)
+            ],
+        }
+
+        normalized = json.loads(_normalize_prose_pending_field_proposal(
+            json.dumps(payload),
+            state,
+            clauses,
+            source,
+        ))
+
+        self.assertEqual(normalized["actions"], [{
+            "type": "answer_pending",
+            "answer": "run-secret-4821",
+            "source_evidence": "run-secret-4821",
+        }])
+        self.assertEqual(
+            [unit["action_indexes"] for unit in normalized["semantic_units"]],
+            [[0], [0]],
+        )
+
+    def test_structured_pending_field_proposal_remains_a_review_transaction(self) -> None:
+        from agent.harness.intent import _normalize_prose_pending_field_proposal
+        from agent.harness.state import new_state
+
+        source = '{"RPC_API_KEY":"run-secret-4821"}'
+        clauses = segment_user_turn(source)
+        state = new_state("structured-pending-proposal")
+        state["pending_question"] = {
+            "id": "RPC_API_KEY",
+            "field": "RPC_API_KEY",
+            "kind": "manual_value",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "scalar_token", "max_length": 180},
+        }
+        payload = {
+            "actions": [{
+                "type": "propose_config_values",
+                "config_values": {"RPC_API_KEY": "run-secret-4821"},
+                "unmapped_values": {},
+                "conflicts": [],
+            }],
+            "semantic_units": [_unit(clauses[0], 1, [0])],
+        }
+
+        normalized = _normalize_prose_pending_field_proposal(
+            json.dumps(payload),
+            state,
+            clauses,
+            source,
+        )
+
+        self.assertEqual(json.loads(normalized), payload)
+
     def test_declared_pending_semantic_rejects_unregistered_match(self) -> None:
         import json
         from types import SimpleNamespace
