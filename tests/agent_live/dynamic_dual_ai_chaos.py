@@ -29,6 +29,7 @@ from tests.agent_live.coverage_evidence import (
     PtyCliTurnRecord,
     RuntimeTurnEvent,
     TurnObservation,
+    VerifiedPostcondition,
     build_pty_cli_evidence_artifact,
     build_pty_diagnostic_artifact,
     pty_transcript_hash,
@@ -579,11 +580,12 @@ class DynamicDualAiChaosRunner:
                     diagnostic_dir,
                 )
                 try:
-                    verified_postcondition = verify_runtime_postcondition(
-                        edge,
+                    verified_postcondition = _verify_declared_postconditions(
                         baseline_event,
                         committed_event,
                         turn,
+                        edge_index=self.edge_index,
+                        target_coverage_ids=selection.target_coverage_ids,
                     )
                 except Exception as exc:
                     pending_diagnostic_path.unlink(missing_ok=True)
@@ -869,6 +871,66 @@ def _validate_decision(
         raise ValueError("simulator decision does not target the scheduled ledger edge")
     if decision.persona != target.persona or decision.goal != target.goal:
         raise ValueError("simulator decision changed the scheduled persona or goal")
+
+
+def _verify_declared_postconditions(
+    baseline_event: RuntimeTurnEvent,
+    committed_event: RuntimeTurnEvent,
+    turn: PtyCliTurnRecord,
+    *,
+    edge_index: Mapping[str, Mapping[str, Any]],
+    target_coverage_ids: Sequence[str],
+) -> VerifiedPostcondition:
+    """Verify every coverage claim attached to one response-driven user turn."""
+
+    edge_keys = tuple(dict.fromkeys(str(item) for item in target_coverage_ids))
+    missing = tuple(edge_key for edge_key in edge_keys if edge_key not in edge_index)
+    if missing:
+        raise ValueError(f"simulator declared unknown coverage ids: {', '.join(missing)}")
+    results = [
+        verify_runtime_postcondition(
+            edge_index[edge_key],
+            baseline_event,
+            committed_event,
+            turn,
+        )
+        for edge_key in edge_keys
+    ]
+    primary = results[0]
+    errors = [
+        f"{edge_key}: {error}"
+        for edge_key, result in zip(edge_keys, results)
+        for error in result.details.get("errors") or ()
+    ]
+    details = {
+        "declared_target_results": {
+            edge_key: dict(result.details)
+            for edge_key, result in zip(edge_keys, results)
+        },
+        "errors": errors,
+    }
+    return VerifiedPostcondition(
+        verifier_id="dynamic-declared-target-set-v1",
+        passed=all(result.passed for result in results),
+        observed_coverage_ids=tuple(dict.fromkeys(
+            coverage_id
+            for result in results
+            for coverage_id in result.observed_coverage_ids
+        )),
+        admitted_typed_actions=tuple(dict.fromkeys(
+            action_type
+            for result in results
+            for action_type in result.admitted_typed_actions
+        )),
+        state_diff=dict(primary.state_diff),
+        next_question_or_result=dict(primary.next_question_or_result),
+        details=details,
+        job_artifacts=tuple(
+            artifact
+            for result in results
+            for artifact in result.job_artifacts
+        ),
+    )
 
 
 def _clean_terminal_text(raw: bytes) -> str:

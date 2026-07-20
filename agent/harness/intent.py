@@ -901,19 +901,6 @@ def _recover_declared_pending_option_semantics(
         if isinstance(index, int) and 0 <= index < len(actions)
     }
 
-    clause_shapes = {clause.clause_id: clause.input_shape for clause in clauses}
-    accepted_pending_types = {
-        str(item).strip()
-        for item in pending.get("accepted_action_types") or []
-        if str(item).strip()
-    }
-    accepted_pending_types.update(
-        str((option.get("action") or {}).get("type") or "").strip()
-        for option in options
-        if isinstance(option.get("action"), dict)
-    )
-    accepted_pending_types.add("answer_pending")
-    accepted_pending_types.discard("")
     candidates = []
     for unit in units:
         if not isinstance(unit, dict):
@@ -935,23 +922,23 @@ def _recover_declared_pending_option_semantics(
             and _action_requires_pending_owner(actions[index], state, pending, options)
             for index in indexes
         )
-        mapped_action_types = {
-            str(actions[index].get("type") or "")
-            for index in indexes
-            if isinstance(index, int)
+        grounded_action = any(
+            isinstance(index, int)
             and 0 <= index < len(actions)
             and isinstance(actions[index], dict)
-        }
-        undeclared_mutations = {
-            action_type
-            for action_type in mapped_action_types - accepted_pending_types
-            if (ACTION_BY_TYPE.get(action_type) is not None)
-            and bool(ACTION_BY_TYPE[action_type].mutation_dimension)
-        }
-        prose_owner_review = (
-            clause_shapes.get(str(unit.get("clause_id") or ""), "prose") == "prose"
-            and bool(undeclared_mutations)
+            and bool(str(actions[index].get("source_evidence") or "").strip())
+            and str(actions[index].get("source_evidence") or "").strip() in str(unit.get("source_text") or "")
+            for index in indexes
         )
+        mapped_mutation = any(
+            isinstance(index, int)
+            and 0 <= index < len(actions)
+            and isinstance(actions[index], dict)
+            and (ACTION_BY_TYPE.get(str(actions[index].get("type") or "")) is not None)
+            and bool(ACTION_BY_TYPE[str(actions[index].get("type") or "")].mutation_dimension)
+            for index in indexes
+        )
+        misowned_action = mapped_mutation and not grounded_action
         if (
             str(unit.get("disposition") or "") != "unresolved"
             and not any(index in invalid_indexes for index in indexes)
@@ -960,7 +947,7 @@ def _recover_declared_pending_option_semantics(
             )
             and not clarification_owned
             and not pending_owned
-            and not prose_owner_review
+            and not misowned_action
         ):
             continue
         source = str(unit.get("source_text") or "")
@@ -1051,7 +1038,9 @@ def _recover_declared_pending_option_semantics(
         "option's declared effect counts as selecting that option. The user need not repeat its label or number. "
         "A supporting unit may select the option, reject alternatives, explain why the selected option is needed, or commit to the "
         "immediate continuation that the selected option's declared effect necessarily opens. Such a continuation "
-        "is support, not a second mutation. manual_value is valid only when manual_input_allowed=true and the "
+        "is support, not a second mutation. A factual rationale that mentions a resource related to the selected "
+        "option, without asking to create, change, validate, or configure that resource now, is support. "
+        "manual_value is valid only when manual_input_allowed=true and the "
         "complete turn directly supplies one value requested by the displayed field and validation contract. "
         "Put only that normalized source-supplied value in answer; never copy a value from state, the prompt, or "
         "an option. A unit that only limits where or how that same supplied manual value may be applied, without "
@@ -1086,7 +1075,7 @@ def _recover_declared_pending_option_semantics(
         "complete_turn": [clause.as_dict() for clause in clauses],
         "units": candidates,
     }, ensure_ascii=False, sort_keys=True)
-    result: dict[str, Any] = {}
+    verdicts: list[dict[str, Any]] = []
     for attempt in range(2):
         messages = [LLMMessage(role="system", content=adjudication_contract)]
         if attempt:
@@ -1106,14 +1095,21 @@ def _recover_declared_pending_option_semantics(
             temperature=0.0,
             max_tokens=500,
         ))
-        result = _parse_json_object(response.text)
-        # A negative first verdict is not enough to discard a potentially
-        # valid pending answer. One independent challenge is required because
-        # natural users routinely wrap a finite answer or scalar in supporting
-        # prose. Positive verdicts are still checked below against the typed
-        # option/value contract and exact source evidence.
-        if str(result.get("decision") or "") in {"select_option", "manual_value"}:
-            break
+        verdicts.append(_parse_json_object(response.text))
+    if len(verdicts) != 2:
+        return plan_text, False
+    decisions = [str(item.get("decision") or "") for item in verdicts]
+    if any(item not in {"select_option", "manual_value"} for item in decisions):
+        return plan_text, False
+    keys = [
+        str(item.get("option_id") or "")
+        if item.get("decision") == "select_option"
+        else str(item.get("answer") or "")
+        for item in verdicts
+    ]
+    if len(set(decisions)) != 1 or len(set(keys)) != 1:
+        return plan_text, False
+    result = dict(verdicts[0])
     decision = str(result.get("decision") or "")
     if decision in {"no_selection", "ambiguous"}:
         return plan_text, False
@@ -1121,13 +1117,38 @@ def _recover_declared_pending_option_semantics(
         return plan_text, False
     candidate_sources = {row["unit_id"]: row["source_text"] for row in candidates}
     available_by_id = {row["option_id"]: row for row in available}
-    supporting_ids = result.get("supporting_unit_ids")
-    independent_ids = result.get("independent_unit_ids")
-    if not isinstance(supporting_ids, list) or not isinstance(independent_ids, list):
-        return plan_text, False
-    supporting = {str(item) for item in supporting_ids}
-    independent = {str(item) for item in independent_ids}
+    if decision == "select_option":
+        proposed_option = available_by_id.get(str(result.get("option_id") or ""))
+        if (
+            proposed_option is not None
+            and isinstance(proposed_option.get("value"), bool)
+            and not _verify_natural_boolean_pending_entailment(
+                provider,
+                pending=pending,
+                proposed_option=proposed_option,
+                complete_turn_text=complete_turn_text,
+                candidates=candidates,
+                verdicts=verdicts,
+            )
+        ):
+            return plan_text, False
     all_candidate_ids = set(candidate_sources)
+    partitions: list[tuple[set[str], set[str]]] = []
+    for verdict in verdicts:
+        supporting_ids = verdict.get("supporting_unit_ids")
+        independent_ids = verdict.get("independent_unit_ids")
+        if not isinstance(supporting_ids, list) or not isinstance(independent_ids, list):
+            return plan_text, False
+        supporting_set = {str(item) for item in supporting_ids}
+        independent_set = {str(item) for item in independent_ids}
+        if (
+            supporting_set & independent_set
+            or supporting_set | independent_set != all_candidate_ids
+        ):
+            return plan_text, False
+        partitions.append((supporting_set, independent_set))
+    supporting = partitions[0][0] & partitions[1][0]
+    independent = all_candidate_ids - supporting
     if (
         not supporting
         or supporting & independent
@@ -1135,7 +1156,10 @@ def _recover_declared_pending_option_semantics(
         or not supporting <= all_candidate_ids
     ):
         return plan_text, False
-    quote = str(result.get("evidence_quote") or "").strip()
+    quotes = [str(item.get("evidence_quote") or "").strip() for item in verdicts]
+    quote = quotes[0]
+    if any(not item or item not in complete_turn_text for item in quotes):
+        return plan_text, False
     quote_candidate_owner = next(
         (
             unit_id
@@ -1323,6 +1347,72 @@ def _recover_declared_pending_option_semantics(
             reason="replaced by the active pending-contract owner",
         )
     return recovered_text, True
+
+
+def _verify_natural_boolean_pending_entailment(
+    provider: Any,
+    *,
+    pending: dict[str, Any],
+    proposed_option: dict[str, Any],
+    complete_turn_text: str,
+    candidates: list[dict[str, Any]],
+    verdicts: list[dict[str, Any]],
+) -> bool:
+    """Require source-grounded entailment before a prose turn answers Y/N."""
+
+    candidate_sources = {
+        str(row.get("unit_id") or ""): str(row.get("source_text") or "")
+        for row in candidates
+    }
+    for verdict in verdicts:
+        supporting = {
+            str(item) for item in verdict.get("supporting_unit_ids") or []
+        }
+        quote = str(verdict.get("evidence_quote") or "").strip()
+        if not quote or not any(
+            unit_id in candidate_sources and quote in candidate_sources[unit_id]
+            for unit_id in supporting
+        ):
+            return False
+    response = provider.complete(LLMRequest(
+        messages=[
+            LLMMessage(
+                role="system",
+                content=(
+                    "Verify whether natural-language evidence entails one proposed answer to a typed yes/no "
+                    "question. Return JSON only: {entailed:boolean,contradicted:boolean,evidence_quote:string,"
+                    "reason:string}. entailed=true only when the user's own words explicitly accept or reject "
+                    "the proposition asked by the pending question in the direction represented by "
+                    "proposed_value. A different request, topic, mutation, question, explanation, or mere "
+                    "topical relation is not an answer. Do not infer agreement from workflow state or from the "
+                    "existence of a pending question. evidence_quote must be the shortest non-empty exact source "
+                    "substring proving that answer."
+                ),
+            ),
+            LLMMessage(role="user", content=json.dumps({
+                "pending_question": {
+                    "id": str(pending.get("id") or ""),
+                    "prompt": str(pending.get("prompt") or ""),
+                    "field": str(pending.get("field") or ""),
+                },
+                "proposed_value": proposed_option.get("value"),
+                "proposed_label": str(proposed_option.get("label") or ""),
+                "complete_turn_text": complete_turn_text,
+                "candidate_units": candidates,
+            }, ensure_ascii=False, sort_keys=True)),
+        ],
+        temperature=0.0,
+        max_tokens=220,
+    ))
+    result = _parse_json_object(response.text)
+    quote = str(result.get("evidence_quote") or "").strip()
+    return bool(
+        result.get("entailed") is True
+        and result.get("contradicted") is False
+        and quote
+        and quote in complete_turn_text
+        and any(quote in source for source in candidate_sources.values())
+    )
 
 
 def _action_has_independent_source(action: dict[str, Any], owner_quote: str) -> bool:

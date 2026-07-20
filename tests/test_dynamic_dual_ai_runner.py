@@ -14,6 +14,7 @@ from unittest.mock import patch
 from tests.agent_live.chaos_scheduler import build_chaos_schedule
 from tests.agent_live.coverage_evidence import (
     RuntimeTurnEvent,
+    VerifiedPostcondition,
     content_hash,
     load_valid_evidence_reference,
     validate_pty_diagnostic_artifact,
@@ -26,8 +27,56 @@ from tests.agent_live.dynamic_dual_ai_chaos import (
     SimulatorContext,
     SimulatorDecision,
     _complete_agent_response,
+    _verify_declared_postconditions,
     encode_bracketed_paste,
 )
+
+
+class DeclaredTargetSetVerificationTest(unittest.TestCase):
+    def test_every_declared_sibling_target_must_pass(self) -> None:
+        passed = VerifiedPostcondition(
+            verifier_id="fixture",
+            passed=True,
+            observed_coverage_ids=("edge-a",),
+            admitted_typed_actions=("answer_pending",),
+            state_diff={"changed": True},
+            next_question_or_result={"pending": "next"},
+            details={"errors": []},
+        )
+        failed = VerifiedPostcondition(
+            verifier_id="fixture",
+            passed=False,
+            observed_coverage_ids=(),
+            admitted_typed_actions=(),
+            state_diff={"changed": True},
+            next_question_or_result={"pending": "next"},
+            details={"errors": ["sibling demand was not preserved"]},
+        )
+        with patch(
+            "tests.agent_live.dynamic_dual_ai_chaos.verify_runtime_postcondition",
+            side_effect=[passed, failed],
+        ) as verifier:
+            result = _verify_declared_postconditions(
+                SimpleNamespace(),
+                SimpleNamespace(),
+                SimpleNamespace(),
+                edge_index={"edge-a": {}, "edge-b": {}},
+                target_coverage_ids=("edge-a", "edge-b"),
+            )
+
+        self.assertFalse(result.passed)
+        self.assertEqual(verifier.call_count, 2)
+        self.assertIn("edge-b: sibling demand was not preserved", result.details["errors"])
+
+    def test_unknown_declared_sibling_target_fails_closed(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unknown coverage ids: edge-missing"):
+            _verify_declared_postconditions(
+                SimpleNamespace(),
+                SimpleNamespace(),
+                SimpleNamespace(),
+                edge_index={"edge-a": {}},
+                target_coverage_ids=("edge-a", "edge-missing"),
+            )
 
 
 EDGE = {
@@ -233,7 +282,7 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             self.assertEqual(artifact["turn_observation"]["seed"], 17)
             self.assertEqual(
                 artifact["turn_observation"]["verified_postcondition"]["verifier_id"],
-                "anychain.runtime-transition-proof.v1",
+                "dynamic-declared-target-set-v1",
             )
             self.assertEqual(artifacts["real_cli"]["turn_observation"]["simulator_decision"], {})
             lane_evidence = schedule_result["targets"][0]["lane_evidence"]

@@ -23,6 +23,130 @@ def _unit(clause, index: int, action_indexes, *, disposition: str = "action", re
 
 
 class PlanCoverageTest(unittest.TestCase):
+    def test_natural_boolean_entailment_rejects_unrelated_mutation(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.state import new_state
+
+        source = "I want to benchmark Solana with fake-node."
+        clauses = segment_user_turn(source)
+        state = new_state("pending-boolean-unrelated", language="en")
+        state["pending_question"] = {
+            "id": "inferred_config_review",
+            "group": "provider_deployment",
+            "field": "inferred_config_review",
+            "kind": "yes_no",
+            "manual_input_allowed": False,
+            "prompt": "Apply the inferred configuration values?",
+            "options": [
+                {"id": "yes", "label": "Y", "value": True, "action": {"type": "answer_pending"}},
+                {"id": "no", "label": "N", "value": False, "action": {"type": "answer_pending"}},
+            ],
+        }
+        payload = {
+            "actions": [{"type": "clarify_unresolved", "clauses": [source]}],
+            "semantic_units": [_unit(clauses[0], 1, [0], disposition="unresolved")],
+        }
+        false_selection = SimpleNamespace(text=json.dumps({
+            "decision": "select_option",
+            "option_id": "yes",
+            "answer": "",
+            "evidence_quote": source,
+            "supporting_unit_ids": ["unit-1"],
+            "independent_unit_ids": [],
+            "reason": "incorrectly inferred agreement from an unrelated request",
+        }))
+        provider = Mock()
+        provider.complete.side_effect = [
+            false_selection,
+            false_selection,
+            SimpleNamespace(text=json.dumps({
+                "entailed": False,
+                "contradicted": False,
+                "evidence_quote": "",
+                "reason": "the turn requests another mutation and does not answer the proposition",
+            })),
+        ]
+
+        recovered, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            clauses=clauses,
+            user_text=source,
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(recovered, json.dumps(payload))
+        self.assertEqual(provider.complete.call_count, 3)
+
+    def test_pending_consensus_preserves_disputed_support_as_independent(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.state import new_state
+
+        source = "Use quick now. Run standard later."
+        clauses = segment_user_turn(source)
+        state = new_state("pending-partition-consensus", language="en")
+        state["pending_question"] = {
+            "id": "benchmark_mode",
+            "group": "qps_profile",
+            "field": "benchmark_mode",
+            "kind": "numbered_choice",
+            "manual_input_allowed": False,
+            "options": [
+                {"id": "quick", "label": "quick", "value": "quick", "action": {"type": "answer_pending"}},
+                {"id": "standard", "label": "standard", "value": "standard", "action": {"type": "answer_pending"}},
+            ],
+        }
+        payload = {
+            "actions": [{"type": "clarify_unresolved", "clauses": [source]}],
+            "semantic_units": [
+                _unit(clause, index, [0], disposition="unresolved")
+                for index, clause in enumerate(clauses, start=1)
+            ],
+        }
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps({
+                "decision": "select_option",
+                "option_id": "quick",
+                "answer": "",
+                "evidence_quote": "Use quick now",
+                "supporting_unit_ids": ["unit-1", "unit-2"],
+                "independent_unit_ids": [],
+                "reason": "first adjudicator treats the later run as support",
+            })),
+            SimpleNamespace(text=json.dumps({
+                "decision": "select_option",
+                "option_id": "quick",
+                "answer": "",
+                "evidence_quote": "Use quick now",
+                "supporting_unit_ids": ["unit-1"],
+                "independent_unit_ids": ["unit-2"],
+                "reason": "second adjudicator preserves the later run request",
+            })),
+        ]
+
+        recovered, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            clauses=clauses,
+            user_text=source,
+        )
+        document = json.loads(recovered)
+
+        self.assertTrue(changed)
+        self.assertEqual(provider.complete.call_count, 2)
+        self.assertEqual(document["semantic_units"][0]["disposition"], "action")
+        self.assertEqual(document["semantic_units"][1]["disposition"], "unresolved")
+        self.assertNotIn("pending_context_admissions", document)
+
     def test_single_structured_assignment_is_not_downgraded_to_prose(self) -> None:
         clauses = segment_user_turn("CLOUD_ZONE: us-west-2b")
 
@@ -36,7 +160,7 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertEqual(len(clauses), 1)
         self.assertEqual(clauses[0].input_shape, "structured")
 
-    def test_pending_option_negative_verdict_gets_one_independent_contract_challenge(self) -> None:
+    def test_pending_option_conflicting_verdicts_fail_closed(self) -> None:
         from types import SimpleNamespace
         from unittest.mock import Mock
 
@@ -95,15 +219,11 @@ class PlanCoverageTest(unittest.TestCase):
             clauses=clauses,
             user_text=source,
         )
-        document = json.loads(recovered)
-
-        self.assertTrue(changed)
+        self.assertFalse(changed)
+        self.assertEqual(recovered, json.dumps(payload))
         self.assertEqual(provider.complete.call_count, 2)
-        admitted = document["actions"][document["pending_answer_admissions"][0]]
-        self.assertEqual(admitted["type"], "answer_pending")
-        self.assertIs(admitted["selected_value"], True)
 
-    def test_pending_manual_value_negative_verdict_gets_one_independent_contract_challenge(self) -> None:
+    def test_pending_manual_value_conflicting_verdicts_fail_closed(self) -> None:
         from types import SimpleNamespace
         from unittest.mock import Mock
 
@@ -162,12 +282,9 @@ class PlanCoverageTest(unittest.TestCase):
             clauses=clauses,
             user_text=source,
         )
-        document = json.loads(recovered)
-
-        self.assertTrue(changed)
+        self.assertFalse(changed)
+        self.assertEqual(recovered, json.dumps(payload))
         self.assertEqual(provider.complete.call_count, 2)
-        admitted = document["actions"][document["pending_answer_admissions"][0]]
-        self.assertEqual(admitted["answer"], "ethereum")
 
     def test_pending_owner_binds_untyped_natural_answer_to_declared_option_value(self) -> None:
         from types import SimpleNamespace
@@ -5436,14 +5553,24 @@ class PlanCoverageTest(unittest.TestCase):
             incomplete_unit_ids=("unit-1", "unit-2"),
         )
         provider = Mock()
-        provider.complete.return_value = SimpleNamespace(text=json.dumps({
-            "decision": "select_option",
-            "option_id": "custom_rpc",
-            "evidence_quote": "add a custom RPC method",
-            "supporting_unit_ids": ["unit-1", "unit-2"],
-            "independent_unit_ids": [],
-            "reason": "rejecting defaults supports the selected mutually exclusive custom-RPC option",
-        }))
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps({
+                "decision": "select_option",
+                "option_id": "custom_rpc",
+                "evidence_quote": "add a custom RPC method",
+                "supporting_unit_ids": ["unit-1", "unit-2"],
+                "independent_unit_ids": [],
+                "reason": "rejecting defaults supports the selected mutually exclusive custom-RPC option",
+            })),
+            SimpleNamespace(text=json.dumps({
+                "decision": "select_option",
+                "option_id": "custom_rpc",
+                "evidence_quote": "add a custom RPC method",
+                "supporting_unit_ids": ["unit-1", "unit-2"],
+                "independent_unit_ids": [],
+                "reason": "independent confirmation of the same pending selection",
+            })),
+        ]
         valid = PlanCoverageResult(True, (), ())
 
         with patch("agent.harness.intent._validate_semantic_fulfillment", return_value=valid):
@@ -5468,6 +5595,7 @@ class PlanCoverageTest(unittest.TestCase):
             [unit["disposition"] for unit in finalized["semantic_units"]],
             ["context", "action"],
         )
+        self.assertEqual(provider.complete.call_count, 2)
 
     def test_final_input_authority_keeps_multifield_prose_proposal_for_review(self) -> None:
         import json
@@ -8181,8 +8309,9 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
 
         def complete(request):
             request_payload = json.loads(request.messages[-1].content)
-            self.assertEqual(request_payload["complete_turn"], [clause.as_dict() for clause in clauses])
-            self.assertEqual(len(request_payload["units"]), 3)
+            contract_payload = request_payload.get("pending_contract", request_payload)
+            self.assertEqual(contract_payload["complete_turn"], [clause.as_dict() for clause in clauses])
+            self.assertEqual(len(contract_payload["units"]), 3)
             return SimpleNamespace(text=json.dumps({
                 "decision": "select_option",
                 "option_id": "protocol",
@@ -8267,7 +8396,7 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
             ],
         }
         provider = Mock()
-        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+        selection = SimpleNamespace(text=json.dumps({
             "decision": "select_option",
             "option_id": "no",
             "evidence_quote": "No, that response contract is incomplete",
@@ -8275,6 +8404,16 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
             "independent_unit_ids": [],
             "reason": "rejects the observed contract and commits to its correction flow",
         }))
+        provider.complete.side_effect = [
+            selection,
+            selection,
+            SimpleNamespace(text=json.dumps({
+                "entailed": True,
+                "contradicted": False,
+                "evidence_quote": "No, that response contract is incomplete",
+                "reason": "the user explicitly rejects the observed response contract",
+            })),
+        ]
 
         recovered_text, changed = _recover_declared_pending_option_semantics(
             provider,
@@ -8361,7 +8500,7 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(recovered_text, original)
 
-    def test_declared_pending_semantic_retries_empty_adjudication_for_imperative_paraphrase(self) -> None:
+    def test_declared_pending_semantic_conflict_remains_unresolved(self) -> None:
         import json
         from types import SimpleNamespace
         from unittest.mock import Mock
@@ -8404,16 +8543,9 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
             state,
             clauses=clauses,
         )
-        recovered = json.loads(recovered_text)
-
-        self.assertTrue(changed)
+        self.assertFalse(changed)
         self.assertEqual(provider.complete.call_count, 2)
-        self.assertEqual(recovered["actions"], [{
-            "type": "answer_pending",
-            "answer": "reset",
-            "selected_value": "reset",
-            "source_evidence": "Discard that partial setup and let me start clean",
-        }])
+        self.assertEqual(recovered_text, json.dumps(payload))
 
     def test_declared_pending_semantic_second_empty_adjudication_remains_unresolved(self) -> None:
         import json
@@ -8610,7 +8742,7 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         self.assertEqual(provider.complete.call_count, 0)
         self.assertEqual(recovered["actions"][0]["type"], "rpc_catalog_command")
 
-    def test_pending_url_owner_replaces_unrelated_mode_action_from_supporting_prose(self) -> None:
+    def test_pending_url_owner_recovers_value_without_erasing_grounded_mode_action(self) -> None:
         import json
         from types import SimpleNamespace
         from unittest.mock import Mock
@@ -8651,9 +8783,9 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
             "option_id": "",
             "answer": "http://geth-dev:8545",
             "evidence_quote": "http://geth-dev:8545",
-            "supporting_unit_ids": ["unit-1", "unit-2"],
+            "supporting_unit_ids": ["unit-1"],
             "independent_unit_ids": [],
-            "reason": "the second sentence scopes validation of the supplied URL",
+            "reason": "the first sentence supplies the requested URL",
         }))
 
         recovered_text, changed = _recover_declared_pending_option_semantics(
@@ -8662,8 +8794,12 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         recovered = json.loads(recovered_text)
 
         self.assertTrue(changed)
-        self.assertEqual([item["type"] for item in recovered["actions"]], ["answer_pending"])
-        self.assertEqual(recovered["actions"][0]["answer"], "http://geth-dev:8545")
+        self.assertEqual(
+            {item["type"] for item in recovered["actions"]},
+            {"answer_pending", "choose_target_mode"},
+        )
+        pending_answer = next(item for item in recovered["actions"] if item["type"] == "answer_pending")
+        self.assertEqual(pending_answer["answer"], "http://geth-dev:8545")
 
     def test_pending_option_accepts_explanation_for_declared_domain_action(self) -> None:
         import json
@@ -9246,6 +9382,7 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
                 }],
                 "ambiguous": False,
             })),
+            SimpleNamespace(text=json.dumps({})),
         ]
 
         recovered_text, changed = _recover_declared_pending_option_semantics(
