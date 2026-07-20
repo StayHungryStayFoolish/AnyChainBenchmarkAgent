@@ -566,11 +566,16 @@ def _append_unstructured_regions(regions: list[tuple[str, str]], text: str) -> N
             while lookahead < len(lines) and _line_looks_structured(lines[lookahead].strip()):
                 run.append(lines[lookahead])
                 lookahead += 1
-            if len(run) >= 2:
-                flush_prose()
-                regions.append(("\n".join(run).strip(), "structured"))
-                index = lookahead
-                continue
+            # Input shape describes transport syntax, not user intent. A
+            # single YAML/env assignment is still structured input and must
+            # reach the same proposal/review boundary as a larger pasted
+            # block. The semantic planner remains responsible for deciding
+            # whether an error label, example, or documentation fragment is
+            # configuration at all.
+            flush_prose()
+            regions.append(("\n".join(run).strip(), "structured"))
+            index = lookahead
+            continue
         prose.append(line)
         index += 1
     flush_prose()

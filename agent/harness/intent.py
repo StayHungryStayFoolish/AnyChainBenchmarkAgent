@@ -1071,8 +1071,11 @@ def _recover_declared_pending_option_semantics(
             messages.append(LLMMessage(
                 role="system",
                 content=(
-                    "The first adjudication was malformed. Re-evaluate the complete turn once. Return one declared "
-                    "decision and a complete partition of candidate unit ids; do not omit the decision field."
+                    "Independently challenge the first adjudication. Re-evaluate the complete turn once against the "
+                    "typed pending contract, including whether one declared option or one manual value is wrapped "
+                    "in explanation, preservation context, or a request to continue. Do not treat supporting prose "
+                    "as a second mutation, but do not erase a real contradiction or independent request. Return one "
+                    "declared decision and a complete partition of candidate unit ids."
                 ),
             ))
         messages.append(LLMMessage(role="user", content=adjudication_payload))
@@ -1082,9 +1085,12 @@ def _recover_declared_pending_option_semantics(
             max_tokens=500,
         ))
         result = _parse_json_object(response.text)
-        if str(result.get("decision") or "") in {
-            "select_option", "manual_value", "no_selection", "ambiguous"
-        }:
+        # A negative first verdict is not enough to discard a potentially
+        # valid pending answer. One independent challenge is required because
+        # natural users routinely wrap a finite answer or scalar in supporting
+        # prose. Positive verdicts are still checked below against the typed
+        # option/value contract and exact source evidence.
+        if str(result.get("decision") or "") in {"select_option", "manual_value"}:
             break
     decision = str(result.get("decision") or "")
     if decision in {"no_selection", "ambiguous"}:
@@ -3243,10 +3249,16 @@ def _adjudicate_pending_answer_actions(
             continue
         action_type = str(action.get("type") or "")
         if action_type == "answer_pending":
+            answer_text = str(action.get("answer") or "")
+            answer_selects_declared_option, _answer_value = exact_answer(
+                answer_text,
+                pending,
+            )
             if (
                 pending.get("manual_input_allowed") is True
                 and not _declared_option_for_pending_answer(action, pending)
-                and value_satisfies_pending_contract(str(action.get("answer") or ""), pending)
+                and not answer_selects_declared_option
+                and value_satisfies_pending_contract(answer_text, pending)
             ):
                 continue
             option = _declared_option_for_pending_answer(action, pending) or None
@@ -3279,14 +3291,23 @@ def _adjudicate_pending_answer_actions(
     for index in review_indexes:
         option = option_by_index.get(index)
         selected = (option or {}).get("value")
-        if option is None and not target_mode_menu:
-            invalid_indexes[index] = "the proposed value is not a declared pending option"
-            continue
         reviews.append({
             "action_index": index,
             "question": str(pending.get("prompt") or ""),
+            "proposed_option_id": str(
+                (option or {}).get("id")
+                or (options.index(option) + 1 if option in options else "")
+            ),
             "selected_option_label": str((option or {}).get("label") or ""),
             "selected_option_value": selected,
+            "available_options": [
+                {
+                    "option_id": str(item.get("id") or option_index),
+                    "label": str(item.get("label") or ""),
+                    "value": item.get("value"),
+                }
+                for option_index, item in enumerate(options, start=1)
+            ],
             "allows_unresolved_target_mode": target_mode_menu,
             "complete_source": str(user_text or ""),
             "source_units": [
@@ -3315,7 +3336,6 @@ def _adjudicate_pending_answer_actions(
         }
         for review in reviews:
             index = int(review["action_index"])
-            selected = review.get("selected_option_value")
             row = by_index.get(index) or {}
             decision = str(row.get("decision") or "").strip()
             quote = str(row.get("evidence_quote") or "").strip()
@@ -3342,14 +3362,27 @@ def _adjudicate_pending_answer_actions(
                     row.get("reason") or "source does not select the proposed pending option"
                 )
             else:
-                option = option_by_index.get(index) or next(
-                    (
-                        item
-                        for item in options
-                        if item.get("value") == selected
-                    ),
-                    None,
-                )
+                bound_option = option_by_index.get(index)
+                selected_option_id = str(row.get("selected_option_id") or "")
+                option = bound_option
+                if option is None:
+                    option = next(
+                        (
+                            item
+                            for option_index, item in enumerate(options, start=1)
+                            if str(item.get("id") or option_index) == selected_option_id
+                        ),
+                        None,
+                    )
+                elif selected_option_id and selected_option_id != str(
+                    option.get("id") or options.index(option) + 1
+                ):
+                    option = None
+                if option is None:
+                    invalid_indexes[index] = (
+                        "the pending owner did not bind the source to one declared option"
+                    )
+                    continue
                 declared = dict((option or {}).get("action") or {})
                 if str(declared.get("type") or "") in {"", "answer_pending"}:
                     actions[index]["selected_value"] = (option or {}).get("value")
@@ -4195,19 +4228,22 @@ def _request_pending_answer_reviews(
     schema = (
         "Return JSON only: {reviews:[{action_index:integer,"
         "decision:'select_option'|'unresolved_target_mode'|'reject',"
-        "evidence_quote:string,reason:string}]}. Include each key exactly once in every row. "
+        "selected_option_id:string,evidence_quote:string,reason:string}]}. Include each key exactly once in every row. "
     )
     rules = (
         "Review every supplied row exactly once. Interpret source_units in the context of complete_source. Use "
         "select_option only when the complete source consistently selects, requests, or answers the displayed "
-        "option in the context of the displayed question. A local source unit does not prove the proposed option "
+        "question with exactly one entry from available_options. When proposed_option_id is non-empty, the selected "
+        "option must be that same option; when it is empty, bind the natural-language answer to exactly one declared "
+        "available option. A local source unit does not prove the proposed option "
         "when another part of complete_source selects a different displayed option. Use "
         "unresolved_target_mode only when allows_unresolved_target_mode=true and the source has a benchmark or "
         "synchronization-observation goal but explicitly leaves the displayed target mode undecided. Otherwise use "
         "reject. Topical relation is insufficient. A greeting, identity question, help request, explanation request, "
         "confusion, or other read-only detour does not select an option. Never infer a choice from workflow state or "
-        "defaults. select_option and unresolved_target_mode require the shortest exact excerpt from source_units in "
-        "evidence_quote; reject uses an empty evidence_quote."
+        "defaults. select_option requires selected_option_id and the shortest exact excerpt from source_units in "
+        "evidence_quote. unresolved_target_mode uses an empty selected_option_id and exact evidence. reject uses an "
+        "empty selected_option_id and empty evidence_quote."
     )
     invalid_output = ""
     for attempt in range(2):
@@ -4236,10 +4272,18 @@ def _request_pending_answer_reviews(
             row = by_index.get(review["action_index"])
             decision = str((row or {}).get("decision") or "")
             quote = str((row or {}).get("evidence_quote") or "").strip()
+            selected_option_id = str((row or {}).get("selected_option_id") or "").strip()
+            if decision == "select_option" and not selected_option_id:
+                selected_option_id = str(review.get("proposed_option_id") or "")
+                if isinstance(row, dict) and selected_option_id:
+                    row["selected_option_id"] = selected_option_id
             if decision not in {"select_option", "unresolved_target_mode", "reject"}:
                 structurally_complete = False
                 break
             if decision in {"select_option", "unresolved_target_mode"} and not quote:
+                structurally_complete = False
+                break
+            if decision == "select_option" and not selected_option_id:
                 structurally_complete = False
                 break
         if structurally_complete:
@@ -4284,16 +4328,18 @@ def _adjudicate_rejected_pending_answer_reviews(
                 content=(
                     "Adjudicate only the supplied negative pending-option verdicts. Return JSON only: "
                     "{reviews:[{action_index:integer,decision:'select_option'|'reject',"
-                    "evidence_quote:string,reason:string}]}. Review every row exactly once. Compare the complete "
+                    "selected_option_id:string,evidence_quote:string,reason:string}]}. Review every row exactly once. Compare the complete "
                     "source_units with the displayed question and the exact proposed option label and value. "
                     "Interpret source_units in the context of complete_source. select_option means the complete "
                     "source consistently answers the question by accepting, rejecting, choosing, or requesting "
-                    "that proposed option. Reject when another part of complete_source selects a different displayed "
+                    "that proposed option, or exactly one available option when proposed_option_id is empty. Reject "
+                    "when another part of complete_source selects a different displayed "
                     "option. Natural-language answers are valid and do not "
                     "need to repeat the option ID, number, label, Y, or N. Topical discussion, help, explanation, "
                     "confusion, or a question about the option is reject. Never select a different value and never "
                     "infer from workflow state or defaults. select_option requires the shortest non-empty exact "
-                    "substring of source_units that proves the choice; reject requires an empty evidence_quote."
+                    "substring of source_units that proves the choice and its declared selected_option_id; reject "
+                    "requires empty selected_option_id and evidence_quote."
                 ),
             ),
             LLMMessage(role="user", content=json.dumps({
@@ -4317,10 +4363,28 @@ def _adjudicate_rejected_pending_answer_reviews(
             continue
         decision = str(row.get("decision") or "")
         quote = str(row.get("evidence_quote") or "").strip()
+        selected_option_id = str(
+            row.get("selected_option_id")
+            or review_by_index[index].get("proposed_option_id")
+            or ""
+        ).strip()
+        if selected_option_id and not row.get("selected_option_id"):
+            row["selected_option_id"] = selected_option_id
         source = "\n".join(str(item) for item in review_by_index[index].get("source_units") or [])
-        if decision == "select_option" and quote and quote in source:
+        available_ids = {
+            str(item.get("option_id") or "")
+            for item in review_by_index[index].get("available_options") or []
+        }
+        proposed_id = str(review_by_index[index].get("proposed_option_id") or "")
+        if (
+            decision == "select_option"
+            and quote
+            and quote in source
+            and selected_option_id in available_ids
+            and (not proposed_id or selected_option_id == proposed_id)
+        ):
             pass
-        elif decision == "reject" and not quote:
+        elif decision == "reject" and not quote and not selected_option_id:
             pass
         else:
             continue

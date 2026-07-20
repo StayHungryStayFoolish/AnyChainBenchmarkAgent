@@ -655,6 +655,27 @@ def _bind_declared_option_actions(
     for action in actions:
         action_type = str(action.get("type") or "")
         if action_type == "answer_pending":
+            if action.get("pending_option_semantic_verified") is True:
+                reference = (
+                    action.get("selected_value")
+                    if action.get("selected_value") is not None
+                    else action.get("answer")
+                )
+                referenced = [
+                    option
+                    for option in options
+                    if option.get("value") == reference
+                    or str(option.get("id") or "") == str(reference)
+                    or str(option.get("label") or "") == str(reference)
+                ]
+                if len(referenced) == 1:
+                    normalized = dict(action)
+                    typed_value = referenced[0].get("value")
+                    normalized["answer"] = typed_value
+                    normalized["selected_value"] = typed_value
+                    normalized["selection_contract_verified"] = True
+                    output.append(normalized)
+                    continue
             # A model may return the exact displayed option label/id while the
             # contract stores a typed value (for example label ``Y`` and value
             # ``True``). Resolve only against the declared option contract and

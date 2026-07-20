@@ -23,6 +23,238 @@ def _unit(clause, index: int, action_indexes, *, disposition: str = "action", re
 
 
 class PlanCoverageTest(unittest.TestCase):
+    def test_single_structured_assignment_is_not_downgraded_to_prose(self) -> None:
+        clauses = segment_user_turn("CLOUD_ZONE: us-west-2b")
+
+        self.assertEqual(len(clauses), 1)
+        self.assertEqual(clauses[0].input_shape, "structured")
+        self.assertEqual(clauses[0].text, "CLOUD_ZONE: us-west-2b")
+
+    def test_single_error_label_remains_structured_syntax_without_assigning_intent(self) -> None:
+        clauses = segment_user_turn("RuntimeError: connection refused")
+
+        self.assertEqual(len(clauses), 1)
+        self.assertEqual(clauses[0].input_shape, "structured")
+
+    def test_pending_option_negative_verdict_gets_one_independent_contract_challenge(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.state import new_state
+
+        source = "Yes, keep the detected 100 GiB value; it matches this disk."
+        clauses = segment_user_turn(source)
+        state = new_state("pending-option-challenge", language="en")
+        state["pending_question"] = {
+            "id": "detected-size",
+            "group": "ledger_disk",
+            "field": "DATA_VOL_SIZE",
+            "kind": "yes_no",
+            "options": [
+                {"id": "1", "label": "Y", "value": True, "action": {"type": "answer_pending"}},
+                {"id": "2", "label": "N", "value": False, "action": {"type": "answer_pending"}},
+            ],
+            "manual_input_allowed": False,
+        }
+        payload = {
+            "actions": [{"type": "clarify_unresolved", "clauses": [source]}],
+            "semantic_units": [
+                _unit(clause, index, [0], disposition="unresolved")
+                for index, clause in enumerate(clauses, start=1)
+            ],
+        }
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps({
+                "decision": "no_selection",
+                "option_id": "",
+                "answer": "",
+                "evidence_quote": "",
+                "supporting_unit_ids": [],
+                "independent_unit_ids": ["unit-1"],
+                "reason": "first verdict missed the wrapped answer",
+            })),
+            SimpleNamespace(text=json.dumps({
+                "decision": "select_option",
+                "option_id": "1",
+                "answer": "",
+                "evidence_quote": "Yes",
+                "supporting_unit_ids": [
+                    f"unit-{index}" for index in range(1, len(clauses) + 1)
+                ],
+                "independent_unit_ids": [],
+                "reason": "the explanation supports the declared yes option",
+            })),
+        ]
+
+        recovered, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            clauses=clauses,
+            user_text=source,
+        )
+        document = json.loads(recovered)
+
+        self.assertTrue(changed)
+        self.assertEqual(provider.complete.call_count, 2)
+        admitted = document["actions"][document["pending_answer_admissions"][0]]
+        self.assertEqual(admitted["type"], "answer_pending")
+        self.assertIs(admitted["selected_value"], True)
+
+    def test_pending_manual_value_negative_verdict_gets_one_independent_contract_challenge(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.state import new_state
+
+        source = "The requirement changed.\nReplace bsc with ethereum.\nKeep the current target mode for now."
+        clauses = segment_user_turn(source)
+        state = new_state("pending-manual-challenge", language="en")
+        state["pending_question"] = {
+            "id": "replacement",
+            "group": "chain_identity",
+            "field": "chain_change_input",
+            "kind": "manual_value",
+            "options": [],
+            "manual_input_allowed": True,
+            "validation": {"value_type": "scalar_token", "max_length": 180},
+        }
+        payload = {
+            "actions": [{"type": "clarify_unresolved", "clauses": [source]}],
+            "semantic_units": [
+                _unit(clause, index, [0], disposition="unresolved")
+                for index, clause in enumerate(clauses, start=1)
+            ],
+        }
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps({
+                "decision": "no_selection",
+                "option_id": "",
+                "answer": "",
+                "evidence_quote": "",
+                "supporting_unit_ids": [],
+                "independent_unit_ids": [
+                    f"unit-{index}" for index in range(1, len(clauses) + 1)
+                ],
+                "reason": "first verdict missed the embedded scalar",
+            })),
+            SimpleNamespace(text=json.dumps({
+                "decision": "manual_value",
+                "option_id": "",
+                "answer": "ethereum",
+                "evidence_quote": "ethereum",
+                "supporting_unit_ids": [
+                    f"unit-{index}" for index in range(1, len(clauses) + 1)
+                ],
+                "independent_unit_ids": [],
+                "reason": "one source-grounded replacement value plus preservation context",
+            })),
+        ]
+
+        recovered, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            clauses=clauses,
+            user_text=source,
+        )
+        document = json.loads(recovered)
+
+        self.assertTrue(changed)
+        self.assertEqual(provider.complete.call_count, 2)
+        admitted = document["actions"][document["pending_answer_admissions"][0]]
+        self.assertEqual(admitted["answer"], "ethereum")
+
+    def test_pending_owner_binds_untyped_natural_answer_to_declared_option_value(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_pending_answer_actions
+        from agent.harness.state import new_state
+
+        source = "Yes, keep the detected 100 GiB value; it matches this disk."
+        clauses = segment_user_turn(source)
+        state = new_state("pending-owner-option-binding", language="en")
+        state["pending_question"] = {
+            "id": "detected-size",
+            "group": "ledger_disk",
+            "field": "DATA_VOL_SIZE",
+            "kind": "yes_no",
+            "options": [
+                {"id": "1", "label": "Y", "value": "100", "action": {"type": "answer_pending"}},
+                {"id": "2", "label": "N", "value": "__manual__", "action": {"type": "answer_pending"}},
+            ],
+            "manual_input_allowed": True,
+            "validation": {"value_type": "positive_number"},
+        }
+        payload = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": "Yes",
+                "source_evidence": "Yes",
+            }],
+            "semantic_units": [_unit(clauses[0], 1, [0])],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "reviews": [{
+                "action_index": 0,
+                "decision": "select_option",
+                "selected_option_id": "1",
+                "evidence_quote": "Yes",
+                "reason": "the answer accepts the detected value",
+            }],
+        }))
+
+        reviewed, changed = _adjudicate_pending_answer_actions(
+            provider,
+            json.dumps(payload),
+            state,
+            source,
+        )
+        document = json.loads(reviewed)
+
+        self.assertTrue(changed)
+        self.assertEqual(document["actions"][0]["selected_value"], "100")
+        self.assertEqual(document["pending_answer_admissions"], [0])
+
+    def test_verified_option_reference_is_bound_to_typed_contract_value_before_dispatch(self) -> None:
+        from agent.harness.coordinator import _validate_action_plan
+        from agent.harness.state import new_state
+
+        state = new_state("verified-option-reference", language="en")
+        state["last_user_input"] = "Yes, keep the detected value."
+        state["pending_question"] = {
+            "id": "detected-size",
+            "group": "ledger_disk",
+            "field": "DATA_VOL_SIZE",
+            "kind": "yes_no",
+            "options": [
+                {"id": "1", "label": "Y", "value": "100", "action": {"type": "answer_pending"}},
+                {"id": "2", "label": "N", "value": "__manual__", "action": {"type": "answer_pending"}},
+            ],
+            "manual_input_allowed": True,
+            "validation": {"value_type": "positive_number"},
+        }
+        actions = [{
+            "type": "answer_pending",
+            "answer": "100",
+            "selected_value": "1",
+            "source_evidence": state["last_user_input"],
+            "pending_option_semantic_verified": True,
+            "semantic_purpose_verified": True,
+        }]
+
+        prepared = _validate_action_plan(state, actions)
+
+        self.assertEqual(prepared[0]["selected_value"], "100")
+        self.assertEqual(prepared[0]["answer"], "100")
+        self.assertIs(prepared[0]["selection_contract_verified"], True)
+
     def test_rpc_mode_coverage_scenario_has_required_workflow_prerequisites(self) -> None:
         from tests.agent_live.harness_contract_scenarios import question_scenarios
 
