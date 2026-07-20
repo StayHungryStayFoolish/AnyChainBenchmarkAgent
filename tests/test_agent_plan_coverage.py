@@ -8077,6 +8077,102 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         self.assertNotIn("choose_target_mode", candidate_types)
         self.assertNotIn("request_target_mode_selection", candidate_types)
 
+    def test_declared_pending_semantic_replaces_valid_clarification_with_manual_answer(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.state import new_state
+
+        source = "Use /dev/nvme1n1 as the dedicated accounts and state disk."
+        clause = segment_user_turn(source)[0]
+        payload = {
+            "actions": [{
+                "type": "clarify_unresolved",
+                "clauses": [source],
+                "reason": "planner did not bind the value",
+            }],
+            "semantic_units": [_unit(clause, 1, [0])],
+        }
+        state = new_state("recover-valid-clarification", language="en")
+        state["pending_question"] = {
+            "id": "ACCOUNTS_DEVICE",
+            "group": "accounts_disk",
+            "field": "ACCOUNTS_DEVICE",
+            "kind": "device",
+            "prompt": "Enter ACCOUNTS_DEVICE.",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "scalar_token"},
+            "options": [],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "matches": [],
+            "manual_matches": [{
+                "unit_id": "unit-1",
+                "answer": "/dev/nvme1n1",
+                "evidence_quote": "/dev/nvme1n1",
+                "reason": "directly supplies the requested device",
+            }],
+            "contexts": [],
+        }))
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            PlanCoverageResult(True, (), ()),
+            (clause,),
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(recovered["actions"], [{
+            "type": "answer_pending",
+            "answer": "/dev/nvme1n1",
+            "source_evidence": "/dev/nvme1n1",
+        }])
+        self.assertEqual(recovered["semantic_units"][0]["action_indexes"], [0])
+
+    def test_structured_pending_config_assignment_is_owned_by_review_proposal(self) -> None:
+        from agent.harness.intent import _reconcile_structured_candidate_ownership
+        from agent.harness.state import new_state
+
+        source = '{"ACCOUNTS_DEVICE":"/dev/nvme1n1"}'
+        clause = segment_user_turn(source)[0]
+        payload = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": "/dev/nvme1n1",
+                "source_evidence": source,
+            }],
+            "semantic_units": [_unit(clause, 1, [0])],
+        }
+        state = new_state("structured-pending-review", language="en")
+        state["pending_question"] = {
+            "id": "ACCOUNTS_DEVICE",
+            "group": "accounts_disk",
+            "field": "ACCOUNTS_DEVICE",
+            "kind": "device",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "scalar_token"},
+            "options": [],
+        }
+
+        reconciled = json.loads(_reconcile_structured_candidate_ownership(
+            json.dumps(payload),
+            (clause,),
+            state,
+        ))
+
+        self.assertEqual(reconciled["actions"][0]["type"], "propose_config_values")
+        self.assertEqual(
+            reconciled["actions"][0]["config_values"],
+            {"ACCOUNTS_DEVICE": "/dev/nvme1n1"},
+        )
+        self.assertEqual(reconciled["semantic_units"][0]["action_indexes"], [0])
+
 
 if __name__ == "__main__":
     unittest.main()

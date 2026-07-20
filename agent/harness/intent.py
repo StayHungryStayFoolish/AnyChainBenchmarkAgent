@@ -81,7 +81,7 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
         raw_response = _prepare_untrusted_action_document(str(response.text or ""))
         raw_response = _recover_omitted_chain_selection(provider, raw_response, state)
         raw_response = _apply_state_plan_policy(raw_response, state)
-        raw_response = _reconcile_structured_candidate_ownership(raw_response, clauses)
+        raw_response = _reconcile_structured_candidate_ownership(raw_response, clauses, state)
         raw_response, _ = _adjudicate_pending_action_ownership(provider, raw_response, state, text)
         raw_response, _ = _adjudicate_group_navigation_actions(provider, raw_response, state)
         raw_response, _ = _adjudicate_chain_selection_actions(provider, raw_response, state)
@@ -148,7 +148,7 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
             )
             raw_response = _recover_omitted_chain_selection(provider, raw_response, state)
             raw_response = _apply_state_plan_policy(raw_response, state)
-            raw_response = _reconcile_structured_candidate_ownership(raw_response, clauses)
+            raw_response = _reconcile_structured_candidate_ownership(raw_response, clauses, state)
             raw_response, _ = _adjudicate_pending_action_ownership(provider, raw_response, state, text)
             raw_response, _ = _adjudicate_group_navigation_actions(provider, raw_response, state)
             raw_response, _ = _adjudicate_chain_selection_actions(provider, raw_response, state)
@@ -212,15 +212,14 @@ def _recover_and_validate_semantic_actions(
 ) -> tuple[str, PlanCoverageResult]:
     """Converge one plan document through the bounded control recovery gate."""
 
-    if validation.valid:
-        return plan_text, validation
-    plan_text, decomposed = _decompose_unresolved_semantic_units(
-        provider,
-        plan_text,
-        clauses,
-    )
-    if decomposed:
-        validation = _validate_action_document(plan_text, clauses, state)
+    if not validation.valid:
+        plan_text, decomposed = _decompose_unresolved_semantic_units(
+            provider,
+            plan_text,
+            clauses,
+        )
+        if decomposed:
+            validation = _validate_action_document(plan_text, clauses, state)
     plan_text, pending_semantic_changed = _recover_declared_pending_option_semantics(
         provider,
         plan_text,
@@ -230,6 +229,8 @@ def _recover_and_validate_semantic_actions(
     )
     if pending_semantic_changed:
         validation = _validate_action_document(plan_text, clauses, state)
+    if validation.valid:
+        return plan_text, validation
     recovered, changed = _recover_registry_bounded_semantic_actions(
         provider,
         plan_text,
@@ -793,12 +794,20 @@ def _recover_declared_pending_option_semantics(
         if not isinstance(unit, dict):
             continue
         indexes = unit.get("action_indexes") if isinstance(unit.get("action_indexes"), list) else []
+        clarification_owned = any(
+            isinstance(index, int)
+            and 0 <= index < len(actions)
+            and isinstance(actions[index], dict)
+            and str(actions[index].get("type") or "") == "clarify_unresolved"
+            for index in indexes
+        )
         if (
             str(unit.get("disposition") or "") != "unresolved"
             and not any(index in invalid_indexes for index in indexes)
             and str(unit.get("unit_id") or "") not in (
                 validation.incomplete_unit_ids if validation else ()
             )
+            and not clarification_owned
         ):
             continue
         source = str(unit.get("source_text") or "")
@@ -1416,14 +1425,18 @@ def _apply_state_plan_policy(text: str, state: AgentGraphState) -> str:
 def _reconcile_structured_candidate_ownership(
     text: str,
     clauses: tuple[TurnClause, ...],
+    state: AgentGraphState | None = None,
 ) -> str:
     """Complete syntax-owned facts after the model selects config intent.
 
     The model decides whether a structured clause is configuration at all.
     Once it maps that clause to ``propose_config_values``, the deterministic
-    parser owns lossless transfer of recognized and unmapped assignments. This
-    keeps logs/examples outside the configuration path while preventing model
-    variance from dropping one key inside an admitted config transaction.
+    parser owns lossless transfer of recognized and unmapped assignments. An
+    exact registered config assignment that the model tried to bind directly
+    to the active manual field is also a configuration transaction, so this
+    boundary converts it to the same review proposal. This keeps logs/examples
+    outside the configuration path while preventing either silent field loss
+    or review bypass.
     """
 
     payload = _parse_json_object(text)
@@ -1444,6 +1457,8 @@ def _reconcile_structured_candidate_ownership(
             for unit in units
             if isinstance(unit, dict) and str(unit.get("clause_id") or "") == clause.clause_id
         ]
+        config_values = dict(candidates.get("config_values") or {})
+        unmapped_values = dict(candidates.get("unmapped_values") or {})
         proposal_indexes = {
             index
             for unit in clause_units
@@ -1453,11 +1468,55 @@ def _reconcile_structured_candidate_ownership(
             and isinstance(actions[index], dict)
             and str(actions[index].get("type") or "") == "propose_config_values"
         }
+        pending = dict((state or {}).get("pending_question") or {})
+        pending_field = str(pending.get("field") or "").strip().upper()
+        if (
+            not proposal_indexes
+            and pending.get("manual_input_allowed") is True
+            and pending_field
+            and pending_field in config_values
+        ):
+            direct_answer_indexes = {
+                index
+                for unit in clause_units
+                for index in (
+                    unit.get("action_indexes")
+                    if isinstance(unit.get("action_indexes"), list)
+                    else []
+                )
+                if isinstance(index, int)
+                and 0 <= index < len(actions)
+                and isinstance(actions[index], dict)
+                and str(actions[index].get("type") or "") == "answer_pending"
+            }
+            if direct_answer_indexes:
+                proposal_index = min(direct_answer_indexes)
+                actions[proposal_index] = {
+                    "type": "propose_config_values",
+                    "source_format": "structured",
+                    "config_values": dict(config_values),
+                    "unmapped_values": dict(unmapped_values),
+                    "source_evidence": clause.text,
+                    "confidence": "high",
+                }
+                for unit in clause_units:
+                    indexes = (
+                        unit.get("action_indexes")
+                        if isinstance(unit.get("action_indexes"), list)
+                        else []
+                    )
+                    if not any(index in direct_answer_indexes for index in indexes):
+                        continue
+                    unit["action_indexes"] = [
+                        *[index for index in indexes if index not in direct_answer_indexes],
+                        proposal_index,
+                    ]
+                    unit["disposition"] = "action"
+                    unit["reason"] = "registered structured config assignment requires review"
+                proposal_indexes = {proposal_index}
+                changed = True
         if not proposal_indexes:
             continue
-
-        config_values = dict(candidates.get("config_values") or {})
-        unmapped_values = dict(candidates.get("unmapped_values") or {})
         for index in proposal_indexes:
             action = actions[index]
             merged_config = dict(action.get("config_values") or {})

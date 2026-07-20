@@ -254,21 +254,42 @@ def apply_environment_action(state: AgentGraphState, action: ActionProposal) -> 
                 consumed_action_ids=(action.action_id,),
                 completion="completed",
             )
-        next_state: AgentGraphState = deepcopy(state)
-        next_state.setdefault("inferred_config", {})["pending_review"] = proposal
-        review_group = str(next_state.get("active_group") or "opening")
-        question = config_proposal_review_question(
-            review_group,
+        return propose_config_assignments_for_review(
+            state,
             proposal,
-            language=str(next_state.get("language") or "en"),
-        )
-        return HandlerResult(
-            delta=StateDelta.between(state, next_state),
             consumed_action_ids=(action.action_id,),
-            pending_question=question,
-            completion="completed",
         )
     return HandlerResult(blocker=f"unsupported environment action: {action.action_type}")
+
+
+def propose_config_assignments_for_review(
+    state: AgentGraphState,
+    proposal: dict[str, Any],
+    *,
+    consumed_action_ids: tuple[str, ...] = (),
+) -> HandlerResult:
+    """Open the single review transaction for recognized config candidates."""
+
+    normalized = build_config_proposal(proposal)
+    if not normalized.get("config_values"):
+        return HandlerResult(
+            consumed_action_ids=consumed_action_ids,
+            completion="completed",
+        )
+    next_state: AgentGraphState = deepcopy(state)
+    next_state.setdefault("inferred_config", {})["pending_review"] = normalized
+    review_group = str(next_state.get("active_group") or "opening")
+    question = config_proposal_review_question(
+        review_group,
+        normalized,
+        language=str(next_state.get("language") or "en"),
+    )
+    return HandlerResult(
+        delta=StateDelta.between(state, next_state),
+        consumed_action_ids=consumed_action_ids,
+        pending_question=question,
+        completion="completed",
+    )
 
 
 def extract_structured_config_proposal(text: str) -> dict[str, Any] | None:

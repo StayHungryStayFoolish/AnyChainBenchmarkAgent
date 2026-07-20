@@ -1390,6 +1390,41 @@ network:
         self.assertIn("CLOUD_REGION", rendered)
         self.assertIn("DATA_VOL_MAX_IOPS", rendered)
 
+    def test_explicit_structured_assignment_uses_the_same_review_transaction(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("structured-pending-review", language="en")
+        state["target_mode"] = "fake-node"
+        state["workflow_mode"] = "rpc_benchmark"
+        state["chain_identity"] = {
+            "raw": "solana",
+            "canonical": "solana",
+            "status": "confirmed",
+            "case": "known",
+        }
+        state["confirmed_config"] = {"BLOCKCHAIN_NODE": "solana"}
+        state["active_group"] = "accounts_disk"
+        state["pending_question"] = {
+            "id": "ACCOUNTS_DEVICE",
+            "group": "accounts_disk",
+            "field": "ACCOUNTS_DEVICE",
+            "kind": "manual",
+            "prompt": "Enter the accounts device.",
+            "manual_input_allowed": True,
+            "contract_version": 1,
+        }
+        state["last_user_input"] = '{"ACCOUNTS_DEVICE":"/dev/nvme1n1"}'
+
+        result = process_turn(state)
+
+        self.assertEqual(result["pending_question"]["id"], "inferred_config_review")
+        self.assertNotIn("ACCOUNTS_DEVICE", result["confirmed_config"])
+        self.assertEqual(
+            result["inferred_config"]["pending_review"]["config_values"],
+            {"ACCOUNTS_DEVICE": "/dev/nvme1n1"},
+        )
+
     def test_qps_override_and_accounts_presence_can_be_set_from_one_freeform_turn(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
         from agent.harness.state import new_state
@@ -1969,7 +2004,7 @@ network:
         prompt = str(result["pending_question"].get("prompt") or "")
         self.assertEqual(sum(prompt in item for item in result.get("visible_response") or []), 1)
 
-    def test_direct_config_assignment_goes_to_named_field_not_current_pending(self) -> None:
+    def test_explicit_config_assignment_reviews_named_field_not_current_pending(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
         from agent.harness.state import new_state
 
@@ -1991,11 +2026,21 @@ network:
 
         result = process_turn(state)
 
-        self.assertEqual(result["confirmed_config"].get("MACHINE_TYPE"), "n2-standard-16")
+        self.assertNotIn("MACHINE_TYPE", result["confirmed_config"])
         self.assertNotEqual(result["confirmed_config"].get("CLOUD_ZONE"), "MACHINE_TYPE=n2-standard-16")
+        self.assertEqual(result["pending_question"]["id"], "inferred_config_review")
+        self.assertEqual(
+            result["inferred_config"]["pending_review"]["config_values"],
+            {"MACHINE_TYPE": "n2-standard-16"},
+        )
+
+        result["last_user_input"] = "Y"
+        result = process_turn(result)
+
+        self.assertEqual(result["confirmed_config"].get("MACHINE_TYPE"), "n2-standard-16")
         self.assertEqual(result["pending_question"]["id"], "CLOUD_ZONE")
 
-    def test_comma_separated_direct_config_assignments_apply_each_field(self) -> None:
+    def test_comma_separated_config_assignments_apply_atomically_after_review(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
         from agent.harness.state import new_state
 
@@ -2007,6 +2052,12 @@ network:
         state["last_user_input"] = "CLOUD_REGION=us-1, CLOUD_ZONE=us-1-z, MACHINE_TYPE=n2"
 
         result = process_turn(state)
+
+        self.assertNotIn("CLOUD_REGION", result["confirmed_config"])
+        self.assertEqual(result["pending_question"]["id"], "inferred_config_review")
+
+        result["last_user_input"] = "Y"
+        result = process_turn(result)
 
         self.assertEqual(result["confirmed_config"].get("CLOUD_REGION"), "us-1")
         self.assertEqual(result["confirmed_config"].get("CLOUD_ZONE"), "us-1-z")

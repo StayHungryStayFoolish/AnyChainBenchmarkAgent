@@ -24,12 +24,12 @@ from .contracts import ActionProposal, CheckpointCommand, HandlerResult, Recover
 from .localization import localized as _localized
 from .domains.orientation import completed_group_status
 from .domains.environment import (
-    apply_direct_config_assignments,
     apply_inferred_config_review,
     config_proposal_review_question,
     merge_config_proposal_from_text,
     is_assignment_only_config_text,
     parse_known_config_assignments,
+    propose_config_assignments_for_review,
 )
 from .domains.chain_rpc import apply_chain_rpc_action
 from .domains.chain_rpc_support import is_existing_family_lifecycle
@@ -338,8 +338,19 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
 
     direct_assignments = parse_known_config_assignments(text) if is_assignment_only_config_text(text) else {}
     if direct_assignments:
-        state = _apply_handler_result(state, apply_direct_config_assignments(state, direct_assignments), owner="environment")
-        return _set_turn_phase(state, "fallback", "direct_assignments")
+        proposal = {
+            "type": "propose_config_values",
+            "source_format": "structured",
+            "config_values": direct_assignments,
+            "unmapped_values": {},
+            "reason": "explicit configuration assignment",
+        }
+        state = _apply_handler_result(
+            state,
+            propose_config_assignments_for_review(state, proposal),
+            owner="environment",
+        )
+        return _set_turn_phase(state, "compose", "config_proposal_review")
 
     if pending and str(pending.get("kind") or "") == "evidence" and should_start_evidence_collection(text):
         state = _apply_evidence_outcome(state, start_evidence_collection(state, text, pending))
