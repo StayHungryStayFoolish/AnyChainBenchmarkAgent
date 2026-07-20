@@ -1424,6 +1424,13 @@ network:
             result["inferred_config"]["pending_review"]["config_values"],
             {"ACCOUNTS_DEVICE": "/dev/nvme1n1"},
         )
+        self.assertEqual(
+            [
+                item.get("type")
+                for item in (result.get("turn_context") or {}).get("admitted_actions") or []
+            ],
+            ["propose_config_values"],
+        )
 
     def test_standalone_yaml_config_uses_the_same_review_transaction(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
@@ -1450,6 +1457,13 @@ network:
             {"CLOUD_REGION": "us-1", "CLOUD_ZONE": "us-1-z"},
         )
         self.assertNotIn("CLOUD_REGION", result["confirmed_config"])
+        self.assertEqual(
+            [
+                item.get("type")
+                for item in (result.get("turn_context") or {}).get("admitted_actions") or []
+            ],
+            ["propose_config_values"],
+        )
 
     def test_mixed_prose_and_structured_config_reaches_the_semantic_planner(self) -> None:
         from unittest.mock import patch

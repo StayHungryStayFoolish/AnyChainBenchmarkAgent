@@ -32,7 +32,6 @@ from .domains.environment import (
     merge_config_proposal_from_text,
     is_assignment_only_config_text,
     parse_known_config_assignments,
-    propose_config_assignments_for_review,
 )
 from .domains.chain_rpc import apply_chain_rpc_action
 from .domains.chain_rpc_support import is_existing_family_lifecycle
@@ -357,18 +356,14 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
     if proposal is None and direct_assignments:
         proposal = {
             "type": "propose_config_values",
-            "source_format": "structured",
+            "source_format": "mixed",
             "config_values": direct_assignments,
             "unmapped_values": {},
             "reason": "explicit configuration assignment",
         }
     if proposal and proposal.get("config_values"):
-        state = _apply_handler_result(
-            state,
-            propose_config_assignments_for_review(state, proposal),
-            owner="environment",
-        )
-        return _set_turn_phase(state, "compose", "config_proposal_review")
+        state["proposed_actions"] = [proposal]
+        return _set_turn_phase(state, "admit", "structured_config_proposal")
 
     if pending and str(pending.get("kind") or "") == "evidence" and should_start_evidence_collection(text):
         state = _apply_evidence_outcome(state, start_evidence_collection(state, text, pending))
