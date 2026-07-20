@@ -516,6 +516,7 @@ def apply_chain_rpc_action(state: AgentGraphState, action: ActionProposal) -> Ha
             "chain_change_input",
             prompt,
             field="chain_change_input",
+            accepted_action_types=("choose_chain", "change_chain"),
             queue_barrier=True,
         ))
         _set_control(next_state, 'visible_response', [render_question(next_state["pending_question"], next_state.get("language", "en"))])

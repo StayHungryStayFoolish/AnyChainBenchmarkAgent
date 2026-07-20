@@ -1057,6 +1057,11 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
                 "trimmed_whitespace_punctuation", "  solana  ", True
             ),
         },
+        manual_action_overrides={
+            "natural_language_answer": "change_chain",
+            "multiline_prose": "change_chain",
+            "structured_json_yaml_env_curl": "change_chain",
+        },
     )
 
     state = new_state("catalog-mainnet-review", language=language, session_purpose="coverage")

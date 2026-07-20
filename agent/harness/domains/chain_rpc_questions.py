@@ -50,13 +50,21 @@ def _endpoint_validation_question(state: AgentGraphState) -> dict[str, Any] | No
             validation={"input_mode": "rpc_method_or_schema_evidence"},
         )
     if custom.get("status") == "needs_schema_evidence":
+        method = normalize_scalar(
+            draft_view(state).get("method") or custom.get("candidate_method")
+        )
+        method_label = (
+            f"`{method}`"
+            if method
+            else localized(language, "当前 RPC method", "the current RPC method")
+        )
         return manual_question(
             "endpoint_process",
             "custom_rpc_schema_evidence",
             localized(
                 language,
-                "请提供该 method 的 schema 证据：可以粘贴 params JSON、curl/request、response 示例或官方文档片段。没有参数时可直接输入 `[]`。",
-                "Provide schema evidence for this method: params JSON, curl/request, response sample, or docs excerpt. Use `[]` when there are no params.",
+                f"请提供 {method_label} 的 schema 证据：可以粘贴 params JSON、curl/request、response 示例或官方文档片段。没有参数时可直接输入 `[]`。",
+                f"Provide schema evidence for {method_label}: params JSON, curl/request, response sample, or docs excerpt. Use `[]` when there are no params.",
             ),
             field="custom_rpc_schema_evidence",
             kind="evidence",
@@ -93,10 +101,20 @@ def _endpoint_validation_question(state: AgentGraphState) -> dict[str, Any] | No
             validation={"input_mode": "rpc_method_or_schema_evidence"},
         )
     if identity.get("status") == "existing_family_needs_schema_evidence":
+        method = normalize_scalar(draft_view(state).get("method"))
+        method_label = (
+            f"`{method}`"
+            if method
+            else localized(language, "当前 RPC method", "the current RPC method")
+        )
         return manual_question(
             "endpoint_process",
             "new_chain_schema_evidence",
-            localized(language, "请提供该 method 的 schema 证据：params JSON、curl/request、response 示例或官方文档片段。没有参数时可直接输入 `[]`。", "Provide schema evidence for this method: params JSON, curl/request, response sample, or docs excerpt. Use `[]` when there are no params."),
+            localized(
+                language,
+                f"请提供 {method_label} 的 schema 证据：params JSON、curl/request、response 示例或官方文档片段。没有参数时可直接输入 `[]`。",
+                f"Provide schema evidence for {method_label}: params JSON, curl/request, response sample, or docs excerpt. Use `[]` when there are no params.",
+            ),
             field="new_chain_schema_evidence",
             kind="evidence",
             accepted_action_types=("rpc_catalog_command",),

@@ -2011,6 +2011,7 @@ network:
         self.assertTrue(result["custom_rpc"]["endpoint_ready"])
         self.assertEqual(result["custom_rpc"]["status"], "needs_schema_evidence")
         self.assertEqual(result["pending_question"]["id"], "custom_rpc_schema_evidence")
+        self.assertIn("`eth_chainId`", result["pending_question"]["prompt"])
         self.assertIn("custom_rpc_endpoint_probe", result["endpoint_evidence"])
 
     def test_config_review_is_prioritized_before_custom_rpc_even_if_model_orders_it_later(self) -> None:
@@ -5791,6 +5792,10 @@ network:
         initial_outcome = apply_chain_rpc_action(initial, action)
         initial_result = _commit_result(initial, initial_outcome, owner="chain_rpc")
         self.assertEqual(initial_result["pending_question"]["id"], "chain_change_input")
+        self.assertEqual(
+            set(initial_result["pending_question"]["accepted_action_types"]),
+            {"answer_pending", "choose_chain", "change_chain"},
+        )
         self.assertIn("chain name to test", initial_result["pending_question"]["prompt"])
         self.assertNotIn("replacement", initial_result["pending_question"]["prompt"])
 
@@ -5803,6 +5808,10 @@ network:
         replacement_result = _commit_result(replacement, replacement_outcome, owner="chain_rpc")
         self.assertIn("replacement chain", replacement_result["pending_question"]["prompt"])
         self.assertIn("`bsc`", replacement_result["pending_question"]["prompt"])
+        self.assertEqual(
+            set(replacement_result["pending_question"]["accepted_action_types"]),
+            {"answer_pending", "choose_chain", "change_chain"},
+        )
 
     def test_case2_compound_rpc_evidence_preserves_endpoint_and_requests_schema_review(self) -> None:
         from agent.harness.domains.chain_rpc import apply_chain_rpc_answer
@@ -6935,6 +6944,7 @@ network:
             state = process_turn(state)
             self.assertEqual(state["chain_identity"]["status"], "existing_family_needs_schema_evidence")
             self.assertEqual(state["pending_question"]["id"], "new_chain_schema_evidence")
+            self.assertIn("`eth_blockNumber`", state["pending_question"]["prompt"])
 
             state["last_user_input"] = "[]"
             state = process_turn(state)
