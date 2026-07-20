@@ -82,9 +82,27 @@ class ReviewedExecutionCaseTest(unittest.TestCase):
         _scenario, case = reviewed_execution_case(edge)  # type: ignore[misc]
         endpoint = "http://local-jsonrpc:8545"
         self.assertEqual(case.resolve_input({REACHABLE_RPC_URL_ENV: endpoint}), endpoint)
+        self.assertTrue(case.admits_recorded_input(endpoint))
+        self.assertTrue(case.admits_recorded_input("http://another-local-service:9545"))
+        self.assertFalse(case.admits_recorded_input("https://public.example/v1?key=secret"))
+        self.assertFalse(case.admits_recorded_input("http://10.0.0.4:8545"))
         self.assertNotIn(endpoint, str(case.descriptor))
         with self.assertRaisesRegex(RuntimeError, REACHABLE_RPC_URL_ENV):
             case.resolve_input({})
+
+        trimmed_edge = next(
+            item for item in self.ledger["edges"]
+            if item["question_id"] == "LOCAL_RPC_URL"
+            and item["input_class"] == "trimmed_whitespace_punctuation"
+        )
+        _scenario, trimmed_case = reviewed_execution_case(trimmed_edge)  # type: ignore[misc]
+        wrapped = f"  {endpoint},  "
+        self.assertEqual(
+            trimmed_case.resolve_input({REACHABLE_RPC_URL_ENV: endpoint}),
+            wrapped,
+        )
+        self.assertTrue(trimmed_case.admits_recorded_input(wrapped))
+        self.assertFalse(trimmed_case.admits_recorded_input(f"use {endpoint}"))
 
     def test_checkpoint_seed_receipt_binds_scenario_session_and_contract(self) -> None:
         scenario = reviewed_scenario("opening")

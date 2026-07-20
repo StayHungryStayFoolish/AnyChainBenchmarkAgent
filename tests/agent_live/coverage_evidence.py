@@ -917,7 +917,7 @@ def _validate_real_cli_provenance(
             raise ValueError(f"seed receipt has invalid {key}")
     if str(receipt.get("checkpoint_path") or "").strip() == "":
         raise ValueError("seed receipt has no checkpoint path")
-    if content_hash(turn.user_message) != content_hash(authoritative_case.resolve_input()):
+    if not authoritative_case.admits_recorded_input(turn.user_message):
         raise ValueError("PTY input does not match the reviewed execution case")
 
 

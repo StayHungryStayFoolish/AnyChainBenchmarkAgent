@@ -7,11 +7,15 @@ evidence lane from using another lane's artifact as an input registry.
 
 from __future__ import annotations
 
+import ipaddress
 import os
+import re
 from dataclasses import asdict, dataclass
 from functools import lru_cache
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
+from agent.harness.input_values import extract_url_candidate
 from tests.agent_live.coverage_evidence import content_hash
 from tests.agent_live.harness_contract_scenarios import (
     ManualInputCase,
@@ -78,6 +82,44 @@ class ContractExecutionCase:
                 )
             return f"  {value},  "
         raise RuntimeError(f"unknown execution-case input provider: {self.input_provider}")
+
+    def admits_recorded_input(self, value: str) -> bool:
+        """Validate recorded input without depending on the ingest process environment."""
+
+        if not self.input_provider:
+            return value == self.exact_input
+        if self.input_provider not in {"reachable_rpc_url", "trimmed_reachable_rpc_url"}:
+            return False
+        candidate = extract_url_candidate(value)
+        parsed = urlsplit(candidate)
+        try:
+            port = parsed.port
+        except ValueError:
+            return False
+        hostname = str(parsed.hostname or "")
+        try:
+            local_host = ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            local_host = bool(
+                "." not in hostname
+                and re.fullmatch(
+                    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?",
+                    hostname,
+                )
+            )
+        if (
+            parsed.scheme not in {"http", "https", "ws", "wss"}
+            or not local_host
+            or port is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            return False
+        if self.input_provider == "trimmed_reachable_rpc_url":
+            return value == f"  {candidate},  "
+        return value == candidate
 
 
 def reviewed_execution_case(
