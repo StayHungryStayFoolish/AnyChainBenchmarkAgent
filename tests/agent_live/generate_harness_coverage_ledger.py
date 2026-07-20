@@ -293,6 +293,21 @@ def _question_contracts() -> list[dict[str, Any]]:
             "scenario_id": scenario_id,
         })[:20]
         key = (group, question_id, variant_hash)
+        accepted_action_types = {
+            str(item).strip()
+            for item in question.get("accepted_action_types") or ()
+            if str(item).strip()
+        }
+        undeclared_manual_actions = {
+            str(action_type).strip()
+            for action_type in (scenario.manual_action_overrides or {}).values()
+            if str(action_type).strip() not in accepted_action_types
+        }
+        if undeclared_manual_actions:
+            raise ValueError(
+                f"scenario {scenario_id} declares manual actions outside the "
+                f"question contract: {sorted(undeclared_manual_actions)}"
+            )
         if key not in variants:
             variants[key] = {
                 "group": group,
@@ -307,6 +322,7 @@ def _question_contracts() -> list[dict[str, Any]]:
                 "option_postcondition_overrides": {},
                 "option_relation_overrides": {},
                 "manual_input_overrides": {},
+                "manual_action_overrides": {},
                 "contract": contract_variant_payload(question),
             }
         variants[key]["scenario_ids"].append(scenario_id)
@@ -324,6 +340,9 @@ def _question_contracts() -> list[dict[str, Any]]:
             )
             variants[key]["manual_input_overrides"] = deepcopy(
                 dict(scenario.manual_input_overrides or {})
+            )
+            variants[key]["manual_action_overrides"] = deepcopy(
+                dict(scenario.manual_action_overrides or {})
             )
     for variant in variants.values():
         variant["scenario_ids"] = sorted(set(variant["scenario_ids"]))
@@ -718,7 +737,12 @@ def build_ledger(
                     and field.upper() in CONFIRMABLE_CONFIG_FIELDS
                 )
                 action_type = (
-                    "propose_config_values" if structured_config_interrupt else "answer_pending"
+                    "propose_config_values"
+                    if structured_config_interrupt
+                    else str(
+                        (variant.get("manual_action_overrides") or {}).get(input_class)
+                        or "answer_pending"
+                    )
                 )
                 postcondition_path = (
                     f"inferred_config.pending_review.config_values.{field.upper()}"

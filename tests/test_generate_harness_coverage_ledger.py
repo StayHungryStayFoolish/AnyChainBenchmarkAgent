@@ -25,6 +25,7 @@ from tests.agent_live.coverage_evidence import COMPILED_GRAPH_RUNNER
 from agent.harness.coverage_events import capture_coverage_events, observe_compiled_graph_turn
 from tests.agent_live.graph_turn import invoke_product_graph_turn
 from tests.agent_live.harness_contract_scenarios import question_scenarios
+from tests.agent_live.harness_contract_scenarios import QuestionScenario
 
 
 class HarnessCoverageLedgerTest(unittest.TestCase):
@@ -120,6 +121,62 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
                     edge["expected_postcondition"]["next_question_ids"],
                     ["inferred_config_review"],
                 )
+
+    def test_semantic_chain_input_uses_declared_domain_action(self) -> None:
+        semantic_classes = {
+            "natural_language_answer",
+            "multiline_prose",
+            "structured_json_yaml_env_curl",
+        }
+        edges = [
+            edge
+            for edge in self.ledger["edges"]
+            if edge["edge_type"] == "manual_input"
+            and edge["question_id"] == "chain"
+            and edge["input_class"] in semantic_classes
+        ]
+        self.assertEqual({edge["input_class"] for edge in edges}, semantic_classes)
+        for edge in edges:
+            self.assertEqual(edge["action_type"], "choose_chain")
+            self.assertEqual(
+                edge["expected_postcondition"]["path"],
+                "chain_identity.canonical",
+            )
+
+        scalar = next(
+            edge
+            for edge in self.ledger["edges"]
+            if edge["edge_type"] == "manual_input"
+            and edge["question_id"] == "MACHINE_TYPE"
+            and edge["input_class"] == "natural_language_answer"
+        )
+        self.assertEqual(scalar["action_type"], "answer_pending")
+
+    def test_manual_action_override_must_be_accepted_by_question(self) -> None:
+        scenario = QuestionScenario(
+            scenario_id="invalid-manual-owner",
+            question={
+                "id": "chain",
+                "group": "chain_identity",
+                "kind": "chain",
+                "field": "chain",
+                "prompt": "chain",
+                "manual_input_allowed": True,
+                "accepted_action_types": ["choose_chain"],
+                "options": [],
+            },
+            seed_state={"active_group": "chain_identity"},
+            manual_action_overrides={"natural_language_answer": "answer_pending"},
+        )
+        with patch(
+            "tests.agent_live.generate_harness_coverage_ledger.question_scenarios",
+            return_value=[scenario],
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "manual actions outside the question contract",
+            ):
+                build_ledger(revision=self.revision)
 
     def test_real_execution_contract_names_the_linux_producer(self) -> None:
         contract = RUNNER_CONTRACTS["real_execution"]

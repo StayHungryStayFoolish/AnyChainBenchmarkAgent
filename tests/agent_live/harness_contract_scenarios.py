@@ -57,6 +57,7 @@ class QuestionScenario:
     option_postcondition_overrides: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     option_relation_overrides: Mapping[str, tuple[Mapping[str, Any], ...]] = field(default_factory=dict)
     manual_input_overrides: Mapping[str, "ManualInputCase"] = field(default_factory=dict)
+    manual_action_overrides: Mapping[str, str] = field(default_factory=dict)
     manual_next_question_ids: tuple[str, ...] = ()
 
     @property
@@ -237,6 +238,7 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
         option_postcondition_overrides: Mapping[str, Mapping[str, Any]] | None = None,
         option_relation_overrides: Mapping[str, tuple[Mapping[str, Any], ...]] | None = None,
         manual_input_overrides: Mapping[str, ManualInputCase] | None = None,
+        manual_action_overrides: Mapping[str, str] | None = None,
     ) -> None:
         if not question:
             return
@@ -251,6 +253,7 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
             option_postcondition_overrides=deepcopy(dict(option_postcondition_overrides or {})),
             option_relation_overrides=deepcopy(dict(option_relation_overrides or {})),
             manual_input_overrides=deepcopy(dict(manual_input_overrides or {})),
+            manual_action_overrides=deepcopy(dict(manual_action_overrides or {})),
             manual_next_question_ids=tuple(manual_next_question_ids),
         )
 
@@ -839,6 +842,15 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
             manual_postcondition_path=(
                 "chain_identity.canonical" if scenario_id == "chain_manual" else ""
             ),
+            manual_action_overrides=(
+                {
+                    "natural_language_answer": "choose_chain",
+                    "multiline_prose": "choose_chain",
+                    "structured_json_yaml_env_curl": "choose_chain",
+                }
+                if scenario_id == "chain_manual"
+                else None
+            ),
         )
     return scenarios
 
@@ -863,6 +875,7 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
         option_postcondition_overrides: Mapping[str, Mapping[str, Any]] | None = None,
         option_relation_overrides: Mapping[str, tuple[Mapping[str, Any], ...]] | None = None,
         manual_input_overrides: Mapping[str, ManualInputCase] | None = None,
+        manual_action_overrides: Mapping[str, str] | None = None,
     ) -> None:
         if question:
             seed = deepcopy(state)
@@ -879,6 +892,7 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
                 ),
                 option_relation_overrides=deepcopy(dict(option_relation_overrides or {})),
                 manual_input_overrides=deepcopy(dict(manual_input_overrides or {})),
+                manual_action_overrides=deepcopy(dict(manual_action_overrides or {})),
                 manual_next_question_ids=tuple(manual_next_question_ids),
             )
 
