@@ -878,6 +878,7 @@ def _validate_real_cli_provenance(
     execution_case: Mapping[str, Any],
     seed_receipt: Mapping[str, Any],
 ) -> None:
+    from tests.agent_live.harness_contract_scenarios import canonical_scenario_state
     from tests.agent_live.reviewed_execution_cases import reviewed_execution_case
 
     resolved = reviewed_execution_case(edge)
@@ -897,7 +898,7 @@ def _validate_real_cli_provenance(
     required = {
         "scenario_id": scenario.scenario_id,
         "scenario_state_fingerprint": scenario.state_fingerprint,
-        "seed_state_hash": content_hash(scenario.seed_state or {}),
+        "seed_state_hash": content_hash(canonical_scenario_state(scenario.seed_state or {})),
         "session_id": turn.session_id,
         "session_purpose": str(observation.runtime_events[0].session_purpose),
         "pending_question_id": str(scenario.question.get("id") or ""),

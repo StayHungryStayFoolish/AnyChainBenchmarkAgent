@@ -15,6 +15,7 @@ from agent.harness.state import project_checkpoint_state
 from tests.agent_live.coverage_evidence import content_hash
 from tests.agent_live.harness_contract_scenarios import (
     action_transition_scenarios,
+    canonical_scenario_state,
     question_scenarios,
 )
 
@@ -105,7 +106,7 @@ def seed_runtime_checkpoint(
     return SeedReceipt(
         scenario_id=str(scenario_id),
         scenario_state_fingerprint=str(scenario_state_fingerprint),
-        seed_state_hash=content_hash(seed_state),
+        seed_state_hash=content_hash(canonical_scenario_state(seed_state)),
         projected_state_hash=content_hash(projected),
         checkpoint_sha256=hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
         checkpoint_path=str(checkpoint),

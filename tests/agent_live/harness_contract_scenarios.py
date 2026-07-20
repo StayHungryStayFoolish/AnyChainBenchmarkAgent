@@ -25,6 +25,20 @@ from tests.agent_live.coverage_evidence import content_hash
 from tests.agent_live.graph_turn import invoke_product_graph_turn
 
 
+def canonical_scenario_state(seed_state: Mapping[str, Any]) -> dict[str, Any]:
+    """Remove runtime-generated identity fields from a reviewed scenario seed."""
+
+    stable = deepcopy(dict(seed_state))
+    session = stable.get("session")
+    if isinstance(session, dict):
+        session.pop("created_at", None)
+        session.pop("updated_at", None)
+    pending = stable.get("pending_question")
+    if isinstance(pending, dict):
+        pending.pop("execution_request_id", None)
+    return stable
+
+
 @dataclass(frozen=True)
 class QuestionScenario:
     scenario_id: str
@@ -45,15 +59,7 @@ class QuestionScenario:
     def state_fingerprint(self) -> str:
         if self.seed_state is None:
             return content_hash({"catalog_scenario_id": self.scenario_id})
-        stable = deepcopy(dict(self.seed_state))
-        session = stable.get("session")
-        if isinstance(session, dict):
-            session.pop("created_at", None)
-            session.pop("updated_at", None)
-        pending = stable.get("pending_question")
-        if isinstance(pending, dict):
-            pending.pop("execution_request_id", None)
-        return content_hash(stable)
+        return content_hash(canonical_scenario_state(self.seed_state))
 
 
 @dataclass(frozen=True)
@@ -73,12 +79,7 @@ class ActionTransitionScenario:
 
     @property
     def state_fingerprint(self) -> str:
-        stable = deepcopy(dict(self.seed_state))
-        session = stable.get("session")
-        if isinstance(session, dict):
-            session.pop("created_at", None)
-            session.pop("updated_at", None)
-        return content_hash(stable)
+        return content_hash(canonical_scenario_state(self.seed_state))
 
 
 def action_transition_scenarios(language: str = "en") -> list[ActionTransitionScenario]:

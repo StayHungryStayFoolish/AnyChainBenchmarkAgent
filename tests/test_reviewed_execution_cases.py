@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -16,6 +17,7 @@ from tests.agent_live.coverage_evidence import (
     pty_transcript_hash,
 )
 from tests.agent_live.generate_harness_coverage_ledger import build_ledger
+from tests.agent_live.harness_contract_scenarios import canonical_scenario_state
 from tests.agent_live.reviewed_execution_cases import (
     REACHABLE_RPC_URL_ENV,
     reviewed_execution_case,
@@ -44,6 +46,22 @@ class ReviewedExecutionCaseTest(unittest.TestCase):
             self.assertIs(type(case.expected_admitted), bool)
             self.assertEqual(case.descriptor_hash, edge["execution_case_hash"])
 
+    def test_canonical_scenario_hash_excludes_only_runtime_identity(self) -> None:
+        scenario = reviewed_scenario("runtime_real_node_smoke")
+        first = deepcopy(dict(scenario.seed_state))
+        second = deepcopy(first)
+        second["session"]["created_at"] = "2099-01-01T00:00:00Z"
+        second["session"]["updated_at"] = "2099-01-01T00:00:01Z"
+        second["pending_question"]["execution_request_id"] = "another-runtime-id"
+        self.assertEqual(
+            content_hash(canonical_scenario_state(first)),
+            content_hash(canonical_scenario_state(second)),
+        )
+        second["target_mode"] = "fake-node"
+        self.assertNotEqual(
+            content_hash(canonical_scenario_state(first)),
+            content_hash(canonical_scenario_state(second)),
+        )
     def test_unreviewed_invalid_cross_product_is_not_applicable(self) -> None:
         for question_id in ("chain", "case3_protocol_evidence"):
             edge = next(
@@ -171,7 +189,7 @@ class ReviewedExecutionCaseTest(unittest.TestCase):
         receipt = {
             "scenario_id": scenario.scenario_id,
             "scenario_state_fingerprint": scenario.state_fingerprint,
-            "seed_state_hash": content_hash(scenario.seed_state or {}),
+            "seed_state_hash": content_hash(canonical_scenario_state(scenario.seed_state or {})),
             "projected_state_hash": "d" * 64,
             "checkpoint_sha256": "e" * 64,
             "checkpoint_path": "/tmp/provenance.sqlite",
