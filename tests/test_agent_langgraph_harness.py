@@ -12315,10 +12315,9 @@ network:
             "ask_capabilities",
             "answer_opening_question",
             "analyze_report",
-            "inspect_failure",
         ):
             self.assertEqual(ACTION_BY_TYPE[action_type].lifetime, "turn_local")
-        for action_type in ("choose_target_mode", "set_qps_mode", "propose_config_values"):
+        for action_type in ("choose_target_mode", "set_qps_mode", "propose_config_values", "inspect_failure"):
             self.assertEqual(ACTION_BY_TYPE[action_type].lifetime, "durable")
         self.assertEqual(ACTION_BY_TYPE["analyze_evidence"].lifetime, "turn_local")
         self.assertTrue(ACTION_BY_TYPE["analyze_evidence"].crosses_pending_barrier)

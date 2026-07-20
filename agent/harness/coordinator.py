@@ -1319,7 +1319,7 @@ def _process_action_queue(
             if next_question:
                 _install_pending_question(state, next_question)
                 state["pending_question"]["resume_action_queue"] = True
-        if completion == "in_progress":
+        if completion == "in_progress" and not state.get("pending_question"):
             active_group = str(state.get("active_group") or "")
             if not _queue_has_followup_for_group(state, active_group):
                 question = _question_for_group(state, active_group)

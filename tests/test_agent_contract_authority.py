@@ -176,9 +176,9 @@ class ActionContractAuthorityTest(unittest.TestCase):
             "answer_opening_question",
             "analyze_evidence",
             "analyze_report",
-            "inspect_failure",
         ):
             self.assertTrue(action_is_turn_local({"type": action_type}), action_type)
+        self.assertFalse(action_is_turn_local({"type": "inspect_failure"}))
         self.assertFalse(action_is_turn_local({"type": "choose_target_mode"}))
 
     def test_retired_custom_rpc_action_is_only_an_admission_compatibility_input(self) -> None:

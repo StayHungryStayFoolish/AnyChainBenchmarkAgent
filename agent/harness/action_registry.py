@@ -415,7 +415,6 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         "inspect_failure",
         "recovery",
         "Inspect structured failure evidence without changing workflow configuration.",
-        lifetime="turn_local",
     ),
     ActionSpec("retry_failure", "recovery", "Clear a retryable external-service failure without executing a benchmark side effect."),
     ActionSpec("cancel_failure_recovery", "recovery", "Pause recovery while preserving evidence and confirmed configuration."),

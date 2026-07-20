@@ -237,6 +237,40 @@ class FailureRecoveryTest(unittest.TestCase):
         self.assertIn("advisory", final_response)
         self.assertIn("Inspect failure evidence and diagnostics", final_response)
 
+    def test_inspection_action_queue_keeps_domain_pending_contract_authoritative(self) -> None:
+        from agent.harness.coordinator import _finalize_turn_response, _process_action_queue
+        from agent.harness.domains.recovery import question_for_recovery
+        from agent.harness.failures import build_failure_record
+        from agent.harness.state import new_state
+
+        state = new_state("recovery-presentation-owner", language="en")
+        state["active_group"] = "failure_recovery"
+        state["failure_recovery"] = {"status": "pending", "record": build_failure_record(
+            "ENDPOINT_UNREACHABLE",
+            source="endpoint",
+            severity="blocking",
+            facts=[{"detail": "connection refused"}],
+        )}
+        state["pending_question"] = question_for_recovery(state, "failure_recovery") or {}
+        state["visible_response"] = []
+
+        with patch("agent.harness.domains.recovery.analyze_evidence_with_model", return_value="advisory"):
+            inspected = _process_action_queue(
+                state,
+                [{"type": "inspect_failure", "action_id": "inspect"}],
+                "inspect the evidence",
+                max_actions=1,
+            )
+        self.assertIsNotNone(inspected)
+        final = _finalize_turn_response(inspected or state)
+        response = "\n".join(final["visible_response"])
+
+        self.assertEqual(response.count("Execution recovery:"), 1)
+        self.assertEqual(response.count("connection refused"), 1)
+        self.assertEqual(response.count("Choose the next step."), 1)
+        self.assertIn("advisory", response)
+        self.assertEqual(final["pending_question"]["id"], "failure_recovery_action")
+
     def test_cancel_preserves_failure_and_configuration_without_rerun(self) -> None:
         from agent.harness.contracts import ActionProposal
         from agent.harness.domains.recovery import apply_recovery_action
