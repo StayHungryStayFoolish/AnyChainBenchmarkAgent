@@ -364,14 +364,14 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
                 "status": "passed",
                 "evidence_ids": [str(artifact_path)],
             }
-            merged = build_ledger({"schema_version": 4, "edges": [edge]}, revision=self.revision)
+            merged = build_ledger({"schema_version": 5, "edges": [edge]}, revision=self.revision)
             restored = next(item for item in merged["edges"] if item["edge_key"] == edge["edge_key"])
             self.assertEqual(restored["evidence"]["deterministic"]["status"], "passed")
             self.assertEqual(restored["evidence"]["deterministic"]["evidence_ids"], [str(artifact_path)])
 
             changed_revision = {"commit": "other", "worktree_hash": "b" * 64}
             invalidated = build_ledger(
-                {"schema_version": 4, "edges": [edge]},
+                {"schema_version": 5, "edges": [edge]},
                 revision=changed_revision,
             )
             restored = next(item for item in invalidated["edges"] if item["edge_key"] == edge["edge_key"])

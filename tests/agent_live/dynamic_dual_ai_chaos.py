@@ -408,15 +408,18 @@ class DynamicDualAiChaosRunner:
         seed_scenario_id = str(self.schedule.targets[0].scenario_id or "")
         if seed_scenario_id:
             from tests.agent_live.runtime_checkpoint import (
-                reviewed_scenario_state,
+                reviewed_scenario,
                 seed_runtime_checkpoint,
             )
 
+            seed_scenario = reviewed_scenario(seed_scenario_id)
             seed_runtime_checkpoint(
-                reviewed_scenario_state(seed_scenario_id),
+                seed_scenario.seed_state,
                 checkpoint_path=runtime_root / "checkpoints.sqlite",
                 session_id=self.config.session_id,
                 session_purpose=self.config.session_purpose,
+                scenario_id=seed_scenario.scenario_id,
+                scenario_state_fingerprint=seed_scenario.state_fingerprint,
             )
 
         transcript: list[tuple[str, str]] = []

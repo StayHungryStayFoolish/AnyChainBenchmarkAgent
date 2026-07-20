@@ -16,7 +16,7 @@ from agent.utils.redaction import redact
 
 
 ARTIFACT_SCHEMA_VERSION = 3
-CLI_ARTIFACT_SCHEMA_VERSION = 3
+CLI_ARTIFACT_SCHEMA_VERSION = 4
 REAL_EXECUTION_ARTIFACT_SCHEMA_VERSION = 1
 TURN_OBSERVATION_SCHEMA_VERSION = 1
 PTY_DIAGNOSTIC_SCHEMA_VERSION = 1
@@ -624,6 +624,8 @@ def build_pty_cli_evidence_artifact(
     turn: PtyCliTurnRecord,
     observation: TurnObservation,
     dynamic_selection: DynamicTurnSelection | None = None,
+    execution_case: Mapping[str, Any] | None = None,
+    seed_receipt: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build tamper-evident evidence from a real PTY CLI turn.
 
@@ -651,6 +653,22 @@ def build_pty_cli_evidence_artifact(
         selection_payload["previous_response_hash"] = content_hash(turn.previous_agent_response)
     elif dynamic_selection is not None:
         raise ValueError("real_cli evidence must not carry a dynamic selection record")
+    fixed_real_cli = (
+        evidence_class == "real_cli"
+        and not bool(((edge.get("evidence") or {}).get("dynamic_dual_ai") or {}).get("required"))
+    )
+    if fixed_real_cli:
+        if not isinstance(execution_case, Mapping) or not isinstance(seed_receipt, Mapping):
+            raise ValueError("real_cli evidence requires execution-case and seed provenance")
+        _validate_real_cli_provenance(
+            edge=edge,
+            turn=turn,
+            observation=observation,
+            execution_case=execution_case,
+            seed_receipt=seed_receipt,
+        )
+    elif evidence_class != "real_cli" and (execution_case is not None or seed_receipt is not None):
+        raise ValueError("dynamic evidence must not claim fixed execution-case provenance")
 
     required_identity = {
         "edge_key": edge.get("edge_key"),
@@ -694,6 +712,10 @@ def build_pty_cli_evidence_artifact(
         "turn": turn_payload,
         "turn_hash": content_hash(turn_payload),
         "dynamic_selection": selection_payload,
+        "execution_case": dict(execution_case or {}),
+        "execution_case_hash": content_hash(dict(execution_case or {})) if execution_case else "",
+        "seed_receipt": dict(seed_receipt or {}),
+        "seed_receipt_hash": content_hash(dict(seed_receipt or {})) if seed_receipt else "",
         "turn_observation": _turn_observation_payload(observation),
         "turn_observation_hash": content_hash(_turn_observation_payload(observation)),
         "outcome": "passed",
@@ -753,6 +775,36 @@ def validate_pty_cli_evidence_artifact(
         _validate_pty_turn_record(turn)
     except ValueError as exc:
         return False, str(exc)
+
+    raw_case = artifact.get("execution_case")
+    raw_receipt = artifact.get("seed_receipt")
+    fixed_real_cli = (
+        evidence_class == "real_cli"
+        and not bool(((edge.get("evidence") or {}).get("dynamic_dual_ai") or {}).get("required"))
+    )
+    if fixed_real_cli:
+        if not isinstance(raw_case, Mapping) or not isinstance(raw_receipt, Mapping):
+            return False, "real CLI artifact has no execution-case seed provenance"
+        if content_hash(raw_case) != str(artifact.get("execution_case_hash") or ""):
+            return False, "execution-case hash mismatch"
+        if content_hash(raw_receipt) != str(artifact.get("seed_receipt_hash") or ""):
+            return False, "seed receipt hash mismatch"
+        try:
+            _validate_real_cli_provenance(
+                edge=edge,
+                turn=turn,
+                observation=_turn_observation_from_payload(
+                    dict(artifact.get("turn_observation") or {})
+                ),
+                execution_case=raw_case,
+                seed_receipt=raw_receipt,
+            )
+        except (TypeError, ValueError) as exc:
+            return False, f"invalid real CLI provenance: {exc}"
+    elif evidence_class != "real_cli" and (
+        raw_case or raw_receipt or artifact.get("execution_case_hash") or artifact.get("seed_receipt_hash")
+    ):
+        return False, "dynamic artifact carries fixed execution-case provenance"
 
     turn_payload = dict(artifact.get("turn") or {})
     expected_hashes = {
@@ -816,6 +868,56 @@ def validate_pty_cli_evidence_artifact(
     if content_hash(evidence_payload) != evidence_id:
         return False, "evidence id mismatch"
     return True, ""
+
+
+def _validate_real_cli_provenance(
+    *,
+    edge: Mapping[str, Any],
+    turn: PtyCliTurnRecord,
+    observation: TurnObservation,
+    execution_case: Mapping[str, Any],
+    seed_receipt: Mapping[str, Any],
+) -> None:
+    from tests.agent_live.reviewed_execution_cases import reviewed_execution_case
+
+    resolved = reviewed_execution_case(edge)
+    if resolved is None:
+        raise ValueError("ledger edge has no reviewed execution case")
+    scenario, authoritative_case = resolved
+    if dict(execution_case) != authoritative_case.descriptor:
+        raise ValueError("execution case is not the authoritative reviewed descriptor")
+    if authoritative_case.case_id not in set(edge.get("execution_case_ids") or ()):
+        raise ValueError("execution case is not bound to the ledger edge")
+    if authoritative_case.descriptor_hash != str(edge.get("execution_case_hash") or ""):
+        raise ValueError("ledger execution-case hash is stale")
+    receipt = dict(seed_receipt)
+    receipt_hash = str(receipt.pop("receipt_hash", ""))
+    if content_hash(receipt) != receipt_hash:
+        raise ValueError("seed receipt self-hash mismatch")
+    required = {
+        "scenario_id": scenario.scenario_id,
+        "scenario_state_fingerprint": scenario.state_fingerprint,
+        "seed_state_hash": content_hash(scenario.seed_state or {}),
+        "session_id": turn.session_id,
+        "session_purpose": str(observation.runtime_events[0].session_purpose),
+        "pending_question_id": str(scenario.question.get("id") or ""),
+        "pending_contract_hash": content_hash(scenario.question),
+    }
+    mismatches = {
+        key: {"expected": value, "actual": receipt.get(key)}
+        for key, value in required.items()
+        if receipt.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(f"seed receipt does not match reviewed scenario: {mismatches}")
+    for key in ("projected_state_hash", "checkpoint_sha256"):
+        value = str(receipt.get(key) or "")
+        if not _is_sha256(value):
+            raise ValueError(f"seed receipt has invalid {key}")
+    if str(receipt.get("checkpoint_path") or "").strip() == "":
+        raise ValueError("seed receipt has no checkpoint path")
+    if content_hash(turn.user_message) != content_hash(authoritative_case.resolve_input()):
+        raise ValueError("PTY input does not match the reviewed execution case")
 
 
 def _validate_pty_turn_record(turn: PtyCliTurnRecord) -> None:
@@ -1132,8 +1234,11 @@ def verify_runtime_postcondition(
     if edge_type == "question_option":
         for path, value in expected.items():
             expected_paths.append(str(path))
-            expected_hash = content_hash(value)
-            if committed.after_value_hashes.get(str(path)) != expected_hash:
+            if not _postcondition_value_matches(
+                committed.after_value_hashes,
+                str(path),
+                value,
+            ):
                 errors.append(f"expected postcondition was not observed: {path}")
         _verify_runtime_state_relations(
             tuple(edge.get("expected_state_relations") or ()),
@@ -1145,19 +1250,29 @@ def verify_runtime_postcondition(
         path = str(expected.get("path") or "").strip()
         if path:
             expected_paths.append(path)
-            after_hash = committed.after_value_hashes.get(path)
-            before_hash = baseline.after_value_hashes.get(path)
+            after_hashes = _path_value_hashes(committed.after_value_hashes, path)
+            before_hashes = _path_value_hashes(baseline.after_value_hashes, path)
             if rejection_expected:
-                if after_hash != before_hash:
+                if after_hashes != before_hashes:
                     errors.append(f"rejected manual input changed the destination field: {path}")
                 if committed.pending_question_id != baseline.pending_question_id:
                     errors.append("rejected manual input did not preserve the pending question")
-                if dict(committed.pending_contract) != dict(baseline.pending_contract):
+                from tests.agent_live.generate_harness_coverage_ledger import contract_variant_hash
+
+                if contract_variant_hash(committed.pending_contract) != contract_variant_hash(
+                    baseline.pending_contract
+                ):
                     errors.append("rejected manual input changed the pending contract")
-            elif not after_hash:
+            elif not after_hashes:
                 errors.append(f"manual-input postcondition was not observed: {path}")
-            elif after_hash == before_hash:
+            elif after_hashes == before_hashes:
                 errors.append(f"manual-input postcondition did not change: {path}")
+            elif "value" in expected and not _postcondition_value_matches(
+                committed.after_value_hashes,
+                path,
+                expected["value"],
+            ):
+                errors.append(f"manual-input postcondition value mismatch: {path}")
         expected_next_ids = {
             str(item).strip()
             for item in expected.get("next_question_ids") or []
@@ -1199,6 +1314,35 @@ def verify_runtime_postcondition(
         next_question_or_result=next_result,
         details=details,
     )
+
+
+def _path_value_hashes(values: Mapping[str, str], path: str) -> dict[str, str]:
+    """Return one scalar hash or all leaf hashes owned by a structured path."""
+
+    prefix = f"{path}."
+    return {
+        candidate[len(prefix):] if candidate.startswith(prefix) else "": value
+        for candidate, value in values.items()
+        if candidate == path or candidate.startswith(prefix)
+    }
+
+
+def _postcondition_value_matches(
+    observed: Mapping[str, str],
+    path: str,
+    expected: Any,
+) -> bool:
+    expected_hashes = _leaf_hashes_for_expected(expected)
+    return _path_value_hashes(observed, path) == expected_hashes
+
+
+def _leaf_hashes_for_expected(value: Any, prefix: tuple[str, ...] = ()) -> dict[str, str]:
+    if isinstance(value, Mapping) and value:
+        output: dict[str, str] = {}
+        for key in sorted(value, key=str):
+            output.update(_leaf_hashes_for_expected(value[key], (*prefix, str(key))))
+        return output
+    return {".".join(prefix): content_hash(value)}
 
 
 def _verify_runtime_state_relations(

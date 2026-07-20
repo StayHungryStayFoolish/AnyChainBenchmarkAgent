@@ -120,6 +120,18 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertEqual(normalize_scalar("  hyperdisk-balanced,  "), "hyperdisk-balanced")
         self.assertEqual(normalize_scalar("eth0；"), "eth0")
 
+    def test_endpoint_extraction_removes_terminal_copy_punctuation(self) -> None:
+        from agent.harness.input_values import extract_url_candidate
+
+        self.assertEqual(
+            extract_url_candidate("  http://geth-dev:8545,  "),
+            "http://geth-dev:8545",
+        )
+        self.assertEqual(
+            extract_url_candidate("endpoint: https://rpc.example/v1。"),
+            "https://rpc.example/v1",
+        )
+
     def test_orientation_consultation_cannot_steal_pending_workflow_control(self) -> None:
         from agent.harness.contracts import ActionProposal
         from agent.harness.domains.orientation import apply_orientation_action

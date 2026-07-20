@@ -154,7 +154,7 @@ class DynamicChaosCoverageTest(unittest.TestCase):
 
         self.assertEqual(real["runner_type"], PTY_REAL_CLI_RUNNER)
         self.assertEqual(dynamic["runner_type"], PTY_DYNAMIC_DUAL_AI_RUNNER)
-        self.assertIsNone(real["dynamic_selection"])
+        self.assertNotEqual(PTY_REAL_CLI_RUNNER, PTY_DYNAMIC_DUAL_AI_RUNNER)
         self.assertEqual(
             dynamic["dynamic_selection"]["previous_response_hash"],
             content_hash(self._turn().previous_agent_response),

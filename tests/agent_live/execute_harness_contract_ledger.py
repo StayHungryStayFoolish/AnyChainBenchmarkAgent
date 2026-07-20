@@ -23,7 +23,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from agent.harness.coverage_events import capture_coverage_events, observe_compiled_graph_turn
 from agent.harness.invariants import validate_state
-from agent.harness.questions import exact_answer, normalize_scalar
+from agent.harness.questions import normalize_scalar
 from tests.agent_live.coverage_evidence import (
     COMPILED_GRAPH_RUNNER,
     build_evidence_artifact,
@@ -33,17 +33,13 @@ from tests.agent_live.coverage_evidence import (
 )
 from tests.agent_live.generate_harness_coverage_ledger import (
     build_ledger,
-    contract_variant_hash,
     derive_overall_status,
     execution_exit_code,
     refresh_ledger_status,
 )
 from tests.agent_live.graph_turn import invoke_product_graph_turn
-from tests.agent_live.harness_contract_scenarios import (
-    QuestionScenario,
-    manual_input_case,
-    question_scenarios,
-)
+from tests.agent_live.harness_contract_scenarios import QuestionScenario
+from tests.agent_live.reviewed_execution_cases import reviewed_execution_case
 
 
 def execute_ledger(
@@ -54,20 +50,20 @@ def execute_ledger(
 ) -> dict[str, Any]:
     active_revision = dict(revision or repository_revision(REPO_ROOT))
     ledger = build_ledger(existing, revision=active_revision)
-    question_index = _question_scenario_index()
-
     required_edges = [
         edge for edge in ledger["edges"]
         if bool((edge.get("evidence") or {}).get("deterministic", {}).get("required"))
     ]
     for edge in required_edges:
-        execution = _execution_for_edge(edge, question_index)
+        execution = reviewed_execution_case(edge)
         if execution is None:
             raise RuntimeError(
                 "deterministic ledger inconsistency: required edge has no executable case: "
                 f"{edge.get('edge_key')}"
             )
-        scenario, input_value, expected_admitted = execution
+        scenario, execution_case = execution
+        input_value = execution_case.resolve_input()
+        expected_admitted = execution_case.expected_admitted
         if edge.get("real_execution_required"):
             raise RuntimeError(
                 f"deterministic ledger incorrectly requires a side effect: {edge.get('edge_key')}"
@@ -128,57 +124,6 @@ def execute_ledger(
     return refresh_ledger_status(ledger)
 
 
-def _question_scenario_index() -> dict[tuple[str, str, str], QuestionScenario]:
-    output: dict[tuple[str, str, str], QuestionScenario] = {}
-    for scenario in question_scenarios("en"):
-        if not scenario.executable:
-            continue
-        question = scenario.question
-        contract_hash = contract_variant_hash(question)
-        runtime_hash = content_hash({
-            "contract_hash": contract_hash,
-            "state_fingerprint": scenario.state_fingerprint,
-            "scenario_id": scenario.scenario_id,
-        })[:20]
-        output[(str(question.get("group") or ""), str(question.get("id") or ""), runtime_hash)] = scenario
-    return output
-
-
-def _execution_for_edge(
-    edge: Mapping[str, Any],
-    question_index: Mapping[tuple[str, str, str], QuestionScenario],
-) -> tuple[QuestionScenario, str, bool] | None:
-    edge_type = str(edge.get("edge_type") or "")
-    if edge_type == "action_transition":
-        return None
-    key = (
-        str(edge.get("group") or ""),
-        str(edge.get("question_id") or ""),
-        str(edge.get("contract_variant_hash") or ""),
-    )
-    scenario = question_index.get(key)
-    if not scenario or scenario.seed_state is None or edge.get("real_execution_required"):
-        return None
-    if edge_type == "question_option":
-        if str(edge.get("input_class") or "") != "exact_option":
-            return None
-        option_id = str(edge.get("option_id") or "")
-        matched, value = exact_answer(option_id, dict(scenario.question))
-        if not matched or value != edge.get("option_value"):
-            return None
-        return scenario, option_id, True
-    if edge_type == "manual_input":
-        input_class = str(edge.get("input_class") or "")
-        case = (
-            (scenario.manual_input_overrides or {}).get(input_class)
-            or manual_input_case(scenario.question, input_class)
-        )
-        if case is None:
-            return None
-        return scenario, case.text, case.expected_admitted
-    return None
-
-
 def _prepare_question_turn(scenario: QuestionScenario, input_value: str) -> Mapping[str, Any]:
     state = deepcopy(dict(scenario.seed_state or {}))
     state["pending_question"] = deepcopy(dict(scenario.question))
@@ -205,6 +150,10 @@ def _verify_postcondition(
             raise AssertionError("manual edge has no expected field")
         path = str(expected.get("path") or f"confirmed_config.{field}")
         actual = _read_path(after, path)
+        if "value" in expected:
+            if actual != expected["value"]:
+                raise AssertionError(f"manual postcondition {path} mismatch: {actual!r}")
+            return
         if normalize_scalar(str(actual)) != normalize_scalar(str(input_value)):
             raise AssertionError(f"manual postcondition {path} was not applied: {actual!r}")
         return

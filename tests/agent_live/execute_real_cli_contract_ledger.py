@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -39,21 +40,50 @@ from tests.agent_live.generate_harness_coverage_ledger import (
     contract_variant_hash,
 )
 from tests.agent_live.runtime_checkpoint import seed_runtime_checkpoint
+from tests.agent_live.reviewed_execution_cases import reviewed_execution_case
 
 
 DEFAULT_OUTPUT = Path(".agent/evidence/real-cli-contracts")
 
 
 def eligible_edges(ledger: Mapping[str, Any]) -> list[Mapping[str, Any]]:
-    """Return rows whose reviewed deterministic artifact supplies seed and input."""
+    """Return fixed real-CLI rows backed by one reviewed execution case."""
 
     return [
         edge
         for edge in ledger.get("edges") or ()
         if bool(((edge.get("evidence") or {}).get("real_cli") or {}).get("required"))
         and not bool(((edge.get("evidence") or {}).get("dynamic_dual_ai") or {}).get("required"))
-        and str(edge.get("deterministic_test_id") or "").strip()
+        and len(edge.get("execution_case_ids") or ()) == 1
     ]
+
+
+def select_edges(
+    ledger: Mapping[str, Any],
+    *,
+    edge_keys: Iterable[str] = (),
+    limit: int = 0,
+    shard_index: int = 0,
+    shard_count: int = 1,
+) -> list[Mapping[str, Any]]:
+    """Select a stable, disjoint subset without changing edge semantics."""
+
+    if shard_count < 1:
+        raise ValueError("shard_count must be at least 1")
+    if shard_index < 0 or shard_index >= shard_count:
+        raise ValueError("shard_index must satisfy 0 <= shard_index < shard_count")
+    selected_keys = {str(item) for item in edge_keys if str(item)}
+    edges = [
+        edge for edge in eligible_edges(ledger)
+        if not selected_keys or str(edge.get("edge_key") or "") in selected_keys
+    ]
+    edges = [
+        edge for index, edge in enumerate(edges)
+        if index % shard_count == shard_index
+    ]
+    if limit > 0:
+        edges = edges[:limit]
+    return edges
 
 
 def execute_edge(
@@ -64,10 +94,17 @@ def execute_edge(
     output_root: Path,
     timeout_seconds: float,
 ) -> Path:
-    deterministic = _load_deterministic_reference(edge)
-    turn_evidence = dict(deterministic.get("turn_evidence") or {})
-    seed_state = deepcopy(dict(turn_evidence.get("seed") or {}))
-    user_input = str(turn_evidence.get("input") if "input" in turn_evidence else "")
+    resolved = reviewed_execution_case(edge)
+    if resolved is None:
+        raise RuntimeError(f"real CLI edge has no reviewed execution case: {edge.get('edge_key')}")
+    scenario, execution_case = resolved
+    if execution_case.case_id not in set(edge.get("execution_case_ids") or ()):
+        raise RuntimeError("resolved execution case is not bound to the ledger edge")
+    if execution_case.descriptor_hash != str(edge.get("execution_case_hash") or ""):
+        raise RuntimeError("resolved execution case hash does not match the ledger edge")
+    seed_state = deepcopy(dict(scenario.seed_state or {}))
+    user_input = execution_case.resolve_input(os.environ)
+    _prepare_execution_case(execution_case.setup_capabilities, seed_state)
     session_id = "real-cli-" + content_hash(edge.get("edge_key"))[:20]
     runtime_root = output_root / "runtime" / session_id
     if runtime_root.exists():
@@ -83,11 +120,13 @@ def execute_edge(
         runtime_root_in_process=runtime_root,
         response_timeout_seconds=timeout_seconds,
     )
-    seed_runtime_checkpoint(
+    seed_receipt = seed_runtime_checkpoint(
         seed_state,
         checkpoint_path=runtime_root / "checkpoints.sqlite",
         session_id=session_id,
         session_purpose=config.session_purpose,
+        scenario_id=scenario.scenario_id,
+        scenario_state_fingerprint=scenario.state_fingerprint,
     )
     env = _runtime_environment(config, runtime_root)
     transport = SubprocessPtyTransport(config.command, cwd=repo_root)
@@ -174,6 +213,11 @@ def execute_edge(
             revision=revision,
             turn=turn,
             observation=observation,
+            execution_case=execution_case.descriptor,
+            seed_receipt={
+                **seed_receipt.payload,
+                "receipt_hash": seed_receipt.receipt_hash,
+            },
         )
         path = write_evidence_artifact(artifact, output_root / "evidence")
         (runtime_root / "transcript.txt").write_text(
@@ -192,16 +236,18 @@ def execute_edges(
     output_root: Path,
     edge_keys: Iterable[str] = (),
     limit: int = 0,
+    shard_index: int = 0,
+    shard_count: int = 1,
     timeout_seconds: float = 180.0,
 ) -> list[Path]:
     revision = dict(ledger.get("revision") or {})
-    selected_keys = {str(item) for item in edge_keys if str(item)}
-    edges = [
-        edge for edge in eligible_edges(ledger)
-        if not selected_keys or str(edge.get("edge_key") or "") in selected_keys
-    ]
-    if limit > 0:
-        edges = edges[:limit]
+    edges = select_edges(
+        ledger,
+        edge_keys=edge_keys,
+        limit=limit,
+        shard_index=shard_index,
+        shard_count=shard_count,
+    )
     paths: list[Path] = []
     for index, edge in enumerate(edges, 1):
         print(f"[{index}/{len(edges)}] {edge['edge_key']}", flush=True)
@@ -215,16 +261,6 @@ def execute_edges(
     return paths
 
 
-def _load_deterministic_reference(edge: Mapping[str, Any]) -> Mapping[str, Any]:
-    path = Path(str(edge.get("deterministic_test_id") or ""))
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("evidence_class") != "deterministic":
-        raise ValueError("real CLI seed reference is not deterministic evidence")
-    if payload.get("edge_key") != edge.get("edge_key"):
-        raise ValueError("real CLI seed reference belongs to another edge")
-    return payload
-
-
 def _runtime_environment(config: ChaosRunConfig, runtime_root: Path) -> dict[str, str]:
     process_root = config.runtime_root_in_process or runtime_root
     env = os.environ.copy()
@@ -236,6 +272,84 @@ def _runtime_environment(config: ChaosRunConfig, runtime_root: Path) -> dict[str
         "ANYCHAIN_AGENT_TURN_EVENT_FILE": str(process_root / "turn-events.jsonl"),
     })
     return env
+
+
+def _prepare_execution_case(
+    capabilities: Iterable[str],
+    seed_state: Mapping[str, Any],
+) -> None:
+    requested = set(capabilities)
+    unknown = requested - {"prepared_real_node_plan", "local_jsonrpc_endpoint"}
+    if unknown:
+        raise RuntimeError(f"unsupported execution-case setup capabilities: {sorted(unknown)}")
+    if "prepared_real_node_plan" not in requested:
+        return
+    plan_file = Path(str(seed_state.get("plan_file") or ""))
+    if not plan_file.is_absolute():
+        raise RuntimeError("prepared_real_node_plan requires an absolute plan_file")
+    from agent.runners.benchmark_pipeline import prepare_benchmark_run
+
+    with tempfile.TemporaryDirectory(prefix="anychain-real-cli-plan-") as output_dir:
+        prepared = prepare_benchmark_run(
+            source_prompt="controlled real CLI final benchmark coverage",
+            chain="ethereum",
+            goal="smoke",
+            rpc_mode="single",
+            use_fake_node=False,
+            target_rpc_url="http://geth-dev:8545",
+            mainnet_rpc_url_reviewed=True,
+            blockchain_process_names=["geth"],
+            deployment_type="container",
+            cloud_provider="other",
+            cloud_region="test-region",
+            cloud_zone="test-zone",
+            machine_type="test-machine",
+            ledger_device="vda",
+            data_vol_type="ssd",
+            data_vol_size="1",
+            data_vol_max_iops="1",
+            data_vol_max_throughput="1",
+            network_interface="eth0",
+            network_max_bandwidth_gbps="1",
+            qps_initial=1,
+            qps_max=1,
+            qps_step=1,
+            duration_seconds=3,
+            rpc_methods=["eth_blockNumber"],
+            observability_enabled=False,
+            observability_mode="local",
+            observability_auto_stop=True,
+            confirmations=[
+                "chain_template_reviewed",
+                "rpc_param_samples_confirmed",
+                "rpc_workload_confirmed",
+                "qps_profile_confirmed",
+                "observability_choice_confirmed",
+                "advanced_config_review",
+                "disk_inventory_confirmation",
+                "ledger_device_confirmation",
+                "benchmark_mode_confirmed",
+                "has_accounts_device",
+            ],
+            output_dir=output_dir,
+        )
+        data = dict(prepared.get("data") or {})
+        generated_path = Path(str(data.get("plan_file") or ""))
+        plan = data.get("plan")
+        preflight = dict(data.get("preflight") or {})
+        if (
+            prepared.get("status") != "ok"
+            or not preflight.get("passed")
+            or not isinstance(plan, Mapping)
+            or not str(plan.get("plan_id") or "")
+            or not generated_path.is_file()
+        ):
+            raise RuntimeError("product plan preparation did not produce an approved executable plan")
+        serialized = generated_path.read_text(encoding="utf-8")
+    plan_file.parent.mkdir(parents=True, exist_ok=True)
+    temporary = plan_file.with_suffix(plan_file.suffix + ".tmp")
+    temporary.write_text(serialized, encoding="utf-8")
+    temporary.replace(plan_file)
 
 
 def _require_revision(observed: Mapping[str, str], expected: Mapping[str, str]) -> None:
@@ -256,6 +370,8 @@ def main() -> int:
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
     parser.add_argument("--edge-key", action="append", default=[])
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=180.0)
     args = parser.parse_args()
     repo_root = REPO_ROOT
@@ -268,6 +384,8 @@ def main() -> int:
         output_root=Path(args.output),
         edge_keys=args.edge_key,
         limit=args.limit,
+        shard_index=args.shard_index,
+        shard_count=args.shard_count,
         timeout_seconds=args.timeout,
     )
     print(json.dumps({"executed": len(paths), "evidence": [str(path) for path in paths]}))

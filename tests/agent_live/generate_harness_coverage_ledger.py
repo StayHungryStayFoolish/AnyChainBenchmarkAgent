@@ -43,7 +43,7 @@ EVIDENCE_CLASSES = (
     "dynamic_dual_ai",
     "real_execution",
 )
-LEDGER_SCHEMA_VERSION = 4
+LEDGER_SCHEMA_VERSION = 5
 EVIDENCE_STATUSES = (
     "not_run",
     "passed",
@@ -86,13 +86,10 @@ RUNNER_CONTRACTS = {
         "gap": "",
     },
     "real_cli": {
-        "status": "partial",
+        "status": "implemented",
         "producer": "tests/agent_live/execute_real_cli_contract_ledger.py",
-        "artifact_schema": "real_cli_evidence.v3",
-        "gap": (
-            "The producer covers reviewed exact/non-semantic rows and dynamic turns emit their "
-            "independent real-CLI artifacts; catalog-only and missing concrete-input rows remain open."
-        ),
+        "artifact_schema": "real_cli_evidence.v4",
+        "gap": "",
     },
     "dynamic_dual_ai": {
         "status": "implemented",
@@ -390,6 +387,8 @@ def _new_edge(
         "deterministic_case_available": bool(deterministic_case_available),
         "expected_admitted": expected_admitted,
         "interrupts_pending_contract": bool(interrupts_pending_contract),
+        "execution_case_ids": [],
+        "execution_case_hash": "",
         "deterministic_test_id": "",
         "fixed_cli_scenario_id": "",
         "dynamic_chaos_round_id": "",
@@ -858,6 +857,24 @@ def build_ledger(
             "edge_key": edge["edge_key"],
             "status": edge["overall_status"],
         })
+
+    from tests.agent_live.reviewed_execution_cases import bind_reviewed_execution_case
+
+    for edge in edges:
+        bind_reviewed_execution_case(edge)
+        edge["evidence"] = _evidence(edge)
+        edge["evidence"]["catalog"]["evidence_ids"] = list(edge["catalog_scenario_ids"])
+        edge["overall_status"] = derive_overall_status(edge)
+        deterministic_required = bool(edge["evidence"]["deterministic"]["required"])
+        fixed_real_cli_required = (
+            bool(edge["evidence"]["real_cli"]["required"])
+            and not bool(edge["evidence"]["dynamic_dual_ai"]["required"])
+        )
+        if (deterministic_required or fixed_real_cli_required) and len(edge["execution_case_ids"]) != 1:
+            raise RuntimeError(
+                "required execution edge does not have exactly one reviewed case: "
+                f"{edge['edge_key']}"
+            )
 
     edges.sort(key=lambda edge: edge["edge_key"])
     _merge_existing_evidence(edges, existing, revision=active_revision)

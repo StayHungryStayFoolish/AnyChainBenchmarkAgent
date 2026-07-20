@@ -149,8 +149,9 @@ def extract_url_candidate(value: Any) -> str:
     text = str(value or "").strip()
     if not text:
         return ""
-    if looks_like_url_value(text):
-        return text
+    scalar = text.strip("`'\"").rstrip(".,;，。；")
+    if looks_like_url_value(scalar):
+        return scalar
     match = re.search(r"\b(?:https?|wss?)://[^\s'\"`，。；;]+", text, flags=re.IGNORECASE)
     if match:
         return match.group(0).rstrip(".,;，。；")

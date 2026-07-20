@@ -71,6 +71,15 @@ class ActionTransitionScenario:
     action_type: str
     seed_state: Mapping[str, Any]
 
+    @property
+    def state_fingerprint(self) -> str:
+        stable = deepcopy(dict(self.seed_state))
+        session = stable.get("session")
+        if isinstance(session, dict):
+            session.pop("created_at", None)
+            session.pop("updated_at", None)
+        return content_hash(stable)
+
 
 def action_transition_scenarios(language: str = "en") -> list[ActionTransitionScenario]:
     """Return minimal valid seeds for semantic coordinator transitions."""
@@ -1101,6 +1110,11 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
                 "custom_rpc_schema_confirm",
                 "custom_rpc_response_confirm",
             )
+        elif scenario_id == "custom_needs_weights":
+            manual_path = "custom_rpc.weights"
+        elif scenario_id == "custom_needs_endpoint":
+            manual_path = "custom_rpc.endpoint"
+            next_ids = ("custom_rpc_endpoint", "custom_rpc_method")
         catalog(
             scenario_id,
             state,
@@ -1169,6 +1183,11 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
                 "new_chain_schema_confirm",
                 "new_chain_response_confirm",
             )
+        elif scenario_id == "new_chain_existing_family_needs_weights":
+            manual_path = "chain_identity.weights"
+        elif scenario_id == "new_chain_existing_family_needs_endpoint":
+            manual_path = "endpoint_evidence.candidate_endpoint"
+            next_ids = ("new_chain_endpoint", "new_chain_method")
         catalog(
             scenario_id,
             state,
@@ -1225,6 +1244,7 @@ def _runtime_execution_scenarios(language: str) -> list[QuestionScenario]:
     final_state = new_state("coverage-real-final", language=language, session_purpose="coverage")
     final_state.update({
         "target_mode": "real-node",
+        "plan_file": COVERAGE_REAL_NODE_PLAN_PATH,
         "smoke": {
             "purpose": "real_node_isolated_smoke",
             "status": "completed",
@@ -1257,3 +1277,4 @@ def _valid_literal(validation: Mapping[str, Any]) -> str | None:
         values = list(validation.get("values") or [])
         return str(values[0]) if values else None
     return None
+COVERAGE_REAL_NODE_PLAN_PATH = "/tmp/anychain-agent-real-cli-coverage-approved-plan.json"

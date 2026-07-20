@@ -56,9 +56,9 @@ class CoverageLaneApplicabilityTest(unittest.TestCase):
         self.assertTrue(contracts["deterministic"]["producer"])
         self.assertEqual(contracts["dynamic_dual_ai"]["status"], "implemented")
         self.assertTrue(contracts["dynamic_dual_ai"]["producer"])
-        self.assertEqual(contracts["real_cli"]["status"], "partial")
+        self.assertEqual(contracts["real_cli"]["status"], "implemented")
         self.assertTrue(contracts["real_cli"]["producer"])
-        self.assertTrue(contracts["real_cli"]["gap"])
+        self.assertFalse(contracts["real_cli"]["gap"])
         self.assertEqual(contracts["real_execution"]["status"], "implemented")
         self.assertEqual(
             contracts["real_execution"]["producer"],
