@@ -833,6 +833,47 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
         self.assertFalse(add["workload"]["replace_defaults"])
         self.assertEqual(add["workload"]["mixed_weights"], final)
 
+    def test_weight_syntax_authority_accepts_yaml_json_and_env_equivalently(self) -> None:
+        from agent.harness.input_values import parse_weight_spec
+
+        expected = {"eth_blockNumber": 40, "eth_gasPrice": 60}
+        inputs = (
+            "weights:\n  eth_blockNumber: 40\n  eth_gasPrice: 60",
+            '{"weights":{"eth_blockNumber":40,"eth_gasPrice":60}}',
+            "eth_blockNumber=40,eth_gasPrice=60",
+            "Please change it to eth_blockNumber=40,eth_gasPrice=60",
+        )
+
+        for value in inputs:
+            with self.subTest(value=value):
+                self.assertEqual(parse_weight_spec(value), expected)
+
+        for invalid in (
+            "weights:\n  eth_blockNumber: 40.5\n  eth_gasPrice: 59.5",
+            '{"eth_blockNumber":true,"eth_gasPrice":99}',
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(parse_weight_spec(invalid), {})
+
+    def test_yaml_weights_reach_the_same_workload_domain_contract(self) -> None:
+        from agent.harness.domains.chain_rpc_support import _chain_rpc_draft
+        from agent.harness.domains.rpc_workload import _apply_weights
+        from agent.harness.state import new_state
+
+        state = new_state("yaml-weights")
+        state["chain_identity"] = {"canonical": "bsc"}
+        state["custom_rpc"] = _custom_rpc_catalog([], scope="mixed_replace")
+        state = _chain_rpc_draft(state)
+
+        _apply_weights(
+            state,
+            "custom_rpc_weights",
+            "weights:\n  eth_getBalance: 25\n  eth_getTransactionCount: 25\n  eth_blockNumber: 25\n  eth_gasPrice: 25",
+        )
+
+        self.assertTrue(state["workload"]["confirmed"])
+        self.assertEqual(sum(state["workload"]["mixed_weights"].values()), 100)
+
     def test_typed_and_manual_mixed_replace_share_the_same_effective_contract(self) -> None:
         from agent.harness.domains.chain_rpc_support import _chain_rpc_draft
         from agent.harness.domains.rpc_workload import _apply_requested_workload, _apply_weights

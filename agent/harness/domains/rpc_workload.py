@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import re
 from typing import Any
 
 from ..input_values import (
@@ -87,7 +85,7 @@ def _apply_weights(state: AgentGraphState, question_id: str, value: Any) -> None
     if case == "custom_rpc" and not parse_methods:
         chain = normalize_scalar((state.get("chain_identity") or {}).get("canonical"))
         parse_methods = list(default_workload(chain).get("methods") or []) if chain else []
-    weights = parse_weight_spec_for_methods(value, parse_methods) if _weight_input_uses_integers(value) else {}
+    weights = parse_weight_spec_for_methods(value, parse_methods)
     language = state.get("language", "en")
     if not weights:
         case_dict["status"] = "existing_family_needs_weights" if case == "new_chain" else "needs_weights"
@@ -281,16 +279,3 @@ def _weight_contract_violations(
     missing = sorted(method for method in required if method not in weights)
     unknown = sorted(method for method in weights if method not in allowed)
     return missing, unknown, invalid
-
-
-def _weight_input_uses_integers(value: Any) -> bool:
-    if isinstance(value, dict):
-        return all(isinstance(item, int) and not isinstance(item, bool) for item in value.values())
-    text = str(value or "").strip()
-    try:
-        parsed = json.loads(text)
-    except (TypeError, json.JSONDecodeError):
-        parsed = None
-    if isinstance(parsed, dict):
-        return all(isinstance(item, int) and not isinstance(item, bool) for item in parsed.values())
-    return not bool(re.search(r"(?:=|:|：|weight|权重)\s*[+-]?\d+\.\d+|^\s*[+-]?\d+\.\d+\s*$", text, re.IGNORECASE))

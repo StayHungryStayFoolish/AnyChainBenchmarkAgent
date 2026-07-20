@@ -5384,6 +5384,91 @@ class PlanCoverageTest(unittest.TestCase):
             "source_evidence": "http://geth-dev:8545",
         }])
 
+    def test_final_input_authority_restores_finite_option_after_model_recovery(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
+        from agent.harness.intent import _finalize_structured_syntax_authority
+        from agent.harness.plan_coverage import PlanCoverageResult, segment_user_turn
+        from agent.harness.state import new_state
+
+        source = (
+            "Do not continue with the template defaults. "
+            "I need to add a custom RPC method."
+        )
+        clauses = segment_user_turn(source)
+        model_replacement = {
+            "actions": [{
+                "type": "clarify_unresolved",
+                "clauses": [clause.text for clause in clauses],
+                "reason": "late recovery lost the finite option owner",
+            }],
+            "semantic_units": [
+                _unit(clause, index, [0], disposition="unresolved")
+                for index, clause in enumerate(clauses, start=1)
+            ],
+        }
+        state = new_state("final-option-owner", language="en")
+        state["pending_question"] = {
+            "id": "workload_confirm",
+            "group": "workload_rpc",
+            "field": "workload_choice",
+            "kind": "numbered_choice",
+            "manual_input_allowed": False,
+            "options": [{
+                "id": "default",
+                "label": "Use defaults",
+                "value": "default",
+                "action": {"type": "use_default_workload"},
+            }, {
+                "id": "custom_rpc",
+                "label": "Add custom RPC method",
+                "value": "custom_rpc",
+                "action": {"type": "rpc_catalog_command", "catalog_command": "enter"},
+            }],
+        }
+        invalid = PlanCoverageResult(
+            valid=False,
+            errors=("late recovery left both clauses unresolved",),
+            unresolved_clauses=tuple(clause.text for clause in clauses),
+            rejected_action_indexes=(0,),
+            incomplete_unit_ids=("unit-1", "unit-2"),
+        )
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "decision": "select_option",
+            "option_id": "custom_rpc",
+            "evidence_quote": "add a custom RPC method",
+            "supporting_unit_ids": ["unit-1", "unit-2"],
+            "independent_unit_ids": [],
+            "reason": "rejecting defaults supports the selected mutually exclusive custom-RPC option",
+        }))
+        valid = PlanCoverageResult(True, (), ())
+
+        with patch("agent.harness.intent._validate_semantic_fulfillment", return_value=valid):
+            finalized_text, validation = _finalize_structured_syntax_authority(
+                provider,
+                json.dumps(model_replacement),
+                clauses,
+                state,
+                source,
+                invalid,
+            )
+
+        finalized = json.loads(finalized_text)
+        self.assertTrue(validation.valid, validation.errors)
+        self.assertEqual(finalized["actions"], [{
+            "type": "rpc_catalog_command",
+            "catalog_command": "enter",
+            "source_evidence": "add a custom RPC method",
+        }])
+        self.assertEqual(finalized["pending_answer_admissions"], [0])
+        self.assertEqual(
+            [unit["disposition"] for unit in finalized["semantic_units"]],
+            ["context", "action"],
+        )
+
     def test_final_input_authority_keeps_multifield_prose_proposal_for_review(self) -> None:
         import json
         from unittest.mock import Mock

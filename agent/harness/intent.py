@@ -333,9 +333,9 @@ def _finalize_structured_syntax_authority(
     Inventory challenges and bounded semantic recovery may replace an action
     document that was canonicalized earlier in the pipeline. Syntax-derived
     structured candidates are immutable facts once the model has assigned the
-    clause to a configuration proposal. A prose-only proposal for exactly the
-    active manual field likewise belongs to that finite pending owner. Replay
-    both contracts at the final admission boundary and validate the resulting
+    clause to a configuration proposal. Prose manual values and finite option
+    selections likewise belong to the active pending owner. Replay all three
+    contracts at the final admission boundary and validate the resulting
     transaction again.
     """
 
@@ -344,6 +344,14 @@ def _finalize_structured_syntax_authority(
     canonical = _normalize_prose_pending_field_proposal(
         canonical,
         state,
+        clauses,
+        user_text,
+    )
+    canonical, _ = _recover_declared_pending_option_semantics(
+        provider,
+        canonical,
+        state,
+        validation,
         clauses,
         user_text,
     )

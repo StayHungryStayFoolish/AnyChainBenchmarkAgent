@@ -291,7 +291,12 @@ def schema_evidence_from_turn_text(value: Any, *, method_hint: str = "") -> str:
 
 
 def parse_weight_spec(value: Any) -> dict[str, int]:
-    """Parse JSON or ``method=weight`` syntax without policy checks."""
+    """Parse the supported structured RPC-weight forms without policy checks.
+
+    This is the shared syntax authority for flat JSON, a JSON ``weights``
+    wrapper, YAML-style mappings, and ``method=weight`` assignments. Method
+    membership and total-weight rules remain with the workload domain.
+    """
 
     text = str(value or "").strip()
     if not text:
@@ -300,18 +305,27 @@ def parse_weight_spec(value: Any) -> dict[str, int]:
         parsed = json.loads(text)
     except json.JSONDecodeError:
         parsed = None
+    if isinstance(parsed, dict) and isinstance(parsed.get("weights"), dict):
+        parsed = parsed["weights"]
     if isinstance(parsed, dict):
         output: dict[str, int] = {}
         for key, item in parsed.items():
             method = str(key).strip()
-            if method:
-                try:
-                    output[method] = int(item)
-                except (TypeError, ValueError):
-                    return {}
+            if not method or isinstance(item, bool):
+                return {}
+            if isinstance(item, int):
+                output[method] = item
+                continue
+            item_text = str(item).strip()
+            if not re.fullmatch(r"[+-]?[0-9]+", item_text):
+                return {}
+            output[method] = int(item_text)
         return output
     output = {}
-    pairs = re.findall(r"([A-Za-z][A-Za-z0-9_./:-]*)\s*=\s*([0-9]+)", text)
+    pairs = re.findall(
+        r"(?<![A-Za-z0-9_./:-])([A-Za-z][A-Za-z0-9_./:-]*)\s*(?:=|:)\s*([+-]?[0-9]+)\s*(?=$|[,，\n\r])",
+        text,
+    )
     if pairs:
         for method, weight in pairs:
             output[method.strip()] = int(weight)

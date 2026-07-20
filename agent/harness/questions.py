@@ -8,7 +8,7 @@ from typing import Any
 
 from agent.knowledge.chain_identity import canonicalize_chain_scalar, repo_chain_names
 from .contracts import ActionProposal, OptionContract, QuestionContract
-from .input_values import extract_json_values, looks_like_wire_method_identity
+from .input_values import extract_json_values, looks_like_wire_method_identity, parse_weight_spec
 from .localization import localized
 
 
@@ -370,7 +370,7 @@ def answer_fits_pending(text: str, question: dict[str, Any]) -> bool:
                 or _is_structured_evidence_literal(text)
             )
         if input_mode == "rpc_weights":
-            return bool(_parse_weight_spec(str(text or "")) or _first_number_text(raw))
+            return bool(parse_weight_spec(text) or _first_number_text(raw))
         if raw.casefold() in {"y", "yes", "n", "no"}:
             return False
         if manual_literal_violation(raw, question):
@@ -570,28 +570,3 @@ def _is_plain_chain_answer(value: str) -> bool:
     # Unknown multi-word names and prose require semantic identity planning.
     # Local admission is reserved for one atomic, source-exact candidate.
     return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", text))
-
-
-def _parse_weight_spec(value: str) -> dict[str, int]:
-    text = str(value or "").strip()
-    if not text:
-        return {}
-    try:
-        candidate = json.loads(text)
-    except json.JSONDecodeError:
-        candidate = None
-    if isinstance(candidate, dict):
-        parsed_json: dict[str, int] = {}
-        for key, item in candidate.items():
-            method = str(key).strip()
-            if not method:
-                return {}
-            try:
-                parsed_json[method] = int(item)
-            except (TypeError, ValueError):
-                return {}
-        return parsed_json
-    parsed: dict[str, int] = {}
-    for method, weight in re.findall(r"([A-Za-z][A-Za-z0-9_./:-]*)\s*(?:=|:)\s*([0-9]+)", text):
-        parsed[method] = int(weight)
-    return parsed
