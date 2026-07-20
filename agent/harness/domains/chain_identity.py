@@ -380,7 +380,6 @@ def _apply_unknown_chain_decision(state: AgentGraphState, value: Any, user_text:
     family = ""
     if isinstance(value, dict):
         family = normalize_scalar(value.get("choose_protocol_family"))
-    family = family or adapter_family_hint(str(user_text or value))
     identity = state.setdefault("chain_identity", {})
     if family:
         _convert_known_candidate_to_unknown(state)

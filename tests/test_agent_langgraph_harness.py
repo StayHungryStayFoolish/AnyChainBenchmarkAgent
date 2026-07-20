@@ -7608,6 +7608,118 @@ network:
         self.assertFalse(_catalog_draft(result)["response_confirmed"])
         self.assertEqual(_catalog_draft(result)["method"], "eth_chainId")
 
+    def test_semantically_admitted_response_rejection_preserves_typed_false(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+
+        state = self._state_for_custom_rpc_response_confirmation()
+        state["last_user_input"] = (
+            "I do not accept that response contract; it is incomplete, "
+            "and I will supply corrected evidence next."
+        )
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            return_value={"actions": [{
+                "type": "answer_pending",
+                "answer": False,
+                "selected_value": False,
+                "source_evidence": "I do not accept that response contract",
+                "pending_option_semantic_verified": True,
+                "semantic_purpose_verified": True,
+                "confidence": "high",
+            }]},
+        ):
+            result = process_turn(state)
+
+        self.assertEqual(result["custom_rpc"]["status"], "needs_schema_evidence")
+        self.assertFalse(_catalog_draft(result)["response_confirmed"])
+        self.assertEqual(result["pending_question"]["id"], "custom_rpc_schema_evidence")
+
+    def test_semantically_admitted_option_preserves_typed_numeric_zero(self) -> None:
+        from unittest.mock import patch
+
+        from agent.harness import coordinator
+        from agent.harness.contracts import HandlerResult, StateDelta
+        from agent.harness.domains.runtime import DomainRuntime
+        from agent.harness.state import new_state
+
+        state = new_state("typed-zero", language="en")
+        state["active_group"] = "provider_deployment"
+        state["pending_question"] = {
+            "contract_version": 1,
+            "id": "typed_zero_choice",
+            "group": "provider_deployment",
+            "kind": "numbered_choice",
+            "field": "typed_zero_choice",
+            "manual_input_allowed": False,
+            "options": [{
+                "id": "zero",
+                "label": "Zero",
+                "value": 0,
+                "expected_patch": {"confirmed_config.CLOUD_REGION": 0},
+            }],
+            "accepted_action_types": ["answer_pending"],
+            "validation": {},
+        }
+        existing = coordinator.DOMAIN_RUNTIME["environment"]
+
+        def apply_answer(_state, _question, value, _text):
+            return HandlerResult(
+                delta=StateDelta.set_values({"confirmed_config": {"CLOUD_REGION": value}}),
+                clear_pending=True,
+                completion="completed",
+            )
+
+        runtime = DomainRuntime(
+            apply_action=existing.apply_action,
+            question_factory=existing.question_factory,
+            apply_answer=apply_answer,
+            cancel_question=existing.cancel_question,
+        )
+        with patch.dict(coordinator.DOMAIN_RUNTIME, {"environment": runtime}):
+            result = coordinator._dispatch_pending_action(
+                state,
+                {"type": "answer_pending", "answer": 0, "selected_value": 0},
+            )
+
+        self.assertEqual(result["confirmed_config"]["CLOUD_REGION"], 0)
+        self.assertEqual(result.get("pending_question"), {})
+
+    def test_new_chain_semantic_response_rejection_satisfies_declared_postcondition(self) -> None:
+        from agent.harness.domains.chain_rpc_questions import _response_confirmation_question
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+
+        state = self._state_for_custom_rpc_response_confirmation()
+        state["chain_identity"] = {
+            "raw": "flow-evm",
+            "canonical": "flow-evm",
+            "adapter_family": "jsonrpc",
+            "status": "existing_family_response_needs_confirmation",
+            "case": "case2",
+        }
+        state["custom_rpc"].pop("status", None)
+        state["pending_question"] = _response_confirmation_question(state, "new_chain")
+        state["last_user_input"] = "Reject this observed response; I will correct the evidence."
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            return_value={"actions": [{
+                "type": "answer_pending",
+                "answer": False,
+                "selected_value": False,
+                "source_evidence": "Reject this observed response",
+                "pending_option_semantic_verified": True,
+                "semantic_purpose_verified": True,
+                "confidence": "high",
+            }]},
+        ):
+            result = process_turn(state)
+
+        self.assertEqual(
+            result["chain_identity"]["status"],
+            "existing_family_needs_schema_evidence",
+        )
+        self.assertFalse(_catalog_draft(result)["response_confirmed"])
+        self.assertEqual(result["pending_question"]["id"], "new_chain_schema_evidence")
+
     @staticmethod
     def _state_for_custom_rpc_response_confirmation() -> dict:
         from agent.harness.domains.chain_rpc_questions import _response_confirmation_question
@@ -11674,7 +11786,7 @@ network:
             "manual_input_allowed": True,
             "options": [],
             "accepted_action_types": ["answer_pending", "start_custom_rpc"],
-            "validation": {},
+            "validation": {"value_type": "url"},
         }
         state["last_user_input"] = (
             "My selected validation endpoint is http://fake-node:19000. "

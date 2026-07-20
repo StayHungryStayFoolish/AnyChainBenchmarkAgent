@@ -77,10 +77,10 @@ def resume_question(state: AgentGraphState) -> dict[str, Any]:
                 ),
                 "expected_patch": {"checkpoint_recovery.status": "quarantined"}
                 if values[0] == "inspect_quarantine"
-                else {"pending_question": {}},
+                else {"resume_context": {}},
                 "return_policy": "stop_after_response" if values[0] == "inspect_quarantine" else "fallback",
             },
-            {"id": "2", "label": "2", "value": values[1], "expected_patch": {"pending_question": {}}},
+            {"id": "2", "label": "2", "value": values[1], "expected_patch": {"resume_context": {}}},
             {"id": "3", "label": "3", "value": values[2], "expected_patch": {"confirmed_config": {}}},
         ],
         queue_barrier=True,
@@ -343,12 +343,12 @@ def recommendation_question(state: AgentGraphState) -> dict[str, Any]:
             {
                 "label": "Y",
                 "value": True,
-                "expected_patch": {"pending_question": {}},
+                "expected_patch": {"active_group": "opening"},
             },
             {
                 "label": "N",
                 "value": False,
-                "expected_patch": {"pending_question": {}},
+                "expected_patch": {"active_group": "opening"},
             },
         ],
         queue_barrier=True,

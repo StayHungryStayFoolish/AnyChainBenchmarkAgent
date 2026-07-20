@@ -434,8 +434,8 @@ def config_proposal_review_question(group: str, proposal: dict[str, Any], *, lan
         kind="yes_no",
         manual_input_allowed=False,
         options=[
-            {"label": "Y", "value": True, "expected_patch": {"pending_question": {}}},
-            {"label": "N", "value": False, "expected_patch": {"pending_question": {}}},
+            {"label": "Y", "value": True, "expected_patch": {"inferred_config.pending_review": {}}},
+            {"label": "N", "value": False, "expected_patch": {"inferred_config.pending_review": {}}},
         ],
         queue_barrier=True,
     )

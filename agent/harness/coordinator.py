@@ -2159,6 +2159,9 @@ def _apply_queue_action(state: AgentGraphState, action: dict[str, Any], text: st
     return None
 
 
+_UNSET_PENDING_VALUE = object()
+
+
 def _dispatch_pending_action(state: AgentGraphState, action: dict[str, Any]) -> AgentGraphState:
     pending = dict(state.get("pending_question") or {})
     if not pending:
@@ -2167,7 +2170,8 @@ def _dispatch_pending_action(state: AgentGraphState, action: dict[str, Any]) -> 
             HandlerResult(blocker="no pending question is available for this answer"),
             owner="coordinator",
         )
-    answer = str(action.get("answer") or action.get("_origin_text") or "").strip()
+    raw_answer = action["answer"] if "answer" in action else action.get("_origin_text", "")
+    answer = str(raw_answer).strip()
     selected = action.get("selected_value")
     if isinstance(selected, str) and not selected.strip():
         selected = None
@@ -2212,7 +2216,14 @@ def _dispatch_pending_action(state: AgentGraphState, action: dict[str, Any]) -> 
             ),
             owner="coordinator",
         )
-    return _apply_pending_answer(state, answer if manual_choice_value else interpreted, pending)
+    declared_selection = _pending_option_value_exists(selected, pending)
+    source_text = str(action.get("_origin_text") or action.get("source_evidence") or answer).strip()
+    return _apply_pending_answer(
+        state,
+        source_text if declared_selection else answer,
+        pending,
+        selected_value=selected if declared_selection else _UNSET_PENDING_VALUE,
+    )
 
 
 def _action_proposal(action: dict[str, Any], confidence: str) -> ActionProposal:
@@ -2508,10 +2519,20 @@ def _reconstruct_question(
         return question
     return None
 
-def _apply_pending_answer(state: AgentGraphState, text: str, question: PendingQuestion) -> AgentGraphState:
+def _apply_pending_answer(
+    state: AgentGraphState,
+    text: str,
+    question: PendingQuestion,
+    *,
+    selected_value: Any = _UNSET_PENDING_VALUE,
+) -> AgentGraphState:
     group = str(question.get("group") or "")
     question_id = str(question.get("id") or "")
-    if question.get("contract_version") == 1:
+    if selected_value is not _UNSET_PENDING_VALUE:
+        if not _pending_option_value_exists(selected_value, question):
+            return state
+        value = selected_value
+    elif question.get("contract_version") == 1:
         matched, value = contract_exact_answer(text, question)
         if not matched:
             return state
@@ -2578,7 +2599,7 @@ def _apply_pending_answer(state: AgentGraphState, text: str, question: PendingQu
         runtime.apply_answer(deepcopy(state), question, value, text),
         owner=GROUP_OWNER.get(group, ""),
     )
-    if expected and (GROUP_OWNER.get(group) == "execution" or not result.get("pending_question")):
+    if expected:
         verify_expected_patch(result, expected)
     _record_admitted_action(
         result,
