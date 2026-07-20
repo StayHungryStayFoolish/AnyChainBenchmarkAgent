@@ -7168,7 +7168,6 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
             ],
         }
         provider = Mock()
-        provider.complete.return_value = SimpleNamespace(text=json.dumps({}))
 
         recovered_text, changed = _recover_declared_pending_option_semantics(
             provider,
@@ -7391,6 +7390,111 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual(len(recovered["actions"]), 1)
         self.assertEqual(recovered["semantic_units"][0]["action_indexes"], [0])
+
+    def test_declared_pending_owner_does_not_reopen_valid_planner_effect(self) -> None:
+        import json
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.state import new_state
+
+        source = "Replace the single workload with this custom method."
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "rpc_catalog_command",
+                "catalog_command": "enter",
+                "source_evidence": source,
+            }],
+            "semantic_units": [self._unit(clauses[0], "unit-1", [0])],
+        }
+        state = new_state("pending-owner-early-admission", language="en")
+        state["pending_question"] = {
+            "id": "custom_rpc_scope",
+            "group": "rpc_workload",
+            "options": [{
+                "id": "single_replace",
+                "label": "Replace single workload",
+                "value": "single_replace",
+                "action": {"type": "rpc_catalog_command", "catalog_command": "enter"},
+            }],
+        }
+        provider = Mock()
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            clauses=clauses,
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertFalse(changed)
+        self.assertEqual(provider.complete.call_count, 0)
+        self.assertEqual(recovered["actions"][0]["type"], "rpc_catalog_command")
+
+    def test_declared_pending_owner_replaces_competing_effect_and_keeps_independent_sibling(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.state import new_state
+
+        source = "Use my custom method, and change the QPS profile to quick."
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [
+                {
+                    "type": "change_group",
+                    "group": "endpoint_process",
+                    "source_evidence": "Use my custom method",
+                },
+                {
+                    "type": "set_qps_mode",
+                    "qps_mode": "quick",
+                    "mutation_explicit": True,
+                    "source_evidence": "change the QPS profile to quick",
+                },
+            ],
+            "semantic_units": [self._unit(clauses[0], "unit-1", [0, 1])],
+        }
+        state = new_state("pending-owner-preserve-sibling", language="en")
+        state["pending_question"] = {
+            "id": "custom_rpc_scope",
+            "group": "rpc_workload",
+            "options": [{
+                "id": "single_replace",
+                "label": "Replace single workload",
+                "value": "single_replace",
+                "action": {"type": "rpc_catalog_command", "catalog_command": "enter"},
+            }],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "matches": [{
+                "unit_id": "unit-1",
+                "option_id": "single_replace",
+                "evidence_quote": "Use my custom method",
+                "reason": "selects the declared custom method option",
+            }],
+        }))
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            clauses=clauses,
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            [action["type"] for action in recovered["actions"]],
+            ["set_qps_mode", "rpc_catalog_command"],
+        )
+        self.assertEqual(recovered["pending_answer_admissions"], [1])
+        self.assertEqual(recovered["semantic_units"][0]["action_indexes"], [0, 1])
 
     def test_declared_pending_option_replaces_rejected_planner_action(self) -> None:
         import json

@@ -82,6 +82,12 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
         raw_response = _recover_omitted_chain_selection(provider, raw_response, state)
         raw_response = _apply_state_plan_policy(raw_response, state)
         raw_response = _reconcile_structured_candidate_ownership(raw_response, clauses, state)
+        raw_response, _ = _recover_declared_pending_option_semantics(
+            provider,
+            raw_response,
+            state,
+            clauses=clauses,
+        )
         raw_response, _ = _adjudicate_pending_action_ownership(provider, raw_response, state, text)
         raw_response, _ = _adjudicate_group_navigation_actions(provider, raw_response, state)
         raw_response, _ = _adjudicate_chain_selection_actions(provider, raw_response, state)
@@ -149,6 +155,12 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
             raw_response = _recover_omitted_chain_selection(provider, raw_response, state)
             raw_response = _apply_state_plan_policy(raw_response, state)
             raw_response = _reconcile_structured_candidate_ownership(raw_response, clauses, state)
+            raw_response, _ = _recover_declared_pending_option_semantics(
+                provider,
+                raw_response,
+                state,
+                clauses=clauses,
+            )
             raw_response, _ = _adjudicate_pending_action_ownership(provider, raw_response, state, text)
             raw_response, _ = _adjudicate_group_navigation_actions(provider, raw_response, state)
             raw_response, _ = _adjudicate_chain_selection_actions(provider, raw_response, state)
@@ -788,6 +800,16 @@ def _recover_declared_pending_option_semantics(
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
     units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
     invalid_indexes = set((validation or PlanCoverageResult(False, (), ())).rejected_action_indexes)
+    preexisting_admitted_indexes = {
+        int(index)
+        for key in (
+            "pending_answer_admissions",
+            "chain_selection_admissions",
+            "target_mode_selection_admissions",
+        )
+        for index in payload.get(key, [])
+        if isinstance(index, int) and 0 <= index < len(actions)
+    }
 
     candidates = []
     for unit in units:
@@ -797,8 +819,17 @@ def _recover_declared_pending_option_semantics(
         clarification_owned = any(
             isinstance(index, int)
             and 0 <= index < len(actions)
+            and index not in preexisting_admitted_indexes
             and isinstance(actions[index], dict)
             and str(actions[index].get("type") or "") == "clarify_unresolved"
+            for index in indexes
+        )
+        pending_owned = any(
+            isinstance(index, int)
+            and 0 <= index < len(actions)
+            and index not in preexisting_admitted_indexes
+            and isinstance(actions[index], dict)
+            and _action_requires_pending_owner(actions[index], state, pending, options)
             for index in indexes
         )
         if (
@@ -808,6 +839,7 @@ def _recover_declared_pending_option_semantics(
                 validation.incomplete_unit_ids if validation else ()
             )
             and not clarification_owned
+            and not pending_owned
         ):
             continue
         source = str(unit.get("source_text") or "")
@@ -820,16 +852,7 @@ def _recover_declared_pending_option_semantics(
     if not candidates:
         return plan_text, False
 
-    admitted_indexes = {
-        int(index)
-        for key in (
-            "pending_answer_admissions",
-            "chain_selection_admissions",
-            "target_mode_selection_admissions",
-        )
-        for index in payload.get(key, [])
-        if isinstance(index, int) and 0 <= index < len(actions)
-    }
+    admitted_indexes = preexisting_admitted_indexes
     candidate_ids = {row["unit_id"] for row in candidates}
     anchors: list[dict[str, Any]] = []
     for unit in units:
@@ -1045,6 +1068,7 @@ def _recover_declared_pending_option_semantics(
 
     recovered_actions = [dict(item) for item in actions if isinstance(item, dict)]
     replaced_indexes: set[int] = set()
+    newly_admitted_indexes: set[int] = set()
     for unit in units:
         if not isinstance(unit, dict):
             continue
@@ -1101,12 +1125,36 @@ def _recover_declared_pending_option_semantics(
         if action_index < 0:
             action_index = len(recovered_actions)
             recovered_actions.append(action)
-        replaced_indexes.update(index for index in existing_indexes if index != action_index)
-        unit["action_indexes"] = [action_index]
+        retained_indexes = [
+            index
+            for index in existing_indexes
+            if index == action_index
+            or (
+                index not in invalid_indexes
+                and str(recovered_actions[index].get("type") or "") != "clarify_unresolved"
+                and not _action_requires_pending_owner(
+                    recovered_actions[index],
+                    state,
+                    pending,
+                    options,
+                )
+            )
+        ]
+        replaced_indexes.update(
+            index for index in existing_indexes if index not in retained_indexes
+        )
+        unit["action_indexes"] = list(dict.fromkeys([*retained_indexes, action_index]))
         unit["disposition"] = "action"
         unit["reason"] = "declared pending-contract semantic recovery"
+        newly_admitted_indexes.add(action_index)
     payload["actions"] = recovered_actions
     payload["semantic_units"] = units
+    if newly_admitted_indexes:
+        payload["pending_answer_admissions"] = sorted({
+            int(index)
+            for index in payload.get("pending_answer_admissions", [])
+            if isinstance(index, int) and 0 <= index < len(recovered_actions)
+        } | newly_admitted_indexes)
     referenced_indexes = {
         index
         for unit in units
@@ -1123,6 +1171,23 @@ def _recover_declared_pending_option_semantics(
             reason="replaced by the active pending-contract owner",
         )
     return recovered_text, True
+
+
+def _action_requires_pending_owner(
+    action: dict[str, Any],
+    state: AgentGraphState,
+    pending: dict[str, Any],
+    options: list[dict[str, Any]],
+) -> bool:
+    """Return whether one proposed action claims the finite pending contract."""
+
+    if str(action.get("type") or "") == "clarify_unresolved":
+        return True
+    if _matching_pending_option(action, state):
+        return False
+    if str(action.get("type") or "") == "answer_pending":
+        return False
+    return _action_competes_with_pending_options(action, pending, options)
 
 
 def _reconcile_pending_single_choice_matches(
@@ -3167,9 +3232,16 @@ def _reconcile_pending_owner_mutations(
     payload = _parse_json_object(text)
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
     units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
+    existing_admissions = {
+        int(index)
+        for index in payload.get("pending_answer_admissions", [])
+        if isinstance(index, int) and 0 <= index < len(actions)
+    }
     reviews: list[dict[str, Any]] = []
     for index, action in enumerate(actions):
         if not isinstance(action, dict):
+            continue
+        if index in existing_admissions:
             continue
         action_type = str(action.get("type") or "")
         spec = ACTION_BY_TYPE.get(action_type)
@@ -3231,11 +3303,7 @@ def _reconcile_pending_owner_mutations(
         if isinstance(row, dict) and isinstance(row.get("action_index"), int)
     }
     changed = False
-    admitted_indexes = {
-        int(index)
-        for index in payload.get("pending_answer_admissions", [])
-        if isinstance(index, int) and 0 <= index < len(actions)
-    }
+    admitted_indexes = set(existing_admissions)
     rejected_indexes: set[int] = set()
     for review in reviews:
         index = int(review["action_index"])
