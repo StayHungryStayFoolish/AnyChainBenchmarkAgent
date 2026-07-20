@@ -230,7 +230,7 @@ class FailureRecoveryTest(unittest.TestCase):
         analyze.assert_called_once()
         self.assertEqual(inspected["confirmed_config"], state["confirmed_config"])
         self.assertEqual(inspected["failure_recovery"]["status"], "pending")
-        self.assertEqual(result.visible_results, ("advisory",))
+        self.assertEqual(result.visible_results[-1], "advisory")
         final_response = "\n".join(inspected["visible_response"])
         self.assertEqual(final_response.count("Execution recovery:"), 1)
         self.assertEqual(final_response.count("exit 2"), 1)

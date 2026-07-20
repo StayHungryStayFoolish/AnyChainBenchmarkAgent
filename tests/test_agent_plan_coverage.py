@@ -7567,6 +7567,72 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         self.assertEqual(recovered["pending_answer_admissions"], [1])
         self.assertEqual(recovered["semantic_units"][0]["action_indexes"], [0, 1])
 
+    def test_declared_pending_owner_removes_same_source_consultation(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.state import new_state
+
+        source = "Show me the diagnostic evidence first; I will not change configuration yet."
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [
+                {
+                    "type": "inspect_failure",
+                    "source_evidence": "Show me the diagnostic evidence first",
+                },
+                {
+                    "type": "answer_opening_question",
+                    "topic": "current_step",
+                    "source_evidence": "Show me the diagnostic evidence first",
+                },
+            ],
+            "semantic_units": [self._unit(clauses[0], "unit-1", [0, 1])],
+        }
+        state = new_state("pending-owner-same-source", language="en")
+        state["pending_question"] = {
+            "id": "failure_recovery_action",
+            "group": "failure_recovery",
+            "options": [{
+                "id": "inspect",
+                "label": "Inspect failure evidence and diagnostics",
+                "value": "inspect",
+                "action": {"type": "inspect_failure"},
+            }],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "decision": "select_option",
+            "option_id": "inspect",
+            "evidence_quote": "Show me the diagnostic evidence first",
+            "supporting_unit_ids": ["unit-1"],
+            "independent_unit_ids": [],
+            "reason": "selects the declared evidence-inspection option",
+        }))
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            PlanCoverageResult(
+                valid=False,
+                errors=("competing same-source consultation",),
+                unresolved_clauses=(),
+                incomplete_unit_ids=("unit-1",),
+            ),
+            clauses=clauses,
+            user_text=source,
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertEqual([action["type"] for action in recovered["actions"]], ["inspect_failure"])
+        self.assertEqual(recovered["pending_answer_admissions"], [0])
+        self.assertEqual(recovered["semantic_units"][0]["action_indexes"], [0])
+
     def test_declared_pending_option_replaces_rejected_planner_action(self) -> None:
         import json
         from types import SimpleNamespace

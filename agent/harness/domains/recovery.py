@@ -17,7 +17,12 @@ from ..state import AgentGraphState
 RECOVERY_GROUPS = {"failure_recovery"}
 
 
-def question_for_recovery(state: AgentGraphState, group: str) -> dict[str, Any] | None:
+def question_for_recovery(
+    state: AgentGraphState,
+    group: str,
+    *,
+    include_summary: bool = True,
+) -> dict[str, Any] | None:
     recovery = dict(state.get("failure_recovery") or {})
     record = dict(recovery.get("record") or {})
     if group != "failure_recovery" or not unresolved_recovery(recovery):
@@ -52,10 +57,15 @@ def question_for_recovery(state: AgentGraphState, group: str) -> dict[str, Any] 
         "expected_patch": {"failure_recovery.status": "cancelled"},
         "return_policy": "stop_after_response",
     })
-    prompt = render_failure_summary(record, language) + "\n" + localized(
+    decision_prompt = localized(
         language,
         "请选择下一步。修正完成后，Agent 会重新运行相关校验并回到正常配置流程。",
         "Choose the next step. After correction, the Agent will rerun the relevant validation and resume the normal configuration flow.",
+    )
+    prompt = (
+        render_failure_summary(record, language) + "\n" + decision_prompt
+        if include_summary
+        else decision_prompt
     )
     return choice_question(
         "failure_recovery",
@@ -79,19 +89,19 @@ def apply_recovery_action(state: AgentGraphState, action: ActionProposal) -> Han
 
     if action.action_type == "inspect_failure":
         recovery["selected_action"] = "inspect_failure"
-        responses: list[str] = []
+        responses = [render_failure_summary(record, str(next_state.get("language") or "en"))]
         if record.get("llm_analysis_useful"):
             advisory = analyze_evidence_with_model(
                 next_state,
                 json.dumps(record, ensure_ascii=False, sort_keys=True),
                 localized(
                     next_state.get("language", "en"),
-                    "解释这个失败的已观察事实、可能原因和验证步骤；只能建议 failure record 中允许的动作。",
-                    "Explain the observed facts, likely causes, and verification steps; recommend only actions allowed by the failure record.",
+                    "只补充可能原因和验证步骤，不要重复 failure heading、已观察事实、保留配置或证据路径；只能建议 failure record 中允许的动作。",
+                    "Add only likely causes and validation steps. Do not repeat the failure heading, observed facts, preserved configuration, or evidence paths; recommend only actions allowed by the failure record.",
                 ),
             )
             responses.append(advisory)
-        next_question = question_for_recovery(next_state, "failure_recovery")
+        next_question = question_for_recovery(next_state, "failure_recovery", include_summary=False)
         return HandlerResult(
             delta=StateDelta.between(state, next_state),
             consumed_action_ids=(action.action_id,),

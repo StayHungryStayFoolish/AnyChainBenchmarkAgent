@@ -1103,6 +1103,10 @@ def _recover_declared_pending_option_semantics(
                     pending,
                     options,
                 )
+                and _action_has_independent_source(
+                    recovered_actions[index],
+                    quote,
+                )
             )
         ]
         replaced_indexes.update(
@@ -1136,6 +1140,14 @@ def _recover_declared_pending_option_semantics(
             reason="replaced by the active pending-contract owner",
         )
     return recovered_text, True
+
+
+def _action_has_independent_source(action: dict[str, Any], owner_quote: str) -> bool:
+    """Keep only exact, source-distinct work beside a finite option effect."""
+
+    source = str(action.get("source_evidence") or "").strip()
+    quote = str(owner_quote or "").strip()
+    return bool(source and quote and source not in quote and quote not in source)
 
 
 def _action_requires_pending_owner(
