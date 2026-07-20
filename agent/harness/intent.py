@@ -1651,7 +1651,85 @@ def _reconstruct_missing_semantic_units(
         candidate_coverage = validate_plan_coverage(candidate, clauses)
         if not any(error.startswith(structural_prefixes) for error in candidate_coverage.errors):
             return json.dumps(candidate, ensure_ascii=False, sort_keys=True)
+    collapsed = _collapse_action_units_to_complete_clauses(payload, clauses)
+    if collapsed is not None:
+        return json.dumps(collapsed, ensure_ascii=False, sort_keys=True)
     return text
+
+
+def _collapse_action_units_to_complete_clauses(
+    payload: dict[str, Any],
+    clauses: tuple[TurnClause, ...],
+) -> dict[str, Any] | None:
+    """Preserve an immutable transaction when only its source partition failed.
+
+    The complete clause remains the authoritative evidence boundary. The
+    semantic-fulfilment reviewer still decides whether the immutable action set
+    represents every demand in that clause.
+    """
+
+    actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
+    if not actions or not units:
+        return None
+
+    by_clause: dict[str, list[dict[str, Any]]] = {}
+    for unit in units:
+        if not isinstance(unit, dict):
+            return None
+        clause_id = str(unit.get("clause_id") or "").strip()
+        indexes = unit.get("action_indexes")
+        if (
+            not clause_id
+            or str(unit.get("disposition") or "") != "action"
+            or not isinstance(indexes, list)
+            or not indexes
+        ):
+            return None
+        by_clause.setdefault(clause_id, []).append(unit)
+
+    expected = {clause.clause_id: clause for clause in clauses}
+    if set(by_clause) != set(expected):
+        return None
+
+    normalized_units: list[dict[str, Any]] = []
+    referenced: set[int] = set()
+    for clause in clauses:
+        if len(by_clause[clause.clause_id]) < 2:
+            return None
+        cursor = 0
+        merged_indexes: list[int] = []
+        for unit in by_clause[clause.clause_id]:
+            anchor = str(unit.get("source_text") or "")
+            position = clause.text.find(anchor, cursor)
+            if not anchor or position < 0:
+                return None
+            cursor = position + len(anchor)
+            for action_index in unit["action_indexes"]:
+                if (
+                    not isinstance(action_index, int)
+                    or isinstance(action_index, bool)
+                    or not 0 <= action_index < len(actions)
+                ):
+                    return None
+                if action_index not in merged_indexes:
+                    merged_indexes.append(action_index)
+                    referenced.add(action_index)
+        normalized_units.append({
+            "unit_id": f"{clause.clause_id}-complete-action-transaction",
+            "clause_id": clause.clause_id,
+            "source_text": clause.text,
+            "disposition": "action",
+            "action_indexes": merged_indexes,
+            "reason": "complete source clause owns the immutable action transaction",
+        })
+
+    if referenced != set(range(len(actions))):
+        return None
+    candidate = dict(payload)
+    candidate["semantic_units"] = normalized_units
+    coverage = validate_plan_coverage(candidate, clauses)
+    return candidate if coverage.valid else None
 
 
 def _validate_action_document(
@@ -3354,32 +3432,15 @@ def _merge_pending_manual_answer_into_config_proposal(
     if not admitted_answers or not proposal_indexes:
         return text, False
 
-    clause_actions: dict[str, set[int]] = {}
-    for unit in units:
-        if not isinstance(unit, dict):
-            continue
-        clause_id = str(unit.get("clause_id") or "")
-        clause_actions.setdefault(clause_id, set()).update(
-            index
-            for index in unit.get("action_indexes") or []
-            if isinstance(index, int) and 0 <= index < len(actions)
-        )
-
     merged_answers: set[int] = set()
     for answer_index in sorted(admitted_answers):
         answer_action = actions[answer_index]
         answer = str(answer_action.get("answer") or "").strip()
         if not answer or not answer_fits_pending(answer, pending):
             continue
-        owners = {
-            proposal_index
-            for indexes in clause_actions.values()
-            if answer_index in indexes
-            for proposal_index in (indexes & proposal_indexes)
-        }
-        if len(owners) != 1:
+        if len(proposal_indexes) != 1:
             continue
-        proposal_index = next(iter(owners))
+        proposal_index = next(iter(proposal_indexes))
         proposal = actions[proposal_index]
         config_values = dict(proposal.get("config_values") or {})
         existing = next(

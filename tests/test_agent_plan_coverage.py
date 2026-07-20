@@ -103,6 +103,92 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertEqual(result["pending_answer_admissions"], [])
         self.assertNotIn("admission_rejections", result)
 
+    def test_separate_clause_manual_field_is_folded_into_the_only_config_review(self) -> None:
+        from agent.harness.intent import _merge_pending_manual_answer_into_config_proposal
+        from agent.harness.state import new_state
+
+        source = "interface: eth0\nUse 100 Gbps as the maximum bandwidth."
+        clauses = segment_user_turn(source)
+        state = new_state("atomic-pending-config-separate-clauses")
+        state["pending_question"] = {
+            "id": "NETWORK_MAX_BANDWIDTH_GBPS",
+            "group": "network",
+            "field": "NETWORK_MAX_BANDWIDTH_GBPS",
+            "kind": "manual_value",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "positive_number"},
+        }
+        payload = {
+            "actions": [
+                {
+                    "type": "propose_config_values",
+                    "config_values": {"NETWORK_INTERFACE": "eth0"},
+                    "unmapped_values": {},
+                    "source_format": "mixed",
+                    "source_evidence": clauses[0].text,
+                },
+                {
+                    "type": "answer_pending",
+                    "answer": "100",
+                    "source_evidence": clauses[1].text,
+                },
+            ],
+            "semantic_units": [
+                _unit(clauses[0], 1, [0]),
+                _unit(clauses[1], 2, [1]),
+            ],
+            "pending_answer_admissions": [1],
+        }
+
+        result_text, changed = _merge_pending_manual_answer_into_config_proposal(
+            json.dumps(payload),
+            state,
+        )
+        result = json.loads(result_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(len(result["actions"]), 1)
+        self.assertEqual(result["actions"][0]["config_values"], {
+            "NETWORK_INTERFACE": "eth0",
+            "NETWORK_MAX_BANDWIDTH_GBPS": "100",
+        })
+        self.assertEqual(
+            [unit["action_indexes"] for unit in result["semantic_units"]],
+            [[0], [0]],
+        )
+
+    def test_manual_field_is_not_folded_when_config_transaction_is_ambiguous(self) -> None:
+        from agent.harness.intent import _merge_pending_manual_answer_into_config_proposal
+        from agent.harness.state import new_state
+
+        source = "CLOUD_REGION=us-east1\nNETWORK_INTERFACE=eth0\nUse 100 Gbps."
+        clauses = segment_user_turn(source)
+        state = new_state("ambiguous-config-transaction")
+        state["pending_question"] = {
+            "id": "NETWORK_MAX_BANDWIDTH_GBPS",
+            "field": "NETWORK_MAX_BANDWIDTH_GBPS",
+            "kind": "manual_value",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "positive_number"},
+        }
+        payload = {
+            "actions": [
+                {"type": "propose_config_values", "config_values": {"CLOUD_REGION": "us-east1"}},
+                {"type": "propose_config_values", "config_values": {"NETWORK_INTERFACE": "eth0"}},
+                {"type": "answer_pending", "answer": "100", "source_evidence": "100 Gbps"},
+            ],
+            "semantic_units": [_unit(clauses[0], 1, [0, 1, 2])],
+            "pending_answer_admissions": [2],
+        }
+
+        result_text, changed = _merge_pending_manual_answer_into_config_proposal(
+            json.dumps(payload),
+            state,
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(json.loads(result_text), payload)
+
     def test_atomic_config_review_does_not_hide_a_conflicting_value(self) -> None:
         from agent.harness.intent import _merge_pending_manual_answer_into_config_proposal
         from agent.harness.state import new_state
@@ -4935,6 +5021,122 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertEqual(recovered["semantic_units"][0]["source_text"], source)
         self.assertEqual(recovered["semantic_units"][0]["action_indexes"], [0, 1, 2, 3, 4])
         provider.complete.assert_called_once()
+
+    def test_lossy_ordered_action_anchors_fall_back_to_complete_clause_transaction(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _reconstruct_missing_semantic_units
+
+        source = "Run sync-observe now, and after that keep a real-node benchmark as the next workflow."
+        clauses = segment_user_turn(source)
+        actions = [
+            {
+                "type": "choose_target_mode",
+                "target_mode": "sync-observe",
+                "target_mode_explicit": True,
+                "source_evidence": "Run sync-observe now",
+            },
+            {
+                "type": "queue_workflow_goal",
+                "target_mode": "real-node",
+                "goal": "real-node benchmark",
+                "source_evidence": "real-node benchmark as the next workflow",
+            },
+        ]
+        lossy_units = [
+            {
+                "unit_id": "unit-1",
+                "clause_id": clauses[0].clause_id,
+                "source_text": "Run sync-observe now",
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "current workflow",
+            },
+            {
+                "unit_id": "unit-2",
+                "clause_id": clauses[0].clause_id,
+                "source_text": "real-node benchmark as the next workflow",
+                "disposition": "action",
+                "action_indexes": [1],
+                "reason": "deferred workflow",
+            },
+        ]
+        invalid = SimpleNamespace(text=json.dumps({"semantic_units": lossy_units}))
+        provider = Mock()
+        provider.complete.side_effect = [invalid, invalid]
+
+        recovered = json.loads(_reconstruct_missing_semantic_units(
+            provider,
+            json.dumps({"actions": actions, "semantic_units": lossy_units}),
+            clauses,
+        ))
+
+        self.assertEqual(recovered["actions"], actions)
+        self.assertEqual(recovered["semantic_units"], [{
+            "unit_id": "clause-1-complete-action-transaction",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "disposition": "action",
+            "action_indexes": [0, 1],
+            "reason": "complete source clause owns the immutable action transaction",
+        }])
+        self.assertTrue(validate_plan_coverage(recovered, clauses).valid)
+        self.assertEqual(provider.complete.call_count, 2)
+
+    def test_complete_clause_transaction_still_rejects_an_omitted_demand(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _validate_semantic_fulfillment
+        from agent.harness.state import new_state
+
+        source = "Run sync-observe now, benchmark real-node later, and email the result."
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [
+                {
+                    "type": "choose_target_mode",
+                    "target_mode": "sync-observe",
+                    "target_mode_explicit": True,
+                    "source_evidence": "Run sync-observe now",
+                },
+                {
+                    "type": "queue_workflow_goal",
+                    "target_mode": "real-node",
+                    "goal": "benchmark real-node later",
+                    "source_evidence": "benchmark real-node later",
+                },
+            ],
+            "semantic_units": [{
+                "unit_id": "clause-1-complete-action-transaction",
+                "clause_id": "clause-1",
+                "source_text": source,
+                "disposition": "action",
+                "action_indexes": [0, 1],
+                "reason": "complete source clause owns the immutable action transaction",
+            }],
+            "target_mode_selection_admissions": [0, 1],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "unit_reviews": [{
+                "unit_id": "clause-1-complete-action-transaction",
+                "complete": False,
+                "missing_demand_quote": "email the result",
+                "reason": "the output-delivery demand has no mapped action",
+            }],
+        }))
+
+        result = _validate_semantic_fulfillment(
+            provider,
+            json.dumps(payload),
+            clauses,
+            new_state("complete-clause-omission", language="en"),
+        )
+
+        self.assertFalse(result.valid)
+        self.assertIn("fulfilment failed", "\n".join(result.errors))
 
     def test_reconstructed_partition_cannot_orphan_an_immutable_action(self) -> None:
         import json
