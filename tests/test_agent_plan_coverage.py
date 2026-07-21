@@ -3712,6 +3712,134 @@ class PlanCoverageTest(unittest.TestCase):
         }])
         self.assertEqual(document["pending_answer_admissions"], [0])
 
+    def test_structured_rpc_request_recovers_omitted_method_owner_symmetrically(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_pending_action_ownership
+        from agent.harness.state import new_state
+
+        source = (
+            "Here is the request I found; I do not have its response yet:\n"
+            '{"jsonrpc":"2.0","id":9,"method":"eth_getBalance",'
+            '"params":["0x0000000000000000000000000000000000000000","latest"]}'
+        )
+        clauses = segment_user_turn(source)
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "reviews": [{
+                "action_index": 0,
+                "decision": "direct_answer",
+                "selected_value": "eth_getBalance",
+                "evidence_quote": "eth_getBalance",
+                "reason": "the structured request supplies the requested wire method",
+            }],
+        }))
+
+        for question_id in ("custom_rpc_method", "new_chain_method"):
+            state = new_state(f"structured-owner-{question_id}", language="en")
+            state["pending_question"] = {
+                "id": question_id,
+                "group": "endpoint_process",
+                "kind": "manual_value",
+                "field": question_id,
+                "prompt": "Enter the RPC method name to validate.",
+                "manual_input_allowed": True,
+                "accepted_action_types": ["rpc_catalog_command"],
+                "manual_action": {
+                    "type": "rpc_catalog_command",
+                    "catalog_command": "set_method",
+                    "value_argument": "rpc_method",
+                },
+                "validation": {"input_mode": "rpc_method_or_schema_evidence"},
+                "options": [],
+            }
+            payload = {
+                "actions": [{
+                    "type": "clarify_unresolved",
+                    "clauses": [clauses[-1].text],
+                }],
+                "semantic_units": [
+                    _unit(clauses[0], 1, [], disposition="context"),
+                    _unit(clauses[-1], 2, [0]),
+                ],
+            }
+
+            result, changed = _adjudicate_pending_action_ownership(
+                provider, json.dumps(payload), state, source
+            )
+            document = json.loads(result)
+
+            self.assertTrue(changed)
+            self.assertEqual(document["actions"], [{
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_method",
+                "rpc_method": "eth_getBalance",
+                "source_evidence": "eth_getBalance",
+            }])
+            self.assertEqual(document["pending_answer_admissions"], [0])
+
+        from agent.harness.action_registry import ACTION_BY_TYPE
+
+        self.assertIn(
+            "evidence_completeness",
+            ACTION_BY_TYPE["rpc_catalog_command"].semantic_support_relations,
+        )
+
+    def test_structured_rpc_request_does_not_bypass_semantic_rejection(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_pending_action_ownership
+        from agent.harness.state import new_state
+
+        source = (
+            "Do not use this documentation example:\n"
+            '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
+        )
+        clauses = segment_user_turn(source)
+        state = new_state("structured-owner-rejection", language="en")
+        state["pending_question"] = {
+            "id": "opaque-method-question",
+            "group": "endpoint_process",
+            "kind": "manual_value",
+            "field": "custom_rpc_method",
+            "prompt": "Enter the RPC method name to validate.",
+            "manual_input_allowed": True,
+            "accepted_action_types": ["rpc_catalog_command"],
+            "manual_action": {
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_method",
+                "value_argument": "rpc_method",
+            },
+            "validation": {"input_mode": "rpc_method_or_schema_evidence"},
+            "options": [],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "reviews": [{
+                "action_index": 0,
+                "decision": "reject",
+                "selected_value": None,
+                "evidence_quote": "",
+                "reason": "the source explicitly rejects the example",
+            }],
+        }))
+        payload = {
+            "actions": [{"type": "clarify_unresolved", "clauses": [source]}],
+            "semantic_units": [_unit(clauses[-1], 1, [0])],
+        }
+
+        result, _changed = _adjudicate_pending_action_ownership(
+            provider, json.dumps(payload), state, source
+        )
+        document = json.loads(result)
+
+        self.assertEqual(document["actions"], [])
+        self.assertEqual(document["semantic_units"][0]["disposition"], "unresolved")
+
     def test_case3_multiline_evidence_compiles_through_declared_owner(self) -> None:
         import json
 

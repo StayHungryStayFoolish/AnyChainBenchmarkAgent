@@ -234,6 +234,32 @@ def _rpc_wire_payloads(value: Any) -> list[Any]:
     return payloads
 
 
+def extract_rpc_method_identities(value: Any) -> list[str]:
+    """Return source-grounded wire method identities from RPC documents.
+
+    This is syntax extraction only.  It deliberately does not decide whether
+    an example should be selected, rejected, or treated as documentation; the
+    active Harness contract and semantic admission layer own that decision.
+    """
+
+    methods: list[str] = []
+    for payload in _rpc_wire_payloads(value):
+        if not isinstance(payload, dict):
+            continue
+        method = next(
+            (
+                item
+                for key, item in payload.items()
+                if str(key).casefold() == "method"
+            ),
+            None,
+        )
+        normalized = normalize_scalar(method)
+        if looks_like_wire_method_identity(normalized) and normalized not in methods:
+            methods.append(normalized)
+    return methods
+
+
 def has_rpc_wire_evidence(value: Any, *, allow_params_only: bool = False) -> bool:
     """Return whether one turn contains an attributable RPC wire fact."""
 

@@ -30,6 +30,7 @@ SEMANTIC_SUPPORT_RELATIONS = frozenset({
     "provenance",
     "format_scope",
     "temporal_scope",
+    "evidence_completeness",
     "non_mutation_scope",
 })
 FRAMED_OPERATION_SUPPORT_RELATIONS = (
@@ -37,6 +38,10 @@ FRAMED_OPERATION_SUPPORT_RELATIONS = (
     "provenance",
     "format_scope",
     "temporal_scope",
+)
+EVIDENCE_OPERATION_SUPPORT_RELATIONS = (
+    *FRAMED_OPERATION_SUPPORT_RELATIONS,
+    "evidence_completeness",
 )
 
 
@@ -365,7 +370,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
             "set_endpoint requires only rpc_endpoint; set_method requires only rpc_method; append_evidence requires only rpc_schema_evidence; enter accepts no payload",
         ),
         incompatible_target_modes=("sync-observe",),
-        semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
+        semantic_support_relations=EVIDENCE_OPERATION_SUPPORT_RELATIONS,
         validator=_validate_rpc_catalog_command,
     ),
     ActionSpec(

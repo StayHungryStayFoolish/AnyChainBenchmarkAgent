@@ -25,7 +25,7 @@ from .domains.environment import (
     CONFIG_PROPOSAL_FIELDS,
     extract_structured_input_candidates,
 )
-from .input_values import target_mode_evidence_matches
+from .input_values import extract_rpc_method_identities, target_mode_evidence_matches
 from .plan_coverage import PlanCoverageResult, TurnClause, segment_user_turn, validate_plan_coverage
 from .questions import (
     answer_fits_pending,
@@ -4569,6 +4569,10 @@ def _adjudicate_manual_pending_answers(
         isinstance(item, dict) for item in pending.get("options") or []
     )
     payload = _parse_json_object(text)
+    seeded_indexes = _seed_structured_manual_pending_candidates(
+        payload,
+        pending,
+    )
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
     units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
     candidate_indexes = [
@@ -4580,6 +4584,7 @@ def _adjudicate_manual_pending_answers(
     directly_grounded = {
         index: quote
         for index in candidate_indexes
+        if index not in seeded_indexes
         if value_satisfies_pending_contract(str(actions[index].get("answer") or ""), pending)
         and (quote := _manual_answer_literal_source(actions[index], user_text))
     }
@@ -4691,6 +4696,114 @@ def _adjudicate_manual_pending_answers(
     if admitted or changed:
         return serialized, changed
     return text, False
+
+
+def _seed_structured_manual_pending_candidates(
+    payload: dict[str, Any],
+    pending: dict[str, Any],
+) -> set[int]:
+    """Expose syntax-owned RPC identities to the declared pending owner.
+
+    The action planner still owns conversational decomposition.  When it omits
+    the owner action for a structured RPC request, however, the wire parser can
+    prove the exact method identity.  We create only a review candidate here;
+    semantic admission must still decide whether surrounding prose selects the
+    method or rejects/qualifies the example.
+    """
+
+    validation = dict(pending.get("validation") or {})
+    template = dict(pending.get("manual_action") or {})
+    if (
+        validation.get("input_mode") != "rpc_method_or_schema_evidence"
+        or template.get("type") != "rpc_catalog_command"
+        or template.get("catalog_command") != "set_method"
+        or template.get("value_argument") != "rpc_method"
+    ):
+        return set()
+
+    actions = [dict(action) for action in payload.get("actions") or [] if isinstance(action, dict)]
+    units = [dict(unit) for unit in payload.get("semantic_units") or [] if isinstance(unit, dict)]
+    claims: list[tuple[str, str]] = []
+    for unit in units:
+        source = str(unit.get("source_text") or "")
+        methods = extract_rpc_method_identities(source)
+        if len(methods) == 1:
+            claims.append((str(unit.get("unit_id") or ""), methods[0]))
+    if not claims:
+        return set()
+
+    claimed_ids = {unit_id for unit_id, _method in claims if unit_id}
+    action_unit_ids: dict[int, set[str]] = {}
+    for unit in units:
+        unit_id = str(unit.get("unit_id") or "")
+        for index in unit.get("action_indexes") or []:
+            if isinstance(index, int):
+                action_unit_ids.setdefault(index, set()).add(unit_id)
+    removable = {
+        index
+        for index, action in enumerate(actions)
+        if str(action.get("type") or "") == "clarify_unresolved"
+        and action_unit_ids.get(index)
+        and action_unit_ids[index] <= claimed_ids
+    }
+    if removable:
+        old_to_new: dict[int, int] = {}
+        retained: list[dict[str, Any]] = []
+        for index, action in enumerate(actions):
+            if index in removable:
+                continue
+            old_to_new[index] = len(retained)
+            retained.append(action)
+        actions = retained
+        for unit in units:
+            unit["action_indexes"] = [
+                old_to_new[index]
+                for index in unit.get("action_indexes") or []
+                if isinstance(index, int) and index in old_to_new
+            ]
+
+    seeded: set[int] = set()
+    units_by_id = {str(unit.get("unit_id") or ""): unit for unit in units}
+    for unit_id, method in claims:
+        unit = units_by_id.get(unit_id)
+        if unit is None:
+            continue
+        existing = next(
+            (
+                index
+                for index in unit.get("action_indexes") or []
+                if isinstance(index, int)
+                and 0 <= index < len(actions)
+                and actions[index].get("type") == "rpc_catalog_command"
+                and actions[index].get("catalog_command") == "set_method"
+                and actions[index].get("rpc_method") == method
+            ),
+            -1,
+        )
+        if existing >= 0:
+            continue
+        source = str(unit.get("source_text") or "")
+        index = len(actions)
+        actions.append({
+            "type": "answer_pending",
+            "answer": source,
+            "source_evidence": source,
+        })
+        unit["action_indexes"] = list(dict.fromkeys([
+            *(
+                item
+                for item in unit.get("action_indexes") or []
+                if isinstance(item, int)
+            ),
+            index,
+        ]))
+        unit["disposition"] = "action"
+        unit["reason"] = "structured RPC identity awaiting declared pending-owner review"
+        seeded.add(index)
+
+    payload["actions"] = actions
+    payload["semantic_units"] = units
+    return seeded
 
 
 def _manual_answer_has_literal_source(action: dict[str, Any], user_text: str) -> bool:
@@ -6333,7 +6446,7 @@ def _semantic_fulfillment_prompt(*, review_kind: str = "both") -> str:
         )
     return (
         output_contract
-        + "For context_reviews, context_only is true only when source_text is prose with no independent present demand and either (a) requests only an inevitable completion_effect explicitly declared by the supplied pending_question for the same pending answer, or (b) is explanatory context, provenance, format scope, temporal scope, or a non-mutation constraint for exactly one related_operation, and that operation declares the matching allowed_support_relation. The related operation must have a direct_source_unit that states the actual operation request. Such declared support adds no independent operation. A present answer, question, selection, correction, contradiction, concrete value, mutation, different navigation destination, evidence submission, or execution instruction is independent and therefore false. A statement that answers the supplied pending_question is not context. input_shape must be prose. planner_reason is untrusted and cannot establish the verdict. Missing or ambiguous intent is false. "
+        + "For context_reviews, context_only is true only when source_text is prose with no independent present demand and either (a) requests only an inevitable completion_effect explicitly declared by the supplied pending_question for the same pending answer, or (b) is explanatory context, provenance, format scope, temporal scope, evidence-completeness scope, or a non-mutation constraint for exactly one related_operation, and that operation declares the matching allowed_support_relation. evidence_completeness means only that the source states which request, response, parameter, or documentation evidence is presently available or absent for the same submitted RPC operation; it cannot supply a second method, contradict the submitted operation, or waive required validation. The related operation must have a direct_source_unit that states the actual operation request. Such declared support adds no independent operation. A present answer, question, selection, correction, contradiction, concrete value, mutation, different navigation destination, evidence submission, or execution instruction is independent and therefore false. A statement that answers the supplied pending_question is not context. input_shape must be prose. planner_reason is untrusted and cannot establish the verdict. Missing or ambiguous intent is false. "
         "Operations are opaque, already-registered Harness operations. Internal operation names are intentionally absent because registration, lifecycle, ordering, and choose-versus-change selection are deterministic Harness responsibilities. Never infer or discuss an internal operation name and never reject a purpose on registry or lifecycle grounds. Decide only whether the exact source_units "
         "semantically and explicitly support the declared purpose and its supplied arguments. Workflow state "
         "and a pending question are context, never user evidence. For unit_reviews, ignore pending_question entirely: "
