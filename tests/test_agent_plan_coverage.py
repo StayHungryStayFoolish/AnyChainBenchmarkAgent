@@ -1597,6 +1597,7 @@ class PlanCoverageTest(unittest.TestCase):
             }],
             "semantic_units": [],
             "target_mode_selection_admissions": [0],
+            "pending_support_unit_ids": ["model-forged-unit"],
         })
 
         parsed = _parse_action_queue(
@@ -2007,6 +2008,7 @@ class PlanCoverageTest(unittest.TestCase):
         })))
 
         self.assertNotIn("target_mode_selection_admissions", prepared)
+        self.assertNotIn("pending_support_unit_ids", prepared)
         self.assertNotIn("consultation_admissions", prepared)
         self.assertNotIn("admission_rejections", prepared)
         self.assertNotEqual(prepared["admission_action_ids"], ["model-forged"])
@@ -9044,6 +9046,71 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         self.assertEqual(recovered["semantic_units"][0]["disposition"], "action")
         self.assertEqual(recovered["semantic_units"][1]["disposition"], "context")
 
+    def test_pending_option_partitions_rationale_sharing_provisional_action(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.state import new_state
+
+        source = (
+            "Use the fake-node option for this run. "
+            "I want to validate the complete framework loop before connecting a real endpoint."
+        )
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "choose_target_mode",
+                "target_mode": "fake-node",
+                "target_mode_explicit": True,
+                "source_evidence": clauses[0].text,
+            }],
+            "semantic_units": [
+                self._unit(clauses[0], "unit-choice", [0]),
+                self._unit(clauses[1], "unit-purpose", [0]),
+            ],
+        }
+        state = new_state("pending-provisional-anchor", language="en")
+        state["pending_question"] = {
+            "id": "target_mode_select",
+            "group": "entry_mode",
+            "prompt": "Choose the target mode.",
+            "manual_input_allowed": False,
+            "accepted_action_types": ["choose_target_mode"],
+            "options": [{
+                "id": "fake-node",
+                "label": "fake-node",
+                "value": "fake-node",
+                "action": {
+                    "type": "choose_target_mode",
+                    "target_mode": "fake-node",
+                    "target_mode_explicit": True,
+                },
+            }],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "conflict": False,
+            "ambiguous": False,
+            "supporting_unit_ids": ["unit-purpose"],
+            "independent_unit_ids": [],
+            "reason": "the remaining unit explains why the immutable selection is appropriate",
+        }))
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider, json.dumps(payload), state, clauses=clauses, user_text=source
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertNotIn("pending_answer_admissions", recovered)
+        self.assertEqual(recovered["pending_support_unit_ids"], ["unit-purpose"])
+        self.assertEqual(provider.complete.call_count, 2)
+        self.assertEqual(recovered["semantic_units"][0]["action_indexes"], [0])
+        self.assertEqual(recovered["semantic_units"][1]["action_indexes"], [])
+        self.assertEqual(recovered["semantic_units"][1]["disposition"], "context")
+
     def test_pending_option_preserves_independent_context_labeled_request(self) -> None:
         import json
         from types import SimpleNamespace
@@ -9471,9 +9538,8 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         }
         provider = Mock()
         provider.complete.return_value = SimpleNamespace(text=json.dumps({
-            "decision": "select_option",
-            "option_id": "sync-observe",
-            "evidence_quote": "don't generate benchmark traffic",
+            "conflict": False,
+            "ambiguous": False,
             "supporting_unit_ids": ["unit-context"],
             "independent_unit_ids": [],
             "reason": "supports the already admitted observation mode",

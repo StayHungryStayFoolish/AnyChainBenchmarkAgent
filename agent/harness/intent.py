@@ -45,6 +45,7 @@ ALLOWED_ACTION_TYPES = [spec.action_type for spec in ACTION_SPECS]
 
 _ADMISSION_RECEIPT_KEYS = frozenset({
     "pending_answer_admissions",
+    "pending_support_unit_ids",
     "chain_selection_admissions",
     "target_mode_selection_admissions",
     "consultation_admissions",
@@ -900,15 +901,52 @@ def _recover_declared_pending_option_semantics(
         for index in payload.get(key, [])
         if isinstance(index, int) and 0 <= index < len(actions)
     }
+    provisional_anchor_indexes = {
+        index
+        for index, action in enumerate(actions)
+        if isinstance(action, dict)
+        and index not in preexisting_admitted_indexes
+        and bool(_matching_pending_option(action, state))
+        and bool(str(action.get("source_evidence") or "").strip())
+    }
 
+    verified_support_unit_ids = {
+        str(item)
+        for item in payload.get("pending_support_unit_ids", [])
+        if str(item)
+    }
     candidates = []
     for unit in units:
         if not isinstance(unit, dict):
+            continue
+        unit_id = str(unit.get("unit_id") or "")
+        if unit_id in verified_support_unit_ids:
             continue
         indexes = unit.get("action_indexes") if isinstance(unit.get("action_indexes"), list) else []
         if any(
             isinstance(index, int) and index in preexisting_admitted_indexes
             for index in indexes
+        ):
+            continue
+        source = str(unit.get("source_text") or "")
+        provisional_indexes = {
+            index
+            for index in indexes
+            if isinstance(index, int) and index in provisional_anchor_indexes
+        }
+        unit_is_incomplete = unit_id in (
+            validation.incomplete_unit_ids if validation else ()
+        )
+        unit_has_rejected_action = any(index in invalid_indexes for index in indexes)
+        if (
+            provisional_indexes
+            and not unit_is_incomplete
+            and not unit_has_rejected_action
+            and str(unit.get("disposition") or "") == "action"
+            and any(
+                str(actions[index].get("source_evidence") or "").strip() in source
+                for index in provisional_indexes
+            )
         ):
             continue
         clarification_owned = any(
@@ -943,6 +981,7 @@ def _recover_declared_pending_option_semantics(
                 for index in indexes
             )
         )
+        shares_provisional_anchor = bool(provisional_indexes)
         disposition = str(unit.get("disposition") or "")
         # The active pending contract owns admission for planner context as
         # well as unresolved or competing mutations. A planner may label an
@@ -959,9 +998,9 @@ def _recover_declared_pending_option_semantics(
             and not clarification_owned
             and not pending_owned
             and not pending_owner_arbitration
+            and not shares_provisional_anchor
         ):
             continue
-        source = str(unit.get("source_text") or "")
         if source:
             candidates.append({
                 "unit_id": str(unit.get("unit_id") or ""),
@@ -971,7 +1010,7 @@ def _recover_declared_pending_option_semantics(
     if not candidates:
         return plan_text, False
 
-    admitted_indexes = preexisting_admitted_indexes
+    anchor_indexes = preexisting_admitted_indexes | provisional_anchor_indexes
     candidate_ids = {row["unit_id"] for row in candidates}
     anchors: list[dict[str, Any]] = []
     manual_anchors: list[dict[str, Any]] = []
@@ -985,7 +1024,7 @@ def _recover_declared_pending_option_semantics(
             index
             for index in unit.get("action_indexes") or []
             if isinstance(index, int)
-            and index in admitted_indexes
+            and index in anchor_indexes
             and index not in invalid_indexes
             and isinstance(actions[index], dict)
         ]
@@ -1026,6 +1065,7 @@ def _recover_declared_pending_option_semantics(
             continue
         anchors.append({
             "unit_id": unit_id,
+            "action_index": indexes[0],
             "option_id": str(selected["option_id"]),
             "source_text": source,
             "evidence_quote": evidence_quote,
@@ -1037,7 +1077,11 @@ def _recover_declared_pending_option_semantics(
 
     complete_turn_text = str(user_text or "").strip() or " ".join(
         clause.text for clause in clauses
-    ).strip() or " ".join(row["source_text"] for row in candidates).strip()
+    ).strip() or " ".join(
+        str(unit.get("source_text") or "")
+        for unit in units
+        if isinstance(unit, dict)
+    ).strip()
     adjudication_contract = (
         "Adjudicate the complete user turn against only the finite contract declared by the active "
         "AnyChain pending question. Decide ownership before assigning individual semantic units. "
@@ -1087,26 +1131,99 @@ def _recover_declared_pending_option_semantics(
         "units": candidates,
     }, ensure_ascii=False, sort_keys=True)
     verdicts: list[dict[str, Any]] = []
-    for attempt in range(2):
-        messages = [LLMMessage(role="system", content=adjudication_contract)]
-        if attempt:
-            messages.append(LLMMessage(
-                role="system",
-                content=(
-                    "Independently challenge the first adjudication. Re-evaluate the complete turn once against the "
-                    "typed pending contract, including whether one declared option or one manual value is wrapped "
-                    "in explanation, preservation context, or a request to continue. Do not treat supporting prose "
-                    "as a second mutation, but do not erase a real contradiction or independent request. Return one "
-                    "declared decision and a complete partition of candidate unit ids."
-                ),
+    anchor_option_ids = {row["option_id"] for row in anchors}
+    if anchors and len(anchor_option_ids) == 1 and not manual_anchors:
+        anchor_contract = (
+            "Classify only the explicitly enumerated candidate_units relative to one immutable pending-option "
+            "selection anchor. The anchor is context owned by another validator: do not select it, admit it, "
+            "or repeat any anchor unit identifier. Return JSON only: "
+            "{conflict:boolean,ambiguous:boolean,supporting_unit_ids:[string],"
+            "independent_unit_ids:[string],reason:string}. A supporting unit only explains, motivates, compares, "
+            "or states a future consequence of the anchor without requesting another present mutation, question, "
+            "navigation, or evidence operation. An independent unit makes such a separate request and must remain "
+            "available to its registered owner. conflict=true only when a candidate rejects or contradicts the "
+            "anchor; ambiguous=true only when its relation cannot be determined. Both booleans must be false for "
+            "a usable partition. supporting_unit_ids and independent_unit_ids must "
+            "be disjoint and partition exactly candidate_unit_ids. Output no identifier outside candidate_unit_ids."
+        )
+        anchor_payload = json.dumps({
+            "pending_question": {
+                "id": str(pending.get("id") or ""),
+                "prompt": str(pending.get("prompt") or ""),
+            },
+            "selection_anchor": {
+                "option_id": anchors[0]["option_id"],
+                "source_text": anchors[0]["source_text"],
+                "evidence_quote": anchors[0]["evidence_quote"],
+            },
+            "complete_turn_text": complete_turn_text,
+            "candidate_unit_ids": [row["unit_id"] for row in candidates],
+            "candidate_units": candidates,
+        }, ensure_ascii=False, sort_keys=True)
+        anchor_verdicts: list[dict[str, Any]] = []
+        for attempt in range(2):
+            messages = [LLMMessage(role="system", content=anchor_contract)]
+            if attempt:
+                messages.append(LLMMessage(
+                    role="system",
+                    content=(
+                        "Independently challenge the first classification. Keep the immutable anchor outside the "
+                        "partition and classify every candidate_unit_id exactly once. Preserve every genuine "
+                        "independent request and reject any conflict or ambiguity."
+                    ),
+                ))
+            messages.append(LLMMessage(role="user", content=anchor_payload))
+            response = provider.complete(LLMRequest(
+                messages=messages,
+                temperature=0.0,
+                max_tokens=400,
             ))
-        messages.append(LLMMessage(role="user", content=adjudication_payload))
-        response = provider.complete(LLMRequest(
-            messages=messages,
-            temperature=0.0,
-            max_tokens=500,
-        ))
-        verdicts.append(_parse_json_object(response.text))
+            anchor_verdicts.append(_parse_json_object(response.text))
+        candidate_ids = {row["unit_id"] for row in candidates}
+        for verdict in anchor_verdicts:
+            if verdict.get("conflict") is not False or verdict.get("ambiguous") is not False:
+                return plan_text, False
+            supporting_ids = verdict.get("supporting_unit_ids")
+            independent_ids = verdict.get("independent_unit_ids")
+            if not isinstance(supporting_ids, list) or not isinstance(independent_ids, list):
+                return plan_text, False
+            supporting_set = {str(item) for item in supporting_ids}
+            independent_set = {str(item) for item in independent_ids}
+            if (
+                supporting_set & independent_set
+                or supporting_set | independent_set != candidate_ids
+            ):
+                return plan_text, False
+            verdicts.append({
+                "decision": "select_option",
+                "option_id": anchors[0]["option_id"],
+                "answer": "",
+                "evidence_quote": anchors[0]["evidence_quote"],
+                "supporting_unit_ids": sorted(supporting_set),
+                "independent_unit_ids": sorted(independent_set),
+                "reason": str(verdict.get("reason") or ""),
+            })
+    else:
+        for attempt in range(2):
+            messages = [LLMMessage(role="system", content=adjudication_contract)]
+            if attempt:
+                messages.append(LLMMessage(
+                    role="system",
+                    content=(
+                        "Independently challenge the first adjudication. Re-evaluate the complete turn once against the "
+                        "typed pending contract, including whether one declared option or one manual value is wrapped "
+                        "in explanation, preservation context, or a request to continue. Do not treat supporting prose "
+                        "as a second mutation, but do not erase a real contradiction or independent request. Return one "
+                        "declared decision and a complete partition of candidate unit ids."
+                    ),
+                ))
+            messages.append(LLMMessage(role="user", content=adjudication_payload))
+            response = provider.complete(LLMRequest(
+                messages=messages,
+                temperature=0.0,
+                max_tokens=500,
+            ))
+            verdicts.append(_parse_json_object(response.text))
     if len(verdicts) != 2:
         return plan_text, False
     decisions = [str(item.get("decision") or "") for item in verdicts]
@@ -1242,6 +1359,9 @@ def _recover_declared_pending_option_semantics(
 
     recovered_actions = [dict(item) for item in actions if isinstance(item, dict)]
     replaced_indexes: set[int] = set()
+    # Recovery partitions context but does not admit a planner-proposed
+    # anchor. The dedicated pending-action owner remains the sole authority
+    # that can validate and admit that action later in the pipeline.
     newly_admitted_indexes: set[int] = set()
     support_action_indexes = {
         index
@@ -1337,6 +1457,10 @@ def _recover_declared_pending_option_semantics(
         newly_admitted_indexes.add(action_index)
     payload["actions"] = recovered_actions
     payload["semantic_units"] = units
+    if accepted_context:
+        payload["pending_support_unit_ids"] = sorted(
+            verified_support_unit_ids | set(accepted_context)
+        )
     if newly_admitted_indexes:
         payload["pending_answer_admissions"] = sorted({
             int(index)
