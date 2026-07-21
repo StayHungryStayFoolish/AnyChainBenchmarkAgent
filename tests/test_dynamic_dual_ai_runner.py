@@ -26,6 +26,7 @@ from tests.agent_live.coverage_evidence import (
 from tests.agent_live.dynamic_dual_ai_chaos import (
     ChaosRunConfig,
     DynamicDualAiChaosRunner,
+    ContainerPtyBridgeTransport,
     SimulatorContext,
     SimulatorDecision,
     SubprocessPtyTransport,
@@ -33,6 +34,7 @@ from tests.agent_live.dynamic_dual_ai_chaos import (
     _validate_decision,
     _verify_declared_postconditions,
     encode_bracketed_paste,
+    transport_for_config,
 )
 
 
@@ -1329,14 +1331,17 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
         command_text = " ".join(config.command)
         self.assertIn("ANYCHAIN_AGENT_CHECKPOINT_PATH=/workspace/.agent/dynamic-chaos/isolated-session/checkpoints.sqlite", command_text)
         self.assertIn("ANYCHAIN_AGENT_JOBS_DIR=/workspace/.agent/dynamic-chaos/isolated-session/jobs", command_text)
+        self.assertEqual(config.transport_kind, "container_pty_bridge")
+        self.assertIn("tests.agent_live.container_pty_bridge", config.command)
         self.assertEqual(config.command[-6:], (
-            "bench",
+            "--",
             "./bin/anychain-agent",
             "--state-file",
             "/workspace/.agent/dynamic-chaos/isolated-session/terminal-session.json",
             "--language",
             "en",
         ))
+        self.assertIsInstance(transport_for_config(config), ContainerPtyBridgeTransport)
 
     def test_runner_sets_independent_linux_terminal_state(self) -> None:
         root = Path("/tmp/anychain-chaos-contract")
@@ -1382,6 +1387,75 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                     transport.close()
                 self.assertIn(f"Agent> VALUE={message!r}", response)
                 self.assertEqual(response.count("Agent> VALUE="), 1)
+
+    def test_container_bridge_owns_one_pty_for_multiline_unicode(self) -> None:
+        program = (
+            "from agent.terminal.io import TerminalIO; "
+            "print('Agent> ready', flush=True); "
+            "value=TerminalIO().input('en'); "
+            "print('Agent> VALUE='+repr(value), flush=True); "
+            "print('User> ', end='', flush=True)"
+        )
+        message = "first line\n第二行\nthird line"
+        command = (
+            sys.executable,
+            "-m",
+            "tests.agent_live.container_pty_bridge",
+            "--cwd",
+            str(Path.cwd()),
+            "--",
+            sys.executable,
+            "-c",
+            program,
+        )
+        transport = ContainerPtyBridgeTransport(command, cwd=Path.cwd())
+        transport.start(env=dict(os.environ))
+        process = transport._process
+        try:
+            transport.read_complete_agent_response(timeout_seconds=5)
+            transport.submit_bracketed_paste(message)
+            response = transport.read_complete_agent_response(timeout_seconds=5)
+        finally:
+            transport.close()
+
+        self.assertIn(f"Agent> VALUE={message!r}", response)
+        self.assertEqual(response.count("Agent> VALUE="), 1)
+        self.assertIsNotNone(process)
+        self.assertIsNotNone(process.poll())
+
+    def test_container_bridge_forwards_ctrl_c_and_reaps_product_cli(self) -> None:
+        program = (
+            "from agent.terminal.io import TerminalIO; "
+            "print('Agent> ready', flush=True); "
+            "io=TerminalIO(); "
+            "\ntry: io.input('en')\n"
+            "except KeyboardInterrupt: print('Agent> cancelled', flush=True)\n"
+            "print('User> ', end='', flush=True)"
+        )
+        command = (
+            sys.executable,
+            "-m",
+            "tests.agent_live.container_pty_bridge",
+            "--cwd",
+            str(Path.cwd()),
+            "--",
+            sys.executable,
+            "-c",
+            program,
+        )
+        transport = ContainerPtyBridgeTransport(command, cwd=Path.cwd())
+        transport.start(env=dict(os.environ))
+        process = transport._process
+        try:
+            transport.read_complete_agent_response(timeout_seconds=5)
+            transport.send_interrupt()
+            response = transport.read_complete_agent_response(timeout_seconds=5)
+        finally:
+            transport.close()
+
+        self.assertIn("Agent> cancelled", response)
+        self.assertIsNotNone(process)
+        self.assertIsNotNone(process.poll())
 
 
 if __name__ == "__main__":

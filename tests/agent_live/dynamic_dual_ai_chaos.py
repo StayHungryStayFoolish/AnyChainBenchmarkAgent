@@ -94,6 +94,7 @@ class ChaosRunConfig:
     runtime_root: Path | None = None
     runtime_root_in_process: Path | None = None
     extra_env: Mapping[str, str] = field(default_factory=dict)
+    transport_kind: str = "direct_pty"
 
     @classmethod
     def docker(
@@ -118,11 +119,17 @@ class ChaosRunConfig:
             "ANYCHAIN_AGENT_JOBS_DIR": str(container_runtime / "jobs"),
             "ANYCHAIN_AGENT_TURN_EVENT_FILE": str(container_runtime / "turn-events.jsonl"),
         }
-        command: list[str] = ["docker", "compose", "exec"]
+        command: list[str] = ["docker", "compose", "exec", "-T"]
         for name, value in container_env.items():
             command.extend(("-e", f"{name}={value}"))
         command.extend((
             service,
+            "/workspace/.venv-adk/bin/python",
+            "-m",
+            "tests.agent_live.container_pty_bridge",
+            "--cwd",
+            "/workspace",
+            "--",
             "./bin/anychain-agent",
             "--state-file",
             str(container_runtime / "terminal-session.json"),
@@ -135,6 +142,7 @@ class ChaosRunConfig:
             session_id=session_id,
             runtime_root=host_runtime,
             runtime_root_in_process=container_runtime,
+            transport_kind="container_pty_bridge",
             **changes,
         )
 
@@ -189,6 +197,8 @@ class PtyTransport(Protocol):
     def read_complete_agent_response(self, *, timeout_seconds: float) -> str: ...
 
     def submit_bracketed_paste(self, message: str) -> None: ...
+
+    def send_interrupt(self) -> None: ...
 
     def close(self) -> None: ...
 
@@ -281,6 +291,11 @@ class SubprocessPtyTransport:
         time.sleep(self.poll_interval_seconds)
         os.write(self._master_fd, b"\r")
 
+    def send_interrupt(self) -> None:
+        if self._master_fd is None:
+            raise RuntimeError("PTY transport is not running")
+        os.write(self._master_fd, b"\x03")
+
     def close(self) -> None:
         process = self._process
         master_fd = self._master_fd
@@ -312,6 +327,155 @@ class SubprocessPtyTransport:
             if not chunk:
                 return bytes(result)
             result.extend(chunk)
+
+
+class ContainerPtyBridgeTransport:
+    """Control one container-local product PTY over a pipe-framed RPC bridge."""
+
+    def __init__(
+        self,
+        command: Sequence[str],
+        *,
+        cwd: str | Path,
+        poll_interval_seconds: float = 0.05,
+    ) -> None:
+        self.command = tuple(command)
+        self.cwd = Path(cwd)
+        self.poll_interval_seconds = poll_interval_seconds
+        self._process: subprocess.Popen[bytes] | None = None
+
+    def start(self, *, env: Mapping[str, str]) -> None:
+        if self._process is not None:
+            raise RuntimeError("container PTY bridge transport has already started")
+        self._process = subprocess.Popen(
+            self.command,
+            cwd=self.cwd,
+            env=dict(env),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+            close_fds=True,
+        )
+
+    def read_complete_agent_response(self, *, timeout_seconds: float) -> str:
+        result = self._request(
+            {"op": "read", "timeout_seconds": timeout_seconds},
+            timeout_seconds=timeout_seconds + 5.0,
+        )
+        response = str(result.get("response") or "")
+        if not response:
+            raise RuntimeError("container PTY bridge returned an empty Agent response")
+        return response
+
+    def submit_bracketed_paste(self, message: str) -> None:
+        self._request(
+            {"op": "submit", "message": message},
+            timeout_seconds=max(5.0, self.poll_interval_seconds * 20),
+        )
+
+    def send_interrupt(self) -> None:
+        self._request({"op": "interrupt"}, timeout_seconds=5.0)
+
+    def close(self) -> None:
+        process = self._process
+        self._process = None
+        if process is None:
+            return
+        if process.poll() is None:
+            try:
+                self._request_with_process(process, {"op": "close"}, timeout_seconds=5.0)
+                process.wait(timeout=5.0)
+            except (OSError, RuntimeError, subprocess.TimeoutExpired):
+                self._terminate_process_group(process)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+
+    def _request(self, payload: Mapping[str, Any], *, timeout_seconds: float) -> dict[str, Any]:
+        if self._process is None:
+            raise RuntimeError("container PTY bridge transport is not running")
+        return self._request_with_process(self._process, payload, timeout_seconds=timeout_seconds)
+
+    def _request_with_process(
+        self,
+        process: subprocess.Popen[bytes],
+        payload: Mapping[str, Any],
+        *,
+        timeout_seconds: float,
+    ) -> dict[str, Any]:
+        if process.stdin is None or process.stdout is None:
+            raise RuntimeError("container PTY bridge pipes are unavailable")
+        if process.poll() is not None:
+            raise RuntimeError(self._exit_message(process))
+        process.stdin.write(json.dumps(dict(payload), ensure_ascii=False).encode("utf-8") + b"\n")
+        process.stdin.flush()
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError(self._exit_message(process))
+            ready, _, _ = select.select(
+                [process.stdout],
+                [],
+                [],
+                min(self.poll_interval_seconds, max(0.0, deadline - time.monotonic())),
+            )
+            if not ready:
+                continue
+            line = process.stdout.readline()
+            if not line:
+                continue
+            response = json.loads(line.decode("utf-8"))
+            if not response.get("ok"):
+                raise RuntimeError(
+                    "container PTY bridge operation failed: "
+                    f"{response.get('error_type')}: {response.get('error')}"
+                )
+            return dict(response)
+        raise TimeoutError(
+            f"timed out after {timeout_seconds:.1f}s waiting for the container PTY bridge"
+        )
+
+    @staticmethod
+    def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=3.0)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=3.0)
+
+    @staticmethod
+    def _exit_message(process: subprocess.Popen[bytes]) -> str:
+        stderr = b""
+        if process.stderr is not None:
+            try:
+                stderr = process.stderr.read() or b""
+            except OSError:
+                stderr = b""
+        return (
+            f"container PTY bridge exited unexpectedly (exit={process.returncode}): "
+            f"{stderr.decode('utf-8', errors='replace')[-2000:]}"
+        )
+
+
+def transport_for_config(config: ChaosRunConfig) -> PtyTransport:
+    if config.transport_kind == "container_pty_bridge":
+        return ContainerPtyBridgeTransport(
+            config.command,
+            cwd=config.repo_root,
+            poll_interval_seconds=config.poll_interval_seconds,
+        )
+    if config.transport_kind != "direct_pty":
+        raise ValueError(f"unsupported PTY transport kind: {config.transport_kind!r}")
+    return SubprocessPtyTransport(
+        config.command,
+        cwd=config.repo_root,
+        poll_interval_seconds=config.poll_interval_seconds,
+    )
 
 
 class JsonlRuntimeEventStream:
@@ -375,11 +539,7 @@ class DynamicDualAiChaosRunner:
     ) -> None:
         self.config = config
         self.simulator = simulator
-        self.transport = transport or SubprocessPtyTransport(
-            config.command,
-            cwd=config.repo_root,
-            poll_interval_seconds=config.poll_interval_seconds,
-        )
+        self.transport = transport or transport_for_config(config)
         self.ledger = dict(ledger)
         self.schedule = schedule
         self.revision = dict(revision or repository_revision(config.repo_root))
