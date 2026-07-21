@@ -4798,6 +4798,46 @@ network:
                     "inferred_config_review",
                 )
 
+    def test_typed_evidence_owner_does_not_swallow_mixed_independent_demand(self) -> None:
+        from agent.harness.domains.chain_rpc import question_for_chain_rpc
+        from agent.harness.state import new_state
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+
+        state = new_state("mixed-evidence-owner", language="en")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "active_group": "endpoint_process",
+            "chain_identity": {
+                "raw": "flow-evm",
+                "canonical": "flow-evm",
+                "adapter_family": "jsonrpc",
+                "status": "existing_family_needs_schema_evidence",
+                "case": "case2",
+                "candidate_method": "eth_blockNumber",
+            },
+        })
+        state["pending_question"] = question_for_chain_rpc(state, "endpoint_process") or {}
+        state["last_user_input"] = (
+            "Also change the QPS profile.\n"
+            '{"method":"eth_blockNumber","params":[]}'
+        )
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            return_value={"actions": [{
+                "type": "clarify_unresolved",
+                "clauses": [state["last_user_input"]],
+            }]},
+        ) as resolver, patch(
+            "agent.harness.domains.rpc_endpoint.extract_rpc_schema_from_evidence",
+        ) as extractor:
+            result = process_turn(state)
+
+        resolver.assert_called_once()
+        extractor.assert_not_called()
+        self.assertEqual(result["chain_identity"]["status"], "existing_family_needs_schema_evidence")
+        self.assertEqual(result["pending_question"]["id"], "new_chain_schema_evidence")
+
     def test_numbered_answer_to_confirm_or_value_question_applies(self) -> None:
         """A numbered answer ("1"/"2") to a confirm_or_value question that renders
 
@@ -7699,6 +7739,7 @@ response:
         self.assertIn("Y/N", result["visible_response"][0])
 
     def test_new_chain_existing_family_extracts_schema_evidence_before_runtime_choice(self) -> None:
+        from agent.harness.domains.chain_rpc import question_for_chain_rpc
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
         from agent.harness.state import new_state
 
@@ -7714,14 +7755,9 @@ response:
             "candidate_method": "eth_blockNumber",
         }
         state["endpoint_evidence"] = {"candidate_endpoint": "https://example.invalid/rpc"}
-        state["pending_question"] = {
-            "id": "new_chain_schema_evidence",
-            "group": "endpoint_process",
-            "kind": "evidence",
-            "field": "new_chain_schema_evidence",
-            "manual_input_allowed": True,
-            "created_turn_index": 0,
-        }
+        state["pending_question"] = question_for_chain_rpc(state, "endpoint_process") or {}
+        self.assertEqual(state["pending_question"]["id"], "new_chain_schema_evidence")
+        self.assertIs(state["pending_question"]["structured_input_owner"], True)
         draft = {
             "status": "draft",
             "method": "eth_blockNumber",
@@ -12723,6 +12759,7 @@ response:
                         "target_mode": "",
                         "consultation_topic": "",
                         "registered_action_type": "discard_next_workflow_goal",
+                        "support_relation": "non_mutation_scope" if is_support else "",
                         "scope_constraint": "",
                         "evidence_quote": unit["source_text"],
                         "reason": "scope support" if is_support else "explicit saved-goal operation",
@@ -12821,6 +12858,11 @@ response:
                             if disposition in {"registered_action", "registered_action_support"}
                             else ""
                         ),
+                        "support_relation": (
+                            "non_mutation_scope"
+                            if disposition == "registered_action_support"
+                            else ""
+                        ),
                         "scope_constraint": (
                             "no_configuration_mutation"
                             if disposition == "registered_action_support"
@@ -12868,6 +12910,355 @@ response:
                 )
                 self.assertTrue(validate_plan_coverage(payload, clauses).valid)
 
+    def test_back_recovery_runs_through_fulfilment_and_coordinator_execution(self) -> None:
+        import json
+        from types import SimpleNamespace
+
+        from agent.harness.coordinator import _process_action_queue
+        from agent.harness.intent import (
+            _recover_registry_bounded_semantic_actions,
+            _validate_semantic_fulfillment,
+        )
+        from agent.harness.plan_coverage import PlanCoverageResult, TurnClause
+        from agent.harness.state import new_state
+
+        explanatory = "I changed my mind."
+        operation = "Please take me back to the previous workflow step."
+        user_text = f"{explanatory} {operation}"
+        clauses = (
+            TurnClause("clause-1", explanatory),
+            TurnClause("clause-2", operation),
+        )
+        unresolved = json.dumps({
+            "actions": [],
+            "semantic_units": [
+                {
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "source_text": explanatory,
+                    "disposition": "unresolved",
+                    "action_indexes": [],
+                    "reason": "unresolved explanatory context",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "clause_id": "clause-2",
+                    "source_text": operation,
+                    "disposition": "unresolved",
+                    "action_indexes": [],
+                    "reason": "unresolved navigation request",
+                },
+            ],
+        })
+        replies = iter((
+            {"decisions": [
+                {
+                    "unit_id": "unit-1",
+                    "disposition": "registered_action_support",
+                    "group": "",
+                    "existing_action_index": None,
+                    "target_mode": "",
+                    "consultation_topic": "",
+                    "registered_action_type": "go_back",
+                    "support_relation": "explanatory_context",
+                    "scope_constraint": "",
+                    "evidence_quote": explanatory,
+                    "reason": "explanatory support",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "disposition": "registered_action",
+                    "group": "",
+                    "existing_action_index": None,
+                    "target_mode": "",
+                    "consultation_topic": "",
+                    "registered_action_type": "go_back",
+                    "support_relation": "",
+                    "scope_constraint": "",
+                    "evidence_quote": operation,
+                    "reason": "direct backward navigation",
+                },
+            ]},
+            {"reviews": [{
+                "action_index": 0,
+                "supported": True,
+                "source_unit_reviews": [
+                    {
+                        "source_text": explanatory,
+                        "role": "support",
+                        "support_relation": "explanatory_context",
+                    },
+                    {
+                        "source_text": operation,
+                        "role": "direct",
+                        "support_relation": "",
+                    },
+                ],
+                "reason": "one direct request with declared explanatory support",
+            }]},
+            {"unit_reviews": [
+                {
+                    "unit_id": "unit-1",
+                    "complete": True,
+                    "missing_demand_quote": "",
+                    "reason": "declared support is represented",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "complete": True,
+                    "missing_demand_quote": "",
+                    "reason": "direct request is represented",
+                },
+            ]},
+        ))
+        provider = SimpleNamespace(
+            complete=lambda _request: SimpleNamespace(text=json.dumps(next(replies)))
+        )
+        state = new_state("back-complete-pipeline", language="en")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "active_group": "qps_profile",
+            "group_history": ["workload_rpc"],
+            "chain_identity": {
+                "canonical": "bsc",
+                "status": "confirmed",
+                "adapter_family": "jsonrpc",
+            },
+            "confirmed_config": {"BLOCKCHAIN_NODE": "bsc"},
+            "rpc_mode": "single",
+        })
+        validation = PlanCoverageResult(
+            valid=False,
+            errors=("unresolved semantic units",),
+            unresolved_clauses=(explanatory, operation),
+            incomplete_unit_ids=("unit-1", "unit-2"),
+        )
+
+        recovered, changed = _recover_registry_bounded_semantic_actions(
+            provider,
+            unresolved,
+            clauses,
+            state,
+            user_text,
+            validation,
+        )
+        self.assertTrue(changed)
+        fulfilment = _validate_semantic_fulfillment(
+            provider,
+            recovered,
+            clauses,
+            state,
+        )
+        self.assertTrue(fulfilment.valid, fulfilment.errors)
+        actions = json.loads(recovered)["actions"]
+        result = _process_action_queue(state, actions, user_text)
+
+        self.assertEqual([action["type"] for action in actions], ["go_back"])
+        self.assertEqual(result["active_group"], "workload_rpc")
+        self.assertEqual(result["group_history"], [])
+
+    def test_product_graph_executes_registry_recovered_back_navigation(self) -> None:
+        import json
+        from types import SimpleNamespace
+
+        from agent.harness.state import new_state
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+
+        explanatory = "I changed my mind."
+        operation = "Please take me back to the previous workflow step."
+        unresolved = {
+            "actions": [],
+            "semantic_units": [
+                {
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "source_text": explanatory,
+                    "disposition": "unresolved",
+                    "action_indexes": [],
+                    "reason": "unresolved explanatory context",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "clause_id": "clause-2",
+                    "source_text": operation,
+                    "disposition": "unresolved",
+                    "action_indexes": [],
+                    "reason": "unresolved navigation request",
+                },
+            ],
+        }
+
+        class Provider:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def complete(self, request: object) -> object:
+                system = str(request.messages[0].content)
+                self.calls.append(system)
+                if "typed intent planner" in system:
+                    payload = unresolved
+                elif "Partition unresolved AnyChain prose" in system:
+                    payload = {"partitions": [
+                        {
+                            "unit_id": "unit-1",
+                            "source_units": [explanatory],
+                            "reason": "one explanatory unit",
+                        },
+                        {
+                            "unit_id": "unit-2",
+                            "source_units": [operation],
+                            "reason": "one navigation unit",
+                        },
+                    ]}
+                elif "Adjudicate only structurally unrepresented" in system:
+                    payload = {"decisions": [
+                        {
+                            "unit_id": "unit-1",
+                            "disposition": "registered_action_support",
+                            "group": "",
+                            "existing_action_index": None,
+                            "target_mode": "",
+                            "consultation_topic": "",
+                            "registered_action_type": "go_back",
+                            "support_relation": "explanatory_context",
+                            "scope_constraint": "",
+                            "evidence_quote": explanatory,
+                            "reason": "explanatory support",
+                        },
+                        {
+                            "unit_id": "unit-2",
+                            "disposition": "registered_action",
+                            "group": "",
+                            "existing_action_index": None,
+                            "target_mode": "",
+                            "consultation_topic": "",
+                            "registered_action_type": "go_back",
+                            "support_relation": "",
+                            "scope_constraint": "",
+                            "evidence_quote": operation,
+                            "reason": "direct backward navigation",
+                        },
+                    ]}
+                elif "Adjudicate AnyChain workflow-group navigation" in system:
+                    payload = {"reviews": [{
+                        "action_index": 0,
+                        "destination_named": False,
+                        "destination_quote": "",
+                        "backward_navigation": True,
+                        "backward_quote": operation,
+                        "generic_resume": False,
+                        "resume_quote": "",
+                        "specific_change_requested": False,
+                        "specific_change_quote": "",
+                        "reason": "explicit previous-step navigation",
+                    }]}
+                elif "Audit only the supplied action-purpose rows" in system:
+                    payload = {"reviews": [{
+                        "action_index": 0,
+                        "supported": True,
+                        "source_unit_reviews": [
+                            {
+                                "source_text": explanatory,
+                                "role": "support",
+                                "support_relation": "explanatory_context",
+                            },
+                            {
+                                "source_text": operation,
+                                "role": "direct",
+                                "support_relation": "",
+                            },
+                        ],
+                        "reason": "registered support contract is satisfied",
+                    }]}
+                elif "Audit only the supplied compound-unit rows" in system:
+                    payload = {"unit_reviews": [
+                        {
+                            "unit_id": "unit-1",
+                            "complete": True,
+                            "missing_demand_quote": "",
+                            "reason": "declared support is represented",
+                        },
+                        {
+                            "unit_id": "unit-2",
+                            "complete": True,
+                            "missing_demand_quote": "",
+                            "reason": "direct request is represented",
+                        },
+                    ]}
+                elif "Audit each AnyChain source unit against its represented" in system:
+                    payload = {"findings": [
+                        {
+                            "unit_id": "unit-1",
+                            "status": "complete",
+                            "missing_demands": [],
+                            "reason": "declared support is represented",
+                        },
+                        {
+                            "unit_id": "unit-2",
+                            "status": "complete",
+                            "missing_demands": [],
+                            "reason": "backward navigation is represented",
+                        },
+                    ]}
+                else:
+                    raise AssertionError(f"unexpected model contract: {system[:120]}")
+                return SimpleNamespace(text=json.dumps(payload))
+
+        provider = Provider()
+        state = new_state("back-product-graph", language="en")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "active_group": "qps_profile",
+            "group_history": ["workload_rpc"],
+            "chain_identity": {
+                "canonical": "bsc",
+                "status": "confirmed",
+                "adapter_family": "jsonrpc",
+            },
+            "confirmed_config": {"BLOCKCHAIN_NODE": "bsc"},
+            "rpc_mode": "single",
+            "last_user_input": f"{explanatory} {operation}",
+        })
+
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = process_turn(state)
+
+        self.assertEqual(
+            result["active_group"],
+            "workload_rpc",
+            {
+                "visible_response": result.get("visible_response"),
+                "failure_recovery": result.get("failure_recovery"),
+                "provider_call_count": len(provider.calls),
+            },
+        )
+        self.assertEqual(result["group_history"], [])
+        self.assertEqual([item["type"] for item in result["completed_actions"]], ["go_back"])
+        self.assertTrue(any("structurally unrepresented" in call for call in provider.calls))
+
+    def test_multi_source_action_review_rejects_undeclared_support_relation(self) -> None:
+        from agent.harness.intent import _valid_action_source_review
+
+        requested = {
+            "source_units": ["go back", "without changing values"],
+            "allowed_support_relations": ["explanatory_context"],
+        }
+        row = {
+            "supported": True,
+            "source_unit_reviews": [
+                {"source_text": "go back", "role": "direct", "support_relation": ""},
+                {
+                    "source_text": "without changing values",
+                    "role": "support",
+                    "support_relation": "non_mutation_scope",
+                },
+            ],
+        }
+
+        self.assertFalse(_valid_action_source_review(row, requested))
+
     def test_repeated_back_navigation_uses_history_then_reports_no_destination(self) -> None:
         from agent.harness.coordinator import _process_action_queue
         from agent.harness.state import new_state
@@ -12901,6 +13292,127 @@ response:
             "There is no previous configuration group",
             "\n".join(second.get("visible_response") or []),
         )
+
+    def test_context_audit_uses_registry_declared_back_support_relation(self) -> None:
+        import json
+        from types import SimpleNamespace
+
+        from agent.harness.intent import _validate_semantic_fulfillment
+        from agent.harness.plan_coverage import TurnClause
+        from agent.harness.state import new_state
+
+        clauses = (
+            TurnClause("clause-1", "I changed my mind."),
+            TurnClause("clause-2", "Please take me back to the previous workflow step."),
+        )
+        plan = json.dumps({
+            "actions": [{
+                "type": "go_back",
+                "source_evidence": (
+                    "I changed my mind. Please take me back to the previous workflow step."
+                ),
+            }],
+            "semantic_units": [
+                {
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "source_text": clauses[0].text,
+                    "disposition": "context",
+                    "action_indexes": [],
+                    "reason": "explanatory context for the represented back request",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "clause_id": "clause-2",
+                    "source_text": clauses[1].text,
+                    "disposition": "action",
+                    "action_indexes": [0],
+                    "reason": "explicit back request",
+                },
+            ],
+        })
+        replies = iter((
+            {"reviews": [{"action_index": 0, "supported": True, "reason": "direct back request"}]},
+            {"unit_reviews": [{"unit_id": "unit-2", "complete": True, "missing_demand_quote": "", "reason": "complete"}]},
+            {"context_reviews": [{"unit_id": "unit-1", "context_only": False, "reason": "first reviewer was too narrow"}]},
+            {"context_reviews": [{
+                "unit_id": "unit-1",
+                "context_only": True,
+                "support_relation": "explanatory_context",
+                "operation_index": 0,
+                "reason": "explains the represented back request",
+            }]},
+        ))
+        provider = SimpleNamespace(
+            complete=lambda _request: SimpleNamespace(text=json.dumps(next(replies)))
+        )
+        state = new_state("back-context-support", language="en")
+        state["active_group"] = "qps_profile"
+        state["group_history"] = ["workload_rpc"]
+
+        result = _validate_semantic_fulfillment(provider, plan, clauses, state)
+
+        self.assertTrue(result.valid, result.errors)
+
+    def test_context_audit_rejects_independent_mutation_next_to_back(self) -> None:
+        import json
+        from types import SimpleNamespace
+
+        from agent.harness.intent import _validate_semantic_fulfillment
+        from agent.harness.plan_coverage import TurnClause
+        from agent.harness.state import new_state
+
+        clauses = (
+            TurnClause("clause-1", "Set quick QPS too."),
+            TurnClause("clause-2", "Please take me back to the previous workflow step."),
+        )
+        plan = json.dumps({
+            "actions": [{
+                "type": "go_back",
+                "source_evidence": (
+                    "Set quick QPS too. Please take me back to the previous workflow step."
+                ),
+            }],
+            "semantic_units": [
+                {
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "source_text": clauses[0].text,
+                    "disposition": "context",
+                    "action_indexes": [],
+                    "reason": "planner proposed context",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "clause_id": "clause-2",
+                    "source_text": clauses[1].text,
+                    "disposition": "action",
+                    "action_indexes": [0],
+                    "reason": "explicit back request",
+                },
+            ],
+        })
+        replies = iter((
+            {"reviews": [{"action_index": 0, "supported": True, "reason": "direct back request"}]},
+            {"unit_reviews": [{"unit_id": "unit-2", "complete": True, "missing_demand_quote": "", "reason": "complete"}]},
+            {"context_reviews": [{"unit_id": "unit-1", "context_only": False, "reason": "independent QPS mutation"}]},
+            {"context_reviews": [{
+                "unit_id": "unit-1",
+                "context_only": False,
+                "support_relation": "",
+                "operation_index": None,
+                "reason": "independent QPS mutation",
+            }]},
+        ))
+        provider = SimpleNamespace(
+            complete=lambda _request: SimpleNamespace(text=json.dumps(next(replies)))
+        )
+        state = new_state("back-context-conflict", language="en")
+
+        result = _validate_semantic_fulfillment(provider, plan, clauses, state)
+
+        self.assertFalse(result.valid)
+        self.assertTrue(any("context" in error for error in result.errors))
 
     def test_explicit_group_destination_suppresses_conflicting_back_action(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn

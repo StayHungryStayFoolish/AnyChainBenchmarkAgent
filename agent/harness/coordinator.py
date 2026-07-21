@@ -349,6 +349,7 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
     pending_owns_structured_input = bool(
         pending_fits
         and pending.get("structured_input_owner") is True
+        and input_shape == "structured"
     )
 
     # Structured configuration is review-owned unless the active typed domain

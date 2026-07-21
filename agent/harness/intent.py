@@ -14,6 +14,7 @@ from .action_registry import (
     ACTION_BY_TYPE,
     ACTION_SPECS,
     CONSULTATION_TOPICS,
+    SEMANTIC_SUPPORT_RELATIONS,
     TRUSTED_ACTION_METADATA_FIELDS,
     lifecycle_rejected_action_indexes,
     semantic_scope_schema,
@@ -2490,6 +2491,7 @@ def _validate_semantic_fulfillment(
             "operation_arguments": _semantic_operation_arguments(action),
             "declared_purpose": _semantic_action_purpose(action, spec.purpose, state),
             "source_units": source_units,
+            "allowed_support_relations": list(spec.semantic_support_relations),
         })
     unit_reviews_input: list[dict[str, Any]] = []
     for unit in mutation_units:
@@ -2560,11 +2562,31 @@ def _validate_semantic_fulfillment(
             ],
         }
 
-    result = _request_semantic_fulfillment_review(
-        provider,
-        reviews=reviews_input,
-        unit_reviews=unit_reviews_input,
-        context_reviews=[{
+    context_reviews_input: list[dict[str, Any]] = []
+    for unit in context_units:
+        related_operations = []
+        for index, action in enumerate(actions):
+            if not isinstance(action, dict):
+                continue
+            spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
+            if spec is None or not spec.semantic_support_relations:
+                continue
+            related_operations.append({
+                "operation_index": index,
+                "declared_purpose": _semantic_action_purpose(action, spec.purpose, state),
+                "allowed_support_relations": list(spec.semantic_support_relations),
+                "direct_source_units": [
+                    str(related.get("source_text") or "")
+                    for related in units
+                    if isinstance(related, dict)
+                    and index in (
+                        related.get("action_indexes")
+                        if isinstance(related.get("action_indexes"), list)
+                        else []
+                    )
+                ],
+            })
+        context_reviews_input.append({
             "unit_id": str(unit.get("unit_id") or ""),
             "source_text": str(unit.get("source_text") or ""),
             "input_shape": next(
@@ -2576,7 +2598,14 @@ def _validate_semantic_fulfillment(
                 "",
             ),
             "planner_reason": str(unit.get("reason") or ""),
-        } for unit in context_units],
+            "related_operations": related_operations,
+        })
+
+    result = _request_semantic_fulfillment_review(
+        provider,
+        reviews=reviews_input,
+        unit_reviews=unit_reviews_input,
+        context_reviews=context_reviews_input,
         pending_question=reviewed_pending,
     )
     rows = result.get("reviews") if isinstance(result.get("reviews"), list) else []
@@ -2620,6 +2649,12 @@ def _validate_semantic_fulfillment(
             reason = str(row.get("reason") or "mapped actions omit an explicit request").strip()
             errors.append(f"semantic unit {unit_id} fulfilment failed: {reason}")
     context_rows = result.get("context_reviews") if isinstance(result.get("context_reviews"), list) else []
+    context_rows = _adjudicate_rejected_context_reviews(
+        provider,
+        context_reviews=context_reviews_input,
+        first_rows=context_rows,
+        pending_question=reviewed_pending,
+    )
     context_by_unit_id = {
         str(row.get("unit_id") or ""): row
         for row in context_rows
@@ -2700,6 +2735,123 @@ def _request_semantic_fulfillment_review(
     return result
 
 
+def _adjudicate_rejected_context_reviews(
+    provider: Any,
+    *,
+    context_reviews: list[dict[str, Any]],
+    first_rows: list[Any],
+    pending_question: dict[str, Any],
+) -> list[Any]:
+    """Recheck only negative context verdicts against declared support relations.
+
+    The second reviewer cannot create, replace, or select an operation. It can
+    only recognize that non-action prose supports one operation already
+    represented elsewhere in the same turn under that operation's registry
+    contract.
+    """
+
+    review_by_id = {
+        str(item.get("unit_id") or ""): item
+        for item in context_reviews
+        if str(item.get("unit_id") or "")
+    }
+    first_by_id = {
+        str(item.get("unit_id") or ""): item
+        for item in first_rows
+        if isinstance(item, dict) and str(item.get("unit_id") or "")
+    }
+    negative = [
+        {
+            **review_by_id[unit_id],
+            "first_negative_reason": str(row.get("reason") or ""),
+        }
+        for unit_id, row in first_by_id.items()
+        if row.get("context_only") is False
+        and unit_id in review_by_id
+        and review_by_id[unit_id].get("related_operations")
+    ]
+    if not negative:
+        return first_rows
+    negative_ids = {str(item["unit_id"]) for item in negative}
+
+    response = provider.complete(LLMRequest(
+        messages=[
+            LLMMessage(
+                role="system",
+                content=(
+                    "Adjudicate only negative context verdicts for source units that may support an already "
+                    "represented AnyChain operation. Return JSON only: "
+                    "{context_reviews:[{unit_id:string,context_only:boolean,support_relation:string,"
+                    "operation_index:integer|null,reason:string}]}. Review every supplied row exactly once. "
+                    "context_only is true only when source_text has no independent present demand and expresses "
+                    "exactly one allowed_support_relation for exactly one related_operation whose direct_source_units "
+                    "contain the actual operation request. It may be explanatory context, provenance, format scope, "
+                    "temporal scope, or a non-mutation constraint only when that exact relation is declared. "
+                    "Questions, selections, corrections, contradictions, concrete values, mutations, different "
+                    "destinations, evidence submissions, and execution requests are independent and must remain false. "
+                    "When true, return the exact declared support_relation and operation_index. When false, return an "
+                    "empty support_relation and null operation_index. Never invent, replace, infer, or authorize an "
+                    "operation; workflow state and the first verdict are not user evidence."
+                ),
+            ),
+            LLMMessage(role="user", content=json.dumps({
+                "reviews": negative,
+                "pending_question": pending_question,
+            }, ensure_ascii=False, sort_keys=True)),
+        ],
+        temperature=0.0,
+        max_tokens=450,
+    ))
+    result = _parse_json_object(response.text)
+    rows = result.get("context_reviews") if isinstance(result.get("context_reviews"), list) else []
+    replacements: dict[str, dict[str, Any]] = {}
+    counts: dict[str, int] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        unit_id = str(row.get("unit_id") or "")
+        review = review_by_id.get(unit_id)
+        if review is None or unit_id not in negative_ids:
+            continue
+        context_only = row.get("context_only")
+        relation = str(row.get("support_relation") or "")
+        operation_index = row.get("operation_index")
+        related_by_index = {
+            item.get("operation_index"): item
+            for item in review.get("related_operations") or []
+            if isinstance(item, dict) and isinstance(item.get("operation_index"), int)
+        }
+        valid_true = (
+            context_only is True
+            and isinstance(operation_index, int)
+            and operation_index in related_by_index
+            and relation in SEMANTIC_SUPPORT_RELATIONS
+            and relation in set(
+                related_by_index[operation_index].get("allowed_support_relations") or ()
+            )
+        )
+        valid_false = (
+            context_only is False
+            and operation_index is None
+            and not relation
+        )
+        if not (valid_true or valid_false):
+            continue
+        counts[unit_id] = counts.get(unit_id, 0) + 1
+        replacements[unit_id] = {
+            "unit_id": unit_id,
+            "context_only": bool(context_only),
+            "reason": str(row.get("reason") or ""),
+        }
+    return [
+        replacements.get(str(row.get("unit_id") or ""), row)
+        if isinstance(row, dict)
+        and counts.get(str(row.get("unit_id") or "")) == 1
+        else row
+        for row in first_rows
+    ]
+
+
 def _request_bounded_semantic_rows(
     provider: Any,
     *,
@@ -2750,6 +2902,11 @@ def _request_bounded_semantic_rows(
             row_id = item.get(id_key)
             if row_id not in requested or not isinstance(item.get(verdict_key), bool):
                 continue
+            if is_action_review and not _valid_action_source_review(
+                item,
+                requested[row_id],
+            ):
+                continue
             counts[row_id] = counts.get(row_id, 0) + 1
             candidates[row_id] = item
         for row_id, count in counts.items():
@@ -2757,6 +2914,39 @@ def _request_bounded_semantic_rows(
                 accepted[row_id] = candidates[row_id]
 
     return [accepted[row.get(id_key)] for row in rows if row.get(id_key) in accepted]
+
+
+def _valid_action_source_review(
+    row: dict[str, Any],
+    requested: dict[str, Any],
+) -> bool:
+    """Validate multi-source action support against the registry contract."""
+
+    if row.get("supported") is not True:
+        return True
+    sources = [str(item) for item in requested.get("source_units") or []]
+    if len(sources) <= 1:
+        return True
+    assessments = row.get("source_unit_reviews")
+    if not isinstance(assessments, list) or len(assessments) != len(sources):
+        return False
+    allowed = set(requested.get("allowed_support_relations") or ())
+    reviewed_sources: list[str] = []
+    direct_count = 0
+    for assessment in assessments:
+        if not isinstance(assessment, dict):
+            return False
+        source_text = str(assessment.get("source_text") or "")
+        role = str(assessment.get("role") or "")
+        relation = str(assessment.get("support_relation") or "")
+        reviewed_sources.append(source_text)
+        if role == "direct" and not relation:
+            direct_count += 1
+            continue
+        if role == "support" and relation in allowed:
+            continue
+        return False
+    return direct_count >= 1 and sorted(reviewed_sources) == sorted(sources)
 
 
 def _adjudicate_incomplete_unit_reviews(
@@ -2862,8 +3052,12 @@ def _adjudicate_rejected_action_reviews(
                 role="system",
                 content=(
                     "Adjudicate only the supplied negative action-purpose verdicts. Return JSON only: "
-                    "{reviews:[{action_index:integer,supported:boolean,reason:string}]}. Review every row exactly "
-                    "once. Operations are immutable opaque registered actions. Decide only whether source_units "
+                    "{reviews:[{action_index:integer,supported:boolean,source_unit_reviews:[{source_text:string,"
+                    "role:'direct'|'support',support_relation:string}],reason:string}]}. Review every row exactly "
+                    "once. For several source_units, return every exact source string once; at least one must be "
+                    "direct, while support is valid only with one exact supplied allowed_support_relations value. "
+                    "For one source unit, source_unit_reviews may be empty. Operations are immutable opaque "
+                    "registered actions. Decide only whether source_units "
                     "semantically and explicitly support declared_purpose with the supplied operation_arguments. "
                     "Apply the declared purpose literally, including distinctions it states between navigation, "
                     "consultation, intake, and mutation. Do not infer a stronger operation from a general word when "
@@ -2890,6 +3084,8 @@ def _adjudicate_rejected_action_reviews(
             continue
         index = int(row["action_index"])
         if index not in review_by_index or not isinstance(row.get("supported"), bool):
+            continue
+        if not _valid_action_source_review(row, review_by_index[index]):
             continue
         counts[index] = counts.get(index, 0) + 1
         candidates[index] = row
@@ -5329,6 +5525,7 @@ def _recover_registry_bounded_semantic_actions(
             "purpose": spec.purpose,
             "source_argument": spec.semantic_recovery_source_argument,
             "effect": spec.effect,
+            "support_relations": list(spec.semantic_support_relations),
         }
         for spec in ACTION_SPECS
         if spec.semantic_recovery_source_argument
@@ -5373,7 +5570,7 @@ def _recover_registry_bounded_semantic_actions(
                     "'context'|'not_group_control',group:string,"
                     "existing_action_index:integer|null,"
                     "target_mode:'fake-node'|'real-node'|'sync-observe'|'',"
-                    "consultation_topic:string,registered_action_type:string,scope_constraint:string,evidence_quote:string,"
+                    "consultation_topic:string,registered_action_type:string,support_relation:string,scope_constraint:string,evidence_quote:string,"
                     "reason:string}]}. Review every supplied unit. Return one decision for a unit with one semantic "
                     "demand. When one unsplit unit contains multiple independent present demands, return one decision "
                     "per demand with the same unit_id and a distinct shortest exact evidence_quote; this is required "
@@ -5399,9 +5596,10 @@ def _recover_registry_bounded_semantic_actions(
                     "Use registered_action only when source_text directly fulfils exactly one listed "
                     "recoverable_registered_action purpose; set registered_action_type to that exact registered type. "
                     "Use registered_action_support only when source_text is not an independent demand and instead "
-                    "states a scope, non-mutation, timing, or explanatory constraint on exactly one registered_action "
-                    "created from another source unit in this turn; set registered_action_type to that same registered "
-                    "type. This shares one action and never creates a second operation. Do not use it when the text "
+                    "states exactly one support_relation declared by the matching recoverable_registered_action for "
+                    "exactly one registered_action created from another source unit in this turn; set "
+                    "registered_action_type to that same registered type and support_relation to the exact declared "
+                    "value. This shares one action and never creates a second operation. Do not use it when the text "
                     "requests another mutation, destination, queue operation, or execution. "
                     "The complete user turn will be supplied only through its declared source_argument. Do not select "
                     "an unlisted configuration, navigation, or execution action. Use not_group_control for ambiguity or unrelated "
@@ -5413,7 +5611,8 @@ def _recover_registry_bounded_semantic_actions(
                     "exact registered name for navigation/owner_mutation and empty otherwise. consultation_topic must be "
                     "an exact allowed topic for consultation and empty otherwise. target_mode must be empty unless "
                     "disposition is explicit_target_mode. registered_action_type must be empty unless disposition is "
-                    "registered_action or registered_action_support. existing_action_index must be null unless disposition is "
+                    "registered_action or registered_action_support. support_relation must be empty unless disposition is "
+                    "registered_action_support. existing_action_index must be null unless disposition is "
                     "shared_navigation. evidence_quote must be the shortest "
                     "exact excerpt from source_text that proves the disposition; use an empty quote only for "
                     "not_group_control. Context requires a non-empty exact evidence quote. scope_constraint must be "
@@ -5457,7 +5656,7 @@ def _recover_registry_bounded_semantic_actions(
     }
     replacements: dict[str, list[dict[str, Any]]] = {}
     shared_navigation_indexes: dict[str, int] = {}
-    registered_action_support_types: dict[str, str] = {}
+    registered_action_support_types: dict[str, tuple[str, str]] = {}
     context_unit_ids: set[str] = set()
     recovered_scopes: dict[str, str] = {}
     recovered_navigation_groups = {
@@ -5493,6 +5692,7 @@ def _recover_registry_bounded_semantic_actions(
             topic = str(decision.get("consultation_topic") or "").strip()
             target_mode = str(decision.get("target_mode") or "").strip()
             registered_action_type = str(decision.get("registered_action_type") or "").strip()
+            support_relation = str(decision.get("support_relation") or "").strip()
             scope_constraint = str(decision.get("scope_constraint") or "").strip()
             existing_action_index = decision.get("existing_action_index")
             if not quote or quote not in source:
@@ -5516,8 +5716,15 @@ def _recover_registry_bounded_semantic_actions(
             if (
                 disposition == "registered_action_support"
                 and registered_action_type in recoverable_registered_by_type
+                and support_relation in SEMANTIC_SUPPORT_RELATIONS
+                and support_relation in set(
+                    recoverable_registered_by_type[registered_action_type].get("support_relations") or ()
+                )
             ):
-                registered_action_support_types[unit_id] = registered_action_type
+                registered_action_support_types[unit_id] = (
+                    registered_action_type,
+                    support_relation,
+                )
                 continue
             if disposition == "context":
                 context_unit_ids.add(unit_id)
@@ -5651,8 +5858,9 @@ def _recover_registry_bounded_semantic_actions(
         if not isinstance(unit, dict):
             continue
         unit_id = str(unit.get("unit_id") or "")
-        support_action_type = registered_action_support_types.get(unit_id)
-        if support_action_type:
+        support_contract = registered_action_support_types.get(unit_id)
+        if support_contract:
+            support_action_type, support_relation = support_contract
             support_key = (support_action_type, shared_action_target({"type": support_action_type}))
             support_index = shared_indexes.get(support_key)
             if support_index is None:
@@ -5674,6 +5882,7 @@ def _recover_registry_bounded_semantic_actions(
             unit["action_indexes"] = list(dict.fromkeys([*indexes, support_index]))
             unit["disposition"] = "action"
             unit["reason"] = "registry-bounded registered-action support recovery"
+            unit["support_relation"] = support_relation
             scope_constraint = recovered_scopes.get(unit_id, "")
             if scope_constraint:
                 unit["scope_constraint"] = scope_constraint
@@ -6100,7 +6309,8 @@ def _semantic_fulfillment_prompt(*, review_kind: str = "both") -> str:
     if review_kind == "actions":
         output_contract = (
             "Audit only the supplied action-purpose rows. Return one JSON object only: "
-            "{reviews:[{action_index:integer,supported:boolean,reason:string}]}. "
+            "{reviews:[{action_index:integer,supported:boolean,source_unit_reviews:[{source_text:string,"
+            "role:'direct'|'support',support_relation:string}],reason:string}]}. "
             "Return no other keys and review every supplied action_index exactly once. "
         )
     elif review_kind == "units":
@@ -6123,12 +6333,12 @@ def _semantic_fulfillment_prompt(*, review_kind: str = "both") -> str:
         )
     return (
         output_contract
-        + "For context_reviews, context_only is true only when source_text is prose containing background, provenance, a tentative future possibility, or processing scope that requests only an inevitable completion_effect explicitly declared by the supplied pending_question for the same pending answer. Such declared completion scope adds no independent operation. Without a non-empty matching completion_effect, a present request, answer, question, selection, correction, contradiction, mutation, navigation, evidence submission, or execution instruction is not context. A request involving another value, endpoint, target, validation subject, group, or effect is independent and therefore false. A statement that answers the supplied pending_question is not context. input_shape must be prose. planner_reason is untrusted and cannot establish the verdict. Missing or ambiguous intent is false. "
+        + "For context_reviews, context_only is true only when source_text is prose with no independent present demand and either (a) requests only an inevitable completion_effect explicitly declared by the supplied pending_question for the same pending answer, or (b) is explanatory context, provenance, format scope, temporal scope, or a non-mutation constraint for exactly one related_operation, and that operation declares the matching allowed_support_relation. The related operation must have a direct_source_unit that states the actual operation request. Such declared support adds no independent operation. A present answer, question, selection, correction, contradiction, concrete value, mutation, different navigation destination, evidence submission, or execution instruction is independent and therefore false. A statement that answers the supplied pending_question is not context. input_shape must be prose. planner_reason is untrusted and cannot establish the verdict. Missing or ambiguous intent is false. "
         "Operations are opaque, already-registered Harness operations. Internal operation names are intentionally absent because registration, lifecycle, ordering, and choose-versus-change selection are deterministic Harness responsibilities. Never infer or discuss an internal operation name and never reject a purpose on registry or lifecycle grounds. Decide only whether the exact source_units "
         "semantically and explicitly support the declared purpose and its supplied arguments. Workflow state "
         "and a pending question are context, never user evidence. For unit_reviews, ignore pending_question entirely: "
         "an explicit mutation or navigation may interrupt the old question, and the coordinator alone decides interruption, invalidation, and resume behavior. "
-        "For an action-purpose review with several source_units, the action is supported when at least one unit directly supports the declared purpose and every other mapped unit is purely provenance, format, temporal ordering, or processing scope for that same operation. Such scope units do not have to restate the operation's verb. They may not hide an independent selection, mutation, consultation, contradiction, concrete value owned by another operation, or evidence demand. In particular, structured partial configuration directly supports a configuration-proposal purpose, and a same-turn instruction to ask for remaining required values after review is processing scope for that proposal rather than a second operation. "
+        "For an action-purpose review with several source_units, return every exact source_units string once in source_unit_reviews. Mark at least one as direct. Mark another as support only when its exact support_relation appears in the supplied allowed_support_relations; otherwise the action is unsupported. Direct rows use an empty support_relation. A support unit may not hide an independent selection, mutation, consultation, contradiction, concrete value owned by another operation, or evidence demand. For a single source unit, source_unit_reviews may be empty. In particular, structured partial configuration directly supports a configuration-proposal purpose, and a same-turn instruction to ask for remaining required values after review is processing scope only when that relation is declared by the operation contract. "
         "Pending-question context is present only when a pending-answer purpose itself is being reviewed. A question asking to "
         "summarize, explain, compare, or report retained state is read-only and cannot support "
         "a durable mutation. An evidence-ingestion purpose is supported only when the "

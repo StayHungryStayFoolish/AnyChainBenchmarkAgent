@@ -132,7 +132,9 @@ def contract_variant_payload(question: Mapping[str, Any]) -> dict[str, Any]:
         "kind": str(question.get("kind") or ""),
         "field": str(question.get("field") or ""),
         "manual_input_allowed": bool(question.get("manual_input_allowed")),
+        "structured_input_owner": bool(question.get("structured_input_owner")),
         "accepted_action_types": sorted(str(item) for item in question.get("accepted_action_types") or []),
+        "manual_action": dict(question.get("manual_action") or {}),
         "queue_barrier": bool(question.get("queue_barrier")),
         "validation": dict(question.get("validation") or {}),
         "requires_capabilities": sorted(str(item) for item in question.get("requires_capabilities") or []),
@@ -844,6 +846,7 @@ def build_ledger(
             action_hash = hashlib.sha256(_canonical_json({
                 "action_type": spec.action_type,
                 "owner": spec.owner,
+                "purpose": spec.purpose,
                 "arguments": list(spec.arguments),
                 "execution_phase": spec.execution_phase,
                 "target_group": spec.target_group,
@@ -854,7 +857,31 @@ def build_ledger(
                 "allows_followup_actions": spec.allows_followup_actions,
                 "requires_capabilities": list(spec.requires_capabilities),
                 "provides_capabilities": list(spec.provides_capabilities),
+                "merge_mapping_fields": list(spec.merge_mapping_fields),
+                "merge_sequence_fields": list(spec.merge_sequence_fields),
+                "lifetime": spec.lifetime,
+                "effect": spec.effect,
+                "turn_local_result_roots": list(spec.turn_local_result_roots),
+                "crosses_pending_barrier": spec.crosses_pending_barrier,
+                "requires_specific_change": spec.requires_specific_change,
+                "incomplete_mutation_intake": spec.incomplete_mutation_intake,
+                "required_arguments": list(spec.required_arguments),
+                "constraints": list(spec.constraints),
                 "suppressed_by": list(spec.suppressed_by),
+                "semantic_recovery_source_argument": spec.semantic_recovery_source_argument,
+                "semantic_support_relations": sorted(
+                    spec.semantic_support_relations
+                ),
+                "pending_option_semantic": spec.pending_option_semantic,
+                "option_navigation_groups": list(spec.option_navigation_groups),
+                "pending_option_admission": spec.pending_option_admission,
+                "incompatible_target_modes": list(spec.incompatible_target_modes),
+                "validator": (
+                    f"{getattr(spec.validator, '__module__', '')}:"
+                    f"{getattr(spec.validator, '__qualname__', '')}"
+                    if spec.validator is not None
+                    else ""
+                ),
             }).encode("utf-8")).hexdigest()
             action_contract_hash = action_hash
             action_variant_hash = content_hash({
@@ -882,12 +909,24 @@ def build_ledger(
                 scenario_ids=action_scenario_ids.get(spec.action_type, ()),
                 executable_scenario_ids=action_scenario_ids.get(spec.action_type, ()),
             )
+            edge["semantic_recovery_source_argument"] = (
+                spec.semantic_recovery_source_argument
+            )
+            edge["semantic_support_relations"] = sorted(
+                spec.semantic_support_relations
+            )
             edges.append(edge)
             action_rows.append({
                 "action_type": spec.action_type,
                 "owner": spec.owner,
                 "purpose": spec.purpose,
                 "arguments": list(spec.arguments),
+                "semantic_recovery_source_argument": (
+                    spec.semantic_recovery_source_argument
+                ),
+                "semantic_support_relations": sorted(
+                    spec.semantic_support_relations
+                ),
                 "target_group": expected_group,
                 "precondition_evidence": "",
                 "postcondition_evidence": "",

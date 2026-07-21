@@ -7,6 +7,7 @@ import subprocess
 import sys
 import unittest
 from copy import deepcopy
+from dataclasses import replace
 from unittest.mock import patch
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -313,6 +314,12 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
         localized["options"] = [{**base["options"][0], "label": "是"}]
         self.assertEqual(contract_variant_hash(base), contract_variant_hash(localized))
 
+        structured_owner = {**base, "structured_input_owner": True}
+        self.assertNotEqual(
+            contract_variant_hash(base),
+            contract_variant_hash(structured_owner),
+        )
+
         described = deepcopy(base)
         described["options"][0]["description"] = "Validates with recorded fixtures."
         changed_description = deepcopy(described)
@@ -328,6 +335,79 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
             if edge["group"] == "opening" and edge["question_id"] == "resume_harness_session"
         }
         self.assertGreaterEqual(len(resume_variants), 2)
+
+    def test_action_identity_includes_semantic_support_contract(self) -> None:
+        from agent.harness.action_registry import ACTION_SPECS, ActionSpec
+
+        go_back = next(spec for spec in ACTION_SPECS if spec.action_type == "go_back")
+        self.assertEqual(
+            ActionSpec("future_action", "test", "future action").semantic_support_relations,
+            (),
+        )
+
+        def edge_for(specs: tuple[object, ...]) -> dict[str, object]:
+            with patch("agent.harness.action_registry.ACTION_SPECS", specs):
+                ledger = build_ledger(revision=self.revision)
+            return next(
+                edge
+                for edge in ledger["edges"]
+                if edge["edge_type"] == "action_transition"
+                and edge["action_type"] == "go_back"
+            )
+
+        reordered = replace(
+            go_back,
+            semantic_support_relations=tuple(
+                reversed(go_back.semantic_support_relations)
+            ),
+        )
+        expanded = replace(
+            go_back,
+            semantic_support_relations=tuple(
+                relation
+                for relation in go_back.semantic_support_relations
+                if relation != "non_mutation_scope"
+            ),
+        )
+        reordered_specs = tuple(
+            reordered if spec.action_type == "go_back" else spec
+            for spec in ACTION_SPECS
+        )
+        expanded_specs = tuple(
+            expanded if spec.action_type == "go_back" else spec
+            for spec in ACTION_SPECS
+        )
+        changed_effect = replace(go_back, effect="read_only")
+        changed_effect_specs = tuple(
+            changed_effect if spec.action_type == "go_back" else spec
+            for spec in ACTION_SPECS
+        )
+
+        baseline_edge = next(
+            edge
+            for edge in self.ledger["edges"]
+            if edge["edge_type"] == "action_transition"
+            and edge["action_type"] == "go_back"
+        )
+        reordered_edge = edge_for(reordered_specs)
+        expanded_edge = edge_for(expanded_specs)
+        changed_effect_edge = edge_for(changed_effect_specs)
+
+        self.assertEqual(
+            baseline_edge["semantic_recovery_source_argument"],
+            go_back.semantic_recovery_source_argument,
+        )
+        self.assertEqual(
+            baseline_edge["semantic_support_relations"],
+            sorted(go_back.semantic_support_relations),
+        )
+        for identity_field in ("contract_hash", "contract_variant_hash", "edge_key"):
+            self.assertEqual(baseline_edge[identity_field], reordered_edge[identity_field])
+            self.assertNotEqual(baseline_edge[identity_field], expanded_edge[identity_field])
+            self.assertNotEqual(
+                baseline_edge[identity_field],
+                changed_effect_edge[identity_field],
+            )
 
     def test_resume_variants_use_saved_context_relations_not_literal_groups(self) -> None:
         resume_edges = [

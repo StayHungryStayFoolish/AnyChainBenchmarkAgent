@@ -112,6 +112,7 @@ def _endpoint_validation_question(state: AgentGraphState) -> dict[str, Any] | No
             queue_barrier=True,
             help_text=_schema_evidence_help(language),
             completion_effect=_schema_evidence_completion(language),
+            structured_input_owner=True,
         )
     if custom.get("status") == "schema_needs_confirmation":
         return _catalog_confirmation_question(state, "custom_rpc")
@@ -193,6 +194,7 @@ def _endpoint_validation_question(state: AgentGraphState) -> dict[str, Any] | No
             queue_barrier=True,
             help_text=_schema_evidence_help(language),
             completion_effect=_schema_evidence_completion(language),
+            structured_input_owner=True,
         )
     if identity.get("status") == "existing_family_schema_needs_confirmation":
         return _catalog_confirmation_question(state, "new_chain")
@@ -392,6 +394,7 @@ def _case3_evidence_question(state: AgentGraphState) -> dict[str, Any]:
             "use_complete_turn": True,
         },
         evidence_path="secondary_handoff.evidence",
+        structured_input_owner=True,
     )
 
 
