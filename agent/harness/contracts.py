@@ -160,6 +160,7 @@ class OptionContract:
     action: ActionProposal
     expected_patch: Mapping[str, Any]
     description: str = ""
+    completion_effect: str = ""
     manual_entry: bool = False
     return_policy: ReturnPolicy = "fallback"
     preconditions: Mapping[str, Any] = dataclass_field(default_factory=dict)

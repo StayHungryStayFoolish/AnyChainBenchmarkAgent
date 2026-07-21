@@ -108,6 +108,11 @@ def validate_plan_coverage(
     if not isinstance(raw_units, list):
         raw_units = []
     raw_units, span_errors = _canonicalize_semantic_units(raw_units, expected)
+    pending_support_unit_ids = {
+        str(unit_id)
+        for unit_id in payload.get("pending_support_unit_ids", [])
+        if str(unit_id)
+    }
     units_by_clause: dict[str, list[Mapping[str, Any]]] = {
         clause_id: [] for clause_id in expected
     }
@@ -163,7 +168,10 @@ def validate_plan_coverage(
             unresolved.append(source_text)
             continue
         if disposition == "context":
-            if expected[clause_id].input_shape != "prose":
+            if (
+                expected[clause_id].input_shape != "prose"
+                and unit_id not in pending_support_unit_ids
+            ):
                 errors.append(f"context semantic unit is not prose: {unit_id}")
             if not str(raw.get("reason") or "").strip():
                 errors.append(f"context semantic unit has no reason: {unit_id}")
@@ -232,6 +240,10 @@ def validate_plan_coverage(
         and index not in referenced_actions
     ]
     errors.extend(f"unreferenced action index: {index}" for index in orphaned)
+    errors.extend(
+        f"pending support receipt references an unknown semantic unit: {unit_id}"
+        for unit_id in sorted(pending_support_unit_ids - seen_unit_ids)
+    )
     return PlanCoverageResult(
         valid=not errors and not unresolved,
         errors=tuple(errors),
@@ -274,7 +286,7 @@ def _canonicalize_semantic_units(
             errors.append(f"semantic unit has an empty source anchor in {clause_id}")
             continue
         if clause.input_shape == "structured":
-            if all(anchor == clause.text for anchor in anchors):
+            if len(units) > 1 and all(anchor == clause.text for anchor in anchors):
                 dispositions = {str(unit.get("disposition") or "").strip() for unit in units}
                 scopes = {str(unit.get("scope_constraint") or "").strip() for unit in units}
                 if dispositions != {"action"} or len(scopes) != 1:

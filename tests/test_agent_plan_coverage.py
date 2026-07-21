@@ -9702,6 +9702,8 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
                 "target_mode_explicit": True,
             },
             "expected_patch": {},
+            "question_prompt": "Choose the target mode.",
+            "completion_effect": "",
         })
 
     def test_pending_option_anchor_carries_opening_effect_for_explanatory_rationale(self) -> None:
@@ -10185,6 +10187,241 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         self.assertEqual(recovered["actions"][0]["type"], "choose_target_mode")
         self.assertEqual(recovered["semantic_units"][0]["disposition"], "context")
         self.assertEqual(recovered["semantic_units"][1]["action_indexes"], [0])
+
+    def test_pending_owner_receipt_can_bind_structured_support_context(self) -> None:
+        source = (
+            "deployment_notes:\n"
+            "  node_process: geth\n"
+            "  location: this_machine\n"
+            "Use the already running local real-node process as the sync-observe source."
+        )
+        clauses = segment_user_turn(source)
+        self.assertEqual([clause.input_shape for clause in clauses], ["structured", "prose"])
+        payload = {
+            "actions": [{
+                "type": "answer_pending",
+                "selected_value": "existing_local_node",
+                "source_evidence": clauses[1].text,
+            }],
+            "pending_answer_admissions": [0],
+            "pending_support_unit_ids": ["unit-context"],
+            "semantic_units": [
+                {
+                    **_unit(clauses[0], 1, [], disposition="context", reason="pending support"),
+                    "unit_id": "unit-context",
+                },
+                {
+                    **_unit(clauses[1], 2, [0]),
+                    "unit_id": "unit-choice",
+                },
+            ],
+        }
+
+        admitted = validate_plan_coverage(payload, clauses)
+        unowned = validate_plan_coverage(
+            {key: value for key, value in payload.items() if key != "pending_support_unit_ids"},
+            clauses,
+        )
+
+        self.assertTrue(admitted.valid, admitted.errors)
+        self.assertFalse(unowned.valid)
+        self.assertIn("context semantic unit is not prose", "\n".join(unowned.errors))
+
+    def test_pending_option_scope_owns_restatement_of_visible_execution_contract(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.state import new_state
+
+        prompt = (
+            "Preflight passed, but no isolated real-node smoke has run. "
+            "Revalidate and submit the safe low-traffic smoke now?"
+        )
+        variants = (
+            (
+                "en",
+                "Proceed with the isolated safe low-traffic real-node smoke now; "
+                "revalidate the custom RPC method before submission.",
+            ),
+            (
+                "zh",
+                "现在执行隔离的安全小流量 real-node smoke；"
+                "提交前重新校验已经确认的自定义 RPC method。",
+            ),
+        )
+        for language, source in variants:
+            with self.subTest(language=language):
+                clauses = segment_user_turn(source)
+                payload = {
+                    "actions": [
+                        {
+                            "type": "approve_preflight_smoke",
+                            "source_evidence": clauses[0].text,
+                        },
+                        {
+                            "type": "answer_pending",
+                            "answer": True,
+                            "selected_value": True,
+                            "source_evidence": clauses[0].text,
+                        },
+                        {
+                            "type": "analyze_evidence",
+                            "evidence": clauses[1].text,
+                            "question": clauses[1].text,
+                            "source_evidence": clauses[1].text,
+                        },
+                    ],
+                    "semantic_units": [
+                        _unit(clauses[0], 1, [0, 1]),
+                        _unit(clauses[1], 2, [2]),
+                    ],
+                }
+                state = new_state(f"pending-execution-scope-{language}", language=language)
+                state["pending_question"] = {
+                    "id": "real_node_smoke_confirm",
+                    "group": "job_monitoring",
+                    "kind": "yes_no",
+                    "prompt": prompt,
+                    "options": [{
+                        "id": "1",
+                        "label": "Y",
+                        "value": True,
+                        "action": {"type": "approve_preflight_smoke"},
+                        "expected_patch": {"preflight.approved": True},
+                        "completion_effect": (
+                            "Revalidate the confirmed custom RPC method and submit the isolated smoke."
+                        ),
+                    }],
+                }
+                verdict = SimpleNamespace(text=json.dumps({
+                    "conflict": False,
+                    "ambiguous": False,
+                    "supporting_unit_ids": ["unit-2"],
+                    "independent_unit_ids": [],
+                    "reason": "restates work already declared by the selected option",
+                }))
+                provider = Mock()
+                provider.complete.side_effect = [verdict, verdict]
+
+                recovered_text, changed = _recover_declared_pending_option_semantics(
+                    provider,
+                    json.dumps(payload),
+                    state,
+                    PlanCoverageResult(
+                        valid=False,
+                        errors=("action 1 semantic fulfilment failed",),
+                        unresolved_clauses=(),
+                        rejected_action_indexes=(2,),
+                    ),
+                    clauses,
+                    source,
+                )
+                recovered = json.loads(recovered_text)
+                adjudication_payload = json.loads(
+                    provider.complete.call_args_list[0].args[0].messages[-1].content
+                )
+
+                self.assertTrue(changed)
+                self.assertEqual(
+                    [action["type"] for action in recovered["actions"]],
+                    ["approve_preflight_smoke", "answer_pending"],
+                )
+                self.assertEqual(recovered["semantic_units"][1]["disposition"], "context")
+                self.assertEqual(recovered["pending_support_unit_ids"], ["unit-2"])
+                self.assertEqual(adjudication_payload["selected_option"]["question_prompt"], prompt)
+                self.assertIn(
+                    "Revalidate the confirmed custom RPC method",
+                    adjudication_payload["selected_option"]["completion_effect"],
+                )
+
+    def test_pending_option_scope_does_not_absorb_independent_endpoint_mutation(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.state import new_state
+
+        source = (
+            "Proceed with the isolated safe low-traffic real-node smoke now; "
+            "switch the endpoint to http://other-node:8545 before submission."
+        )
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [
+                {
+                    "type": "approve_preflight_smoke",
+                    "source_evidence": clauses[0].text,
+                },
+                {
+                    "type": "answer_pending",
+                    "answer": True,
+                    "selected_value": True,
+                    "source_evidence": clauses[0].text,
+                },
+                {
+                    "type": "analyze_evidence",
+                    "evidence": clauses[1].text,
+                    "question": clauses[1].text,
+                    "source_evidence": clauses[1].text,
+                },
+            ],
+            "semantic_units": [
+                _unit(clauses[0], 1, [0, 1]),
+                _unit(clauses[1], 2, [2]),
+            ],
+        }
+        state = new_state("pending-execution-independent-endpoint", language="en")
+        state["pending_question"] = {
+            "id": "real_node_smoke_confirm",
+            "group": "job_monitoring",
+            "kind": "yes_no",
+            "prompt": "Revalidate and submit the safe low-traffic smoke now?",
+            "options": [{
+                "id": "1",
+                "label": "Y",
+                "value": True,
+                "action": {"type": "approve_preflight_smoke"},
+                "completion_effect": (
+                    "Revalidate the already confirmed endpoint and custom RPC method, "
+                    "then submit the isolated smoke."
+                ),
+            }],
+        }
+        verdict = SimpleNamespace(text=json.dumps({
+            "conflict": False,
+            "ambiguous": False,
+            "supporting_unit_ids": [],
+            "independent_unit_ids": ["unit-2"],
+            "reason": "changing the endpoint is a separate configuration mutation",
+        }))
+        provider = Mock()
+        provider.complete.side_effect = [verdict, verdict]
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            PlanCoverageResult(
+                valid=False,
+                errors=("action 1 semantic fulfilment failed",),
+                unresolved_clauses=(),
+                rejected_action_indexes=(2,),
+            ),
+            clauses,
+            source,
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertFalse(changed)
+        self.assertEqual(recovered, payload)
+        self.assertNotIn("pending_support_unit_ids", recovered)
+        self.assertEqual(
+            [action["type"] for action in recovered["actions"]],
+            ["approve_preflight_smoke", "answer_pending", "analyze_evidence"],
+        )
 
     def test_declared_pending_contract_binds_context_to_admitted_sibling(self) -> None:
         import json

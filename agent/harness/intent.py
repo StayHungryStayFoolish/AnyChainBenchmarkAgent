@@ -810,6 +810,12 @@ def _recover_declared_pending_option_semantics(
             "value": option.get("value"),
             "declared_action": declared or {"type": "answer_pending"},
             "expected_patch": dict(option.get("expected_patch") or {}),
+            "question_prompt": str(pending.get("prompt") or ""),
+            "completion_effect": str(
+                option.get("completion_effect")
+                or pending.get("completion_effect")
+                or ""
+            ),
         })
     manual_allowed = pending.get("manual_input_allowed") is True
     if not available and not manual_allowed:
@@ -956,25 +962,44 @@ def _recover_declared_pending_option_semantics(
             and index not in invalid_indexes
             and isinstance(actions[index], dict)
         ]
-        if len(indexes) != 1:
+        if not indexes:
             continue
-        action = actions[indexes[0]]
         source = str(unit.get("source_text") or "")
-        evidence_quote = str(action.get("source_evidence") or "").strip()
-        declared_option = _declared_option_for_pending_answer(action, pending)
-        selected = next(
-            (
-                option
-                for option in available
-                if (
-                    declared_option
-                    and option.get("value") == declared_option.get("value")
-                )
-                or _same_declared_pending_effect(action, dict(option["declared_action"]))
-            ),
-            None,
-        )
+        resolved_actions: list[tuple[int, dict[str, Any], dict[str, Any], str]] = []
+        for index in indexes:
+            action = actions[index]
+            evidence_quote = str(action.get("source_evidence") or "").strip()
+            declared_option = _declared_option_for_pending_answer(action, pending)
+            selected = next(
+                (
+                    option
+                    for option in available
+                    if (
+                        declared_option
+                        and option.get("value") == declared_option.get("value")
+                    )
+                    or _same_declared_pending_effect(action, dict(option["declared_action"]))
+                ),
+                None,
+            )
+            if selected is None or not source or not evidence_quote or evidence_quote not in source:
+                resolved_actions = []
+                break
+            resolved_actions.append((index, action, selected, evidence_quote))
+        selected_option_ids = {
+            str(selected["option_id"])
+            for _, _, selected, _ in resolved_actions
+        }
+        evidence_quotes = {
+            evidence_quote
+            for _, _, _, evidence_quote in resolved_actions
+        }
+        selected = resolved_actions[0][2] if resolved_actions else None
         if selected is None:
+            if len(indexes) != 1:
+                continue
+            action = actions[indexes[0]]
+            evidence_quote = str(action.get("source_evidence") or "").strip()
             answer = str(action.get("answer") or "").strip()
             if (
                 manual_allowed
@@ -989,11 +1014,13 @@ def _recover_declared_pending_option_semantics(
                     "evidence_quote": evidence_quote,
                 })
             continue
-        if not source or not evidence_quote or evidence_quote not in source:
+        if len(selected_option_ids) != 1 or len(evidence_quotes) != 1:
             continue
+        evidence_quote = next(iter(evidence_quotes))
         anchors.append({
             "unit_id": unit_id,
-            "action_index": indexes[0],
+            "action_index": resolved_actions[0][0],
+            "equivalent_action_indexes": [row[0] for row in resolved_actions],
             "option_id": str(selected["option_id"]),
             "source_text": source,
             "evidence_quote": evidence_quote,
@@ -1072,8 +1099,10 @@ def _recover_declared_pending_option_semantics(
             "independent_unit_ids:[string],reason:string}. A supporting unit only explains, motivates, compares, "
             "or states a future consequence of the selected_option contract without requesting another present "
             "mutation, question, navigation, or evidence operation. Judge that relationship from the full "
-            "selected_option label, value, declared action, and expected state patch rather than from its identifier "
-            "alone. An independent unit makes a separate present request and must remain "
+            "selected_option label, value, declared action, expected state patch, question prompt, and completion "
+            "effect rather than from its identifier alone. A clause that merely restates work already promised by "
+            "the selected option's visible question is supporting context; a new subject, value, side effect, or "
+            "constraint outside that declared scope is independent. An independent unit makes a separate present request and must remain "
             "available to its registered owner. conflict=true only when a candidate rejects or contradicts the "
             "anchor; ambiguous=true only when its relation cannot be determined. Both booleans must be false for "
             "a usable partition. supporting_unit_ids and independent_unit_ids must "
@@ -1250,6 +1279,7 @@ def _recover_declared_pending_option_semantics(
         if (
             proposed_option is not None
             and isinstance(proposed_option.get("value"), bool)
+            and not anchors
             and not _verify_natural_boolean_pending_entailment(
                 provider,
                 pending=pending,

@@ -114,6 +114,7 @@ def choice_question(
                 action=action,
                 expected_patch=expected,
                 description=str(raw.get("description") or "").strip(),
+                completion_effect=str(raw.get("completion_effect") or "").strip(),
                 manual_entry=raw.get("manual_entry") is True,
                 return_policy=str(raw.get("return_policy") or "fallback"),  # type: ignore[arg-type]
             )
@@ -123,6 +124,11 @@ def choice_question(
                 "id": option_id,
                 "label": str(raw.get("label") or value),
                 "description": str(raw.get("description") or "").strip(),
+                **(
+                    {"completion_effect": str(raw.get("completion_effect") or "").strip()}
+                    if str(raw.get("completion_effect") or "").strip()
+                    else {}
+                ),
                 "manual_entry": raw.get("manual_entry") is True,
                 "value": value,
                 "action": {"type": action.action_type, **dict(action.arguments)},

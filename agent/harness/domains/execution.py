@@ -32,8 +32,28 @@ def question_for_execution(state: AgentGraphState, group: str) -> dict[str, Any]
             field="real_node_smoke_confirmed",
             kind="yes_no",
             options=[
-                {"label": "Y", "value": True, "action": {"type": "approve_preflight_smoke"}, "expected_patch": {"preflight.approved": True}},
-                {"label": "N", "value": False, "action": {"type": "reject_preflight_smoke"}, "expected_patch": {"preflight.approved": False}},
+                {
+                    "label": "Y",
+                    "value": True,
+                    "action": {"type": "approve_preflight_smoke"},
+                    "expected_patch": {"preflight.approved": True},
+                    "completion_effect": localized(
+                        language,
+                        "重新校验已确认的 endpoint、自定义 RPC method/schema 和执行前置条件，然后提交一次隔离的安全小流量 real-node smoke。",
+                        "Revalidate the confirmed endpoint, custom RPC method/schema, and execution prerequisites, then submit one isolated safe low-traffic real-node smoke.",
+                    ),
+                },
+                {
+                    "label": "N",
+                    "value": False,
+                    "action": {"type": "reject_preflight_smoke"},
+                    "expected_patch": {"preflight.approved": False},
+                    "completion_effect": localized(
+                        language,
+                        "不重新校验或提交 real-node smoke，并返回配置流程。",
+                        "Do not revalidate or submit the real-node smoke; return to configuration.",
+                    ),
+                },
             ],
             queue_barrier=True,
         )
