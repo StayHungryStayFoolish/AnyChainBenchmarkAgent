@@ -3659,7 +3659,7 @@ class PlanCoverageTest(unittest.TestCase):
             second["admission_rejections"][1]["admission_action_id"],
         )
 
-    def test_owner_receipt_does_not_skip_compound_unit_inventory(self) -> None:
+    def test_owner_receipt_is_not_reopened_by_compound_unit_inventory(self) -> None:
         import json
         from types import SimpleNamespace
         from unittest.mock import Mock
@@ -3698,8 +3698,8 @@ class PlanCoverageTest(unittest.TestCase):
 
                 self.assertFalse(changed)
                 self.assertEqual(result, payload)
-                self.assertEqual(incomplete, ("unit-compound",))
-                self.assertEqual(provider.complete.call_count, 2)
+                self.assertEqual(incomplete, ())
+                provider.complete.assert_not_called()
 
     def test_generic_group_navigation_becomes_resume_current_flow(self) -> None:
         import json
@@ -4791,7 +4791,7 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertEqual([action["type"] for action in recovered["actions"]], ["set_rpc_mode", "choose_chain"])
         self.assertEqual(recovered["semantic_units"][0]["action_indexes"], [0, 1])
 
-    def test_registry_inventory_audits_complete_units_without_rejudging_pending_action(self) -> None:
+    def test_registry_inventory_excludes_pending_owner_units(self) -> None:
         import json
         from types import SimpleNamespace
         from unittest.mock import Mock
@@ -4818,22 +4818,6 @@ class PlanCoverageTest(unittest.TestCase):
             ],
         }
         provider = Mock()
-        provider.complete.return_value = SimpleNamespace(text=json.dumps({
-            "findings": [
-                {
-                    "unit_id": "unit-1",
-                    "status": "complete",
-                    "missing_demands": [],
-                    "reason": "the admitted mode also preserves the no-traffic constraint",
-                },
-                {
-                    "unit_id": "unit-2",
-                    "status": "complete",
-                    "missing_demands": [],
-                    "reason": "the admitted mode preserves the observation goal",
-                },
-            ],
-        }))
         state = new_state("inventory-pending-owner", language="en")
         state["pending_question"] = {
             "id": "target_mode_select",
@@ -4863,20 +4847,9 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(incomplete, ())
         self.assertEqual(json.loads(result_text), payload)
-        provider.complete.assert_called_once()
-        request = json.loads(provider.complete.call_args.args[0].messages[1].content)
-        represented = request["units"][0]["represented_actions"][0]
-        self.assertEqual(represented["owner_admission"], "pending_option")
-        self.assertEqual(
-            represented["declared_pending_option"]["declared_action"]["type"],
-            "choose_target_mode",
-        )
-        self.assertEqual(
-            represented["declared_pending_option"]["expected_patch"]["workflow_mode"],
-            "sync_observe",
-        )
+        provider.complete.assert_not_called()
 
-    def test_registry_inventory_exposes_failure_recovery_option_effect(self) -> None:
+    def test_registry_inventory_excludes_failure_recovery_owner_unit(self) -> None:
         import json
         from types import SimpleNamespace
         from unittest.mock import Mock
@@ -4904,14 +4877,6 @@ class PlanCoverageTest(unittest.TestCase):
             }],
         }
         provider = Mock()
-        provider.complete.return_value = SimpleNamespace(text=json.dumps({
-            "findings": [{
-                "unit_id": "unit-1",
-                "status": "complete",
-                "missing_demands": [],
-                "reason": "the declared recovery option covers correction and revalidation",
-            }],
-        }))
 
         result_text, changed, incomplete = _challenge_registry_action_inventory(
             provider,
@@ -4922,19 +4887,9 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(incomplete, ())
         self.assertEqual(json.loads(result_text), payload)
-        request = json.loads(provider.complete.call_args.args[0].messages[1].content)
-        represented = request["units"][0]["represented_actions"][0]
-        self.assertEqual(represented["owner_admission"], "pending_option")
-        self.assertEqual(represented["declared_pending_option"], {
-            "declared_action": {"type": "correct_failure"},
-            "expected_patch": {"failure_recovery.status": "correcting"},
-            "label": "修正受影响的配置并重新验证",
-            "question_id": "failure_recovery_action",
-            "question_prompt": "请选择下一步。",
-            "value": "correct",
-        })
+        provider.complete.assert_not_called()
 
-    def test_registry_inventory_recovers_demand_outside_pending_option_effect(self) -> None:
+    def test_registry_inventory_does_not_reinterpret_an_owner_partition(self) -> None:
         import json
         from types import SimpleNamespace
         from unittest.mock import Mock
@@ -4967,38 +4922,6 @@ class PlanCoverageTest(unittest.TestCase):
             }],
         }
         provider = Mock()
-        provider.complete.side_effect = [
-            SimpleNamespace(text=json.dumps({
-                "findings": [{
-                    "unit_id": "unit-1",
-                    "status": "missing",
-                    "missing_demands": [{
-                        "group": "qps_profile",
-                        "evidence_quote": "set the QPS mode to quick",
-                        "reason": "the QPS request is independent of the selected chain option",
-                    }],
-                    "reason": "one independent demand is not represented",
-                }],
-            })),
-            SimpleNamespace(text=json.dumps({
-                "reviews": [{
-                    "demand_id": "unit-1:0",
-                    "direct_unrepresented": True,
-                    "evidence_quote": "set the QPS mode to quick",
-                    "reason": "the source directly requests quick QPS and no action preserves it",
-                }],
-            })),
-            SimpleNamespace(text=json.dumps({
-                "action": {
-                    "type": "set_qps_mode",
-                    "qps_mode": "quick",
-                    "mutation_explicit": True,
-                    "source_evidence": "set the QPS mode to quick",
-                },
-                "reason": "the QPS owner can represent the quoted demand",
-            })),
-        ]
-
         recovered_text, changed, incomplete = _challenge_registry_action_inventory(
             provider,
             json.dumps(payload),
@@ -5006,13 +4929,10 @@ class PlanCoverageTest(unittest.TestCase):
         )
         recovered = json.loads(recovered_text)
 
-        self.assertTrue(changed)
+        self.assertFalse(changed)
         self.assertEqual(incomplete, ())
-        self.assertEqual(
-            [action["type"] for action in recovered["actions"]],
-            ["answer_pending", "set_qps_mode"],
-        )
-        self.assertEqual(recovered["semantic_units"][0]["action_indexes"], [0, 1])
+        self.assertEqual(recovered, payload)
+        provider.complete.assert_not_called()
 
     def test_registry_inventory_still_audits_independent_sibling_of_pending_answer(self) -> None:
         import json
@@ -5068,7 +4988,7 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertEqual(incomplete, ())
         self.assertEqual(json.loads(result_text), payload)
         request = json.loads(provider.complete.call_args.args[0].messages[1].content)
-        self.assertEqual([row["unit_id"] for row in request["units"]], ["unit-1", "unit-2"])
+        self.assertEqual([row["unit_id"] for row in request["units"]], ["unit-2"])
 
     def test_registry_inventory_does_not_duplicate_an_existing_typed_action(self) -> None:
         import json
@@ -5205,7 +5125,7 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertEqual(result_plan, plan)
         self.assertIs(result_validation, validation)
 
-    def test_inventory_wrapper_fails_closed_for_incomplete_owner_admitted_unit(self) -> None:
+    def test_inventory_wrapper_does_not_let_challenger_revoke_owner_receipt(self) -> None:
         import json
         from unittest.mock import Mock, patch
 
@@ -5243,8 +5163,7 @@ class PlanCoverageTest(unittest.TestCase):
             )
 
         self.assertEqual(result_plan, plan)
-        self.assertFalse(result_validation.valid)
-        self.assertEqual(result_validation.incomplete_unit_ids, ("unit-owner",))
+        self.assertIs(result_validation, validation)
 
     def test_inventory_wrapper_never_bypasses_an_initially_invalid_plan(self) -> None:
         from unittest.mock import Mock, patch

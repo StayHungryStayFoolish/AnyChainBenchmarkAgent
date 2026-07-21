@@ -1698,7 +1698,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(_state(), "What can you do?")
 
-        self.assertEqual(provider.complete.call_count, 3)
+        self.assertEqual(provider.complete.call_count, 2)
         self.assertEqual(result["actions"][0]["type"], "answer_opening_question")
 
     def test_free_form_planner_allows_one_schema_repair_then_semantic_admission(self) -> None:
@@ -1728,7 +1728,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(_state(), "What can you do?")
 
-        self.assertEqual(provider.complete.call_count, 5)
+        self.assertEqual(provider.complete.call_count, 4)
         system_prompts = [call.args[0].messages[0].content for call in provider.complete.call_args_list]
         self.assertEqual(
             sum(prompt.startswith("Repair one malformed AnyChain typed action-plan response") for prompt in system_prompts),
@@ -1855,7 +1855,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(_state(), text)
 
-        self.assertEqual(provider.complete.call_count, 8)
+        self.assertEqual(provider.complete.call_count, 7)
         self.assertEqual(result["actions"][0]["type"], "answer_opening_question")
         self.assertEqual(result["actions"][0]["topic"], "current_config")
 
@@ -1898,7 +1898,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, "I only need one RPC method.")
 
-        self.assertEqual(provider.complete.call_count, 3)
+        self.assertEqual(provider.complete.call_count, 2)
         self.assertEqual(result["actions"][0]["type"], "set_rpc_mode")
         self.assertEqual(result["actions"][0]["rpc_mode"], "single")
         self.assertTrue(result["actions"][0]["pending_option_semantic_verified"])
@@ -1942,7 +1942,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, "Use several weighted RPC methods.")
 
-        self.assertEqual(provider.complete.call_count, 3)
+        self.assertEqual(provider.complete.call_count, 2)
         self.assertEqual(result["actions"][0]["type"], "set_rpc_mode")
         self.assertEqual(result["actions"][0]["rpc_mode"], "mixed")
         self.assertTrue(result["actions"][0]["pending_option_semantic_verified"])
