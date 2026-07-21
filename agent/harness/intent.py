@@ -938,7 +938,27 @@ def _recover_declared_pending_option_semantics(
             and bool(ACTION_BY_TYPE[str(actions[index].get("type") or "")].mutation_dimension)
             for index in indexes
         )
-        misowned_action = mapped_mutation and not grounded_action
+        # A source-grounded mutation is not automatically entitled to cross an
+        # active pending contract. Its evidence may merely mention a current
+        # mode/group while supplying the value owned by that contract. Route
+        # every unadmitted durable mutation through the complete-turn owner
+        # arbitration; that boundary can preserve a genuinely independent
+        # jump and discard supporting context without either domain competing
+        # for the same source span.
+        pending_owner_arbitration = (
+            mapped_mutation
+            and not any(
+                isinstance(index, int) and index in preexisting_admitted_indexes
+                for index in indexes
+            )
+            and not any(
+                isinstance(index, int)
+                and 0 <= index < len(actions)
+                and isinstance(actions[index], dict)
+                and _matching_pending_option(actions[index], state)
+                for index in indexes
+            )
+        )
         if (
             str(unit.get("disposition") or "") != "unresolved"
             and not any(index in invalid_indexes for index in indexes)
@@ -947,7 +967,7 @@ def _recover_declared_pending_option_semantics(
             )
             and not clarification_owned
             and not pending_owned
-            and not misowned_action
+            and not pending_owner_arbitration
         ):
             continue
         source = str(unit.get("source_text") or "")
@@ -1313,6 +1333,7 @@ def _recover_declared_pending_option_semantics(
                 and _action_has_independent_source(
                     recovered_actions[index],
                     quote,
+                    str(unit.get("source_text") or ""),
                 )
             )
         ]
@@ -1415,12 +1436,23 @@ def _verify_natural_boolean_pending_entailment(
     )
 
 
-def _action_has_independent_source(action: dict[str, Any], owner_quote: str) -> bool:
+def _action_has_independent_source(
+    action: dict[str, Any],
+    owner_quote: str,
+    unit_source: str,
+) -> bool:
     """Keep only exact, source-distinct work beside a finite option effect."""
 
     source = str(action.get("source_evidence") or "").strip()
     quote = str(owner_quote or "").strip()
-    return bool(source and quote and source not in quote and quote not in source)
+    unit = str(unit_source or "")
+    return bool(
+        source
+        and quote
+        and source in unit
+        and source not in quote
+        and quote not in source
+    )
 
 
 def _action_requires_pending_owner(

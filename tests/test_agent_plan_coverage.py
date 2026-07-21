@@ -751,6 +751,131 @@ class PlanCoverageTest(unittest.TestCase):
         }])
         self.assertEqual(result["semantic_units"][1]["disposition"], "context")
 
+    def test_manual_url_answer_owns_contextual_mode_mention(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.state import new_state
+
+        source = (
+            "Use http://host.docker.internal:8545 for sync and health checks. "
+            "Keep fake-node only as the existing local process attribution context."
+        )
+        clauses = segment_user_turn(source)
+        state = new_state("manual-url-context")
+        state["pending_question"] = {
+            "id": "SYNC_OBSERVE_RPC_URL",
+            "group": "endpoint_process",
+            "field": "SYNC_OBSERVE_RPC_URL",
+            "kind": "url",
+            "manual_input_allowed": True,
+        }
+        payload = {
+            "actions": [{
+                "type": "choose_target_mode",
+                "target_mode": "fake-node",
+                "target_mode_explicit": True,
+                "source_evidence": "fake-node",
+            }],
+            "semantic_units": [
+                _unit(clauses[0], 1, [0]),
+                _unit(clauses[1], 2, [0]),
+            ],
+        }
+        verdict = {
+            "decision": "manual_value",
+            "option_id": "",
+            "answer": "http://host.docker.internal:8545",
+            "evidence_quote": "http://host.docker.internal:8545",
+            "supporting_unit_ids": ["unit-1", "unit-2"],
+            "independent_unit_ids": [],
+            "reason": "the mode mention describes the existing attribution role",
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps(verdict))
+
+        result_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            clauses=clauses,
+            user_text=source,
+        )
+        result = json.loads(result_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(result["actions"], [{
+            "type": "answer_pending",
+            "answer": "http://host.docker.internal:8545",
+            "source_evidence": "http://host.docker.internal:8545",
+        }])
+        self.assertEqual(
+            [unit["disposition"] for unit in result["semantic_units"]],
+            ["action", "context"],
+        )
+
+    def test_manual_url_answer_preserves_distinct_explicit_mode_switch(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.state import new_state
+
+        source = (
+            "Use http://host.docker.internal:8545 for this endpoint. "
+            "After recording it, switch this workflow to real-node."
+        )
+        clauses = segment_user_turn(source)
+        state = new_state("manual-url-independent-jump")
+        state["pending_question"] = {
+            "id": "SYNC_OBSERVE_RPC_URL",
+            "group": "endpoint_process",
+            "field": "SYNC_OBSERVE_RPC_URL",
+            "kind": "url",
+            "manual_input_allowed": True,
+        }
+        payload = {
+            "actions": [{
+                "type": "choose_target_mode",
+                "target_mode": "real-node",
+                "target_mode_explicit": True,
+                "source_evidence": "switch this workflow to real-node",
+            }],
+            "semantic_units": [
+                _unit(clauses[0], 1, [0]),
+                _unit(clauses[1], 2, [0]),
+            ],
+        }
+        verdict = {
+            "decision": "manual_value",
+            "option_id": "",
+            "answer": "http://host.docker.internal:8545",
+            "evidence_quote": "http://host.docker.internal:8545",
+            "supporting_unit_ids": ["unit-1"],
+            "independent_unit_ids": ["unit-2"],
+            "reason": "the endpoint answer and later mode switch are independent",
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps(verdict))
+
+        result_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            clauses=clauses,
+            user_text=source,
+        )
+        result = json.loads(result_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            [action["type"] for action in result["actions"]],
+            ["choose_target_mode", "answer_pending"],
+        )
+        self.assertEqual(result["semantic_units"][0]["action_indexes"], [1])
+        self.assertEqual(result["semantic_units"][1]["action_indexes"], [0])
+
     def test_same_group_navigation_cannot_replace_the_active_pending_answer(self) -> None:
         from agent.harness.intent import _validate_action_document
         from agent.harness.state import new_state
@@ -8784,7 +8909,7 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
             "answer": "http://geth-dev:8545",
             "evidence_quote": "http://geth-dev:8545",
             "supporting_unit_ids": ["unit-1"],
-            "independent_unit_ids": [],
+            "independent_unit_ids": ["unit-2"],
             "reason": "the first sentence supplies the requested URL",
         }))
 
