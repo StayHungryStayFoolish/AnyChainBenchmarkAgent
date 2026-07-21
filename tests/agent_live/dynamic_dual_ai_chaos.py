@@ -65,6 +65,7 @@ class SimulatorContext:
     previous_response_received_at_ns: int
     scheduled_target: ScheduledCoverageTarget
     transcript: tuple[tuple[str, str], ...]
+    coverage_contract: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -503,6 +504,7 @@ class DynamicDualAiChaosRunner:
                     previous_response_received_at_ns=previous_received_ns,
                     scheduled_target=scheduled_target,
                     transcript=tuple(transcript),
+                    coverage_contract=dict(edge),
                 )
                 decision = self.simulator(context)
                 selected_at_ns = self.clock_ns()

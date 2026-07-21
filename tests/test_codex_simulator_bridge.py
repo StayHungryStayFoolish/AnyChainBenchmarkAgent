@@ -30,6 +30,12 @@ class StdioCodexSimulatorTest(unittest.TestCase):
                 goal="choose a safe framework check in natural language",
             ),
             transcript=(),
+            coverage_contract={
+                "edge_key": "opening::fake-node",
+                "input_class": "natural_language_option",
+                "action_type": "choose_target_mode",
+                "expected_postcondition": {"field": "target_mode"},
+            },
         )
 
     def _decision_frame(self, context: SimulatorContext, **changes: object) -> str:
@@ -62,6 +68,7 @@ class StdioCodexSimulatorTest(unittest.TestCase):
             content_hash(context.previous_agent_response),
         )
         self.assertEqual(payload["scheduled_target"]["edge_key"], "opening::fake-node")
+        self.assertEqual(payload["coverage_contract"], context.coverage_contract)
         contract = payload["decision_contract"]
         self.assertEqual(contract["frame_prefix"], DECISION_FRAME)
         self.assertEqual(contract["response_binding_key"], "previous_response_hash")
@@ -79,6 +86,7 @@ class StdioCodexSimulatorTest(unittest.TestCase):
             contract["decision_template"]["target_coverage_ids"],
             [context.scheduled_target.edge_key],
         )
+        self.assertIn("coverage_contract.input_class", contract["input_generation_rule"])
         self.assertEqual(
             set(contract["required_keys"]),
             {
@@ -92,6 +100,27 @@ class StdioCodexSimulatorTest(unittest.TestCase):
         )
         self.assertEqual(decision.user_message, "I just want a safe check without a real node.")
         self.assertEqual(decision.target_coverage_ids, ("opening::fake-node",))
+
+    def test_structured_config_contract_requires_a_concrete_supplied_value(self) -> None:
+        context = self._context()
+        context = SimulatorContext(
+            **{
+                **context.__dict__,
+                "coverage_contract": {
+                    "input_class": "structured_json_yaml_env_curl",
+                    "action_type": "propose_config_values",
+                    "expected_postcondition": {"field": "CLOUD_ZONE"},
+                },
+            }
+        )
+        output = io.StringIO()
+
+        StdioCodexSimulator(io.StringIO(self._decision_frame(context)), output)(context)
+
+        payload = json.loads(output.getvalue()[len(CONTEXT_FRAME):])
+        rule = payload["decision_contract"]["input_generation_rule"]
+        self.assertIn("supply a concrete value for CLOUD_ZONE", rule)
+        self.assertIn("must not ask the Agent to invent", rule)
 
     def test_rejects_a_decision_for_a_stale_agent_response(self) -> None:
         context = self._context()

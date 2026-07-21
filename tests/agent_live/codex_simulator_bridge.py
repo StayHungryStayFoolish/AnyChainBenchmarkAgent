@@ -31,6 +31,26 @@ DECISION_FRAME = "CODEX_SIMULATOR_DECISION "
 RESULT_FRAME = "CODEX_SIMULATOR_RESULT "
 
 
+def _input_generation_rule(contract: Mapping[str, Any]) -> str:
+    input_class = str(contract.get("input_class") or "")
+    action_type = str(contract.get("action_type") or "")
+    postcondition = contract.get("expected_postcondition")
+    expected_field = ""
+    if isinstance(postcondition, Mapping):
+        expected_field = str(postcondition.get("field") or "")
+    if input_class == "structured_json_yaml_env_curl" and action_type == "propose_config_values":
+        return (
+            "The user_message must supply a concrete value for "
+            f"{expected_field or 'the expected configuration field'} in a parseable "
+            "JSON, YAML, env, shell, curl, or mixed configuration block. It must not ask "
+            "the Agent to invent, recommend, or output that user-owned value."
+        )
+    return (
+        "The user_message must genuinely exercise coverage_contract.input_class and "
+        "supply the evidence required by its action_type and expected_postcondition."
+    )
+
+
 class StdioCodexSimulator:
     """Exchange one revision-bound decision per complete Agent response."""
 
@@ -57,6 +77,7 @@ class StdioCodexSimulator:
             "previous_response_hash": response_hash,
             "previous_response_received_at_ns": context.previous_response_received_at_ns,
             "scheduled_target": asdict(context.scheduled_target),
+            "coverage_contract": dict(context.coverage_contract),
             "transcript": [list(item) for item in context.transcript],
             "decision_contract": {
                 "frame_prefix": DECISION_FRAME,
@@ -70,6 +91,7 @@ class StdioCodexSimulator:
                     "Declare only coverage IDs genuinely demanded by user_message; "
                     "the scheduled edge must remain among them."
                 ),
+                "input_generation_rule": _input_generation_rule(context.coverage_contract),
                 "output_rule": (
                     "Write exactly one line beginning with frame_prefix followed by "
                     "one JSON object; do not write plain user prose or Markdown."
