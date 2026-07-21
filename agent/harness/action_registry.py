@@ -27,6 +27,7 @@ ActionValidator = Callable[[Mapping[str, Any]], None]
 
 SEMANTIC_SUPPORT_RELATIONS = frozenset({
     "explanatory_context",
+    "operation_restatement",
     "provenance",
     "format_scope",
     "temporal_scope",
@@ -35,6 +36,7 @@ SEMANTIC_SUPPORT_RELATIONS = frozenset({
 })
 FRAMED_OPERATION_SUPPORT_RELATIONS = (
     "explanatory_context",
+    "operation_restatement",
     "provenance",
     "format_scope",
     "temporal_scope",
@@ -312,6 +314,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         ("target_mode", "goal", "source_evidence"),
         70,
         merge_identity=("target_mode", "goal"),
+        effect="workflow_state_mutation",
         required_arguments=("target_mode", "source_evidence"),
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
     ),
@@ -321,6 +324,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         "Activate the oldest explicitly queued workflow goal when the user explicitly asks to start, continue, or advance to that saved/deferred follow-up. Do not use request_target_mode_selection or choose_target_mode for a referenced queued goal.",
         ("source_evidence",),
         execution_phase=10,
+        effect="workflow_state_mutation",
         required_arguments=("source_evidence",),
         constraints=("workflow_goals must contain at least one saved goal",),
         semantic_recovery_source_argument="source_evidence",
@@ -335,6 +339,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         "Discard only the oldest explicitly queued workflow goal when the user explicitly cancels or removes that saved/deferred follow-up.",
         ("source_evidence",),
         execution_phase=10,
+        effect="workflow_state_mutation",
         required_arguments=("source_evidence",),
         constraints=("workflow_goals must contain at least one saved goal",),
         semantic_recovery_source_argument="source_evidence",

@@ -8813,12 +8813,185 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
                 "effect": "read_only",
                 "support_relations": [
                     "explanatory_context",
+                    "operation_restatement",
                     "provenance",
                     "format_scope",
                     "temporal_scope",
                 ],
             },
         )
+
+    def test_lifecycle_operation_restatement_shares_one_recovered_action(self) -> None:
+        import json
+
+        from agent.harness.intent import _recover_registry_bounded_semantic_actions
+        from agent.harness.state import new_state
+
+        cases = (
+            (
+                "discard_next_workflow_goal",
+                "Remove the queued follow-up task; I no longer want the saved sync observation.",
+                "Remove the queued follow-up task",
+                "I no longer want the saved sync observation",
+            ),
+            (
+                "activate_next_workflow_goal",
+                "我仍然需要之前保存的观察任务；现在继续执行那个待办。",
+                "现在继续执行那个待办",
+                "我仍然需要之前保存的观察任务",
+            ),
+        )
+        for action_type, user_text, direct_quote, support_quote in cases:
+            with self.subTest(action_type=action_type):
+                clauses = segment_user_turn(user_text)
+                payload = {
+                    "actions": [],
+                    "semantic_units": [
+                        self._unit(clause, f"unit-{index}", [], disposition="unresolved")
+                        for index, clause in enumerate(clauses, start=1)
+                    ],
+                }
+                direct_unit = next(
+                    f"unit-{index}"
+                    for index, clause in enumerate(clauses, start=1)
+                    if direct_quote in clause.text
+                )
+                self.assertTrue(any(support_quote in clause.text for clause in clauses))
+                decisions = []
+                for index, clause in enumerate(clauses, start=1):
+                    unit_id = f"unit-{index}"
+                    decisions.append({
+                        "unit_id": unit_id,
+                        "disposition": (
+                            "registered_action"
+                            if unit_id == direct_unit
+                            else "registered_action_support"
+                        ),
+                        "group": "",
+                        "existing_action_index": None,
+                        "target_mode": "",
+                        "consultation_topic": "",
+                        "registered_action_type": action_type,
+                        "support_relation": (
+                            "" if unit_id == direct_unit else "operation_restatement"
+                        ),
+                        "scope_constraint": "",
+                        "evidence_quote": clause.text,
+                        "reason": "direct lifecycle command or same-operation restatement",
+                    })
+                provider = self._provider(decisions)
+
+                recovered_text, changed = _recover_registry_bounded_semantic_actions(
+                    provider,
+                    json.dumps(payload),
+                    clauses,
+                    new_state(f"lifecycle-restatement-{action_type}", language="en"),
+                    user_text,
+                )
+                recovered = json.loads(recovered_text)
+
+                self.assertTrue(changed)
+                self.assertEqual(len(recovered["actions"]), 1)
+                self.assertEqual(recovered["actions"][0]["type"], action_type)
+                self.assertTrue(all(
+                    unit["action_indexes"] == [0]
+                    for unit in recovered["semantic_units"]
+                ))
+
+    def test_operation_restatement_cannot_authorize_lifecycle_action_by_itself(self) -> None:
+        import json
+
+        from agent.harness.intent import _recover_registry_bounded_semantic_actions
+        from agent.harness.state import new_state
+
+        user_text = "I no longer want the saved sync observation."
+        clauses = segment_user_turn(user_text)
+        payload = {
+            "actions": [],
+            "semantic_units": [self._unit(
+                clauses[0], "unit-1", [], disposition="unresolved"
+            )],
+        }
+        provider = self._provider([{
+            "unit_id": "unit-1",
+            "disposition": "registered_action_support",
+            "group": "",
+            "existing_action_index": None,
+            "target_mode": "",
+            "consultation_topic": "",
+            "registered_action_type": "discard_next_workflow_goal",
+            "support_relation": "operation_restatement",
+            "scope_constraint": "",
+            "evidence_quote": clauses[0].text,
+            "reason": "support without a direct operation",
+        }])
+
+        recovered_text, changed = _recover_registry_bounded_semantic_actions(
+            provider,
+            json.dumps(payload),
+            clauses,
+            new_state("restatement-without-direct", language="en"),
+            user_text,
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(json.loads(recovered_text), payload)
+
+    def test_independent_duplicate_lifecycle_demands_do_not_merge_partially(self) -> None:
+        import json
+
+        from agent.harness.intent import _recover_registry_bounded_semantic_actions
+        from agent.harness.state import new_state
+
+        user_text = "Discard the oldest saved goal; then discard the next saved goal too."
+        clauses = segment_user_turn(user_text)
+        payload = {
+            "actions": [],
+            "semantic_units": [
+                self._unit(clause, f"unit-{index}", [], disposition="unresolved")
+                for index, clause in enumerate(clauses, start=1)
+            ],
+        }
+        provider = self._provider([
+            {
+                "unit_id": f"unit-{index}",
+                "disposition": "registered_action",
+                "group": "",
+                "existing_action_index": None,
+                "target_mode": "",
+                "consultation_topic": "",
+                "registered_action_type": "discard_next_workflow_goal",
+                "support_relation": "",
+                "scope_constraint": "",
+                "evidence_quote": clause.text,
+                "reason": "each clause requests a separate queue mutation",
+            }
+            for index, clause in enumerate(clauses, start=1)
+        ])
+
+        recovered_text, changed = _recover_registry_bounded_semantic_actions(
+            provider,
+            json.dumps(payload),
+            clauses,
+            new_state("duplicate-discard-demands", language="en"),
+            user_text,
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(json.loads(recovered_text), payload)
+
+    def test_lifecycle_registry_declares_shared_restatement_contract(self) -> None:
+        from agent.harness.action_registry import ACTION_BY_TYPE
+
+        for action_type in (
+            "queue_workflow_goal",
+            "activate_next_workflow_goal",
+            "discard_next_workflow_goal",
+        ):
+            self.assertIn(
+                "operation_restatement",
+                ACTION_BY_TYPE[action_type].semantic_support_relations,
+            )
 
     def test_read_only_workload_question_stays_consultation(self) -> None:
         import json
