@@ -942,7 +942,12 @@ def question_for_environment(state: AgentGraphState, group: str) -> dict[str, An
                     validation={"value_type": "scalar_token"},
                     options=[
                         {"label": "Y", "value": detected},
-                        {"label": "N", "value": "__manual__", "expected_patch": {f"inferred_config.{env_key}_manual_required": True}},
+                        {
+                            "label": "N",
+                            "value": "__manual__",
+                            "manual_entry": True,
+                            "expected_patch": {f"inferred_config.{env_key}_manual_required": True},
+                        },
                     ],
                 )
             return manual_question(
@@ -1109,7 +1114,12 @@ def _disk_question(state: AgentGraphState, *, prefix: str, device_key: str, grou
                     validation={"value_type": "positive_number"},
                     options=[
                         {"label": "Y", "value": inferred},
-                        {"label": "N", "value": "__manual__", "expected_patch": {f"inferred_config.{env_key}_manual_required": True}},
+                        {
+                            "label": "N",
+                            "value": "__manual__",
+                            "manual_entry": True,
+                            "expected_patch": {f"inferred_config.{env_key}_manual_required": True},
+                        },
                     ],
                 )
         value_type = "positive_number" if env_key.endswith(("_VOL_SIZE", "_VOL_MAX_IOPS", "_VOL_MAX_THROUGHPUT")) else "scalar_token"

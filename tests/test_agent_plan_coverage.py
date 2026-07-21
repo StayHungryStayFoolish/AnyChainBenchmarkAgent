@@ -286,6 +286,171 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertEqual(recovered, json.dumps(payload))
         self.assertEqual(provider.complete.call_count, 2)
 
+    def test_terminal_manual_value_supersedes_declared_manual_entry_option(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.coordinator import _dispatch_pending_action
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.state import new_state
+
+        source = (
+            "Do not trust test-region; that came from the test harness.\n"
+            "The deployment ticket assigns this node to asia-east1, so use that as CLOUD_REGION."
+        )
+        clauses = segment_user_turn(source)
+        state = new_state("pending-manual-entry-precedence", language="en")
+        state["pending_question"] = {
+            "id": "CLOUD_REGION",
+            "group": "provider_deployment",
+            "field": "CLOUD_REGION",
+            "kind": "yes_no",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "scalar_token"},
+            "options": [
+                {"id": "1", "label": "Y", "value": "test-region", "action": {"type": "answer_pending"}},
+                {
+                    "id": "2",
+                    "label": "N",
+                    "value": "__manual__",
+                    "manual_entry": True,
+                    "action": {"type": "answer_pending"},
+                },
+            ],
+        }
+        payload = {
+            "actions": [{"type": "clarify_unresolved", "clauses": [source]}],
+            "semantic_units": [
+                _unit(clause, index, [0], disposition="unresolved")
+                for index, clause in enumerate(clauses, start=1)
+            ],
+        }
+        unit_ids = [f"unit-{index}" for index in range(1, len(clauses) + 1)]
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps({
+                "decision": "select_option",
+                "option_id": "2",
+                "answer": "",
+                "evidence_quote": "Do not trust test-region",
+                "supporting_unit_ids": unit_ids,
+                "independent_unit_ids": [],
+                "reason": "rejects the detected value and enters manual input",
+            })),
+            SimpleNamespace(text=json.dumps({
+                "decision": "manual_value",
+                "option_id": "",
+                "answer": "asia-east1",
+                "evidence_quote": "asia-east1",
+                "supporting_unit_ids": unit_ids,
+                "independent_unit_ids": [],
+                "reason": "supplies the terminal replacement value",
+            })),
+        ]
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            clauses=clauses,
+            user_text=source,
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(recovered["actions"], [{
+            "type": "answer_pending",
+            "answer": "asia-east1",
+            "source_evidence": "asia-east1",
+        }])
+        state["last_user_input"] = source
+        committed = _dispatch_pending_action(state, recovered["actions"][0])
+        self.assertEqual(committed["confirmed_config"]["CLOUD_REGION"], "asia-east1")
+        self.assertEqual(committed["pending_question"], {})
+
+    def test_terminal_manual_value_does_not_override_a_non_manual_option_conflict(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.state import new_state
+
+        source = "Use the detected region; asia-east1 is only an example."
+        clauses = segment_user_turn(source)
+        state = new_state("pending-manual-entry-conflict", language="en")
+        state["pending_question"] = {
+            "id": "CLOUD_REGION",
+            "group": "provider_deployment",
+            "field": "CLOUD_REGION",
+            "kind": "yes_no",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "scalar_token"},
+            "options": [
+                {"id": "1", "label": "Y", "value": "test-region", "action": {"type": "answer_pending"}},
+                {
+                    "id": "2",
+                    "label": "N",
+                    "value": "__manual__",
+                    "manual_entry": True,
+                    "action": {"type": "answer_pending"},
+                },
+            ],
+        }
+        payload = {
+            "actions": [{"type": "clarify_unresolved", "clauses": [source]}],
+            "semantic_units": [
+                _unit(clause, index, [0], disposition="unresolved")
+                for index, clause in enumerate(clauses, start=1)
+            ],
+        }
+        unit_ids = [f"unit-{index}" for index in range(1, len(clauses) + 1)]
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps({
+                "decision": "select_option",
+                "option_id": "1",
+                "answer": "",
+                "evidence_quote": "Use the detected region",
+                "supporting_unit_ids": unit_ids,
+                "independent_unit_ids": [],
+                "reason": "selects the detected value",
+            })),
+            SimpleNamespace(text=json.dumps({
+                "decision": "manual_value",
+                "option_id": "",
+                "answer": "asia-east1",
+                "evidence_quote": "asia-east1",
+                "supporting_unit_ids": unit_ids,
+                "independent_unit_ids": [],
+                "reason": "incorrectly treats the example as a replacement",
+            })),
+        ]
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            clauses=clauses,
+            user_text=source,
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(recovered_text, json.dumps(payload))
+
+    def test_detected_value_question_declares_manual_entry_transition(self) -> None:
+        from agent.harness.domains.environment import question_for_environment
+        from agent.harness.state import new_state
+
+        state = new_state("detected-manual-entry-contract", language="en")
+        state["discovery"] = {"cloud": {"region": "test-region"}}
+        question = question_for_environment(state, "provider_deployment")
+
+        self.assertIsNotNone(question)
+        self.assertFalse(question["options"][0]["manual_entry"])
+        self.assertTrue(question["options"][1]["manual_entry"])
+
     def test_pending_owner_binds_untyped_natural_answer_to_declared_option_value(self) -> None:
         from types import SimpleNamespace
         from unittest.mock import Mock
@@ -1040,7 +1205,7 @@ class PlanCoverageTest(unittest.TestCase):
         document = json.loads(result)
         self.assertEqual(document["pending_answer_admissions"], [0])
         self.assertEqual(document["actions"][0]["answer"], "1000")
-        self.assertEqual(document["actions"][0]["selected_value"], "1000")
+        self.assertNotIn("selected_value", document["actions"][0])
         self.assertEqual(document["actions"][0]["source_evidence"], "1000")
 
     def test_literal_grounding_cannot_turn_a_question_into_a_manual_url_value(self) -> None:
@@ -9528,6 +9693,7 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
             "option_id": "fake-node",
             "label": "fake-node",
             "description": "",
+            "manual_entry": False,
             "semantic_action": "",
             "value": "fake-node",
             "declared_action": {

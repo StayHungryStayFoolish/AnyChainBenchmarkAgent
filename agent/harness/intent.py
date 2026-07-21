@@ -805,6 +805,7 @@ def _recover_declared_pending_option_semantics(
             "option_id": str(option.get("id") or index),
             "label": str(option.get("label") or option.get("value") or ""),
             "description": str(option.get("description") or ""),
+            "manual_entry": option.get("manual_entry") is True,
             "semantic_action": semantic,
             "value": option.get("value"),
             "declared_action": declared or {"type": "answer_pending"},
@@ -1160,6 +1161,72 @@ def _recover_declared_pending_option_semantics(
     if len(verdicts) != 2:
         return plan_text, False
     decisions = [str(item.get("decision") or "") for item in verdicts]
+    if set(decisions) == {"select_option", "manual_value"}:
+        manual_verdict = next(
+            item for item in verdicts if str(item.get("decision") or "") == "manual_value"
+        )
+        option_verdict = next(
+            item for item in verdicts if str(item.get("decision") or "") == "select_option"
+        )
+        selected_option = next(
+            (
+                item
+                for item in available
+                if str(item.get("option_id") or "")
+                == str(option_verdict.get("option_id") or "")
+            ),
+            None,
+        )
+        manual_answer = str(manual_verdict.get("answer") or "").strip()
+        manual_quote = str(manual_verdict.get("evidence_quote") or "").strip()
+        manual_support = {
+            str(item) for item in manual_verdict.get("supporting_unit_ids") or []
+        }
+        option_support = {
+            str(item) for item in option_verdict.get("supporting_unit_ids") or []
+        }
+        quote_owner = next(
+            (
+                unit_id
+                for unit_id, source in {
+                    str(item.get("unit_id") or ""): str(item.get("source_text") or "")
+                    for item in candidates
+                }.items()
+                if manual_quote and manual_quote in source
+            ),
+            "",
+        )
+        if (
+            selected_option is not None
+            and selected_option.get("manual_entry") is True
+            and manual_answer
+            and manual_quote
+            and manual_quote in complete_turn_text
+            and quote_owner in manual_support & option_support
+            and value_satisfies_pending_contract(manual_answer, pending)
+            and manual_answer not in {str(item.get("value")) for item in available}
+            and re.search(
+                rf"(?<!\w){re.escape(manual_answer)}(?!\w)",
+                manual_quote,
+                flags=re.IGNORECASE,
+            )
+            is not None
+        ):
+            verdicts = [
+                {
+                    **item,
+                    "decision": "manual_value",
+                    "option_id": "",
+                    "answer": manual_answer,
+                    "evidence_quote": manual_quote,
+                    "reason": (
+                        "a source-grounded terminal manual value supersedes the "
+                        "declared procedural manual-entry option"
+                    ),
+                }
+                for item in verdicts
+            ]
+            decisions = ["manual_value", "manual_value"]
     if any(item not in {"select_option", "manual_value"} for item in decisions):
         return plan_text, False
     keys = [
@@ -4267,6 +4334,9 @@ def _adjudicate_manual_pending_answers(
     pending = dict(state.get("pending_question") or {})
     if pending.get("manual_input_allowed") is not True:
         return text, False
+    has_declared_options = any(
+        isinstance(item, dict) for item in pending.get("options") or []
+    )
     payload = _parse_json_object(text)
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
     units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
@@ -4286,9 +4356,12 @@ def _adjudicate_manual_pending_answers(
         actions[index] = {
             **actions[index],
             "answer": quote,
-            "selected_value": quote,
             "source_evidence": quote,
         }
+        if has_declared_options:
+            actions[index].pop("selected_value", None)
+        else:
+            actions[index]["selected_value"] = quote
     review_indexes = [index for index in candidate_indexes if index not in directly_grounded]
     if not review_indexes and not directly_grounded:
         return text, False
@@ -4351,9 +4424,12 @@ def _adjudicate_manual_pending_answers(
             actions[index] = {
                 **actions[index],
                 "answer": selected_text,
-                "selected_value": selected_text,
                 "source_evidence": quote,
             }
+            if has_declared_options:
+                actions[index].pop("selected_value", None)
+            else:
+                actions[index]["selected_value"] = selected_text
             admitted.add(index)
             changed = True
             continue

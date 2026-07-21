@@ -1007,6 +1007,23 @@ class HarnessQuestionContractTest(unittest.TestCase):
         region_result = _dispatch_pending_action(region_state, region_action)
         self.assertEqual(region_result["confirmed_config"]["CLOUD_REGION"], "us-central1")
 
+        detected_region_action = {
+            "type": "answer_pending",
+            "answer": "asia-east1",
+            "source_evidence": "set CLOUD_REGION to asia-east1",
+            "semantic_purpose_verified": True,
+            "pending_option_semantic_verified": True,
+        }
+        detected_region_result = _dispatch_pending_action(
+            region_state,
+            detected_region_action,
+        )
+        self.assertEqual(
+            detected_region_result["confirmed_config"]["CLOUD_REGION"],
+            "asia-east1",
+        )
+        self.assertEqual(detected_region_result["pending_question"], {})
+
         normalized_state = _state("en")
         normalized_state["pending_question"] = question_for_environment(
             normalized_state,
