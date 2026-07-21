@@ -3899,13 +3899,28 @@ def _materialize_pending_manual_owner_actions(
     for index in sorted(answer_indexes):
         answer = actions[index]
         selected = answer.get("selected_value")
-        value = selected if selected not in (None, "") else answer.get("answer")
+        if not use_complete_turn and selected in (None, ""):
+            continue
+        evidence = str(answer.get("source_evidence") or "").strip()
+        selected_text = str(selected if selected is not None else "").strip()
+        if (
+            not use_complete_turn
+            and (
+                not evidence
+                or selected_text not in evidence
+                or evidence not in str(user_text or "")
+            )
+        ):
+            continue
+        value = selected
         if use_complete_turn:
             value = str(user_text or "").strip()
         candidate = {
             **template,
             value_argument: value,
-            "source_evidence": str(user_text or answer.get("source_evidence") or "").strip(),
+            "source_evidence": str(
+                user_text if use_complete_turn else evidence
+            ).strip(),
         }
         try:
             candidate = validate_action_contract(candidate)
@@ -4211,18 +4226,26 @@ def _adjudicate_manual_pending_answers(
         and not _declared_option_for_pending_answer(action, pending)
     ]
     directly_grounded = {
-        index
+        index: quote
         for index in candidate_indexes
         if value_satisfies_pending_contract(str(actions[index].get("answer") or ""), pending)
-        and _manual_answer_has_literal_source(actions[index], user_text)
+        and (quote := _manual_answer_literal_source(actions[index], user_text))
     }
+    for index, quote in directly_grounded.items():
+        actions[index] = {
+            **actions[index],
+            "answer": quote,
+            "selected_value": quote,
+            "source_evidence": quote,
+        }
     review_indexes = [index for index in candidate_indexes if index not in directly_grounded]
     if not review_indexes and not directly_grounded:
         return text, False
 
     if not review_indexes:
         payload["pending_answer_admissions"] = sorted(directly_grounded)
-        return json.dumps(payload, ensure_ascii=False, sort_keys=True), False
+        payload["actions"] = actions
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True), bool(directly_grounded)
 
     reviews = []
     for index in review_indexes:
@@ -4261,10 +4284,34 @@ def _adjudicate_manual_pending_answers(
         row = by_index.get(index) or {}
         decision = str(row.get("decision") or "")
         quote = str(row.get("evidence_quote") or "").strip()
-        if decision == "direct_answer" and quote and quote in user_text:
+        source_units = [str(item) for item in review.get("source_units") or [] if str(item)]
+        quote_is_owned = bool(quote and any(quote in source for source in source_units))
+        selected = row.get("selected_value")
+        selected_text = str(selected if selected is not None else "").strip()
+        if (
+            decision == "direct_answer"
+            and quote_is_owned
+            and quote in user_text
+            and selected_text
+            and selected_text in quote
+            and selected_text in user_text
+            and value_satisfies_pending_contract(selected_text, pending)
+        ):
+            actions[index] = {
+                **actions[index],
+                "answer": selected_text,
+                "selected_value": selected_text,
+                "source_evidence": quote,
+            }
             admitted.add(index)
+            changed = True
             continue
-        if decision == "generic_resume" and quote and quote in user_text:
+        if (
+            decision == "generic_resume"
+            and selected in (None, "")
+            and quote_is_owned
+            and quote in user_text
+        ):
             actions[index] = {
                 "type": "resume_current_flow",
                 "source_evidence": quote,
@@ -4291,15 +4338,22 @@ def _adjudicate_manual_pending_answers(
 def _manual_answer_has_literal_source(action: dict[str, Any], user_text: str) -> bool:
     """Prove that a normalized manual answer occurs in exact source evidence."""
 
+    return bool(_manual_answer_literal_source(action, user_text))
+
+
+def _manual_answer_literal_source(action: dict[str, Any], user_text: str) -> str:
+    """Return the exact source slice for one already-normalized manual value."""
+
     answer = str(action.get("answer") or "").strip()
     quote = str(action.get("source_evidence") or "").strip()
     if not answer or not quote or quote not in str(user_text or ""):
-        return False
-    return re.search(
+        return ""
+    match = re.search(
         rf"(?<!\w){re.escape(answer)}(?!\w)",
         quote,
         flags=re.IGNORECASE,
-    ) is not None
+    )
+    return match.group(0) if match else ""
 
 
 def _request_manual_pending_reviews(provider: Any, reviews: list[dict[str, Any]]) -> dict[str, Any]:
@@ -4307,13 +4361,16 @@ def _request_manual_pending_reviews(provider: Any, reviews: list[dict[str, Any]]
 
     system = (
         "Return JSON only: {reviews:[{action_index:integer,"
-        "decision:'direct_answer'|'generic_resume'|'reject',evidence_quote:string,reason:string}]}. "
+        "decision:'direct_answer'|'generic_resume'|'reject',selected_value:string|null,"
+        "evidence_quote:string,reason:string}]}. "
         "Review every row exactly once. direct_answer means source_units directly supply one value requested by the "
         "displayed question and field; ordinary prose around that value is allowed, but navigation, a question, a "
         "correction, a comparison, or a value for another field is not. generic_resume means the source explicitly "
         "asks to resume or return to the current benchmark configuration without naming a different destination or "
-        "supplying the requested field value. reject means neither. Never infer a value from workflow state, defaults, "
-        "or the proposed_answer. For direct_answer and generic_resume, evidence_quote must be the shortest exact excerpt "
+        "supplying the requested field value. reject means neither. For direct_answer, selected_value is the exact "
+        "value supplied by source_units and must occur literally inside the shortest exact evidence_quote. Never infer "
+        "or normalize selected_value from workflow state, defaults, or proposed_answer. generic_resume and reject use "
+        "selected_value:null. For direct_answer and generic_resume, evidence_quote must be the shortest exact excerpt "
         "from source_units proving the decision. reject uses an empty quote."
     )
     invalid = ""
@@ -4333,23 +4390,42 @@ def _request_manual_pending_reviews(provider: Any, reviews: list[dict[str, Any]]
         invalid = str(response.text or "")
         result = _parse_json_object(invalid)
         rows = result.get("reviews") if isinstance(result.get("reviews"), list) else []
+        counts: dict[int, int] = {}
+        for row in rows:
+            if isinstance(row, dict) and isinstance(row.get("action_index"), int):
+                index = int(row["action_index"])
+                counts[index] = counts.get(index, 0) + 1
         by_index = {
             row.get("action_index"): row
             for row in rows
             if isinstance(row, dict) and isinstance(row.get("action_index"), int)
         }
-        complete = True
+        expected_indexes = {int(review["action_index"]) for review in reviews}
+        complete = (
+            len(rows) == len(reviews)
+            and set(by_index) == expected_indexes
+            and all(counts.get(index) == 1 for index in expected_indexes)
+        )
         for review in reviews:
+            if not complete:
+                break
             row = by_index.get(review["action_index"])
             decision = str((row or {}).get("decision") or "")
             quote = str((row or {}).get("evidence_quote") or "").strip()
             if decision not in {"direct_answer", "generic_resume", "reject"}:
                 complete = False
                 break
-            if decision == "reject" and quote:
-                complete = False
-                break
-            if decision != "reject" and not quote:
+            selected = (row or {}).get("selected_value")
+            if decision == "direct_answer":
+                selected_text = str(selected if selected is not None else "").strip()
+                if not quote or not selected_text or selected_text not in quote:
+                    complete = False
+                    break
+            elif decision == "generic_resume":
+                if selected not in (None, "") or not quote:
+                    complete = False
+                    break
+            elif selected not in (None, "") or quote:
                 complete = False
                 break
         if complete:

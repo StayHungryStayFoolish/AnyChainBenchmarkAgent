@@ -1036,8 +1036,12 @@ class PlanCoverageTest(unittest.TestCase):
         )
 
         provider.complete.assert_not_called()
-        self.assertFalse(changed)
-        self.assertEqual(json.loads(result)["pending_answer_admissions"], [0])
+        self.assertTrue(changed)
+        document = json.loads(result)
+        self.assertEqual(document["pending_answer_admissions"], [0])
+        self.assertEqual(document["actions"][0]["answer"], "1000")
+        self.assertEqual(document["actions"][0]["selected_value"], "1000")
+        self.assertEqual(document["actions"][0]["source_evidence"], "1000")
 
     def test_literal_grounding_cannot_turn_a_question_into_a_manual_url_value(self) -> None:
         import json
@@ -3451,6 +3455,7 @@ class PlanCoverageTest(unittest.TestCase):
             "field": "CLOUD_REGION",
             "prompt": "Enter CLOUD_REGION.",
             "manual_input_allowed": True,
+            "validation": {"value_type": "scalar_token"},
             "options": [],
         }
         provider = Mock()
@@ -3458,6 +3463,7 @@ class PlanCoverageTest(unittest.TestCase):
             "reviews": [{
                 "action_index": 0,
                 "decision": "direct_answer",
+                "selected_value": "asia-east1",
                 "evidence_quote": "asia-east1",
                 "reason": "direct value for the displayed field",
             }],
@@ -3475,7 +3481,358 @@ class PlanCoverageTest(unittest.TestCase):
 
         result, _changed = _adjudicate_manual_pending_answers(provider, payload, state, source)
 
-        self.assertEqual(json.loads(result)["pending_answer_admissions"], [0])
+        document = json.loads(result)
+        self.assertEqual(document["pending_answer_admissions"], [0])
+        self.assertEqual(document["actions"][0]["answer"], "asia-east1")
+        self.assertEqual(document["actions"][0]["selected_value"], "asia-east1")
+        self.assertEqual(document["actions"][0]["source_evidence"], "asia-east1")
+
+    def test_prose_wrapped_rpc_method_compiles_through_declared_owner(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_pending_action_ownership
+        from agent.harness.state import new_state
+
+        source = "The method name is `eth_chainId`. I do not have its request or response sample with me yet."
+        clauses = segment_user_turn(source)
+        state = new_state("manual-rpc-method", language="en")
+        state["pending_question"] = {
+            "id": "custom_rpc_method",
+            "group": "endpoint_process",
+            "kind": "manual_value",
+            "field": "custom_rpc_method",
+            "prompt": "Enter the custom RPC method name to validate.",
+            "manual_input_allowed": True,
+            "accepted_action_types": ["rpc_catalog_command"],
+            "manual_action": {
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_method",
+                "value_argument": "rpc_method",
+            },
+            "validation": {"input_mode": "rpc_method_or_schema_evidence"},
+            "options": [],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "reviews": [{
+                "action_index": 0,
+                "decision": "direct_answer",
+                "selected_value": "eth_chainId",
+                "evidence_quote": "eth_chainId",
+                "reason": "the source directly names the requested RPC method",
+            }],
+        }))
+        payload = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": source,
+                "source_evidence": source,
+            }],
+            "semantic_units": [_unit(clauses[0], 1, [0])],
+        }
+
+        result, changed = _adjudicate_pending_action_ownership(
+            provider, json.dumps(payload), state, source
+        )
+        document = json.loads(result)
+
+        self.assertTrue(changed)
+        self.assertEqual(document["actions"], [{
+            "type": "rpc_catalog_command",
+            "catalog_command": "set_method",
+            "rpc_method": "eth_chainId",
+            "source_evidence": "eth_chainId",
+        }])
+        self.assertEqual(document["pending_answer_admissions"], [0])
+
+    def test_manual_pending_review_extracts_typed_values_generically(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_manual_pending_answers
+        from agent.harness.state import new_state
+
+        cases = (
+            ("url", "Use https://rpc.example.test for validation.", "https://rpc.example.test", {}),
+            ("region", "Set this run to us-central1 please.", "us-central1", {"value_type": "scalar_token"}),
+            ("device", "Use /dev/nvme1n1 for the ledger.", "/dev/nvme1n1", {"value_type": "scalar_token"}),
+            ("number", "The limit should be 20000 IOPS.", "20000", {"value_type": "positive_number"}),
+        )
+        for kind, source, selected, validation in cases:
+            with self.subTest(kind=kind):
+                state = new_state(f"manual-{kind}", language="en")
+                state["pending_question"] = {
+                    "id": kind,
+                    "group": "test_group",
+                    "kind": "url" if kind == "url" else ("device" if kind == "device" else "manual_value"),
+                    "field": kind,
+                    "prompt": f"Enter {kind}.",
+                    "manual_input_allowed": True,
+                    "validation": validation,
+                    "options": [],
+                }
+                provider = Mock()
+                provider.complete.return_value = SimpleNamespace(text=json.dumps({
+                    "reviews": [{
+                        "action_index": 0,
+                        "decision": "direct_answer",
+                        "selected_value": selected,
+                        "evidence_quote": selected,
+                        "reason": "direct typed value",
+                    }],
+                }))
+                payload = json.dumps({
+                    "actions": [{"type": "answer_pending", "answer": source}],
+                    "semantic_units": [{
+                        "unit_id": "unit-1",
+                        "clause_id": "clause-1",
+                        "source_text": source,
+                        "disposition": "action",
+                        "action_indexes": [0],
+                    }],
+                })
+
+                result, changed = _adjudicate_manual_pending_answers(
+                    provider, payload, state, source
+                )
+                document = json.loads(result)
+
+                self.assertTrue(changed)
+                self.assertEqual(document["pending_answer_admissions"], [0])
+                self.assertEqual(document["actions"][0]["selected_value"], selected)
+                self.assertEqual(document["actions"][0]["source_evidence"], selected)
+
+    def test_manual_pending_review_rejects_untrusted_extracted_values(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_manual_pending_answers
+        from agent.harness.state import new_state
+
+        cases = (
+            (
+                "invented",
+                "Use the endpoint I mentioned earlier.",
+                "https://invented.example",
+                "the endpoint I mentioned earlier",
+                "url",
+                {},
+            ),
+            (
+                "invalid",
+                "Use not-a-number for the limit.",
+                "not-a-number",
+                "not-a-number",
+                "manual_value",
+                {"value_type": "positive_number"},
+            ),
+            (
+                "ambiguous",
+                "Use 1000 or 2000 for the limit.",
+                "1000 or 2000",
+                "1000 or 2000",
+                "manual_value",
+                {"value_type": "positive_number"},
+            ),
+        )
+        for name, source, selected, quote, question_kind, validation in cases:
+            with self.subTest(name=name):
+                state = new_state(f"manual-reject-{name}", language="en")
+                state["pending_question"] = {
+                    "id": "limit",
+                    "group": "test_group",
+                    "kind": question_kind,
+                    "field": "limit",
+                    "prompt": "Enter the limit.",
+                    "manual_input_allowed": True,
+                    "validation": validation,
+                    "options": [],
+                }
+                provider = Mock()
+                provider.complete.return_value = SimpleNamespace(text=json.dumps({
+                    "reviews": [{
+                        "action_index": 0,
+                        "decision": "direct_answer",
+                        "selected_value": selected,
+                        "evidence_quote": quote,
+                        "reason": "candidate value",
+                    }],
+                }))
+                payload = json.dumps({
+                    "actions": [{"type": "answer_pending", "answer": source}],
+                    "semantic_units": [{
+                        "unit_id": "unit-1",
+                        "clause_id": "clause-1",
+                        "source_text": source,
+                        "disposition": "action",
+                        "action_indexes": [0],
+                    }],
+                })
+
+                result, changed = _adjudicate_manual_pending_answers(
+                    provider, payload, state, source
+                )
+                document = json.loads(result)
+
+                self.assertTrue(changed)
+                self.assertEqual(document["actions"], [])
+                self.assertEqual(document["semantic_units"][0]["disposition"], "unresolved")
+
+    def test_prose_wrapped_endpoint_compiles_through_declared_owner(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_pending_action_ownership
+        from agent.harness.state import new_state
+
+        source = "Use https://rpc.example.test only to validate this method."
+        clauses = segment_user_turn(source)
+        state = new_state("manual-rpc-endpoint", language="en")
+        state["pending_question"] = {
+            "id": "custom_rpc_endpoint",
+            "group": "endpoint_process",
+            "kind": "url",
+            "field": "custom_rpc_endpoint",
+            "prompt": "Provide a reachable RPC endpoint.",
+            "manual_input_allowed": True,
+            "accepted_action_types": ["rpc_catalog_command"],
+            "manual_action": {
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_endpoint",
+                "value_argument": "rpc_endpoint",
+            },
+            "options": [],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "reviews": [{
+                "action_index": 0,
+                "decision": "direct_answer",
+                "selected_value": "https://rpc.example.test",
+                "evidence_quote": "https://rpc.example.test",
+                "reason": "the source directly supplies the endpoint",
+            }],
+        }))
+        payload = {
+            "actions": [{"type": "answer_pending", "answer": source}],
+            "semantic_units": [_unit(clauses[0], 1, [0])],
+        }
+
+        result, changed = _adjudicate_pending_action_ownership(
+            provider, json.dumps(payload), state, source
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(json.loads(result)["actions"], [{
+            "type": "rpc_catalog_command",
+            "catalog_command": "set_endpoint",
+            "rpc_endpoint": "https://rpc.example.test",
+            "source_evidence": "https://rpc.example.test",
+        }])
+
+    def test_generic_resume_is_not_compiled_by_manual_domain_owner(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_pending_action_ownership
+        from agent.harness.state import new_state
+
+        source = "Return to the current benchmark setup."
+        clauses = segment_user_turn(source)
+        state = new_state("manual-owner-resume", language="en")
+        state["pending_question"] = {
+            "id": "custom_rpc_endpoint",
+            "group": "endpoint_process",
+            "kind": "url",
+            "field": "custom_rpc_endpoint",
+            "prompt": "Provide a reachable RPC endpoint.",
+            "manual_input_allowed": True,
+            "manual_action": {
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_endpoint",
+                "value_argument": "rpc_endpoint",
+            },
+            "options": [],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "reviews": [{
+                "action_index": 0,
+                "decision": "generic_resume",
+                "selected_value": None,
+                "evidence_quote": source,
+                "reason": "the source requests generic workflow resumption",
+            }],
+        }))
+        payload = {
+            "actions": [{"type": "answer_pending", "answer": source}],
+            "semantic_units": [_unit(clauses[0], 1, [0])],
+        }
+
+        result, changed = _adjudicate_pending_action_ownership(
+            provider, json.dumps(payload), state, source
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(json.loads(result)["actions"], [{
+            "type": "resume_current_flow",
+            "source_evidence": source,
+        }])
+
+    def test_manual_pending_review_schema_requires_one_selected_value_receipt(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _request_manual_pending_reviews
+
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps({
+                "reviews": [{
+                    "action_index": 0,
+                    "decision": "direct_answer",
+                    "evidence_quote": "asia-east1",
+                    "reason": "missing selected value",
+                }],
+            })),
+            SimpleNamespace(text=json.dumps({
+                "reviews": [
+                    {
+                        "action_index": 0,
+                        "decision": "direct_answer",
+                        "selected_value": "asia-east1",
+                        "evidence_quote": "asia-east1",
+                        "reason": "duplicate one",
+                    },
+                    {
+                        "action_index": 0,
+                        "decision": "direct_answer",
+                        "selected_value": "asia-east1",
+                        "evidence_quote": "asia-east1",
+                        "reason": "duplicate two",
+                    },
+                ],
+            })),
+        ]
+
+        result = _request_manual_pending_reviews(provider, [{
+            "action_index": 0,
+            "question": "Enter CLOUD_REGION.",
+            "field": "CLOUD_REGION",
+            "kind": "manual_value",
+            "proposed_answer": "Use asia-east1.",
+            "source_units": ["Use asia-east1."],
+        }])
+
+        self.assertEqual(result, {"reviews": []})
+        self.assertEqual(provider.complete.call_count, 2)
 
     def test_manual_pending_navigation_prose_becomes_generic_resume(self) -> None:
         import json
@@ -10283,8 +10640,9 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         payload = {
             "actions": [{
                 "type": "answer_pending",
-                "answer": source,
-                "source_evidence": source,
+                "answer": "[]",
+                "selected_value": "[]",
+                "source_evidence": "params: []",
             }],
             "semantic_units": [_unit(clauses[0], 1, [0])],
             "pending_answer_admissions": [0],

@@ -275,7 +275,8 @@ def value_satisfies_pending_contract(value: Any, question: dict[str, Any]) -> bo
     if question.get("manual_input_allowed") is not True:
         return False
     validation = question.get("validation") or {}
-    if str(validation.get("value_type") or "") == "bounded_text":
+    value_type = str(validation.get("value_type") or "")
+    if value_type == "bounded_text":
         max_length = int(validation.get("max_length") or 512)
         return bool(
             len(raw) <= max_length
@@ -283,6 +284,14 @@ def value_satisfies_pending_contract(value: Any, question: dict[str, Any]) -> bo
             and "\r" not in raw
             and all(character.isprintable() for character in raw)
         )
+    if value_type in {
+        "scalar_token",
+        "positive_number",
+        "positive_integer",
+        "json",
+        "enum",
+    }:
+        return literal_matches_validation(raw, validation)
     return answer_fits_pending(raw, question)
 
 
