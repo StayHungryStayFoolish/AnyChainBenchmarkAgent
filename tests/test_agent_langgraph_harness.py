@@ -2689,6 +2689,82 @@ network:
         empty = process_turn(_empty_allowed_state("eth_fooBar=100"))
         self.assertEqual(empty["custom_rpc"]["status"], "needs_weights")
 
+    def test_weight_parser_accepts_embedded_structured_mapping_and_rejects_conflicts(self) -> None:
+        from agent.harness.input_values import parse_weight_spec
+
+        expected = {"eth_blockNumber": 65, "eth_gasPrice": 35}
+        self.assertEqual(parse_weight_spec('{"eth_blockNumber":65,"eth_gasPrice":35}'), expected)
+        self.assertEqual(
+            parse_weight_spec('Use these weights:\n```json\n{"eth_blockNumber":65,"eth_gasPrice":35}\n```'),
+            expected,
+        )
+        self.assertEqual(
+            parse_weight_spec('Review this JSON: {"weights":{"eth_blockNumber":"65","eth_gasPrice":35}}'),
+            expected,
+        )
+        self.assertEqual(parse_weight_spec("eth_blockNumber: 65\neth_gasPrice: 35"), expected)
+        self.assertEqual(parse_weight_spec("eth_blockNumber=65,eth_gasPrice=35"), expected)
+        self.assertEqual(
+            parse_weight_spec(
+                '{"eth_blockNumber":65,"eth_gasPrice":35}\n'
+                '{"eth_blockNumber":50,"eth_gasPrice":50}'
+            ),
+            {},
+        )
+        self.assertEqual(parse_weight_spec('{"eth_blockNumber":true,"eth_gasPrice":35}'), {})
+
+    def test_case1_and_case2_weights_accept_fenced_json_through_shared_domain(self) -> None:
+        from agent.harness.domains.chain_rpc import apply_chain_rpc_answer
+        from agent.harness.domains.rpc_catalog import migrate_legacy_catalog
+        from agent.harness.state import new_state
+
+        def apply(state: dict, question_id: str) -> dict:
+            state["pending_question"] = {
+                "id": question_id,
+                "group": "endpoint_process",
+                "kind": "manual_value",
+                "field": question_id,
+                "manual_input_allowed": True,
+                "validation": {"input_mode": "rpc_weights"},
+            }
+            answer = 'Use these weights:\n```json\n{"eth_blockNumber":65,"eth_gasPrice":35}\n```'
+            outcome = apply_chain_rpc_answer(state, state["pending_question"], answer, answer)
+            return _commit_result(state, outcome, owner="chain_rpc")
+
+        case1 = new_state("case1-json-weights", language="en")
+        case1["target_mode"] = "real-node"
+        case1["workflow_mode"] = "rpc_benchmark"
+        case1["chain_identity"] = {"canonical": "bsc", "status": "confirmed", "case": "known"}
+        case1["custom_rpc"] = {
+            "status": "needs_weights",
+            "scope": "mixed_replace",
+            "validated_methods": [
+                {"method": "eth_blockNumber", "params": []},
+                {"method": "eth_gasPrice", "params": []},
+            ],
+        }
+        migrate_legacy_catalog(case1)
+        case1 = apply(case1, "custom_rpc_weights")
+        self.assertEqual(case1["workload"]["mixed_weights"], {"eth_blockNumber": 65, "eth_gasPrice": 35})
+
+        case2 = new_state("case2-json-weights", language="en")
+        case2["target_mode"] = "real-node"
+        case2["workflow_mode"] = "rpc_benchmark"
+        case2["chain_identity"] = {
+            "canonical": "flow-evm",
+            "adapter_family": "jsonrpc",
+            "status": "existing_family_needs_weights",
+            "case": "case2",
+            "workload_scope": "mixed_replace",
+            "validated_methods": [
+                {"method": "eth_blockNumber", "params": []},
+                {"method": "eth_gasPrice", "params": []},
+            ],
+        }
+        migrate_legacy_catalog(case2)
+        case2 = apply(case2, "new_chain_custom_weights")
+        self.assertEqual(case2["workload"]["mixed_weights"], {"eth_blockNumber": 65, "eth_gasPrice": 35})
+
     def test_qps_override_rejects_invalid_values(self) -> None:
         """QPS override values must be validated: positive integers, MAX >= INITIAL.
 

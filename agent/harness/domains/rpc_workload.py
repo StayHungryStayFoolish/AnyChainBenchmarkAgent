@@ -89,7 +89,7 @@ def _apply_weights(state: AgentGraphState, question_id: str, value: Any) -> None
     language = state.get("language", "en")
     if not weights:
         case_dict["status"] = "existing_family_needs_weights" if case == "new_chain" else "needs_weights"
-        _set_control(state, 'visible_response', [localized(language, "没有识别到有效权重。请使用 `method=weight,method2=weight2` 格式。", "No valid weights were found. Use `method=weight,method2=weight2` format.")])
+        _set_control(state, 'visible_response', [localized(language, "没有识别到唯一且有效的权重映射。请使用 JSON/YAML 映射或 `method=weight,method2=weight2`，并确保没有相互冲突的多份映射。", "No unique valid weight mapping was found. Use a JSON/YAML mapping or `method=weight,method2=weight2`, and do not provide conflicting mappings.")])
         return
     total = sum(weights.values())
     missing, unknown, invalid = _weight_contract_violations(

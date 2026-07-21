@@ -547,8 +547,8 @@ def _weights_question(state: AgentGraphState, case: str) -> dict[str, Any]:
         question_id,
         localized(
             state.get("language", "en"),
-            f"请输入{'新链 ' if case == 'new_chain' else ''}mixed 权重，总和必须为 100。{'已验证' if case == 'new_chain' else '可用'} methods：{', '.join(methods) or '<none>'}。格式示例：`{example}`。",
-            f"Enter mixed weights{' for the new chain' if case == 'new_chain' else ''}. The total must be 100. {'Validated' if case == 'new_chain' else 'Available'} methods: {', '.join(methods) or '<none>'}. Example: `{example}`.",
+            f"请输入{'新链 ' if case == 'new_chain' else ''}mixed 权重，总和必须为 100。{'已验证' if case == 'new_chain' else '可用'} methods：{', '.join(methods) or '<none>'}。可使用 JSON/YAML 映射或 `{example}`。",
+            f"Enter mixed weights{' for the new chain' if case == 'new_chain' else ''}. The total must be 100. {'Validated' if case == 'new_chain' else 'Available'} methods: {', '.join(methods) or '<none>'}. Use a JSON/YAML mapping or `{example}`.",
         ),
         field=question_id,
         validation={"input_mode": "rpc_weights"},

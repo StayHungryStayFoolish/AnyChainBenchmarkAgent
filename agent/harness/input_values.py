@@ -305,22 +305,19 @@ def parse_weight_spec(value: Any) -> dict[str, int]:
         parsed = json.loads(text)
     except json.JSONDecodeError:
         parsed = None
-    if isinstance(parsed, dict) and isinstance(parsed.get("weights"), dict):
-        parsed = parsed["weights"]
-    if isinstance(parsed, dict):
-        output: dict[str, int] = {}
-        for key, item in parsed.items():
-            method = str(key).strip()
-            if not method or isinstance(item, bool):
-                return {}
-            if isinstance(item, int):
-                output[method] = item
-                continue
-            item_text = str(item).strip()
-            if not re.fullmatch(r"[+-]?[0-9]+", item_text):
-                return {}
-            output[method] = int(item_text)
-        return output
+    direct = _weight_mapping(parsed)
+    if direct is not None:
+        return direct
+
+    embedded: list[dict[str, int]] = []
+    for candidate in extract_json_values(text):
+        weights = _weight_mapping(candidate)
+        if weights is not None and weights not in embedded:
+            embedded.append(weights)
+    if len(embedded) == 1:
+        return embedded[0]
+    if len(embedded) > 1:
+        return {}
     output = {}
     pairs = re.findall(
         r"(?<![A-Za-z0-9_./:-])([A-Za-z][A-Za-z0-9_./:-]*)\s*(?:=|:)\s*([+-]?[0-9]+)\s*(?=$|[,，\n\r])",
@@ -343,6 +340,30 @@ def parse_weight_spec(value: Any) -> dict[str, int]:
             output[method] = int(weight.strip())
         except ValueError:
             return {}
+    return output
+
+
+def _weight_mapping(value: Any) -> dict[str, int] | None:
+    """Normalize one complete JSON weight mapping without applying policy."""
+
+    if not isinstance(value, dict):
+        return None
+    if set(value) == {"weights"} and isinstance(value.get("weights"), dict):
+        value = value["weights"]
+    if not value:
+        return None
+    output: dict[str, int] = {}
+    for key, item in value.items():
+        method = str(key).strip()
+        if not method or isinstance(item, bool):
+            return None
+        if isinstance(item, int):
+            output[method] = item
+            continue
+        item_text = str(item).strip()
+        if not re.fullmatch(r"[+-]?[0-9]+", item_text):
+            return None
+        output[method] = int(item_text)
     return output
 
 
