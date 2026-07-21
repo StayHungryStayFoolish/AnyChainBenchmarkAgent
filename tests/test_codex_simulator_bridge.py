@@ -62,6 +62,34 @@ class StdioCodexSimulatorTest(unittest.TestCase):
             content_hash(context.previous_agent_response),
         )
         self.assertEqual(payload["scheduled_target"]["edge_key"], "opening::fake-node")
+        contract = payload["decision_contract"]
+        self.assertEqual(contract["frame_prefix"], DECISION_FRAME)
+        self.assertEqual(contract["response_binding_key"], "previous_response_hash")
+        self.assertEqual(
+            contract["response_binding_value"],
+            content_hash(context.previous_agent_response),
+        )
+        self.assertEqual(contract["immutable_persona"], context.scheduled_target.persona)
+        self.assertEqual(contract["immutable_goal"], context.scheduled_target.goal)
+        self.assertEqual(
+            contract["decision_template"]["previous_response_hash"],
+            content_hash(context.previous_agent_response),
+        )
+        self.assertEqual(
+            contract["decision_template"]["target_coverage_ids"],
+            [context.scheduled_target.edge_key],
+        )
+        self.assertEqual(
+            set(contract["required_keys"]),
+            {
+                "previous_response_hash",
+                "user_message",
+                "persona",
+                "goal",
+                "rationale",
+                "target_coverage_ids",
+            },
+        )
         self.assertEqual(decision.user_message, "I just want a safe check without a real node.")
         self.assertEqual(decision.target_coverage_ids, ("opening::fake-node",))
 

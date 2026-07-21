@@ -40,6 +40,15 @@ class StdioCodexSimulator:
 
     def __call__(self, context: SimulatorContext) -> SimulatorDecision:
         response_hash = content_hash(context.previous_agent_response)
+        target = context.scheduled_target
+        decision_template = {
+            "previous_response_hash": response_hash,
+            "user_message": "<one dynamically selected user message>",
+            "persona": target.persona,
+            "goal": target.goal,
+            "rationale": "<why this message follows from the complete Agent response>",
+            "target_coverage_ids": [target.edge_key],
+        }
         payload = {
             "schema_version": 1,
             "session_id": context.session_id,
@@ -49,6 +58,24 @@ class StdioCodexSimulator:
             "previous_response_received_at_ns": context.previous_response_received_at_ns,
             "scheduled_target": asdict(context.scheduled_target),
             "transcript": [list(item) for item in context.transcript],
+            "decision_contract": {
+                "frame_prefix": DECISION_FRAME,
+                "schema_version": 1,
+                "required_keys": list(decision_template),
+                "response_binding_key": "previous_response_hash",
+                "response_binding_value": response_hash,
+                "immutable_persona": target.persona,
+                "immutable_goal": target.goal,
+                "coverage_rule": (
+                    "Declare only coverage IDs genuinely demanded by user_message; "
+                    "the scheduled edge must remain among them."
+                ),
+                "output_rule": (
+                    "Write exactly one line beginning with frame_prefix followed by "
+                    "one JSON object; do not write plain user prose or Markdown."
+                ),
+                "decision_template": decision_template,
+            },
         }
         self.output_stream.write(CONTEXT_FRAME + json.dumps(payload, ensure_ascii=False) + "\n")
         self.output_stream.flush()
@@ -67,7 +94,6 @@ class StdioCodexSimulator:
         if str(decision.get("previous_response_hash") or "") != response_hash:
             raise RuntimeError("external Codex simulator decision references a stale Agent response")
 
-        target = context.scheduled_target
         return SimulatorDecision(
             user_message=_required_text(decision, "user_message"),
             persona=_required_text(decision, "persona"),
