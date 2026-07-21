@@ -8984,6 +8984,129 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
             "source_evidence": "Add a custom RPC method",
         }])
 
+    def test_pending_option_reviews_context_labeled_choice_and_rationale(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.state import new_state
+
+        source = (
+            "Use the fake-node option for this run. "
+            "I want to validate the complete framework loop before connecting a real endpoint."
+        )
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [],
+            "semantic_units": [
+                self._unit(clauses[0], "unit-choice", [], disposition="context"),
+                self._unit(clauses[1], "unit-purpose", [], disposition="context"),
+            ],
+        }
+        state = new_state("pending-context-choice", language="en")
+        state["pending_question"] = {
+            "id": "target_mode_select",
+            "group": "entry_mode",
+            "prompt": "Choose the target mode.",
+            "manual_input_allowed": False,
+            "accepted_action_types": ["choose_target_mode"],
+            "options": [{
+                "id": "fake-node",
+                "label": "fake-node",
+                "value": "fake-node",
+                "action": {
+                    "type": "choose_target_mode",
+                    "target_mode": "fake-node",
+                    "target_mode_explicit": True,
+                },
+            }],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "decision": "select_option",
+            "option_id": "fake-node",
+            "answer": "",
+            "evidence_quote": "Use the fake-node option",
+            "supporting_unit_ids": ["unit-choice", "unit-purpose"],
+            "independent_unit_ids": [],
+            "reason": "the first unit selects the option and the second explains its purpose",
+        }))
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider, json.dumps(payload), state, clauses=clauses, user_text=source
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertEqual([item["type"] for item in recovered["actions"]], ["choose_target_mode"])
+        self.assertEqual(recovered["actions"][0]["target_mode"], "fake-node")
+        self.assertEqual(recovered["semantic_units"][0]["disposition"], "action")
+        self.assertEqual(recovered["semantic_units"][1]["disposition"], "context")
+
+    def test_pending_option_preserves_independent_context_labeled_request(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.state import new_state
+
+        source = "Use fake-node for this run. Also change the QPS profile to quick."
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "set_qps_mode",
+                "qps_mode": "quick",
+                "mutation_explicit": True,
+                "source_evidence": "change the QPS profile to quick",
+            }],
+            "semantic_units": [
+                self._unit(clauses[0], "unit-choice", [], disposition="context"),
+                self._unit(clauses[1], "unit-qps", [0], disposition="action"),
+            ],
+        }
+        state = new_state("pending-context-sibling", language="en")
+        state["pending_question"] = {
+            "id": "target_mode_select",
+            "group": "entry_mode",
+            "prompt": "Choose the target mode.",
+            "manual_input_allowed": False,
+            "accepted_action_types": ["choose_target_mode"],
+            "options": [{
+                "id": "fake-node",
+                "label": "fake-node",
+                "value": "fake-node",
+                "action": {
+                    "type": "choose_target_mode",
+                    "target_mode": "fake-node",
+                    "target_mode_explicit": True,
+                },
+            }],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "decision": "select_option",
+            "option_id": "fake-node",
+            "answer": "",
+            "evidence_quote": "Use fake-node",
+            "supporting_unit_ids": ["unit-choice"],
+            "independent_unit_ids": ["unit-qps"],
+            "reason": "the mode selection and QPS mutation are independent",
+        }))
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider, json.dumps(payload), state, clauses=clauses, user_text=source
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            [item["type"] for item in recovered["actions"]],
+            ["set_qps_mode", "choose_target_mode"],
+        )
+        self.assertEqual(recovered["semantic_units"][1]["action_indexes"], [0])
+
     def test_declared_pending_owner_replaces_competing_effect_and_keeps_independent_sibling(self) -> None:
         import json
         from types import SimpleNamespace

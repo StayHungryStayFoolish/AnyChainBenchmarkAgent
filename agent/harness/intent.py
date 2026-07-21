@@ -906,10 +906,14 @@ def _recover_declared_pending_option_semantics(
         if not isinstance(unit, dict):
             continue
         indexes = unit.get("action_indexes") if isinstance(unit.get("action_indexes"), list) else []
+        if any(
+            isinstance(index, int) and index in preexisting_admitted_indexes
+            for index in indexes
+        ):
+            continue
         clarification_owned = any(
             isinstance(index, int)
             and 0 <= index < len(actions)
-            and index not in preexisting_admitted_indexes
             and isinstance(actions[index], dict)
             and str(actions[index].get("type") or "") == "clarify_unresolved"
             for index in indexes
@@ -917,17 +921,8 @@ def _recover_declared_pending_option_semantics(
         pending_owned = any(
             isinstance(index, int)
             and 0 <= index < len(actions)
-            and index not in preexisting_admitted_indexes
             and isinstance(actions[index], dict)
             and _action_requires_pending_owner(actions[index], state, pending, options)
-            for index in indexes
-        )
-        grounded_action = any(
-            isinstance(index, int)
-            and 0 <= index < len(actions)
-            and isinstance(actions[index], dict)
-            and bool(str(actions[index].get("source_evidence") or "").strip())
-            and str(actions[index].get("source_evidence") or "").strip() in str(unit.get("source_text") or "")
             for index in indexes
         )
         mapped_mutation = any(
@@ -938,19 +933,8 @@ def _recover_declared_pending_option_semantics(
             and bool(ACTION_BY_TYPE[str(actions[index].get("type") or "")].mutation_dimension)
             for index in indexes
         )
-        # A source-grounded mutation is not automatically entitled to cross an
-        # active pending contract. Its evidence may merely mention a current
-        # mode/group while supplying the value owned by that contract. Route
-        # every unadmitted durable mutation through the complete-turn owner
-        # arbitration; that boundary can preserve a genuinely independent
-        # jump and discard supporting context without either domain competing
-        # for the same source span.
         pending_owner_arbitration = (
             mapped_mutation
-            and not any(
-                isinstance(index, int) and index in preexisting_admitted_indexes
-                for index in indexes
-            )
             and not any(
                 isinstance(index, int)
                 and 0 <= index < len(actions)
@@ -959,8 +943,15 @@ def _recover_declared_pending_option_semantics(
                 for index in indexes
             )
         )
+        disposition = str(unit.get("disposition") or "")
+        # The active pending contract owns admission for planner context as
+        # well as unresolved or competing mutations. A planner may label an
+        # explicit option and its rationale as context; allowing that label to
+        # bypass this boundary leaves a displayed choice without an executable
+        # path. Normal typed actions still proceed to their dedicated admission
+        # owners, avoiding a second controller for an already mapped effect.
         if (
-            str(unit.get("disposition") or "") != "unresolved"
+            disposition not in {"unresolved", "context"}
             and not any(index in invalid_indexes for index in indexes)
             and str(unit.get("unit_id") or "") not in (
                 validation.incomplete_unit_ids if validation else ()
