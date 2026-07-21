@@ -8,7 +8,7 @@ from typing import Any
 
 from agent.knowledge.chain_identity import canonicalize_chain_scalar, repo_chain_names
 from .contracts import ActionProposal, OptionContract, QuestionContract
-from .input_values import extract_json_values, looks_like_wire_method_identity, parse_weight_spec
+from .input_values import has_rpc_wire_evidence, looks_like_wire_method_identity, parse_weight_spec
 from .localization import localized
 
 
@@ -418,28 +418,8 @@ def _is_structured_evidence_literal(value: Any, *, allow_params_only: bool = Fal
         lines = candidate.splitlines()
         if len(lines) >= 3:
             candidate = "\n".join(lines[1:-1]).strip()
-    try:
-        parsed = json.loads(candidate)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        parsed = None
-    if isinstance(parsed, list):
-        return allow_params_only
-    if isinstance(parsed, dict) and (
-        {"method", "params"}.issubset(parsed)
-        or "result" in parsed
-        or "error" in parsed
-    ):
+    if has_rpc_wire_evidence(candidate, allow_params_only=allow_params_only):
         return True
-    # A pasted request is still deterministic wire evidence when it is
-    # surrounded by explanatory prose. Parse the embedded value instead of
-    # treating the prose itself as a pending-question answer.
-    for embedded in extract_json_values(candidate):
-        if isinstance(embedded, dict) and (
-            {"method", "params"}.issubset(embedded)
-            or "result" in embedded
-            or "error" in embedded
-        ):
-            return True
     first_line = candidate.splitlines()[0].strip().casefold()
     return first_line == "curl" or first_line.startswith("curl ")
 

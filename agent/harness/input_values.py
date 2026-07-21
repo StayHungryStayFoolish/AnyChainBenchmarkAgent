@@ -6,6 +6,8 @@ import json
 import re
 from typing import Any
 
+import yaml
+
 
 def normalize_scalar(value: Any) -> str:
     """Trim one scalar using the Harness answer contract."""
@@ -180,6 +182,89 @@ def extract_json_values(value: Any) -> list[Any]:
     return output
 
 
+_RPC_WIRE_KEYS = frozenset({"request", "response", "method", "jsonrpc", "params", "result", "error"})
+
+
+def extract_rpc_wire_values(value: Any) -> list[Any]:
+    """Decode source-exact JSON/YAML wire documents embedded in one turn.
+
+    This parser establishes syntax ownership only. It does not decide whether
+    the user wants to configure a method, and it never mutates workflow state.
+    """
+
+    text = str(value or "").strip()
+    if not text:
+        return []
+    output = list(extract_json_values(text))
+    yaml_candidates: list[str] = [text]
+    yaml_candidates.extend(
+        match.group(1).strip()
+        for match in re.finditer(r"```(?:ya?ml)?\s*\n(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+        if match.group(1).strip()
+    )
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line != line.lstrip() or ":" not in line:
+            continue
+        key = line.split(":", 1)[0].strip().strip("\"'").casefold()
+        if key in _RPC_WIRE_KEYS:
+            yaml_candidates.append("\n".join(lines[index:]).strip())
+            break
+    for candidate in yaml_candidates:
+        if not candidate or candidate[0] in "[{":
+            continue
+        try:
+            parsed = yaml.safe_load(candidate)
+        except yaml.YAMLError:
+            continue
+        if isinstance(parsed, (dict, list)) and parsed not in output:
+            output.append(parsed)
+    return output
+
+
+def _rpc_wire_payloads(value: Any) -> list[Any]:
+    payloads: list[Any] = []
+    for document in extract_rpc_wire_values(value):
+        payloads.append(document)
+        if isinstance(document, dict):
+            for key in ("request", "response"):
+                nested = document.get(key)
+                if isinstance(nested, (dict, list)):
+                    payloads.append(nested)
+    return payloads
+
+
+def has_rpc_wire_evidence(value: Any, *, allow_params_only: bool = False) -> bool:
+    """Return whether one turn contains an attributable RPC wire fact."""
+
+    for payload in _rpc_wire_payloads(value):
+        if isinstance(payload, list):
+            if allow_params_only:
+                return True
+            continue
+        if not isinstance(payload, dict):
+            continue
+        keys = {str(key).casefold() for key in payload}
+        if {"method", "params"}.issubset(keys) or "result" in keys or "error" in keys:
+            return True
+        if allow_params_only and keys and keys.issubset({"params", "arguments", "args"}):
+            params = next(iter(payload.values()))
+            if isinstance(params, (list, dict)):
+                return True
+    return False
+
+
+def has_rpc_response_evidence(value: Any) -> bool:
+    """Return whether one turn contains a response object, not only a request."""
+
+    return any(
+        isinstance(payload, dict)
+        and any(str(key).casefold() in {"result", "error"} for key in payload)
+        and not any(str(key).casefold() == "method" for key in payload)
+        for payload in _rpc_wire_payloads(value)
+    )
+
+
 def extract_json_object_or_array(value: Any) -> str:
     """Return the first outer JSON object/array substring in user input."""
 
@@ -220,38 +305,24 @@ def declares_no_rpc_params(value: Any) -> bool:
 
 
 def extract_rpc_params_or_request(value: Any) -> tuple[str, Any | None]:
-    """Extract a JSON-RPC method and params, including from pasted request text."""
+    """Extract a JSON-RPC method and params from JSON/YAML request text."""
 
     text = str(value or "").strip()
     if not text:
         return "", None
     if declares_no_rpc_params(text):
         return "", []
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        parsed = None
-        for candidate in extract_json_values(text):
-            if isinstance(candidate, dict) and "params" in candidate and (
-                "method" in candidate or "jsonrpc" in candidate
-            ):
-                parsed = candidate
-                break
-            if isinstance(candidate, list):
-                parsed = candidate
-                break
-        if parsed is None:
-            return "", None
-    if isinstance(parsed, dict) and "params" in parsed and (
-        "method" in parsed or "jsonrpc" in parsed
-    ):
-        params = parsed.get("params")
-        return normalize_scalar(parsed.get("method")), params if isinstance(params, (list, dict)) else None
-    if isinstance(parsed, list):
-        return "", parsed
-    if isinstance(parsed, dict) and set(parsed).issubset({"params", "arguments", "args"}):
-        params = parsed.get("params", parsed.get("arguments", parsed.get("args")))
-        return "", params if isinstance(params, (list, dict)) else None
+    for parsed in _rpc_wire_payloads(text):
+        if isinstance(parsed, dict) and "params" in parsed and (
+            "method" in parsed or "jsonrpc" in parsed
+        ):
+            params = parsed.get("params")
+            return normalize_scalar(parsed.get("method")), params if isinstance(params, (list, dict)) else None
+        if isinstance(parsed, list):
+            return "", parsed
+        if isinstance(parsed, dict) and set(parsed).issubset({"params", "arguments", "args"}):
+            params = parsed.get("params", parsed.get("arguments", parsed.get("args")))
+            return "", params if isinstance(params, (list, dict)) else None
     return "", None
 
 

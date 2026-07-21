@@ -16,3 +16,4 @@ langgraph
 langgraph-checkpoint-sqlite
 openai
 prompt-toolkit
+PyYAML

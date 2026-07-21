@@ -6983,6 +6983,88 @@ network:
         self.assertIn("encoding=20-byte hex", prompt)
         self.assertEqual(state["pending_question"]["id"], "custom_rpc_parameter_confirm")
 
+    def test_yaml_rpc_exchange_uses_the_declared_evidence_contract(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.domains.chain_rpc import question_for_chain_rpc
+        from agent.harness.state import new_state
+
+        state = new_state("yaml-rpc-evidence", language="en")
+        state["target_mode"] = "real-node"
+        state["workflow_mode"] = "rpc_benchmark"
+        state["active_group"] = "endpoint_process"
+        state["chain_identity"] = {
+            "raw": "ethereum",
+            "canonical": "ethereum",
+            "adapter_family": "jsonrpc",
+            "status": "confirmed",
+            "case": "known",
+        }
+        state["custom_rpc"] = {
+            "status": "needs_schema_evidence",
+            "endpoint": "https://example.invalid/rpc",
+            "endpoint_ready": True,
+            "method": "eth_blockNumber",
+        }
+        state["pending_question"] = question_for_chain_rpc(state, "endpoint_process")
+        evidence = """Verify this wire exchange:
+request:
+  jsonrpc: "2.0"
+  id: 1
+  method: eth_blockNumber
+  params: []
+response:
+  jsonrpc: "2.0"
+  id: 1
+  result: '0x10'
+"""
+        extracted = {
+            "status": "draft",
+            "method": "eth_blockNumber",
+            "params": [],
+            "params_json": [],
+            "response_summary": "hex block number",
+            "response_fields": [{"name": "result", "json_type": "string", "meaning": "block number"}],
+            "confidence": "high",
+        }
+        with patch("agent.harness.domains.rpc_endpoint.extract_rpc_schema_from_evidence", return_value=extracted):
+            state["last_user_input"] = evidence
+            result = process_turn(state)
+
+        self.assertEqual((result["custom_rpc"]["catalog"]["last_transition"])["command"], "correct_draft")
+        self.assertIn(
+            result["pending_question"]["id"],
+            {"custom_rpc_parameter_confirm", "custom_rpc_schema_confirm", "custom_rpc_response_confirm"},
+        )
+        self.assertNotIn("clarify_unresolved", result.get("turn_context", {}).get("admitted_action_types", []))
+
+    def test_rpc_wire_syntax_authority_rejects_unrelated_yaml_and_logs(self) -> None:
+        from agent.harness.input_values import (
+            extract_rpc_params_or_request,
+            has_rpc_response_evidence,
+            has_rpc_wire_evidence,
+        )
+
+        exchange = """request:
+  jsonrpc: "2.0"
+  id: 1
+  method: eth_getBalance
+  params:
+    - "0x0000000000000000000000000000000000000000"
+    - latest
+response:
+  jsonrpc: "2.0"
+  id: 1
+  result: '0x0'
+"""
+        method, params = extract_rpc_params_or_request(exchange)
+        self.assertEqual(method, "eth_getBalance")
+        self.assertEqual(params, ["0x0000000000000000000000000000000000000000", "latest"])
+        self.assertTrue(has_rpc_wire_evidence(exchange))
+        self.assertTrue(has_rpc_response_evidence(exchange))
+        self.assertFalse(has_rpc_wire_evidence("CLOUD_REGION: us-east1\nMACHINE_TYPE: n2-standard-8"))
+        self.assertFalse(has_rpc_wire_evidence("worker log: method failed and result was unavailable"))
+        self.assertFalse(has_rpc_wire_evidence("method: eth_blockNumber"))
+
     def test_split_request_and_response_evidence_are_merged_before_confirmation(self) -> None:
         from agent.harness.domains.chain_rpc import apply_chain_rpc_answer
         from agent.harness.state import new_state

@@ -9,6 +9,7 @@ from ..failures import build_failure_record
 from ..input_values import (
     extract_json_object_or_array,
     extract_json_values,
+    has_rpc_response_evidence,
     extract_rpc_params_or_request,
     extract_url_candidate,
     looks_like_url_value,
@@ -404,13 +405,7 @@ def _request_only_schema_evidence(fragments: list[str], method: str) -> bool:
             continue
         if canonical_method and clean == canonical_method:
             continue
-        json_values = extract_json_values(clean)
-        if any(
-            isinstance(item, dict)
-            and ("result" in item or "error" in item)
-            and "method" not in item
-            for item in json_values
-        ):
+        if has_rpc_response_evidence(clean):
             return False
         parsed_method, params = extract_rpc_params_or_request(clean)
         if params is not None and (not canonical_method or not parsed_method or parsed_method == canonical_method):
