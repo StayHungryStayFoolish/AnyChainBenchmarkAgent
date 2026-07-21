@@ -7884,17 +7884,40 @@ class PlanCoverageTest(unittest.TestCase):
             "chain_selection_admissions": [0],
         }
         provider = Mock()
-        provider.complete.return_value = SimpleNamespace(text=json.dumps({
-            "reviews": [{
-                "action_index": 1,
-                "supported": True,
-                "reason": "the mapped value is source grounded",
-            }],
-            "unit_reviews": [
+        source_reviews = [
+            {
+                "source_text": clauses[0].text,
+                "role": "support",
+                "support_relation": "provenance",
+                "reason": "deployment-note provenance",
+            },
+            {
+                "source_text": clauses[1].text,
+                "role": "direct",
+                "support_relation": "",
+                "reason": "source-grounded operation",
+            },
+        ]
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps({"reviews": [
+                {
+                    "action_index": 0,
+                    "supported": True,
+                    "source_unit_reviews": source_reviews,
+                    "reason": "the chain selection is source grounded",
+                },
+                {
+                    "action_index": 1,
+                    "supported": True,
+                    "source_unit_reviews": source_reviews,
+                    "reason": "the mapped value is source grounded",
+                },
+            ]})),
+            SimpleNamespace(text=json.dumps({"unit_reviews": [
                 {"unit_id": "unit-1", "complete": True, "reason": "framing"},
                 {"unit_id": "unit-2", "complete": True, "reason": "facts preserved"},
-            ],
-        }))
+            ]})),
+        ]
 
         result = _validate_semantic_fulfillment(
             provider,
@@ -8613,12 +8636,14 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         provider = self._provider([
             {
                 "unit_id": f"unit-{index}",
-                "disposition": "turn_local_action",
+                "disposition": "registered_action",
                 "group": "",
                 "existing_action_index": None,
                 "target_mode": "",
                 "consultation_topic": "",
-                "turn_local_action_type": "analyze_evidence",
+                "registered_action_type": "analyze_evidence",
+                "support_relation": "",
+                "scope_constraint": "",
                 "evidence_quote": clause.text,
                 "reason": "the source is execution evidence",
             }
@@ -8646,13 +8671,25 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         self.assertEqual(recovered["actions"], [{"type": "analyze_evidence", "evidence": user_text}])
         self.assertTrue(all(unit["action_indexes"] == [0] for unit in recovered["semantic_units"]))
         request_payload = json.loads(provider.complete.call_args.args[0].messages[1].content)
+        analyze_contract = next(
+            item
+            for item in request_payload["recoverable_registered_actions"]
+            if item["type"] == "analyze_evidence"
+        )
         self.assertEqual(
-            request_payload["recoverable_turn_local_actions"],
-            [{
+            analyze_contract,
+            {
                 "type": "analyze_evidence",
                 "purpose": "Analyze pasted or previously collected logs/errors/evidence without becoming a deferred workflow command.",
                 "source_argument": "evidence",
-            }],
+                "effect": "read_only",
+                "support_relations": [
+                    "explanatory_context",
+                    "provenance",
+                    "format_scope",
+                    "temporal_scope",
+                ],
+            },
         )
 
     def test_read_only_workload_question_stays_consultation(self) -> None:

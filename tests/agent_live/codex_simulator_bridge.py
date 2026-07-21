@@ -45,6 +45,16 @@ def _input_generation_rule(contract: Mapping[str, Any]) -> str:
             "JSON, YAML, env, shell, curl, or mixed configuration block. It must not ask "
             "the Agent to invent, recommend, or output that user-owned value."
         )
+    action_contract = contract.get("simulator_action_contract")
+    if isinstance(action_contract, Mapping):
+        return (
+            "The user_message must directly and consistently request the exact declared action purpose, "
+            "supply every user-selected value required by required_arguments, and remain compatible with "
+            "the declared effect and constraints. It must not substitute another domain purpose, contradict "
+            "the requested state change, or claim the scheduled coverage ID merely because the action name "
+            "sounds related. Audit this before submitting the turn. Contract: "
+            + json.dumps(dict(action_contract), ensure_ascii=False, sort_keys=True)
+        )
     return (
         "The user_message must genuinely exercise coverage_contract.input_class and "
         "supply the evidence required by its action_type and expected_postcondition."

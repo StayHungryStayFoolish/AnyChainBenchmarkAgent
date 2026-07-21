@@ -53,6 +53,45 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
         self.assertIn("job_monitoring:real_node_smoke_confirm", self.ledger["runtime_only_questions"])
         self.assertIn("job_monitoring:real_node_final_benchmark_confirm", self.ledger["runtime_only_questions"])
 
+    def test_dynamic_action_edges_expose_authoritative_simulator_contract(self) -> None:
+        from agent.harness.action_registry import ACTION_BY_TYPE
+
+        for action_type in ("queue_workflow_goal", "discard_next_workflow_goal", "change_group"):
+            with self.subTest(action_type=action_type):
+                edge = next(
+                    item
+                    for item in self.ledger["edges"]
+                    if item["edge_type"] == "action_transition"
+                    and item["action_type"] == action_type
+                )
+                spec = ACTION_BY_TYPE[action_type]
+                self.assertEqual(edge["simulator_action_contract"], {
+                    "purpose": spec.purpose,
+                    "effect": spec.effect,
+                    "allowed_arguments": list(spec.allowed_arguments),
+                    "required_arguments": list(spec.required_arguments),
+                    "constraints": list(spec.constraints),
+                })
+
+    def test_source_grounded_navigation_actions_declare_non_mutation_scope(self) -> None:
+        from agent.harness.action_registry import ACTION_SPECS
+
+        navigation = [
+            spec
+            for spec in ACTION_SPECS
+            if spec.effect == "workflow_navigation"
+            and "source_evidence" in spec.allowed_arguments
+        ]
+        self.assertTrue(navigation)
+        self.assertEqual(
+            [
+                spec.action_type
+                for spec in navigation
+                if "non_mutation_scope" not in spec.semantic_support_relations
+            ],
+            [],
+        )
+
     def test_custom_rpc_manual_edges_use_canonical_owner_and_declared_successors(self) -> None:
         expected = {
             "custom_rpc_method": (

@@ -2431,10 +2431,10 @@ def _activate_group_question(state: AgentGraphState, group: str, *, record_histo
         state["pending_question"] = {}
         state["visible_response"] = [_localized(
             state.get("language", "en"),
-            "这个配置组当前没有阻塞项。我会继续寻找下一项必须确认的配置。",
-            "This configuration group has no blocking item right now. I will continue to the next required configuration item.",
+            f"已进入 `{group}`。该配置组当前没有需要确认的阻塞项；你可以说明要修改的内容，或在下一轮继续默认配置流程。",
+            f"Entered `{group}`. This configuration group currently has no blocking item; describe what to change, or continue the default configuration flow on the next turn.",
         )]
-        state = _ask_next_blocking_question(state)
+        state["_stop_after_response"] = True
         return state
     state["_stop_after_response"] = True
     return state

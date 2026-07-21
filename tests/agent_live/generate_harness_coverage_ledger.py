@@ -915,6 +915,13 @@ def build_ledger(
             edge["semantic_support_relations"] = sorted(
                 spec.semantic_support_relations
             )
+            edge["simulator_action_contract"] = {
+                "purpose": spec.purpose,
+                "effect": spec.effect,
+                "allowed_arguments": list(spec.allowed_arguments),
+                "required_arguments": list(spec.required_arguments),
+                "constraints": list(spec.constraints),
+            }
             edges.append(edge)
             action_rows.append({
                 "action_type": spec.action_type,

@@ -266,7 +266,10 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         crosses_pending_barrier=True,
         required_arguments=("group", "navigation_explicit", "source_evidence"),
         effect="workflow_navigation",
-        semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
+        semantic_support_relations=(
+            *FRAMED_OPERATION_SUPPORT_RELATIONS,
+            "non_mutation_scope",
+        ),
         validator=_validate_group_navigation,
     ),
     ActionSpec(
@@ -280,7 +283,10 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         required_arguments=("source_evidence",),
         suppressed_by=("change_group", "go_back"),
         pending_option_semantic="continue_current_flow",
-        semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
+        semantic_support_relations=(
+            *FRAMED_OPERATION_SUPPORT_RELATIONS,
+            "non_mutation_scope",
+        ),
     ),
     ActionSpec(
         "go_back",

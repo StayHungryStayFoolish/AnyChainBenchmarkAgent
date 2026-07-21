@@ -1656,7 +1656,7 @@ network:
         self.assertFalse(result["confirmed_config"]["has_accounts_device"])
         self.assertEqual(result["pending_question"]["id"], "DATA_VOL_SIZE")
 
-    def test_jump_to_completed_group_continues_to_next_fallback_question(self) -> None:
+    def test_jump_to_empty_group_keeps_explicit_destination_visible_until_next_turn(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
         from agent.harness.state import new_state
 
@@ -1680,8 +1680,59 @@ network:
             resolver.return_value = {"actions": [{"type": "change_group", "group": "accounts_disk", "navigation_explicit": True, "source_evidence": "回到 accounts 配置", "confidence": "high"}]}
             result = process_turn(state)
 
-        self.assertIn("没有阻塞项", "\n".join(result.get("visible_response") or []))
-        self.assertEqual(result["pending_question"]["id"], "DATA_VOL_SIZE")
+        self.assertIn("`accounts_disk`", "\n".join(result.get("visible_response") or []))
+        self.assertIn("没有需要确认的阻塞项", "\n".join(result.get("visible_response") or []))
+        self.assertEqual(result["active_group"], "accounts_disk")
+        self.assertFalse(result.get("pending_question"))
+
+        result["last_user_input"] = "继续默认配置流程"
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            return_value={"actions": []},
+        ):
+            resumed = process_turn(result)
+
+        self.assertEqual(resumed["active_group"], "ledger_disk")
+        self.assertEqual(resumed["pending_question"]["id"], "DATA_VOL_SIZE")
+
+    def test_optional_endpoint_navigation_does_not_advance_fallback_in_same_turn(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("empty-auxiliary-navigation", language="en")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "active_group": "opening",
+            "chain_identity": {
+                "raw": "bsc",
+                "canonical": "bsc",
+                "status": "confirmed",
+                "case": "known",
+            },
+            "confirmed_config": {"BLOCKCHAIN_NODE": "bsc"},
+            "last_user_input": (
+                "Take me to the optional chain endpoint and credential settings "
+                "without changing any confirmed value."
+            ),
+        })
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            return_value={"actions": [{
+                "type": "change_group",
+                "group": "chain_auxiliary_endpoints",
+                "navigation_explicit": True,
+                "source_evidence": state["last_user_input"],
+                "confidence": "high",
+            }]},
+        ):
+            result = process_turn(state)
+
+        self.assertEqual(result["active_group"], "chain_auxiliary_endpoints")
+        self.assertFalse(result.get("pending_question"))
+        text = "\n".join(result.get("visible_response") or [])
+        self.assertIn("`chain_auxiliary_endpoints`", text)
+        self.assertNotIn("CLOUD_REGION", text)
 
     def test_config_proposal_rejection_does_not_mutate_confirmed_config(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
