@@ -3921,7 +3921,115 @@ def _adjudicate_pending_action_ownership(
     )
     changed = changed or step_changed
     current, step_changed = _merge_pending_manual_answer_into_config_proposal(current, state)
+    changed = changed or step_changed
+    current, step_changed = _materialize_pending_manual_owner_actions(
+        current,
+        state,
+        user_text,
+    )
     return current, changed or step_changed
+
+
+def _materialize_pending_manual_owner_actions(
+    text: str,
+    state: AgentGraphState,
+    user_text: str,
+) -> tuple[str, bool]:
+    """Compile admitted manual input through its declared domain owner.
+
+    A pending question may accept free-form input while declaring that a typed
+    domain action, rather than generic ``answer_pending``, owns the resulting
+    transaction. The question contract is trusted application state; planner
+    output cannot create or alter this template.
+    """
+
+    pending = dict(state.get("pending_question") or {})
+    template = dict(pending.get("manual_action") or {})
+    value_argument = str(template.pop("value_argument", "") or "").strip()
+    use_complete_turn = template.pop("use_complete_turn", False) is True
+    if not template or not value_argument:
+        return text, False
+
+    payload = _parse_json_object(text)
+    actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    admitted = {
+        int(index)
+        for index in payload.get("pending_answer_admissions", [])
+        if isinstance(index, int)
+        and 0 <= index < len(actions)
+        and isinstance(actions[index], dict)
+    }
+    answer_indexes = {
+        index
+        for index in admitted
+        if str(actions[index].get("type") or "") == "answer_pending"
+    }
+    if not answer_indexes:
+        return text, False
+
+    units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
+    removed: set[int] = set()
+    next_admitted = set(admitted)
+    for index in sorted(answer_indexes):
+        answer = actions[index]
+        selected = answer.get("selected_value")
+        value = selected if selected not in (None, "") else answer.get("answer")
+        if use_complete_turn:
+            value = str(user_text or "").strip()
+        candidate = {
+            **template,
+            value_argument: value,
+            "source_evidence": str(user_text or answer.get("source_evidence") or "").strip(),
+        }
+        try:
+            candidate = validate_action_contract(candidate)
+        except ValueError:
+            continue
+        identity = {
+            key: item
+            for key, item in candidate.items()
+            if key not in {"source_evidence", "confidence", "reason", "action_id"}
+        }
+        equivalent = next(
+            (
+                other_index
+                for other_index, other in enumerate(actions)
+                if other_index != index
+                and isinstance(other, dict)
+                and all(other.get(key) == item for key, item in identity.items())
+            ),
+            -1,
+        )
+        owner_index = equivalent if equivalent >= 0 else index
+        if equivalent >= 0:
+            removed.add(index)
+        else:
+            actions[index] = candidate
+        next_admitted.discard(index)
+        next_admitted.add(owner_index)
+        for unit in units:
+            if not isinstance(unit, dict):
+                continue
+            indexes = unit.get("action_indexes") if isinstance(unit.get("action_indexes"), list) else []
+            if index not in indexes:
+                continue
+            unit["action_indexes"] = list(dict.fromkeys(
+                owner_index if item == index else item for item in indexes
+            ))
+            unit["disposition"] = "action"
+            unit["reason"] = "manual pending input compiled through declared domain owner"
+
+    payload["actions"] = actions
+    payload["semantic_units"] = units
+    payload["pending_answer_admissions"] = sorted(next_admitted)
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    if removed:
+        serialized, _ = _remove_rejected_action_indexes(
+            serialized,
+            tuple(sorted(removed)),
+            reason="duplicate generic pending answer replaced by declared domain owner",
+        )
+    return serialized, True
 
 
 def _merge_pending_manual_answer_into_config_proposal(

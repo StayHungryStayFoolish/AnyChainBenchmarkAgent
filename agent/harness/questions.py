@@ -27,6 +27,7 @@ def manual_question(
     field: str,
     kind: str = "manual_value",
     accepted_action_types: tuple[str, ...] = (),
+    manual_action: dict[str, Any] | None = None,
     queue_barrier: bool = False,
     validation: dict[str, Any] | None = None,
     requires_capabilities: tuple[str, ...] = (),
@@ -36,6 +37,8 @@ def manual_question(
     rejection_evidence_value: Any = None,
 ) -> dict[str, Any]:
     field_validation = _question_validation(kind, validation)
+    declared_manual_action = dict(manual_action or {})
+    declared_action_type = str(declared_manual_action.get("type") or "").strip()
     return {
         "contract_version": 1,
         "id": question_id,
@@ -45,7 +48,12 @@ def manual_question(
         "field": field,
         "manual_input_allowed": True,
         "options": [],
-        "accepted_action_types": sorted({"answer_pending", *accepted_action_types}),
+        "accepted_action_types": sorted({
+            "answer_pending",
+            *accepted_action_types,
+            *([declared_action_type] if declared_action_type else []),
+        }),
+        **({"manual_action": declared_manual_action} if declared_manual_action else {}),
         "queue_barrier": queue_barrier,
         "validation": field_validation,
         "requires_capabilities": list(requires_capabilities),

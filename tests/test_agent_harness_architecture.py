@@ -984,6 +984,23 @@ class HarnessQuestionContractTest(unittest.TestCase):
         region_result = _dispatch_pending_action(region_state, region_action)
         self.assertEqual(region_result["confirmed_config"]["CLOUD_REGION"], "us-central1")
 
+        normalized_state = _state("en")
+        normalized_state["pending_question"] = question_for_environment(
+            normalized_state,
+            "provider_deployment",
+        )
+        normalized_action = {
+            "type": "answer_pending",
+            "selected_value": "us-central1",
+            "source_evidence": "us-central1",
+            "_origin_text": "Use the following region for this run:\nus-central1",
+        }
+        normalized_result = _dispatch_pending_action(normalized_state, normalized_action)
+        self.assertEqual(
+            normalized_result["confirmed_config"]["CLOUD_REGION"],
+            "us-central1",
+        )
+
     def _question_cases(self) -> list[tuple[str, Callable[[str], dict[str, Any] | None]]]:
         from agent.harness.contracts import ActionProposal
         from agent.harness.domains.chain_rpc import question_for_chain_rpc

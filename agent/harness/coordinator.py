@@ -2210,10 +2210,10 @@ def _dispatch_pending_action(state: AgentGraphState, action: dict[str, Any]) -> 
     source_text = str(action.get("_origin_text") or action.get("source_evidence") or answer).strip()
     return _apply_pending_answer(
         state,
-        source_text if declared_selection else answer,
+        source_text,
         pending,
         selected_value=selected if declared_selection else _UNSET_PENDING_VALUE,
-        manual_value=answer if not declared_selection else _UNSET_PENDING_VALUE,
+        manual_value=interpreted if not declared_selection else _UNSET_PENDING_VALUE,
     )
 
 

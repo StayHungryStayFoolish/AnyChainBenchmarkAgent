@@ -10189,6 +10189,111 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         )
         self.assertEqual(reconciled["semantic_units"][0]["action_indexes"], [0])
 
+    def test_manual_pending_owner_merges_equivalent_domain_action(self) -> None:
+        from agent.harness.intent import _materialize_pending_manual_owner_actions
+        from agent.harness.state import new_state
+
+        source = (
+            "Use this endpoint only for validating the custom method:\n"
+            "http://fake-node:19000\n"
+            "Also show the current workflow status."
+        )
+        clauses = segment_user_turn(source)
+        state = new_state("manual-owner-merge", language="en")
+        state["pending_question"] = {
+            "id": "opaque-endpoint-question",
+            "group": "endpoint_process",
+            "kind": "url",
+            "manual_input_allowed": True,
+            "manual_action": {
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_endpoint",
+                "value_argument": "rpc_endpoint",
+            },
+        }
+        payload = {
+            "actions": [
+                {
+                    "type": "rpc_catalog_command",
+                    "catalog_command": "set_endpoint",
+                    "rpc_endpoint": "http://fake-node:19000",
+                    "source_evidence": "http://fake-node:19000",
+                },
+                {
+                    "type": "answer_pending",
+                    "selected_value": "http://fake-node:19000",
+                    "source_evidence": "http://fake-node:19000",
+                },
+                {"type": "show_current_state"},
+            ],
+            "semantic_units": [
+                _unit(clauses[0], 1, [0, 1]),
+                _unit(clauses[0], 2, [2]),
+            ],
+            "pending_answer_admissions": [1],
+        }
+
+        materialized, changed = _materialize_pending_manual_owner_actions(
+            json.dumps(payload), state, source
+        )
+        result = json.loads(materialized)
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            [action["type"] for action in result["actions"]],
+            ["rpc_catalog_command", "show_current_state"],
+        )
+        self.assertEqual(result["pending_answer_admissions"], [0])
+        self.assertEqual(result["semantic_units"][0]["action_indexes"], [0])
+        self.assertEqual(result["semantic_units"][1]["action_indexes"], [1])
+
+    def test_structured_pending_evidence_compiles_to_catalog_owner(self) -> None:
+        from agent.harness.intent import (
+            _materialize_pending_manual_owner_actions,
+            _validate_action_document,
+        )
+        from agent.harness.state import new_state
+
+        source = (
+            'request:\n  jsonrpc: "2.0"\n  id: 1\n'
+            '  method: eth_blockNumber\n  params: []\n'
+            'response:\n  jsonrpc: "2.0"\n  id: 1\n  result: "0x1"'
+        )
+        clauses = segment_user_turn(source)
+        state = new_state("structured-evidence-owner", language="en")
+        state["pending_question"] = {
+            "id": "opaque-evidence-question",
+            "group": "endpoint_process",
+            "kind": "evidence",
+            "manual_input_allowed": True,
+            "manual_action": {
+                "type": "rpc_catalog_command",
+                "catalog_command": "append_evidence",
+                "value_argument": "rpc_schema_evidence",
+                "use_complete_turn": True,
+            },
+        }
+        payload = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": source,
+                "source_evidence": source,
+            }],
+            "semantic_units": [_unit(clauses[0], 1, [0])],
+            "pending_answer_admissions": [0],
+        }
+
+        materialized, changed = _materialize_pending_manual_owner_actions(
+            json.dumps(payload), state, source
+        )
+        result = json.loads(materialized)
+
+        self.assertTrue(changed)
+        self.assertEqual(result["actions"][0]["type"], "rpc_catalog_command")
+        self.assertEqual(result["actions"][0]["catalog_command"], "append_evidence")
+        self.assertEqual(result["actions"][0]["rpc_schema_evidence"], source)
+        self.assertTrue(_validate_action_document(materialized, clauses, state).valid)
+
 
 if __name__ == "__main__":
     unittest.main()
