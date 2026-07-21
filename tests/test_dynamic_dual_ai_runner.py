@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from typing import Mapping
 from unittest.mock import patch
 
-from tests.agent_live.chaos_scheduler import build_chaos_schedule
+from tests.agent_live.chaos_scheduler import ScheduledCoverageTarget, build_chaos_schedule
 from tests.agent_live.coverage_evidence import (
     RuntimeTurnEvent,
     VerifiedPostcondition,
@@ -30,9 +30,58 @@ from tests.agent_live.dynamic_dual_ai_chaos import (
     SimulatorDecision,
     SubprocessPtyTransport,
     _complete_agent_response,
+    _validate_decision,
     _verify_declared_postconditions,
     encode_bracketed_paste,
 )
+
+
+class SimulatorInputClassAdmissionTest(unittest.TestCase):
+    def _decision(self, message: str) -> SimulatorDecision:
+        return SimulatorDecision(
+            user_message=message,
+            persona="operator",
+            goal="exercise the scheduled input class",
+            rationale="selected after reading the Agent response",
+            target_coverage_ids=("edge-1",),
+        )
+
+    def _target(self) -> ScheduledCoverageTarget:
+        return ScheduledCoverageTarget(
+            target_id="target-1",
+            edge_key="edge-1",
+            persona="operator",
+            goal="exercise the scheduled input class",
+        )
+
+    def test_multiline_prose_rejects_structured_assignment(self) -> None:
+        with self.assertRaisesRegex(ValueError, "does not exercise multiline_prose"):
+            _validate_decision(
+                self._decision("CLOUD_REGION=us-central1\nCLOUD_ZONE=us-central1-a"),
+                self._target(),
+                {"input_class": "multiline_prose"},
+            )
+
+    def test_multiline_prose_accepts_multiple_prose_lines(self) -> None:
+        _validate_decision(
+            self._decision("The region should stay unchanged.\nPlease explain what the next step needs."),
+            self._target(),
+            {"input_class": "multiline_prose"},
+        )
+
+    def test_structured_lane_requires_structured_region(self) -> None:
+        with self.assertRaisesRegex(ValueError, "structured_json_yaml_env_curl"):
+            _validate_decision(
+                self._decision("Please configure the region for me."),
+                self._target(),
+                {"input_class": "structured_json_yaml_env_curl"},
+            )
+
+        _validate_decision(
+            self._decision("CLOUD_REGION=us-central1\nCLOUD_ZONE=us-central1-a"),
+            self._target(),
+            {"input_class": "structured_json_yaml_env_curl"},
+        )
 
 
 class DeclaredTargetSetVerificationTest(unittest.TestCase):

@@ -33,6 +33,7 @@ def action_schema() -> list[dict[str, Any]]:
             "effect": spec.effect,
             "target_group": spec.target_group,
             "requires_specific_change": spec.requires_specific_change,
+            "incomplete_mutation_intake": spec.incomplete_mutation_intake,
             "incompatible_target_modes": list(spec.incompatible_target_modes),
         }
         for spec in ACTION_SPECS

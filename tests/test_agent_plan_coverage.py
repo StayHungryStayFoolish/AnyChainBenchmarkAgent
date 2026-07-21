@@ -4719,6 +4719,71 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(json.loads(result_text), payload)
 
+    def test_named_group_change_without_concrete_value_uses_registered_intake(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_group_navigation_actions
+
+        source = (
+            "I need to change the blockchain chain first; "
+            "take me to the chain identity configuration."
+        )
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps({"reviews": [{
+                "action_index": 0,
+                "destination_named": True,
+                "destination_quote": "chain identity configuration",
+                "generic_resume": False,
+                "resume_quote": "",
+                "specific_change_requested": True,
+                "specific_change_quote": "change the blockchain chain",
+                "reason": "the source requests a chain change in the named group",
+            }]})),
+            SimpleNamespace(text=json.dumps({"reviews": [{
+                "action_index": 0,
+                "specific_change_requested": True,
+                "specific_change_quote": "change the blockchain chain",
+                "reason": "the change is explicit but has no replacement value",
+            }]})),
+            SimpleNamespace(text=json.dumps({
+                "action": None,
+                "reason": "no concrete replacement chain was supplied",
+            })),
+        ]
+        payload = {
+            "actions": [{
+                "type": "change_group",
+                "group": "chain_identity",
+                "navigation_explicit": True,
+                "source_evidence": source,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": source,
+                "disposition": "action",
+                "action_indexes": [0],
+            }],
+        }
+
+        result_text, changed = _adjudicate_group_navigation_actions(
+            provider,
+            json.dumps(payload),
+            {"pending_question": {}},
+        )
+        result = json.loads(result_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(result["actions"], [{
+            "type": "request_chain_selection",
+            "source_evidence": source,
+        }])
+        self.assertNotIn("group_navigation_admissions", result)
+        self.assertEqual(provider.complete.call_count, 3)
+
     def test_duplicate_group_control_review_fails_closed(self) -> None:
         import json
         from types import SimpleNamespace
@@ -8178,6 +8243,7 @@ class UnresolvedSemanticInventoryTest(unittest.TestCase):
         from unittest.mock import Mock, patch
 
         from agent.harness.intent import _recover_registry_bounded_semantic_actions
+        from agent.harness.plan_coverage import PlanCoverageResult
         from agent.harness.state import new_state
 
         text = "我要测试 BNB，用 mixed，QPS quick，并开启本地 Grafana"
@@ -8248,6 +8314,137 @@ class UnresolvedSemanticInventoryTest(unittest.TestCase):
 
 
 class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
+    def test_equivalent_owner_intake_and_navigation_share_one_group_transition(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
+        from agent.harness.intent import _recover_registry_bounded_semantic_actions
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.state import new_state
+
+        source = (
+            "I need to change the blockchain chain first; "
+            "take me to the chain identity configuration."
+        )
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [
+                {
+                    "type": "change_chain",
+                    "chain_candidates": [],
+                    "chain_text": clauses[0].text,
+                    "source_evidence": clauses[0].text,
+                },
+                {
+                    "type": "change_group",
+                    "group": "chain_identity",
+                    "navigation_explicit": True,
+                    "source_evidence": clauses[1].text,
+                },
+            ],
+            "semantic_units": [
+                _unit(clauses[0], 1, [0]),
+                _unit(clauses[1], 2, [1]),
+            ],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({"decisions": [
+            {
+                "unit_id": "unit-1",
+                "disposition": "owner_mutation",
+                "group": "chain_identity",
+                "existing_action_index": None,
+                "target_mode": "",
+                "consultation_topic": "",
+                "turn_local_action_type": "",
+                "scope_constraint": "",
+                "evidence_quote": clauses[0].text,
+                "reason": "requests a chain change without a replacement value",
+            },
+        ]}))
+
+        with patch("agent.harness.intent._resolve_owned_group_mutation", return_value=None):
+            recovered_text, changed = _recover_registry_bounded_semantic_actions(
+                provider,
+                json.dumps(payload),
+                clauses,
+                new_state("equivalent-chain-navigation", language="en"),
+                source,
+                PlanCoverageResult(
+                    valid=False,
+                    errors=("invalid value for change_chain.chain_candidates: too few items",),
+                    unresolved_clauses=(clauses[0].text,),
+                    rejected_action_indexes=(0,),
+                    incomplete_unit_ids=("unit-1",),
+                ),
+            )
+
+        recovered = json.loads(recovered_text)
+        self.assertTrue(changed)
+        self.assertEqual(len(recovered["actions"]), 1)
+        self.assertEqual(recovered["actions"][0]["type"], "request_chain_selection")
+        self.assertEqual(recovered["actions"][0]["source_evidence"], clauses[0].text)
+        self.assertEqual(
+            [unit["action_indexes"] for unit in recovered["semantic_units"]],
+            [[0], [0]],
+        )
+
+    def test_manual_pending_recovery_receives_declared_completion_effect(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.state import new_state
+
+        source = "http://fake-node:19000\nProbe this exact endpoint before trusting it."
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": "http://fake-node:19000",
+                "source_evidence": "http://fake-node:19000",
+            }],
+            "semantic_units": [
+                _unit(clauses[0], 1, [0]),
+                _unit(clauses[1], 2, [], disposition="unresolved"),
+            ],
+        }
+        state = new_state("manual-completion-scope", language="en")
+        state["pending_question"] = {
+            "id": "LOCAL_RPC_URL",
+            "group": "endpoint_process",
+            "kind": "manual_value",
+            "field": "LOCAL_RPC_URL",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "url"},
+            "options": [],
+            "completion_effect": "Probe this endpoint and record validation evidence before continuing.",
+        }
+        verdict = SimpleNamespace(text=json.dumps({
+            "decision": "manual_value",
+            "option_id": "",
+            "answer": "http://fake-node:19000",
+            "evidence_quote": "http://fake-node:19000",
+            "supporting_unit_ids": ["unit-2"],
+            "independent_unit_ids": [],
+            "reason": "the second line restates the declared completion effect",
+        }))
+        provider = Mock()
+        provider.complete.side_effect = [verdict, verdict]
+
+        _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            PlanCoverageResult(False, ("unresolved",), (clauses[1].text,), (), ()),
+            clauses,
+            source,
+        )
+
+        request_payload = json.loads(provider.complete.call_args_list[0].args[0].messages[-1].content)
+        self.assertIn("Probe this endpoint", request_payload["pending_question"]["completion_effect"])
+
     @staticmethod
     def _provider(decisions):
         import json

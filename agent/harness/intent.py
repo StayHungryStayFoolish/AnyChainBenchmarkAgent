@@ -1077,6 +1077,7 @@ def _recover_declared_pending_option_semantics(
             "kind": str(pending.get("kind") or ""),
             "validation": pending.get("validation") or {},
             "manual_input_allowed": manual_allowed,
+            "completion_effect": str(pending.get("completion_effect") or ""),
         },
         "available_options": available,
         "admitted_anchors": anchors,
@@ -5110,12 +5111,17 @@ def _adjudicate_group_navigation_actions(
                 proposed_group,
                 source,
             )
+            if replacement is None:
+                replacement = _incomplete_mutation_intake(proposed_group, source)
             if replacement is not None:
                 actions[index] = replacement
                 changed = True
                 continue
-            rejected[index] = "source requests a specific owned configuration change that was not safely resolved"
-            continue
+            # The named group remains the safe typed intake path when the user
+            # requests a change but has not supplied enough concrete values for
+            # an owner mutation.  Its domain questions collect those values;
+            # dropping the already-proved navigation would lose the request.
+            specific_change = False
         if destination_named:
             if action_type != "change_group":
                 replacement = {
@@ -5443,6 +5449,17 @@ def _recover_registry_bounded_semantic_actions(
     shared_navigation_indexes: dict[str, int] = {}
     context_unit_ids: set[str] = set()
     recovered_scopes: dict[str, str] = {}
+    recovered_navigation_groups = {
+        str(row.get("group") or "").strip()
+        for rows in by_unit.values()
+        for row in rows
+        if str(row.get("disposition") or "") == "navigation"
+        and str(row.get("group") or "").strip() in known_groups
+    } | {
+        str(row.get("group") or "").strip()
+        for row in sibling_navigations
+        if str(row.get("group") or "").strip() in known_groups
+    }
     for candidate in candidates:
         unit_id = candidate["unit_id"]
         source = candidate["source_text"]
@@ -5527,6 +5544,15 @@ def _recover_registry_bounded_semantic_actions(
             elif disposition == "owner_mutation" and group in known_groups:
                 replacement = _resolve_owned_group_mutation(provider, group, quote)
                 if replacement is None:
+                    replacement = _incomplete_mutation_intake(group, quote)
+                if replacement is None and group in recovered_navigation_groups:
+                    replacement = {
+                        "type": "change_group",
+                        "group": group,
+                        "navigation_explicit": True,
+                        "source_evidence": quote,
+                    }
+                if replacement is None:
                     return plan_text, False
             else:
                 return plan_text, False
@@ -5577,12 +5603,28 @@ def _recover_registry_bounded_semantic_actions(
         "answer_opening_question",
         "request_target_mode_selection",
         "choose_target_mode",
+        *(
+            spec.action_type
+            for spec in ACTION_SPECS
+            if spec.incomplete_mutation_intake
+        ),
         *recoverable_turn_local_by_type,
     }
+    def shared_action_target(action: dict[str, Any]) -> str:
+        action_type = str(action.get("type") or "")
+        spec = ACTION_BY_TYPE.get(action_type)
+        return str(
+            action.get("group")
+            or action.get("topic")
+            or action.get("target_mode")
+            or getattr(spec, "target_group", "")
+            or ""
+        )
+
     shared_indexes: dict[tuple[str, str], int] = {
         (
             str(action.get("type") or ""),
-            str(action.get("group") or action.get("topic") or action.get("target_mode") or ""),
+            shared_action_target(action),
         ): index
         for index, action in enumerate(recovered_actions)
         if isinstance(action, dict)
@@ -5625,11 +5667,19 @@ def _recover_registry_bounded_semantic_actions(
         recovered_indexes: list[int] = []
         for replacement in unit_replacements:
             action_type = str(replacement.get("type") or "")
-            merge_key = (
-                action_type,
-                str(replacement.get("group") or replacement.get("topic") or replacement.get("target_mode") or ""),
-            )
-            if action_type in shareable_action_types and merge_key in shared_indexes:
+            action_target = shared_action_target(replacement)
+            merge_key = (action_type, action_target)
+            spec = ACTION_BY_TYPE.get(action_type)
+            navigation_key = ("change_group", action_target)
+            if (
+                spec
+                and spec.incomplete_mutation_intake
+                and navigation_key in shared_indexes
+            ):
+                action_index = shared_indexes.pop(navigation_key)
+                recovered_actions[action_index] = replacement
+                shared_indexes[merge_key] = action_index
+            elif action_type in shareable_action_types and merge_key in shared_indexes:
                 action_index = shared_indexes[merge_key]
             else:
                 action_index = len(recovered_actions)
@@ -5701,6 +5751,29 @@ def _resolve_owned_group_mutation(
     action = dict(action)
     action.setdefault("source_evidence", source_text)
     action.setdefault("confidence", "medium")
+    try:
+        return validate_action_contract(action)
+    except ValueError:
+        return None
+
+
+def _incomplete_mutation_intake(
+    group: str,
+    source_text: str,
+) -> dict[str, Any] | None:
+    """Return the registry-owned typed intake for a value-less mutation."""
+
+    candidates = [
+        spec
+        for spec in ACTION_SPECS
+        if spec.target_group == group and spec.incomplete_mutation_intake
+    ]
+    if len(candidates) != 1:
+        return None
+    action = {
+        "type": candidates[0].action_type,
+        "source_evidence": source_text,
+    }
     try:
         return validate_action_contract(action)
     except ValueError:

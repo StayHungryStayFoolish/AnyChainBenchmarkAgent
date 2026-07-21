@@ -44,6 +44,7 @@ from tests.agent_live.chaos_scheduler import (
     validate_chaos_schedule,
     write_chaos_schedule,
 )
+from agent.harness.plan_coverage import segment_user_turn
 
 
 _ANSI_CSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
@@ -521,7 +522,7 @@ class DynamicDualAiChaosRunner:
                         "reason": "external Codex simulator did not provide a decision",
                     })
                     raise RuntimeError("external Codex simulator did not provide a decision")
-                _validate_decision(decision, scheduled_target)
+                _validate_decision(decision, scheduled_target, edge)
                 submitted_at_ns = self.clock_ns()
                 self.transport.submit_bracketed_paste(decision.user_message)
                 response = self.transport.read_complete_agent_response(
@@ -860,6 +861,7 @@ def encode_bracketed_paste(message: str) -> bytes:
 def _validate_decision(
     decision: SimulatorDecision,
     target: ScheduledCoverageTarget,
+    coverage_contract: Mapping[str, Any],
 ) -> None:
     required = {
         "user_message": decision.user_message,
@@ -878,6 +880,30 @@ def _validate_decision(
         raise ValueError("simulator decision does not target the scheduled ledger edge")
     if decision.persona != target.persona or decision.goal != target.goal:
         raise ValueError("simulator decision changed the scheduled persona or goal")
+    _validate_declared_input_class(decision.user_message, coverage_contract)
+
+
+def _validate_declared_input_class(
+    user_message: str,
+    coverage_contract: Mapping[str, Any],
+) -> None:
+    """Reject simulator evidence whose transport shape contradicts its lane."""
+
+    input_class = str(coverage_contract.get("input_class") or "")
+    clauses = segment_user_turn(user_message)
+    shapes = {clause.input_shape for clause in clauses}
+    if input_class == "multiline_prose":
+        if "\n" not in user_message or not clauses or shapes != {"prose"}:
+            raise ValueError(
+                "simulator decision does not exercise multiline_prose: "
+                "expected multiple prose lines without a structured data block"
+            )
+    elif input_class == "structured_json_yaml_env_curl":
+        if "structured" not in shapes:
+            raise ValueError(
+                "simulator decision does not exercise structured_json_yaml_env_curl: "
+                "expected a parseable structured input region"
+            )
 
 
 def _verify_declared_postconditions(

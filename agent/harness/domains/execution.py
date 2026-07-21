@@ -72,8 +72,28 @@ def question_for_execution(state: AgentGraphState, group: str) -> dict[str, Any]
             field="final_benchmark_confirmed",
             kind="yes_no",
             options=[
-                {"label": "Y", "value": True, "action": {"type": "approve_final_benchmark"}, "expected_patch": {"final_benchmark.approved": True}},
-                {"label": "N", "value": False, "action": {"type": "reject_final_benchmark"}, "expected_patch": {"final_benchmark.approved": False}},
+                {
+                    "label": "Y",
+                    "value": True,
+                    "action": {"type": "approve_final_benchmark"},
+                    "expected_patch": {"final_benchmark.approved": True},
+                    "completion_effect": localized(
+                        language,
+                        "提交正式 benchmark，并沿用已经确认的 QPS profile。",
+                        "Submit the final benchmark with the already confirmed QPS profile.",
+                    ),
+                },
+                {
+                    "label": "N",
+                    "value": False,
+                    "action": {"type": "reject_final_benchmark"},
+                    "expected_patch": {"final_benchmark.approved": False},
+                    "completion_effect": localized(
+                        language,
+                        "不提交正式 benchmark，并保留已经成功完成的 smoke 证据。",
+                        "Do not submit the final benchmark and preserve the successful smoke evidence.",
+                    ),
+                },
             ],
             queue_barrier=True,
         )

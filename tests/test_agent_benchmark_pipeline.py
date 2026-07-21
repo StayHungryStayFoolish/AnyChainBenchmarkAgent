@@ -710,6 +710,7 @@ class RealNodeExecutionStateMachineTest(unittest.TestCase):
         state = apply_state_delta(state, reconciled.delta, owner="execution")
         question = question_for_execution(state, "job_monitoring")
         self.assertEqual(question["id"], "real_node_final_benchmark_confirm")
+        self.assertIn("preserve the successful smoke evidence", question["options"][1]["completion_effect"])
 
         final_state = dict(state)
         final_state.update({

@@ -149,6 +149,7 @@ class ActionSpec:
     turn_local_result_roots: tuple[str, ...] = ()
     crosses_pending_barrier: bool = False
     requires_specific_change: bool = False
+    incomplete_mutation_intake: bool = False
     required_arguments: tuple[str, ...] = ()
     constraints: tuple[str, ...] = ()
     suppressed_by: tuple[str, ...] = ()
@@ -217,21 +218,23 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
     ActionSpec(
         "request_chain_selection",
         "chain_rpc",
-        "Ask for a replacement chain without discarding the current chain first.",
+        "Open typed chain-selection intake when the user requests a chain selection or replacement but supplies no concrete chain.",
         ("chain_candidates", "source_evidence"),
         execution_phase=25,
         target_group="chain_identity",
         requires_capabilities=("target_mode",),
         provides_capabilities=("chain_identity",),
+        incomplete_mutation_intake=True,
     ),
     ActionSpec(
         "request_target_mode_selection",
         "chain_rpc",
-        "Ask the user to select a target mode when it is unresolved, or to select a replacement without discarding the current mode first.",
+        "Open typed target-mode intake when it is unresolved, including initial selection or replacement requests that supply no concrete target mode.",
         ("source_evidence",),
         execution_phase=24,
         target_group="target_mode",
         provides_capabilities=("target_mode",),
+        incomplete_mutation_intake=True,
     ),
     ActionSpec(
         "change_group",
@@ -1002,6 +1005,20 @@ def validate_action_registry() -> None:
                 "actions requiring a specific change need a target group and required "
                 f"source evidence: {spec.action_type}"
             )
+        if spec.incomplete_mutation_intake and (
+            not spec.target_group or "source_evidence" not in spec.allowed_arguments
+        ):
+            raise RuntimeError(
+                "incomplete mutation intake actions need a target group and source evidence: "
+                f"{spec.action_type}"
+            )
+    intake_groups = [
+        spec.target_group
+        for spec in ACTION_SPECS
+        if spec.incomplete_mutation_intake
+    ]
+    if len(intake_groups) != len(set(intake_groups)):
+        raise RuntimeError("only one incomplete mutation intake action is allowed per group")
 
 
 validate_action_registry()
