@@ -2274,10 +2274,49 @@ class HarnessStateInvariantTest(unittest.TestCase):
                 action_queue=[{"action_id": "same"}, {"action_id": "same"}],
             ),
             "unknown_group_history": _state(group_history=["opening", "not-a-group"]),
+            "case3_pending_without_handoff_owner": _state(
+                active_group="chain_identity",
+                chain_identity={
+                    "status": "case3_needs_evidence",
+                    "adapter_family": "unsupported",
+                    "case": "case3",
+                },
+                pending_question={
+                    "id": "case3_protocol_evidence",
+                    "group": "chain_identity",
+                },
+            ),
         }
         for name, state in cases.items():
             with self.subTest(case=name), self.assertRaises(StateInvariantError):
                 validate_state(state)
+
+    def test_validate_state_accepts_complete_case3_evidence_owner(self) -> None:
+        from agent.harness.invariants import validate_state
+
+        state = _state(
+            active_group="chain_identity",
+            chain_identity={
+                "raw": "WeirdP2PChain",
+                "canonical": "WeirdP2PChain",
+                "status": "case3_needs_evidence",
+                "adapter_family": "unsupported",
+                "case": "case3",
+            },
+            secondary_handoff={
+                "status": "collecting_evidence",
+                "kind": "case3_protocol_adapter_implementation",
+                "chain": "WeirdP2PChain",
+                "adapter_family": "unsupported",
+                "evidence": [],
+            },
+            pending_question={
+                "id": "case3_protocol_evidence",
+                "group": "chain_identity",
+            },
+        )
+
+        validate_state(state)
 
     def test_completed_group_cannot_own_a_pending_question(self) -> None:
         from agent.harness.invariants import StateInvariantError, validate_state

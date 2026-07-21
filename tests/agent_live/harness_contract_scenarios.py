@@ -545,14 +545,41 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
             "case3_next",
             "chain_identity",
             {
-                "chain_identity": {"status": "case3_collecting_evidence"},
-                "secondary_handoff": {"evidence": ["evidence"]},
+                "chain_identity": {
+                    "raw": "WeirdP2PChain",
+                    "canonical": "WeirdP2PChain",
+                    "adapter_family": "unsupported",
+                    "status": "case3_collecting_evidence",
+                    "case": "case3",
+                },
+                "secondary_handoff": {
+                    "status": "collecting_evidence",
+                    "kind": "case3_protocol_adapter_implementation",
+                    "chain": "WeirdP2PChain",
+                    "adapter_family": "unsupported",
+                    "evidence": ["evidence"],
+                },
             },
         ),
         (
             "case3_evidence",
             "chain_identity",
-            {"chain_identity": {"status": "case3_needs_evidence"}},
+            {
+                "chain_identity": {
+                    "raw": "WeirdP2PChain",
+                    "canonical": "WeirdP2PChain",
+                    "adapter_family": "unsupported",
+                    "status": "case3_needs_evidence",
+                    "case": "case3",
+                },
+                "secondary_handoff": {
+                    "status": "collecting_evidence",
+                    "kind": "case3_protocol_adapter_implementation",
+                    "chain": "WeirdP2PChain",
+                    "adapter_family": "unsupported",
+                    "evidence": [],
+                },
+            },
         ),
         (
             "custom_adapter",

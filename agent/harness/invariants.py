@@ -210,6 +210,29 @@ def validate_state(state: AgentGraphState) -> None:
     ):
         raise StateInvariantError("sync-observe state contains RPC benchmark workload or QPS configuration")
 
+    identity = state.get("chain_identity") or {}
+    pending_id = str((state.get("pending_question") or {}).get("id") or "")
+    case3_statuses = {
+        "unsupported_family_handoff",
+        "case3_collecting_evidence",
+        "case3_needs_evidence",
+    }
+    case3_active = str(identity.get("status") or "") in case3_statuses or pending_id in {
+        "case3_protocol_evidence",
+        "case3_evidence_input",
+        "case3_evidence_next",
+    }
+    if case3_active:
+        handoff = state.get("secondary_handoff") or {}
+        if str(identity.get("case") or "") != "case3":
+            raise StateInvariantError("Case 3 evidence state requires case3 chain identity ownership")
+        if str(identity.get("adapter_family") or "") != "unsupported":
+            raise StateInvariantError("Case 3 evidence state requires an unsupported adapter family")
+        if str(handoff.get("status") or "") != "collecting_evidence":
+            raise StateInvariantError("Case 3 evidence state requires an active collecting handoff")
+        if str(handoff.get("kind") or "") != "case3_protocol_adapter_implementation":
+            raise StateInvariantError("Case 3 evidence state requires the protocol-adapter handoff owner")
+
 
 def verify_expected_patch(state: AgentGraphState, expected: dict[str, Any]) -> None:
     """Fail an option execution whose declared postcondition did not occur."""

@@ -9461,7 +9461,11 @@ network:
             "status": "unsupported_family_handoff",
             "case": "case3",
         }
-        state["secondary_handoff"] = {"status": "collecting_evidence", "evidence": []}
+        state["secondary_handoff"] = {
+            "status": "collecting_evidence",
+            "kind": "case3_protocol_adapter_implementation",
+            "evidence": [],
+        }
         state["active_group"] = "chain_identity"
         state["pending_question"] = {
             "id": "case3_protocol_evidence",
@@ -9510,7 +9514,11 @@ network:
             "status": "case3_collecting_evidence",
             "case": "case3",
         }
-        state["secondary_handoff"] = {"status": "collecting_evidence", "evidence": ["protocol: weird-p2p"]}
+        state["secondary_handoff"] = {
+            "status": "collecting_evidence",
+            "kind": "case3_protocol_adapter_implementation",
+            "evidence": ["protocol: weird-p2p"],
+        }
         state["last_user_input"] = "先别管这些，帮我分析最近一次 job 的 http 报告"
 
         with patch("agent.harness.coordinator.resolve_action_queue", return_value={"actions": [{"type": "analyze_report", "confidence": "high"}]}):
@@ -9532,7 +9540,11 @@ network:
             "status": "unsupported_family_handoff",
             "case": "case3",
         }
-        state["secondary_handoff"] = {"status": "collecting_evidence", "evidence": ["protocol: weird-p2p"]}
+        state["secondary_handoff"] = {
+            "status": "collecting_evidence",
+            "kind": "case3_protocol_adapter_implementation",
+            "evidence": ["protocol: weird-p2p"],
+        }
         state["active_group"] = "chain_identity"
         state["pending_question"] = {
             "id": "case3_evidence_next",
@@ -9567,7 +9579,11 @@ network:
             "status": "unsupported_family_handoff",
             "case": "case3",
         }
-        state["secondary_handoff"] = {"status": "collecting_evidence", "evidence": ["protocol: weird-p2p"]}
+        state["secondary_handoff"] = {
+            "status": "collecting_evidence",
+            "kind": "case3_protocol_adapter_implementation",
+            "evidence": ["protocol: weird-p2p"],
+        }
         state["last_user_input"] = "先别管之前配置，帮我分析最近一次 job 的报告和日志"
 
         with (
@@ -9601,7 +9617,11 @@ network:
             "status": "unsupported_family_handoff",
             "case": "case3",
         }
-        state["secondary_handoff"] = {"status": "collecting_evidence", "evidence": ["protocol: weird-p2p"]}
+        state["secondary_handoff"] = {
+            "status": "collecting_evidence",
+            "kind": "case3_protocol_adapter_implementation",
+            "evidence": ["protocol: weird-p2p"],
+        }
         state["last_user_input"] = "我需要测试，但是我不知道可以测试什么"
 
         with patch("agent.harness.coordinator.resolve_action_queue") as resolver:
@@ -9623,7 +9643,11 @@ network:
             "status": "unsupported_family_handoff",
             "case": "case3",
         }
-        state["secondary_handoff"] = {"status": "collecting_evidence", "evidence": ["protocol: weird-p2p"]}
+        state["secondary_handoff"] = {
+            "status": "collecting_evidence",
+            "kind": "case3_protocol_adapter_implementation",
+            "evidence": ["protocol: weird-p2p"],
+        }
         state["last_user_input"] = "什么意思？你在讲什么"
 
         result = process_turn(state)
