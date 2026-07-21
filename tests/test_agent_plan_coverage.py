@@ -9523,6 +9523,104 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         self.assertEqual(recovered["semantic_units"][0]["action_indexes"], [0])
         self.assertEqual(recovered["semantic_units"][1]["action_indexes"], [])
         self.assertEqual(recovered["semantic_units"][1]["disposition"], "context")
+        review_payload = json.loads(provider.complete.call_args_list[0].args[0].messages[-1].content)
+        self.assertEqual(review_payload["selected_option"], {
+            "option_id": "fake-node",
+            "label": "fake-node",
+            "semantic_action": "",
+            "value": "fake-node",
+            "declared_action": {
+                "type": "choose_target_mode",
+                "target_mode": "fake-node",
+                "target_mode_explicit": True,
+            },
+            "expected_patch": {},
+        })
+
+    def test_pending_option_anchor_carries_opening_effect_for_explanatory_rationale(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.state import new_state
+
+        source = "Start the fake-node benchmark. I need the fastest framework check first."
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [
+                {
+                    "type": "choose_target_mode",
+                    "target_mode": "fake-node",
+                    "target_mode_explicit": True,
+                    "source_evidence": clauses[0].text,
+                },
+                {
+                    "type": "clarify_unresolved",
+                    "clauses": [clauses[1].text],
+                    "reason": "the second sentence was not mapped",
+                },
+            ],
+            "semantic_units": [
+                self._unit(clauses[0], "unit-choice", [0]),
+                self._unit(clauses[1], "unit-purpose", [1], disposition="unresolved"),
+            ],
+        }
+        state = new_state("opening-option-rationale", language="en")
+        state["pending_question"] = {
+            "id": "opening_next_action",
+            "group": "opening",
+            "field": "target_mode",
+            "kind": "numbered_choice",
+            "prompt": "What would you like me to help with?",
+            "manual_input_allowed": False,
+            "accepted_action_types": [
+                "answer_opening_question",
+                "answer_pending",
+                "choose_target_mode",
+            ],
+            "options": [{
+                "id": "1",
+                "label": "Start a fake-node benchmark",
+                "value": "fake-node",
+                "action": {
+                    "type": "choose_target_mode",
+                    "target_mode": "fake-node",
+                    "target_mode_explicit": True,
+                },
+                "expected_patch": {
+                    "target_mode": "fake-node",
+                    "workflow_mode": "rpc_benchmark",
+                },
+            }],
+        }
+        verdict = SimpleNamespace(text=json.dumps({
+            "conflict": False,
+            "ambiguous": False,
+            "supporting_unit_ids": ["unit-purpose"],
+            "independent_unit_ids": [],
+            "reason": "the second sentence explains the selected framework-check option",
+        }))
+        provider = Mock()
+        provider.complete.side_effect = [verdict, verdict]
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            clauses=clauses,
+            user_text=source,
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertEqual([action["type"] for action in recovered["actions"]], ["choose_target_mode"])
+        self.assertEqual(recovered["pending_support_unit_ids"], ["unit-purpose"])
+        review_payload = json.loads(provider.complete.call_args_list[0].args[0].messages[-1].content)
+        self.assertEqual(
+            review_payload["selected_option"]["expected_patch"],
+            {"target_mode": "fake-node", "workflow_mode": "rpc_benchmark"},
+        )
 
     def test_pending_option_preserves_independent_context_labeled_request(self) -> None:
         import json

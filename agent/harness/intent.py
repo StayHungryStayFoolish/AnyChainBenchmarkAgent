@@ -807,6 +807,7 @@ def _recover_declared_pending_option_semantics(
             "semantic_action": semantic,
             "value": option.get("value"),
             "declared_action": declared or {"type": "answer_pending"},
+            "expected_patch": dict(option.get("expected_patch") or {}),
         })
     manual_allowed = pending.get("manual_input_allowed") is True
     if not available and not manual_allowed:
@@ -1058,14 +1059,19 @@ def _recover_declared_pending_option_semantics(
     verdicts: list[dict[str, Any]] = []
     anchor_option_ids = {row["option_id"] for row in anchors}
     if anchors and len(anchor_option_ids) == 1 and not manual_anchors:
+        anchored_option = next(
+            row for row in available if row["option_id"] == anchors[0]["option_id"]
+        )
         anchor_contract = (
             "Classify only the explicitly enumerated candidate_units relative to one immutable pending-option "
             "selection anchor. The anchor is context owned by another validator: do not select it, admit it, "
             "or repeat any anchor unit identifier. Return JSON only: "
             "{conflict:boolean,ambiguous:boolean,supporting_unit_ids:[string],"
             "independent_unit_ids:[string],reason:string}. A supporting unit only explains, motivates, compares, "
-            "or states a future consequence of the anchor without requesting another present mutation, question, "
-            "navigation, or evidence operation. An independent unit makes such a separate request and must remain "
+            "or states a future consequence of the selected_option contract without requesting another present "
+            "mutation, question, navigation, or evidence operation. Judge that relationship from the full "
+            "selected_option label, value, declared action, and expected state patch rather than from its identifier "
+            "alone. An independent unit makes a separate present request and must remain "
             "available to its registered owner. conflict=true only when a candidate rejects or contradicts the "
             "anchor; ambiguous=true only when its relation cannot be determined. Both booleans must be false for "
             "a usable partition. supporting_unit_ids and independent_unit_ids must "
@@ -1081,6 +1087,7 @@ def _recover_declared_pending_option_semantics(
                 "source_text": anchors[0]["source_text"],
                 "evidence_quote": anchors[0]["evidence_quote"],
             },
+            "selected_option": anchored_option,
             "complete_turn_text": complete_turn_text,
             "candidate_unit_ids": [row["unit_id"] for row in candidates],
             "candidate_units": candidates,
