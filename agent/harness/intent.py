@@ -2353,10 +2353,19 @@ def _validate_semantic_fulfillment(
         and index not in navigation_admissions
     ]
     units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
+    # Untrusted planner receipts are stripped before owner admission; only the
+    # pending owner can mint these support-unit IDs inside this pipeline.
+    pending_support_unit_ids = {
+        str(unit_id)
+        for unit_id in payload.get("pending_support_unit_ids", [])
+        if str(unit_id)
+    }
     context_units = [
         unit
         for unit in units
-        if isinstance(unit, dict) and str(unit.get("disposition") or "") == "context"
+        if isinstance(unit, dict)
+        and str(unit.get("disposition") or "") == "context"
+        and str(unit.get("unit_id") or "") not in pending_support_unit_ids
     ]
     action_units_per_clause: dict[str, int] = {}
     for unit in units:

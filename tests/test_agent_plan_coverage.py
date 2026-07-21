@@ -524,6 +524,55 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertFalse(result.valid)
         self.assertIn("context semantic unit unit-2 admission failed", "\n".join(result.errors))
 
+    def test_pending_owner_receipt_closes_duplicate_context_review(self) -> None:
+        import json
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _validate_semantic_fulfillment
+        from agent.harness.state import new_state
+
+        clauses = segment_user_turn(
+            "Use the fake-node option for this run. "
+            "I want to validate the complete framework loop first."
+        )
+        payload = {
+            "actions": [{
+                "type": "choose_target_mode",
+                "target_mode": "fake-node",
+                "source_evidence": clauses[0].text,
+            }],
+            "semantic_units": [
+                _unit(clauses[0], 1, [0]),
+                _unit(
+                    clauses[1],
+                    2,
+                    [],
+                    disposition="context",
+                    reason="purpose supporting the pending selection",
+                ),
+            ],
+            "pending_answer_admissions": [0],
+            "pending_support_unit_ids": ["unit-2"],
+        }
+        provider = Mock()
+        provider.complete.side_effect = AssertionError(
+            "receipt-covered pending support must not be reviewed again"
+        )
+        state = new_state("pending-owner-receipt", language="en")
+        state["pending_question"] = {
+            "id": "target_mode_select",
+            "kind": "choice",
+            "options": [
+                {"id": "fake-node", "label": "fake-node", "value": "fake-node"},
+                {"id": "real-node", "label": "real-node", "value": "real-node"},
+            ],
+        }
+
+        result = _validate_semantic_fulfillment(provider, json.dumps(payload), clauses, state)
+
+        self.assertTrue(result.valid, result.errors)
+        provider.complete.assert_not_called()
+
     def test_same_clause_manual_field_is_folded_into_atomic_config_review(self) -> None:
         from agent.harness.intent import _merge_pending_manual_answer_into_config_proposal
         from agent.harness.state import new_state
