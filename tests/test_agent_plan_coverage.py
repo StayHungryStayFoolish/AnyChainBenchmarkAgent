@@ -3512,8 +3512,9 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertEqual(document["actions"], [{"type": "request_target_change"}])
         self.assertEqual(document["pending_answer_admissions"], [0])
 
-    def test_consultation_option_remains_owned_by_consultation_admission(self) -> None:
+    def test_consultation_option_is_admitted_by_the_active_pending_owner(self) -> None:
         import json
+        from types import SimpleNamespace
         from unittest.mock import Mock
 
         from agent.harness.intent import _adjudicate_pending_answer_actions
@@ -3542,12 +3543,27 @@ class PlanCoverageTest(unittest.TestCase):
             "semantic_units": [],
         })
         provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "reviews": [{
+                "action_index": 0,
+                "decision": "select_option",
+                "selected_option_id": "info",
+                "evidence_quote": source,
+                "reason": "the complete source selects the declared read-only option",
+            }],
+        }))
 
         result, changed = _adjudicate_pending_answer_actions(provider, payload, state, source)
 
-        self.assertFalse(changed)
-        self.assertEqual(result, payload)
-        provider.complete.assert_not_called()
+        self.assertTrue(changed)
+        document = json.loads(result)
+        self.assertEqual(document["actions"], [{
+            "type": "answer_opening_question",
+            "topic": "capabilities",
+            "source_evidence": source,
+        }])
+        self.assertEqual(document["pending_answer_admissions"], [0])
+        provider.complete.assert_called()
 
     def test_unsupported_same_group_mutation_is_removed_fail_closed(self) -> None:
         import json
@@ -10428,6 +10444,211 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         self.assertEqual(recovered["actions"][0]["target_mode"], "fake-node")
         self.assertEqual(recovered["semantic_units"][0]["disposition"], "action")
         self.assertEqual(recovered["semantic_units"][1]["disposition"], "context")
+
+    def test_pending_option_contract_prioritizes_declared_omission_over_manual_value(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.state import new_state
+
+        source = "Skip this optional credential; leave it unconfigured."
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": "Skip",
+                "source_evidence": "Skip",
+            }],
+            "semantic_units": [
+                self._unit(clause, f"unit-{index}", [0], disposition="action")
+                for index, clause in enumerate(clauses, start=1)
+            ],
+        }
+        state = new_state("pending-optional-omission", language="en")
+        state["pending_question"] = {
+            "id": "optional_credential",
+            "group": "chain_auxiliary_endpoints",
+            "field": "OPTIONAL_CREDENTIAL",
+            "kind": "manual_value",
+            "prompt": "Supply the optional credential or skip it.",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "scalar_token", "max_length": 180},
+            "options": [{
+                "id": "omit",
+                "label": "Skip (not configured)",
+                "value": "none",
+                "action": {"type": "answer_pending"},
+                "expected_patch": {"confirmed_config.OPTIONAL_CREDENTIAL": "none"},
+            }],
+        }
+        verdict = SimpleNamespace(text=json.dumps({
+            "decision": "select_option",
+            "option_id": "omit",
+            "answer": "",
+            "evidence_quote": "Skip this optional credential",
+            "supporting_unit_ids": ["unit-1", "unit-2"],
+            "independent_unit_ids": [],
+            "reason": "the complete turn selects the declared omission effect",
+        }))
+        provider = Mock()
+        provider.complete.side_effect = [verdict, verdict]
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            clauses=clauses,
+            user_text=source,
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(recovered["actions"], [{
+            "type": "answer_pending",
+            "answer": "none",
+            "selected_value": "none",
+            "source_evidence": "Skip this optional credential",
+        }])
+        contract = provider.complete.call_args_list[0].args[0].messages[0].content
+        self.assertIn("finite declared option owns it", contract)
+
+    def test_pending_read_only_option_owns_non_mutating_scope_context(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.state import new_state
+
+        source = (
+            "I am not ready to configure a benchmark. "
+            "Show me the supported chains, RPC methods, and extension paths."
+        )
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "clarify_unresolved",
+                "clauses": [clause.text for clause in clauses],
+                "reason": "the turn was split before pending ownership",
+            }],
+            "semantic_units": [
+                self._unit(clause, f"unit-{index}", [0], disposition="unresolved")
+                for index, clause in enumerate(clauses, start=1)
+            ],
+        }
+        state = new_state("pending-read-only-scope", language="en")
+        state["pending_question"] = {
+            "id": "entry_choice",
+            "group": "opening",
+            "field": "target_mode",
+            "kind": "numbered_choice",
+            "prompt": "What would you like help with?",
+            "manual_input_allowed": False,
+            "options": [{
+                "id": "guide",
+                "label": "Learn supported chains, RPC methods, and extension paths",
+                "description": "Read-only product guidance without changing configuration.",
+                "value": "info",
+                "action": {"type": "answer_opening_question", "topic": "capabilities"},
+                "expected_patch": {},
+                "return_policy": "stop_after_response",
+            }],
+        }
+        verdict = SimpleNamespace(text=json.dumps({
+            "decision": "select_option",
+            "option_id": "guide",
+            "answer": "",
+            "evidence_quote": "Show me the supported chains, RPC methods, and extension paths",
+            "supporting_unit_ids": ["unit-1", "unit-2"],
+            "independent_unit_ids": [],
+            "reason": "the first unit limits mutations and the second requests one read-only option",
+        }))
+        provider = Mock()
+        provider.complete.side_effect = [verdict, verdict]
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            clauses=clauses,
+            user_text=source,
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(recovered["actions"], [{
+            "type": "answer_opening_question",
+            "topic": "capabilities",
+            "source_evidence": "Show me the supported chains, RPC methods, and extension paths",
+        }])
+        contract = provider.complete.call_args_list[0].args[0].messages[0].content
+        self.assertIn("non-mutating scope context", contract)
+
+    def test_pending_owned_consultation_cannot_be_rewritten_by_generic_owner(self) -> None:
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_consultation_actions
+        from agent.harness.state import new_state
+
+        payload = {
+            "actions": [{
+                "type": "answer_opening_question",
+                "topic": "capabilities",
+                "source_evidence": "Show me the supported chains and extension paths",
+            }],
+            "pending_answer_admissions": [0],
+            "semantic_units": [],
+        }
+        provider = Mock()
+
+        result, changed = _adjudicate_consultation_actions(
+            provider,
+            json.dumps(payload),
+            new_state("pending-consultation-owner", language="en"),
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(json.loads(result), payload)
+        provider.complete.assert_not_called()
+
+    def test_read_only_consultation_registry_contract_supports_pending_selection_scope(self) -> None:
+        from agent.harness.action_registry import ACTION_BY_TYPE
+
+        spec = ACTION_BY_TYPE["answer_opening_question"]
+        self.assertTrue(spec.pending_option_admission)
+        self.assertIn("non_mutation_scope", spec.semantic_support_relations)
+
+    def test_untrusted_scope_schema_row_is_canonicalized_only_by_exact_registry_identity(self) -> None:
+        from agent.harness.action_registry import semantic_scope_schema
+        from agent.harness.intent import _prepare_untrusted_action_document
+
+        registered = next(
+            row for row in semantic_scope_schema() if row["name"] == "consultation_only"
+        )
+        payload = {
+            "actions": [],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": "Show capabilities",
+                "disposition": "action",
+                "action_indexes": [],
+                "scope_constraint": registered,
+                "reason": "read-only scope",
+            }],
+        }
+
+        canonical = json.loads(_prepare_untrusted_action_document(json.dumps(payload)))
+        self.assertEqual(
+            canonical["semantic_units"][0]["scope_constraint"],
+            "consultation_only",
+        )
+
+        altered = dict(registered)
+        altered["description"] = "untrusted replacement"
+        payload["semantic_units"][0]["scope_constraint"] = altered
+        preserved = json.loads(_prepare_untrusted_action_document(json.dumps(payload)))
+        self.assertEqual(preserved["semantic_units"][0]["scope_constraint"], altered)
 
     def test_pending_option_partitions_rationale_sharing_provisional_action(self) -> None:
         import json

@@ -234,8 +234,10 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         lifetime="turn_local",
         effect="read_only",
         required_arguments=("topic",),
-        pending_option_admission=False,
-        semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
+        semantic_support_relations=(
+            *FRAMED_OPERATION_SUPPORT_RELATIONS,
+            "non_mutation_scope",
+        ),
     ),
     ActionSpec("choose_target_mode", "chain_rpc", "Select fake-node, real-node, or sync-observe only when the user explicitly requests that mutation.", ("target_mode", "target_mode_explicit", "source_evidence"), 10, "target_mode", mutation_dimension="target_mode", provides_capabilities=("target_mode",), required_arguments=("target_mode", "target_mode_explicit", "source_evidence"), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS),
     ActionSpec("choose_chain", "chain_rpc", "Select a chain when none is confirmed, or expose multiple candidates without choosing silently.", ("chain_text", "chain_candidates", "source_evidence", "chain_exists", "canonical_chain_name", "adapter_family", "possible_known_chain", "evidence_summary"), 20, "chain_identity", mutation_dimension="chain", provides_capabilities=("chain_identity",), required_arguments=("source_evidence",), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS, validator=_validate_chain_selection),

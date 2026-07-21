@@ -1051,10 +1051,17 @@ def _recover_declared_pending_option_semantics(
         "select_option is valid only when the complete turn semantically selects exactly one available option. "
         "A direct imperative or natural-language paraphrase that asks the Agent to perform one displayed "
         "option's declared effect counts as selecting that option. The user need not repeat its label or number. "
+        "When the same source could be read either as a declared option effect or as a manual field value, the "
+        "finite declared option owns it; manual_value is reserved for a source-supplied field value that is not "
+        "semantically equivalent to any available option. This precedence is determined from each option's label, "
+        "description, value, declared action, expected patch, and completion effect, not from keywords. "
         "A supporting unit may select the option, reject alternatives, explain why the selected option is needed, or commit to the "
         "immediate continuation that the selected option's declared effect necessarily opens. Such a continuation "
         "is support, not a second mutation. A factual rationale that mentions a resource related to the selected "
         "option, without asking to create, change, validate, or configure that resource now, is support. "
+        "For a read-only option, a statement that declines, postpones, or limits mutating alternatives is non-mutating "
+        "scope context when the complete turn also directly requests exactly that one read-only option. It is not a "
+        "second demand or a contradiction unless it requests another present operation. "
         "manual_value is valid only when manual_input_allowed=true and the "
         "complete turn directly supplies one value requested by the displayed field and validation contract. "
         "Put only that normalized source-supplied value in answer; never copy a value from state, the prompt, or "
@@ -1619,7 +1626,11 @@ def _action_requires_pending_owner(
     if _matching_pending_option(action, state):
         return False
     if str(action.get("type") or "") == "answer_pending":
-        return False
+        # A free-form answer beside declared options is not manual merely
+        # because it satisfies the field's scalar validator.  The pending
+        # owner must first arbitrate whether the complete turn selected one of
+        # the finite effects or supplied an independent manual value.
+        return bool(options)
     return _action_competes_with_pending_options(action, pending, options)
 
 
@@ -3612,11 +3623,17 @@ def _adjudicate_consultation_actions(
     payload.pop("consultation_admissions", None)
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
     semantic_units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
+    pending_admissions = {
+        int(index)
+        for index in payload.get("pending_answer_admissions", [])
+        if isinstance(index, int) and 0 <= index < len(actions)
+    }
     review_indexes = [
         index
         for index, action in enumerate(actions)
         if isinstance(action, dict)
         and str(action.get("type") or "") == "answer_opening_question"
+        and index not in pending_admissions
     ]
     if not review_indexes:
         return text, False
@@ -4184,8 +4201,18 @@ def _adjudicate_pending_action_ownership(
 
     current = text
     changed = False
-    current, step_changed = _adjudicate_manual_pending_answers(provider, current, state, user_text)
-    changed = changed or step_changed
+    pending = dict(state.get("pending_question") or {})
+    has_declared_options = any(
+        isinstance(item, dict) for item in pending.get("options") or []
+    )
+    if not has_declared_options:
+        current, step_changed = _adjudicate_manual_pending_answers(
+            provider,
+            current,
+            state,
+            user_text,
+        )
+        changed = changed or step_changed
     current, step_changed = _reconcile_pending_owner_mutations(provider, current, state, user_text)
     changed = changed or step_changed
     current, step_changed = _adjudicate_pending_answer_actions(provider, current, state, user_text)
@@ -7023,8 +7050,33 @@ def _prepare_untrusted_action_document(text: str) -> str:
         cleaned.append(action)
     if isinstance(payload.get("actions"), list):
         payload["actions"] = cleaned
+    units = payload.get("semantic_units")
+    if isinstance(units, list):
+        payload["semantic_units"] = [
+            _canonicalize_semantic_scope_reference(unit)
+            if isinstance(unit, dict)
+            else unit
+            for unit in units
+        ]
     _ensure_admission_action_ids(payload)
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _canonicalize_semantic_scope_reference(unit: dict[str, Any]) -> dict[str, Any]:
+    """Resolve an exact exported scope-schema row to its registry identity."""
+
+    normalized = dict(unit)
+    scope = normalized.get("scope_constraint")
+    if not isinstance(scope, dict):
+        return normalized
+    matches = [
+        str(row["name"])
+        for row in semantic_scope_schema()
+        if scope == row
+    ]
+    if len(matches) == 1:
+        normalized["scope_constraint"] = matches[0]
+    return normalized
 
 
 def _ensure_admission_action_ids(payload: dict[str, Any]) -> list[str]:
