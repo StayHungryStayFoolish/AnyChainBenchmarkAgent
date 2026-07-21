@@ -32,6 +32,7 @@ from agent.knowledge.chain_identity import canonicalize_chain_scalar, repo_chain
 from agent.onboarding.families import SUPPORTED_FAMILIES
 from agent.planners import question_prompts
 from agent.validators.rpc_workload import default_workload
+from agent.validators.endpoint_probe import health_probe_methods, validate_rpc_endpoint
 from .rpc_catalog import catalog_method_names, draft_view
 CHAIN_RPC_GROUPS = {
     "target_mode",
@@ -809,6 +810,26 @@ def apply_chain_rpc_answer(
             endpoint = extract_url_candidate(value)
             if not endpoint:
                 return HandlerResult(blocker="MAINNET_RPC_URL must be a valid endpoint")
+            identity = next_state.get("chain_identity") or {}
+            chain = normalize_scalar(identity.get("canonical") or identity.get("raw"))
+            family = _adapter_family(next_state)
+            methods, params = health_probe_methods(chain, family)
+            probe = validate_rpc_endpoint(
+                chain=chain,
+                endpoint=endpoint,
+                methods=methods,
+                adapter_family=family,
+                method_params=params,
+                timeout=3.0,
+            )
+            evidence = next_state.setdefault("endpoint_evidence", {})
+            evidence["mainnet_rpc_url_probe"] = probe
+            if not probe.get("ready"):
+                evidence["mainnet_rpc_url_ready"] = False
+                return HandlerResult(
+                    blocker=f"MAINNET_RPC_URL validation failed: {probe.get('error') or probe.get('status')}"
+                )
+            evidence["mainnet_rpc_url_ready"] = True
             confirmed["MAINNET_RPC_URL"] = endpoint
         confirmed["MAINNET_RPC_URL_REVIEWED"] = True
         return _answer_result(state, next_state)

@@ -47,6 +47,7 @@ def invalidate_for_chain_change(state: AgentGraphState, *, new_chain: str = "") 
     confirmed = state.setdefault("confirmed_config", {})
     for field in (
         "LOCAL_RPC_URL",
+        "SYNC_OBSERVE_RPC_URL",
         "MAINNET_RPC_URL",
         "MAINNET_RPC_URL_REVIEWED",
         "BLOCKCHAIN_PROCESS_NAMES",

@@ -469,7 +469,14 @@ def _probe_schema(state: AgentGraphState, case: str, params: Any) -> None:
     expected_response = normalize_scalar(draft.get("response_summary")).casefold()
     response_fields = draft.get("response_fields") if isinstance(draft.get("response_fields"), list) else []
     conflicts = draft.get("conflicts") if isinstance(draft.get("conflicts"), list) else []
-    response_conflicts = _response_contract_conflicts(draft, observed_response.get("sample", ""))
+    identity = result.get("identity") if isinstance(result.get("identity"), dict) else {}
+    response_conflicts = _response_contract_conflicts(
+        draft,
+        observed_response.get("sample", ""),
+        stable_result=normalize_scalar(identity.get("observed"))
+        if normalize_scalar(identity.get("method")) == method
+        else "",
+    )
     if response_conflicts:
         conflicts = list(dict.fromkeys([*conflicts, *response_conflicts]))
         draft["conflicts"] = conflicts
@@ -776,7 +783,12 @@ def _validation_endpoint(state: AgentGraphState, case: str) -> str:
     return normalize_scalar((state.get("custom_rpc") or {}).get("endpoint"))
 
 
-def _response_contract_conflicts(draft: dict[str, Any], observed_sample: str) -> list[str]:
+def _response_contract_conflicts(
+    draft: dict[str, Any],
+    observed_sample: str,
+    *,
+    stable_result: str = "",
+) -> list[str]:
     """Compare user-confirmed response evidence with the probed JSON shape."""
 
     try:
@@ -795,6 +807,17 @@ def _response_contract_conflicts(draft: dict[str, Any], observed_sample: str) ->
         observed_shape = _json_shape(observed)
         if expected_shape != observed_shape:
             conflicts.append(f"response shape mismatch: expected {expected_shape}, observed {observed_shape}")
+        if stable_result:
+            expected_result = expected_sample.get("result") if isinstance(expected_sample, dict) else expected_sample
+            expected_stable = normalize_scalar(expected_result)
+            try:
+                expected_stable = str(int(expected_stable, 0))
+            except (TypeError, ValueError):
+                pass
+            if expected_stable and expected_stable != stable_result:
+                conflicts.append(
+                    f"stable response mismatch: expected {expected_stable}, observed {stable_result}"
+                )
 
     fields = [item for item in draft.get("response_fields") or [] if isinstance(item, dict) and normalize_scalar(item.get("name"))]
     if fields:

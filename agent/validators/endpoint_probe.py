@@ -99,6 +99,15 @@ def validate_rpc_endpoint(
         "checks": [],
         "warnings": [],
         "blockers": [],
+        "identity": {
+            "required": False,
+            "verified": False,
+            "method": "",
+            "expected": "",
+            "observed": "",
+            "normalization": "",
+            "assertion_source": "",
+        },
     }
     if not chain:
         result["blockers"].append("chain is required")
@@ -159,6 +168,7 @@ def validate_rpc_endpoint(
     failed = [item for item in result["checks"] if not item.get("passed")]
     result["ready"] = not failed
     result["blockers"].extend(f"{item.get('name')}: {item.get('detail')}" for item in failed)
+    _apply_chain_identity_attestation(result, endpoint=endpoint, timeout=timeout)
     return _finalize_result(result)
 
 
@@ -213,6 +223,7 @@ def _validate_generic_jsonrpc_endpoint(
     failed = [item for item in result["checks"] if not item.get("passed")]
     result["ready"] = not failed
     result["blockers"].extend(f"{item.get('name')}: {item.get('detail')}" for item in failed)
+    _apply_chain_identity_attestation(result, endpoint=endpoint, timeout=timeout)
     if result["ready"]:
         if _chain_template_exists(str(result.get("chain") or "")):
             result["warnings"].append(
@@ -259,6 +270,98 @@ def _probe_generic_jsonrpc_method(
         response_shape_hash=_response_shape_hash(sample),
         response_sample=sample[:512],
     )
+
+
+def _apply_chain_identity_attestation(
+    result: dict[str, Any],
+    *,
+    endpoint: str,
+    timeout: float,
+) -> None:
+    """Bind a reachable endpoint to the selected known chain.
+
+    Health and workload methods establish transport compatibility only. A
+    template may additionally declare an immutable identity probe whose stable
+    response must match before the endpoint is ready for any endpoint role.
+    """
+
+    if not result.get("ready"):
+        return
+    chain = str(result.get("chain") or "")
+    probe = _chain_meta(chain).get("identity_probe")
+    if not isinstance(probe, dict) or not probe:
+        return
+    identity = result.setdefault("identity", {})
+    method = str(probe.get("method") or "").strip()
+    normalization = str(probe.get("normalization") or "exact")
+    expected = _normalize_identity(probe.get("expected"), normalization)
+    identity.update({
+        "required": True,
+        "method": method,
+        "expected": expected,
+        "normalization": normalization,
+        "assertion_source": str(probe.get("source") or f"config/chains/{chain}.json"),
+    })
+    if not method or not expected:
+        result["ready"] = False
+        result["blockers"].append("CHAIN_IDENTITY_UNAVAILABLE: template identity probe is incomplete")
+        return
+    params = probe.get("params") if isinstance(probe.get("params"), (list, dict)) else []
+    status, sample = _call_request(
+        {
+            "method": "POST",
+            "url": endpoint,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, separators=(",", ":")),
+        },
+        timeout,
+    )
+    observed_raw = _json_pointer_value(sample, str(probe.get("result_pointer") or "/result"))
+    observed = _normalize_identity(observed_raw, normalization)
+    passed = _acceptable_status(status, sample) and observed == expected
+    identity.update({"verified": passed, "observed": observed})
+    result["checks"].append(_check(
+        "chain_identity_probe",
+        passed,
+        f"method={method}, expected={expected}, observed={observed or '<unavailable>'}, status={status}",
+        rpc_method=method,
+        http_status=status,
+        expected_identity=expected,
+        observed_identity=observed,
+        response_shape_hash=_response_shape_hash(sample),
+        response_sample=sample[:512],
+    ))
+    if not passed:
+        result["ready"] = False
+        result["blockers"].append(
+            f"CHAIN_IDENTITY_MISMATCH: expected {expected}, observed {observed or '<unavailable>'}"
+        )
+
+
+def _json_pointer_value(sample: str, pointer: str) -> Any:
+    try:
+        value: Any = json.loads(sample)
+    except Exception:
+        return None
+    for token in [item for item in pointer.split("/") if item]:
+        token = token.replace("~1", "/").replace("~0", "~")
+        if isinstance(value, dict) and token in value:
+            value = value[token]
+        elif isinstance(value, list) and token.isdigit() and int(token) < len(value):
+            value = value[int(token)]
+        else:
+            return None
+    return value
+
+
+def _normalize_identity(value: Any, normalization: str) -> str:
+    text = str(value if value is not None else "").strip()
+    if normalization == "integer":
+        try:
+            return str(int(text, 0))
+        except (TypeError, ValueError):
+            return ""
+    return text.casefold()
 
 
 def _should_use_generic_rest_probe(chain: str, adapter_family: str, methods: list[str]) -> bool:
@@ -337,6 +440,7 @@ def _validate_generic_rest_endpoint(
     failed = [item for item in result["checks"] if not item.get("passed")]
     result["ready"] = not failed
     result["blockers"].extend(f"{item.get('name')}: {item.get('detail')}" for item in failed)
+    _apply_chain_identity_attestation(result, endpoint=endpoint, timeout=timeout)
     if result["ready"]:
         result["warnings"].append(
             "generic REST probe passed for an unsupported chain; create a reviewed job-local chain override or chain template before benchmark execution"
@@ -618,6 +722,12 @@ def _finalize_result(result: dict[str, Any]) -> dict[str, Any]:
         result["response_shape_hash"] = selected.get("response_shape_hash", "")
         result["params"] = selected.get("params", {})
     result["status"] = _derive_status(result)
+    result["attestation_fingerprint"] = hashlib.sha256(json.dumps({
+        "chain": result.get("chain"),
+        "endpoint": result.get("endpoint"),
+        "transport": result.get("transport"),
+        "identity": result.get("identity"),
+    }, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
     if result.get("blockers"):
         result["error"] = str(result["blockers"][0])
     evidence_file = _write_evidence(result)
@@ -629,6 +739,10 @@ def _derive_status(result: dict[str, Any]) -> str:
     if result.get("ready"):
         return "ok"
     blockers = " | ".join(str(item) for item in result.get("blockers", []))
+    if "CHAIN_IDENTITY_MISMATCH" in blockers:
+        return "chain_identity_mismatch"
+    if "CHAIN_IDENTITY_UNAVAILABLE" in blockers:
+        return "needs_chain_identity"
     if "chain is required" in blockers:
         return "needs_chain"
     if "endpoint must be" in blockers or "provide an HTTP endpoint" in blockers:

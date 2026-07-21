@@ -29,6 +29,16 @@ def _endpoint_probe_completion(language: str) -> str:
     )
 
 
+def _method_identity_completion(language: str) -> str:
+    """Describe the typed continuation after a method identity is accepted."""
+
+    return localized(
+        language,
+        "接受 method 名称后，Agent 会保存带来源的 job-local draft，并继续收集该 method 的参数、request、response 或官方文档证据；暂时缺少后续证据不会撤销已经确认的 method。",
+        "After accepting the method name, the Agent stores a source-attributed job-local draft and continues with parameter, request, response, or official-document evidence. Missing later evidence does not undo the accepted method.",
+    )
+
+
 def _endpoint_validation_question(state: AgentGraphState) -> dict[str, Any] | None:
     language = str(state.get("language") or "en")
     custom = state.get("custom_rpc") or {}
@@ -61,6 +71,7 @@ def _endpoint_validation_question(state: AgentGraphState) -> dict[str, Any] | No
             accepted_action_types=("rpc_catalog_command",),
             queue_barrier=True,
             validation={"input_mode": "rpc_method_or_schema_evidence"},
+            completion_effect=_method_identity_completion(language),
         )
     if custom.get("status") == "needs_schema_evidence":
         method = normalize_scalar(
@@ -127,6 +138,7 @@ def _endpoint_validation_question(state: AgentGraphState) -> dict[str, Any] | No
             accepted_action_types=("rpc_catalog_command",),
             queue_barrier=True,
             validation={"input_mode": "rpc_method_or_schema_evidence"},
+            completion_effect=_method_identity_completion(language),
         )
     if identity.get("status") == "existing_family_needs_schema_evidence":
         method = normalize_scalar(draft_view(state).get("method"))

@@ -546,6 +546,99 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
             thread.join(timeout=2)
             server.server_close()
 
+    def test_evm_endpoint_attestation_rejects_wrong_chain_and_normalizes_hex(self) -> None:
+        import json
+
+        from agent.validators.endpoint_probe import validate_rpc_endpoint
+
+        compatible = (200, json.dumps({"jsonrpc": "2.0", "id": 1, "result": False}))
+        with patch("agent.validators.endpoint_probe._call_request", side_effect=[
+            compatible,
+            compatible,
+            (200, json.dumps({"jsonrpc": "2.0", "id": 1, "result": "0x1"})),
+        ]):
+            rejected = validate_rpc_endpoint(
+                chain="bsc",
+                endpoint="https://ethereum.example.invalid",
+                methods=["eth_syncing"],
+                adapter_family="jsonrpc",
+                method_params={"eth_syncing": []},
+            )
+        self.assertFalse(rejected["ready"])
+        self.assertEqual(rejected["status"], "chain_identity_mismatch")
+        self.assertEqual(rejected["identity"]["expected"], "56")
+        self.assertEqual(rejected["identity"]["observed"], "1")
+        self.assertIn("CHAIN_IDENTITY_MISMATCH", rejected["error"])
+
+        with patch("agent.validators.endpoint_probe._call_request", side_effect=[
+            compatible,
+            compatible,
+            (200, json.dumps({"jsonrpc": "2.0", "id": 1, "result": "0x38"})),
+        ]):
+            accepted = validate_rpc_endpoint(
+                chain="bsc",
+                endpoint="https://bsc.example.invalid",
+                methods=["eth_syncing"],
+                adapter_family="jsonrpc",
+                method_params={"eth_syncing": []},
+            )
+        self.assertTrue(accepted["ready"], accepted.get("blockers"))
+        self.assertTrue(accepted["identity"]["verified"])
+        self.assertTrue(accepted["attestation_fingerprint"])
+
+    def test_custom_rpc_method_questions_declare_incremental_continuation(self) -> None:
+        from agent.harness.domains.chain_rpc import question_for_chain_rpc
+        from agent.harness.state import new_state
+
+        custom = new_state("custom-method-continuation", language="en")
+        custom["active_group"] = "endpoint_process"
+        custom["chain_identity"] = {"canonical": "bsc", "adapter_family": "jsonrpc", "status": "confirmed"}
+        custom["custom_rpc"] = {"status": "needs_method", "endpoint_ready": True}
+        question = question_for_chain_rpc(custom, "endpoint_process")
+        self.assertEqual(question["id"], "custom_rpc_method")
+        self.assertIn("Missing later evidence does not undo", question["completion_effect"])
+
+        new_chain = new_state("new-chain-method-continuation", language="en")
+        new_chain["active_group"] = "endpoint_process"
+        new_chain["chain_identity"] = {
+            "canonical": "new-evm",
+            "adapter_family": "jsonrpc",
+            "status": "existing_family_needs_method",
+        }
+        question = question_for_chain_rpc(new_chain, "endpoint_process")
+        self.assertEqual(question["id"], "new_chain_method")
+        self.assertIn("Missing later evidence does not undo", question["completion_effect"])
+
+    def test_stable_identity_response_sample_requires_semantic_equality(self) -> None:
+        from agent.harness.domains.rpc_endpoint import _response_contract_conflicts
+
+        draft = {"response_sample": {"jsonrpc": "2.0", "id": 1, "result": "0x38"}}
+        observed = '{"jsonrpc":"2.0","id":1,"result":"0x1"}'
+        self.assertIn(
+            "stable response mismatch: expected 56, observed 1",
+            _response_contract_conflicts(draft, observed, stable_result="1"),
+        )
+
+    def test_chain_change_clears_sync_endpoint_and_attestation(self) -> None:
+        from agent.harness.state import new_state
+        from agent.harness.transitions import invalidate_for_chain_change
+
+        state = new_state("chain-change-attestation", language="en")
+        state["confirmed_config"] = {
+            "SYNC_OBSERVE_RPC_URL": "https://old.example.invalid",
+            "LOCAL_RPC_URL": "https://old.example.invalid",
+            "MAINNET_RPC_URL": "https://old-mainnet.example.invalid",
+        }
+        state["endpoint_evidence"] = {
+            "sync_rpc_url_ready": True,
+            "sync_rpc_url_probe": {"attestation_fingerprint": "old"},
+        }
+        invalidate_for_chain_change(state, new_chain="ethereum")
+        self.assertNotIn("SYNC_OBSERVE_RPC_URL", state["confirmed_config"])
+        self.assertNotIn("LOCAL_RPC_URL", state["confirmed_config"])
+        self.assertNotIn("MAINNET_RPC_URL", state["confirmed_config"])
+        self.assertEqual(state["endpoint_evidence"], {})
+
     def test_target_mode_choice_asks_chain_before_provider_values(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
 
