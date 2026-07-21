@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -26,6 +28,7 @@ from tests.agent_live.dynamic_dual_ai_chaos import (
     DynamicDualAiChaosRunner,
     SimulatorContext,
     SimulatorDecision,
+    SubprocessPtyTransport,
     _complete_agent_response,
     _verify_declared_postconditions,
     encode_bracketed_paste,
@@ -1301,9 +1304,35 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
         message = "请分析：\n```json\n{\"method\":\"eth_call\",\"params\":[]}\n```"
         encoded = encode_bracketed_paste(message)
         self.assertTrue(encoded.startswith(b"\x1b[200~"))
-        self.assertTrue(encoded.endswith(b"\x1b[201~\r"))
+        self.assertTrue(encoded.endswith(b"\x1b[201~"))
         self.assertEqual(encoded.count(b"\x1b[200~"), 1)
         self.assertEqual(encoded.count(b"\x1b[201~"), 1)
+        self.assertFalse(encoded.endswith(b"\r"))
+
+    def test_real_prompt_toolkit_submits_single_and_multiline_paste_once(self) -> None:
+        program = (
+            "from agent.terminal.io import TerminalIO; "
+            "print('Agent> ready', flush=True); "
+            "value=TerminalIO().input('en'); "
+            "print('Agent> VALUE='+repr(value), flush=True); "
+            "print('User> ', end='', flush=True)"
+        )
+        for message in ("single value", "first line\n第二行\nthird line"):
+            with self.subTest(message=message):
+                transport = SubprocessPtyTransport(
+                    (sys.executable, "-c", program),
+                    cwd=Path.cwd(),
+                    poll_interval_seconds=0.05,
+                )
+                transport.start(env=dict(os.environ))
+                try:
+                    transport.read_complete_agent_response(timeout_seconds=5)
+                    transport.submit_bracketed_paste(message)
+                    response = transport.read_complete_agent_response(timeout_seconds=5)
+                finally:
+                    transport.close()
+                self.assertIn(f"Agent> VALUE={message!r}", response)
+                self.assertEqual(response.count("Agent> VALUE="), 1)
 
 
 if __name__ == "__main__":

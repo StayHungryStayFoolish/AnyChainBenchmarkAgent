@@ -274,6 +274,11 @@ class SubprocessPtyTransport:
         if self._master_fd is None:
             raise RuntimeError("PTY transport is not running")
         os.write(self._master_fd, encode_bracketed_paste(message))
+        # A real terminal delivers the paste boundary before the user's later
+        # Enter key. Give prompt-toolkit one input cycle to leave paste mode;
+        # otherwise multiline content can remain in the edit buffer forever.
+        time.sleep(self.poll_interval_seconds)
+        os.write(self._master_fd, b"\r")
 
     def close(self) -> None:
         process = self._process
@@ -846,10 +851,10 @@ class DynamicDualAiChaosRunner:
 
 
 def encode_bracketed_paste(message: str) -> bytes:
-    """Encode one user turn without treating embedded newlines as submissions."""
+    """Encode one paste event without treating embedded newlines as submissions."""
 
     normalized = str(message).replace("\r\n", "\n").replace("\r", "\n")
-    return b"\x1b[200~" + normalized.encode("utf-8") + b"\x1b[201~\r"
+    return b"\x1b[200~" + normalized.encode("utf-8") + b"\x1b[201~"
 
 
 def _validate_decision(
