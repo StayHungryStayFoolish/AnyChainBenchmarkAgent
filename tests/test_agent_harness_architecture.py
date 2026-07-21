@@ -810,6 +810,32 @@ class HarnessQuestionContractTest(unittest.TestCase):
         self.assertTrue(answer_fits_pending('["0xabc", "latest"]', evidence_question))
         self.assertFalse(answer_fits_pending('{"ticket": "INC-1"}', evidence_question))
 
+    def test_evidence_contract_requires_semantic_ownership_for_multiline_prose(self) -> None:
+        from agent.harness.questions import (
+            answer_fits_pending,
+            manual_question,
+            value_satisfies_pending_contract,
+        )
+
+        question = manual_question(
+            "chain_identity",
+            "protocol_evidence",
+            "Provide protocol evidence.",
+            field="protocol_evidence",
+            kind="evidence",
+        )
+        evidence = (
+            "The protocol uses a peer-to-peer RPC transport.\n"
+            "Its request schema is not compatible with the supported adapters."
+        )
+
+        self.assertFalse(answer_fits_pending(evidence, question))
+        self.assertTrue(value_satisfies_pending_contract(evidence, question))
+        self.assertEqual(
+            question["validation"],
+            {"value_type": "evidence_contribution", "max_length": 65536},
+        )
+
     def test_turn_finalizer_removes_superseded_barrier_question_only(self) -> None:
         from agent.harness.coordinator import _finalize_turn_response
         from agent.harness.questions import manual_question, render_question

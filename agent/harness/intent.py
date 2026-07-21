@@ -4045,6 +4045,7 @@ def _materialize_pending_manual_owner_actions(
     units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
     removed: set[int] = set()
     next_admitted = set(admitted)
+    materialized = False
     for index in sorted(answer_indexes):
         answer = actions[index]
         selected = answer.get("selected_value")
@@ -4095,6 +4096,7 @@ def _materialize_pending_manual_owner_actions(
             removed.add(index)
         else:
             actions[index] = candidate
+        materialized = True
         next_admitted.discard(index)
         next_admitted.add(owner_index)
         for unit in units:
@@ -4109,6 +4111,8 @@ def _materialize_pending_manual_owner_actions(
             unit["disposition"] = "action"
             unit["reason"] = "manual pending input compiled through declared domain owner"
 
+    if not materialized:
+        return text, False
     payload["actions"] = actions
     payload["semantic_units"] = units
     payload["pending_answer_admissions"] = sorted(next_admitted)

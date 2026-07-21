@@ -3712,6 +3712,63 @@ class PlanCoverageTest(unittest.TestCase):
         }])
         self.assertEqual(document["pending_answer_admissions"], [0])
 
+    def test_case3_multiline_evidence_compiles_through_declared_owner(self) -> None:
+        import json
+
+        from agent.harness.domains.chain_rpc_questions import _case3_evidence_question
+        from agent.harness.intent import _materialize_pending_manual_owner_actions
+        from agent.harness.state import new_state
+
+        source = (
+            "The protocol documentation says this chain exposes its own peer-to-peer RPC transport.\n"
+            "Its request and response schema is not compatible with the currently supported adapter families."
+        )
+        state = new_state("case3-evidence-owner", language="en")
+        state["chain_identity"] = {
+            "raw": "WeirdP2PChain",
+            "canonical": "WeirdP2PChain",
+            "adapter_family": "unsupported",
+            "status": "case3_collecting_evidence",
+            "case": "case3",
+        }
+        state["secondary_handoff"] = {
+            "status": "collecting_evidence",
+            "kind": "case3_protocol_adapter_implementation",
+            "evidence": [],
+        }
+        state["pending_question"] = _case3_evidence_question(state)
+        payload = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": source,
+                "selected_value": source,
+                "source_evidence": source,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": source,
+                "disposition": "action",
+                "action_indexes": [0],
+            }],
+            "pending_answer_admissions": [0],
+        }
+
+        result, changed = _materialize_pending_manual_owner_actions(
+            json.dumps(payload), state, source
+        )
+        document = json.loads(result)
+
+        self.assertTrue(changed)
+        self.assertEqual(document["actions"], [{
+            "type": "secondary_handoff_command",
+            "handoff_command": "append_evidence",
+            "handoff_evidence": source,
+            "source_evidence": source,
+        }])
+        self.assertEqual(document["pending_answer_admissions"], [0])
+        self.assertEqual(document["semantic_units"][0]["action_indexes"], [0])
+
     def test_manual_pending_review_extracts_typed_values_generically(self) -> None:
         import json
         from types import SimpleNamespace

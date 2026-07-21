@@ -14,6 +14,8 @@ from .localization import localized
 
 def _question_validation(kind: str, validation: dict[str, Any] | None) -> dict[str, Any]:
     field_validation = dict(validation or {})
+    if kind == "evidence" and not field_validation:
+        return {"value_type": "evidence_contribution", "max_length": 65536}
     if kind == "manual_value" and not field_validation:
         return {"value_type": "scalar_token", "max_length": 180}
     return field_validation
@@ -286,6 +288,15 @@ def value_satisfies_pending_contract(value: Any, question: dict[str, Any]) -> bo
         return False
     validation = question.get("validation") or {}
     value_type = str(validation.get("value_type") or "")
+    if value_type == "evidence_contribution":
+        max_length = int(validation.get("max_length") or 65536)
+        return bool(
+            len(raw) <= max_length
+            and all(
+                character.isprintable() or character in {"\n", "\r", "\t"}
+                for character in raw
+            )
+        )
     if value_type == "bounded_text":
         max_length = int(validation.get("max_length") or 512)
         return bool(

@@ -320,7 +320,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         "secondary_handoff_command",
         "chain_rpc",
         "Append one source-grounded protocol-development evidence item to an active Case 3 handoff.",
-        ("handoff_command", "handoff_evidence"),
+        ("handoff_command", "handoff_evidence", "source_evidence"),
         40,
         "chain_identity",
         preserve_pending=True,

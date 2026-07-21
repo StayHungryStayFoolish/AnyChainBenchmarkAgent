@@ -385,6 +385,12 @@ def _case3_evidence_question(state: AgentGraphState) -> dict[str, Any]:
         field="case3_protocol_evidence",
         kind="evidence",
         accepted_action_types=("secondary_handoff_command",),
+        manual_action={
+            "type": "secondary_handoff_command",
+            "handoff_command": "append_evidence",
+            "value_argument": "handoff_evidence",
+            "use_complete_turn": True,
+        },
         evidence_path="secondary_handoff.evidence",
     )
 
