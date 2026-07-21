@@ -804,6 +804,7 @@ def _recover_declared_pending_option_semantics(
         available.append({
             "option_id": str(option.get("id") or index),
             "label": str(option.get("label") or option.get("value") or ""),
+            "description": str(option.get("description") or ""),
             "semantic_action": semantic,
             "value": option.get("value"),
             "declared_action": declared or {"type": "answer_pending"},

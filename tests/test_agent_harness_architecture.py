@@ -1659,6 +1659,46 @@ class HarnessQuestionContractTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             render_question(question)  # type: ignore[call-arg]
 
+    def test_option_description_is_visible_semantic_context_not_an_exact_alias(self) -> None:
+        from agent.harness.questions import choice_question, exact_answer, render_question
+
+        description = "Fast framework validation with recorded fixtures."
+        question = choice_question(
+            "opening",
+            "described_option_contract",
+            "Choose one.",
+            field="target_mode",
+            options=[{
+                "id": "fake-node",
+                "label": "Start fake-node",
+                "description": description,
+                "value": "fake-node",
+                "action": {"type": "choose_target_mode", "target_mode": "fake-node"},
+            }],
+        )
+
+        self.assertEqual(question["options"][0]["description"], description)
+        self.assertIn(description, render_question(question, "en"))
+        self.assertEqual(exact_answer("fake-node", question), (True, "fake-node"))
+        self.assertEqual(exact_answer(description, question), (False, None))
+
+    def test_opening_options_explain_product_effect_in_both_languages(self) -> None:
+        from agent.harness.domains.orientation import opening_question
+        from agent.harness.questions import render_question
+
+        for language in ("en", "zh"):
+            with self.subTest(language=language):
+                question = opening_question(_state(language))
+                descriptions = [
+                    str(option.get("description") or "").strip()
+                    for option in question["options"]
+                ]
+                self.assertEqual(len(descriptions), 4)
+                self.assertTrue(all(descriptions))
+                rendered = render_question(question, language)
+                for description in descriptions:
+                    self.assertIn(description, rendered)
+
     def test_manual_choice_question_has_complete_validation_at_construction(self) -> None:
         from agent.harness.questions import choice_question
 

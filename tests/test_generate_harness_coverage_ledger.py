@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 import unittest
+from copy import deepcopy
 from unittest.mock import patch
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -311,6 +312,15 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
         localized = {**base, "prompt": "中文提示"}
         localized["options"] = [{**base["options"][0], "label": "是"}]
         self.assertEqual(contract_variant_hash(base), contract_variant_hash(localized))
+
+        described = deepcopy(base)
+        described["options"][0]["description"] = "Validates with recorded fixtures."
+        changed_description = deepcopy(described)
+        changed_description["options"][0]["description"] = "Measures real-node performance."
+        self.assertNotEqual(
+            contract_variant_hash(described),
+            contract_variant_hash(changed_description),
+        )
 
         resume_variants = {
             edge["contract_variant_hash"]

@@ -159,6 +159,7 @@ class OptionContract:
     value: Any
     action: ActionProposal
     expected_patch: Mapping[str, Any]
+    description: str = ""
     return_policy: ReturnPolicy = "fallback"
     preconditions: Mapping[str, Any] = dataclass_field(default_factory=dict)
 

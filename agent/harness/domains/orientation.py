@@ -298,24 +298,44 @@ def opening_question(state: AgentGraphState) -> dict[str, Any]:
         options=[
             {
                 "label": "启动 fake-node 测试" if zh else "Start a fake-node benchmark",
+                "description": localized(
+                    language,
+                    "使用预录 fixtures 做最快的低风险框架闭环验证；不测量真实节点性能。",
+                    "Fast, low-risk framework validation with recorded fixtures; it does not measure real-node performance.",
+                ),
                 "value": "fake-node",
                 "action": {"type": "choose_target_mode", "target_mode": "fake-node", "target_mode_explicit": True},
                 "expected_patch": {"target_mode": "fake-node", "workflow_mode": "rpc_benchmark"},
             },
             {
                 "label": "启动 real-node 测试" if zh else "Start a real-node benchmark",
+                "description": localized(
+                    language,
+                    "对可访问的真实节点 RPC endpoint 进行负载测试并分析性能瓶颈。",
+                    "Load-test a reachable real-node RPC endpoint and analyze performance bottlenecks.",
+                ),
                 "value": "real-node",
                 "action": {"type": "choose_target_mode", "target_mode": "real-node", "target_mode_explicit": True},
                 "expected_patch": {"target_mode": "real-node", "workflow_mode": "rpc_benchmark"},
             },
             {
                 "label": "启动 sync-observe（观察真实节点同步）" if zh else "Start sync-observe (real-node synchronization)",
+                "description": localized(
+                    language,
+                    "观察真实节点追块、资源与可用 MGas/s 指标；不运行 Vegeta 压测。",
+                    "Observe real-node synchronization, resources, and available MGas/s metrics without Vegeta load.",
+                ),
                 "value": "sync-observe",
                 "action": {"type": "choose_target_mode", "target_mode": "sync-observe", "target_mode_explicit": True},
                 "expected_patch": {"target_mode": "sync-observe", "workflow_mode": "sync_observe"},
             },
             {
                 "label": "了解支持的链、RPC method 和二次开发方式" if zh else "Learn supported chains, RPC methods, and extension paths",
+                "description": localized(
+                    language,
+                    "只读查看框架能力、默认 workload 与扩展路径，不修改测试配置。",
+                    "Read-only guidance about capabilities, default workloads, and extension paths without changing test configuration.",
+                ),
                 "value": "info",
                 "action": {"type": "answer_opening_question", "topic": "capabilities"},
                 "expected_patch": {},

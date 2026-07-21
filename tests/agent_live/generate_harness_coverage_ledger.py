@@ -118,6 +118,7 @@ def contract_variant_payload(question: Mapping[str, Any]) -> dict[str, Any]:
         action = option.get("action") if isinstance(option.get("action"), Mapping) else {}
         options.append({
             "id": str(option.get("id") or ""),
+            "description": str(option.get("description") or ""),
             "value": option.get("value"),
             "action": dict(action),
             "expected_patch": dict(option.get("expected_patch") or {}),

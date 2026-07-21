@@ -9527,6 +9527,7 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         self.assertEqual(review_payload["selected_option"], {
             "option_id": "fake-node",
             "label": "fake-node",
+            "description": "",
             "semantic_action": "",
             "value": "fake-node",
             "declared_action": {
@@ -9582,6 +9583,10 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
             "options": [{
                 "id": "1",
                 "label": "Start a fake-node benchmark",
+                "description": (
+                    "Fast, low-risk framework validation with recorded fixtures; "
+                    "it does not measure real-node performance."
+                ),
                 "value": "fake-node",
                 "action": {
                     "type": "choose_target_mode",
@@ -9620,6 +9625,13 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         self.assertEqual(
             review_payload["selected_option"]["expected_patch"],
             {"target_mode": "fake-node", "workflow_mode": "rpc_benchmark"},
+        )
+        self.assertEqual(
+            review_payload["selected_option"]["description"],
+            (
+                "Fast, low-risk framework validation with recorded fixtures; "
+                "it does not measure real-node performance."
+            ),
         )
 
     def test_pending_option_preserves_independent_context_labeled_request(self) -> None:

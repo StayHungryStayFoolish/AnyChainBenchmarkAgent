@@ -113,6 +113,7 @@ def choice_question(
                 value=value,
                 action=action,
                 expected_patch=expected,
+                description=str(raw.get("description") or "").strip(),
                 return_policy=str(raw.get("return_policy") or "fallback"),  # type: ignore[arg-type]
             )
         )
@@ -120,6 +121,7 @@ def choice_question(
             {
                 "id": option_id,
                 "label": str(raw.get("label") or value),
+                "description": str(raw.get("description") or "").strip(),
                 "value": value,
                 "action": {"type": action.action_type, **dict(action.arguments)},
                 "expected_patch": expected,
@@ -486,7 +488,9 @@ def pending_option_value_exists(value: Any, question: dict[str, Any]) -> bool:
 def render_question(question: dict[str, Any], language: str) -> str:
     lines = [str(question.get("prompt") or "").strip()]
     for index, option in enumerate(question.get("options") or [], start=1):
-        lines.append(f"{index}. {option.get('label') or option.get('value')}")
+        label = option.get("label") or option.get("value")
+        description = str(option.get("description") or "").strip()
+        lines.append(f"{index}. {label}{f' — {description}' if description else ''}")
     options = question.get("options") or []
     if question.get("manual_input_allowed"):
         lines.append(localized(
