@@ -390,7 +390,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         constraints=(
             "append_evidence is valid only while a Case 3 handoff is collecting official protocol, endpoint, request, or response evidence",
         ),
-        semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
+        semantic_support_relations=EVIDENCE_OPERATION_SUPPORT_RELATIONS,
     ),
     ActionSpec(
         "rpc_workload_command",

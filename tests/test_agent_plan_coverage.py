@@ -3787,6 +3787,219 @@ class PlanCoverageTest(unittest.TestCase):
             ACTION_BY_TYPE["rpc_catalog_command"].semantic_support_relations,
         )
 
+    def test_complete_turn_evidence_owner_recovers_partial_wire_evidence(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _adjudicate_pending_action_ownership
+        from agent.harness.state import new_state
+
+        cases = (
+            (
+                "I only have the request so far; no response was captured:\n"
+                '{"jsonrpc":"2.0","id":9,"method":"chain_status","params":[]}',
+                '{"jsonrpc":"2.0","id":9,"method":"chain_status","params":[]}',
+            ),
+            (
+                "目前只拿到了响应，没有请求：\n"
+                '{"jsonrpc":"2.0","id":9,"result":{"height":"42"}}',
+                '{"jsonrpc":"2.0","id":9,"result":{"height":"42"}}',
+            ),
+        )
+        for source, evidence_quote in cases:
+            with self.subTest(source=source):
+                clauses = segment_user_turn(source)
+                state = new_state("structured-handoff-evidence", language="en")
+                state["pending_question"] = {
+                    "id": "opaque-evidence-question",
+                    "group": "chain_identity",
+                    "kind": "evidence",
+                    "field": "protocol_evidence",
+                    "prompt": "Provide protocol evidence.",
+                    "manual_input_allowed": True,
+                    "accepted_action_types": ["secondary_handoff_command"],
+                    "manual_action": {
+                        "type": "secondary_handoff_command",
+                        "handoff_command": "append_evidence",
+                        "value_argument": "handoff_evidence",
+                        "use_complete_turn": True,
+                    },
+                    "validation": {
+                        "value_type": "evidence_contribution",
+                        "max_length": 65536,
+                    },
+                    "structured_input_owner": True,
+                    "options": [],
+                }
+                payload = {
+                    "actions": [{
+                        "type": "clarify_unresolved",
+                        "clauses": [clauses[-1].text],
+                    }],
+                    "semantic_units": [
+                        _unit(clauses[0], 1, [], disposition="context"),
+                        _unit(clauses[-1], 2, [0]),
+                    ],
+                }
+                provider = Mock()
+                provider.complete.return_value = SimpleNamespace(text=json.dumps({
+                    "reviews": [{
+                        "action_index": 0,
+                        "decision": "direct_answer",
+                        "selected_value": evidence_quote,
+                        "evidence_quote": evidence_quote,
+                        "reason": "the structured fragment is attributable wire evidence",
+                    }],
+                }))
+
+                result, changed = _adjudicate_pending_action_ownership(
+                    provider,
+                    json.dumps(payload),
+                    state,
+                    source,
+                )
+                document = json.loads(result)
+
+                self.assertTrue(changed)
+                self.assertEqual(document["actions"], [{
+                    "type": "secondary_handoff_command",
+                    "handoff_command": "append_evidence",
+                    "handoff_evidence": source,
+                    "source_evidence": source,
+                }])
+                self.assertEqual(document["pending_answer_admissions"], [0])
+                review_payload = json.loads(provider.complete.call_args.args[0].messages[1].content)
+                self.assertEqual(
+                    review_payload["reviews"][0]["validation"]["value_type"],
+                    "evidence_contribution",
+                )
+                self.assertTrue(review_payload["reviews"][0]["structured_input_owner"])
+                self.assertTrue(review_payload["reviews"][0]["use_complete_turn"])
+                self.assertIn(
+                    "protocol-development evidence",
+                    review_payload["reviews"][0]["declared_owner_purpose"],
+                )
+
+        from agent.harness.action_registry import ACTION_BY_TYPE
+
+        self.assertIn(
+            "evidence_completeness",
+            ACTION_BY_TYPE["secondary_handoff_command"].semantic_support_relations,
+        )
+
+    def test_structured_evidence_owner_does_not_claim_unrelated_json(self) -> None:
+        import json
+
+        from agent.harness.intent import _seed_structured_manual_pending_candidates
+
+        source = '{"CLOUD_REGION":"asia-east1","INITIAL_QPS":10}'
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{"type": "clarify_unresolved", "clauses": [source]}],
+            "semantic_units": [_unit(clauses[0], 1, [0])],
+        }
+        pending = {
+            "structured_input_owner": True,
+            "manual_action": {
+                "type": "secondary_handoff_command",
+                "handoff_command": "append_evidence",
+                "value_argument": "handoff_evidence",
+                "use_complete_turn": True,
+            },
+            "validation": {"value_type": "evidence_contribution"},
+        }
+
+        seeded = _seed_structured_manual_pending_candidates(payload, pending, source)
+
+        self.assertEqual(seeded, set())
+        self.assertEqual(payload["actions"], [{
+            "type": "clarify_unresolved",
+            "clauses": [source],
+        }])
+
+    def test_structured_evidence_owner_supersedes_generic_wire_analysis_only(self) -> None:
+        from agent.harness.intent import _seed_structured_manual_pending_candidates
+
+        source = (
+            "I only have the request so far; no response was captured:\n"
+            '{"jsonrpc":"2.0","id":9,"method":"chain_status","params":[]}'
+        )
+        clauses = segment_user_turn(source)
+        self.assertGreaterEqual(len(clauses), 2)
+        payload = {
+            "actions": [{
+                "type": "analyze_evidence",
+                "evidence": clauses[-1].text,
+                "question": "",
+            }],
+            "semantic_units": [
+                _unit(clauses[0], 1, [], disposition="unresolved"),
+                _unit(clauses[-1], 2, [0]),
+            ],
+        }
+        pending = {
+            "structured_input_owner": True,
+            "manual_action": {
+                "type": "secondary_handoff_command",
+                "handoff_command": "append_evidence",
+                "value_argument": "handoff_evidence",
+                "use_complete_turn": True,
+            },
+            "validation": {"value_type": "evidence_contribution"},
+        }
+
+        seeded = _seed_structured_manual_pending_candidates(payload, pending, source)
+
+        self.assertEqual(seeded, {0})
+        self.assertEqual(payload["actions"], [{
+            "type": "answer_pending",
+            "answer": source,
+            "source_evidence": source,
+        }])
+        self.assertEqual(payload["semantic_units"][0]["disposition"], "context")
+        self.assertEqual(payload["semantic_units"][0]["action_indexes"], [])
+        self.assertEqual(payload["semantic_units"][-1]["action_indexes"], [0])
+
+    def test_structured_evidence_owner_preserves_separate_analysis_demand(self) -> None:
+        from agent.harness.intent import _seed_structured_manual_pending_candidates
+
+        source = (
+            "Analyze this request before saving it;\n"
+            '{"jsonrpc":"2.0","id":9,"method":"chain_status","params":[]}'
+        )
+        clauses = segment_user_turn(source)
+        self.assertGreaterEqual(len(clauses), 2)
+        payload = {
+            "actions": [{
+                "type": "analyze_evidence",
+                "evidence": source,
+                "question": clauses[0].text,
+            }],
+            "semantic_units": [
+                _unit(clauses[0], 1, [0]),
+                _unit(clauses[-1], 2, [0]),
+            ],
+        }
+        pending = {
+            "structured_input_owner": True,
+            "manual_action": {
+                "type": "secondary_handoff_command",
+                "handoff_command": "append_evidence",
+                "value_argument": "handoff_evidence",
+                "use_complete_turn": True,
+            },
+            "validation": {"value_type": "evidence_contribution"},
+        }
+
+        seeded = _seed_structured_manual_pending_candidates(payload, pending, source)
+
+        self.assertEqual(seeded, {1})
+        self.assertEqual(payload["actions"][0]["type"], "analyze_evidence")
+        self.assertEqual(payload["actions"][1]["type"], "answer_pending")
+        self.assertEqual(payload["semantic_units"][0]["action_indexes"], [0])
+        self.assertEqual(payload["semantic_units"][-1]["action_indexes"], [0, 1])
+
     def test_structured_rpc_request_does_not_bypass_semantic_rejection(self) -> None:
         import json
         from types import SimpleNamespace

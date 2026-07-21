@@ -383,7 +383,7 @@ def _case3_evidence_question(state: AgentGraphState) -> dict[str, Any]:
     return manual_question(
         "chain_identity",
         "case3_protocol_evidence",
-        localized(language, "请提供官方协议/RPC 文档、endpoint 文档或完整 request/response 示例。", "Provide official protocol/RPC docs, endpoint docs, or a complete request/response example."),
+        localized(language, "请提供官方协议/RPC 文档、endpoint 文档或 request 和/或 response 示例。可以先提交当前已有的部分。", "Provide official protocol/RPC docs, endpoint docs, or a request and/or response example. You may submit the part currently available."),
         field="case3_protocol_evidence",
         kind="evidence",
         accepted_action_types=("secondary_handoff_command",),

@@ -25,7 +25,11 @@ from .domains.environment import (
     CONFIG_PROPOSAL_FIELDS,
     extract_structured_input_candidates,
 )
-from .input_values import extract_rpc_method_identities, target_mode_evidence_matches
+from .input_values import (
+    extract_rpc_method_identities,
+    has_rpc_wire_evidence,
+    target_mode_evidence_matches,
+)
 from .plan_coverage import PlanCoverageResult, TurnClause, segment_user_turn, validate_plan_coverage
 from .questions import (
     answer_fits_pending,
@@ -4574,6 +4578,7 @@ def _adjudicate_manual_pending_answers(
     seeded_indexes = _seed_structured_manual_pending_candidates(
         payload,
         pending,
+        user_text,
     )
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
     units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
@@ -4610,6 +4615,8 @@ def _adjudicate_manual_pending_answers(
         return json.dumps(payload, ensure_ascii=False, sort_keys=True), bool(directly_grounded)
 
     reviews = []
+    manual_template = dict(pending.get("manual_action") or {})
+    manual_spec = ACTION_BY_TYPE.get(str(manual_template.get("type") or ""))
     for index in review_indexes:
         sources = [
             str(unit.get("source_text") or "")
@@ -4627,6 +4634,10 @@ def _adjudicate_manual_pending_answers(
             "question": str(pending.get("prompt") or ""),
             "field": str(pending.get("field") or ""),
             "kind": str(pending.get("kind") or ""),
+            "validation": dict(pending.get("validation") or {}),
+            "structured_input_owner": pending.get("structured_input_owner") is True,
+            "use_complete_turn": manual_template.get("use_complete_turn") is True,
+            "declared_owner_purpose": manual_spec.purpose if manual_spec is not None else "",
             "proposed_answer": actions[index].get("answer"),
             "source_units": sources,
         })
@@ -4703,51 +4714,85 @@ def _adjudicate_manual_pending_answers(
 def _seed_structured_manual_pending_candidates(
     payload: dict[str, Any],
     pending: dict[str, Any],
+    user_text: str,
 ) -> set[int]:
-    """Expose syntax-owned RPC identities to the declared pending owner.
+    """Expose syntax-owned RPC facts to the declared pending owner.
 
-    The action planner still owns conversational decomposition.  When it omits
-    the owner action for a structured RPC request, however, the wire parser can
-    prove the exact method identity.  We create only a review candidate here;
-    semantic admission must still decide whether surrounding prose selects the
-    method or rejects/qualifies the example.
+    The action planner still owns conversational decomposition. When it omits
+    an owner action for structured RPC input, the wire parser may prove an
+    exact method identity or an attributable evidence contribution. This stage
+    creates review candidates only; semantic admission still decides whether
+    surrounding prose selects, qualifies, or rejects the structured example.
     """
 
     validation = dict(pending.get("validation") or {})
     template = dict(pending.get("manual_action") or {})
-    if (
-        validation.get("input_mode") != "rpc_method_or_schema_evidence"
-        or template.get("type") != "rpc_catalog_command"
-        or template.get("catalog_command") != "set_method"
-        or template.get("value_argument") != "rpc_method"
-    ):
+    method_identity_owner = (
+        validation.get("input_mode") == "rpc_method_or_schema_evidence"
+        and template.get("type") == "rpc_catalog_command"
+        and template.get("catalog_command") == "set_method"
+        and template.get("value_argument") == "rpc_method"
+    )
+    action_type = str(template.get("type") or "")
+    action_spec = ACTION_BY_TYPE.get(action_type)
+    complete_turn_evidence_owner = bool(
+        pending.get("structured_input_owner") is True
+        and validation.get("value_type") == "evidence_contribution"
+        and template.get("use_complete_turn") is True
+        and str(template.get("value_argument") or "")
+        and action_spec is not None
+        and "evidence_completeness" in action_spec.semantic_support_relations
+        and has_rpc_wire_evidence(user_text)
+    )
+    if not method_identity_owner and not complete_turn_evidence_owner:
         return set()
 
     actions = [dict(action) for action in payload.get("actions") or [] if isinstance(action, dict)]
     units = [dict(unit) for unit in payload.get("semantic_units") or [] if isinstance(unit, dict)]
     claims: list[tuple[str, str]] = []
+    evidence_unit_ids: set[str] = set()
     for unit in units:
         source = str(unit.get("source_text") or "")
-        methods = extract_rpc_method_identities(source)
-        if len(methods) == 1:
-            claims.append((str(unit.get("unit_id") or ""), methods[0]))
-    if not claims:
+        unit_id = str(unit.get("unit_id") or "")
+        if method_identity_owner:
+            methods = extract_rpc_method_identities(source)
+            if len(methods) == 1:
+                claims.append((unit_id, methods[0]))
+        if complete_turn_evidence_owner and has_rpc_wire_evidence(source):
+            evidence_unit_ids.add(unit_id)
+    if not claims and not evidence_unit_ids:
         return set()
 
-    claimed_ids = {unit_id for unit_id, _method in claims if unit_id}
+    claimed_ids = {
+        unit_id for unit_id, _method in claims if unit_id
+    } | {unit_id for unit_id in evidence_unit_ids if unit_id}
     action_unit_ids: dict[int, set[str]] = {}
     for unit in units:
         unit_id = str(unit.get("unit_id") or "")
         for index in unit.get("action_indexes") or []:
             if isinstance(index, int):
                 action_unit_ids.setdefault(index, set()).add(unit_id)
-    removable = {
-        index
-        for index, action in enumerate(actions)
-        if str(action.get("type") or "") == "clarify_unresolved"
-        and action_unit_ids.get(index)
-        and action_unit_ids[index] <= claimed_ids
-    }
+    removable: set[int] = set()
+    for index, action in enumerate(actions):
+        owned_units = action_unit_ids.get(index) or set()
+        if not owned_units or not owned_units <= claimed_ids:
+            continue
+        action_type = str(action.get("type") or "")
+        spec = ACTION_BY_TYPE.get(action_type)
+        if action_type == "clarify_unresolved":
+            removable.add(index)
+            continue
+        if (
+            complete_turn_evidence_owner
+            and spec is not None
+            and spec.lifetime == "turn_local"
+            and spec.effect == "read_only"
+        ):
+            # A structured pending owner outranks a generic read-only
+            # interpretation of exactly the same wire-evidence unit.  A real
+            # analysis request remains separate because its prose unit is not
+            # owned by the submitted wire fragment.
+            removable.add(index)
     if removable:
         old_to_new: dict[int, int] = {}
         retained: list[dict[str, Any]] = []
@@ -4763,6 +4808,19 @@ def _seed_structured_manual_pending_candidates(
                 for index in unit.get("action_indexes") or []
                 if isinstance(index, int) and index in old_to_new
             ]
+            if (
+                complete_turn_evidence_owner
+                and str(unit.get("unit_id") or "") not in evidence_unit_ids
+                and not unit["action_indexes"]
+                and str(unit.get("source_text") or "").strip()
+            ):
+                # The semantic fulfilment gate decides whether surrounding
+                # prose is merely provenance/evidence-completeness support or
+                # an independent demand.  Marking it as reviewable context
+                # preserves that distinction without teaching this layer
+                # phrases or locales.
+                unit["disposition"] = "context"
+                unit["reason"] = "surrounding prose awaiting structured evidence-owner review"
 
     seeded: set[int] = set()
     units_by_id = {str(unit.get("unit_id") or ""): unit for unit in units}
@@ -4802,6 +4860,44 @@ def _seed_structured_manual_pending_candidates(
         unit["disposition"] = "action"
         unit["reason"] = "structured RPC identity awaiting declared pending-owner review"
         seeded.add(index)
+
+    if complete_turn_evidence_owner and evidence_unit_ids:
+        existing = next(
+            (
+                index
+                for index, action in enumerate(actions)
+                if isinstance(action, dict)
+                and str(action.get("type") or "") == "answer_pending"
+                and any(
+                    index in (unit.get("action_indexes") or [])
+                    for unit_id, unit in units_by_id.items()
+                    if unit_id in evidence_unit_ids
+                )
+            ),
+            -1,
+        )
+        if existing < 0:
+            index = len(actions)
+            actions.append({
+                "type": "answer_pending",
+                "answer": str(user_text or "").strip(),
+                "source_evidence": str(user_text or "").strip(),
+            })
+            for unit_id in evidence_unit_ids:
+                unit = units_by_id.get(unit_id)
+                if unit is None:
+                    continue
+                unit["action_indexes"] = list(dict.fromkeys([
+                    *(
+                        item
+                        for item in unit.get("action_indexes") or []
+                        if isinstance(item, int)
+                    ),
+                    index,
+                ]))
+                unit["disposition"] = "action"
+                unit["reason"] = "structured RPC evidence awaiting declared pending-owner review"
+            seeded.add(index)
 
     payload["actions"] = actions
     payload["semantic_units"] = units
@@ -4843,7 +4939,13 @@ def _request_manual_pending_reviews(provider: Any, reviews: list[dict[str, Any]]
         "supplying the requested field value. reject means neither. For direct_answer, selected_value is the exact "
         "value supplied by source_units and must occur literally inside the shortest exact evidence_quote. Never infer "
         "or normalize selected_value from workflow state, defaults, or proposed_answer. generic_resume and reject use "
-        "selected_value:null. For direct_answer and generic_resume, evidence_quote must be the shortest exact excerpt "
+        "selected_value:null. When validation.value_type is evidence_contribution, direct_answer instead means the "
+        "source submits a new attributable protocol, endpoint, request, response, parameter, or documentation fact to "
+        "the declared owner purpose. A request-only or response-only contribution is valid when that is all the source "
+        "currently has; a statement identifying the absent counterpart is evidence-completeness scope, not a reason "
+        "to reject the evidence that is present. selected_value must be the exact contributed evidence excerpt. Reject "
+        "when the source says not to ingest/save it, asks only to analyze or discuss it, or supplies no attributable "
+        "evidence. For direct_answer and generic_resume, evidence_quote must be the shortest exact excerpt "
         "from source_units proving the decision. reject uses an empty quote."
     )
     invalid = ""
