@@ -37,6 +37,7 @@ def manual_question(
     completion_effect: str = "",
     evidence_path: str = "",
     rejection_evidence_value: Any = None,
+    structured_input_owner: bool = False,
 ) -> dict[str, Any]:
     field_validation = _question_validation(kind, validation)
     declared_manual_action = dict(manual_action or {})
@@ -49,6 +50,7 @@ def manual_question(
         "prompt": prompt,
         "field": field,
         "manual_input_allowed": True,
+        **({"structured_input_owner": True} if structured_input_owner else {}),
         "options": [],
         "accepted_action_types": sorted({
             "answer_pending",

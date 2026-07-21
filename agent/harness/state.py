@@ -26,6 +26,7 @@ class PendingQuestion(TypedDict, total=False):
     next_on_valid: str
     next_on_invalid: str
     manual_input_allowed: bool
+    structured_input_owner: bool
     accepted_action_types: list[str]
     manual_action: dict[str, Any]
     requires_capabilities: list[str]

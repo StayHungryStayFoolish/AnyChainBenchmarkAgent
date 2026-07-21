@@ -590,6 +590,7 @@ def _weights_question(state: AgentGraphState, case: str) -> dict[str, Any]:
         ),
         field=question_id,
         validation={"input_mode": "rpc_weights"},
+        structured_input_owner=True,
     )
 
 

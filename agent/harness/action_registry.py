@@ -260,7 +260,14 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         suppressed_by=("change_group", "go_back"),
         pending_option_semantic="continue_current_flow",
     ),
-    ActionSpec("go_back", "coordinator", "Return to the most recent relevant interrupted group.", effect="workflow_navigation"),
+    ActionSpec(
+        "go_back",
+        "coordinator",
+        "Return to the most recent relevant interrupted group.",
+        ("source_evidence",),
+        effect="workflow_navigation",
+        semantic_recovery_source_argument="source_evidence",
+    ),
     ActionSpec(
         "queue_workflow_goal",
         "coordinator",

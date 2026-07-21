@@ -345,12 +345,18 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
         state = _apply_evidence_outcome(state, start_evidence_collection(state, text, pending))
         return _set_turn_phase(state, "compose", "evidence_collection_started")
 
-    # Structured transport is never a scalar fast-path answer. The semantic
-    # planner first decides whether the block is configuration, evidence, a
-    # report, or a compound request; registered configuration then enters the
-    # single inferred-config review transaction. This ordering is shared by
-    # JSON, YAML, env, shell assignments, and prose-plus-data turns.
-    if input_shape in {"structured", "mixed"}:
+    pending_fits = bool(pending and _answer_fits_pending(text, pending))
+    pending_owns_structured_input = bool(
+        pending_fits
+        and pending.get("structured_input_owner") is True
+    )
+
+    # Structured configuration is review-owned unless the active typed domain
+    # contract explicitly owns a structured answer. This keeps environment
+    # proposals on the inferred-config review path while allowing contracts
+    # such as RPC weight maps to validate their own declared data shape without
+    # model arbitration.
+    if input_shape in {"structured", "mixed"} and not pending_owns_structured_input:
         return _set_turn_phase(state, "plan", "structured_turn_requires_semantic_ownership")
 
     violation = manual_literal_violation(text, pending) if pending else {}
@@ -368,7 +374,7 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
             message_en,
         ), _render_question(pending, language)]
         return _set_turn_phase(state, "compose", "pending_literal_rejected")
-    if pending and _answer_fits_pending(text, pending):
+    if pending_fits:
         pending_question_id = str(pending.get("id") or "")
         resume_queue = bool(
             _queue_has_admitted_durable_work(state)

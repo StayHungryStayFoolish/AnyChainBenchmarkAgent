@@ -4756,6 +4756,48 @@ network:
         self.assertTrue(final["workload"]["confirmed"])
         self.assertEqual(final["custom_rpc"]["status"], "validated")
 
+    def test_typed_weight_question_owns_assignment_json_and_yaml_answers(self) -> None:
+        from agent.harness.domains.chain_rpc import question_for_chain_rpc
+        from agent.harness.state import new_state
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+
+        answers = (
+            "eth_getBalance=40,eth_getTransactionCount=20,eth_blockNumber=20,eth_gasPrice=20",
+            '{"eth_getBalance":40,"eth_getTransactionCount":20,"eth_blockNumber":20,"eth_gasPrice":20}',
+            "eth_getBalance: 40\neth_getTransactionCount: 20\neth_blockNumber: 20\neth_gasPrice: 20",
+        )
+        for answer in answers:
+            with self.subTest(answer=answer):
+                state = new_state("typed-weight-owner", language="en")
+                state.update({
+                    "target_mode": "real-node",
+                    "workflow_mode": "rpc_benchmark",
+                    "chain_identity": {
+                        "raw": "bsc",
+                        "canonical": "bsc",
+                        "adapter_family": "jsonrpc",
+                        "status": "confirmed",
+                        "case": "known",
+                    },
+                    "rpc_mode": "mixed",
+                    "active_group": "endpoint_process",
+                    "custom_rpc": {"job_local_override": True, "status": "needs_weights"},
+                    "last_user_input": answer,
+                })
+                state["pending_question"] = question_for_chain_rpc(state, "endpoint_process") or {}
+
+                self.assertEqual(state["pending_question"]["id"], "custom_rpc_weights")
+                self.assertIs(state["pending_question"]["structured_input_owner"], True)
+                result = process_turn(state)
+
+                self.assertEqual(result["rpc_mode"], "mixed")
+                self.assertTrue(result["workload"]["confirmed"])
+                self.assertEqual(result["custom_rpc"]["status"], "validated")
+                self.assertNotEqual(
+                    (result.get("pending_question") or {}).get("id"),
+                    "inferred_config_review",
+                )
+
     def test_numbered_answer_to_confirm_or_value_question_applies(self) -> None:
         """A numbered answer ("1"/"2") to a confirm_or_value question that renders
 
@@ -12721,6 +12763,183 @@ response:
                     [[0], [0]],
                 )
                 self.assertTrue(validate_plan_coverage(payload, clauses).valid)
+
+    def test_back_navigation_is_recovered_through_registered_action_contract(self) -> None:
+        import json
+        from types import SimpleNamespace
+
+        from agent.harness.intent import _recover_registry_bounded_semantic_actions
+        from agent.harness.plan_coverage import PlanCoverageResult, TurnClause, validate_plan_coverage
+        from agent.harness.state import new_state
+
+        cases = (
+            (
+                "I changed my mind",
+                "go back to the previous workflow step",
+                "context",
+                "registered_action",
+            ),
+            (
+                "保留已经确认的值",
+                "返回上一个配置步骤",
+                "registered_action_support",
+                "registered_action",
+            ),
+            (
+                "返回上一个配置步骤",
+                "不要修改已经确认的值",
+                "registered_action",
+                "registered_action_support",
+            ),
+        )
+        for first, second, first_disposition, second_disposition in cases:
+            with self.subTest(first=first, second=second):
+                clauses = (TurnClause("clause-1", first), TurnClause("clause-2", second))
+                units = [
+                    {
+                        "unit_id": f"unit-{index}",
+                        "clause_id": clause.clause_id,
+                        "source_text": clause.text,
+                        "disposition": "unresolved",
+                        "action_indexes": [],
+                        "reason": "planner left the semantic unit unresolved",
+                    }
+                    for index, clause in enumerate(clauses, start=1)
+                ]
+                plan = json.dumps({"actions": [], "semantic_units": units})
+                decisions = []
+                for unit, disposition in zip(units, (first_disposition, second_disposition)):
+                    decisions.append({
+                        "unit_id": unit["unit_id"],
+                        "disposition": disposition,
+                        "group": "",
+                        "existing_action_index": None,
+                        "target_mode": "",
+                        "consultation_topic": "",
+                        "registered_action_type": (
+                            "go_back"
+                            if disposition in {"registered_action", "registered_action_support"}
+                            else ""
+                        ),
+                        "scope_constraint": (
+                            "no_configuration_mutation"
+                            if disposition == "registered_action_support"
+                            else ""
+                        ),
+                        "evidence_quote": unit["source_text"],
+                        "reason": "registered backward navigation contract",
+                    })
+                provider = SimpleNamespace(complete=lambda _request: SimpleNamespace(
+                    text=json.dumps({"decisions": decisions})
+                ))
+                state = new_state("registered-back-recovery", language="en")
+                state["active_group"] = "qps_profile"
+                state["group_history"] = ["workload_rpc"]
+                validation = PlanCoverageResult(
+                    valid=False,
+                    errors=("unresolved semantic units",),
+                    unresolved_clauses=(first, second),
+                    incomplete_unit_ids=("unit-1", "unit-2"),
+                )
+
+                recovered, changed = _recover_registry_bounded_semantic_actions(
+                    provider,
+                    plan,
+                    clauses,
+                    state,
+                    f"{first}; {second}",
+                    validation,
+                )
+
+                self.assertTrue(changed)
+                payload = json.loads(recovered)
+                self.assertEqual([item["type"] for item in payload["actions"]], ["go_back"])
+                self.assertEqual(
+                    payload["actions"][0]["source_evidence"],
+                    f"{first}; {second}",
+                )
+                self.assertEqual(
+                    [unit["action_indexes"] for unit in payload["semantic_units"]],
+                    (
+                        [[0], [0]]
+                        if "registered_action_support" in {first_disposition, second_disposition}
+                        else [[], [0]]
+                    ),
+                )
+                self.assertTrue(validate_plan_coverage(payload, clauses).valid)
+
+    def test_repeated_back_navigation_uses_history_then_reports_no_destination(self) -> None:
+        from agent.harness.coordinator import _process_action_queue
+        from agent.harness.state import new_state
+
+        state = new_state("repeated-registered-back", language="en")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "active_group": "qps_profile",
+            "group_history": ["workload_rpc"],
+            "chain_identity": {
+                "canonical": "bsc",
+                "status": "confirmed",
+                "adapter_family": "jsonrpc",
+            },
+            "confirmed_config": {"BLOCKCHAIN_NODE": "bsc"},
+            "rpc_mode": "single",
+        })
+        action = {"type": "go_back", "source_evidence": "return one step"}
+
+        first = _process_action_queue(state, [action], "return one step")
+        second = _process_action_queue(first, [action], "return one step")
+
+        self.assertEqual(first["active_group"], "workload_rpc")
+        self.assertEqual(first["group_history"], [])
+        self.assertEqual(first["pending_question"]["id"], "workload_confirm")
+        self.assertEqual(second["active_group"], "workload_rpc")
+        self.assertEqual(second["group_history"], [])
+        self.assertFalse(second.get("pending_question"))
+        self.assertIn(
+            "There is no previous configuration group",
+            "\n".join(second.get("visible_response") or []),
+        )
+
+    def test_explicit_group_destination_suppresses_conflicting_back_action(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("conflicting-navigation", language="en")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "active_group": "qps_profile",
+            "group_history": ["workload_rpc"],
+            "chain_identity": {
+                "canonical": "bsc",
+                "status": "confirmed",
+                "adapter_family": "jsonrpc",
+            },
+            "confirmed_config": {"BLOCKCHAIN_NODE": "bsc"},
+            "last_user_input": "go back to disk settings",
+        })
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            return_value={"actions": [
+                {"type": "go_back", "source_evidence": "go back"},
+                {
+                    "type": "change_group",
+                    "group": "ledger_disk",
+                    "navigation_explicit": True,
+                    "source_evidence": "disk settings",
+                },
+            ]},
+        ):
+            result = process_turn(state)
+
+        self.assertEqual(result["active_group"], "ledger_disk")
+        self.assertNotEqual(result["active_group"], "workload_rpc")
+        self.assertEqual(
+            [item["type"] for item in result.get("completed_actions") or []],
+            ["change_group"],
+        )
 
     def test_saved_workflow_goal_is_resumable_and_visible_in_status(self) -> None:
         from agent.harness.domains.orientation import has_resumable_configuration
