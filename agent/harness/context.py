@@ -4,10 +4,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from .action_registry import ACTION_ARGUMENT_SCHEMAS, ACTION_SPECS, CONSULTATION_TOPICS
+from .action_registry import (
+    ACTION_ARGUMENT_SCHEMAS,
+    ACTION_SPECS,
+    CONSULTATION_TOPICS,
+    semantic_scope_schema,
+)
 from .state import AgentGraphState
 
-from agent.workflows.group_registry import GROUPS
+from agent.workflows.group_registry import GROUPS, USER_NAVIGABLE_GROUPS
 
 
 def action_schema() -> list[dict[str, Any]]:
@@ -25,6 +30,7 @@ def action_schema() -> list[dict[str, Any]]:
             "constraints": list(spec.constraints),
             "suppressed_by": list(spec.suppressed_by),
             "execution_phase": spec.execution_phase,
+            "effect": spec.effect,
             "target_group": spec.target_group,
             "requires_specific_change": spec.requires_specific_change,
             "incompatible_target_modes": list(spec.incompatible_target_modes),
@@ -35,7 +41,7 @@ def action_schema() -> list[dict[str, Any]]:
         if item["type"] == "answer_opening_question":
             item["allowed_topics"] = list(CONSULTATION_TOPICS)
         if item["type"] == "change_group":
-            item["allowed_groups"] = [group.name for group in GROUPS]
+            item["allowed_groups"] = list(USER_NAVIGABLE_GROUPS)
     return output
 
 
@@ -49,6 +55,7 @@ def group_schema() -> list[dict[str, Any]]:
             "depends_on": list(group.depends_on),
             "invalidates": list(group.invalidates),
             "category": group.category,
+            "navigation_entry": group.navigation_entry,
         }
         for group in GROUPS
     ]
@@ -142,7 +149,7 @@ def build_action_resolver_prompt() -> str:
         "The request contains authoritative structural clauses produced without intent classification. For every prose clause, partition its complete text into semantically independent units only when exact contiguous source_text anchors cover every word. If conjunctions or framing make a lossless split uncertain, use one full-clause semantic unit mapped to every typed action that preserves it; do not omit connective prose or reject an otherwise representable request merely to force a split. Structured clauses remain one atomic unit. Every unit must contain an ordered exact source_text anchor copied from its parent clause. Do not calculate character offsets; the Harness derives them. Anchors may omit only punctuation or whitespace between units and must not omit prose. Introductory, framing, or trailing prose around a structured block is still a semantic unit: map it to the action that consumes the related block, or mark it unresolved when that relationship is genuinely unclear. Then classify every unit independently as one of: answer the active pending contract, read-only consultation, concrete mutation, explicit navigation, evidence/report analysis, or unresolved. A pending question never takes precedence over another explicit unit. "
         "Questions and consultations must not become configuration changes. Configuration values are proposals until confirmed. "
         "When the user explicitly asks for subsequent responses in Chinese or English, emit set_response_language with language=zh or en and exact source_evidence. This action may coexist with every other request in the same turn; never mark the language-preference unit unresolved merely because terminal presentation already uses that language. "
-        "An explicit consultation-only, not-starting-yet, or no-configuration-change unit is a scope constraint, not unresolved. Set scope_constraint='consultation_only' on that semantic unit and map it to every read-only consultation action it scopes. Do not emit a durable mutation in that scope. If the same scope also explicitly requests a mutation, preserve the conflict as unresolved instead of partially committing either interpretation. "
+        "Use only semantic scope constraints declared by semantic_scope_schema. consultation_only is for an entirely read-only request and does not authorize navigation. no_configuration_mutation permits read-only inspection and workflow navigation while prohibiting configuration changes. no_execution prohibits execution while permitting otherwise represented requests. Map each constrained semantic unit to every action it scopes. If one scope contradicts an explicit request in the same unit, preserve the conflict as unresolved instead of partially committing either interpretation. Judge effects from action_schema.effect, never from action lifetime. "
         "A pending question accepts exact local answers outside this planner; all other input may answer it, ask a question, change groups, "
         "revise earlier state, paste evidence, or combine several of those. Preserve unresolved work. "
         "Use answer_pending only when the user is actually answering the active pending question in natural language. Put the complete answer in its answer argument. "
@@ -185,5 +192,5 @@ def build_action_resolver_prompt() -> str:
         "When workflow_state.evidence_collection.active is true, classify the current turn semantically like every other turn. Use append_evidence_collection only for a current-turn evidence fragment and copy that exact fragment into evidence and source_evidence. Use finish_evidence_collection or cancel_evidence_collection only for an explicit completion or cancellation request. An explicit demand to pause or suspend collection requires pause_evidence_collection; navigation alone does not preserve that independent demand. Emit the pause together with any requested navigation/configuration actions. An explicit return to a paused collection uses resume_evidence_collection. Questions about collected content use analyze_evidence; navigation, corrections, status, and configuration requests use their normal typed actions. A semantic detour must not append the utterance or discard already collected lines. "
         "Put each action's allowed arguments directly beside type; never wrap them in an arguments object. "
         "Never express workflow behavior in prose. Follow action_schema exactly for each action; fields not declared there are rejected. "
-        "Return an object with actions, semantic_units, and optional document-level conflicts and reason. semantic_units must account for every supplied clause. Each row is {unit_id, clause_id, source_text, disposition:'action'|'context'|'unresolved', action_indexes:[zero-based action indexes], optional scope_constraint:'consultation_only', reason}. Use disposition action when typed actions preserve that exact unit. Use context only for prose that supplies background or a tentative future possibility but contains no present request, answer, question, selection, mutation, navigation, or execution instruction; context has no action indexes or scope constraint and requires a reason. Structured input can never be context. Context is independently audited and cannot authorize itself. Use unresolved with an empty action_indexes list when safe interpretation is unavailable. Every URL, exact wire RPC method, or concrete value claimed as preserved must occur in the mapped owning action. A full-clause unit may map several independent typed actions when that is the only lossless contiguous partition; it may not hide an omitted request. Never silently omit source text."
+        "Return an object with actions, semantic_units, and optional document-level conflicts and reason. semantic_units must account for every supplied clause. Each row is {unit_id, clause_id, source_text, disposition:'action'|'context'|'unresolved', action_indexes:[zero-based action indexes], optional scope_constraint from semantic_scope_schema, reason}. Use disposition action when typed actions preserve that exact unit. Use context only for prose that supplies background or a tentative future possibility but contains no present request, answer, question, selection, mutation, navigation, or execution instruction; context has no action indexes or scope constraint and requires a reason. Structured input can never be context. Context is independently audited and cannot authorize itself. Use unresolved with an empty action_indexes list when safe interpretation is unavailable. Every URL, exact wire RPC method, or concrete value claimed as preserved must occur in the mapped owning action. A full-clause unit may map several independent typed actions when that is the only lossless contiguous partition; it may not hide an omitted request. Never silently omit source text."
     )

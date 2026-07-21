@@ -676,6 +676,7 @@ def build_ledger(
     revision: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     from agent.harness.action_registry import ACTION_SPECS
+    from agent.workflows.group_registry import USER_NAVIGABLE_GROUPS
     from agent.workflows.group_registry import GROUPS
 
     group_by_name = {group.name: group for group in GROUPS}
@@ -837,62 +838,66 @@ def build_ledger(
     action_rows: list[dict[str, Any]] = []
     for spec in ACTION_SPECS:
         action_group = spec.target_group or f"@action_only/{spec.owner}"
-        action_hash = hashlib.sha256(_canonical_json({
-            "action_type": spec.action_type,
-            "owner": spec.owner,
-            "arguments": list(spec.arguments),
-            "execution_phase": spec.execution_phase,
-            "target_group": spec.target_group,
-            "merge_identity": list(spec.merge_identity),
-            "preserve_pending": spec.preserve_pending,
-            "mutation_dimension": spec.mutation_dimension,
-            "allows_followup_actions": spec.allows_followup_actions,
-            "requires_capabilities": list(spec.requires_capabilities),
-            "provides_capabilities": list(spec.provides_capabilities),
-            "suppressed_by": list(spec.suppressed_by),
-        }).encode("utf-8")).hexdigest()
-        action_contract_hash = action_hash
-        action_variant_hash = content_hash({
-            "contract_hash": action_contract_hash,
-            "runtime_variant": "action-registry",
-        })[:20]
-        edge = _new_edge(
-            group=action_group,
-            question_id="",
-            variant_hash=action_variant_hash,
-            contract_hash=action_contract_hash,
-            state_fingerprint="action-registry",
-            input_class="action_only_transition",
-            option_or_action=f"action:{spec.action_type}",
-            edge_type="action_transition",
-            owner=spec.owner,
-            action_type=spec.action_type,
-            applicability_reason="accepted action registry transition",
-            preconditions={"requires_capabilities": list(spec.requires_capabilities)},
-            expected_postcondition={
+        destinations = USER_NAVIGABLE_GROUPS if spec.action_type == "change_group" else (spec.target_group,)
+        for destination in destinations:
+            action_hash = hashlib.sha256(_canonical_json({
+                "action_type": spec.action_type,
+                "owner": spec.owner,
+                "arguments": list(spec.arguments),
+                "execution_phase": spec.execution_phase,
                 "target_group": spec.target_group,
+                "navigation_destination": destination if spec.action_type == "change_group" else "",
+                "merge_identity": list(spec.merge_identity),
+                "preserve_pending": spec.preserve_pending,
+                "mutation_dimension": spec.mutation_dimension,
+                "allows_followup_actions": spec.allows_followup_actions,
+                "requires_capabilities": list(spec.requires_capabilities),
                 "provides_capabilities": list(spec.provides_capabilities),
-            },
-            scenario_ids=action_scenario_ids.get(spec.action_type, ()),
-            executable_scenario_ids=action_scenario_ids.get(spec.action_type, ()),
-        )
-        edges.append(edge)
-        action_rows.append({
-            "action_type": spec.action_type,
-            "owner": spec.owner,
-            "purpose": spec.purpose,
-            "arguments": list(spec.arguments),
-            "target_group": spec.target_group,
-            "precondition_evidence": "",
-            "postcondition_evidence": "",
-            "return_policy_evidence": "",
-            "deterministic_test_id": "",
-            "fixed_cli_scenario_id": "",
-            "dynamic_chaos_round_id": "",
-            "real_execution_evidence": "",
-            "edge_key": edge["edge_key"],
-            "status": edge["overall_status"],
-        })
+                "suppressed_by": list(spec.suppressed_by),
+            }).encode("utf-8")).hexdigest()
+            action_contract_hash = action_hash
+            action_variant_hash = content_hash({
+                "contract_hash": action_contract_hash,
+                "runtime_variant": "action-registry",
+            })[:20]
+            expected_group = destination if spec.action_type == "change_group" else spec.target_group
+            edge = _new_edge(
+                group=action_group,
+                question_id="",
+                variant_hash=action_variant_hash,
+                contract_hash=action_contract_hash,
+                state_fingerprint="action-registry",
+                input_class="action_only_transition",
+                option_or_action=f"action:{spec.action_type}",
+                edge_type="action_transition",
+                owner=spec.owner,
+                action_type=spec.action_type,
+                applicability_reason="accepted action registry transition",
+                preconditions={"requires_capabilities": list(spec.requires_capabilities)},
+                expected_postcondition={
+                    "target_group": expected_group,
+                    "provides_capabilities": list(spec.provides_capabilities),
+                },
+                scenario_ids=action_scenario_ids.get(spec.action_type, ()),
+                executable_scenario_ids=action_scenario_ids.get(spec.action_type, ()),
+            )
+            edges.append(edge)
+            action_rows.append({
+                "action_type": spec.action_type,
+                "owner": spec.owner,
+                "purpose": spec.purpose,
+                "arguments": list(spec.arguments),
+                "target_group": expected_group,
+                "precondition_evidence": "",
+                "postcondition_evidence": "",
+                "return_policy_evidence": "",
+                "deterministic_test_id": "",
+                "fixed_cli_scenario_id": "",
+                "dynamic_chaos_round_id": "",
+                "real_execution_evidence": "",
+                "edge_key": edge["edge_key"],
+                "status": edge["overall_status"],
+            })
 
     from tests.agent_live.reviewed_execution_cases import bind_reviewed_execution_case
 

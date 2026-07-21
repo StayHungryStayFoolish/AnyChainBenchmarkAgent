@@ -16,7 +16,30 @@ from .input_values import (
 
 
 ActionLifetime = Literal["turn_local", "durable"]
+ActionEffect = Literal[
+    "read_only",
+    "workflow_navigation",
+    "configuration_mutation",
+    "workflow_state_mutation",
+    "execution",
+]
 ActionValidator = Callable[[Mapping[str, Any]], None]
+
+
+SEMANTIC_SCOPE_POLICIES: dict[str, dict[str, Any]] = {
+    "consultation_only": {
+        "description": "Permit read-only answers only; workflow navigation is not authorized.",
+        "allowed_effects": ("read_only",),
+    },
+    "no_configuration_mutation": {
+        "description": "Permit state inspection and workflow navigation without changing benchmark configuration values.",
+        "allowed_effects": ("read_only", "workflow_navigation"),
+    },
+    "no_execution": {
+        "description": "Permit inspection, navigation, and configuration while prohibiting execution or retry side effects.",
+        "forbidden_effects": ("execution",),
+    },
+}
 
 
 def _validate_chain_selection(action: Mapping[str, Any]) -> None:
@@ -90,6 +113,14 @@ def _validate_sync_observe_options(action: Mapping[str, Any]) -> None:
         raise ValueError("sync_observe_duration_seconds is valid only for duration stop condition")
 
 
+def _validate_group_navigation(action: Mapping[str, Any]) -> None:
+    from agent.workflows.group_registry import is_user_navigable_group
+
+    group = str(action.get("group") or "").strip()
+    if not is_user_navigable_group(group):
+        raise ValueError(f"change_group requires a user-navigable workflow group: {group or '<missing>'}")
+
+
 def _validate_evidence_collection_append(action: Mapping[str, Any]) -> None:
     evidence = str(action.get("evidence") or "")
     source = str(action.get("source_evidence") or "")
@@ -114,6 +145,7 @@ class ActionSpec:
     merge_mapping_fields: tuple[str, ...] = ()
     merge_sequence_fields: tuple[str, ...] = ()
     lifetime: ActionLifetime = "durable"
+    effect: ActionEffect = "configuration_mutation"
     turn_local_result_roots: tuple[str, ...] = ()
     crosses_pending_barrier: bool = False
     requires_specific_change: bool = False
@@ -142,6 +174,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         ("source_evidence",),
         execution_phase=5,
         lifetime="turn_local",
+        effect="read_only",
     ),
     ActionSpec(
         "set_response_language",
@@ -150,6 +183,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         ("language", "source_evidence"),
         execution_phase=2,
         lifetime="turn_local",
+        effect="workflow_state_mutation",
         required_arguments=("language", "source_evidence"),
     ),
     ActionSpec(
@@ -159,10 +193,11 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         ("clauses",),
         execution_phase=1,
         lifetime="turn_local",
+        effect="read_only",
         required_arguments=("clauses",),
     ),
-    ActionSpec("reset_session", "orientation", "Clear workflow configuration while preserving the workflow job receipt; startup discovery and historical jobs remain external read models.", execution_phase=0),
-    ActionSpec("ask_capabilities", "orientation", "Explain supported product capabilities from framework facts.", execution_phase=5, lifetime="turn_local"),
+    ActionSpec("reset_session", "orientation", "Clear workflow configuration while preserving the workflow job receipt; startup discovery and historical jobs remain external read models.", execution_phase=0, effect="workflow_state_mutation"),
+    ActionSpec("ask_capabilities", "orientation", "Explain supported product capabilities from framework facts.", execution_phase=5, lifetime="turn_local", effect="read_only"),
     ActionSpec(
         "answer_opening_question",
         "orientation",
@@ -172,6 +207,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         merge_identity=("topic", "subject"),
         allows_followup_actions=True,
         lifetime="turn_local",
+        effect="read_only",
         required_arguments=("topic",),
         pending_option_admission=False,
     ),
@@ -206,6 +242,8 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         merge_identity=("group",),
         crosses_pending_barrier=True,
         required_arguments=("group", "navigation_explicit", "source_evidence"),
+        effect="workflow_navigation",
+        validator=_validate_group_navigation,
     ),
     ActionSpec(
         "resume_current_flow",
@@ -214,11 +252,12 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         ("source_evidence",),
         execution_phase=5,
         lifetime="turn_local",
+        effect="workflow_navigation",
         required_arguments=("source_evidence",),
         suppressed_by=("change_group", "go_back"),
         pending_option_semantic="continue_current_flow",
     ),
-    ActionSpec("go_back", "coordinator", "Return to the most recent relevant interrupted group."),
+    ActionSpec("go_back", "coordinator", "Return to the most recent relevant interrupted group.", effect="workflow_navigation"),
     ActionSpec(
         "queue_workflow_goal",
         "coordinator",
@@ -328,9 +367,9 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         ),
         validator=_validate_sync_observe_options,
     ),
-    ActionSpec("approve_preflight_smoke", "execution", "Approve one idempotent preflight/smoke submission."),
+    ActionSpec("approve_preflight_smoke", "execution", "Approve one idempotent preflight/smoke submission.", effect="execution"),
     ActionSpec("reject_preflight_smoke", "execution", "Pause before preflight/smoke without submitting a job."),
-    ActionSpec("approve_final_benchmark", "execution", "Approve final real-node benchmark submission after isolated smoke success."),
+    ActionSpec("approve_final_benchmark", "execution", "Approve final real-node benchmark submission after isolated smoke success.", effect="execution"),
     ActionSpec("reject_final_benchmark", "execution", "Pause after successful real-node smoke without submitting the final benchmark."),
     ActionSpec("set_accounts_presence", "environment", "Confirm whether a separate accounts/state disk exists.", ("has_accounts_device",), target_group="accounts_disk", required_arguments=("has_accounts_device",)),
     ActionSpec(
@@ -396,6 +435,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         ("evidence", "question"),
         execution_phase=5,
         lifetime="turn_local",
+        effect="read_only",
         turn_local_result_roots=("evidence_buffer",),
         crosses_pending_barrier=True,
         semantic_recovery_source_argument="evidence",
@@ -408,6 +448,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         execution_phase=5,
         allows_followup_actions=True,
         lifetime="turn_local",
+        effect="read_only",
         turn_local_result_roots=("report_context",),
     ),
     ActionSpec("correct_failure", "recovery", "Reopen only the policy-declared affected configuration group."),
@@ -415,11 +456,12 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         "inspect_failure",
         "recovery",
         "Inspect structured failure evidence without changing workflow configuration.",
+        effect="read_only",
     ),
     ActionSpec("retry_failure", "recovery", "Clear a retryable external-service failure without executing a benchmark side effect."),
     ActionSpec("cancel_failure_recovery", "recovery", "Pause recovery while preserving evidence and confirmed configuration."),
     ActionSpec("answer_pending", "coordinator", "Answer the active typed question after interpreting non-exact user language.", ("answer", "selected_value", "source_evidence"), 0, required_arguments=("source_evidence",)),
-    ActionSpec("unknown", "orientation", "Report that no safe action could be resolved.", ("reason",), required_arguments=("reason",)),
+    ActionSpec("unknown", "orientation", "Report that no safe action could be resolved.", ("reason",), effect="read_only", required_arguments=("reason",)),
 )
 
 
@@ -807,6 +849,39 @@ def action_lifetime(action: dict[str, Any]) -> ActionLifetime:
 
 def action_is_turn_local(action: dict[str, Any]) -> bool:
     return action_lifetime(action) == "turn_local"
+
+
+def action_effect(action: Mapping[str, Any]) -> ActionEffect:
+    """Return the registry-owned business effect independently of lifetime."""
+
+    spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
+    return spec.effect if spec is not None else "configuration_mutation"
+
+
+def semantic_scope_schema() -> list[dict[str, Any]]:
+    """Expose the single semantic-scope contract to planners and validators."""
+
+    return [
+        {
+            "name": name,
+            "description": str(policy["description"]),
+            "allowed_effects": list(policy.get("allowed_effects") or ()),
+            "forbidden_effects": list(policy.get("forbidden_effects") or ()),
+        }
+        for name, policy in SEMANTIC_SCOPE_POLICIES.items()
+    ]
+
+
+def semantic_scope_accepts_action(scope: str, action: Mapping[str, Any]) -> bool:
+    """Validate a semantic scope against registry effect metadata."""
+
+    policy = SEMANTIC_SCOPE_POLICIES.get(str(scope or ""))
+    if policy is None:
+        return False
+    effect = action_effect(action)
+    allowed = tuple(policy.get("allowed_effects") or ())
+    forbidden = tuple(policy.get("forbidden_effects") or ())
+    return (not allowed or effect in allowed) and effect not in forbidden
 
 
 def action_crosses_pending_barrier(action: dict[str, Any]) -> bool:

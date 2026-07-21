@@ -17,7 +17,7 @@ from .oracle import (
     compute_next_action,
     format_recommended_next_action,
 )
-from .routing import chain_identity_confirmed, next_group_and_reason
+from .routing import chain_identity_confirmed, group_readiness, next_group_and_reason
 from .turns import adjudicate_turn
 from .action_registry import ACTION_BY_TYPE, action_crosses_pending_barrier, action_execution_phase, action_is_turn_local, action_merge_key, assign_action_ids, compile_legacy_custom_rpc_action, lifecycle_rejected_action_indexes, merge_semantic_actions, normalize_action_relations, validate_action_contract
 from .contracts import ActionProposal, CheckpointCommand, HandlerResult, RecoveryCommand
@@ -63,7 +63,12 @@ from .questions import (
     render_question as _render_question,
 )
 from .input_values import normalize_target_mode, target_mode_evidence_matches
-from agent.workflows.group_registry import GROUP_ORDER, invalidation_targets
+from agent.workflows.group_registry import (
+    GROUP_ORDER,
+    GROUP_SPEC_BY_NAME,
+    invalidation_targets,
+    is_user_navigable_group,
+)
 QUEUE_RESUME_PENDING_IDS = {
     "inferred_config_review",
     "target_mode_change_confirm",
@@ -90,13 +95,14 @@ def apply_coordinator_action(state: AgentGraphState, action: ActionProposal) -> 
         )
     if action.action_type == "change_group":
         group = str(action.arguments.get("group") or "").strip()
-        if group not in ALLOWED_GROUPS:
-            return HandlerResult(blocker=f"unknown workflow group: {group or '<missing>'}")
-        if group == "workload_rpc" and not chain_identity_confirmed(next_state):
+        if group not in ALLOWED_GROUPS or not is_user_navigable_group(group):
+            return HandlerResult(blocker=f"group is not a user-navigable destination: {group or '<missing>'}")
+        prerequisite = _navigation_prerequisite(next_state, group)
+        if prerequisite:
             control = dict(next_state.get("control") or {})
             control["deferred_group"] = group
             next_state["control"] = control
-            next_state = _activate_group_question(next_state, "chain_identity")
+            next_state = _activate_group_question(next_state, prerequisite)
             return HandlerResult(
                 consumed_action_ids=(action.action_id,),
                 completion="blocked",
@@ -1951,7 +1957,10 @@ def _activate_ready_deferred_group(state: AgentGraphState) -> AgentGraphState:
     deferred_group = str(control.get("deferred_group") or "").strip()
     if not deferred_group or deferred_group not in ALLOWED_GROUPS:
         return state
-    if deferred_group == "workload_rpc" and not chain_identity_confirmed(state):
+    prerequisite = _navigation_prerequisite(state, deferred_group)
+    if prerequisite:
+        if prerequisite != str(state.get("active_group") or ""):
+            return _activate_group_question(state, prerequisite)
         return state
     control.pop("deferred_group", None)
     state["control"] = control
@@ -2258,6 +2267,23 @@ def _active_group_has_blocking_question(state: AgentGraphState) -> bool:
     return bool(_question_for_group(state, active_group))
 
 
+def _navigation_prerequisite(state: AgentGraphState, group: str) -> str:
+    """Return the first typed prerequisite for one public group destination."""
+
+    spec = GROUP_SPEC_BY_NAME.get(group)
+    if spec is None or not is_user_navigable_group(group):
+        return ""
+    workflow_mode = str(state.get("workflow_mode") or "").strip()
+    if spec.workflow_modes and workflow_mode not in spec.workflow_modes:
+        return "target_mode"
+    for dependency in spec.depends_on:
+        if dependency == "target_mode" and not str(state.get("target_mode") or "").strip():
+            return dependency
+        if not group_readiness(state, dependency).ready:
+            return dependency
+    return ""
+
+
 def _ask_next_blocking_question(state: AgentGraphState) -> AgentGraphState:
     interrupted_question = _resume_suspended_question(state)
     if interrupted_question:
@@ -2273,10 +2299,13 @@ def _ask_next_blocking_question(state: AgentGraphState) -> AgentGraphState:
     control = dict(state.get("control") or {})
     deferred_group = str(control.get("deferred_group") or "").strip()
     if deferred_group and deferred_group in ALLOWED_GROUPS:
-        if deferred_group != "workload_rpc" or chain_identity_confirmed(state):
+        prerequisite = _navigation_prerequisite(state, deferred_group)
+        if not prerequisite:
             control.pop("deferred_group", None)
             state["control"] = control
             return _activate_group_question(state, deferred_group)
+        if prerequisite != str(state.get("active_group") or ""):
+            return _activate_group_question(state, prerequisite)
     active_group = str(state.get("active_group") or "").strip()
     if active_group and active_group not in {"opening", "job_monitoring", "error_evidence_analysis", "report_artifact_analysis"}:
         active_question = _question_for_group(state, active_group)
@@ -2323,29 +2352,6 @@ def _remove_rendered_question(state: AgentGraphState, question: PendingQuestion)
 
 
 def _activate_group_question(state: AgentGraphState, group: str, *, record_history: bool = True) -> AgentGraphState:
-    if group == "sync_observe":
-        current_mode = str(state.get("target_mode") or "").strip()
-        if current_mode != "sync-observe":
-            action = ActionProposal(
-                action_id=f"{state.get('thread_id') or 'default'}:{state.get('turn_index') or 0}:sync-observe-jump",
-                action_type="choose_target_mode",
-                arguments={"target_mode": "sync-observe", "target_mode_explicit": True, "selection_contract_verified": True},
-                confidence="high",
-            )
-            updated = _apply_handler_result(
-                state,
-                apply_chain_rpc_action(state, action),
-                owner="chain_rpc",
-            )
-            # Coordinator actions execute against an isolated control-state
-            # snapshot. Keep that snapshot identity stable when a domain owner
-            # returns a new committed value; otherwise the caller retains the
-            # pre-dispatch object and silently loses the dependency-change
-            # confirmation contract.
-            state.clear()
-            state.update(updated)
-            if state.get("pending_question"):
-                return state
     _record_group_transition(state, group, record_history=record_history)
     state.setdefault("group_states", {}).setdefault(group, {})["status"] = "in_progress"
     # An explicit navigation to chain identity means "choose or change the

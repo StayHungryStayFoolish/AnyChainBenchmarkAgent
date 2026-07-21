@@ -7064,7 +7064,7 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertFalse(result.valid)
         self.assertEqual(result.unresolved_clauses, (unknown_anchor,))
 
-    def test_consultation_scope_accepts_only_turn_local_actions(self) -> None:
+    def test_consultation_scope_accepts_only_read_only_effects(self) -> None:
         clauses = segment_user_turn("I am only asking and do not change configuration")
         unit = {
             "unit_id": "unit-1",
@@ -7091,7 +7091,95 @@ class PlanCoverageTest(unittest.TestCase):
         )
         self.assertTrue(accepted.valid, accepted.errors)
         self.assertFalse(rejected.valid)
-        self.assertTrue(any("durable action" in error for error in rejected.errors))
+        self.assertTrue(any("configuration_mutation action" in error for error in rejected.errors))
+
+    def test_no_configuration_mutation_scope_accepts_durable_navigation(self) -> None:
+        clauses = segment_user_turn("Jump to QPS first without changing its values")
+        unit = {
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": clauses[0].text,
+            "disposition": "action",
+            "action_indexes": [0],
+            "scope_constraint": "no_configuration_mutation",
+            "reason": "navigation without configuration mutation",
+        }
+        accepted = validate_plan_coverage(
+            {
+                "actions": [{
+                    "type": "change_group",
+                    "group": "qps_profile",
+                    "navigation_explicit": True,
+                    "source_evidence": "Jump to QPS first",
+                }],
+                "semantic_units": [unit],
+            },
+            clauses,
+        )
+        rejected = validate_plan_coverage(
+            {
+                "actions": [{"type": "set_qps_mode", "qps_mode": "quick"}],
+                "semantic_units": [unit],
+            },
+            clauses,
+        )
+        self.assertTrue(accepted.valid, accepted.errors)
+        self.assertFalse(rejected.valid)
+        self.assertTrue(any("configuration_mutation action" in error for error in rejected.errors))
+
+    def test_consultation_scope_does_not_authorize_navigation(self) -> None:
+        clauses = segment_user_turn("Only explain the current QPS profile")
+        result = validate_plan_coverage(
+            {
+                "actions": [{
+                    "type": "change_group",
+                    "group": "qps_profile",
+                    "navigation_explicit": True,
+                    "source_evidence": clauses[0].text,
+                }],
+                "semantic_units": [{
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "source_text": clauses[0].text,
+                    "disposition": "action",
+                    "action_indexes": [0],
+                    "scope_constraint": "consultation_only",
+                    "reason": "read-only consultation",
+                }],
+            },
+            clauses,
+        )
+        self.assertFalse(result.valid)
+        self.assertTrue(any("workflow_navigation action" in error for error in result.errors))
+
+    def test_no_execution_scope_rejects_execution_effect_only(self) -> None:
+        clauses = segment_user_turn("Configure quick but do not run anything")
+        unit = {
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": clauses[0].text,
+            "disposition": "action",
+            "action_indexes": [0],
+            "scope_constraint": "no_execution",
+            "reason": "configuration without execution",
+        }
+        accepted = validate_plan_coverage(
+            {
+                "actions": [{"type": "set_qps_mode", "qps_mode": "quick"}],
+                "semantic_units": [unit],
+            },
+            clauses,
+        )
+        rejected = validate_plan_coverage(
+            {
+                "actions": [{"type": "approve_preflight_smoke"}],
+                "semantic_units": [unit],
+            },
+            clauses,
+        )
+        self.assertTrue(accepted.valid, accepted.errors)
+        self.assertFalse(rejected.valid)
+        self.assertTrue(any("execution action" in error for error in rejected.errors))
 
     def test_empty_consultation_scope_mapping_binds_all_read_only_actions(self) -> None:
         clauses = segment_user_turn("I am only consulting and have not selected a test")

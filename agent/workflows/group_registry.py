@@ -9,7 +9,10 @@ user text, mutate state, or render responses.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Literal
+
+
+NavigationEntry = Literal["question_or_status", "action_only"]
 
 
 @dataclass(frozen=True)
@@ -24,6 +27,7 @@ class GroupSpec:
     category: str = "setup"
     workflow_modes: tuple[str, ...] = ()
     fallback: bool = True
+    navigation_entry: NavigationEntry = "question_or_status"
 
 
 GROUPS: tuple[GroupSpec, ...] = (
@@ -270,6 +274,7 @@ GROUPS: tuple[GroupSpec, ...] = (
         product_node="job_monitoring",
         category="execution",
         fallback=False,
+        navigation_entry="action_only",
     ),
     GroupSpec(
         name="failure_recovery",
@@ -279,6 +284,7 @@ GROUPS: tuple[GroupSpec, ...] = (
         product_node="failure_recovery",
         category="execution",
         fallback=False,
+        navigation_entry="action_only",
     ),
     GroupSpec(
         name="error_evidence_analysis",
@@ -287,6 +293,7 @@ GROUPS: tuple[GroupSpec, ...] = (
         product_node="evidence_review",
         category="analysis",
         fallback=False,
+        navigation_entry="action_only",
     ),
     GroupSpec(
         name="report_artifact_analysis",
@@ -296,6 +303,7 @@ GROUPS: tuple[GroupSpec, ...] = (
         product_node="analysis",
         category="analysis",
         fallback=False,
+        navigation_entry="action_only",
     ),
 )
 
@@ -329,6 +337,14 @@ def validate_group_registry(groups: Iterable[GroupSpec]) -> tuple[GroupSpec, ...
 
     known = set(names)
     for group in registry:
+        if group.navigation_entry not in {"question_or_status", "action_only"}:
+            raise RuntimeError(
+                f"invalid navigation entry for GroupSpec {group.name}: {group.navigation_entry}"
+            )
+        if group.navigation_entry == "action_only" and group.fallback:
+            raise RuntimeError(
+                f"action-only GroupSpec {group.name} cannot be a fallback destination"
+            )
         unknown_dependencies = sorted(set(group.depends_on) - known)
         unknown_invalidations = sorted(set(group.invalidates) - known)
         unknown_modes = sorted(set(group.workflow_modes) - SUPPORTED_WORKFLOW_MODES)
@@ -376,6 +392,9 @@ GROUP_QUESTION_ORDER: tuple[tuple[str, tuple[str, ...]], ...] = tuple(
 )
 GROUP_TO_PRODUCT_NODE: dict[str, str] = {group.name: group.product_node for group in GROUPS if group.product_node}
 GROUP_SPEC_BY_NAME: dict[str, GroupSpec] = {group.name: group for group in GROUPS}
+USER_NAVIGABLE_GROUPS: tuple[str, ...] = tuple(
+    group.name for group in GROUPS if group.navigation_entry == "question_or_status"
+)
 
 
 def normalize_group_name(value: object) -> str:
@@ -406,3 +425,9 @@ def product_node_for_group(group_name: str) -> str:
 def invalidation_targets(group_name: str) -> tuple[str, ...]:
     spec = GROUP_SPEC_BY_NAME.get(normalize_group_name(group_name))
     return spec.invalidates if spec else ()
+
+
+def is_user_navigable_group(group_name: object) -> bool:
+    """Return whether ``change_group`` may enter this registry destination."""
+
+    return normalize_group_name(group_name) in USER_NAVIGABLE_GROUPS

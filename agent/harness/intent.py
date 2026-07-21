@@ -16,6 +16,7 @@ from .action_registry import (
     CONSULTATION_TOPICS,
     TRUSTED_ACTION_METADATA_FIELDS,
     lifecycle_rejected_action_indexes,
+    semantic_scope_schema,
     validate_action_contract,
 )
 from .context import action_schema, build_action_resolver_prompt, group_schema, workflow_snapshot
@@ -31,9 +32,10 @@ from .questions import (
     pending_option_value_exists,
     value_satisfies_pending_contract,
 )
-from .state import DEFAULT_GROUP_ORDER, AgentGraphState
+from .state import AgentGraphState
+from agent.workflows.group_registry import USER_NAVIGABLE_GROUPS
 
-ALLOWED_GROUPS = list(DEFAULT_GROUP_ORDER)
+ALLOWED_GROUPS = list(USER_NAVIGABLE_GROUPS)
 
 # Single source of truth for the supported adapter families (audit Finding C3):
 # derive prompt/payload copies from `onboarding.families.SUPPORTED_FAMILIES`.
@@ -2016,6 +2018,7 @@ def _reconstruct_missing_semantic_units(
     request_payload = {
         "actions": actions,
         "clauses": [clause.as_dict() for clause in clauses],
+        "semantic_scope_schema": semantic_scope_schema(),
     }
     for _attempt in range(2):
         ensure_turn_active()
@@ -2027,7 +2030,7 @@ def _reconstruct_missing_semantic_units(
                         "Reconstruct only the missing semantic_units for one immutable AnyChain action plan. "
                         "Return one JSON object only: {semantic_units:[{unit_id:string,clause_id:string,"
                         "source_text:string,disposition:'action'|'context'|'unresolved',action_indexes:[integer],reason:string,"
-                        "optional scope_constraint:'consultation_only'}]}. Do not return actions. Do not add, remove, "
+                        "optional scope_constraint from semantic_scope_schema}]}. Do not return actions. Do not add, remove, "
                         "reorder, rename, reinterpret, or repair any supplied action. Every clause must be covered by "
                         "ordered exact source_text anchors. When conjunctions make a lossless split uncertain, use "
                         "one full-clause unit mapped to every supplied action that preserves part of it. Keep structured "
@@ -5067,6 +5070,7 @@ def _recover_registry_bounded_semantic_actions(
         candidates.append({
             "unit_id": str(unit.get("unit_id") or ""),
             "source_text": source,
+            "current_scope_constraint": str(unit.get("scope_constraint") or ""),
             "invalid_actions": [
                 actions[index]
                 for index in rejected
@@ -5125,7 +5129,7 @@ def _recover_registry_bounded_semantic_actions(
                     "'context'|'not_group_control',group:string,"
                     "existing_action_index:integer|null,"
                     "target_mode:'fake-node'|'real-node'|'sync-observe'|'',"
-                    "consultation_topic:string,turn_local_action_type:string,evidence_quote:string,"
+                    "consultation_topic:string,turn_local_action_type:string,scope_constraint:string,evidence_quote:string,"
                     "reason:string}]}. Review every supplied unit. Return one decision for a unit with one semantic "
                     "demand. When one unsplit unit contains multiple independent present demands, return one decision "
                     "per demand with the same unit_id and a distinct shortest exact evidence_quote; this is required "
@@ -5163,7 +5167,10 @@ def _recover_registry_bounded_semantic_actions(
                     "turn_local_action. existing_action_index must be null unless disposition is "
                     "shared_navigation. evidence_quote must be the shortest "
                     "exact excerpt from source_text that proves the disposition; use an empty quote only for "
-                    "not_group_control. Context requires a non-empty exact evidence quote."
+                    "not_group_control. Context requires a non-empty exact evidence quote. scope_constraint must be "
+                    "empty unless the source explicitly imposes one supplied semantic_scope_schema policy on the "
+                    "mapped operation. In particular, a prohibition on changing configuration while navigating is "
+                    "no_configuration_mutation, not consultation_only. Never infer a scope from action lifetime."
                 ),
             ),
             LLMMessage(role="user", content=json.dumps({
@@ -5178,6 +5185,7 @@ def _recover_registry_bounded_semantic_actions(
                     for row in group_schema()
                 ],
                 "allowed_consultation_topics": sorted(CONSULTATION_TOPICS),
+                "semantic_scope_schema": semantic_scope_schema(),
                 "recoverable_turn_local_actions": recoverable_turn_local_actions,
                 "available_sibling_navigations": sibling_navigations,
                 "units": candidates,
@@ -5201,6 +5209,7 @@ def _recover_registry_bounded_semantic_actions(
     replacements: dict[str, list[dict[str, Any]]] = {}
     shared_navigation_indexes: dict[str, int] = {}
     context_unit_ids: set[str] = set()
+    recovered_scopes: dict[str, str] = {}
     for candidate in candidates:
         unit_id = candidate["unit_id"]
         source = candidate["source_text"]
@@ -5223,9 +5232,19 @@ def _recover_registry_bounded_semantic_actions(
             topic = str(decision.get("consultation_topic") or "").strip()
             target_mode = str(decision.get("target_mode") or "").strip()
             turn_local_action_type = str(decision.get("turn_local_action_type") or "").strip()
+            scope_constraint = str(decision.get("scope_constraint") or "").strip()
             existing_action_index = decision.get("existing_action_index")
             if not quote or quote not in source:
                 return plan_text, False
+            if scope_constraint and scope_constraint not in {
+                row["name"] for row in semantic_scope_schema()
+            }:
+                return plan_text, False
+            if scope_constraint:
+                prior_scope = recovered_scopes.get(unit_id, scope_constraint)
+                if prior_scope != scope_constraint:
+                    return plan_text, False
+                recovered_scopes[unit_id] = scope_constraint
             if (
                 disposition == "shared_navigation"
                 and isinstance(existing_action_index, int)
@@ -5355,11 +5374,17 @@ def _recover_registry_bounded_semantic_actions(
             unit["action_indexes"] = [*indexes, shared_new_index]
             unit["disposition"] = "action"
             unit["reason"] = "registry-bounded shared navigation recovery"
+            scope_constraint = recovered_scopes.get(unit_id, "")
+            if scope_constraint:
+                unit["scope_constraint"] = scope_constraint
+            else:
+                unit.pop("scope_constraint", None)
             continue
         if unit_id in context_unit_ids:
             unit["action_indexes"] = []
             unit["disposition"] = "context"
             unit["reason"] = "registry-bounded non-action context recovery"
+            unit.pop("scope_constraint", None)
             continue
         unit_replacements = replacements.get(unit_id)
         if not unit_replacements:
@@ -5383,6 +5408,11 @@ def _recover_registry_bounded_semantic_actions(
         unit["action_indexes"] = list(dict.fromkeys([*indexes, *recovered_indexes]))
         unit["disposition"] = "action"
         unit["reason"] = "registry-bounded group-control recovery"
+        scope_constraint = recovered_scopes.get(unit_id, "")
+        if scope_constraint:
+            unit["scope_constraint"] = scope_constraint
+        else:
+            unit.pop("scope_constraint", None)
     recovered["actions"] = recovered_actions
     return json.dumps(recovered, ensure_ascii=False, sort_keys=True), True
 
@@ -5779,13 +5809,13 @@ def _action_plan_repair_prompt() -> str:
         "Preserve every semantic-unit source_text partition from invalid_output that already exactly covers its authoritative clause. When one invalid action must be split into multiple valid typed actions, keep that valid partition and update only its action_indexes to reference all replacement actions; do not repartition or reinterpret the user turn. "
         "Return semantic_units with ordered exact source_text anchors copied from every clause. "
         "The Harness derives character offsets; do not calculate them. Each row is "
-        "{unit_id, clause_id, source_text, disposition:'action'|'context'|'unresolved', optional scope_constraint:'consultation_only', "
+        "{unit_id, clause_id, source_text, disposition:'action'|'context'|'unresolved', optional scope_constraint from semantic_scope_schema, "
         "action_indexes:[zero-based indexes], reason}. Split prose only when exact contiguous anchors cover every word. "
         "When conjunctions or framing make a lossless split uncertain, use one full-clause unit mapped to every preserving typed action. "
         "Keep structured clauses atomic. Anchors may omit only punctuation or whitespace between units; never omit prose. "
         "Introductory, framing, and trailing prose around a structured block must have its own semantic unit mapped to the block-consuming action, be context only when it contains no present operation and will pass independent context admission, or be explicitly unresolved when the relationship is unclear. Structured clauses can never be context. "
         "structured_candidates are deterministic syntax facts for their clause. When that clause is configuration/review input, preserve config_values and unmapped_values in propose_config_values, route workflow_values through their typed workflow actions, and map the atomic clause to every action needed to preserve it. A same-turn instruction to review or apply that partial configuration and continue asking for required values not supplied is processing scope of propose_config_values; map it to that proposal without adding resume_current_flow, bypassing review, or leaving it unresolved. "
-        "An explicit consultation-only, not-starting-yet, or no-change unit sets scope_constraint='consultation_only' and maps to all read-only consultation action indexes it scopes; it is not unresolved. "
+        "Use only semantic_scope_schema constraints. consultation_only maps only read-only consultation actions. no_configuration_mutation may map read-only inspection and workflow navigation but not configuration changes. no_execution may map non-execution actions. Judge these constraints from action_schema.effect, never action lifetime. "
         "Never claim an action covers a URL, exact wire RPC method, or concrete fact unless that exact value is present in the mapped owning action."
         "When validation_errors report source anchors that do not cover a prose clause, repair that clause with exactly one semantic unit whose source_text is the complete authoritative clause text and whose action_indexes list every typed action that preserves the clause. "
         "When validation_errors report a missing exact wire RPC method, add the owning rpc_catalog_command set_method action with that exact method; citing the whole sentence as source_evidence on another action does not preserve it."
@@ -5826,6 +5856,7 @@ def _action_queue_payload(state: AgentGraphState, text: str) -> dict[str, Any]:
         },
         "structured_candidates": structured_candidates,
         "action_schema": action_schema(),
+        "semantic_scope_schema": semantic_scope_schema(),
         "group_schema": group_schema(),
         "workflow_state": workflow_snapshot(state),
     }

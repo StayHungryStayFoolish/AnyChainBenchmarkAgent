@@ -5525,9 +5525,64 @@ network:
             resolver.return_value = {"actions": [{"type": "change_group", "group": "sync_observe", "navigation_explicit": True, "source_evidence": "observe node sync", "confidence": "high"}]}
             result = process_turn(state)
 
-        self.assertEqual(result["pending_question"]["id"], "target_mode_change_confirm")
-        self.assertEqual(result["target_mode_change_candidate"], "sync-observe")
+        self.assertEqual(result["pending_question"]["id"], "target_mode_select")
+        self.assertEqual(result["pending_question"]["group"], "target_mode")
         self.assertEqual(result["target_mode"], "fake-node")
+        self.assertEqual(result["workflow_mode"], "rpc_benchmark")
+        self.assertEqual(result["control"]["deferred_group"], "sync_observe")
+
+    def test_public_group_jump_defers_to_declared_dependency(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("unit-thread")
+        state["target_mode"] = "fake-node"
+        state["workflow_mode"] = "rpc_benchmark"
+        state["last_user_input"] = "Take me to the RPC workload first."
+
+        with patch("agent.harness.coordinator.resolve_action_queue") as resolver:
+            resolver.return_value = {"actions": [{
+                "type": "change_group",
+                "group": "workload_rpc",
+                "navigation_explicit": True,
+                "source_evidence": state["last_user_input"],
+                "confidence": "high",
+            }]}
+            result = process_turn(state)
+
+        self.assertEqual(result["active_group"], "chain_identity")
+        self.assertEqual(result["pending_question"]["id"], "chain")
+        self.assertEqual(result["control"]["deferred_group"], "workload_rpc")
+
+    def test_completed_public_group_jump_renders_status_without_fallback(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("unit-thread")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "qps_profile": {
+                "mode": "quick",
+                "default_decision_made": True,
+                "confirmed": True,
+                "overrides": {},
+            },
+            "last_user_input": "Show the current QPS profile without changing it.",
+        })
+        with patch("agent.harness.coordinator.resolve_action_queue") as resolver:
+            resolver.return_value = {"actions": [{
+                "type": "change_group",
+                "group": "qps_profile",
+                "navigation_explicit": True,
+                "source_evidence": state["last_user_input"],
+                "confidence": "high",
+            }]}
+            result = process_turn(state)
+
+        self.assertEqual(result["active_group"], "qps_profile")
+        self.assertFalse(result.get("pending_question"))
+        self.assertIn("quick", "\n".join(result["visible_response"]))
 
     def test_unknown_chain_uses_identity_gate_not_partial_coercion(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
@@ -10044,8 +10099,9 @@ network:
 
         self.assertEqual(result["evidence_collection"]["lines"], original_lines)
         self.assertEqual(result["evidence_collection"]["status"], "paused")
-        self.assertEqual(result["active_group"], "qps_profile")
-        self.assertEqual((result.get("pending_question") or {}).get("group"), "qps_profile")
+        self.assertEqual(result["active_group"], "target_mode")
+        self.assertEqual((result.get("pending_question") or {}).get("group"), "target_mode")
+        self.assertEqual((result.get("control") or {}).get("deferred_group"), "qps_profile")
 
     def test_paused_evidence_collection_resumes_only_through_typed_action(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
@@ -10980,10 +11036,11 @@ network:
 
         from agent.harness.intent import ALLOWED_GROUPS
         from agent.harness.state import DEFAULT_GROUP_ORDER
-        from agent.workflows.group_registry import GROUP_ORDER
+        from agent.workflows.group_registry import GROUP_ORDER, USER_NAVIGABLE_GROUPS
 
         self.assertEqual(list(GROUP_ORDER), list(DEFAULT_GROUP_ORDER))
-        self.assertEqual(list(ALLOWED_GROUPS), list(DEFAULT_GROUP_ORDER))
+        self.assertEqual(list(ALLOWED_GROUPS), list(USER_NAVIGABLE_GROUPS))
+        self.assertLess(set(ALLOWED_GROUPS), set(DEFAULT_GROUP_ORDER))
         self.assertNotIn("hardware_discovery", DEFAULT_GROUP_ORDER)
 
     def test_adapter_family_lists_derive_from_single_source(self) -> None:

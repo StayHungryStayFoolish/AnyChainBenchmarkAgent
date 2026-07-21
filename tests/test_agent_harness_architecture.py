@@ -74,6 +74,27 @@ def _commit_result(
 
 
 class HarnessArchitectureTest(unittest.TestCase):
+    def test_change_group_schema_and_validator_share_public_navigation_catalog(self) -> None:
+        from agent.harness.action_registry import validate_action_contract
+        from agent.harness.context import action_schema
+        from agent.workflows.group_registry import USER_NAVIGABLE_GROUPS
+
+        change_group = next(item for item in action_schema() if item["type"] == "change_group")
+        self.assertEqual(change_group["allowed_groups"], list(USER_NAVIGABLE_GROUPS))
+        validate_action_contract({
+            "type": "change_group",
+            "group": "qps_profile",
+            "navigation_explicit": True,
+            "source_evidence": "show the QPS profile",
+        })
+        with self.assertRaisesRegex(ValueError, "user-navigable"):
+            validate_action_contract({
+                "type": "change_group",
+                "group": "job_monitoring",
+                "navigation_explicit": True,
+                "source_evidence": "go to job monitoring",
+            })
+
     def test_chain_rpc_invalidations_commit_cross_domain_state_once_at_coordinator(self) -> None:
         from agent.harness.domains.chain_rpc_support import _domain_result
         from agent.harness.transitions import (
@@ -584,7 +605,9 @@ class HarnessArchitectureTest(unittest.TestCase):
         self.assertIn("classify every unit independently", prompt)
         self.assertIn("the Harness derives them", prompt)
         self.assertIn("must not omit prose", prompt)
-        self.assertIn("consultation-only", prompt)
+        self.assertIn("consultation_only", prompt)
+        self.assertIn("no_configuration_mutation", prompt)
+        self.assertIn("action_schema.effect", prompt)
         self.assertIn("A pending question never takes precedence", prompt)
         self.assertIn("current_config/current_context/next_action", prompt)
 

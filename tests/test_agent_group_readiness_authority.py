@@ -13,6 +13,7 @@ from agent.workflows.group_registry import (
     FIELD_OWNER,
     GROUPS,
     GroupSpec,
+    USER_NAVIGABLE_GROUPS,
     fallback_groups_for_workflow,
     group_for_field,
     validate_group_registry,
@@ -66,6 +67,24 @@ class GroupRegistryAuthorityTests(unittest.TestCase):
             validate_group_registry(
                 (GroupSpec(name="one", owner="alpha", depends_on=("missing",)),)
             )
+
+    def test_registry_rejects_invalid_navigation_contracts(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "invalid navigation entry"):
+            validate_group_registry((
+                GroupSpec(name="one", owner="alpha", navigation_entry="unsupported"),  # type: ignore[arg-type]
+            ))
+        with self.assertRaisesRegex(RuntimeError, "action-only.*fallback"):
+            validate_group_registry((
+                GroupSpec(name="one", owner="alpha", navigation_entry="action_only"),
+            ))
+
+    def test_only_configuration_entry_groups_are_public_navigation_destinations(self) -> None:
+        self.assertNotIn("job_monitoring", USER_NAVIGABLE_GROUPS)
+        self.assertNotIn("failure_recovery", USER_NAVIGABLE_GROUPS)
+        self.assertNotIn("error_evidence_analysis", USER_NAVIGABLE_GROUPS)
+        self.assertNotIn("report_artifact_analysis", USER_NAVIGABLE_GROUPS)
+        self.assertIn("qps_profile", USER_NAVIGABLE_GROUPS)
+        self.assertIn("sync_observe", USER_NAVIGABLE_GROUPS)
         with self.assertRaisesRegex(RuntimeError, "dependency cycle"):
             validate_group_registry(
                 (

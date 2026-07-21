@@ -42,7 +42,12 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
         self.assertEqual(summary["groups"], len(GROUPS))
         self.assertEqual(summary["registered_questions"], sum(len(group.questions) for group in GROUPS))
         self.assertEqual(summary["actions"], len(ACTION_SPECS))
-        self.assertEqual(summary["action_only_transitions"], len(ACTION_SPECS))
+        from agent.workflows.group_registry import USER_NAVIGABLE_GROUPS
+
+        self.assertEqual(
+            summary["action_only_transitions"],
+            len(ACTION_SPECS) - 1 + len(USER_NAVIGABLE_GROUPS),
+        )
         self.assertIn("job_monitoring:real_node_smoke_confirm", self.ledger["runtime_only_questions"])
         self.assertIn("job_monitoring:real_node_final_benchmark_confirm", self.ledger["runtime_only_questions"])
 

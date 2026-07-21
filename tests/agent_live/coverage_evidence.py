@@ -1202,6 +1202,12 @@ def verify_runtime_postcondition(
         visible_group = str((committed.next_result or {}).get("group") or committed.active_group or "")
         if not navigation_targets:
             errors.append("change_group emitted no admitted destination")
+        expected_target = str((edge.get("expected_postcondition") or {}).get("target_group") or "")
+        if expected_target and expected_target not in navigation_targets:
+            errors.append(
+                "change_group admitted the wrong destination: "
+                f"expected={expected_target}, admitted={sorted(navigation_targets)}"
+            )
         elif visible_group not in navigation_targets:
             errors.append(
                 "change_group destination was not observed: "

@@ -115,6 +115,7 @@ def validate_plan_coverage(
     errors: list[str] = list(span_errors)
     unresolved: list[str] = []
     referenced_actions: set[int] = set()
+    incomplete_unit_ids: set[str] = set()
 
     for raw in raw_units:
         if not isinstance(raw, Mapping):
@@ -174,8 +175,8 @@ def validate_plan_coverage(
         if disposition != "action":
             errors.append(f"invalid semantic unit disposition for {unit_id}: {disposition or '<missing>'}")
             continue
-        if scope_constraint == "consultation_only" and not indexes:
-            indexes = _derive_consultation_scope_indexes(unit_id, action_list, errors)
+        if scope_constraint and not indexes:
+            indexes = _derive_scope_indexes(unit_id, scope_constraint, action_list, errors)
         if not indexes:
             errors.append(f"action semantic unit has no action index: {unit_id}")
             continue
@@ -191,10 +192,10 @@ def validate_plan_coverage(
             referenced_actions.add(value)
             mapped_actions.append(action)
         if scope_constraint:
-            if scope_constraint != "consultation_only":
-                errors.append(f"invalid scope constraint for {unit_id}: {scope_constraint}")
-            else:
-                _validate_consultation_scope(unit_id, mapped_actions, errors)
+            scope_error_count = len(errors)
+            _validate_semantic_scope(unit_id, scope_constraint, mapped_actions, errors)
+            if len(errors) != scope_error_count:
+                incomplete_unit_ids.add(unit_id)
         _validate_literal_anchors(
             unit_id,
             source_text,
@@ -235,6 +236,7 @@ def validate_plan_coverage(
         valid=not errors and not unresolved,
         errors=tuple(errors),
         unresolved_clauses=tuple(dict.fromkeys(unresolved)),
+        incomplete_unit_ids=tuple(sorted(incomplete_unit_ids)),
     )
 
 
@@ -361,39 +363,51 @@ def _separator_only(value: str) -> bool:
     return all(character.isspace() or unicodedata.category(character)[0] in {"P", "S"} for character in value)
 
 
-def _validate_consultation_scope(
+def _validate_semantic_scope(
     unit_id: str,
+    scope_constraint: str,
     mapped_actions: Sequence[Mapping[str, Any]],
     errors: list[str],
 ) -> None:
-    from .action_registry import action_is_turn_local
+    from .action_registry import (
+        SEMANTIC_SCOPE_POLICIES,
+        action_effect,
+        semantic_scope_accepts_action,
+    )
 
+    if scope_constraint not in SEMANTIC_SCOPE_POLICIES:
+        errors.append(f"invalid scope constraint for {unit_id}: {scope_constraint}")
+        return
     if not mapped_actions:
-        errors.append(f"consultation-only scope has no mapped actions: {unit_id}")
+        errors.append(f"{scope_constraint} scope has no mapped actions: {unit_id}")
         return
     for action in mapped_actions:
-        if not action_is_turn_local(dict(action)):
+        if not semantic_scope_accepts_action(scope_constraint, action):
             errors.append(
-                f"consultation-only scope maps to a durable action for {unit_id}: "
+                f"{scope_constraint} scope rejects {action_effect(action)} action for {unit_id}: "
                 f"{action.get('type') or '<missing>'}"
             )
 
 
-def _derive_consultation_scope_indexes(
+def _derive_scope_indexes(
     unit_id: str,
+    scope_constraint: str,
     actions: Sequence[Any],
     errors: list[str],
 ) -> list[int]:
-    from .action_registry import action_is_turn_local
+    from .action_registry import SEMANTIC_SCOPE_POLICIES, semantic_scope_accepts_action
 
+    if scope_constraint not in SEMANTIC_SCOPE_POLICIES:
+        errors.append(f"invalid scope constraint for {unit_id}: {scope_constraint}")
+        return []
     if not actions:
-        errors.append(f"consultation-only scope has no actions to bind: {unit_id}")
+        errors.append(f"{scope_constraint} scope has no actions to bind: {unit_id}")
         return []
     indexes: list[int] = []
     for index, action in enumerate(actions):
-        if not isinstance(action, Mapping) or not action_is_turn_local(dict(action)):
+        if not isinstance(action, Mapping) or not semantic_scope_accepts_action(scope_constraint, action):
             errors.append(
-                f"consultation-only scope cannot bind a durable action for {unit_id}: "
+                f"{scope_constraint} scope cannot bind action for {unit_id}: "
                 f"{action.get('type') if isinstance(action, Mapping) else '<invalid>'}"
             )
             return []
