@@ -340,14 +340,25 @@ def extract_structured_input_candidates(text: str) -> dict[str, Any] | None:
     """
 
     flattened: dict[str, Any] = {}
-    flattened.update(_extract_json_flat_values(text))
-    flattened.update(_extract_yaml_flat_values(text))
+    detected_formats: set[str] = set()
+    json_values = _extract_json_flat_values(text)
+    if json_values:
+        detected_formats.add("json")
+        flattened.update(json_values)
+    yaml_values = _extract_yaml_flat_values(text)
+    if yaml_values:
+        detected_formats.add("yaml")
+        flattened.update(yaml_values)
+    env_values: dict[str, Any] = {}
     for raw_line in str(text or "").splitlines():
         line = raw_line.strip()
         if line.startswith("export "):
             line = line[len("export "):].strip()
         for key, value in iter_config_assignments(line):
-            flattened[key] = value
+            env_values[key] = value
+    if env_values:
+        detected_formats.add("env")
+        flattened.update(env_values)
     if not flattened:
         return None
 
@@ -358,6 +369,7 @@ def extract_structured_input_candidates(text: str) -> dict[str, Any] | None:
         "config_values": config_values,
         "workflow_values": workflow_values,
         "unmapped_values": unmapped_values,
+        "source_format": next(iter(detected_formats)) if len(detected_formats) == 1 else "mixed",
     }
 
 

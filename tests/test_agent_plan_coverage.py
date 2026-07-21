@@ -10551,7 +10551,179 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
             reconciled["actions"][0]["config_values"],
             {"ACCOUNTS_DEVICE": "/dev/nvme1n1"},
         )
+        self.assertEqual(reconciled["actions"][0]["source_format"], "json")
         self.assertEqual(reconciled["semantic_units"][0]["action_indexes"], [0])
+
+    def test_structured_pending_assignment_and_trailing_proposal_scope_rejoin_one_review(self) -> None:
+        from agent.harness.intent import (
+            _reconcile_structured_candidate_ownership,
+            _validate_action_document,
+        )
+        from agent.harness.state import new_state
+
+        source = (
+            "The network profile says:\n"
+            "```env\nNETWORK_MAX_BANDWIDTH_GBPS=25\n```\n"
+            "Use that as the proposed bandwidth value."
+        )
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": "25",
+                "selected_value": "25",
+                "source_evidence": "25",
+            }],
+            "semantic_units": [
+                _unit(clauses[0], 1, [], disposition="unresolved"),
+                _unit(clauses[1], 2, [0]),
+            ],
+            "pending_answer_admissions": [0],
+        }
+        state = new_state("structured-pending-cross-clause", language="en")
+        state["pending_question"] = {
+            "id": "NETWORK_MAX_BANDWIDTH_GBPS",
+            "group": "network",
+            "field": "NETWORK_MAX_BANDWIDTH_GBPS",
+            "kind": "manual_value",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "positive_number"},
+            "options": [],
+        }
+
+        reconciled = json.loads(_reconcile_structured_candidate_ownership(
+            json.dumps(payload),
+            clauses,
+            state,
+        ))
+
+        self.assertEqual(reconciled["actions"][0]["type"], "propose_config_values")
+        self.assertEqual(
+            reconciled["actions"][0]["config_values"],
+            {"NETWORK_MAX_BANDWIDTH_GBPS": "25"},
+        )
+        self.assertEqual(reconciled["actions"][0]["source_format"], "env")
+        self.assertEqual(reconciled["pending_answer_admissions"], [])
+        self.assertEqual(reconciled["semantic_units"][0]["action_indexes"], [0])
+        self.assertEqual(reconciled["semantic_units"][1]["action_indexes"], [0])
+        self.assertTrue(
+            _validate_action_document(json.dumps(reconciled), clauses, state).valid
+        )
+
+    def test_cross_clause_structured_pending_assignment_uses_pending_intent_before_admission(self) -> None:
+        from agent.harness.intent import _reconcile_structured_candidate_ownership
+        from agent.harness.state import new_state
+
+        source = "```env\nCLOUD_REGION=asia-east1\n```\nUse that proposed value."
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": "asia-east1",
+                "selected_value": "asia-east1",
+                "source_evidence": "asia-east1",
+            }],
+            "semantic_units": [
+                _unit(clauses[0], 1, [], disposition="unresolved"),
+                _unit(clauses[1], 2, [0]),
+            ],
+        }
+        state = new_state("structured-pending-no-admission", language="en")
+        state["pending_question"] = {
+            "id": "CLOUD_REGION",
+            "group": "provider_deployment",
+            "field": "CLOUD_REGION",
+            "kind": "manual_value",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "scalar_token"},
+            "options": [],
+        }
+
+        reconciled = json.loads(_reconcile_structured_candidate_ownership(
+            json.dumps(payload),
+            clauses,
+            state,
+        ))
+
+        self.assertEqual(reconciled["actions"][0]["type"], "propose_config_values")
+        self.assertEqual(
+            reconciled["actions"][0]["config_values"],
+            {"CLOUD_REGION": "asia-east1"},
+        )
+        self.assertEqual(reconciled["actions"][0]["source_format"], "env")
+
+    def test_cross_clause_structured_assignment_without_pending_intent_is_not_claimed(self) -> None:
+        from agent.harness.intent import _reconcile_structured_candidate_ownership
+        from agent.harness.state import new_state
+
+        source = "```env\nCLOUD_REGION=asia-east1\n```\nWhat does this setting mean?"
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "answer_capability_question",
+                "topic": "configuration",
+                "source_evidence": clauses[1].text,
+            }],
+            "semantic_units": [
+                _unit(clauses[0], 1, [], disposition="unresolved"),
+                _unit(clauses[1], 2, [0]),
+            ],
+        }
+        state = new_state("structured-pending-consultation", language="en")
+        state["pending_question"] = {
+            "id": "CLOUD_REGION",
+            "group": "provider_deployment",
+            "field": "CLOUD_REGION",
+            "kind": "manual_value",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "scalar_token"},
+            "options": [],
+        }
+
+        reconciled = json.loads(_reconcile_structured_candidate_ownership(
+            json.dumps(payload),
+            clauses,
+            state,
+        ))
+
+        self.assertEqual(reconciled, payload)
+
+    def test_cross_clause_structured_assignment_does_not_override_a_different_pending_value(self) -> None:
+        from agent.harness.intent import _reconcile_structured_candidate_ownership
+        from agent.harness.state import new_state
+
+        source = "```env\nNETWORK_MAX_BANDWIDTH_GBPS=25\n```\nActually use 30 instead."
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": "30",
+                "selected_value": "30",
+                "source_evidence": clauses[1].text,
+            }],
+            "semantic_units": [
+                _unit(clauses[0], 1, [], disposition="unresolved"),
+                _unit(clauses[1], 2, [0]),
+            ],
+        }
+        state = new_state("structured-pending-conflict", language="en")
+        state["pending_question"] = {
+            "id": "NETWORK_MAX_BANDWIDTH_GBPS",
+            "group": "network",
+            "field": "NETWORK_MAX_BANDWIDTH_GBPS",
+            "kind": "manual_value",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "positive_number"},
+            "options": [],
+        }
+
+        reconciled = json.loads(_reconcile_structured_candidate_ownership(
+            json.dumps(payload),
+            clauses,
+            state,
+        ))
+
+        self.assertEqual(reconciled, payload)
 
     def test_manual_pending_owner_merges_equivalent_domain_action(self) -> None:
         from agent.harness.intent import _materialize_pending_manual_owner_actions

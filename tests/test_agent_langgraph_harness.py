@@ -1882,6 +1882,7 @@ network:
 
         self.assertEqual(candidates["config_values"], {"CLOUD_REGION": "asia-east1"})
         self.assertEqual(candidates["unmapped_values"], {"environment.team_ticket": "INC-12345"})
+        self.assertEqual(candidates["source_format"], "yaml")
 
         proposal = build_config_proposal({
             "config_values": {"CLOUD_REGION": "asia-east1"},
@@ -1902,6 +1903,7 @@ network:
 
         self.assertEqual(candidates["config_values"], {"NETWORK_INTERFACE": "eth0"})
         self.assertEqual(candidates["unmapped_values"], {})
+        self.assertEqual(candidates["source_format"], "json")
 
     def test_structured_candidates_separate_workflow_and_unknown_fields(self) -> None:
         from agent.harness.domains.environment import extract_structured_input_candidates
@@ -1916,6 +1918,20 @@ network:
         self.assertEqual(candidates["config_values"], {"CLOUD_REGION": "asia-east1"})
         self.assertEqual(candidates["workflow_values"], {"RPC_MODE": "single"})
         self.assertEqual(candidates["unmapped_values"], {"UNRELATED_TICKET": "INC-12345"})
+        self.assertEqual(candidates["source_format"], "env")
+
+    def test_structured_candidates_report_mixed_source_syntax(self) -> None:
+        from agent.harness.domains.environment import extract_structured_input_candidates
+
+        candidates = extract_structured_input_candidates(
+            '{"CLOUD_REGION":"asia-east1"}\nNETWORK_INTERFACE=eth0'
+        )
+
+        self.assertEqual(
+            candidates["config_values"],
+            {"CLOUD_REGION": "asia-east1", "NETWORK_INTERFACE": "eth0"},
+        )
+        self.assertEqual(candidates["source_format"], "mixed")
 
     def test_action_payload_exposes_clause_scoped_structured_candidates(self) -> None:
         from agent.harness.intent import _action_queue_payload

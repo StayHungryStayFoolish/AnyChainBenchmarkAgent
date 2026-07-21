@@ -1738,6 +1738,17 @@ def _reconcile_structured_candidate_ownership(
         return text
 
     changed = False
+    pending = dict((state or {}).get("pending_question") or {})
+    pending_field = str(pending.get("field") or "").strip().upper()
+    structured_pending_values = []
+    if pending.get("manual_input_allowed") is True and pending_field:
+        for candidate_clause in clauses:
+            if candidate_clause.input_shape != "structured":
+                continue
+            candidate = extract_structured_input_candidates(candidate_clause.text) or {}
+            candidate_values = dict(candidate.get("config_values") or {})
+            if pending_field in candidate_values:
+                structured_pending_values.append(candidate_values[pending_field])
     for clause in clauses:
         if clause.input_shape != "structured":
             continue
@@ -1760,8 +1771,6 @@ def _reconcile_structured_candidate_ownership(
             and isinstance(actions[index], dict)
             and str(actions[index].get("type") or "") == "propose_config_values"
         }
-        pending = dict((state or {}).get("pending_question") or {})
-        pending_field = str(pending.get("field") or "").strip().upper()
         if (
             not proposal_indexes
             and pending.get("manual_input_allowed") is True
@@ -1785,7 +1794,7 @@ def _reconcile_structured_candidate_ownership(
                 proposal_index = min(direct_answer_indexes)
                 actions[proposal_index] = {
                     "type": "propose_config_values",
-                    "source_format": "structured",
+                    "source_format": str(candidates.get("source_format") or "mixed"),
                     "config_values": dict(config_values),
                     "unmapped_values": dict(unmapped_values),
                     "source_evidence": clause.text,
@@ -1807,6 +1816,40 @@ def _reconcile_structured_candidate_ownership(
                     unit["reason"] = "registered structured config assignment requires review"
                 proposal_indexes = {proposal_index}
                 changed = True
+            elif len(structured_pending_values) == 1:
+                pending_answer_indexes = {
+                    index
+                    for index, action in enumerate(actions)
+                    if isinstance(action, dict)
+                    and str(action.get("type") or "") == "answer_pending"
+                    and str(
+                        action.get("selected_value")
+                        if action.get("selected_value") is not None
+                        else action.get("answer") or ""
+                    ).strip().strip("\"'")
+                    == str(structured_pending_values[0]).strip().strip("\"'")
+                }
+                if len(pending_answer_indexes) == 1:
+                    proposal_index = next(iter(pending_answer_indexes))
+                    actions[proposal_index] = {
+                        "type": "propose_config_values",
+                        "source_format": str(candidates.get("source_format") or "mixed"),
+                        "config_values": dict(config_values),
+                        "unmapped_values": dict(unmapped_values),
+                        "source_evidence": clause.text,
+                        "confidence": "high",
+                    }
+                    for unit in clause_units:
+                        unit["action_indexes"] = [proposal_index]
+                        unit["disposition"] = "action"
+                        unit["reason"] = "source-grounded structured config assignment requires review"
+                    payload["pending_answer_admissions"] = [
+                        index
+                        for index in payload.get("pending_answer_admissions", [])
+                        if index != proposal_index
+                    ]
+                    proposal_indexes = {proposal_index}
+                    changed = True
         if not proposal_indexes:
             continue
         for index in proposal_indexes:
