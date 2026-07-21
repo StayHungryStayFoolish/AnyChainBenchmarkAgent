@@ -14,6 +14,7 @@ from ..state import AgentGraphState
 from ..transitions import record_group_invalidations
 
 from agent.planners import question_prompts
+from agent.utils.redaction import redact
 from agent.workflows.group_registry import group_for_field, invalidation_targets
 ENVIRONMENT_GROUPS = {"provider_deployment", "ledger_disk", "accounts_disk", "network"}
 
@@ -462,18 +463,21 @@ def format_config_proposal_prompt(proposal: dict[str, Any], *, language: str = "
     config_values = proposal.get("config_values") if isinstance(proposal.get("config_values"), dict) else {}
     unmapped = proposal.get("unmapped_values") if isinstance(proposal.get("unmapped_values"), dict) else {}
     conflicts = _normalize_conflicts(proposal.get("conflicts"))
+    display_config_values = redact(config_values)
+    display_unmapped = redact(unmapped)
+    display_conflicts = redact(conflicts)
     lines = []
-    if config_values:
+    if display_config_values:
         lines.append(localized(language, "我从你粘贴的内容中推断出这些配置候选值：", "I inferred these candidate config values from your pasted content:"))
-        for key in sorted(config_values):
-            lines.append(f"- {key}: `{config_values[key]}`")
-    if unmapped:
+        for key in sorted(display_config_values):
+            lines.append(f"- {key}: `{display_config_values[key]}`")
+    if display_unmapped:
         lines.append(localized(language, "以下内容没有自动映射到已知配置项，不会自动写入：", "These extracted values did not map to known config fields and will not be applied automatically:"))
-        for key in sorted(unmapped):
-            lines.append(f"- {key}: `{unmapped[key]}`")
-    if conflicts:
+        for key in sorted(display_unmapped):
+            lines.append(f"- {key}: `{display_unmapped[key]}`")
+    if display_conflicts:
         lines.append(localized(language, "以下输入存在冲突，请在确认前核对：", "The following inputs conflict; review them before confirming:"))
-        lines.extend(f"- {item}" for item in conflicts)
+        lines.extend(f"- {item}" for item in display_conflicts)
     if proposal.get("reason"):
         lines.append(localized(language, f"推断依据：{proposal.get('reason')}", f"Reason: {proposal.get('reason')}"))
     lines.append(localized(language, "是否确认应用这些已映射的候选值？", "Apply the mapped candidate values?"))

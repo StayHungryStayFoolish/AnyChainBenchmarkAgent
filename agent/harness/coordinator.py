@@ -19,6 +19,7 @@ from .oracle import (
 )
 from .routing import chain_identity_confirmed, group_readiness, next_group_and_reason
 from .turns import adjudicate_turn
+from .plan_coverage import segment_user_turn
 from .action_registry import ACTION_BY_TYPE, action_crosses_pending_barrier, action_execution_phase, action_is_turn_local, action_merge_key, assign_action_ids, compile_legacy_custom_rpc_action, lifecycle_rejected_action_indexes, merge_semantic_actions, normalize_action_relations, validate_action_contract
 from .contracts import ActionProposal, CheckpointCommand, HandlerResult, RecoveryCommand
 from .localization import localized as _localized
@@ -280,6 +281,16 @@ def prepare_turn_step(state: AgentGraphState) -> AgentGraphState:
         state["active_group"] = pending_owner
     state["turn_index"] = int(state.get("turn_index") or 0) + 1
     text = str(state.get("last_user_input") or "").strip()
+    clauses = segment_user_turn(text)
+    clause_shapes = {str(clause.input_shape or "prose") for clause in clauses}
+    input_shape = (
+        "structured"
+        if clause_shapes == {"structured"}
+        else "mixed"
+        if "structured" in clause_shapes
+        else "prose"
+    )
+    state["input_shape"] = input_shape
     state["visible_response"] = []
     state["current_action"] = {}
     state["completed_actions"] = []
@@ -289,6 +300,7 @@ def prepare_turn_step(state: AgentGraphState) -> AgentGraphState:
         "id": int(state.get("turn_index") or 0),
         "kind": str(turn.kind),
         "text": text,
+        "input_shape": input_shape,
         "origin_group": str(state.get("active_group") or ""),
         "pending_snapshot": dict(state.get("pending_question") or {}),
         "admitted_actions": [],
@@ -320,6 +332,27 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
         return _set_turn_phase(state, "fallback", "empty_turn")
 
     pending = state.get("pending_question") or {}
+    input_shape = str((state.get("turn_context") or {}).get("input_shape") or "prose")
+    if str(pending.get("id") or "") == "inferred_config_review":
+        merged = _merge_pending_config_proposal_from_text(state, text)
+        if merged:
+            return _set_turn_phase(merged, "compose", "merged_config_proposal")
+
+    # Evidence framing is a terminal transport concern: collect a complete
+    # multiline block before asking the semantic planner to classify it. The
+    # completed block re-enters the normal semantic owner as one turn.
+    if pending and str(pending.get("kind") or "") == "evidence" and should_start_evidence_collection(text):
+        state = _apply_evidence_outcome(state, start_evidence_collection(state, text, pending))
+        return _set_turn_phase(state, "compose", "evidence_collection_started")
+
+    # Structured transport is never a scalar fast-path answer. The semantic
+    # planner first decides whether the block is configuration, evidence, a
+    # report, or a compound request; registered configuration then enters the
+    # single inferred-config review transaction. This ordering is shared by
+    # JSON, YAML, env, shell assignments, and prose-plus-data turns.
+    if input_shape in {"structured", "mixed"}:
+        return _set_turn_phase(state, "plan", "structured_turn_requires_semantic_ownership")
+
     violation = manual_literal_violation(text, pending) if pending else {}
     if violation:
         max_length = int(violation.get("max_length") or 0)
@@ -335,15 +368,6 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
             message_en,
         ), _render_question(pending, language)]
         return _set_turn_phase(state, "compose", "pending_literal_rejected")
-    if str(pending.get("id") or "") == "inferred_config_review":
-        merged = _merge_pending_config_proposal_from_text(state, text)
-        if merged:
-            return _set_turn_phase(merged, "compose", "merged_config_proposal")
-
-    if pending and str(pending.get("kind") or "") == "evidence" and should_start_evidence_collection(text):
-        state = _apply_evidence_outcome(state, start_evidence_collection(state, text, pending))
-        return _set_turn_phase(state, "compose", "evidence_collection_started")
-
     if pending and _answer_fits_pending(text, pending):
         pending_question_id = str(pending.get("id") or "")
         resume_queue = bool(
@@ -457,10 +481,34 @@ def admit_turn_step(state: AgentGraphState) -> AgentGraphState:
     if turn_local_actions:
         state = _execute_turn_local_actions(state, turn_local_actions, text)
     pending = state.get("pending_question") or {}
+    existing_queue = [
+        dict(item)
+        for item in state.get("action_queue") or []
+        if isinstance(item, dict)
+    ]
+    accepted_types = {
+        str(item).strip()
+        for item in pending.get("accepted_action_types") or []
+        if str(item).strip()
+    }
+    answers_active_semantic_contract = bool(
+        accepted_types
+        and any(str(item.get("type") or "") in accepted_types for item in durable_actions)
+    )
+    if answers_active_semantic_contract and not pending.get("resume_action_queue"):
+        # A pre-Harness checkpoint may contain an unadmitted command with no
+        # plan identity. It must never outrank a current-turn action accepted
+        # by the active question contract. Properly admitted deferred work is
+        # retained and resumes through the normal queue barrier.
+        existing_queue = [
+            item
+            for item in existing_queue
+            if "_plan_scope" in item or "_submitted_turn_index" in item
+        ]
     ordered_queue = _order_action_queue(
         state,
         _merge_durable_action_queue(
-            [dict(item) for item in state.get("action_queue") or [] if isinstance(item, dict)],
+            existing_queue,
             durable_actions,
         ),
     )
@@ -1735,6 +1783,10 @@ def _order_action_queue(
     for proposal_index in proposal_indexes:
         for consumer_index, action in enumerate(actions):
             if consumer_index == proposal_index:
+                continue
+            proposal_scope = str(actions[proposal_index].get("_plan_scope") or "")
+            consumer_scope = str(action.get("_plan_scope") or "")
+            if not proposal_scope or proposal_scope != consumer_scope:
                 continue
             if str(action.get("type") or "") not in proposal_blocked_types:
                 continue

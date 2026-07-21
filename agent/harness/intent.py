@@ -5323,20 +5323,20 @@ def _recover_registry_bounded_semantic_actions(
     if not candidates:
         return plan_text, False
 
-    recoverable_turn_local_actions = [
+    recoverable_registered_actions = [
         {
             "type": spec.action_type,
             "purpose": spec.purpose,
             "source_argument": spec.semantic_recovery_source_argument,
+            "effect": spec.effect,
         }
         for spec in ACTION_SPECS
-        if spec.lifetime == "turn_local"
-        and spec.semantic_recovery_source_argument
+        if spec.semantic_recovery_source_argument
         and spec.semantic_recovery_source_argument in spec.allowed_arguments
     ]
-    recoverable_turn_local_by_type = {
+    recoverable_registered_by_type = {
         row["type"]: row
-        for row in recoverable_turn_local_actions
+        for row in recoverable_registered_actions
     }
 
     sibling_navigations = [
@@ -5368,11 +5368,12 @@ def _recover_registry_bounded_semantic_actions(
                 content=(
                     "Adjudicate only structurally unrepresented AnyChain group-control intent. Return JSON only: "
                     "{decisions:[{unit_id:string,disposition:'navigation'|'shared_navigation'|'generic_resume'|'consultation'|"
-                    "'owner_mutation'|'explicit_target_mode'|'unresolved_target_mode'|'turn_local_action'|"
+                    "'owner_mutation'|'explicit_target_mode'|'unresolved_target_mode'|'registered_action'|"
+                    "'registered_action_support'|"
                     "'context'|'not_group_control',group:string,"
                     "existing_action_index:integer|null,"
                     "target_mode:'fake-node'|'real-node'|'sync-observe'|'',"
-                    "consultation_topic:string,turn_local_action_type:string,scope_constraint:string,evidence_quote:string,"
+                    "consultation_topic:string,registered_action_type:string,scope_constraint:string,evidence_quote:string,"
                     "reason:string}]}. Review every supplied unit. Return one decision for a unit with one semantic "
                     "demand. When one unsplit unit contains multiple independent present demands, return one decision "
                     "per demand with the same unit_id and a distinct shortest exact evidence_quote; this is required "
@@ -5395,10 +5396,15 @@ def _recover_registry_bounded_semantic_actions(
                     "for exactly one available_sibling_navigation already supported by another source unit in this same "
                     "turn; set existing_action_index to that row's exact action_index. It does not create a destination "
                     "or action. Never use it for unrelated, contradictory, ambiguous, or independently actionable text. "
-                    "Use turn_local_action only when source_text directly fulfils exactly one listed "
-                    "recoverable_turn_local_action purpose; set turn_local_action_type to that exact registered type. "
+                    "Use registered_action only when source_text directly fulfils exactly one listed "
+                    "recoverable_registered_action purpose; set registered_action_type to that exact registered type. "
+                    "Use registered_action_support only when source_text is not an independent demand and instead "
+                    "states a scope, non-mutation, timing, or explanatory constraint on exactly one registered_action "
+                    "created from another source unit in this turn; set registered_action_type to that same registered "
+                    "type. This shares one action and never creates a second operation. Do not use it when the text "
+                    "requests another mutation, destination, queue operation, or execution. "
                     "The complete user turn will be supplied only through its declared source_argument. Do not select "
-                    "a durable configuration or execution action. Use not_group_control for ambiguity or unrelated "
+                    "an unlisted configuration, navigation, or execution action. Use not_group_control for ambiguity or unrelated "
                     "content that may still require clarification. Use context only for prose that is background, "
                     "provenance, or a tentative future possibility and contains no present request, answer, question, "
                     "selection, correction, contradiction, mutation, navigation, evidence submission, or execution "
@@ -5406,8 +5412,8 @@ def _recover_registry_bounded_semantic_actions(
                     "destination from workflow order, current state, defaults, or a pending question. group must be an "
                     "exact registered name for navigation/owner_mutation and empty otherwise. consultation_topic must be "
                     "an exact allowed topic for consultation and empty otherwise. target_mode must be empty unless "
-                    "disposition is explicit_target_mode. turn_local_action_type must be empty unless disposition is "
-                    "turn_local_action. existing_action_index must be null unless disposition is "
+                    "disposition is explicit_target_mode. registered_action_type must be empty unless disposition is "
+                    "registered_action or registered_action_support. existing_action_index must be null unless disposition is "
                     "shared_navigation. evidence_quote must be the shortest "
                     "exact excerpt from source_text that proves the disposition; use an empty quote only for "
                     "not_group_control. Context requires a non-empty exact evidence quote. scope_constraint must be "
@@ -5429,7 +5435,7 @@ def _recover_registry_bounded_semantic_actions(
                 ],
                 "allowed_consultation_topics": sorted(CONSULTATION_TOPICS),
                 "semantic_scope_schema": semantic_scope_schema(),
-                "recoverable_turn_local_actions": recoverable_turn_local_actions,
+                "recoverable_registered_actions": recoverable_registered_actions,
                 "available_sibling_navigations": sibling_navigations,
                 "units": candidates,
             }, ensure_ascii=False, sort_keys=True)),
@@ -5451,6 +5457,7 @@ def _recover_registry_bounded_semantic_actions(
     }
     replacements: dict[str, list[dict[str, Any]]] = {}
     shared_navigation_indexes: dict[str, int] = {}
+    registered_action_support_types: dict[str, str] = {}
     context_unit_ids: set[str] = set()
     recovered_scopes: dict[str, str] = {}
     recovered_navigation_groups = {
@@ -5485,7 +5492,7 @@ def _recover_registry_bounded_semantic_actions(
             group = str(decision.get("group") or "").strip()
             topic = str(decision.get("consultation_topic") or "").strip()
             target_mode = str(decision.get("target_mode") or "").strip()
-            turn_local_action_type = str(decision.get("turn_local_action_type") or "").strip()
+            registered_action_type = str(decision.get("registered_action_type") or "").strip()
             scope_constraint = str(decision.get("scope_constraint") or "").strip()
             existing_action_index = decision.get("existing_action_index")
             if not quote or quote not in source:
@@ -5505,6 +5512,12 @@ def _recover_registry_bounded_semantic_actions(
                 and existing_action_index in sibling_navigation_indexes
             ):
                 shared_navigation_indexes[unit_id] = existing_action_index
+                continue
+            if (
+                disposition == "registered_action_support"
+                and registered_action_type in recoverable_registered_by_type
+            ):
+                registered_action_support_types[unit_id] = registered_action_type
                 continue
             if disposition == "context":
                 context_unit_ids.add(unit_id)
@@ -5527,10 +5540,10 @@ def _recover_registry_bounded_semantic_actions(
                     "topic": topic,
                     "source_evidence": user_text,
                 }
-            elif disposition == "turn_local_action" and turn_local_action_type in recoverable_turn_local_by_type:
-                recovery_contract = recoverable_turn_local_by_type[turn_local_action_type]
+            elif disposition == "registered_action" and registered_action_type in recoverable_registered_by_type:
+                recovery_contract = recoverable_registered_by_type[registered_action_type]
                 replacement = {
-                    "type": turn_local_action_type,
+                    "type": registered_action_type,
                     str(recovery_contract["source_argument"]): user_text,
                 }
             elif disposition == "unresolved_target_mode":
@@ -5612,7 +5625,7 @@ def _recover_registry_bounded_semantic_actions(
             for spec in ACTION_SPECS
             if spec.incomplete_mutation_intake
         ),
-        *recoverable_turn_local_by_type,
+        *recoverable_registered_by_type,
     }
     def shared_action_target(action: dict[str, Any]) -> str:
         action_type = str(action.get("type") or "")
@@ -5638,6 +5651,35 @@ def _recover_registry_bounded_semantic_actions(
         if not isinstance(unit, dict):
             continue
         unit_id = str(unit.get("unit_id") or "")
+        support_action_type = registered_action_support_types.get(unit_id)
+        if support_action_type:
+            support_key = (support_action_type, shared_action_target({"type": support_action_type}))
+            support_index = shared_indexes.get(support_key)
+            if support_index is None:
+                support_replacement = next(
+                    (
+                        replacement
+                        for unit_actions in replacements.values()
+                        for replacement in unit_actions
+                        if str(replacement.get("type") or "") == support_action_type
+                    ),
+                    None,
+                )
+                if support_replacement is None:
+                    return plan_text, False
+                support_index = len(recovered_actions)
+                recovered_actions.append(support_replacement)
+                shared_indexes[support_key] = support_index
+            indexes = unit.get("action_indexes") if isinstance(unit.get("action_indexes"), list) else []
+            unit["action_indexes"] = list(dict.fromkeys([*indexes, support_index]))
+            unit["disposition"] = "action"
+            unit["reason"] = "registry-bounded registered-action support recovery"
+            scope_constraint = recovered_scopes.get(unit_id, "")
+            if scope_constraint:
+                unit["scope_constraint"] = scope_constraint
+            else:
+                unit.pop("scope_constraint", None)
+            continue
         shared_old_index = shared_navigation_indexes.get(unit_id)
         if shared_old_index is not None:
             shared_new_index = retained_index_map.get(shared_old_index)

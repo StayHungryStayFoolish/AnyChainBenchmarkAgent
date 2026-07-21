@@ -33,7 +33,7 @@ from tests.agent_live.harness_contract_scenarios import (
     manual_input_case,
     question_scenarios,
 )
-from agent.harness.domains.environment import CONFIRMABLE_CONFIG_FIELDS
+from agent.harness.domains.environment import CONFIG_PROPOSAL_FIELDS
 
 
 EVIDENCE_CLASSES = (
@@ -742,7 +742,7 @@ def build_ledger(
                 field = str(contract.get("field") or "")
                 structured_config_interrupt = (
                     input_class == "structured_json_yaml_env_curl"
-                    and field.upper() in CONFIRMABLE_CONFIG_FIELDS
+                    and field.upper() in CONFIG_PROPOSAL_FIELDS
                 )
                 action_type = (
                     "propose_config_values"

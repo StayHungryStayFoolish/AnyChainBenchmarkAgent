@@ -278,6 +278,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         execution_phase=10,
         required_arguments=("source_evidence",),
         constraints=("workflow_goals must contain at least one saved goal",),
+        semantic_recovery_source_argument="source_evidence",
     ),
     ActionSpec(
         "discard_next_workflow_goal",
@@ -287,6 +288,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         execution_phase=10,
         required_arguments=("source_evidence",),
         constraints=("workflow_goals must contain at least one saved goal",),
+        semantic_recovery_source_argument="source_evidence",
     ),
     ActionSpec(
         "set_rpc_mode",

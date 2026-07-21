@@ -2180,6 +2180,14 @@ network:
             "field": "custom_rpc_schema_evidence",
             "kind": "evidence",
             "manual_input_allowed": True,
+            "accepted_action_types": ["rpc_catalog_command"],
+            "manual_action": {
+                "type": "rpc_catalog_command",
+                "catalog_command": "append_evidence",
+                "value_argument": "rpc_schema_evidence",
+                "use_complete_turn": True,
+            },
+            "queue_barrier": True,
         }
         state["action_queue"] = [
             {
@@ -2191,7 +2199,16 @@ network:
         state["last_user_input"] = "[]"
 
         ok_probe = {"ready": True, "status": "ok", "evidence_file": ".agent/evidence/probe.json"}
-        with patch("agent.harness.domains.rpc_endpoint.extract_rpc_schema_from_evidence", return_value={"status": "draft", "method": "eth_chainId", "params": [], "params_json": [], "response_summary": "hex chain id", "confidence": "high"}), patch("agent.harness.domains.rpc_endpoint.validate_rpc_endpoint", return_value=ok_probe):
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            return_value={"actions": [{
+                "type": "rpc_catalog_command",
+                "catalog_command": "append_evidence",
+                "rpc_schema_evidence": state["last_user_input"],
+                "source_evidence": state["last_user_input"],
+                "confidence": "high",
+            }]},
+        ), patch("agent.harness.domains.rpc_endpoint.extract_rpc_schema_from_evidence", return_value={"status": "draft", "method": "eth_chainId", "params": [], "params_json": [], "response_summary": "hex chain id", "confidence": "high"}), patch("agent.harness.domains.rpc_endpoint.validate_rpc_endpoint", return_value=ok_probe):
             result = process_turn(state)
             self.assertEqual(result["custom_rpc"]["status"], "schema_needs_confirmation")
             self.assertEqual(result["pending_question"]["id"], "custom_rpc_schema_confirm")
@@ -2263,6 +2280,55 @@ network:
         self.assertEqual(result["confirmed_config"].get("CLOUD_ZONE"), "us-1-z")
         self.assertEqual(result["confirmed_config"].get("MACHINE_TYPE"), "n2")
         self.assertEqual(result["pending_question"]["id"], "LEDGER_DEVICE")
+
+    def test_structured_config_field_families_share_review_ownership(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.state import new_state
+
+        cases = (
+            ("CLOUD_REGION", "asia-east1", "CLOUD_REGION=asia-east1"),
+            ("DATA_VOL_MAX_IOPS", "20000", "DATA_VOL_MAX_IOPS=20000"),
+            ("BLOCKCHAIN_PROCESS_NAMES", "geth", "BLOCKCHAIN_PROCESS_NAMES=geth"),
+            ("LOCAL_RPC_URL", "http://node:8545", "LOCAL_RPC_URL=http://node:8545"),
+            ("RPC_API_KEY", "unit-secret-value", "RPC_API_KEY=unit-secret-value"),
+            ("SYNC_OBSERVE_DURATION_SECONDS", "600", "sync_observe_duration_seconds: 600"),
+        )
+        for field, value, user_text in cases:
+            with self.subTest(field=field):
+                state = new_state(f"structured-{field}", language="en")
+                state["target_mode"] = "sync-observe" if field.startswith("SYNC_OBSERVE") else "real-node"
+                state["workflow_mode"] = "sync_observe" if field.startswith("SYNC_OBSERVE") else "rpc_benchmark"
+                state["active_group"] = "provider_deployment"
+                state["pending_question"] = {
+                    "group": "provider_deployment",
+                    "id": "CLOUD_ZONE",
+                    "field": "CLOUD_ZONE",
+                    "kind": "manual_value",
+                    "manual_input_allowed": True,
+                    "prompt": "Confirm CLOUD_ZONE.",
+                }
+                state["last_user_input"] = user_text
+                proposal = {
+                    "type": "propose_config_values",
+                    "source_format": "yaml" if ":" in user_text and "=" not in user_text else "env",
+                    "config_values": {field: value},
+                    "source_evidence": user_text,
+                    "confidence": "high",
+                }
+                with patch(
+                    "agent.harness.coordinator.resolve_action_queue",
+                    return_value={"actions": [proposal]},
+                ):
+                    result = process_turn(state)
+
+                self.assertEqual(result["pending_question"]["id"], "inferred_config_review")
+                self.assertEqual(result["input_shape"], "structured")
+                self.assertEqual(result["inferred_config"]["pending_review"]["config_values"][field], value)
+                self.assertNotIn(field, result["confirmed_config"])
+                if field == "RPC_API_KEY":
+                    response = "\n".join(result.get("visible_response") or [])
+                    self.assertNotIn(value, response)
+                    self.assertIn("***REDACTED***", response)
 
     def test_assignments_embedded_in_natural_language_do_not_bypass_other_actions(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
@@ -2686,11 +2752,23 @@ network:
             state["last_user_input"] = answer
             return state
 
+        def _answer_weights(answer: str) -> dict:
+            with patch(
+                "agent.harness.coordinator.resolve_action_queue",
+                return_value={"actions": [{
+                    "type": "answer_pending",
+                    "answer": answer,
+                    "source_evidence": answer,
+                    "confidence": "high",
+                }]},
+            ):
+                return process_turn(_weights_state(answer))
+
         # Garbage method -> rejected (kept at needs_weights).
-        rejected = process_turn(_weights_state("eth_getBlockByNumber=50,eth_fooBar=50"))
+        rejected = _answer_weights("eth_getBlockByNumber=50,eth_fooBar=50")
         self.assertEqual(rejected["custom_rpc"]["status"], "needs_weights")
         # mixed_replace accepts only methods validated for this runtime workload.
-        accepted = process_turn(_weights_state("eth_getBlockByNumber=50,eth_getBalance=50"))
+        accepted = _answer_weights("eth_getBlockByNumber=50,eth_getBalance=50")
         self.assertEqual(accepted["custom_rpc"]["status"], "validated")
 
         # Empty allowed-set (no validated custom methods AND no template — e.g. a
@@ -2702,7 +2780,17 @@ network:
             state["custom_rpc"] = {"status": "needs_weights", "scope": "mixed_replace", "validated_methods": []}
             return state
 
-        empty = process_turn(_empty_allowed_state("eth_fooBar=100"))
+        answer = "eth_fooBar=100"
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            return_value={"actions": [{
+                "type": "answer_pending",
+                "answer": answer,
+                "source_evidence": answer,
+                "confidence": "high",
+            }]},
+        ):
+            empty = process_turn(_empty_allowed_state(answer))
         self.assertEqual(empty["custom_rpc"]["status"], "needs_weights")
 
     def test_weight_parser_accepts_embedded_structured_mapping_and_rejects_conflicts(self) -> None:
@@ -6688,7 +6776,17 @@ network:
             self.assertEqual(state["custom_rpc"]["status"], "needs_schema_evidence")
 
             state["last_user_input"] = "[]"
-            state = process_turn(state)
+            with patch(
+                "agent.harness.coordinator.resolve_action_queue",
+                return_value={"actions": [{
+                    "type": "rpc_catalog_command",
+                    "catalog_command": "append_evidence",
+                    "rpc_schema_evidence": state["last_user_input"],
+                    "source_evidence": state["last_user_input"],
+                    "confidence": "high",
+                }]},
+            ):
+                state = process_turn(state)
             self.assertEqual(state["custom_rpc"]["status"], "schema_needs_confirmation")
             self.assertEqual(state["pending_question"]["id"], "custom_rpc_schema_confirm")
 
@@ -6705,12 +6803,32 @@ network:
         self.assertEqual(state["custom_rpc"]["status"], "needs_weights")
 
         state["last_user_input"] = "eth_blockNumber=70,eth_getBalance=20"
-        state = process_turn(state)
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            return_value={"actions": [{
+                "type": "answer_pending",
+                "answer": state["last_user_input"],
+                "source_evidence": state["last_user_input"],
+                "semantic_purpose_verified": True,
+                "confidence": "high",
+            }]},
+        ):
+            state = process_turn(state)
         self.assertEqual(state["custom_rpc"]["status"], "needs_weights")
         self.assertEqual(state["pending_question"]["id"], "custom_rpc_weights")
 
         state["last_user_input"] = "eth_blockNumber=70,eth_getBalance=30"
-        state = process_turn(state)
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            return_value={"actions": [{
+                "type": "answer_pending",
+                "answer": state["last_user_input"],
+                "source_evidence": state["last_user_input"],
+                "semantic_purpose_verified": True,
+                "confidence": "high",
+            }]},
+        ):
+            state = process_turn(state)
         self.assertEqual(state["custom_rpc"]["status"], "validated")
         self.assertTrue(state["workload"]["confirmed"])
         self.assertEqual(state["workload"]["mixed_weights"], {"eth_blockNumber": 70, "eth_getBalance": 30})
@@ -9167,19 +9285,43 @@ response:
             "endpoint": "https://example.invalid/rpc",
             "endpoint_ready": True,
         }
-        state["action_queue"] = [{"type": "set_qps_mode", "qps_mode": "quick", "confidence": "high", "_origin_text": "quick"}]
+        state["action_queue"] = [{
+            "type": "set_qps_mode",
+            "qps_mode": "quick",
+            "mutation_explicit": True,
+            "source_evidence": "quick",
+            "confidence": "high",
+            "_origin_text": "quick",
+        }]
         state["pending_question"] = {
             "id": "custom_rpc_schema_evidence",
             "group": "endpoint_process",
             "kind": "evidence",
             "field": "custom_rpc_schema_evidence",
             "manual_input_allowed": True,
+            "accepted_action_types": ["rpc_catalog_command"],
+            "manual_action": {
+                "type": "rpc_catalog_command",
+                "catalog_command": "append_evidence",
+                "value_argument": "rpc_schema_evidence",
+                "use_complete_turn": True,
+            },
+            "queue_barrier": True,
             "resume_action_queue": True,
         }
         state["last_user_input"] = "[]"
         probe = {"ready": True, "status": "ok", "evidence_file": ".agent/evidence/probe.json"}
 
-        with patch("agent.harness.domains.rpc_endpoint.extract_rpc_schema_from_evidence", return_value={"status": "draft", "method": "eth_chainId", "params": [], "params_json": [], "response_summary": "hex chain id", "confidence": "high"}), patch("agent.harness.domains.rpc_endpoint.validate_rpc_endpoint", return_value=probe):
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            return_value={"actions": [{
+                "type": "rpc_catalog_command",
+                "catalog_command": "append_evidence",
+                "rpc_schema_evidence": state["last_user_input"],
+                "source_evidence": state["last_user_input"],
+                "confidence": "high",
+            }]},
+        ), patch("agent.harness.domains.rpc_endpoint.extract_rpc_schema_from_evidence", return_value={"status": "draft", "method": "eth_chainId", "params": [], "params_json": [], "response_summary": "hex chain id", "confidence": "high"}), patch("agent.harness.domains.rpc_endpoint.validate_rpc_endpoint", return_value=probe):
             result = process_turn(state)
             self.assertEqual(result["pending_question"]["id"], "custom_rpc_schema_confirm")
             self.assertTrue(result["pending_question"].get("resume_action_queue"))
@@ -12499,6 +12641,86 @@ response:
                     "source_evidence": "the saved follow-up",
                 })
                 self.assertEqual(validated["source_evidence"], "the saved follow-up")
+
+    def test_saved_goal_support_clause_shares_one_registry_action(self) -> None:
+        import json
+        from types import SimpleNamespace
+
+        from agent.harness.intent import _recover_registry_bounded_semantic_actions
+        from agent.harness.plan_coverage import PlanCoverageResult, TurnClause, validate_plan_coverage
+        from agent.harness.state import new_state
+
+        support = "Leave the current settings untouched"
+        operation = "remove the oldest saved follow-up request"
+        for ordered_sources in ((support, operation), (operation, support)):
+            with self.subTest(ordered_sources=ordered_sources):
+                clauses = tuple(
+                    TurnClause(f"clause-{index}", source)
+                    for index, source in enumerate(ordered_sources, start=1)
+                )
+                units = [
+                    {
+                        "unit_id": f"unit-{index}",
+                        "clause_id": clause.clause_id,
+                        "source_text": clause.text,
+                        "disposition": "unresolved",
+                        "action_indexes": [],
+                        "reason": "planner left the semantic unit unresolved",
+                    }
+                    for index, clause in enumerate(clauses, start=1)
+                ]
+                plan = json.dumps({"actions": [], "semantic_units": units})
+                decisions = []
+                for unit in units:
+                    is_support = unit["source_text"] == support
+                    decisions.append({
+                        "unit_id": unit["unit_id"],
+                        "disposition": "registered_action_support" if is_support else "registered_action",
+                        "group": "",
+                        "existing_action_index": None,
+                        "target_mode": "",
+                        "consultation_topic": "",
+                        "registered_action_type": "discard_next_workflow_goal",
+                        "scope_constraint": "",
+                        "evidence_quote": unit["source_text"],
+                        "reason": "scope support" if is_support else "explicit saved-goal operation",
+                    })
+                provider = SimpleNamespace(complete=lambda _request: SimpleNamespace(
+                    text=json.dumps({"decisions": decisions})
+                ))
+                state = new_state("saved-goal-support", language="en")
+                state["workflow_goals"] = [{
+                    "target_mode": "sync-observe",
+                    "goal": "observe synchronization",
+                    "source_evidence": "observe synchronization later",
+                }]
+                validation = PlanCoverageResult(
+                    valid=False,
+                    errors=("unresolved semantic units",),
+                    unresolved_clauses=tuple(ordered_sources),
+                    incomplete_unit_ids=tuple(unit["unit_id"] for unit in units),
+                )
+
+                recovered, changed = _recover_registry_bounded_semantic_actions(
+                    provider,
+                    plan,
+                    clauses,
+                    state,
+                    "; ".join(ordered_sources),
+                    validation,
+                )
+
+                self.assertTrue(changed)
+                payload = json.loads(recovered)
+                self.assertEqual(
+                    [action["type"] for action in payload["actions"]],
+                    ["discard_next_workflow_goal"],
+                )
+                self.assertEqual(
+                    [unit["action_indexes"] for unit in payload["semantic_units"]],
+                    [[0], [0]],
+                )
+                self.assertTrue(validate_plan_coverage(payload, clauses).valid)
 
     def test_saved_workflow_goal_is_resumable_and_visible_in_status(self) -> None:
         from agent.harness.domains.orientation import has_resumable_configuration
