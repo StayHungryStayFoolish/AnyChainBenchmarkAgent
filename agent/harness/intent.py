@@ -1085,14 +1085,17 @@ def _recover_declared_pending_option_semantics(
         "A constraint that requests any additional mutation, navigation, or conflicting value remains independent. "
         "Do not select from a question, explanation request, contradiction, ambiguity, or a request for "
         "another option. evidence_quote must be a non-empty exact substring of complete_turn_text that proves the "
-        "selection or manual value. An admitted_anchor is a read-only option binding already admitted by its "
+        "selection or manual value. For a new source-owned selection, evidence_quote identifies exactly one "
+        "owner unit. Do not repeat that owner in supporting_unit_ids or independent_unit_ids; those lists must "
+        "partition every remaining candidate unit. supporting_unit_ids contains only non-owning context for the "
+        "same selection. independent_unit_ids contains every separate present demand. An admitted_anchor is a "
+        "read-only option binding already admitted by its "
         "dedicated owner; a new selection may only agree with it. An admitted_manual_anchor is an already admitted "
         "source-grounded manual "
         "value; manual_value may only agree with its answer, and scope-only candidate units may support it without "
-        "creating another mutation. supporting_unit_ids must contain every candidate unit used "
-        "solely for this finite decision. independent_unit_ids must contain every remaining candidate unit with a "
-        "separate present request, group jump, question, mutation, or evidence payload for unrestricted planning. "
-        "The two lists must be disjoint and partition all candidate units. Use no_selection when the turn does not "
+        "creating another mutation. When evidence_quote belongs to an admitted anchor outside candidate units, "
+        "supporting_unit_ids and independent_unit_ids must instead partition all candidate units. The two lists "
+        "must always be disjoint. Use no_selection when the turn does not "
         "answer the pending question, and ambiguous when it supports competing answers. Never invent an option or value."
     )
     adjudication_payload = json.dumps({
@@ -1319,22 +1322,52 @@ def _recover_declared_pending_option_semantics(
         ):
             return plan_text, False
     all_candidate_ids = set(candidate_sources)
-    partitions: list[tuple[set[str], set[str]]] = []
-    for verdict in verdicts:
+    quotes = [str(item.get("evidence_quote") or "").strip() for item in verdicts]
+    if any(not item or item not in complete_turn_text for item in quotes):
+        return plan_text, False
+    partitions: list[tuple[str, set[str], set[str]]] = []
+    for verdict, verdict_quote in zip(verdicts, quotes):
         supporting_ids = verdict.get("supporting_unit_ids")
         independent_ids = verdict.get("independent_unit_ids")
         if not isinstance(supporting_ids, list) or not isinstance(independent_ids, list):
             return plan_text, False
         supporting_set = {str(item) for item in supporting_ids}
         independent_set = {str(item) for item in independent_ids}
-        if (
-            supporting_set & independent_set
-            or supporting_set | independent_set != all_candidate_ids
-        ):
+        if supporting_set & independent_set:
             return plan_text, False
-        partitions.append((supporting_set, independent_set))
-    supporting = partitions[0][0] & partitions[1][0]
-    independent = all_candidate_ids - supporting
+        candidate_owners = {
+            unit_id
+            for unit_id, source in candidate_sources.items()
+            if verdict_quote in source
+        }
+        quote_is_anchor = any(
+            verdict_quote in str(anchor.get("source_text") or "")
+            for anchor in (*anchors, *manual_anchors)
+        )
+        if quote_is_anchor:
+            if candidate_owners:
+                return plan_text, False
+            owner_unit_id = ""
+            partition_domain = all_candidate_ids
+        else:
+            if len(candidate_owners) != 1:
+                return plan_text, False
+            owner_unit_id = next(iter(candidate_owners))
+            if owner_unit_id in independent_set:
+                return plan_text, False
+            supporting_set.discard(owner_unit_id)
+            partition_domain = all_candidate_ids - {owner_unit_id}
+        if supporting_set | independent_set != partition_domain:
+            return plan_text, False
+        partitions.append((owner_unit_id, supporting_set, independent_set))
+    if len({owner for owner, _, _ in partitions}) != 1:
+        return plan_text, False
+    owner_unit_id = partitions[0][0]
+    partition_domain = all_candidate_ids - ({owner_unit_id} if owner_unit_id else set())
+    supporting = set.intersection(*(support for _, support, _ in partitions))
+    independent = partition_domain - supporting
+    if owner_unit_id:
+        supporting.add(owner_unit_id)
     if (
         not supporting
         or supporting & independent
@@ -1342,29 +1375,7 @@ def _recover_declared_pending_option_semantics(
         or not supporting <= all_candidate_ids
     ):
         return plan_text, False
-    quotes = [str(item.get("evidence_quote") or "").strip() for item in verdicts]
     quote = quotes[0]
-    if any(not item or item not in complete_turn_text for item in quotes):
-        return plan_text, False
-    quote_candidate_owner = next(
-        (
-            unit_id
-            for unit_id in supporting
-            if quote and quote in candidate_sources[unit_id]
-        ),
-        "",
-    )
-    quote_is_anchor = any(
-        quote and quote in str(anchor.get("source_text") or "")
-        for anchor in (*anchors, *manual_anchors)
-    )
-    if (
-        not quote
-        or quote not in complete_turn_text
-        or (not quote_candidate_owner and not quote_is_anchor)
-    ):
-        return plan_text, False
-    owner_unit_id = quote_candidate_owner
     accepted: dict[str, tuple[dict[str, Any], str]] = {}
     accepted_manual: dict[str, tuple[str, str]] = {}
     accepted_context: dict[str, str] = {}

@@ -11990,6 +11990,172 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         }])
         self.assertEqual(recovered["semantic_units"][0]["action_indexes"], [0])
 
+    def test_declared_pending_semantic_separates_value_owner_from_multiline_context(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.state import new_state
+
+        source = (
+            "Use the dedicated accounts volume.\n"
+            "The device is /dev/nvme1n1.\n"
+            "Continue with that value."
+        )
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "clarify_unresolved",
+                "clauses": [clause.text for clause in clauses],
+                "reason": "planner did not bind the value",
+            }],
+            "semantic_units": [
+                _unit(clause, index, [0])
+                for index, clause in enumerate(clauses, start=1)
+            ],
+        }
+        state = new_state("recover-multiline-manual-owner", language="en")
+        state["pending_question"] = {
+            "id": "ACCOUNTS_DEVICE",
+            "group": "accounts_disk",
+            "field": "ACCOUNTS_DEVICE",
+            "kind": "device",
+            "prompt": "Enter ACCOUNTS_DEVICE.",
+            "manual_input_allowed": True,
+            "manual_action": {"type": "answer_pending", "value_argument": "answer"},
+            "validation": {"value_type": "scalar_token"},
+            "options": [],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "decision": "manual_value",
+            "answer": "/dev/nvme1n1",
+            "evidence_quote": "The device is /dev/nvme1n1.",
+            "supporting_unit_ids": ["unit-1", "unit-3"],
+            "independent_unit_ids": [],
+            "reason": "units one and three only support the value in unit two",
+        }))
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            PlanCoverageResult(True, (), ()),
+            clauses,
+            source,
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(recovered["actions"], [{
+            "type": "answer_pending",
+            "answer": "/dev/nvme1n1",
+            "source_evidence": "The device is /dev/nvme1n1.",
+        }])
+        self.assertEqual(
+            [unit["disposition"] for unit in recovered["semantic_units"]],
+            ["context", "action", "context"],
+        )
+
+    def test_declared_pending_semantic_rejects_value_owner_as_independent_demand(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.state import new_state
+
+        source = "Use the dedicated accounts volume.\nThe device is /dev/nvme1n1."
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [],
+            "semantic_units": [
+                _unit(clause, index, [])
+                for index, clause in enumerate(clauses, start=1)
+            ],
+        }
+        state = new_state("reject-independent-manual-owner", language="en")
+        state["pending_question"] = {
+            "id": "ACCOUNTS_DEVICE",
+            "group": "accounts_disk",
+            "field": "ACCOUNTS_DEVICE",
+            "kind": "device",
+            "prompt": "Enter ACCOUNTS_DEVICE.",
+            "manual_input_allowed": True,
+            "manual_action": {"type": "answer_pending", "value_argument": "answer"},
+            "validation": {"value_type": "scalar_token"},
+            "options": [],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "decision": "manual_value",
+            "answer": "/dev/nvme1n1",
+            "evidence_quote": "The device is /dev/nvme1n1.",
+            "supporting_unit_ids": ["unit-1"],
+            "independent_unit_ids": ["unit-2"],
+            "reason": "invalidly classifies the owner as independent",
+        }))
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            clauses=clauses,
+            user_text=source,
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(json.loads(recovered_text), payload)
+
+    def test_declared_pending_semantic_rejects_duplicate_evidence_owners(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.state import new_state
+
+        source = "Primary device: /dev/nvme1n1.\nFallback device: /dev/nvme1n1."
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [],
+            "semantic_units": [
+                _unit(clause, index, [])
+                for index, clause in enumerate(clauses, start=1)
+            ],
+        }
+        state = new_state("reject-duplicate-manual-owners", language="en")
+        state["pending_question"] = {
+            "id": "ACCOUNTS_DEVICE",
+            "group": "accounts_disk",
+            "field": "ACCOUNTS_DEVICE",
+            "kind": "device",
+            "prompt": "Enter ACCOUNTS_DEVICE.",
+            "manual_input_allowed": True,
+            "manual_action": {"type": "answer_pending", "value_argument": "answer"},
+            "validation": {"value_type": "scalar_token"},
+            "options": [],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "decision": "manual_value",
+            "answer": "/dev/nvme1n1",
+            "evidence_quote": "/dev/nvme1n1",
+            "supporting_unit_ids": ["unit-1", "unit-2"],
+            "independent_unit_ids": [],
+            "reason": "the quote appears in two possible owner units",
+        }))
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            clauses=clauses,
+            user_text=source,
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(json.loads(recovered_text), payload)
+
     def test_declared_pending_semantic_attaches_scope_to_admitted_manual_anchor(self) -> None:
         from types import SimpleNamespace
         from unittest.mock import Mock
