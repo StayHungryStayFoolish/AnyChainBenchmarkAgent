@@ -25,6 +25,7 @@ from .context import action_schema, build_action_resolver_prompt, group_schema, 
 from .domains.environment import (
     CONFIG_PROPOSAL_FIELDS,
     extract_structured_input_candidates,
+    normalize_proposed_config_value,
 )
 from .input_values import (
     extract_rpc_method_identities,
@@ -2158,8 +2159,15 @@ def _normalize_prose_pending_field_proposal(
     normalized_values = {
         str(key).strip().upper(): value for key, value in config_values.items()
     }
+    residual_values = {
+        key: value
+        for key, value in normalized_values.items()
+        if key != pending_field
+        and not _proposal_value_matches_confirmed_config(state, key, value)
+    }
     if (
-        set(normalized_values) != {pending_field}
+        pending_field not in normalized_values
+        or residual_values
         or proposal.get("unmapped_values")
         or proposal.get("conflicts")
     ):
@@ -2182,6 +2190,29 @@ def _normalize_prose_pending_field_proposal(
     }
     payload["actions"] = actions
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _proposal_value_matches_confirmed_config(
+    state: AgentGraphState,
+    key: str,
+    proposed_value: Any,
+) -> bool:
+    """Return whether a proposal only reaffirms canonical confirmed state."""
+
+    normalized_key, normalized_proposed = normalize_proposed_config_value(key, proposed_value)
+    confirmed = dict(state.get("confirmed_config") or {})
+    state_key = (
+        "has_accounts_device"
+        if normalized_key == "HAS_ACCOUNTS_DEVICE"
+        else normalized_key
+    )
+    if state_key not in confirmed:
+        return False
+    _current_key, normalized_current = normalize_proposed_config_value(
+        normalized_key,
+        confirmed[state_key],
+    )
+    return normalized_proposed == normalized_current
 
 
 def _remove_empty_config_proposals(text: str) -> str:

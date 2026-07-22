@@ -9916,6 +9916,183 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
 
         self.assertEqual(json.loads(normalized), payload)
 
+    def test_pending_prose_answer_owns_confirmed_noop_context(self) -> None:
+        from agent.harness.intent import _normalize_prose_pending_field_proposal
+        from agent.harness.state import new_state
+
+        source = (
+            "Set the maximum network bandwidth to 25 Gbps.\n"
+            "Keep the detected interface."
+        )
+        clauses = segment_user_turn(source)
+        state = new_state("pending-prose-confirmed-noop")
+        state["confirmed_config"] = {"NETWORK_INTERFACE": "eth0"}
+        state["pending_question"] = {
+            "id": "NETWORK_MAX_BANDWIDTH_GBPS",
+            "field": "NETWORK_MAX_BANDWIDTH_GBPS",
+            "kind": "manual_value",
+            "manual_input_allowed": True,
+            "validation": {
+                "normalization": "semantic_scalar",
+                "value_type": "positive_number",
+            },
+        }
+        payload = {
+            "actions": [{
+                "type": "propose_config_values",
+                "config_values": {
+                    "NETWORK_INTERFACE": "eth0",
+                    "NETWORK_MAX_BANDWIDTH_GBPS": "25",
+                },
+                "unmapped_values": {},
+                "conflicts": [],
+                "source_format": "mixed",
+                "source_evidence": source,
+            }],
+            "semantic_units": [
+                _unit(clause, index, [0])
+                for index, clause in enumerate(clauses, start=1)
+            ],
+        }
+
+        normalized = json.loads(_normalize_prose_pending_field_proposal(
+            json.dumps(payload),
+            state,
+            clauses,
+            source,
+        ))
+
+        self.assertEqual(normalized["actions"], [{
+            "type": "answer_pending",
+            "answer": "25",
+            "source_evidence": "25",
+        }])
+        self.assertEqual(
+            [unit["action_indexes"] for unit in normalized["semantic_units"]],
+            [[0], [0]],
+        )
+
+    def test_pending_prose_answer_cannot_hide_changed_or_unconfirmed_field(self) -> None:
+        from agent.harness.intent import _normalize_prose_pending_field_proposal
+        from agent.harness.state import new_state
+
+        source = "Set bandwidth to 25 Gbps.\nUse interface eth1."
+        clauses = segment_user_turn(source)
+        base = new_state("pending-prose-residual-mutation")
+        base["pending_question"] = {
+            "id": "NETWORK_MAX_BANDWIDTH_GBPS",
+            "field": "NETWORK_MAX_BANDWIDTH_GBPS",
+            "kind": "manual_value",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "positive_number"},
+        }
+        payload = {
+            "actions": [{
+                "type": "propose_config_values",
+                "config_values": {
+                    "NETWORK_INTERFACE": "eth1",
+                    "NETWORK_MAX_BANDWIDTH_GBPS": "25",
+                },
+                "unmapped_values": {},
+                "conflicts": [],
+            }],
+            "semantic_units": [_unit(clause, index, [0]) for index, clause in enumerate(clauses, 1)],
+        }
+
+        for confirmed in ({"NETWORK_INTERFACE": "eth0"}, {}):
+            with self.subTest(confirmed=confirmed):
+                state = dict(base)
+                state["confirmed_config"] = confirmed
+                normalized = _normalize_prose_pending_field_proposal(
+                    json.dumps(payload),
+                    state,
+                    clauses,
+                    source,
+                )
+                self.assertEqual(json.loads(normalized), payload)
+
+    def test_pending_prose_answer_owns_unrelated_confirmed_text_context(self) -> None:
+        from agent.harness.intent import _normalize_prose_pending_field_proposal
+        from agent.harness.state import new_state
+
+        source = "Use run-secret-4821 for the API key and keep machine type n2."
+        clauses = segment_user_turn(source)
+        state = new_state("pending-prose-confirmed-text-noop")
+        state["confirmed_config"] = {"MACHINE_TYPE": "n2"}
+        state["pending_question"] = {
+            "id": "RPC_API_KEY",
+            "field": "RPC_API_KEY",
+            "kind": "manual_value",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "scalar_token", "max_length": 180},
+        }
+        payload = {
+            "actions": [{
+                "type": "propose_config_values",
+                "config_values": {
+                    "RPC_API_KEY": "run-secret-4821",
+                    "MACHINE_TYPE": "n2",
+                },
+                "unmapped_values": {},
+                "conflicts": [],
+            }],
+            "semantic_units": [_unit(clauses[0], 1, [0])],
+        }
+
+        normalized = json.loads(_normalize_prose_pending_field_proposal(
+            json.dumps(payload),
+            state,
+            clauses,
+            source,
+        ))
+
+        self.assertEqual(normalized["actions"], [{
+            "type": "answer_pending",
+            "answer": "run-secret-4821",
+            "source_evidence": "run-secret-4821",
+        }])
+
+    def test_pending_prose_answer_uses_canonical_confirmed_numeric_context(self) -> None:
+        from agent.harness.intent import _normalize_prose_pending_field_proposal
+        from agent.harness.state import new_state
+
+        source = "Set data disk IOPS to 3000 and keep its detected 100 GiB size."
+        clauses = segment_user_turn(source)
+        state = new_state("pending-prose-confirmed-numeric-noop")
+        state["confirmed_config"] = {"DATA_VOL_SIZE": "100"}
+        state["pending_question"] = {
+            "id": "DATA_VOL_MAX_IOPS",
+            "field": "DATA_VOL_MAX_IOPS",
+            "kind": "manual_value",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "positive_number"},
+        }
+        payload = {
+            "actions": [{
+                "type": "propose_config_values",
+                "config_values": {
+                    "DATA_VOL_MAX_IOPS": "3000",
+                    "DATA_VOL_SIZE": "100 GiB",
+                },
+                "unmapped_values": {},
+                "conflicts": [],
+            }],
+            "semantic_units": [_unit(clauses[0], 1, [0])],
+        }
+
+        normalized = json.loads(_normalize_prose_pending_field_proposal(
+            json.dumps(payload),
+            state,
+            clauses,
+            source,
+        ))
+
+        self.assertEqual(normalized["actions"], [{
+            "type": "answer_pending",
+            "answer": "3000",
+            "source_evidence": "3000",
+        }])
+
     def test_empty_config_proposal_cannot_steal_direct_pending_answer(self) -> None:
         from agent.harness.intent import _remove_empty_config_proposals
 
