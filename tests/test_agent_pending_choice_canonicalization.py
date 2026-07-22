@@ -103,7 +103,151 @@ def _recovery_state() -> dict[str, Any]:
     return state
 
 
+def _performance_manual_state(*, advanced: bool = False) -> dict[str, Any]:
+    from agent.harness.domains.performance import question_for_performance
+
+    if advanced:
+        state = _state(
+            active_group="advanced_tuning",
+            target_mode="fake-node",
+            workflow_mode="rpc_benchmark",
+            advanced_tuning={
+                "default_decision_made": True,
+                "adjust_field": "MONITOR_INTERVAL",
+            },
+        )
+        group = "advanced_tuning"
+    else:
+        state = _state(
+            active_group="qps_profile",
+            target_mode="fake-node",
+            workflow_mode="rpc_benchmark",
+            qps_profile={
+                "mode": "quick",
+                "default_decision_made": True,
+                "adjust_field": "INITIAL_QPS",
+            },
+        )
+        group = "qps_profile"
+    state["pending_question"] = question_for_performance(state, group) or {}
+    return state
+
+
 class CanonicalPendingChoiceTests(unittest.TestCase):
+    def test_same_group_domain_mutation_is_readjudicated_as_manual_pending_answer(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        state = _performance_manual_state()
+        text = "Start this profile at 75 QPS."
+        first = _document({
+            "type": "set_qps_override",
+            "qps_overrides": {"INITIAL_QPS": 75},
+        }, text)
+        resolved = _document({
+            "type": "answer_pending",
+            "answer": "75",
+            "source_evidence": text,
+        }, text)
+        provider = _provider([first, resolved])
+
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
+        self.assertEqual(provider.complete.call_count, 4)
+        self.assertEqual([item["type"] for item in result["actions"]], ["answer_pending"])
+        self.assertEqual(result["actions"][0]["answer"], "75")
+        self.assertEqual(result.get("pending_choice_contracts"), [])
+
+    def test_unresolved_neighboring_manual_number_uses_the_same_focused_contract(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        state = _performance_manual_state(advanced=True)
+        text = "Use a twelve second interval here."
+        first = _document(
+            {"type": "clarify_unresolved", "clauses": [text]},
+            text,
+        )
+        resolved = _document({
+            "type": "answer_pending",
+            "answer": "12",
+            "source_evidence": text,
+        }, text)
+        provider = _provider([first, resolved])
+
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
+        self.assertEqual(provider.complete.call_count, 4)
+        self.assertEqual(result["actions"][0]["type"], "answer_pending")
+        self.assertEqual(result["actions"][0]["answer"], "12")
+
+    def test_manual_pending_adjudication_preserves_independent_consultation(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        state = _performance_manual_state()
+        text = "Start at 75 QPS.\nAlso explain what the quick profile means."
+        first = {
+            "actions": [
+                {"type": "set_qps_override", "qps_overrides": {"INITIAL_QPS": 75}},
+                {
+                    "type": "answer_opening_question",
+                    "topic": "config_explanation",
+                    "subject": "quick QPS profile",
+                    "source_evidence": "Also explain what the quick profile means.",
+                },
+            ],
+            "semantic_units": [
+                {
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "source_text": "Start at 75 QPS.",
+                    "disposition": "action",
+                    "action_indexes": [0],
+                    "reason": "QPS value",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "clause_id": "clause-2",
+                    "source_text": "Also explain what the quick profile means.",
+                    "disposition": "action",
+                    "action_indexes": [1],
+                    "reason": "independent consultation",
+                },
+            ],
+        }
+        resolved = deepcopy(first)
+        resolved["actions"][0] = {
+            "type": "answer_pending",
+            "answer": "75",
+            "source_evidence": "Start at 75 QPS.",
+        }
+        provider = _provider([first, resolved])
+
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
+        self.assertEqual(
+            [item["type"] for item in result["actions"]],
+            ["answer_pending", "answer_opening_question"],
+        )
+
+    def test_unrelated_consultation_does_not_readjudicate_manual_pending(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        state = _performance_manual_state()
+        text = "What can this Agent do?"
+        provider = _provider([_document({
+            "type": "answer_opening_question",
+            "topic": "capabilities",
+            "source_evidence": text,
+        }, text)])
+
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
+        self.assertEqual(provider.complete.call_count, 2)
+        self.assertEqual(result["actions"][0]["type"], "answer_opening_question")
+
     def test_admitted_clarify_plan_enters_one_focused_adjudication(self) -> None:
         from agent.harness.intent import resolve_action_queue
 

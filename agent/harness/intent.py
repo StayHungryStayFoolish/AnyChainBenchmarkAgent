@@ -136,21 +136,21 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
             state,
             clauses,
         )
-        pending_choice_unresolved = bool(
+        pending_contract_unresolved = bool(
             admission is not None
             and admission.valid
             and plan is not None
-            and _admitted_plan_requires_pending_choice_adjudication(plan, admission, state)
+            and _admitted_plan_requires_pending_contract_adjudication(plan, admission, state)
         )
-        if admission is not None and admission.valid and plan is not None and not pending_choice_unresolved:
+        if admission is not None and admission.valid and plan is not None and not pending_contract_unresolved:
             try:
                 return _admitted_action_queue(plan, admission, state)
             except ValueError as exc:
                 admission_errors = (*admission_errors, f"receipt attachment failed: {exc}")
-        if pending_choice_unresolved:
+        if pending_contract_unresolved:
             admission_errors = (
                 *admission_errors,
-                "active pending choice remains unresolved after whole-plan admission",
+                "active pending contract remains unresolved after whole-plan admission",
             )
 
         repair_payload = {
@@ -163,12 +163,12 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
             "action_schema": action_schema(),
             "original_request": request_payload,
         }
-        active_choice = bool((state.get("pending_question") or {}).get("options"))
+        active_pending_contract = bool(state.get("pending_question"))
         repaired_response, repair_errors = _compile_semantic_candidate(
             provider,
             system_prompt=(
-                _pending_choice_adjudication_prompt()
-                if active_choice
+                _pending_contract_adjudication_prompt()
+                if active_pending_contract
                 else _action_plan_repair_prompt()
             ),
             request_payload=repair_payload,
@@ -512,36 +512,52 @@ def _review_bounded_semantic_candidate(
     return plan, admission, admission.errors
 
 
-def _admitted_plan_requires_pending_choice_adjudication(
+def _admitted_plan_requires_pending_contract_adjudication(
     plan: ImmutableSemanticPlan,
     admission: WholePlanAdmission,
     state: AgentGraphState,
 ) -> bool:
-    """Detect admitted-but-unresolved work at an active choice boundary."""
+    """Detect admitted work that bypasses an active typed question owner."""
 
     pending = dict(state.get("pending_question") or {})
-    if not pending.get("options"):
+    if not pending:
         return False
     payload = plan.document()
-    if payload.get("pending_choice_contracts"):
-        return False
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
-    if any(
-        isinstance(action, Mapping) and str(action.get("type") or "") == "clarify_unresolved"
+    if payload.get("pending_choice_contracts") or any(
+        isinstance(action, Mapping) and str(action.get("type") or "") == "answer_pending"
         for action in actions
     ):
-        return True
+        return False
     units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
-    if any(
+    unresolved = any(
         isinstance(unit, Mapping) and str(unit.get("disposition") or "") == "unresolved"
         for unit in units
-    ):
-        return True
-    return any(
+    ) or any(
         str(row.get("verdict") or "") in {"unresolved", "omitted"}
         for row in admission.unit_verdicts
         if isinstance(row, Mapping)
     )
+    if pending.get("options"):
+        return unresolved or any(
+            isinstance(action, Mapping) and str(action.get("type") or "") == "clarify_unresolved"
+            for action in actions
+        )
+    if pending.get("manual_input_allowed") is not True:
+        return False
+    pending_group = str(pending.get("group") or "").strip()
+    same_owner_group = any(
+        isinstance(action, Mapping)
+        and resolve_action_target_group(dict(action)) == pending_group
+        for action in actions
+    )
+    # A same-group mutation may be a direct restatement of the value requested
+    # by the active manual question. The focused reviewer, not a field-specific
+    # heuristic, decides whether it is an answer or an independent mutation.
+    return bool(same_owner_group or unresolved or any(
+        isinstance(action, Mapping) and str(action.get("type") or "") == "clarify_unresolved"
+        for action in actions
+    ))
 
 
 def _freeze_bounded_semantic_plan(
@@ -2004,19 +2020,22 @@ def _action_plan_repair_prompt() -> str:
     )
 
 
-def _pending_choice_adjudication_prompt() -> str:
-    """Return the single bounded adjudication contract for an active choice."""
+def _pending_contract_adjudication_prompt() -> str:
+    """Return the single bounded adjudication contract for an active question."""
 
     return (
         _action_plan_repair_prompt()
-        + " The original_request contains one active pending question with its exact typed options. "
-        "Re-adjudicate the complete user turn once. If any semantic unit selects one declared option, "
-        "represent that selection only as answer_pending with selected_value exactly equal to that "
-        "option's declared value and source_evidence copied from the selecting semantic unit. Do not "
-        "emit the option's owner action. Preserve every unrelated, interrupting, or compound demand as "
-        "its own registered action and preserve all semantic-unit mappings. If the active choice is not "
-        "resolved by the source, leave it unresolved rather than guessing. Return one complete plan; this "
-        "is the only focused adjudication and the entire result remains subject to whole-plan admission."
+        + " The original_request contains one active typed pending question. Re-adjudicate the complete "
+        "user turn once. If any semantic unit selects one declared option, represent that selection only "
+        "as answer_pending with selected_value exactly equal to that option's declared value and "
+        "source_evidence copied from the selecting semantic unit. If the question accepts manual input "
+        "and a semantic unit supplies a value satisfying its typed validation, represent that value only "
+        "as answer_pending with answer equal to the exact extracted value and source_evidence copied from "
+        "the supplying semantic unit. Do not emit a domain owner mutation for the same answer. Preserve "
+        "every unrelated, interrupting, or compound demand as its own registered action and preserve all "
+        "semantic-unit mappings. If the active question is not resolved by the source, leave it unresolved "
+        "rather than guessing. Return one complete plan; this is the only focused adjudication and the "
+        "entire result remains subject to whole-plan admission."
     )
 
 
