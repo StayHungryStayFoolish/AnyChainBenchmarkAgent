@@ -74,12 +74,16 @@ def _whole_plan_admission_payload(request: Any) -> dict[str, Any]:
             "evidence": evidence,
             "grounded_arguments": [
                 {
-                    "argument": argument,
+                    "argument_name": argument,
                     "evidence_quote": str(units[action["unit_ids"][0]]["source_text"]),
                 }
                 for argument in action.get("required_value_grounding_arguments") or []
             ],
-            "pending_answer_argument": "",
+            "pending_answer_argument": (
+                action["pending_value_candidates"][0]["candidate_id"]
+                if len(action.get("pending_value_candidates") or []) == 1
+                else ""
+            ),
             "reason": "the immutable registered action preserves its source units",
         })
     unit_verdicts = []
@@ -216,6 +220,14 @@ def _immutable_admission_fixture() -> tuple[Any, dict[str, Any]]:
 
 
 class BoundedSemanticAdmissionTest(unittest.TestCase):
+    def test_admission_prompt_requires_unit_and_action_relation_consistency(self) -> None:
+        from agent.harness.semantic_compiler import whole_plan_admission_prompt
+
+        prompt = whole_plan_admission_prompt("policy")
+
+        self.assertIn("one consistency contract", prompt)
+        self.assertIn("Never return complete for a support-cited unit", prompt)
+
     def _validate(self, payload: dict[str, Any] | str):
         from agent.harness.intent import ALLOWED_ACTION_TYPES
         from agent.harness.semantic_compiler import validate_whole_plan_admission
@@ -496,7 +508,7 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
                     "support_relation": "",
                 }],
                 "grounded_arguments": [{
-                    "argument": "target_mode",
+                    "argument_name": "target_mode",
                     "evidence_quote": "simulated-node workflow",
                 }],
                 "pending_answer_argument": "",
@@ -647,6 +659,465 @@ def _admitted_field_intake_action(
 
 
 class HarnessArchitectureTest(unittest.TestCase):
+    def test_evidence_collection_actions_require_their_registered_lifecycle(self) -> None:
+        from agent.harness.action_registry import lifecycle_rejected_action_indexes
+        from agent.harness.state import new_state
+
+        empty = new_state("evidence-lifecycle-empty", language="en")
+        actions = [
+            {"type": "pause_evidence_collection", "source_evidence": "pause this setup"},
+            {"type": "resume_evidence_collection", "source_evidence": "resume"},
+        ]
+        self.assertEqual(lifecycle_rejected_action_indexes(empty, actions), (0, 1))
+
+        active = new_state("evidence-lifecycle-active", language="en")
+        active["evidence_collection"] = {"status": "active", "lines": ["trace"]}
+        self.assertEqual(lifecycle_rejected_action_indexes(active, actions), ())
+
+        paused = new_state("evidence-lifecycle-paused", language="en")
+        paused["evidence_collection"] = {"status": "paused", "lines": ["trace"]}
+        self.assertEqual(lifecycle_rejected_action_indexes(paused, actions), (0,))
+
+        ordered = [
+            {"type": "pause_evidence_collection", "source_evidence": "pause"},
+            {
+                "type": "append_evidence_collection",
+                "evidence": "more",
+                "source_evidence": "more",
+            },
+        ]
+        self.assertEqual(lifecycle_rejected_action_indexes(active, ordered), (1,))
+        ordered.reverse()
+        self.assertEqual(lifecycle_rejected_action_indexes(active, ordered), ())
+
+        completing_append = {
+            "type": "append_evidence_collection",
+            "evidence": 'response: {"jsonrpc":"2.0","result":"0x1"}',
+            "source_evidence": 'response: {"jsonrpc":"2.0","result":"0x1"}',
+        }
+        completing = deepcopy(active)
+        completing["evidence_collection"]["lines"] = [
+            'request: {"jsonrpc":"2.0","method":"eth_blockNumber"}',
+        ]
+        self.assertEqual(
+            lifecycle_rejected_action_indexes(
+                completing,
+                [
+                    completing_append,
+                    {"type": "pause_evidence_collection", "source_evidence": "pause"},
+                ],
+            ),
+            (1,),
+        )
+
+    def test_exact_reviewer_quote_must_bind_the_selected_rpc_value(self) -> None:
+        from agent.harness.semantic_compiler import freeze_semantic_plan, validate_whole_plan_admission
+        from agent.harness.intent import ALLOWED_ACTION_TYPES
+
+        source = "Use https://first.example/rpc for reference but test https://second.example/rpc."
+        action = {
+            "type": "rpc_catalog_command",
+            "catalog_command": "set_endpoint",
+            "rpc_endpoint": "https://second.example/rpc",
+            "source_evidence": source,
+        }
+        unit = {
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "disposition": "action",
+            "action_indexes": [0],
+        }
+        plan = freeze_semantic_plan(
+            {"actions": [action], "semantic_units": [unit]},
+            action_records=[{
+                "action_id": "action-1",
+                "action_index": 0,
+                "action": action,
+                "operation_arguments": {
+                    "catalog_command": "set_endpoint",
+                    "rpc_endpoint": "https://second.example/rpc",
+                },
+                "unit_ids": ["unit-1"],
+                "allowed_support_relations": [],
+                "required_value_grounding_arguments": ["rpc_endpoint"],
+                "exact_source_value_arguments": ["rpc_endpoint"],
+                "pending_value_candidates": [],
+            }],
+            unit_records=[{
+                "unit_id": "unit-1",
+                "unit_index": 0,
+                "unit": unit,
+                "source_text": source,
+                "disposition": "action",
+                "owner_action_ids": ["action-1"],
+            }],
+            review_context={"pending_question": {}},
+        )
+        payload = {
+            "plan_hash": plan.plan_hash,
+            "action_verdicts": [{
+                "action_id": "action-1",
+                "verdict": "admit",
+                "unit_ids": ["unit-1"],
+                "evidence": [{
+                    "unit_id": "unit-1",
+                    "quote": source,
+                    "relation": "direct",
+                    "support_relation": "",
+                }],
+                "grounded_arguments": [{
+                    "argument_name": "rpc_endpoint",
+                    "evidence_quote": "https://first.example/rpc",
+                }],
+                "pending_answer_argument": "",
+                "reason": "endpoint selection",
+            }],
+            "unit_verdicts": [{
+                "unit_id": "unit-1",
+                "verdict": "complete",
+                "owner_action_ids": ["action-1"],
+                "evidence_quote": source,
+                "omitted_action_type": "",
+                "reason": "complete",
+            }],
+            "reason": "reviewed",
+        }
+        rejected = validate_whole_plan_admission(
+            json.dumps(payload),
+            plan,
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+        self.assertFalse(rejected.valid)
+        self.assertIn("does not contain its immutable value", "; ".join(rejected.errors))
+
+        payload["action_verdicts"][0]["grounded_arguments"][0]["evidence_quote"] = (
+            "test https://second.example/rpc"
+        )
+        accepted = validate_whole_plan_admission(
+            json.dumps(payload),
+            plan,
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+        self.assertTrue(accepted.valid, accepted.errors)
+
+    def test_go_back_cancels_field_reconfiguration_continuation(self) -> None:
+        from agent.harness.coordinator import apply_coordinator_action
+        from agent.harness.contracts import ActionProposal
+
+        state = _state(
+            control={
+                "field_reconfiguration_continuation": {
+                    "group": "ledger_disk",
+                    "config_field": "DATA_VOL_SIZE",
+                    "prerequisite_question_id": "LEDGER_DEVICE",
+                }
+            },
+            group_history=["network"],
+        )
+        result = apply_coordinator_action(
+            state,
+            ActionProposal("back-1", "go_back", {}, "high"),
+        )
+        self.assertNotIn("field_reconfiguration_continuation", state.get("control") or {})
+        self.assertEqual(result.completion, "completed")
+
+    def test_legacy_custom_rpc_migration_quarantines_untrusted_source(self) -> None:
+        from agent.harness.state import migrate_state
+
+        base = {
+            "action_queue": [{
+                "type": "start_custom_rpc",
+                "rpc_endpoint": "https://second.example/rpc",
+                "rpc_method": "eth_chainId",
+                "source_evidence": "Use https://first.example/rpc with eth_accounts",
+            }],
+        }
+        rejected = migrate_state(
+            base,
+            thread_id="legacy-untrusted",
+            language="en",
+            session_purpose="user",
+        )
+        self.assertEqual(rejected["action_queue"], [])
+        self.assertEqual(rejected["audit_events"][-1]["rejected_untrusted"], 1)
+
+        trusted = deepcopy(base)
+        trusted["action_queue"][0]["source_evidence"] = (
+            "Use https://second.example/rpc with eth_chainId"
+        )
+        migrated = migrate_state(
+            trusted,
+            thread_id="legacy-trusted",
+            language="en",
+            session_purpose="user",
+        )
+        self.assertEqual(
+            [row.get("catalog_command") for row in migrated["action_queue"]],
+            ["set_endpoint", "set_method"],
+        )
+
+    def test_checkpoint_migration_quarantines_retired_pending_action_contracts(self) -> None:
+        from agent.harness.state import migrate_state
+
+        pending = {
+            "contract_version": 1,
+            "id": "legacy-custom-rpc-choice",
+            "group": "workload_rpc",
+            "kind": "numbered_choice",
+            "field": "rpc_workload",
+            "manual_input_allowed": False,
+            "options": [{
+                "id": "1",
+                "value": "custom_rpc",
+                "action": {"type": "start_custom_rpc"},
+            }],
+            "accepted_action_types": ["answer_pending", "start_custom_rpc"],
+        }
+        migrated = migrate_state(
+            {
+                "active_group": "workload_rpc",
+                "pending_question": pending,
+                "action_queue": [{"type": "unknown_retired_action"}],
+            },
+            thread_id="legacy-pending-action",
+            language="en",
+            session_purpose="user",
+        )
+
+        self.assertEqual(migrated["pending_question"], {})
+        self.assertEqual(migrated["active_group"], "workload_rpc")
+        self.assertEqual(migrated["action_queue"], [])
+        events = migrated["audit_events"]
+        self.assertEqual(events[-1]["event"], "checkpoint_pending_actions_quarantined")
+        self.assertEqual(events[-1]["unsupported_action_types"], ["start_custom_rpc"])
+
+    def test_checkpoint_migration_preserves_current_pending_action_contracts(self) -> None:
+        from agent.harness.state import migrate_state
+
+        pending = {
+            "contract_version": 1,
+            "id": "current-choice",
+            "group": "opening",
+            "kind": "numbered_choice",
+            "field": "target_mode",
+            "manual_input_allowed": False,
+            "options": [{
+                "id": "1",
+                "value": "fake-node",
+                "action": {
+                    "type": "choose_target_mode",
+                    "target_mode": "fake-node",
+                    "target_mode_explicit": True,
+                },
+            }],
+            "accepted_action_types": ["answer_pending", "choose_target_mode"],
+        }
+        migrated = migrate_state(
+            {"active_group": "opening", "pending_question": pending},
+            thread_id="current-pending-action",
+            language="en",
+            session_purpose="user",
+        )
+
+        self.assertEqual(migrated["pending_question"], pending)
+
+    def test_checkpoint_migration_quarantines_retired_resume_context_contract(self) -> None:
+        from agent.harness.state import migrate_state
+
+        stale = {
+            "contract_version": 1,
+            "id": "legacy-resumed-custom-rpc",
+            "group": "workload_rpc",
+            "kind": "numbered_choice",
+            "options": [{
+                "id": "1",
+                "value": "custom_rpc",
+                "action": {"type": "start_custom_rpc"},
+            }],
+        }
+        migrated = migrate_state(
+            {
+                "active_group": "opening",
+                "pending_question": {
+                    "id": "resume_harness_session",
+                    "group": "opening",
+                    "kind": "numbered_choice",
+                    "options": [{
+                        "id": "1",
+                        "value": "continue",
+                        "action": {"type": "answer_pending", "answer": "continue"},
+                    }],
+                },
+                "resume_context": {
+                    "active_group": "workload_rpc",
+                    "pending_question": stale,
+                },
+            },
+            thread_id="legacy-resume-context",
+            language="en",
+            session_purpose="user",
+        )
+
+        self.assertEqual(migrated["pending_question"]["id"], "resume_harness_session")
+        self.assertEqual(migrated["resume_context"]["pending_question"], {})
+        event = migrated["audit_events"][-1]
+        self.assertEqual(event["location"], "resume_context")
+        self.assertEqual(event["unsupported_action_types"], ["start_custom_rpc"])
+
+    def test_state_policy_removes_inapplicable_evidence_pause_without_losing_navigation(self) -> None:
+        from agent.harness.intent import _apply_state_plan_policy
+        from agent.harness.state import new_state
+
+        source = "Pause this method setup and take me to observability settings."
+        payload = {
+            "actions": [
+                {"type": "pause_evidence_collection", "source_evidence": source},
+                {
+                    "type": "change_group",
+                    "group": "observability",
+                    "navigation_explicit": True,
+                    "source_evidence": source,
+                },
+            ],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": source,
+                "disposition": "action",
+                "action_indexes": [0, 1],
+                "reason": "temporary workflow detour",
+            }],
+        }
+
+        result = json.loads(_apply_state_plan_policy(
+            json.dumps(payload),
+            new_state("no-evidence-pause", language="en"),
+        ))
+
+        self.assertEqual([row["type"] for row in result["actions"]], ["change_group"])
+        self.assertEqual(result["semantic_units"][0]["action_indexes"], [0])
+        self.assertEqual(result["semantic_units"][0]["disposition"], "action")
+
+    def test_generic_navigation_purpose_excludes_registered_typed_entry(self) -> None:
+        from agent.harness.intent import _semantic_action_purpose
+
+        purpose = _semantic_action_purpose(
+            {"type": "change_group", "group": "endpoint_process"},
+            "fallback",
+        )
+
+        self.assertIn("does not match a registered typed entry purpose", purpose)
+        self.assertIn("Enter custom RPC method catalog setup", purpose)
+
+    def test_go_back_purpose_is_bound_to_recoverable_state(self) -> None:
+        from agent.harness.intent import _semantic_action_purpose
+
+        unavailable = _semantic_action_purpose(
+            {"type": "go_back"},
+            "fallback",
+            {"group_history": [], "interruption_stack": []},
+        )
+        available = _semantic_action_purpose(
+            {"type": "go_back"},
+            "fallback",
+            {"group_history": ["network"], "interruption_stack": []},
+        )
+
+        self.assertIn("operation is unavailable", unavailable)
+        self.assertIn("['network']", available)
+
+    def test_go_back_without_recoverable_state_fails_plan_validation(self) -> None:
+        from agent.harness.intent import _validate_action_document
+        from agent.harness.plan_coverage import TurnClause
+        from agent.harness.state import new_state
+
+        text = "Go back to endpoint settings."
+        document = json.dumps({
+            "actions": [{"type": "go_back", "source_evidence": text}],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": text,
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "back navigation",
+            }],
+        })
+        state = new_state("no-history", language="en")
+
+        result = _validate_action_document(
+            document,
+            (TurnClause("clause-1", text),),
+            state,
+        )
+
+        self.assertFalse(result.valid)
+        self.assertIn("go_back has no recoverable", "; ".join(result.errors))
+
+    def test_rpc_catalog_payload_must_exist_in_its_mapped_source_unit(self) -> None:
+        from agent.harness.intent import _validate_action_document
+        from agent.harness.plan_coverage import TurnClause
+        from agent.harness.state import new_state
+
+        text = "Configure the method shown in another document."
+        document = json.dumps({
+            "actions": [{
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_method",
+                "rpc_method": "eth_accounts",
+                "source_evidence": text,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": text,
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "method request",
+            }],
+        })
+
+        result = _validate_action_document(
+            document,
+            (TurnClause("clause-1", text),),
+            new_state("rpc-grounding", language="en"),
+        )
+
+        self.assertFalse(result.valid)
+        self.assertIn("rpc_method is not present", "; ".join(result.errors))
+
+    def test_rpc_catalog_wire_payload_requires_exact_source_evidence(self) -> None:
+        from agent.harness.intent import _validate_action_document
+        from agent.harness.plan_coverage import TurnClause
+        from agent.harness.state import new_state
+
+        text = "Use the selected method from the saved document."
+        document = json.dumps({
+            "actions": [{
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_method",
+                "rpc_method": "eth_accounts",
+                "source_evidence": text,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": text,
+                "disposition": "action",
+                "action_indexes": [0],
+            }],
+        })
+
+        result = _validate_action_document(
+            document,
+            (TurnClause("clause-1", text),),
+            new_state("rpc-exact-source", language="en"),
+        )
+
+        self.assertFalse(result.valid)
+        self.assertIn("exact source_evidence", "; ".join(result.errors))
+
     def test_scalar_reconfiguration_contract_is_registry_owned(self) -> None:
         from agent.harness.action_registry import validate_action_contract
         from agent.harness.context import action_schema
@@ -807,6 +1278,21 @@ class HarnessArchitectureTest(unittest.TestCase):
                 "navigation_explicit": True,
                 "source_evidence": "go to job monitoring",
             })
+
+    def test_group_schema_exposes_registered_domain_entry_actions(self) -> None:
+        from agent.harness.context import group_schema
+
+        endpoint_process = next(
+            item for item in group_schema() if item["name"] == "endpoint_process"
+        )
+        self.assertEqual(endpoint_process["entry_actions"], [{
+            "type": "rpc_catalog_command",
+            "purpose": (
+                "Enter custom RPC method catalog setup and collect its endpoint, "
+                "method, and schema evidence."
+            ),
+            "arguments": {"catalog_command": "enter"},
+        }])
 
     def test_chain_rpc_invalidations_commit_cross_domain_state_once_at_coordinator(self) -> None:
         from agent.harness.domains.chain_rpc_support import _domain_result
@@ -2814,6 +3300,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
                 {
                     "type": "rpc_catalog_command",
                     "catalog_command": "enter",
+                    "source_evidence": text,
                 },
                 text,
             ),
@@ -3547,7 +4034,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
             "options": [],
             "validation": {},
         }
-        with self.assertRaisesRegex(StateInvariantError, "target-mode lifecycle"):
+        with self.assertRaisesRegex(StateInvariantError, "typed lifecycle state"):
             _validate_action_plan(state, [{
                 "type": "rpc_catalog_command",
                 "catalog_command": "set_endpoint",
@@ -3585,7 +4072,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
 
         self.assertEqual(result["actions"], [])
         self.assertEqual(result["semantic_units"][0]["disposition"], "unresolved")
-        self.assertIn("target-mode lifecycle", result["semantic_units"][0]["reason"])
+        self.assertIn("typed lifecycle state", result["semantic_units"][0]["reason"])
 
 
 if __name__ == "__main__":

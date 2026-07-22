@@ -38,7 +38,7 @@ _ACTION_EVIDENCE_KEYS = frozenset({
     "support_relation",
 })
 _GROUNDED_ARGUMENT_KEYS = frozenset({
-    "argument",
+    "argument_name",
     "evidence_quote",
 })
 _UNIT_VERDICT_KEYS = frozenset({
@@ -216,14 +216,16 @@ def whole_plan_admission_prompt(semantic_policy: str) -> str:
         "Judge only the supplied immutable ids, actions, registry purposes, source units, pending contract, and workflow state. "
         "Return exactly one JSON object with exactly these keys: plan_hash, action_verdicts, unit_verdicts, reason. "
         "Echo plan_hash exactly. Return exactly one action_verdict for every supplied action_id and exactly one unit_verdict for every supplied unit_id; never add an id. "
-        "Each action_verdict is {action_id,verdict:'admit'|'reject',unit_ids:[string],evidence:[{unit_id,quote,relation:'direct'|'support',support_relation:string}],grounded_arguments:[{argument:string,evidence_quote:string}],pending_answer_argument:string,reason}. "
+        "Each action_verdict is {action_id,verdict:'admit'|'reject',unit_ids:[string],evidence:[{unit_id,quote,relation:'direct'|'support',support_relation:string}],grounded_arguments:[{argument_name:string,evidence_quote:string}],pending_answer_argument:string,reason}. "
         "unit_ids must exactly equal that action's supplied immutable unit_ids. An admitted action needs one evidence row for every unit_id, every quote must be a non-empty exact substring of that unit, at least one relation must be direct, and a support row may use only one supplied allowed_support_relation. Direct rows use an empty support_relation. "
-        "grounded_arguments must contain exactly one row for every supplied required_value_grounding_argument and no other argument. Its evidence_quote must be a non-empty exact substring of one owned source unit that semantically selects the exact immutable operation_arguments value. Merely naming the argument or dimension, asking to change it without selecting a value, stating a generic benchmark goal, or relying on workflow state does not ground a concrete value. Natural-language equivalents may ground a value only when they unambiguously select that exact value. Actions with no required value-grounding arguments return an empty list. "
-        "pending_answer_argument is empty unless the supplied active pending question allows manual input and exactly one supplied pending_value_candidate semantically answers that question. When it does, set pending_answer_argument to that candidate's exact candidate_id. A syntax-compatible value for an unrelated interruption is not an answer. Never invent a candidate id or rewrite the action. "
+        "grounded_arguments must contain exactly one row for every supplied required_value_grounding_argument and no other row. argument_name is the exact required_value_grounding_argument name copied verbatim, never an explanation or value. Its evidence_quote must be a non-empty exact substring of one owned source unit that semantically selects the exact immutable operation_arguments value. Merely naming the argument or dimension, asking to change it without selecting a value, stating a generic benchmark goal, or relying on workflow state does not ground a concrete value. Natural-language equivalents may ground a value only when they unambiguously select that exact value. Actions with no required value-grounding arguments return an empty list. "
+        "pending_answer_argument is empty unless the supplied active pending question allows manual input and exactly one supplied pending_value_candidate semantically answers that question. When it does, set pending_answer_argument to that candidate's exact candidate_id. A syntax-compatible value for an unrelated interruption is not an answer. A candidate mentioned only as an example, quotation, rejected option, negated operation, correction target, or value the user says not to apply is not an answer. Never invent a candidate id or rewrite the action. "
         "Each unit_verdict is {unit_id,verdict:'complete'|'support'|'context'|'unresolved'|'omitted',owner_action_ids:[string],evidence_quote:string,omitted_action_type:string,reason}. "
         "owner_action_ids must exactly equal the supplied immutable owner_action_ids. complete is valid only when the unit directly expresses a present demand preserved by every registered owner action. support is valid only when the unit does not independently request another action, every owner action cites it with relation=support and a supplied allowed_support_relation, and each owner action has direct evidence in another unit. context is valid only for a supplied context unit with no present demand and no owner. unresolved means the request is genuinely unsafe or not expressible. omitted means the unit contains a present independently actionable demand expressible by one action_schema type but missing from the immutable actions; set omitted_action_type to that exact registered type. Never propose its arguments or a replacement action. For every other verdict omitted_action_type is empty. Every evidence_quote is a non-empty exact substring of that unit. "
+        "The action evidence and unit verdict are one consistency contract, not independent guesses. For each owned unit: if every owner action cites that unit as direct, its unit verdict is complete; if every owner action cites it as support, its unit verdict is support. Never return complete for a support-cited unit or support for a direct-cited unit. "
         "A mapped action may be individually plausible while its unit still has an omitted demand. Questions, corrections, navigation, configuration, evidence analysis, execution approval, and pending answers are all present demands when explicitly requested. Workflow state and planner reasons are context, never user evidence. "
         "A pending option or manual answer is admitted only when current source evidence satisfies the supplied typed pending contract. A registered group or field owner is admitted only when its declared purpose and exact target preserve the source demand. Structured syntax facts are authoritative only after the immutable compiler assigned that structured unit to the corresponding registered owner; examples or logs do not become configuration merely because they contain assignments. "
+        "A pending-answer owner covers only the answer to the question that existed at turn start. If its owned unit also states any independently actionable value, evidence, mutation, consultation, or navigation for a later step, the unit is complete only when the immutable plan includes every corresponding registered owner action; otherwise return omitted for that unit. Never treat creation of a later typed question as preservation of an explicit value already present in the current source. "
         "Malformed ids, missing rows, duplicate rows, invented quotes, an unsupported support relation, or uncertainty must fail closed. "
         + semantic_policy
     )
@@ -331,6 +333,15 @@ def validate_whole_plan_admission(
             str(value)
             for value in record.get("required_value_grounding_arguments") or []
         ]
+        exact_grounding = {
+            str(value)
+            for value in record.get("exact_source_value_arguments") or []
+        }
+        operation_arguments = (
+            record.get("operation_arguments")
+            if isinstance(record.get("operation_arguments"), Mapping)
+            else {}
+        )
         grounding_counts: dict[str, int] = {}
         owned_sources = [
             str((unit_records.get(unit_id) or {}).get("source_text") or "")
@@ -343,14 +354,20 @@ def validate_whole_plan_admission(
             grounding_row = dict(raw_grounding)
             if set(grounding_row) != _GROUNDED_ARGUMENT_KEYS:
                 errors.append(f"whole-plan grounded argument has missing or undeclared keys: {action_id}")
-            argument = str(grounding_row.get("argument") or "")
+            argument = str(grounding_row.get("argument_name") or "")
             grounding_counts[argument] = grounding_counts.get(argument, 0) + 1
             quote = str(grounding_row.get("evidence_quote") or "")
             if argument not in expected_grounding:
                 errors.append(f"whole-plan grounded argument is undeclared: {action_id}/{argument or '<missing>'}")
             if not quote or not any(quote in source for source in owned_sources):
                 errors.append(f"whole-plan grounded argument evidence is not exact: {action_id}/{argument or '<missing>'}")
-        if [str(item.get("argument") or "") for item in grounding_rows if isinstance(item, dict)] != expected_grounding:
+            exact_value = str(operation_arguments.get(argument) or "").strip()
+            if argument in exact_grounding and exact_value and exact_value not in quote:
+                errors.append(
+                    f"whole-plan exact grounded argument quote does not contain its immutable value: "
+                    f"{action_id}/{argument}"
+                )
+        if [str(item.get("argument_name") or "") for item in grounding_rows if isinstance(item, dict)] != expected_grounding:
             errors.append(f"whole-plan grounded argument order or cardinality mismatch: {action_id}")
         if any(grounding_counts.get(argument, 0) != 1 for argument in expected_grounding):
             errors.append(f"whole-plan required argument is not grounded exactly once: {action_id}")
@@ -362,6 +379,19 @@ def validate_whole_plan_admission(
         ]
         if pending_argument and pending_argument not in pending_candidates:
             errors.append(f"whole-plan pending answer argument is undeclared: {action_id}/{pending_argument}")
+        immutable_action = record.get("action") if isinstance(record.get("action"), Mapping) else {}
+        if (
+            verdict == "admit"
+            and str(immutable_action.get("type") or "") == "answer_pending"
+            and pending_candidates
+            and (
+                len(pending_candidates) != 1
+                or pending_argument != pending_candidates[0]
+            )
+        ):
+            errors.append(
+                f"whole-plan admitted pending answer lacks one explicit typed candidate selection: {action_id}"
+            )
         seen_evidence: set[str] = set()
         direct_count = 0
         allowed_support = set(record.get("allowed_support_relations") or [])

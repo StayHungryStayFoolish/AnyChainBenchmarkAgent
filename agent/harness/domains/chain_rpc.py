@@ -603,8 +603,6 @@ def apply_chain_rpc_action(state: AgentGraphState, action: ActionProposal) -> Ha
     endpoint = extract_url_candidate(arguments.get("rpc_endpoint"))
     origin_text = _origin_text(next_state, arguments)
     evidence = str(arguments.get("rpc_schema_evidence") or "").strip()
-    if not evidence:
-        evidence = schema_evidence_from_turn_text(origin_text, method_hint=method)
     identity = next_state.setdefault("chain_identity", {})
     if is_existing_family_lifecycle(identity):
         previous_pending = deepcopy(next_state.get("pending_question") or {})
@@ -797,8 +795,7 @@ def apply_chain_rpc_answer(
             return _answer_result(state, next_state, stop=True)
         return _answer_result(state, next_state, completion="in_progress")
     if question_id in {"LOCAL_RPC_URL", "SYNC_OBSERVE_RPC_URL", "custom_rpc_endpoint", "new_chain_endpoint"}:
-        raw = user_text if question_id in {"custom_rpc_endpoint", "new_chain_endpoint"} and user_text else value
-        _apply_endpoint_answer(next_state, question_id, raw)
+        _apply_endpoint_answer(next_state, question_id, value)
         next_question = question_for_chain_rpc(next_state, "endpoint_process")
         if next_question:
             _set_control(next_state, 'pending_question', next_question)
@@ -839,11 +836,19 @@ def apply_chain_rpc_answer(
         confirmed["MAINNET_RPC_URL_REVIEWED"] = True
         return _answer_result(state, next_state)
     if question_id in {"custom_rpc_method", "new_chain_method"}:
-        _apply_method_answer(next_state, question_id, user_text or value)
+        # The coordinator owns language interpretation and delivers the
+        # contract-validated value. The original turn is provenance only;
+        # feeding it back into the domain would discard semantic
+        # normalization such as prose -> exact RPC method.
+        _apply_method_answer(next_state, question_id, value)
         _install_chain_rpc_next_question(next_state, "endpoint_process")
         return _answer_result(state, next_state, completion="in_progress")
     if question_id in {"custom_rpc_schema_evidence", "new_chain_schema_evidence"}:
-        _apply_schema_evidence(next_state, case="new_chain" if question_id.startswith("new_chain") else "custom_rpc", evidence=str(user_text or value))
+        _apply_schema_evidence(
+            next_state,
+            case="new_chain" if question_id.startswith("new_chain") else "custom_rpc",
+            evidence=str(value),
+        )
         return _answer_result(state, next_state, completion="in_progress")
     if question_id in {"custom_rpc_parameter_confirm", "new_chain_parameter_confirm"}:
         case = "new_chain" if question_id.startswith("new_chain") else "custom_rpc"
@@ -976,6 +981,13 @@ def cancel_chain_rpc_question(state: AgentGraphState, question: dict[str, Any]) 
             identity.pop(key, None)
         if identity.get("case") == "case2":
             identity["status"] = "needs_protocol_confirmation"
+        evidence = next_state.setdefault("endpoint_evidence", {})
+        for key in (
+            "candidate_endpoint",
+            "candidate_endpoint_ready",
+            "new_chain_endpoint_probe",
+        ):
+            evidence.pop(key, None)
         resume_group = "chain_identity"
     elif question_id == "SYNC_OBSERVE_RPC_URL":
         evidence = next_state.setdefault("endpoint_evidence", {})

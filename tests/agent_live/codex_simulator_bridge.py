@@ -84,6 +84,16 @@ def _input_generation_rule(contract: Mapping[str, Any]) -> str:
             "JSON, YAML, env, shell, curl, or mixed configuration block. It must not ask "
             "the Agent to invent, recommend, or output that user-owned value."
         )
+    if action_type == "change_group":
+        target_group = ""
+        if isinstance(postcondition, Mapping):
+            target_group = str(postcondition.get("target_group") or "")
+        return (
+            "The user_message must request only generic navigation to the exact target group "
+            f"{target_group or '<declared target>'}. It must not request a concrete mutation, "
+            "supply a value, or name a registered domain subflow/intake such as custom RPC "
+            "catalog setup; those belong to their typed domain actions rather than change_group."
+        )
     action_contract = contract.get("simulator_action_contract")
     if isinstance(action_contract, Mapping):
         return (

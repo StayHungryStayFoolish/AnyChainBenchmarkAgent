@@ -58,6 +58,7 @@ class ActionContractAuthorityTest(unittest.TestCase):
             "type": "rpc_catalog_command",
             "catalog_command": "set_method",
             "rpc_method": "eth_getBalance",
+            "source_evidence": "use eth_getBalance",
             "rpc_endpoint": "",
             "rpc_schema_evidence": None,
         })
@@ -68,6 +69,7 @@ class ActionContractAuthorityTest(unittest.TestCase):
                 "type": "rpc_catalog_command",
                 "catalog_command": "set_method",
                 "rpc_method": "eth_getBalance",
+                "source_evidence": "use eth_getBalance",
             },
         )
 
@@ -100,6 +102,7 @@ class ActionContractAuthorityTest(unittest.TestCase):
             validate_action_contract({
                 "type": "rpc_catalog_command",
                 "catalog_command": "set_endpoint",
+                "source_evidence": "set endpoint",
             })
         with self.assertRaisesRegex(ValueError, "does not accept: rpc_method"):
             validate_action_contract({
@@ -107,18 +110,21 @@ class ActionContractAuthorityTest(unittest.TestCase):
                 "catalog_command": "set_endpoint",
                 "rpc_endpoint": "https://example.invalid",
                 "rpc_method": "eth_chainId",
+                "source_evidence": "use https://example.invalid and eth_chainId",
             })
         with self.assertRaisesRegex(ValueError, "exact wire method token"):
             validate_action_contract({
                 "type": "rpc_catalog_command",
                 "catalog_command": "set_method",
                 "rpc_method": "my own RPC method",
+                "source_evidence": "my own RPC method",
             })
         self.assertEqual(
             validate_action_contract({
                 "type": "rpc_catalog_command",
                 "catalog_command": "set_method",
                 "rpc_method": "eth_blockNumber",
+                "source_evidence": "eth_blockNumber",
             })["rpc_method"],
             "eth_blockNumber",
         )
@@ -127,6 +133,7 @@ class ActionContractAuthorityTest(unittest.TestCase):
                 "type": "rpc_catalog_command",
                 "catalog_command": "set_method",
                 "rpc_method": "GET /v1/blocks/{height}",
+                "source_evidence": "GET /v1/blocks/{height}",
             })["rpc_method"],
             "GET /v1/blocks/{height}",
         )

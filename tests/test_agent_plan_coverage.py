@@ -23,6 +23,42 @@ def _unit(clause, index: int, action_indexes, *, disposition: str = "action", re
 
 
 class PlanCoverageTest(unittest.TestCase):
+    def test_typed_group_entry_excludes_competing_generic_navigation(self) -> None:
+        from agent.harness.plan_coverage import TurnClause, validate_plan_coverage
+
+        text = "Add and validate my own RPC method first."
+        payload = {
+            "actions": [
+                {
+                    "type": "change_group",
+                    "group": "endpoint_process",
+                    "navigation_explicit": True,
+                    "source_evidence": text,
+                },
+                {
+                    "type": "rpc_catalog_command",
+                    "catalog_command": "enter",
+                    "source_evidence": text,
+                },
+            ],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": text,
+                "disposition": "action",
+                "action_indexes": [0, 1],
+                "reason": "duplicate entry owners",
+            }],
+        }
+
+        result = validate_plan_coverage(payload, (TurnClause("clause-1", text),))
+
+        self.assertFalse(result.valid)
+        self.assertTrue(any(
+            error.startswith("generic navigation competes with registered typed entry: endpoint_process")
+            for error in result.errors
+        ))
+
 
 
     def test_single_structured_assignment_is_not_downgraded_to_prose(self) -> None:
@@ -542,6 +578,23 @@ class PlanCoverageTest(unittest.TestCase):
                     tuple(arguments),
                 )
 
+        self.assertEqual(
+            semantic_grounding_arguments({
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_endpoint",
+                "rpc_endpoint": "https://example.invalid/rpc",
+            }),
+            ("rpc_endpoint",),
+        )
+        self.assertEqual(
+            semantic_grounding_arguments({
+                "type": "secondary_handoff_command",
+                "handoff_command": "append_evidence",
+                "handoff_evidence": "official protocol notes",
+            }),
+            (),
+        )
+
 
 
 
@@ -885,10 +938,11 @@ class PlanCoverageTest(unittest.TestCase):
             reconciled["actions"][0]["unmapped_values"],
             {"UNRELATED_TICKET": "INC-12345"},
         )
-        self.assertEqual(len(reconciled["semantic_units"]), 1)
-        self.assertEqual(reconciled["semantic_units"][0]["source_text"], source)
+        self.assertEqual(len(reconciled["semantic_units"]), 2)
         self.assertEqual(reconciled["semantic_units"][0]["disposition"], "action")
         self.assertEqual(reconciled["semantic_units"][0]["action_indexes"], [0])
+        self.assertEqual(reconciled["semantic_units"][1]["disposition"], "unresolved")
+        self.assertEqual(reconciled["semantic_units"][1]["action_indexes"], [])
 
 
 
@@ -1748,265 +1802,6 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
 
 
 
-    def test_single_pending_field_proposal_from_prose_compiles_to_pending_answer(self) -> None:
-        from agent.harness.intent import _normalize_prose_pending_field_proposal
-        from agent.harness.state import new_state
-
-        source = (
-            "The credential is run-secret-4821.\n"
-            "Use it only for this run without changing the saved template."
-        )
-        clauses = segment_user_turn(source)
-        state = new_state("prose-pending-proposal")
-        state["pending_question"] = {
-            "id": "RPC_API_KEY",
-            "field": "RPC_API_KEY",
-            "kind": "manual_value",
-            "manual_input_allowed": True,
-            "validation": {"value_type": "scalar_token", "max_length": 180},
-        }
-        payload = {
-            "actions": [{
-                "type": "propose_config_values",
-                "config_values": {"RPC_API_KEY": "run-secret-4821"},
-                "unmapped_values": {},
-                "conflicts": [],
-                "source_format": "mixed",
-                "source_evidence": clauses[-1].text,
-            }],
-            "semantic_units": [
-                _unit(clause, index, [0])
-                for index, clause in enumerate(clauses, start=1)
-            ],
-        }
-
-        normalized = json.loads(_normalize_prose_pending_field_proposal(
-            json.dumps(payload),
-            state,
-            clauses,
-            source,
-        ))
-
-        self.assertEqual(normalized["actions"], [{
-            "type": "answer_pending",
-            "answer": "run-secret-4821",
-            "source_evidence": "run-secret-4821",
-        }])
-        self.assertEqual(
-            [unit["action_indexes"] for unit in normalized["semantic_units"]],
-            [[0], [0]],
-        )
-
-    def test_structured_pending_field_proposal_remains_a_review_transaction(self) -> None:
-        from agent.harness.intent import _normalize_prose_pending_field_proposal
-        from agent.harness.state import new_state
-
-        source = '{"RPC_API_KEY":"run-secret-4821"}'
-        clauses = segment_user_turn(source)
-        state = new_state("structured-pending-proposal")
-        state["pending_question"] = {
-            "id": "RPC_API_KEY",
-            "field": "RPC_API_KEY",
-            "kind": "manual_value",
-            "manual_input_allowed": True,
-            "validation": {"value_type": "scalar_token", "max_length": 180},
-        }
-        payload = {
-            "actions": [{
-                "type": "propose_config_values",
-                "config_values": {"RPC_API_KEY": "run-secret-4821"},
-                "unmapped_values": {},
-                "conflicts": [],
-            }],
-            "semantic_units": [_unit(clauses[0], 1, [0])],
-        }
-
-        normalized = _normalize_prose_pending_field_proposal(
-            json.dumps(payload),
-            state,
-            clauses,
-            source,
-        )
-
-        self.assertEqual(json.loads(normalized), payload)
-
-    def test_pending_prose_answer_owns_confirmed_noop_context(self) -> None:
-        from agent.harness.intent import _normalize_prose_pending_field_proposal
-        from agent.harness.state import new_state
-
-        source = (
-            "Set the maximum network bandwidth to 25 Gbps.\n"
-            "Keep the detected interface."
-        )
-        clauses = segment_user_turn(source)
-        state = new_state("pending-prose-confirmed-noop")
-        state["confirmed_config"] = {"NETWORK_INTERFACE": "eth0"}
-        state["pending_question"] = {
-            "id": "NETWORK_MAX_BANDWIDTH_GBPS",
-            "field": "NETWORK_MAX_BANDWIDTH_GBPS",
-            "kind": "manual_value",
-            "manual_input_allowed": True,
-            "validation": {
-                "normalization": "semantic_scalar",
-                "value_type": "positive_number",
-            },
-        }
-        payload = {
-            "actions": [{
-                "type": "propose_config_values",
-                "config_values": {
-                    "NETWORK_INTERFACE": "eth0",
-                    "NETWORK_MAX_BANDWIDTH_GBPS": "25",
-                },
-                "unmapped_values": {},
-                "conflicts": [],
-                "source_format": "mixed",
-                "source_evidence": source,
-            }],
-            "semantic_units": [
-                _unit(clause, index, [0])
-                for index, clause in enumerate(clauses, start=1)
-            ],
-        }
-
-        normalized = json.loads(_normalize_prose_pending_field_proposal(
-            json.dumps(payload),
-            state,
-            clauses,
-            source,
-        ))
-
-        self.assertEqual(normalized["actions"], [{
-            "type": "answer_pending",
-            "answer": "25",
-            "source_evidence": "25",
-        }])
-        self.assertEqual(
-            [unit["action_indexes"] for unit in normalized["semantic_units"]],
-            [[0], [0]],
-        )
-
-    def test_pending_prose_answer_cannot_hide_changed_or_unconfirmed_field(self) -> None:
-        from agent.harness.intent import _normalize_prose_pending_field_proposal
-        from agent.harness.state import new_state
-
-        source = "Set bandwidth to 25 Gbps.\nUse interface eth1."
-        clauses = segment_user_turn(source)
-        base = new_state("pending-prose-residual-mutation")
-        base["pending_question"] = {
-            "id": "NETWORK_MAX_BANDWIDTH_GBPS",
-            "field": "NETWORK_MAX_BANDWIDTH_GBPS",
-            "kind": "manual_value",
-            "manual_input_allowed": True,
-            "validation": {"value_type": "positive_number"},
-        }
-        payload = {
-            "actions": [{
-                "type": "propose_config_values",
-                "config_values": {
-                    "NETWORK_INTERFACE": "eth1",
-                    "NETWORK_MAX_BANDWIDTH_GBPS": "25",
-                },
-                "unmapped_values": {},
-                "conflicts": [],
-            }],
-            "semantic_units": [_unit(clause, index, [0]) for index, clause in enumerate(clauses, 1)],
-        }
-
-        for confirmed in ({"NETWORK_INTERFACE": "eth0"}, {}):
-            with self.subTest(confirmed=confirmed):
-                state = dict(base)
-                state["confirmed_config"] = confirmed
-                normalized = _normalize_prose_pending_field_proposal(
-                    json.dumps(payload),
-                    state,
-                    clauses,
-                    source,
-                )
-                self.assertEqual(json.loads(normalized), payload)
-
-    def test_pending_prose_answer_owns_unrelated_confirmed_text_context(self) -> None:
-        from agent.harness.intent import _normalize_prose_pending_field_proposal
-        from agent.harness.state import new_state
-
-        source = "Use run-secret-4821 for the API key and keep machine type n2."
-        clauses = segment_user_turn(source)
-        state = new_state("pending-prose-confirmed-text-noop")
-        state["confirmed_config"] = {"MACHINE_TYPE": "n2"}
-        state["pending_question"] = {
-            "id": "RPC_API_KEY",
-            "field": "RPC_API_KEY",
-            "kind": "manual_value",
-            "manual_input_allowed": True,
-            "validation": {"value_type": "scalar_token", "max_length": 180},
-        }
-        payload = {
-            "actions": [{
-                "type": "propose_config_values",
-                "config_values": {
-                    "RPC_API_KEY": "run-secret-4821",
-                    "MACHINE_TYPE": "n2",
-                },
-                "unmapped_values": {},
-                "conflicts": [],
-            }],
-            "semantic_units": [_unit(clauses[0], 1, [0])],
-        }
-
-        normalized = json.loads(_normalize_prose_pending_field_proposal(
-            json.dumps(payload),
-            state,
-            clauses,
-            source,
-        ))
-
-        self.assertEqual(normalized["actions"], [{
-            "type": "answer_pending",
-            "answer": "run-secret-4821",
-            "source_evidence": "run-secret-4821",
-        }])
-
-    def test_pending_prose_answer_uses_canonical_confirmed_numeric_context(self) -> None:
-        from agent.harness.intent import _normalize_prose_pending_field_proposal
-        from agent.harness.state import new_state
-
-        source = "Set data disk IOPS to 3000 and keep its detected 100 GiB size."
-        clauses = segment_user_turn(source)
-        state = new_state("pending-prose-confirmed-numeric-noop")
-        state["confirmed_config"] = {"DATA_VOL_SIZE": "100"}
-        state["pending_question"] = {
-            "id": "DATA_VOL_MAX_IOPS",
-            "field": "DATA_VOL_MAX_IOPS",
-            "kind": "manual_value",
-            "manual_input_allowed": True,
-            "validation": {"value_type": "positive_number"},
-        }
-        payload = {
-            "actions": [{
-                "type": "propose_config_values",
-                "config_values": {
-                    "DATA_VOL_MAX_IOPS": "3000",
-                    "DATA_VOL_SIZE": "100 GiB",
-                },
-                "unmapped_values": {},
-                "conflicts": [],
-            }],
-            "semantic_units": [_unit(clauses[0], 1, [0])],
-        }
-
-        normalized = json.loads(_normalize_prose_pending_field_proposal(
-            json.dumps(payload),
-            state,
-            clauses,
-            source,
-        ))
-
-        self.assertEqual(normalized["actions"], [{
-            "type": "answer_pending",
-            "answer": "3000",
-            "source_evidence": "3000",
-        }])
-
     def test_empty_config_proposal_cannot_steal_direct_pending_answer(self) -> None:
         from agent.harness.intent import _remove_empty_config_proposals
 
@@ -2196,9 +1991,9 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
 
 
 
-    def test_structured_pending_config_assignment_is_owned_by_review_proposal(self) -> None:
+    def test_structured_parser_does_not_replace_compiler_answer_action(self) -> None:
+        import json
         from agent.harness.intent import _reconcile_structured_candidate_ownership
-        from agent.harness.state import new_state
 
         source = '{"ACCOUNTS_DEVICE":"/dev/nvme1n1"}'
         clause = segment_user_turn(source)[0]
@@ -2210,128 +2005,45 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
             }],
             "semantic_units": [_unit(clause, 1, [0])],
         }
-        state = new_state("structured-pending-review", language="en")
-        state["pending_question"] = {
-            "id": "ACCOUNTS_DEVICE",
-            "group": "accounts_disk",
-            "field": "ACCOUNTS_DEVICE",
-            "kind": "device",
-            "manual_input_allowed": True,
-            "validation": {"value_type": "scalar_token"},
-            "options": [],
+
+        reconciled = json.loads(_reconcile_structured_candidate_ownership(
+            json.dumps(payload),
+            (clause,),
+        ))
+
+        self.assertEqual(reconciled, payload)
+
+    def test_structured_parser_hydrates_only_declared_proposal_owner(self) -> None:
+        import json
+        from agent.harness.intent import _reconcile_structured_candidate_ownership
+
+        source = "CLOUD_REGION=asia-east1\nunrelated_ticket=INC-12345"
+        clause = segment_user_turn(source)[0]
+        payload = {
+            "actions": [{
+                "type": "propose_config_values",
+                "config_values": {},
+                "unmapped_values": {},
+                "source_format": "env",
+                "source_evidence": source,
+            }],
+            "semantic_units": [_unit(clause, 1, [0])],
         }
 
         reconciled = json.loads(_reconcile_structured_candidate_ownership(
             json.dumps(payload),
             (clause,),
-            state,
         ))
 
-        self.assertEqual(reconciled["actions"][0]["type"], "propose_config_values")
-        self.assertEqual(
-            reconciled["actions"][0]["config_values"],
-            {"ACCOUNTS_DEVICE": "/dev/nvme1n1"},
-        )
-        self.assertEqual(reconciled["actions"][0]["source_format"], "json")
-        self.assertEqual(reconciled["semantic_units"][0]["action_indexes"], [0])
-
-    def test_structured_pending_assignment_and_trailing_proposal_scope_rejoin_one_review(self) -> None:
-        from agent.harness.intent import (
-            _reconcile_structured_candidate_ownership,
-            _validate_action_document,
-        )
-        from agent.harness.state import new_state
-
-        source = (
-            "The network profile says:\n"
-            "```env\nNETWORK_MAX_BANDWIDTH_GBPS=25\n```\n"
-            "Use that as the proposed bandwidth value."
-        )
-        clauses = segment_user_turn(source)
-        payload = {
-            "actions": [{
-                "type": "answer_pending",
-                "answer": "25",
-                "selected_value": "25",
-                "source_evidence": "25",
-            }],
-            "semantic_units": [
-                _unit(clauses[0], 1, [], disposition="unresolved"),
-                _unit(clauses[1], 2, [0]),
-            ],
-            "pending_answer_admissions": [0],
-        }
-        state = new_state("structured-pending-cross-clause", language="en")
-        state["pending_question"] = {
-            "id": "NETWORK_MAX_BANDWIDTH_GBPS",
-            "group": "network",
-            "field": "NETWORK_MAX_BANDWIDTH_GBPS",
-            "kind": "manual_value",
-            "manual_input_allowed": True,
-            "validation": {"value_type": "positive_number"},
-            "options": [],
-        }
-
-        reconciled = json.loads(_reconcile_structured_candidate_ownership(
-            json.dumps(payload),
-            clauses,
-            state,
-        ))
-
-        self.assertEqual(reconciled["actions"][0]["type"], "propose_config_values")
-        self.assertEqual(
-            reconciled["actions"][0]["config_values"],
-            {"NETWORK_MAX_BANDWIDTH_GBPS": "25"},
-        )
-        self.assertEqual(reconciled["actions"][0]["source_format"], "env")
-        self.assertEqual(reconciled["pending_answer_admissions"], [])
-        self.assertEqual(reconciled["semantic_units"][0]["action_indexes"], [0])
-        self.assertEqual(reconciled["semantic_units"][1]["action_indexes"], [0])
-        self.assertTrue(
-            _validate_action_document(json.dumps(reconciled), clauses, state).valid
-        )
-
-    def test_cross_clause_structured_pending_assignment_uses_pending_intent_before_admission(self) -> None:
-        from agent.harness.intent import _reconcile_structured_candidate_ownership
-        from agent.harness.state import new_state
-
-        source = "```env\nCLOUD_REGION=asia-east1\n```\nUse that proposed value."
-        clauses = segment_user_turn(source)
-        payload = {
-            "actions": [{
-                "type": "answer_pending",
-                "answer": "asia-east1",
-                "selected_value": "asia-east1",
-                "source_evidence": "asia-east1",
-            }],
-            "semantic_units": [
-                _unit(clauses[0], 1, [], disposition="unresolved"),
-                _unit(clauses[1], 2, [0]),
-            ],
-        }
-        state = new_state("structured-pending-no-admission", language="en")
-        state["pending_question"] = {
-            "id": "CLOUD_REGION",
-            "group": "provider_deployment",
-            "field": "CLOUD_REGION",
-            "kind": "manual_value",
-            "manual_input_allowed": True,
-            "validation": {"value_type": "scalar_token"},
-            "options": [],
-        }
-
-        reconciled = json.loads(_reconcile_structured_candidate_ownership(
-            json.dumps(payload),
-            clauses,
-            state,
-        ))
-
-        self.assertEqual(reconciled["actions"][0]["type"], "propose_config_values")
         self.assertEqual(
             reconciled["actions"][0]["config_values"],
             {"CLOUD_REGION": "asia-east1"},
         )
-        self.assertEqual(reconciled["actions"][0]["source_format"], "env")
+        self.assertEqual(
+            reconciled["actions"][0]["unmapped_values"],
+            {"UNRELATED_TICKET": "INC-12345"},
+        )
+        self.assertEqual(reconciled["semantic_units"], payload["semantic_units"])
 
     def test_cross_clause_structured_assignment_without_pending_intent_is_not_claimed(self) -> None:
         from agent.harness.intent import _reconcile_structured_candidate_ownership
@@ -2405,6 +2117,134 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         ))
 
         self.assertEqual(reconciled, payload)
+
+    def test_exact_structured_pending_assignment_stays_out_of_direct_pending_candidates(self) -> None:
+        from agent.harness.intent import _action_queue_payload
+        from agent.harness.state import new_state
+
+        source = "NETWORK_MAX_BANDWIDTH_GBPS: 25"
+        state = new_state("structured-pending-clarification", language="en")
+        state["pending_question"] = {
+            "id": "NETWORK_MAX_BANDWIDTH_GBPS",
+            "group": "network",
+            "field": "NETWORK_MAX_BANDWIDTH_GBPS",
+            "kind": "manual_value",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "positive_number"},
+            "options": [],
+        }
+
+        request = _action_queue_payload(state, source)
+
+        self.assertEqual(request["pending_typed_candidates"], [])
+        self.assertEqual(
+            request["structured_candidates"][0]["config_values"],
+            {"NETWORK_MAX_BANDWIDTH_GBPS": "25"},
+        )
+        self.assertEqual(
+            request["structured_candidates"][0]["config_values"],
+            {"NETWORK_MAX_BANDWIDTH_GBPS": "25"},
+        )
+
+    def test_structured_candidate_for_another_group_does_not_answer_pending_field(self) -> None:
+        from agent.harness.intent import _action_queue_payload
+        from agent.harness.state import new_state
+
+        state = new_state("structured-cross-group", language="en")
+        state["pending_question"] = {
+            "id": "CLOUD_ZONE",
+            "group": "provider_deployment",
+            "field": "CLOUD_ZONE",
+            "kind": "manual_value",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "scalar_token"},
+            "options": [],
+        }
+
+        request = _action_queue_payload(
+            state,
+            "NETWORK_MAX_BANDWIDTH_GBPS: 25\nThen tell me what remains.",
+        )
+
+        self.assertEqual(request["pending_typed_candidates"], [])
+        self.assertEqual(
+            request["structured_candidates"][0]["config_values"],
+            {"NETWORK_MAX_BANDWIDTH_GBPS": "25"},
+        )
+        self.assertEqual(len(request["clauses"]), 2)
+
+    def test_case3_policy_does_not_reassign_removed_demands_to_handoff_owner(self) -> None:
+        from agent.harness.intent import _apply_state_plan_policy
+        from agent.harness.state import new_state
+
+        state = new_state("case3-evidence-policy", language="en")
+        state["chain_identity"] = {
+            "case": "case3",
+            "adapter_family": "unsupported",
+        }
+        payload = {
+            "actions": [
+                {"type": "rpc_catalog_command", "catalog_command": "enter"},
+                {
+                    "type": "rpc_catalog_command",
+                    "catalog_command": "set_method",
+                    "rpc_method": "getLatestBlock",
+                },
+                {
+                    "type": "secondary_handoff_command",
+                    "handoff_command": "append_evidence",
+                    "handoff_evidence": (
+                        'POST /rpc\n{"jsonrpc":"2.0","method":"getLatestBlock","params":[]}'
+                    ),
+                    "source_evidence": (
+                        'POST /rpc\n{"jsonrpc":"2.0","method":"getLatestBlock","params":[]}'
+                    ),
+                },
+            ],
+            "semantic_units": [
+                {
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "source_text": "I only have the request example so far:",
+                    "disposition": "action",
+                    "action_indexes": [0],
+                    "reason": "request framing",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "clause_id": "clause-2",
+                    "source_text": "POST /rpc",
+                    "disposition": "action",
+                    "action_indexes": [0],
+                    "reason": "request transport",
+                },
+                {
+                    "unit_id": "unit-3",
+                    "clause_id": "clause-3",
+                    "source_text": '{"jsonrpc":"2.0","method":"getLatestBlock","params":[]}',
+                    "disposition": "action",
+                    "action_indexes": [1, 2],
+                    "reason": "request payload",
+                },
+            ],
+        }
+
+        normalized = json.loads(_apply_state_plan_policy(json.dumps(payload), state))
+
+        self.assertEqual(
+            [action["type"] for action in normalized["actions"]],
+            ["secondary_handoff_command"],
+        )
+        self.assertEqual(normalized["semantic_units"][0]["action_indexes"], [])
+        self.assertEqual(normalized["semantic_units"][0]["disposition"], "unresolved")
+        self.assertEqual(normalized["semantic_units"][1]["action_indexes"], [])
+        self.assertEqual(normalized["semantic_units"][1]["disposition"], "unresolved")
+        self.assertEqual(normalized["semantic_units"][2]["action_indexes"], [0])
+        self.assertEqual(normalized["semantic_units"][2]["disposition"], "action")
+        self.assertEqual(
+            normalized["actions"][0]["source_evidence"],
+            'POST /rpc\n{"jsonrpc":"2.0","method":"getLatestBlock","params":[]}',
+        )
 
 
 

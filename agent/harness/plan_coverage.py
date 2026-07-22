@@ -98,6 +98,8 @@ def segment_user_turn(text: str) -> tuple[TurnClause, ...]:
 def validate_plan_coverage(
     payload: Mapping[str, Any],
     clauses: Sequence[TurnClause],
+    *,
+    pending_answer_action_indexes: Sequence[int] = (),
 ) -> PlanCoverageResult:
     """Validate complete clause-to-action accounting for one model plan."""
 
@@ -118,6 +120,7 @@ def validate_plan_coverage(
     }
     seen_unit_ids: set[str] = set()
     errors: list[str] = list(span_errors)
+    errors.extend(_entry_intake_exclusivity_errors(action_list))
     unresolved: list[str] = []
     referenced_actions: set[int] = set()
     incomplete_unit_ids: set[str] = set()
@@ -210,6 +213,12 @@ def validate_plan_coverage(
             mapped_actions,
             errors,
             input_shape=expected[clause_id].input_shape,
+            allow_pending_answer=any(
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value in pending_answer_action_indexes
+                for value in indexes
+            ),
         )
 
     for clause_id, clause in expected.items():
@@ -250,6 +259,41 @@ def validate_plan_coverage(
         unresolved_clauses=tuple(dict.fromkeys(unresolved)),
         incomplete_unit_ids=tuple(sorted(incomplete_unit_ids)),
     )
+
+
+def _entry_intake_exclusivity_errors(actions: Sequence[Any]) -> list[str]:
+    """Reject generic navigation that competes with a typed group entry.
+
+    Entry ownership is registry metadata. Once a transaction contains the
+    registered typed intake for a group, ``change_group`` cannot also claim
+    that destination; the typed intake owns interruption and group activation.
+    """
+
+    from .action_registry import ACTION_BY_TYPE, resolve_action_target_group
+
+    typed_entry_groups: set[str] = set()
+    for action in actions:
+        if not isinstance(action, Mapping):
+            continue
+        spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
+        if spec is None or not spec.entry_intake:
+            continue
+        if any(action.get(key) != value for key, value in spec.entry_intake_arguments):
+            continue
+        target = resolve_action_target_group(action)
+        if target:
+            typed_entry_groups.add(target)
+
+    return [
+        (
+            f"generic navigation competes with registered typed entry: {target}; "
+            "remove change_group and retain the registered typed entry action"
+        )
+        for action in actions
+        if isinstance(action, Mapping)
+        and str(action.get("type") or "") == "change_group"
+        and (target := str(action.get("group") or "").strip()) in typed_entry_groups
+    ]
 
 
 def _canonicalize_semantic_units(
@@ -442,6 +486,7 @@ def _validate_literal_anchors(
     errors: list[str],
     *,
     input_shape: str,
+    allow_pending_answer: bool,
 ) -> None:
     """Protect exact facts in atomic data without interpreting prose roles.
 
@@ -476,7 +521,11 @@ def _validate_literal_anchors(
     for method in _WIRE_METHOD_CANDIDATE_RE.findall(source_without_urls):
         if method == method.upper():
             continue
-        if not _mapped_action_preserves_wire_method(method, actions):
+        if not _mapped_action_preserves_wire_method(
+            method,
+            actions,
+            allow_pending_answer=allow_pending_answer,
+        ):
             errors.append(
                 f"wire method {method!r} from {unit_id} is absent from its mapped actions"
             )
@@ -485,16 +534,30 @@ def _validate_literal_anchors(
 def _mapped_action_preserves_wire_method(
     method: str,
     actions: Sequence[Mapping[str, Any]],
+    *,
+    allow_pending_answer: bool,
 ) -> bool:
     """Require an exact method fact in its owning action or evidence payload."""
 
     for action in actions:
         if str(action.get("rpc_method") or "").strip() == method:
             return True
-        for key in ("rpc_schema_evidence", "handoff_evidence", "evidence", "subject"):
+        for key in (
+            "rpc_schema_evidence",
+            "handoff_evidence",
+            "evidence",
+            "subject",
+        ):
             value = action.get(key)
             if isinstance(value, str) and method in value:
                 return True
+        if (
+            allow_pending_answer
+            and str(action.get("type") or "") == "answer_pending"
+            and isinstance(action.get("answer"), str)
+            and method in str(action.get("answer"))
+        ):
+            return True
     return False
 
 

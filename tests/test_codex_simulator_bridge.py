@@ -159,6 +159,28 @@ class StdioCodexSimulatorTest(unittest.TestCase):
         self.assertIn("supply a concrete value for CLOUD_ZONE", rule)
         self.assertIn("must not ask the Agent to invent", rule)
 
+    def test_change_group_contract_excludes_registered_domain_intakes(self) -> None:
+        context = self._context()
+        context = SimulatorContext(
+            **{
+                **context.__dict__,
+                "coverage_contract": {
+                    "input_class": "natural_language",
+                    "action_type": "change_group",
+                    "expected_postcondition": {"target_group": "endpoint_process"},
+                },
+            }
+        )
+        output = io.StringIO()
+
+        StdioCodexSimulator(io.StringIO(self._decision_frame(context)), output)(context)
+
+        payload = json.loads(output.getvalue()[len(CONTEXT_FRAME):])
+        rule = payload["decision_contract"]["input_generation_rule"]
+        self.assertIn("generic navigation", rule)
+        self.assertIn("custom RPC catalog setup", rule)
+        self.assertIn("typed domain actions", rule)
+
     def test_rejects_a_decision_for_a_stale_agent_response(self) -> None:
         context = self._context()
         stale = self._decision_frame(context, previous_response_hash="stale")

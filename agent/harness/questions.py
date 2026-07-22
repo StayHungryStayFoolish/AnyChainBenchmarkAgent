@@ -10,6 +10,7 @@ from agent.knowledge.chain_identity import canonicalize_chain_scalar, repo_chain
 from .action_registry import ACTION_BY_TYPE
 from .contracts import ActionProposal, OptionContract, QuestionContract
 from .input_values import (
+    extract_rpc_method_token_candidates,
     extract_url_candidates,
     has_rpc_wire_evidence,
     looks_like_wire_method_identity,
@@ -386,6 +387,18 @@ def typed_pending_value_candidates(
             for candidate in extract_url_candidates(text)
             if value_satisfies_pending_contract(candidate, question)
         )
+    input_mode = str(validation.get("input_mode") or "")
+    if input_mode == "rpc_method_or_schema_evidence":
+        candidates = extract_rpc_method_token_candidates(text)
+        if has_rpc_wire_evidence(text):
+            candidates.append(str(text or "").strip())
+        return tuple(dict.fromkeys(
+            candidate
+            for candidate in candidates
+            if value_satisfies_pending_contract(candidate, question)
+        ))
+    if str(validation.get("value_type") or "") == "evidence_contribution":
+        return (str(text or "").strip(),) if has_rpc_wire_evidence(text) else ()
     return ()
 
 

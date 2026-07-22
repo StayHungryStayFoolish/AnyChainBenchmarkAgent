@@ -279,6 +279,40 @@ def extract_rpc_method_identities(value: Any) -> list[str]:
     return methods
 
 
+def extract_rpc_method_token_candidates(value: Any) -> list[str]:
+    """Return syntax-only method candidates embedded in prose or wire data.
+
+    Exact JSON-RPC documents remain the strongest source. For prose, expose
+    only tokens with wire-like separators (or an HTTP verb/path identity), so
+    ordinary words are not promoted to method identities. Semantic admission
+    still decides whether the user selected any candidate.
+    """
+
+    methods = extract_rpc_method_identities(value)
+    text = str(value or "")
+    for verb, path in re.findall(
+        r"(?i)\b(GET|POST|PUT|PATCH|DELETE|HEAD)\s+(/\S+)",
+        text,
+    ):
+        candidate = normalize_scalar(f"{verb.upper()} {path}")
+        if looks_like_rest_method_identity(candidate) and candidate not in methods:
+            methods.append(candidate)
+    separated = re.findall(
+        r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9]*(?:[._:][A-Za-z0-9]+)+)(?![A-Za-z0-9])",
+        text,
+    )
+    camel_case = [
+        token
+        for token in re.findall(r"(?<![A-Za-z0-9])([a-z][A-Za-z0-9]{2,127})(?![A-Za-z0-9])", text)
+        if re.search(r"[a-z][A-Z]", token)
+    ]
+    for token in (*separated, *camel_case):
+        candidate = normalize_scalar(token)
+        if looks_like_rpc_method_token(candidate) and candidate not in methods:
+            methods.append(candidate)
+    return methods
+
+
 def has_rpc_wire_evidence(value: Any, *, allow_params_only: bool = False) -> bool:
     """Return whether one turn contains an attributable RPC wire fact."""
 

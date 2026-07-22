@@ -302,10 +302,18 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
                 "prompt": "Confirm the researched chain identity.",
                 "manual_input_allowed": False,
                 "options": [
-                    {"label": "Continue", "value": "confirm", "action": {"type": "confirm_proposed_protocol"}},
-                    {"label": "Choose protocol", "value": "protocol", "action": {"type": "choose_protocol"}},
+                    {
+                        "label": "Continue",
+                        "value": "confirm_proposed_protocol",
+                        "action": {"type": "answer_pending", "answer": "confirm_proposed_protocol"},
+                    },
+                    {
+                        "label": "Choose protocol",
+                        "value": "choose_protocol",
+                        "action": {"type": "answer_pending", "answer": "choose_protocol"},
+                    },
                 ],
-                "accepted_action_types": ["answer_pending", "choose_chain", "change_chain"],
+                "accepted_action_types": ["answer_pending"],
             }
             runtime._persist_state(
                 {
@@ -323,6 +331,67 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
             self.assertEqual(state["pending_question"].get(key), value)
         self.assertEqual(state["active_group"], "chain_identity")
         self.assertIn("Confirm the researched chain identity", "\n".join(state["visible_response"]))
+        self.assertEqual(state.get("resume_context"), {})
+
+    def test_terminal_resume_continue_never_restores_retired_pending_action(self) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.action_registry import ACTION_BY_TYPE
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / "checkpoint.sqlite"
+            runtime = AnyChainGraphRuntime(
+                thread_id="resume-retired-pending",
+                checkpoint_path=checkpoint,
+            )
+            runtime._persist_state(
+                {
+                    "target_mode": "fake-node",
+                    "workflow_mode": "rpc_benchmark",
+                    "chain_identity": {
+                        "canonical": "bsc",
+                        "status": "confirmed",
+                    },
+                    "active_group": "opening",
+                    "pending_question": {
+                        "id": "resume_harness_session",
+                        "group": "opening",
+                        "kind": "numbered_choice",
+                        "field": "resume_harness_session",
+                        "manual_input_allowed": False,
+                        "options": [{
+                            "id": "1",
+                            "label": "Continue",
+                            "value": "continue",
+                            "action": {
+                                "type": "answer_pending",
+                                "answer": "continue",
+                            },
+                        }],
+                    },
+                    "resume_context": {
+                        "active_group": "workload_rpc",
+                        "pending_question": {
+                            "id": "legacy-custom-rpc-choice",
+                            "group": "workload_rpc",
+                            "kind": "numbered_choice",
+                            "options": [{
+                                "id": "1",
+                                "value": "custom_rpc",
+                                "action": {"type": "start_custom_rpc"},
+                            }],
+                        },
+                    },
+                }
+            )
+            state = runtime.invoke("1", language="en")
+
+        self.assertNotEqual(
+            state.get("pending_question", {}).get("id"),
+            "legacy-custom-rpc-choice",
+        )
+        for option in state.get("pending_question", {}).get("options") or []:
+            action_type = str((option.get("action") or {}).get("type") or "")
+            self.assertIn(action_type, ACTION_BY_TYPE)
         self.assertEqual(state.get("resume_context"), {})
 
     def test_terminal_resume_continue_preserves_deferred_action_queue(self) -> None:

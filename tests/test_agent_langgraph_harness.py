@@ -24,6 +24,15 @@ def _admitted_mock_plan(state, text, payload):
     )
 
     actions = deepcopy(list(payload.get("actions") or []))
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
+        if (
+            (spec is not None and "source_evidence" in spec.required_arguments)
+            or str(action.get("type") or "") == "start_custom_rpc"
+        ):
+            action.setdefault("source_evidence", str(text))
     pending = dict(state.get("pending_question") or {})
     options = [item for item in pending.get("options") or [] if isinstance(item, dict)]
     selected_options: dict[int, dict] = {}
@@ -1278,7 +1287,7 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
             "active_group": "advanced_tuning",
         })
         actions = [
-            {"type": "rpc_catalog_command", "catalog_command": "enter", "confidence": "high"},
+            {"type": "rpc_catalog_command", "catalog_command": "enter", "source_evidence": "enter custom RPC setup", "confidence": "high"},
             {"type": "analyze_report", "confidence": "high", "subject": "latest"},
         ]
         with (
@@ -1315,7 +1324,7 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
             {"type": "set_rpc_mode", "rpc_mode": "single", "mutation_explicit": True, "source_evidence": "single", "confidence": "high"},
             {"type": "set_qps_mode", "qps_mode": "quick", "mutation_explicit": True, "source_evidence": "quick", "confidence": "high"},
             {"type": "set_observability", "observability_mode": "disabled", "mutation_explicit": True, "source_evidence": "observability disabled", "confidence": "high"},
-            {"type": "rpc_catalog_command", "catalog_command": "enter", "confidence": "high"},
+            {"type": "rpc_catalog_command", "catalog_command": "enter", "source_evidence": "custom RPC", "confidence": "high"},
         ]
 
         result = _process_action_queue(state, actions, "single, custom RPC, quick, observability disabled")
@@ -1386,13 +1395,247 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
 
         result = _process_action_queue(
             state,
-            [{"type": "rpc_catalog_command", "catalog_command": "enter", "confidence": "high"}],
+            [{"type": "rpc_catalog_command", "catalog_command": "enter", "source_evidence": "Take me to custom RPC", "confidence": "high"}],
             "Take me to custom RPC",
         )
 
         self.assertEqual(result.get("active_group"), "endpoint_process")
         self.assertEqual((result.get("custom_rpc") or {}).get("status"), "needs_endpoint")
         self.assertTrue(result.get("interruption_stack"))
+
+    def test_named_detour_preserves_and_resumes_partial_custom_rpc_state(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.domains.chain_rpc import question_for_chain_rpc
+        from agent.harness.state import new_state
+
+        state = new_state("custom-rpc-detour-resume", language="en")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "chain_identity": {
+                "raw": "bsc",
+                "canonical": "bsc",
+                "adapter_family": "jsonrpc",
+                "status": "confirmed",
+            },
+            "active_group": "endpoint_process",
+            "custom_rpc": {
+                "status": "needs_method",
+                "endpoint": "http://geth-dev:8545",
+                "endpoint_ready": True,
+            },
+        })
+        state["pending_question"] = question_for_chain_rpc(state, "endpoint_process") or {}
+        state["last_user_input"] = "Visit observability settings first."
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            return_value={"actions": [{
+                "type": "change_group",
+                "group": "observability",
+                "navigation_explicit": True,
+                "source_evidence": "Visit observability settings first.",
+            }]},
+        ):
+            detour = process_turn(state)
+
+        self.assertEqual(detour["pending_question"]["group"], "observability")
+        self.assertEqual(detour["custom_rpc"]["status"], "needs_method")
+        self.assertEqual(detour["interruption_stack"][-1]["question_id"], "custom_rpc_method")
+
+        detour["last_user_input"] = "1"
+        resumed = process_turn(detour)
+
+        self.assertEqual(resumed["observability"]["mode"], "disabled")
+        self.assertEqual(resumed["custom_rpc"]["status"], "needs_method")
+        self.assertEqual(resumed["pending_question"]["id"], "custom_rpc_method")
+
+    def test_named_detour_resumes_registered_field_reconfiguration_question(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.domains.environment import question_for_environment_field
+        from agent.harness.state import new_state
+
+        state = new_state("field-detour-resume", language="en")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "active_group": "provider_deployment",
+            "confirmed_config": {"CLOUD_REGION": "us-east1"},
+        })
+        state["pending_question"] = question_for_environment_field(
+            state,
+            "provider_deployment",
+            "CLOUD_REGION",
+        ) or {}
+        state["last_user_input"] = "Visit observability settings first."
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            return_value={"actions": [{
+                "type": "change_group",
+                "group": "observability",
+                "navigation_explicit": True,
+                "source_evidence": state["last_user_input"],
+            }]},
+        ):
+            detour = process_turn(state)
+
+        self.assertEqual(detour["pending_question"]["id"], "observability_mode")
+        self.assertEqual(detour["interruption_stack"][-1]["field"], "CLOUD_REGION")
+        detour["last_user_input"] = "1"
+        resumed = process_turn(detour)
+        self.assertEqual(resumed["pending_question"]["id"], "CLOUD_REGION")
+        self.assertEqual(resumed["pending_question"]["field"], "CLOUD_REGION")
+        self.assertEqual(resumed["confirmed_config"]["CLOUD_REGION"], "us-east1")
+
+    def test_named_detour_resumes_case2_schema_evidence_question(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.domains.chain_rpc import question_for_chain_rpc
+        from agent.harness.state import new_state
+
+        state = new_state("case2-detour-resume", language="en")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "active_group": "endpoint_process",
+            "chain_identity": {
+                "raw": "flow",
+                "canonical": "flow",
+                "adapter_family": "jsonrpc",
+                "status": "existing_family_needs_schema_evidence",
+                "case": "case2",
+                "candidate_method": "eth_blockNumber",
+            },
+            "endpoint_evidence": {
+                "candidate_endpoint": "http://fake-node:19000",
+                "candidate_endpoint_ready": True,
+            },
+        })
+        state["pending_question"] = question_for_chain_rpc(state, "endpoint_process") or {}
+        self.assertEqual(state["pending_question"]["id"], "new_chain_schema_evidence")
+        state["last_user_input"] = "Visit observability settings first."
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            return_value={"actions": [{
+                "type": "change_group",
+                "group": "observability",
+                "navigation_explicit": True,
+                "source_evidence": state["last_user_input"],
+            }]},
+        ):
+            detour = process_turn(state)
+
+        self.assertEqual(detour["pending_question"]["id"], "observability_mode")
+        self.assertEqual(detour["interruption_stack"][-1]["question_id"], "new_chain_schema_evidence")
+        detour["last_user_input"] = "1"
+        resumed = process_turn(detour)
+        self.assertEqual(resumed["pending_question"]["id"], "new_chain_schema_evidence")
+        self.assertEqual(_catalog_draft(resumed)["method"], "eth_blockNumber")
+
+    def test_case2_endpoint_answer_preserves_future_method_and_named_detour(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.domains.chain_rpc import question_for_chain_rpc
+        from agent.harness.state import new_state
+
+        source = (
+            "Use http://fake-node:19000 for validation. "
+            "The method is eth_blockNumber with no params. "
+            "Before the response schema, take me to observability settings."
+        )
+        state = new_state("case2-answer-future-actions", language="en")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "active_group": "endpoint_process",
+            "chain_identity": {
+                "raw": "flow",
+                "canonical": "flow",
+                "adapter_family": "jsonrpc",
+                "status": "existing_family_needs_endpoint",
+                "case": "case2",
+            },
+            "last_user_input": source,
+        })
+        state["pending_question"] = question_for_chain_rpc(state, "endpoint_process") or {}
+        self.assertEqual(state["pending_question"]["id"], "new_chain_endpoint")
+        actions = [
+            {
+                "type": "answer_pending",
+                "answer": "http://fake-node:19000",
+                "source_evidence": "Use http://fake-node:19000 for validation.",
+                "confidence": "high",
+            },
+            {
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_method",
+                "rpc_method": "eth_blockNumber",
+                "source_evidence": "The method is eth_blockNumber with no params.",
+                "confidence": "high",
+            },
+            {
+                "type": "change_group",
+                "group": "observability",
+                "navigation_explicit": True,
+                "group_navigation_semantic_verified": True,
+                "source_evidence": "take me to observability settings",
+                "confidence": "high",
+            },
+        ]
+        probe = {"ready": True, "status": "ok", "evidence_file": ".agent/evidence/probe.json"}
+        with (
+            patch(
+                "agent.harness.coordinator.resolve_action_queue",
+                side_effect=_admitted_mock_resolver({"actions": actions}),
+            ),
+            patch("agent.harness.domains.rpc_endpoint.validate_rpc_endpoint", return_value=probe),
+        ):
+            detour = process_turn(state)
+
+        self.assertEqual(detour["pending_question"]["id"], "observability_mode")
+        self.assertEqual(_catalog_draft(detour)["method"], "eth_blockNumber")
+        self.assertEqual(
+            [row["question_id"] for row in detour["interruption_stack"]],
+            ["new_chain_schema_evidence"],
+        )
+        detour["last_user_input"] = "1"
+        resumed = process_turn(detour)
+        self.assertEqual(resumed["pending_question"]["id"], "new_chain_schema_evidence")
+        self.assertEqual(_catalog_draft(resumed)["method"], "eth_blockNumber")
+        self.assertEqual(resumed["interruption_stack"], [])
+
+    def test_go_back_consumes_interruption_before_domain_resume_fallback(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.domains.chain_rpc import question_for_chain_rpc
+        from agent.harness.state import new_state
+
+        state = new_state("go-back-interruption-owner", language="en")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "chain_identity": {"canonical": "bsc", "status": "confirmed"},
+            "active_group": "endpoint_process",
+            "custom_rpc": {"status": "needs_method", "endpoint_ready": True},
+            "confirmed_config": {"CLOUD_REGION": "us-east1"},
+            "interruption_stack": [{
+                "group": "provider_deployment",
+                "question_id": "CLOUD_REGION",
+                "field": "CLOUD_REGION",
+                "reason": "explicit_navigation",
+            }],
+        })
+        state["pending_question"] = question_for_chain_rpc(state, "endpoint_process") or {}
+        state["last_user_input"] = "Go back."
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            return_value={"actions": [{
+                "type": "go_back",
+                "source_evidence": state["last_user_input"],
+            }]},
+        ):
+            result = process_turn(state)
+
+        self.assertEqual(result["pending_question"]["id"], "CLOUD_REGION")
+        self.assertEqual(result["active_group"], "provider_deployment")
+        self.assertEqual(result["interruption_stack"], [])
+        self.assertEqual(result["custom_rpc"], {})
 
     def test_deferred_actions_survive_next_turn_and_resume_after_barrier_answer(self) -> None:
         from agent.harness.coordinator import _process_action_queue
@@ -5443,6 +5686,50 @@ network:
         self.assertEqual(result["pending_question"]["id"], "new_chain_endpoint")
         self.assertIn("endpoint validation failed", "\n".join(result.get("visible_response") or []))
 
+    def test_case2_go_back_invalidates_endpoint_evidence_before_family_reentry(self) -> None:
+        from agent.harness.domains.chain_rpc import apply_chain_rpc_action, cancel_chain_rpc_question
+        from agent.harness.contracts import ActionProposal
+        from agent.harness.invariants import apply_state_delta
+        from agent.harness.state import new_state
+
+        state = new_state("case2-back-endpoint", language="en")
+        state["target_mode"] = "real-node"
+        state["workflow_mode"] = "rpc_benchmark"
+        state["chain_identity"] = {
+            "raw": "flow",
+            "canonical": "flow",
+            "adapter_family": "jsonrpc",
+            "status": "existing_family_needs_method",
+            "case": "case2",
+            "identity_confirmed": True,
+        }
+        state["endpoint_evidence"] = {
+            "candidate_endpoint": "https://flow.example/rpc",
+            "candidate_endpoint_ready": True,
+            "new_chain_endpoint_probe": {"ready": True},
+        }
+        question = {
+            "id": "new_chain_method",
+            "group": "endpoint_process",
+            "kind": "text",
+        }
+        cancelled = cancel_chain_rpc_question(state, question)
+        restored = apply_state_delta(state, cancelled.delta, owner="chain_rpc")
+
+        self.assertEqual(restored["chain_identity"]["status"], "needs_protocol_confirmation")
+        self.assertFalse(restored.get("endpoint_evidence"))
+
+        confirmed = apply_chain_rpc_action(
+            restored,
+            ActionProposal(
+                "family-1",
+                "choose_adapter_family",
+                {"adapter_family": "jsonrpc"},
+                "high",
+            ),
+        )
+        self.assertEqual((confirmed.pending_question or {}).get("id"), "new_chain_endpoint")
+
     def test_pending_endpoint_question_explains_requirements_instead_of_repeating_prompt(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
         from agent.harness.state import new_state
@@ -5996,7 +6283,7 @@ network:
         with patch("agent.harness.coordinator.resolve_action_queue") as resolver:
             resolver.return_value = {
                 "actions": [
-                    {"type": "start_custom_rpc", "rpc_endpoint": "endpoint", "reason": "validate a custom method first", "confidence": "high"},
+                    {"type": "start_custom_rpc", "rpc_endpoint": "endpoint", "source_evidence": state["last_user_input"], "reason": "validate a custom method first", "confidence": "high"},
                 ]
             }
             with patch("agent.harness.domains.rpc_endpoint.validate_rpc_endpoint") as probe:
@@ -7714,18 +8001,21 @@ response:
                     "type": "rpc_catalog_command",
                     "catalog_command": "set_endpoint",
                     "rpc_endpoint": "http://fake-node:19000",
+                    "source_evidence": state["last_user_input"],
                     "confidence": "high",
                 },
                 {
                     "type": "rpc_catalog_command",
                     "catalog_command": "set_method",
                     "rpc_method": "eth_chainId",
+                    "source_evidence": state["last_user_input"],
                     "confidence": "high",
                 },
                 {
                     "type": "rpc_catalog_command",
                     "catalog_command": "append_evidence",
                     "rpc_schema_evidence": '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}',
+                    "source_evidence": state["last_user_input"],
                     "confidence": "high",
                 },
             ]
@@ -8687,6 +8977,7 @@ response:
                     "type": "rpc_catalog_command",
                     "catalog_command": "append_evidence",
                     "rpc_schema_evidence": state["last_user_input"],
+                    "source_evidence": state["last_user_input"],
                     "confidence": "high",
                 }]},
             ),
@@ -8747,6 +9038,7 @@ response:
                     "type": "rpc_catalog_command",
                     "catalog_command": "append_evidence",
                     "rpc_schema_evidence": state["last_user_input"],
+                    "source_evidence": state["last_user_input"],
                     "confidence": "high",
                 }]},
             ),
@@ -8814,6 +9106,7 @@ response:
                     "type": "rpc_catalog_command",
                     "catalog_command": "append_evidence",
                     "rpc_schema_evidence": state["last_user_input"],
+                    "source_evidence": state["last_user_input"],
                     "confidence": "high",
                 }]},
             ),
@@ -9565,8 +9858,8 @@ response:
         with patch(
             "agent.harness.coordinator.resolve_action_queue",
             return_value={"actions": [
-                {"type": "start_custom_rpc", "confidence": "high"},
-                {"type": "change_group", "group": "endpoint_process", "navigation_explicit": True, "confidence": "high"},
+                {"type": "start_custom_rpc", "source_evidence": state["last_user_input"], "confidence": "high"},
+                {"type": "change_group", "group": "endpoint_process", "navigation_explicit": True, "source_evidence": state["last_user_input"], "confidence": "high"},
             ]},
         ):
             result = process_turn(state)
@@ -9591,6 +9884,7 @@ response:
             return_value={"actions": [{
                 "type": "start_custom_rpc",
                 "rpc_endpoint": "http://geth-dev:8545",
+                "source_evidence": state["last_user_input"],
                 "confidence": "high",
             }]},
         ):
@@ -9877,6 +10171,7 @@ response:
                     "type": "rpc_catalog_command",
                     "catalog_command": "append_evidence",
                     "rpc_schema_evidence": state["last_user_input"],
+                    "source_evidence": state["last_user_input"],
                     "confidence": "high",
                 }]},
             ),
@@ -10030,7 +10325,7 @@ response:
         self.assertGreater(result["custom_rpc"]["catalog"]["revision"], 1)
         self.assertEqual(result["pending_question"]["id"], "custom_rpc_schema_confirm")
 
-    def test_start_custom_rpc_uses_original_turn_as_schema_evidence(self) -> None:
+    def test_legacy_custom_rpc_compiles_explicit_schema_evidence_action(self) -> None:
         from agent.harness.coordinator import _apply_queue_action
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
         from agent.harness.state import new_state
@@ -10048,9 +10343,11 @@ response:
             "type": "start_custom_rpc",
             "rpc_method": "eth_chainId",
             "rpc_endpoint": "https://example.invalid/rpc",
+            "rpc_schema_evidence": "没有参数",
             "workload_scope": "mixed_replace",
             "rpc_weights": {"eth_chainId": 100},
             "finish_methods": True,
+            "source_evidence": state["last_user_input"],
             "confidence": "high",
         }
         probe = {"ready": True, "status": "ok", "evidence_file": ".agent/evidence/probe.json"}
@@ -10061,7 +10358,7 @@ response:
             for compiled in compile_legacy_custom_rpc_action(action):
                 result = _apply_queue_action(result, compiled, state["last_user_input"])
             self.assertEqual(result["custom_rpc"]["status"], "schema_needs_confirmation")
-            result = self._confirm_catalog_through_graph(result, process_turn)
+            result = self._confirm_catalog_through_domain(result)
 
         self.assertNotIn("LOCAL_RPC_URL", result.get("confirmed_config", {}))
         self.assertEqual(_catalog_draft(result)["params_json"], [])
@@ -10070,6 +10367,46 @@ response:
         self.assertEqual(result["workload"]["mixed_weights"], {"eth_chainId": 100})
         self.assertTrue(result["workload"]["replace_defaults"])
         self.assertIn("自定义 RPC mixed workload 已确认", "\n".join(result["visible_response"]))
+
+    def test_catalog_method_action_does_not_steal_schema_from_turn_text(self) -> None:
+        from agent.harness.contracts import ActionProposal
+        from agent.harness.domains.chain_rpc import apply_chain_rpc_action
+        from agent.harness.state import new_state
+
+        state = new_state("single-catalog-transition", language="en")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "chain_identity": {
+                "raw": "bsc",
+                "canonical": "bsc",
+                "adapter_family": "jsonrpc",
+                "status": "confirmed",
+            },
+            "custom_rpc": {
+                "status": "needs_method",
+                "endpoint": "http://geth-dev:8545",
+                "endpoint_ready": True,
+            },
+            "last_user_input": "Use eth_chainId; it has no parameters and returns a hex quantity.",
+        })
+
+        with patch("agent.harness.domains.rpc_endpoint.extract_rpc_schema_from_evidence") as extractor:
+            outcome = apply_chain_rpc_action(
+                state,
+                ActionProposal(
+                    "set-method-only",
+                    "rpc_catalog_command",
+                    {"catalog_command": "set_method", "rpc_method": "eth_chainId"},
+                    "high",
+                ),
+            )
+            result = _commit_result(state, outcome, owner="chain_rpc")
+
+        extractor.assert_not_called()
+        self.assertEqual(result["custom_rpc"]["status"], "needs_schema_evidence")
+        self.assertEqual(_catalog_draft(result)["method"], "eth_chainId")
+        self.assertFalse(_catalog_draft(result).get("params_json"))
 
     def test_custom_rpc_validation_recovers_inline_weight_hint_after_method_is_known(self) -> None:
         from agent.harness.domains.chain_rpc import apply_chain_rpc_answer
@@ -10208,6 +10545,7 @@ response:
                 "type": "rpc_catalog_command",
                 "catalog_command": "set_endpoint",
                 "rpc_endpoint": "https://example.invalid/rpc",
+                "source_evidence": source,
                 "_origin_text": source,
                 "confidence": "medium",
             },
@@ -10215,6 +10553,7 @@ response:
                 "type": "rpc_catalog_command",
                 "catalog_command": "set_method",
                 "rpc_method": "eth_blockNumber",
+                "source_evidence": source,
                 "_origin_text": source,
                 "confidence": "medium",
             },
@@ -10817,6 +11156,7 @@ response:
             "question": {"id": "freeform_evidence", "kind": "log_evidence"},
             "lines": list(original_lines),
             "language": "zh",
+            "status": "active",
         }
         state["last_user_input"] = "这是什么意思，应该怎么修？"
         with (
@@ -10873,6 +11213,7 @@ response:
             "question": {"id": "freeform_evidence", "kind": "log_evidence"},
             "lines": list(original_lines),
             "language": "zh",
+            "status": "active",
         }
         state["last_user_input"] = "先去配置 QPS"
         with patch("agent.harness.coordinator.resolve_action_queue", return_value={"actions": [
@@ -10896,6 +11237,36 @@ response:
         self.assertEqual(result["active_group"], "target_mode")
         self.assertEqual((result.get("pending_question") or {}).get("group"), "target_mode")
         self.assertEqual((result.get("control") or {}).get("deferred_group"), "qps_profile")
+
+    def test_execution_rejects_append_after_prior_action_pauses_collection(self) -> None:
+        from agent.harness.coordinator import _process_action_queue
+        from agent.harness.state import new_state
+
+        state = new_state("stale-evidence-action", language="en")
+        state["evidence_collection"] = {
+            "question": {"id": "freeform_evidence", "kind": "log_evidence"},
+            "lines": ["Traceback"],
+            "language": "en",
+            "status": "active",
+        }
+        source = "Pause this paste; the next line belongs elsewhere."
+        result = _process_action_queue(state, [
+            {
+                "type": "pause_evidence_collection",
+                "source_evidence": source,
+                "confidence": "high",
+            },
+            {
+                "type": "append_evidence_collection",
+                "evidence": "do not append",
+                "source_evidence": source,
+                "confidence": "high",
+            },
+        ], source)
+
+        self.assertEqual(result["evidence_collection"]["status"], "paused")
+        self.assertEqual(result["evidence_collection"]["lines"], ["Traceback"])
+        self.assertIn("lifecycle_inapplicable", [row.get("error") for row in result.get("action_errors") or []])
 
     def test_paused_evidence_collection_resumes_only_through_typed_action(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
@@ -10997,6 +11368,7 @@ response:
             "question": {"id": "freeform_evidence", "kind": "log_evidence"},
             "lines": ["Traceback (most recent call last):"],
             "language": "en",
+            "status": "active",
         }
         state["last_user_input"] = "Cancel this evidence collection."
         with patch("agent.harness.coordinator.resolve_action_queue", return_value={"actions": [{
@@ -13311,7 +13683,7 @@ response:
                             "evidence": evidence,
                             "grounded_arguments": [
                                 {
-                                    "argument": argument,
+                                    "argument_name": argument,
                                     "evidence_quote": operation,
                                 }
                                 for argument in action.get("required_value_grounding_arguments") or []
@@ -14172,6 +14544,41 @@ response:
             item.get("type") == "answer_pending"
             for item in (result.get("turn_context") or {}).get("admitted_actions") or []
         ))
+
+    def test_semantic_false_option_is_not_rejected_as_an_empty_pending_value(self) -> None:
+        from copy import deepcopy
+        from unittest.mock import patch
+
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from tests.agent_live.harness_contract_scenarios import question_scenarios
+
+        scenario = next(
+            item
+            for item in question_scenarios("en")
+            if item.scenario_id == "mainnet_review"
+        )
+        state = deepcopy(scenario.seed_state)
+        state["pending_question"] = deepcopy(scenario.question)
+        state["last_user_input"] = (
+            "No, do not use the template comparison endpoint; I will provide my own later."
+        )
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            return_value={"actions": [{
+                "type": "answer_pending",
+                "answer": False,
+                "selected_value": False,
+                "source_evidence": state["last_user_input"],
+                "pending_option_semantic_verified": True,
+            }]},
+        ):
+            result = process_turn(state)
+
+        self.assertIs(result["confirmed_config"]["MAINNET_RPC_URL_REVIEWED"], True)
+        self.assertNotEqual(
+            (result.get("pending_question") or {}).get("id"),
+            "MAINNET_RPC_URL_REVIEWED",
+        )
 
 
 if __name__ == "__main__":

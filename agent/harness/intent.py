@@ -31,7 +31,6 @@ from .action_registry import (
 )
 from .context import action_schema, build_action_resolver_prompt, group_schema, workflow_snapshot
 from .domains.environment import (
-    CONFIG_PROPOSAL_FIELDS,
     extract_structured_input_candidates,
     normalize_proposed_config_value,
 )
@@ -98,6 +97,10 @@ GROUP_NAVIGATION_SEMANTIC_POLICY = (
     "the navigation/intake transaction, not a second mutation that navigation must execute immediately. A request "
     "to enter the destination so the user can inspect, compare, or decide among that group's later typed options "
     "is also one navigation/intake transaction; it neither selects an option nor creates a separate unresolved demand. "
+    "However, when the supplied group_schema for that destination declares an entry_action whose purpose matches "
+    "the source request, generic navigation is unsupported: the declared typed entry action owns that subflow and "
+    "its registry-supplied entry arguments. An action that merely shares target_group but is not listed in "
+    "entry_actions is never inferred as an entry. "
     "becomes an owner mutation only when the source explicitly asks to alter, customize, override, or select a "
     "concrete field, value, or default that a registered owner action can apply. Naming the destination resource "
     "again, or expressing a general desire to revise it without a concrete setting or value, is not sufficient. "
@@ -166,23 +169,15 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
             "original_request": request_payload,
         }
         active_pending_contract = bool(state.get("pending_question"))
-        admitted_pending_answer = (
-            _canonicalize_admitted_pending_argument(plan, admission, state)
-            if pending_contract_unresolved and plan is not None and admission is not None
-            else None
+        repaired_response, repair_errors = _compile_semantic_candidate(
+            provider,
+            system_prompt=(
+                _pending_contract_adjudication_prompt()
+                if active_pending_contract
+                else _action_plan_repair_prompt()
+            ),
+            request_payload=repair_payload,
         )
-        if admitted_pending_answer is not None:
-            repaired_response, repair_errors = admitted_pending_answer, ()
-        else:
-            repaired_response, repair_errors = _compile_semantic_candidate(
-                provider,
-                system_prompt=(
-                    _pending_contract_adjudication_prompt()
-                    if active_pending_contract
-                    else _action_plan_repair_prompt()
-                ),
-                request_payload=repair_payload,
-            )
         repaired, repaired_validation = _prepare_bounded_semantic_candidate(
             repaired_response,
             state,
@@ -205,6 +200,7 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
                 repaired_plan,
                 final_admission,
                 state,
+                focused_adjudication=True,
             )
         )
         if (
@@ -233,70 +229,6 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
             "actions": [{"type": "unknown", "reason": f"action queue resolver failed: {type(exc).__name__}", "confidence": "low"}],
             "reason": "resolver failed",
         }
-
-
-def _canonicalize_admitted_pending_argument(
-    plan: ImmutableSemanticPlan,
-    admission: WholePlanAdmission,
-    state: AgentGraphState,
-) -> str | None:
-    """Convert one independently admitted pending-value argument to its owner."""
-
-    pending = dict(state.get("pending_question") or {})
-    if pending.get("manual_input_allowed") is not True:
-        return None
-    payload = plan.document()
-    request = plan.request_payload()
-    actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
-    records = {
-        str(record.get("action_id") or ""): record
-        for record in request.get("actions") or []
-        if isinstance(record, Mapping)
-    }
-    candidates: list[tuple[int, Any, Mapping[str, Any]]] = []
-    for index, row in enumerate(admission.action_verdicts):
-        candidate_id = str(row.get("pending_answer_argument") or "")
-        if not candidate_id or index >= len(actions) or not isinstance(actions[index], Mapping):
-            continue
-        record = records.get(str(row.get("action_id") or "")) or {}
-        candidate = next(
-            (
-                item for item in record.get("pending_value_candidates") or []
-                if isinstance(item, Mapping)
-                and str(item.get("candidate_id") or "") == candidate_id
-            ),
-            None,
-        )
-        if candidate is None or not value_satisfies_pending_contract(candidate.get("value"), pending):
-            raise ValueError("admitted pending argument does not satisfy the active contract")
-        candidates.append((index, candidate.get("value"), row))
-    if not candidates:
-        return None
-    if len(candidates) != 1:
-        raise ValueError("whole-plan admission selected multiple pending answer arguments")
-    index, pending_value, row = candidates[0]
-    original = dict(actions[index])
-    source = str(original.get("source_evidence") or "").strip()
-    if not source:
-        direct = next(
-            (
-                evidence for evidence in row.get("evidence") or []
-                if isinstance(evidence, Mapping)
-                and str(evidence.get("relation") or "") == "direct"
-                and str(evidence.get("quote") or "").strip()
-            ),
-            {},
-        )
-        source = str(direct.get("quote") or "").strip()
-    actions[index] = {
-        "type": "answer_pending",
-        "answer": pending_value,
-        "source_evidence": source,
-        "confidence": str(original.get("confidence") or "medium"),
-    }
-    payload["actions"] = actions
-    payload.pop("admission_action_ids", None)
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
 def _compile_semantic_candidate(
@@ -332,19 +264,12 @@ def _prepare_bounded_semantic_candidate(
         candidate = _apply_state_plan_policy(candidate, state)
         candidate = _reconcile_structured_candidate_ownership(candidate, clauses, state)
         candidate = _remove_empty_config_proposals(candidate)
-        candidate = _normalize_prose_pending_field_proposal(
-            candidate,
-            state,
-            clauses,
-            user_text,
-        )
         candidate = _materialize_absent_semantic_units(candidate, clauses)
         candidate = _canonicalize_candidate_config_proposals(candidate)
         candidate = _reset_candidate_action_ids(candidate)
         candidate = _canonicalize_pending_choice_actions(candidate, state)
         candidate = _mark_pending_owner_candidates(candidate, state)
         validation = _validate_action_document(candidate, clauses, state)
-        validation = _validate_action_source_grounding(candidate, validation)
     except ValueError as exc:
         candidate = "{}"
         validation = _invalid_plan_coverage(clauses, (str(exc),))
@@ -650,12 +575,25 @@ def _validate_action_source_grounding(
     for index, action in enumerate(actions):
         if not isinstance(action, dict):
             continue
+        spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
+        exact_arguments = tuple(spec.exact_source_value_arguments if spec is not None else ())
         source = str(action.get("source_evidence") or "").strip()
         if not source:
+            if exact_arguments:
+                errors.append(
+                    f"action {index} has exact source values but no source_evidence"
+                )
             continue
         units = _source_units_for_action(payload, index)
         if not any(source in str(unit.get("source_text") or "") for unit in units):
             errors.append(f"action {index} source_evidence is not an exact mapped-unit quote")
+            continue
+        for value_argument in exact_arguments:
+            value = str(action.get(value_argument) or "").strip()
+            if value and value not in source:
+                errors.append(
+                    f"action {index} {value_argument} is not present in its exact source_evidence"
+                )
     return _merge_plan_errors(validation, tuple(errors)) if errors else validation
 
 
@@ -685,6 +623,8 @@ def _admitted_plan_requires_pending_contract_adjudication(
     plan: ImmutableSemanticPlan,
     admission: WholePlanAdmission,
     state: AgentGraphState,
+    *,
+    focused_adjudication: bool = False,
 ) -> bool:
     """Detect admitted work that bypasses an active typed question owner."""
 
@@ -693,11 +633,28 @@ def _admitted_plan_requires_pending_contract_adjudication(
         return False
     payload = plan.document()
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    focused_valid_pending_answer = focused_adjudication and any(
+        isinstance(action, Mapping)
+        and str(action.get("type") or "") == "answer_pending"
+        and _reviewer_selected_pending_value(
+            plan,
+            admission,
+            index,
+            state,
+        )
+        == action.get("selected_value", action.get("answer"))
+        for index, action in enumerate(actions)
+    )
     if payload.get("pending_choice_contracts") or any(
-        isinstance(action, Mapping) and str(action.get("type") or "") == "answer_pending"
+        isinstance(action, dict) and _action_owns_pending_candidate(action, state)
         for action in actions
     ):
         return False
+    invalid_pending_answer = any(
+        isinstance(action, Mapping)
+        and str(action.get("type") or "") == "answer_pending"
+        for action in actions
+    ) and not focused_valid_pending_answer
     units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
     unresolved = any(
         isinstance(unit, Mapping) and str(unit.get("disposition") or "") == "unresolved"
@@ -719,14 +676,40 @@ def _admitted_plan_requires_pending_contract_adjudication(
         for row in admission.action_verdicts
         if isinstance(row, Mapping)
     )
+    selected_indexes = {
+        index
+        for index, row in enumerate(admission.action_verdicts)
+        if isinstance(row, Mapping)
+        and str(row.get("pending_answer_argument") or "")
+    }
+    if (
+        selected_indexes
+        and all(
+            index < len(actions)
+            and isinstance(actions[index], Mapping)
+            and str(actions[index].get("type") or "") == "propose_config_values"
+            for index in selected_indexes
+        )
+        and not unresolved
+    ):
+        # A structured configuration proposal intentionally interrupts a raw
+        # field question with the standard inferred-review transaction. It
+        # must not be collapsed back into a direct pending answer merely
+        # because the proposal contains that field's value.
+        return False
     # The independent reviewer has already compared every typed candidate with
     # the active pending contract. An admitted mutation with no selected
     # pending argument is an interruption and must retain normal cross-group
     # routing instead of being forced to consume an unrelated question.
-    return bool(reviewer_selected_pending_owner or unresolved or any(
+    return bool(
+        invalid_pending_answer
+        or (reviewer_selected_pending_owner and not focused_valid_pending_answer)
+        or unresolved
+        or any(
         isinstance(action, Mapping) and str(action.get("type") or "") == "clarify_unresolved"
         for action in actions
-    ))
+        )
+    )
 
 
 def _freeze_bounded_semantic_plan(
@@ -777,6 +760,7 @@ def _freeze_bounded_semantic_plan(
             "required_value_grounding_arguments": list(
                 semantic_grounding_arguments(action)
             ),
+            "exact_source_value_arguments": list(spec.exact_source_value_arguments),
             "pending_value_candidates": pending_value_candidates,
             "unit_ids": [
                 unit_ids[unit_index]
@@ -821,7 +805,10 @@ def _pending_operation_value_candidates(
     if pending.get("manual_input_allowed") is not True:
         return []
     output: list[dict[str, Any]] = []
+    seen_values: set[str] = set()
     for argument, value in operation_arguments.items():
+        if str(argument) in {"source_evidence", "reason"}:
+            continue
         values: list[tuple[tuple[str, ...], Any]] = [((), value)]
         if isinstance(value, Mapping):
             values.extend(
@@ -831,6 +818,10 @@ def _pending_operation_value_candidates(
         for path, candidate in values:
             if not value_satisfies_pending_contract(candidate, dict(pending)):
                 continue
+            identity = json.dumps(candidate, ensure_ascii=False, sort_keys=True, default=str)
+            if identity in seen_values:
+                continue
+            seen_values.add(identity)
             output.append({
                 "candidate_id": f"candidate-{len(output)}",
                 "argument": str(argument),
@@ -856,6 +847,43 @@ def _semantic_unit_owner_indexes(
     ):
         return list(range(len(actions)))
     return []
+
+
+_NO_REVIEWED_PENDING_VALUE = object()
+
+
+def _reviewer_selected_pending_value(
+    plan: ImmutableSemanticPlan,
+    admission: WholePlanAdmission,
+    action_index: int,
+    state: AgentGraphState,
+) -> Any:
+    """Return the exact typed candidate explicitly selected by the reviewer."""
+
+    if action_index >= len(admission.action_verdicts):
+        return _NO_REVIEWED_PENDING_VALUE
+    row = admission.action_verdicts[action_index]
+    candidate_id = str(row.get("pending_answer_argument") or "")
+    if not candidate_id:
+        return _NO_REVIEWED_PENDING_VALUE
+    records = plan.request_payload().get("actions") or []
+    if action_index >= len(records) or not isinstance(records[action_index], Mapping):
+        return _NO_REVIEWED_PENDING_VALUE
+    candidate = next(
+        (
+            item
+            for item in records[action_index].get("pending_value_candidates") or []
+            if isinstance(item, Mapping)
+            and str(item.get("candidate_id") or "") == candidate_id
+        ),
+        None,
+    )
+    if candidate is None:
+        return _NO_REVIEWED_PENDING_VALUE
+    value = candidate.get("value")
+    if not value_satisfies_pending_contract(value, dict(state.get("pending_question") or {})):
+        return _NO_REVIEWED_PENDING_VALUE
+    return value
 
 
 def _admitted_action_queue(
@@ -888,12 +916,28 @@ def _admitted_action_queue(
         row = action_rows.get(action_ids[index])
         if row is None:
             raise ValueError("admitted immutable plan is missing an action verdict")
-        if _action_owns_pending_candidate(action, state) or _admitted_manual_answer_owns_pending(
-            action,
-            state,
-            payload,
+        reviewed_pending_value = _reviewer_selected_pending_value(
+            plan,
+            admission,
             index,
-            row,
+            state,
+        )
+        if (
+            (
+                (
+                    action_type != "answer_pending"
+                    or bool(_declared_option_for_pending_answer(action, dict(state.get("pending_question") or {})))
+                )
+                and _action_owns_pending_candidate(action, state)
+            )
+            or _admitted_manual_answer_owns_pending(
+                action,
+                state,
+                payload,
+                index,
+                row,
+                reviewed_pending_value,
+            )
         ):
             pending_indexes.append(index)
         if action_type in {"choose_chain", "change_chain"}:
@@ -982,6 +1026,7 @@ def _admitted_manual_answer_owns_pending(
     payload: Mapping[str, Any],
     action_index: int,
     admission_row: Mapping[str, Any],
+    reviewed_pending_value: Any,
 ) -> bool:
     """Bind a semantically normalized value after independent admission."""
 
@@ -990,6 +1035,8 @@ def _admitted_manual_answer_owns_pending(
         str(action.get("type") or "") != "answer_pending"
         or pending.get("manual_input_allowed") is not True
         or not value_satisfies_pending_contract(action.get("answer"), pending)
+        or reviewed_pending_value is _NO_REVIEWED_PENDING_VALUE
+        or reviewed_pending_value != action.get("answer")
     ):
         return False
     source = str(action.get("source_evidence") or "").strip()
@@ -1001,6 +1048,7 @@ def _admitted_manual_answer_owns_pending(
     }
     return bool(
         source
+        and _manual_answer_has_literal_source(dict(action), source)
         and any(
             str(unit.get("unit_id") or "") in admitted_unit_ids
             and source in str(unit.get("source_text") or "")
@@ -1210,8 +1258,8 @@ def _apply_state_plan_policy(text: str, state: AgentGraphState) -> str:
             json.dumps(payload, ensure_ascii=False, sort_keys=True),
             lifecycle_rejected,
             reason=(
-                "operation is incompatible with the active target-mode lifecycle; "
-                "answer the active typed question or explicitly change target mode first"
+                "operation is incompatible with the current typed lifecycle state; "
+                "complete or explicitly change the owning workflow state first"
             ),
         )
         payload = _parse_json_object(text)
@@ -1253,16 +1301,12 @@ def _reconcile_structured_candidate_ownership(
     clauses: tuple[TurnClause, ...],
     state: AgentGraphState | None = None,
 ) -> str:
-    """Complete syntax-owned facts after the model selects config intent.
+    """Hydrate only compiler-owned structured configuration proposals.
 
-    The model decides whether a structured clause is configuration at all.
-    Once it maps that clause to ``propose_config_values``, the deterministic
-    parser owns lossless transfer of recognized and unmapped assignments. An
-    exact registered config assignment that the model tried to bind directly
-    to the active manual field is also a configuration transaction, so this
-    boundary converts it to the same review proposal. This keeps logs/examples
-    outside the configuration path while preventing either silent field loss
-    or review bypass.
+    Semantic compilation owns action type and unit ownership. After it maps a
+    structured clause to exactly one ``propose_config_values`` action, the
+    deterministic parser owns lossless field transfer. It never converts an
+    answer, claims an unresolved unit, or infers another workflow owner.
     """
 
     payload = _parse_json_object(text)
@@ -1272,17 +1316,6 @@ def _reconcile_structured_candidate_ownership(
         return text
 
     changed = False
-    pending = dict((state or {}).get("pending_question") or {})
-    pending_field = str(pending.get("field") or "").strip().upper()
-    structured_pending_values = []
-    if pending.get("manual_input_allowed") is True and pending_field:
-        for candidate_clause in clauses:
-            if candidate_clause.input_shape != "structured":
-                continue
-            candidate = extract_structured_input_candidates(candidate_clause.text) or {}
-            candidate_values = dict(candidate.get("config_values") or {})
-            if pending_field in candidate_values:
-                structured_pending_values.append(candidate_values[pending_field])
     for clause in clauses:
         if clause.input_shape != "structured":
             continue
@@ -1305,87 +1338,10 @@ def _reconcile_structured_candidate_ownership(
             and isinstance(actions[index], dict)
             and str(actions[index].get("type") or "") == "propose_config_values"
         }
-        if (
-            not proposal_indexes
-            and pending.get("manual_input_allowed") is True
-            and pending_field
-            and pending_field in config_values
-        ):
-            direct_answer_indexes = {
-                index
-                for unit in clause_units
-                for index in (
-                    unit.get("action_indexes")
-                    if isinstance(unit.get("action_indexes"), list)
-                    else []
-                )
-                if isinstance(index, int)
-                and 0 <= index < len(actions)
-                and isinstance(actions[index], dict)
-                and str(actions[index].get("type") or "") == "answer_pending"
-            }
-            if direct_answer_indexes:
-                proposal_index = min(direct_answer_indexes)
-                actions[proposal_index] = {
-                    "type": "propose_config_values",
-                    "source_format": str(candidates.get("source_format") or "mixed"),
-                    "config_values": dict(config_values),
-                    "unmapped_values": dict(unmapped_values),
-                    "source_evidence": clause.text,
-                    "confidence": "high",
-                }
-                for unit in clause_units:
-                    indexes = (
-                        unit.get("action_indexes")
-                        if isinstance(unit.get("action_indexes"), list)
-                        else []
-                    )
-                    if not any(index in direct_answer_indexes for index in indexes):
-                        continue
-                    unit["action_indexes"] = [
-                        *[index for index in indexes if index not in direct_answer_indexes],
-                        proposal_index,
-                    ]
-                    unit["disposition"] = "action"
-                    unit["reason"] = "registered structured config assignment requires review"
-                proposal_indexes = {proposal_index}
-                changed = True
-            elif len(structured_pending_values) == 1:
-                pending_answer_indexes = {
-                    index
-                    for index, action in enumerate(actions)
-                    if isinstance(action, dict)
-                    and str(action.get("type") or "") == "answer_pending"
-                    and str(
-                        action.get("selected_value")
-                        if action.get("selected_value") is not None
-                        else action.get("answer") or ""
-                    ).strip().strip("\"'")
-                    == str(structured_pending_values[0]).strip().strip("\"'")
-                }
-                if len(pending_answer_indexes) == 1:
-                    proposal_index = next(iter(pending_answer_indexes))
-                    actions[proposal_index] = {
-                        "type": "propose_config_values",
-                        "source_format": str(candidates.get("source_format") or "mixed"),
-                        "config_values": dict(config_values),
-                        "unmapped_values": dict(unmapped_values),
-                        "source_evidence": clause.text,
-                        "confidence": "high",
-                    }
-                    for unit in clause_units:
-                        unit["action_indexes"] = [proposal_index]
-                        unit["disposition"] = "action"
-                        unit["reason"] = "source-grounded structured config assignment requires review"
-                    payload["pending_answer_admissions"] = [
-                        index
-                        for index in payload.get("pending_answer_admissions", [])
-                        if index != proposal_index
-                    ]
-                    proposal_indexes = {proposal_index}
-                    changed = True
         if not proposal_indexes:
             continue
+        if len(proposal_indexes) != 1:
+            raise ValueError("one structured clause must have exactly one configuration proposal owner")
         for index in proposal_indexes:
             action = actions[index]
             merged_config = dict(action.get("config_values") or {})
@@ -1405,161 +1361,9 @@ def _reconcile_structured_candidate_ownership(
             action["unmapped_values"] = merged_unmapped
             changed = changed or before != (merged_config, merged_unmapped)
 
-        proposal_index = min(proposal_indexes)
-        for unit in clause_units:
-            if str(unit.get("disposition") or "") != "unresolved":
-                continue
-            unit_candidates = extract_structured_input_candidates(str(unit.get("source_text") or ""))
-            if not unit_candidates:
-                continue
-            if not (
-                unit_candidates.get("config_values")
-                or unit_candidates.get("unmapped_values")
-            ):
-                continue
-            unit["disposition"] = "action"
-            unit["action_indexes"] = [proposal_index]
-            unit["reason"] = "deterministic structured assignment owned by propose_config_values"
-            changed = True
-
-        workflow_values = dict(candidates.get("workflow_values") or {})
-        workflow_owner_indexes: set[int] = set()
-        every_workflow_value_owned = True
-        for key, value in workflow_values.items():
-            assignment = f"{key}={value}"
-            owners = {
-                index
-                for index, action in enumerate(actions)
-                if isinstance(action, dict)
-                and str(action.get("type") or "") != "propose_config_values"
-                and assignment.casefold() in str(action.get("source_evidence") or "").casefold()
-            }
-            if not owners:
-                every_workflow_value_owned = False
-                break
-            workflow_owner_indexes.update(owners)
-        if every_workflow_value_owned:
-            owner_indexes = sorted(proposal_indexes | workflow_owner_indexes)
-            atomic_unit = {
-                "unit_id": f"{clause.clause_id}-structured",
-                "clause_id": clause.clause_id,
-                "source_text": clause.text,
-                "disposition": "action",
-                "action_indexes": owner_indexes,
-                "reason": "atomic structured configuration transaction",
-            }
-            normalized_units: list[dict[str, Any]] = []
-            inserted = False
-            for unit in units:
-                if (
-                    isinstance(unit, dict)
-                    and str(unit.get("clause_id") or "") == clause.clause_id
-                ):
-                    if not inserted:
-                        normalized_units.append(atomic_unit)
-                        inserted = True
-                    continue
-                if isinstance(unit, dict):
-                    normalized_units.append(unit)
-            if not inserted:
-                normalized_units.append(atomic_unit)
-            payload["semantic_units"] = normalized_units
-            units = payload["semantic_units"]
-            changed = True
-
     if not changed:
         return text
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
-
-
-def _normalize_prose_pending_field_proposal(
-    text: str,
-    state: AgentGraphState,
-    clauses: tuple[TurnClause, ...],
-    user_text: str,
-) -> str:
-    """Compile a prose-supplied pending scalar back to its finite owner."""
-
-    pending = dict(state.get("pending_question") or {})
-    pending_field = str(pending.get("field") or "").strip().upper()
-    if (
-        pending.get("manual_input_allowed") is not True
-        or pending_field not in CONFIG_PROPOSAL_FIELDS
-        or not clauses
-        or any(clause.input_shape != "prose" for clause in clauses)
-    ):
-        return text
-
-    payload = _parse_json_object(text)
-    actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
-    proposal_indexes = [
-        index
-        for index, action in enumerate(actions)
-        if isinstance(action, dict)
-        and str(action.get("type") or "") == "propose_config_values"
-    ]
-    if len(proposal_indexes) != 1:
-        return text
-    proposal_index = proposal_indexes[0]
-    proposal = actions[proposal_index]
-    config_values = dict(proposal.get("config_values") or {})
-    normalized_values = {
-        str(key).strip().upper(): value for key, value in config_values.items()
-    }
-    residual_values = {
-        key: value
-        for key, value in normalized_values.items()
-        if key != pending_field
-        and not _proposal_value_matches_confirmed_config(state, key, value)
-    }
-    if (
-        pending_field not in normalized_values
-        or residual_values
-        or proposal.get("unmapped_values")
-        or proposal.get("conflicts")
-    ):
-        return text
-    answer = str(normalized_values[pending_field]).strip()
-    if (
-        not answer
-        or not value_satisfies_pending_contract(answer, pending)
-        or re.search(
-            rf"(?<!\w){re.escape(answer)}(?!\w)",
-            str(user_text or ""),
-            flags=re.IGNORECASE,
-        ) is None
-    ):
-        return text
-    actions[proposal_index] = {
-        "type": "answer_pending",
-        "answer": answer,
-        "source_evidence": answer,
-    }
-    payload["actions"] = actions
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
-
-
-def _proposal_value_matches_confirmed_config(
-    state: AgentGraphState,
-    key: str,
-    proposed_value: Any,
-) -> bool:
-    """Return whether a proposal only reaffirms canonical confirmed state."""
-
-    normalized_key, normalized_proposed = normalize_proposed_config_value(key, proposed_value)
-    confirmed = dict(state.get("confirmed_config") or {})
-    state_key = (
-        "has_accounts_device"
-        if normalized_key == "HAS_ACCOUNTS_DEVICE"
-        else normalized_key
-    )
-    if state_key not in confirmed:
-        return False
-    _current_key, normalized_current = normalize_proposed_config_value(
-        normalized_key,
-        confirmed[state_key],
-    )
-    return normalized_proposed == normalized_current
 
 
 def _remove_empty_config_proposals(text: str) -> str:
@@ -1613,6 +1417,18 @@ def _validate_action_document(
             rejected_action_indexes.add(index)
             continue
         if (
+            str(raw.get("type") or "") == "go_back"
+            and state is not None
+            and not (state.get("group_history") or [])
+            and not (state.get("interruption_stack") or [])
+        ):
+            action_errors.append(
+                f"action {index} go_back has no recoverable previous or interrupted group; "
+                "use named group navigation when the source supplies a destination"
+            )
+            rejected_action_indexes.add(index)
+            continue
+        if (
             pending
             and not pending_admissions
             and str(raw.get("type") or "") == "change_group"
@@ -1644,11 +1460,42 @@ def _validate_action_document(
                 f"for pending question {pending.get('id')!r}"
             )
             rejected_action_indexes.add(index)
-    coverage = validate_plan_coverage(payload, clauses)
+    units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
+    for clause in clauses:
+        if clause.input_shape != "structured":
+            continue
+        candidates = extract_structured_input_candidates(clause.text) or {}
+        if not candidates.get("config_values"):
+            continue
+        for unit in units:
+            if not isinstance(unit, Mapping) or str(unit.get("clause_id") or "") != clause.clause_id:
+                continue
+            for index in unit.get("action_indexes") or []:
+                if (
+                    isinstance(index, int)
+                    and not isinstance(index, bool)
+                    and 0 <= index < len(payload["actions"])
+                    and isinstance(payload["actions"][index], Mapping)
+                    and str(payload["actions"][index].get("type") or "") == "answer_pending"
+                ):
+                    action_errors.append(
+                        f"action {index} bypasses structured configuration review for {clause.clause_id}"
+                    )
+                    rejected_action_indexes.add(index)
+    coverage = validate_plan_coverage(
+        payload,
+        clauses,
+        pending_answer_action_indexes=tuple(
+            index
+            for index, action in enumerate(payload["actions"])
+            if isinstance(action, dict)
+            and _action_owns_pending_candidate(action, state or {})
+        ),
+    )
     if state is not None:
         action_errors.extend(_validate_pending_choice_contracts(payload, state))
     if not action_errors:
-        return coverage
+        return _validate_action_source_grounding(text, coverage)
     return PlanCoverageResult(
         valid=False,
         errors=tuple([*action_errors, *coverage.errors]),
@@ -1694,6 +1541,46 @@ def _semantic_action_purpose(
         )
     if action_type == "answer_pending" and state:
         return "Supply a source-grounded answer that actually satisfies the active typed pending contract."
+    if action_type == "change_group":
+        target_group = str(action.get("group") or "").strip()
+        entry_purposes = [
+            spec.entry_intake_purpose
+            for spec in ACTION_SPECS
+            if spec.entry_intake
+            and spec.target_group == target_group
+            and spec.entry_intake_purpose.strip()
+        ]
+        exclusion = (
+            " Registered typed entry purposes excluded from this generic navigation are: "
+            + "; ".join(entry_purposes)
+            if entry_purposes
+            else ""
+        )
+        return (
+            f"Temporarily suspend the active group and navigate to workflow group {target_group!r} "
+            "for a general request to visit or revisit that area which does not match a registered "
+            "typed entry purpose; after the destination work completes, resume the interrupted group."
+            f"{exclusion}"
+        )
+    if action_type == "go_back":
+        history = [str(value) for value in (state or {}).get("group_history") or [] if str(value)]
+        interruptions = [
+            str(row.get("group") or "")
+            for row in (state or {}).get("interruption_stack") or []
+            if isinstance(row, Mapping) and str(row.get("group") or "")
+        ]
+        recoverable = [*history, *interruptions]
+        availability = (
+            f"The current recoverable group sequence is {recoverable!r}."
+            if recoverable
+            else "The current state has no recoverable previous or interrupted group, so this operation is unavailable."
+        )
+        return (
+            "Return only to the most recent recoverable previous/interrupted workflow group. "
+            "This operation does not select an explicitly named destination when no matching recoverable group exists; "
+            "that request belongs to named group navigation. "
+            + availability
+        )
     if action_type == "answer_opening_question":
         topic = canonical_consultation_topic(action.get("topic"))
         subject = str(action.get("subject") or "").strip()
@@ -2318,25 +2205,45 @@ def _pending_contract_adjudication_prompt() -> str:
     """Return the single bounded adjudication contract for an active question."""
 
     return (
-        _action_plan_repair_prompt()
-        + " The original_request contains one active typed pending question. Re-adjudicate the complete "
-        "user turn once. If any semantic unit selects one declared option, represent that selection only "
-        "as answer_pending with selected_value exactly equal to that option's declared value and "
-        "source_evidence copied from the selecting semantic unit. If the question accepts manual input "
-        "and a semantic unit supplies a value satisfying its typed validation, represent that value only "
-        "as answer_pending with answer equal to the exact extracted value and source_evidence copied from "
-        "the supplying semantic unit. pending_typed_candidates are syntax-only candidates derived from the "
-        "question's declared validation; use one only when the source semantically selects it, and never "
-        "guess among multiple candidates. Do not emit a domain owner mutation for the same answer. Preserve "
-        "every unrelated, interrupting, or compound demand as its own registered action and preserve all "
-        "semantic-unit mappings. If the active question is not resolved by the source, leave it unresolved "
-        "rather than guessing. Return one complete plan; this is the only focused adjudication and the "
-        "entire result remains subject to whole-plan admission."
+        "You are the focused typed-question adjudicator for AnyChain Benchmark Agent. "
+        "Return one JSON action plan only; never answer the user. This is the only focused adjudication. "
+        "Read original_request.user_text, clauses, workflow_state.pending_question, "
+        "pending_typed_candidates, action_schema, invalid_output, and validation_errors. "
+        "Decide only whether the source semantically answers the active typed question, while preserving "
+        "every independent consultation, mutation, navigation, or evidence demand already present. "
+        "For a declared option, emit answer_pending with selected_value exactly equal to that option's "
+        "declared value. For manual input, emit answer_pending with answer equal to one exact extracted "
+        "value that satisfies validation. A pending_typed_candidate is syntax evidence, not permission: "
+        "select it only when the source actually supplies it as the answer. A candidate mentioned only as "
+        "an example, quotation, rejected option, negated operation, correction target, or value the user "
+        "explicitly says not to apply is not an answer. Partial request, response, "
+        "documentation, endpoint, or protocol evidence is a valid manual contribution when the pending "
+        "contract declares an evidence owner; do not require all evidence at once. Do not emit the domain "
+        "manual owner as a duplicate of answer_pending. A structured_candidates row containing config_values "
+        "is always one propose_config_values review transaction, including when one field matches the active "
+        "pending question. Never convert that structured clause to answer_pending; inferred review owns its "
+        "confirmation. Registered structured config values for other fields remain in that same proposal and "
+        "must not be discarded merely because another question is pending. Keep unrelated valid actions from "
+        "invalid_output. "
+        "Return semantic_units covering every clause. Each row must be "
+        "{unit_id, clause_id, source_text, disposition:'action'|'context'|'unresolved', "
+        "action_indexes:[zero-based indexes], reason}. Copy clause_id and exact source_text from the "
+        "authoritative clauses; never omit either field. Structured clauses remain atomic. Each action "
+        "source_evidence must be an exact excerpt of one mapped source unit. "
+        "Use only declared action types and arguments. If the source does not answer the pending contract, "
+        "leave that unit unresolved rather than guessing. The complete result remains subject to independent "
+        "whole-plan admission."
     )
 
 
 def _action_queue_prompt() -> str:
-    return build_action_resolver_prompt() + GROUP_NAVIGATION_SEMANTIC_POLICY
+    return (
+        build_action_resolver_prompt()
+        + GROUP_NAVIGATION_SEMANTIC_POLICY
+        + " A structured_candidates row containing config_values is one propose_config_values review "
+        "transaction even when a field matches the active pending question. Never map that structured "
+        "configuration clause to answer_pending; inferred review owns confirmation."
+    )
 
 
 def _action_queue_payload(state: AgentGraphState, text: str) -> dict[str, Any]:
@@ -2354,6 +2261,15 @@ def _action_queue_payload(state: AgentGraphState, text: str) -> dict[str, Any]:
                 **candidates,
             })
     pending = dict(state.get("pending_question") or {})
+    pending_candidates: list[Any] = list(typed_pending_value_candidates(raw, pending))
+    unique_pending_candidates: list[Any] = []
+    seen_pending_candidates: set[str] = set()
+    for value in pending_candidates:
+        identity = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        if identity in seen_pending_candidates:
+            continue
+        seen_pending_candidates.add(identity)
+        unique_pending_candidates.append(value)
     return {
         "user_text": raw,
         "clauses": [clause.as_dict() for clause in clauses],
@@ -2363,9 +2279,7 @@ def _action_queue_payload(state: AgentGraphState, text: str) -> dict[str, Any]:
             "contains_json_delimiters": "{" in raw and "}" in raw,
         },
         "structured_candidates": structured_candidates,
-        "pending_typed_candidates": list(
-            typed_pending_value_candidates(raw, pending)
-        ),
+        "pending_typed_candidates": unique_pending_candidates,
         "action_schema": action_schema(),
         "semantic_scope_schema": semantic_scope_schema(),
         "group_schema": group_schema(),

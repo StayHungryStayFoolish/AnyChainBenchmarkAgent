@@ -183,7 +183,23 @@ def apply_coordinator_action(state: AgentGraphState, action: ActionProposal) -> 
             stop_after_response=True,
         )
     if action.action_type == "go_back":
+        control = dict(next_state.get("control") or {})
+        control.pop("field_reconfiguration_continuation", None)
+        next_state["control"] = control
         resume_group = str(action.arguments.get("cancellation_resume_group") or "").strip()
+        interrupted_question = _pop_interruption_question(next_state)
+        if interrupted_question:
+            _install_pending_question(next_state, interrupted_question)
+            return HandlerResult(
+                consumed_action_ids=(action.action_id,),
+                pending_question=interrupted_question,
+                visible_result=_render_question(
+                    interrupted_question,
+                    next_state.get("language", "en"),
+                ),
+                completion="blocked",
+                stop_after_response=True,
+            )
         if resume_group:
             _discard_cancelled_origin_from_history(next_state)
         previous_group = resume_group or _pop_previous_group(next_state)
@@ -820,7 +836,7 @@ def _validate_action_plan(state: AgentGraphState, actions: list[dict[str, Any]])
             for index in lifecycle_rejected
         )
         raise StateInvariantError(
-            f"actions incompatible with active target-mode lifecycle: {rejected_types}"
+            f"actions incompatible with current typed lifecycle state: {rejected_types}"
         )
     identity = state.get("chain_identity") or {}
     if identity.get("case") == "case3" and identity.get("adapter_family") == "unsupported":
@@ -877,20 +893,23 @@ def _validate_action_plan(state: AgentGraphState, actions: list[dict[str, Any]])
             item for item in prepared
             if str(item.get("type") or "") != "choose_adapter_family"
         ]
-    if any(str(item.get("type") or "") == "answer_pending" for item in prepared):
-        accepted = {
-            str(action_type).strip()
-            for action_type in (state.get("pending_question") or {}).get("accepted_action_types") or []
-            if str(action_type).strip() and str(action_type).strip() != "answer_pending"
-        }
-        # One turn may express the choice both as an answer to the current
-        # contract and as a domain mutation. The answered contract is the
-        # authority; replaying its equivalent setter can recreate the same
-        # question and reorder unrelated queued work.
+    pending_answers = [
+        item for item in prepared
+        if str(item.get("type") or "") == "answer_pending"
+    ]
+    if pending_answers:
+        # One turn may express the current answer both as answer_pending and as
+        # its declared domain effect. Drop only that exact duplicate effect.
+        # Another operation owned by the same action type (for example a
+        # custom-RPC method supplied beside an endpoint answer) is independent
+        # durable work and must survive the newly created question barrier.
         prepared = [
             item for item in prepared
             if str(item.get("type") or "") == "answer_pending"
-            or str(item.get("type") or "") not in accepted
+            or not any(
+                _action_duplicates_pending_answer_effect(state, item, answer)
+                for answer in pending_answers
+            )
         ]
     prepared = [
         item
@@ -976,6 +995,72 @@ def _validate_action_plan(state: AgentGraphState, actions: list[dict[str, Any]])
         })
     prepared = _drop_redundant_group_navigation(state, prepared)
     return _ensure_action_prerequisites(state, prepared)
+
+
+def _action_duplicates_pending_answer_effect(
+    state: AgentGraphState,
+    action: Mapping[str, Any],
+    pending_answer: Mapping[str, Any],
+) -> bool:
+    """Match a sibling action to the current answer's declared exact effect."""
+
+    pending = dict(state.get("pending_question") or {})
+    selected = pending_answer.get("selected_value")
+    declared = action_for_value(pending, selected)
+    if not declared and pending.get("manual_input_allowed") is True:
+        manual = pending.get("manual_action")
+        if isinstance(manual, Mapping):
+            declared = {
+                str(key): value
+                for key, value in manual.items()
+                if str(key) not in {"value_argument", "use_complete_turn"}
+            }
+            value_argument = str(manual.get("value_argument") or "").strip()
+            answer_value = (
+                selected
+                if selected not in (None, "")
+                else pending_answer.get("answer")
+            )
+            if value_argument and answer_value not in (None, ""):
+                declared[value_argument] = answer_value
+    if not declared or str(action.get("type") or "") != str(declared.get("type") or ""):
+        return False
+    effect_fields = {
+        key: value
+        for key, value in declared.items()
+        if key != "type"
+        and key != "source_evidence"
+        and not key.endswith("_explicit")
+        and key not in {"selection_contract_verified", "semantic_purpose_verified"}
+    }
+    if not effect_fields:
+        return False
+    return all(
+        action.get(key) == value
+        for key, value in effect_fields.items()
+    )
+
+
+def _action_satisfies_pending_manual_effect(
+    pending: Mapping[str, Any],
+    action: Mapping[str, Any],
+) -> bool:
+    """Return whether one typed action supplies the pending manual contract."""
+
+    manual = pending.get("manual_action")
+    if not isinstance(manual, Mapping):
+        return False
+    if str(action.get("type") or "") != str(manual.get("type") or ""):
+        return False
+    value_argument = str(manual.get("value_argument") or "").strip()
+    fixed = {
+        str(key): value
+        for key, value in manual.items()
+        if str(key) not in {"type", "value_argument", "use_complete_turn"}
+    }
+    if any(action.get(key) != value for key, value in fixed.items()):
+        return False
+    return bool(value_argument and action.get(value_argument) not in (None, ""))
 
 
 def _resolve_pending_answer_invalidation_conflicts(
@@ -1365,6 +1450,13 @@ def _process_action_queue(
     while state.get("action_queue"):
         action = dict(state["action_queue"].pop(0))
         remaining_actions = [dict(item) for item in state.get("action_queue") or [] if isinstance(item, dict)]
+        if lifecycle_rejected_action_indexes(state, [action]):
+            state.setdefault("action_errors", []).append({
+                "action": action,
+                "error": "lifecycle_inapplicable",
+            })
+            changed = True
+            continue
         action_id = str(action.get("action_id") or "")
         if action_id and action_id in set(state.get("applied_action_ids") or []):
             continue
@@ -1391,6 +1483,7 @@ def _process_action_queue(
             and action_spec.preserve_pending
             and before_pending_id
             and after_action_pending_id != before_pending_id
+            and not _action_satisfies_pending_manual_effect(before_pending, action)
         ):
             _push_interruption_frame(state, before_pending, reason=f"{action_spec.action_type}_overlay")
         if before_responses and action.get("type") != "reset_session":
@@ -1704,11 +1797,21 @@ def _next_queue_action_crosses_pending_barrier(state: AgentGraphState) -> bool:
     if not pending:
         return True
     # Navigation may detour from a question that was already visible when the
-    # user submitted this turn. It must not bypass an approval or validation
-    # barrier produced by an earlier action in the same transaction.
+    # user submitted this turn. A separately admitted explicit navigation in
+    # the same semantic transaction may also suspend a question created by an
+    # earlier sibling action; the interruption stack, not the barrier, owns
+    # resumption. Other actions cannot bypass a newly created contract.
     submitted_turn = int(action.get("_submitted_turn_index") or 0)
     created_turn = int(pending.get("created_turn_index") or 0)
-    return bool(submitted_turn and created_turn < submitted_turn)
+    if submitted_turn and created_turn < submitted_turn:
+        return True
+    return bool(
+        submitted_turn
+        and created_turn == submitted_turn
+        and str(action.get("type") or "") == "change_group"
+        and action.get("group_navigation_semantic_verified") is True
+        and str(action.get("source_evidence") or "").strip()
+    )
 
 
 def _pending_is_queue_barrier(state: AgentGraphState) -> bool:
@@ -1734,6 +1837,9 @@ def _push_interruption_frame(state: AgentGraphState, pending: PendingQuestion, *
         "question_id": str(pending.get("id") or ""),
         "reason": reason,
     }
+    field = str(pending.get("field") or "").strip()
+    if field:
+        frame["field"] = field
     if not frame["group"] or not frame["question_id"]:
         return
     stack = list(state.get("interruption_stack") or [])
@@ -1778,6 +1884,13 @@ def _resume_suspended_question(state: AgentGraphState) -> PendingQuestion | None
                 return question
             return None
 
+    return _pop_interruption_question(state)
+
+
+def _pop_interruption_question(state: AgentGraphState) -> PendingQuestion | None:
+    """Consume the newest reconstructable interruption frame."""
+
+    stack = list(state.get("interruption_stack") or [])
     while stack:
         frame = stack.pop()
         group = str((frame or {}).get("group") or "").strip()
@@ -2241,31 +2354,29 @@ def _apply_queue_action(state: AgentGraphState, action: dict[str, Any], text: st
             if requested_job:
                 domain_action["job_id"] = requested_job.group(0)
         dispatch_state = state
-        cancellation_resume_group = ""
         if owner == "coordinator" and action_type in {"change_group", "go_back"}:
-            # Navigation may abandon a domain-owned transient workflow. Commit
-            # that owner's cancellation delta first, then let the coordinator
-            # mutate only control-plane state. This keeps ownership explicit
-            # and prevents a locally rebound cancellation snapshot from being
-            # discarded when the coordinator result is committed.
             target_group = str(domain_action.get("group") or "").strip()
             interrupted_pending = deepcopy(state.get("pending_question") or {})
             pending_group = str(interrupted_pending.get("group") or "").strip()
             same_group_navigation = action_type == "change_group" and target_group == pending_group
             if not same_group_navigation:
-                dispatch_state, cancellation_resume_group = _cancel_transient_question(state)
-                if (
-                    action_type == "change_group"
-                    and interrupted_pending
-                    and _reconstruct_question(dispatch_state, interrupted_pending) is not None
-                ):
-                    _push_interruption_frame(
-                        dispatch_state,
-                        interrupted_pending,
-                        reason="explicit_navigation",
-                    )
-            if cancellation_resume_group:
-                domain_action["cancellation_resume_group"] = cancellation_resume_group
+                if action_type == "go_back":
+                    dispatch_state, cancellation_resume_group = _cancel_transient_question(state)
+                    if cancellation_resume_group:
+                        domain_action["cancellation_resume_group"] = cancellation_resume_group
+                else:
+                    # Named detours suspend a domain-owned question without
+                    # cancelling or rewriting its partial state.
+                    dispatch_state = deepcopy(state)
+                    if (
+                        interrupted_pending
+                        and _reconstruct_question(dispatch_state, interrupted_pending) is not None
+                    ):
+                        _push_interruption_frame(
+                            dispatch_state,
+                            interrupted_pending,
+                            reason="explicit_navigation",
+                        )
         handler_state = deepcopy(dispatch_state)
         result = runtime.apply_action(handler_state, _action_proposal(domain_action, confidence))
         return _apply_handler_result(
@@ -2295,7 +2406,10 @@ def _dispatch_pending_action(state: AgentGraphState, action: dict[str, Any]) -> 
         selected = None
     choice_question = str(pending.get("kind") or "") in {"numbered_choice", "yes_no"}
     interpreted: Any = selected if selected is not None else raw_answer
-    if not choice_question and not interpreted:
+    if not choice_question and (
+        interpreted is None
+        or (isinstance(interpreted, str) and not interpreted.strip())
+    ):
         return _apply_handler_result(
             state,
             HandlerResult(blocker="the pending answer is empty"),
@@ -2659,6 +2773,16 @@ def _reconstruct_question(
                 language=str(state.get("language") or "en"),
             )
         return None
+    field = str(identity.get("field") or "").strip()
+    if field:
+        runtime = DOMAIN_RUNTIME.get(GROUP_OWNER.get(group, ""))
+        question = (
+            runtime.field_question_factory(state, group, field)
+            if runtime and runtime.field_question_factory
+            else None
+        )
+        if question and str(question.get("id") or "") == question_id:
+            return question
     question = _question_for_group(state, group)
     if question and str(question.get("id") or "") == question_id:
         return question

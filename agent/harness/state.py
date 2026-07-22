@@ -178,6 +178,7 @@ def migrate_state(
 
     migrate_legacy_catalog(fresh)
     _migrate_legacy_action_queue(fresh)
+    _quarantine_unsupported_pending_actions(fresh)
     fresh["schema_version"] = STATE_SCHEMA_VERSION
     _normalize_mode_exclusive_state(fresh)
     _normalize_pending_question_contract(fresh)
@@ -187,15 +188,32 @@ def migrate_state(
 def _migrate_legacy_action_queue(state: AgentGraphState) -> None:
     """Compile retired durable actions once while loading old checkpoints."""
 
-    from .action_registry import compile_legacy_custom_rpc_action
+    from .action_registry import ACTION_BY_TYPE, compile_legacy_custom_rpc_action
 
     queue = list(state.get("action_queue") or [])
-    migrated = [
-        compiled
-        for item in queue
-        if isinstance(item, dict)
-        for compiled in compile_legacy_custom_rpc_action(item)
-    ]
+    migrated: list[dict[str, Any]] = []
+    rejected = 0
+    for item in queue:
+        if not isinstance(item, dict):
+            rejected += 1
+            continue
+        action_type = str(item.get("type") or "")
+        if action_type in ACTION_BY_TYPE:
+            migrated.append(item)
+            continue
+        if action_type != "start_custom_rpc":
+            rejected += 1
+            continue
+        source = str(item.get("source_evidence") or "").strip()
+        exact_values = [
+            str(item.get(key) or "").strip()
+            for key in ("rpc_endpoint", "rpc_method", "rpc_schema_evidence")
+            if item.get(key) not in (None, "")
+        ]
+        if not source or any(value not in source for value in exact_values):
+            rejected += 1
+            continue
+        migrated.extend(compile_legacy_custom_rpc_action(item))
     if migrated == queue:
         return
     state["action_queue"] = migrated
@@ -203,7 +221,59 @@ def _migrate_legacy_action_queue(state: AgentGraphState) -> None:
         "event": "legacy_custom_rpc_actions_migrated",
         "before": len(queue),
         "after": len(migrated),
+        "rejected_untrusted": rejected,
     })
+
+
+def _quarantine_unsupported_pending_actions(state: AgentGraphState) -> None:
+    """Drop persisted questions whose action contracts are no longer executable."""
+
+    from .action_registry import ACTION_BY_TYPE
+
+    def unsupported_actions(pending: Any) -> list[str]:
+        if not isinstance(pending, dict) or not pending:
+            return []
+        declared: set[str] = set()
+        manual = pending.get("manual_action")
+        if isinstance(manual, dict):
+            declared.add(str(manual.get("type") or ""))
+        for option in pending.get("options") or []:
+            if not isinstance(option, dict):
+                continue
+            action = option.get("action")
+            if isinstance(action, dict):
+                declared.add(str(action.get("type") or ""))
+        return sorted(
+            action_type
+            for action_type in declared
+            if action_type and action_type not in ACTION_BY_TYPE
+        )
+
+    candidates: list[tuple[str, dict[str, Any], str]] = []
+    pending = state.get("pending_question")
+    if isinstance(pending, dict):
+        candidates.append(("pending_question", pending, "top_level"))
+    resume_context = state.get("resume_context")
+    if isinstance(resume_context, dict):
+        resumed = resume_context.get("pending_question")
+        if isinstance(resumed, dict):
+            candidates.append(("pending_question", resumed, "resume_context"))
+    for key, candidate, location in candidates:
+        unsupported = unsupported_actions(candidate)
+        if not unsupported:
+            continue
+        if location == "top_level":
+            state[key] = {}
+        else:
+            updated = dict(state.get("resume_context") or {})
+            updated[key] = {}
+            state["resume_context"] = updated
+        state.setdefault("audit_events", []).append({
+            "event": "checkpoint_pending_actions_quarantined",
+            "location": location,
+            "question_id": str(candidate.get("id") or ""),
+            "unsupported_action_types": unsupported,
+        })
 
 
 def _recover_legacy_prepared_plan(raw_state: dict[str, Any], state: AgentGraphState) -> None:
