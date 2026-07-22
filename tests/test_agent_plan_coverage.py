@@ -8751,6 +8751,116 @@ class UnresolvedSemanticInventoryTest(unittest.TestCase):
 
 
 class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
+    def test_pending_manual_replacement_owns_rejection_and_new_value_as_one_transaction(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.state import new_state
+
+        source = (
+            "Do not use the detected capacity for this run.\n"
+            "Set the requested capacity to 2048 GiB instead."
+        )
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": "2048",
+                "source_evidence": clauses[1].text,
+            }],
+            "semantic_units": [
+                _unit(clauses[0], 1, [0]),
+                _unit(clauses[1], 2, [0]),
+            ],
+        }
+        state = new_state("pending-manual-replacement-transaction", language="en")
+        state["pending_question"] = {
+            "id": "generic_capacity",
+            "group": "ledger_disk",
+            "field": "GENERIC_CAPACITY",
+            "manual_input_allowed": True,
+            "manual_action": {"type": "answer_pending", "value_argument": "answer"},
+            "validation": {
+                "value_type": "positive_number",
+                "normalization": "semantic_scalar",
+            },
+            "options": [
+                {
+                    "id": "keep",
+                    "label": "Y",
+                    "value": "100",
+                    "manual_entry": False,
+                    "action": {"type": "answer_pending"},
+                },
+                {
+                    "id": "replace",
+                    "label": "N",
+                    "value": "__manual__",
+                    "manual_entry": True,
+                    "action": {"type": "answer_pending"},
+                },
+            ],
+        }
+        verdict = SimpleNamespace(text=json.dumps({
+            "decision": "manual_value",
+            "option_id": "",
+            "answer": "2048",
+            "evidence_quote": "2048 GiB",
+            "supporting_unit_ids": ["unit-1"],
+            "independent_unit_ids": [],
+            "reason": "one replacement transaction for the displayed field",
+        }))
+        provider = Mock()
+        provider.complete.side_effect = [verdict, verdict]
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            PlanCoverageResult(
+                valid=False,
+                errors=("pending owner review required",),
+                unresolved_clauses=(),
+                incomplete_unit_ids=("unit-1", "unit-2"),
+            ),
+            clauses,
+            source,
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(len(recovered["actions"]), 1)
+        self.assertEqual(recovered["actions"][0]["type"], "answer_pending")
+        self.assertEqual(recovered["actions"][0]["answer"], "2048")
+        self.assertEqual(
+            [unit["disposition"] for unit in recovered["semantic_units"]],
+            ["context", "action"],
+        )
+        contract = provider.complete.call_args_list[0].args[0].messages[0].content
+        self.assertIn("complete replacement transaction", contract)
+        self.assertIn("same displayed field", contract)
+
+    def test_group_navigation_contract_owns_value_less_revision_purpose(self) -> None:
+        from agent.harness.action_registry import ACTION_BY_TYPE
+        from agent.harness.intent import (
+            GROUP_NAVIGATION_SEMANTIC_POLICY,
+            _semantic_fulfillment_prompt,
+        )
+
+        self.assertIn("value-less statement", GROUP_NAVIGATION_SEMANTIC_POLICY)
+        self.assertIn("without a concrete setting or value", GROUP_NAVIGATION_SEMANTIC_POLICY)
+        self.assertIn(
+            GROUP_NAVIGATION_SEMANTIC_POLICY,
+            _semantic_fulfillment_prompt(review_kind="units"),
+        )
+        self.assertIn(
+            "operation_restatement",
+            ACTION_BY_TYPE["change_group"].semantic_support_relations,
+        )
+
     def test_equivalent_owner_intake_and_navigation_share_one_group_transition(self) -> None:
         from types import SimpleNamespace
         from unittest.mock import Mock, patch
