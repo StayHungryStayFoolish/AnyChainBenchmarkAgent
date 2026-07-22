@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from agent.knowledge.chain_identity import canonicalize_chain_scalar, repo_chain_names
+from .action_registry import ACTION_BY_TYPE
 from .contracts import ActionProposal, OptionContract, QuestionContract
 from .input_values import has_rpc_wire_evidence, looks_like_wire_method_identity, parse_weight_spec
 from .localization import localized
@@ -19,6 +20,33 @@ def _question_validation(kind: str, validation: dict[str, Any] | None) -> dict[s
     if kind == "manual_value" and not field_validation:
         return {"value_type": "scalar_token", "max_length": 180}
     return field_validation
+
+
+def _manual_owner_contract(
+    *,
+    manual_input_allowed: bool,
+    manual_action: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return and validate the typed owner for free-form pending input."""
+
+    if not manual_input_allowed:
+        if manual_action:
+            raise ValueError("manual_action requires manual_input_allowed")
+        return {}
+    declared = dict(
+        manual_action
+        or {"type": "answer_pending", "value_argument": "answer"}
+    )
+    action_type = str(declared.get("type") or "").strip()
+    value_argument = str(declared.get("value_argument") or "").strip()
+    spec = ACTION_BY_TYPE.get(action_type)
+    if spec is None:
+        raise ValueError(f"unknown manual_action type: {action_type or '<missing>'}")
+    if not value_argument or value_argument not in spec.allowed_arguments:
+        raise ValueError(
+            f"manual_action {action_type} requires a writable value_argument"
+        )
+    return declared
 
 
 def manual_question(
@@ -40,7 +68,10 @@ def manual_question(
     structured_input_owner: bool = False,
 ) -> dict[str, Any]:
     field_validation = _question_validation(kind, validation)
-    declared_manual_action = dict(manual_action or {})
+    declared_manual_action = _manual_owner_contract(
+        manual_input_allowed=True,
+        manual_action=manual_action,
+    )
     declared_action_type = str(declared_manual_action.get("type") or "").strip()
     return {
         "contract_version": 1,
@@ -82,6 +113,7 @@ def choice_question(
     kind: str = "numbered_choice",
     manual_input_allowed: bool = False,
     accepted_action_types: tuple[str, ...] = (),
+    manual_action: dict[str, Any] | None = None,
     queue_barrier: bool = False,
     validation: dict[str, Any] | None = None,
     requires_capabilities: tuple[str, ...] = (),
@@ -90,6 +122,11 @@ def choice_question(
     evidence_path: str = "",
     rejection_evidence_value: Any = None,
 ) -> dict[str, Any]:
+    declared_manual_action = _manual_owner_contract(
+        manual_input_allowed=manual_input_allowed,
+        manual_action=manual_action,
+    )
+    declared_action_type = str(declared_manual_action.get("type") or "").strip()
     contracts: list[OptionContract] = []
     rendered: list[dict[str, Any]] = []
     for index, raw in enumerate(options, start=1):
@@ -168,10 +205,12 @@ def choice_question(
             {
                 "answer_pending",
                 *accepted_action_types,
+                *([declared_action_type] if declared_action_type else []),
                 *(str(option["action"].get("type") or "") for option in rendered),
             }
             - {""}
         ),
+        **({"manual_action": declared_manual_action} if declared_manual_action else {}),
         "queue_barrier": queue_barrier,
         "validation": _question_validation(kind, validation),
         "requires_capabilities": list(requires_capabilities),

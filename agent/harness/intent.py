@@ -3210,9 +3210,9 @@ def _declared_option_for_pending_answer(
     """Resolve one answer action against the exact typed option contract.
 
     The planner may express a declared option through ``answer`` without
-    repeating it in ``selected_value``. An explicitly supplied selected value
-    remains authoritative, including when it conflicts with ``answer``; the
-    fallback therefore applies only when that field is absent or null.
+    repeating it in ``selected_value``. When it supplies both representations,
+    they must agree before the action can become an option anchor. A distinct
+    source-grounded manual value is owned by complete-turn adjudication.
     """
 
     if str(action.get("type") or "") != "answer_pending":
@@ -3222,7 +3222,7 @@ def _declared_option_for_pending_answer(
         if "selected_value" in action and action.get("selected_value") is not None
         else action.get("answer")
     )
-    return next(
+    option = next(
         (
             item
             for item in pending.get("options") or []
@@ -3230,6 +3230,24 @@ def _declared_option_for_pending_answer(
         ),
         {},
     )
+    if not option or "selected_value" not in action or action.get("selected_value") is None:
+        return option
+    answer = action.get("answer")
+    if answer in (None, "") or answer == selected or str(answer).strip() == str(selected).strip():
+        return option
+    answer_selects_option, answer_value = exact_answer(str(answer), pending)
+    if answer_selects_option and answer_value == selected:
+        return option
+    if (
+        pending.get("manual_input_allowed") is True
+        and value_satisfies_pending_contract(answer, pending)
+        and _manual_answer_has_literal_source(
+            action,
+            str(action.get("source_evidence") or ""),
+        )
+    ):
+        return {}
+    return option
 
 
 def _semantic_operation_arguments(action: dict[str, Any]) -> dict[str, Any]:
@@ -4293,6 +4311,17 @@ def _materialize_pending_manual_owner_actions(
     for index in sorted(answer_indexes):
         answer = actions[index]
         selected = answer.get("selected_value")
+        if (
+            selected not in (None, "")
+            and answer.get("answer") not in (None, "")
+            and not _declared_option_for_pending_answer(answer, pending)
+        ):
+            # A selected option and a distinct source-grounded manual answer
+            # are competing representations, not an authoritative option.
+            # Complete-turn adjudication has left this action admitted as the
+            # manual owner, so compile its canonical answer rather than the
+            # inconsistent selected value.
+            selected = answer.get("answer")
         if selected in (None, ""):
             selected = answer.get("answer")
         if not use_complete_turn and selected in (None, ""):

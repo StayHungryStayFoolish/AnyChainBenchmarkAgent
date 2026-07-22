@@ -6282,6 +6282,109 @@ network:
             {"type": "change_chain", "value_argument": "chain_text"},
         )
 
+    def test_free_form_question_factories_declare_one_typed_manual_owner(self) -> None:
+        from agent.harness.questions import choice_question, manual_question
+
+        manual = manual_question(
+            "provider_deployment",
+            "CLOUD_REGION",
+            "Enter a region.",
+            field="CLOUD_REGION",
+        )
+        self.assertEqual(
+            manual["manual_action"],
+            {"type": "answer_pending", "value_argument": "answer"},
+        )
+
+        choice_with_manual = choice_question(
+            "network",
+            "NETWORK_INTERFACE",
+            "Choose an interface.",
+            field="NETWORK_INTERFACE",
+            manual_input_allowed=True,
+            options=[{"label": "eth0", "value": "eth0"}],
+        )
+        self.assertEqual(
+            choice_with_manual["manual_action"],
+            {"type": "answer_pending", "value_argument": "answer"},
+        )
+
+        finite_choice = choice_question(
+            "accounts_disk",
+            "has_accounts_device",
+            "Separate accounts disk?",
+            field="has_accounts_device",
+            options=[{"label": "Y", "value": True}, {"label": "N", "value": False}],
+        )
+        self.assertNotIn("manual_action", finite_choice)
+
+    def test_free_form_question_factory_rejects_invalid_owner_contract(self) -> None:
+        from agent.harness.questions import manual_question
+
+        with self.assertRaisesRegex(ValueError, "unknown manual_action type"):
+            manual_question(
+                "provider_deployment",
+                "CLOUD_REGION",
+                "Enter a region.",
+                field="CLOUD_REGION",
+                manual_action={"type": "not_an_action", "value_argument": "answer"},
+            )
+        with self.assertRaisesRegex(ValueError, "writable value_argument"):
+            manual_question(
+                "provider_deployment",
+                "CLOUD_REGION",
+                "Enter a region.",
+                field="CLOUD_REGION",
+                manual_action={"type": "answer_pending", "value_argument": "missing"},
+            )
+
+    def test_distinct_source_grounded_manual_value_is_not_a_finite_option_anchor(self) -> None:
+        import json
+
+        from agent.harness.domains.environment import question_for_environment
+        from agent.harness.intent import (
+            _declared_option_for_pending_answer,
+            _materialize_pending_manual_owner_actions,
+        )
+        from agent.harness.state import new_state
+
+        state = new_state("manual-versus-option", language="en")
+        state["discovery"] = {"cloud": {"region": "test-region"}}
+        question = question_for_environment(state, "provider_deployment") or {}
+        action = {
+            "type": "answer_pending",
+            "answer": "asia-east1",
+            "selected_value": "test-region",
+            "source_evidence": "Use asia-east1 as CLOUD_REGION.",
+        }
+        self.assertEqual(_declared_option_for_pending_answer(action, question), {})
+
+        state["pending_question"] = question
+        plan = json.dumps({
+            "actions": [action],
+            "pending_answer_admissions": [0],
+            "semantic_units": [{
+                "unit_id": "region",
+                "source_text": action["source_evidence"],
+                "action_indexes": [0],
+                "disposition": "action",
+            }],
+        })
+        materialized, changed = _materialize_pending_manual_owner_actions(
+            plan,
+            state,
+            action["source_evidence"],
+        )
+        self.assertTrue(changed)
+        self.assertEqual(json.loads(materialized)["actions"][0]["answer"], "asia-east1")
+        self.assertNotIn("selected_value", json.loads(materialized)["actions"][0])
+
+        action.update(answer="Y", source_evidence="Y")
+        self.assertEqual(
+            _declared_option_for_pending_answer(action, question).get("value"),
+            "test-region",
+        )
+
     def test_multiline_replacement_chain_is_owned_by_declared_pending_action(self) -> None:
         import json
         from types import SimpleNamespace
