@@ -278,7 +278,9 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             ledger = self._ledger()
             transport = FakeTransport([
                 "Agent> Model config: provider=deepseek, model=deepseek-chat, auth=api_key\n"
+                "Agent> Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456\n"
                 "Agent> Choose a mode.\n1. fake-node\n2. real-node",
+                "Agent> Endpoint https://rpc.example/abcdefghijklmnopqrstuvwxyz123456 accepted.\n"
                 "Agent> Which chain do you want to test?",
             ])
             seen: list[SimulatorContext] = []
@@ -291,7 +293,10 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                     user_message="I only want a safe dry run first.",
                     persona=context.scheduled_target.persona,
                     goal=context.scheduled_target.goal,
-                    rationale="The immediately preceding response offered fake-node.",
+                    rationale=(
+                        "The response offered fake-node; API_KEY="
+                        "abcdefghijklmnopqrstuvwxyz123456"
+                    ),
                     target_coverage_ids=(context.scheduled_target.edge_key,),
                 )
 
@@ -334,6 +339,10 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 )
                 self.assertTrue(valid, reason)
             artifact = artifacts["dynamic_dual_ai"]
+            persisted = json.dumps(artifacts, ensure_ascii=False)
+            self.assertNotIn("abcdefghijklmnopqrstuvwxyz123456", persisted)
+            self.assertIn("***REDACTED***", persisted)
+            self.assertTrue(artifact["content_redacted"])
             self.assertEqual(artifact["turn_observation"]["seed"], 17)
             self.assertEqual(
                 artifact["turn_observation"]["verified_postcondition"]["verifier_id"],
@@ -346,6 +355,63 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 list((root / ".agent/dynamic-chaos/contract-session/diagnostics").glob("*.json")),
                 [],
             )
+
+    def test_committed_event_precedes_reading_the_new_turn_response(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            ledger = self._ledger()
+            order: list[str] = []
+
+            class OrderedTransport(FakeTransport):
+                def read_complete_agent_response(inner_self, *, timeout_seconds: float) -> str:
+                    order.append("read")
+                    return super(OrderedTransport, inner_self).read_complete_agent_response(
+                        timeout_seconds=timeout_seconds
+                    )
+
+                def submit_bracketed_paste(inner_self, message: str) -> None:
+                    order.append("submit")
+                    super(OrderedTransport, inner_self).submit_bracketed_paste(message)
+
+            class OrderedEvents(FakeEventStream):
+                def baseline(inner_self) -> RuntimeTurnEvent:
+                    order.append("baseline")
+                    return super(OrderedEvents, inner_self).baseline()
+
+                def next_event(inner_self, *, timeout_seconds: float) -> RuntimeTurnEvent:
+                    order.append("event")
+                    return super(OrderedEvents, inner_self).next_event(
+                        timeout_seconds=timeout_seconds
+                    )
+
+            transport = OrderedTransport([
+                "Agent> Model config: provider=deepseek, model=deepseek-chat, auth=api_key\n"
+                "Agent> Choose a mode.",
+                "Agent> Which chain?",
+            ])
+            events = OrderedEvents([
+                self._event(1, "a" * 64, "b" * 64, "opening_next_action"),
+                self._event(2, "b" * 64, "c" * 64, "opening_next_action"),
+            ])
+            runner = DynamicDualAiChaosRunner(
+                ChaosRunConfig.linux(root, session_id="contract-session"),
+                lambda context: SimulatorDecision(
+                    user_message="Use fake-node.",
+                    persona=context.scheduled_target.persona,
+                    goal=context.scheduled_target.goal,
+                    rationale="Selected from the complete response.",
+                    target_coverage_ids=(context.scheduled_target.edge_key,),
+                ),
+                ledger=ledger,
+                schedule=self._schedule(ledger),
+                transport=transport,
+                event_stream=events,
+                revision=REVISION,
+            )
+
+            runner.run()
+
+            self.assertEqual(order, ["read", "baseline", "submit", "event", "read"])
 
     def test_scheduler_rejects_a_seed_scenario_owned_by_another_edge(self) -> None:
         ledger = self._ledger()
@@ -504,7 +570,7 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             )
             self.assertEqual(len(seen), 1)
 
-    def test_action_edge_rejects_product_modification_waiting_state(self) -> None:
+    def test_action_edge_uses_registered_pending_action_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             action_edge = {
@@ -578,14 +644,14 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             )
 
             with patch("tests.agent_live.runtime_checkpoint.seed_runtime_checkpoint"):
-                with self.assertRaisesRegex(
-                    RuntimeError,
-                    "reviewed checkpoint did not restore the scheduled target contract",
-                ):
-                    runner.run()
+                result = runner.run()
 
-            self.assertEqual(transport.submitted, ["2"])
-            self.assertEqual(seen, [])
+            self.assertEqual(result.execution_status, "complete")
+            self.assertEqual(transport.submitted, [
+                "2",
+                "Finish this benchmark first, then observe node synchronization.",
+            ])
+            self.assertEqual(len(seen), 1)
 
     def test_missing_provider_identity_fails_closed_without_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -748,6 +814,13 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             )
             self.assertIn("Bearer ***REDACTED***", boundary["completed_turn"]["agent_response"])
             self.assertNotIn("super-secret-token", diagnostics[0].read_text(encoding="utf-8"))
+            transcript = (
+                root / ".agent/dynamic-chaos/contract-session/transcript.txt"
+            ).read_text(encoding="utf-8")
+            self.assertNotIn("super-secret-token", transcript)
+            self.assertNotIn("abcdefghijklmnopqrstuvwxyz123456", transcript)
+            self.assertIn("Bearer ***REDACTED***", transcript)
+            self.assertIn("https://rpc.example/***REDACTED***", transcript)
             self.assertFalse(boundary["verified_postcondition"]["passed"])
             qualifying, rejection = load_valid_evidence_reference(
                 str(diagnostics[0]), edge=EDGE, revision=REVISION
@@ -1333,8 +1406,18 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
 
     def test_runner_sets_independent_docker_paths(self) -> None:
         root = Path("/tmp/anychain-chaos-contract")
-        config = ChaosRunConfig.docker(root, session_id="isolated-session", service="bench")
+        config = ChaosRunConfig.docker(
+            root,
+            session_id="isolated-session",
+            execution_id="chaos-isolated-session",
+            service="bench",
+        )
         command_text = " ".join(config.command)
+        self.assertIn("ANYCHAIN_CHAOS_EXECUTION_ID=chaos-isolated-session", command_text)
+        self.assertIn(
+            "ANYCHAIN_CHAOS_INNER_CLEANUP_RECEIPT_DIR=/workspace/.agent/dynamic-chaos/isolated-session/container-cleanup-receipts",
+            command_text,
+        )
         self.assertIn("ANYCHAIN_AGENT_CHECKPOINT_PATH=/workspace/.agent/dynamic-chaos/isolated-session/checkpoints.sqlite", command_text)
         self.assertIn("ANYCHAIN_AGENT_JOBS_DIR=/workspace/.agent/dynamic-chaos/isolated-session/jobs", command_text)
         self.assertEqual(config.transport_kind, "container_pty_bridge")
@@ -1353,6 +1436,8 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
         root = Path("/tmp/anychain-chaos-contract")
         config = ChaosRunConfig.linux(root, session_id="isolated-session")
 
+        self.assertEqual(config.transport_kind, "container_pty_bridge")
+        self.assertIn("tests.agent_live.container_pty_bridge", config.command)
         self.assertEqual(config.command[-4:], (
             "--state-file",
             "/tmp/anychain-chaos-contract/.agent/dynamic-chaos/isolated-session/terminal-session.json",
@@ -1428,6 +1513,8 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
         self.assertEqual(response.count("Agent> VALUE="), 1)
         self.assertIsNotNone(process)
         self.assertIsNotNone(process.poll())
+        self.assertIsNotNone(transport.cleanup_receipt)
+        self.assertTrue(bool(transport.cleanup_receipt["cleaned"]))
 
     def test_container_bridge_forwards_ctrl_c_and_reaps_product_cli(self) -> None:
         program = (
@@ -1462,6 +1549,33 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
         self.assertIn("Agent> cancelled", response)
         self.assertIsNotNone(process)
         self.assertIsNotNone(process.poll())
+        self.assertIsNotNone(transport.cleanup_receipt)
+        self.assertTrue(bool(transport.cleanup_receipt["cleaned"]))
+
+    def test_container_bridge_drains_large_stderr_and_reads_fragmented_frame(self) -> None:
+        program = (
+            "import json,sys,time\n"
+            "for line in sys.stdin:\n"
+            " request=json.loads(line)\n"
+            " sys.stderr.write('x'*200000); sys.stderr.flush()\n"
+            " payload=json.dumps({'ok': True, 'response': 'Agent> complete'})+'\\n'\n"
+            " sys.stdout.write(payload[:7]); sys.stdout.flush(); time.sleep(0.05)\n"
+            " sys.stdout.write(payload[7:]); sys.stdout.flush()\n"
+            " if request.get('op') == 'close': break\n"
+        )
+        transport = ContainerPtyBridgeTransport(
+            (sys.executable, "-c", program),
+            cwd=Path.cwd(),
+            poll_interval_seconds=0.01,
+        )
+        transport.start(env=dict(os.environ))
+        try:
+            response = transport.read_complete_agent_response(timeout_seconds=3)
+        finally:
+            transport.close()
+
+        self.assertEqual(response, "Agent> complete")
+        self.assertLessEqual(len(transport._stderr_buffer), transport._stderr_cap_bytes)
 
 
 if __name__ == "__main__":

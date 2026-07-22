@@ -8,6 +8,8 @@ user text, mutate state, or render responses.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Iterable, Literal
 
@@ -21,6 +23,8 @@ class GroupSpec:
     owner: str
     fields: tuple[str, ...] = ()
     questions: tuple[str, ...] = ()
+    reconfiguration_questions: tuple[tuple[str, str], ...] = ()
+    immutable_fields: tuple[str, ...] = ()
     depends_on: tuple[str, ...] = ()
     invalidates: tuple[str, ...] = ()
     product_node: str = ""
@@ -85,6 +89,12 @@ GROUPS: tuple[GroupSpec, ...] = (
             "MACHINE_TYPE",
         ),
         questions=("CLOUD_REGION", "CLOUD_ZONE", "MACHINE_TYPE", "inferred_config_review"),
+        reconfiguration_questions=(
+            ("CLOUD_REGION", "CLOUD_REGION"),
+            ("CLOUD_ZONE", "CLOUD_ZONE"),
+            ("MACHINE_TYPE", "MACHINE_TYPE"),
+        ),
+        immutable_fields=("CLOUD_PROVIDER",),
         invalidates=("preflight_smoke_execution", "job_monitoring"),
         product_node="environment_config",
     ),
@@ -106,6 +116,13 @@ GROUPS: tuple[GroupSpec, ...] = (
             "DATA_VOL_MAX_IOPS",
             "DATA_VOL_MAX_THROUGHPUT",
             "inferred_config_review",
+        ),
+        reconfiguration_questions=(
+            ("LEDGER_DEVICE", "LEDGER_DEVICE"),
+            ("DATA_VOL_TYPE", "DATA_VOL_TYPE"),
+            ("DATA_VOL_SIZE", "DATA_VOL_SIZE"),
+            ("DATA_VOL_MAX_IOPS", "DATA_VOL_MAX_IOPS"),
+            ("DATA_VOL_MAX_THROUGHPUT", "DATA_VOL_MAX_THROUGHPUT"),
         ),
         product_node="environment_config",
     ),
@@ -130,6 +147,14 @@ GROUPS: tuple[GroupSpec, ...] = (
             "ACCOUNTS_VOL_MAX_THROUGHPUT",
             "inferred_config_review",
         ),
+        reconfiguration_questions=(
+            ("has_accounts_device", "has_accounts_device"),
+            ("ACCOUNTS_DEVICE", "ACCOUNTS_DEVICE"),
+            ("ACCOUNTS_VOL_TYPE", "ACCOUNTS_VOL_TYPE"),
+            ("ACCOUNTS_VOL_SIZE", "ACCOUNTS_VOL_SIZE"),
+            ("ACCOUNTS_VOL_MAX_IOPS", "ACCOUNTS_VOL_MAX_IOPS"),
+            ("ACCOUNTS_VOL_MAX_THROUGHPUT", "ACCOUNTS_VOL_MAX_THROUGHPUT"),
+        ),
         product_node="environment_config",
     ),
     GroupSpec(
@@ -137,6 +162,10 @@ GROUPS: tuple[GroupSpec, ...] = (
         owner="environment",
         fields=("NETWORK_INTERFACE", "NETWORK_MAX_BANDWIDTH_GBPS"),
         questions=("network_interface", "NETWORK_MAX_BANDWIDTH_GBPS", "inferred_config_review"),
+        reconfiguration_questions=(
+            ("NETWORK_INTERFACE", "network_interface"),
+            ("NETWORK_MAX_BANDWIDTH_GBPS", "NETWORK_MAX_BANDWIDTH_GBPS"),
+        ),
         invalidates=("preflight_smoke_execution", "job_monitoring"),
         product_node="environment_config",
     ),
@@ -374,6 +403,34 @@ def validate_group_registry(groups: Iterable[GroupSpec]) -> tuple[GroupSpec, ...
             )
         if group.name in group.depends_on:
             raise RuntimeError(f"GroupSpec {group.name} cannot depend on itself")
+        reconfiguration_fields = [field for field, _question in group.reconfiguration_questions]
+        duplicate_reconfiguration_fields = sorted({
+            field for field in reconfiguration_fields if reconfiguration_fields.count(field) > 1
+        })
+        unknown_reconfiguration_fields = sorted(set(reconfiguration_fields) - set(group.fields))
+        unknown_reconfiguration_questions = sorted({
+            question
+            for _field, question in group.reconfiguration_questions
+            if question not in group.questions
+        })
+        unknown_immutable_fields = sorted(set(group.immutable_fields) - set(group.fields))
+        conflicting_field_policies = sorted(
+            set(group.immutable_fields).intersection(reconfiguration_fields)
+        )
+        if (
+            duplicate_reconfiguration_fields
+            or unknown_reconfiguration_fields
+            or unknown_reconfiguration_questions
+            or unknown_immutable_fields
+            or conflicting_field_policies
+        ):
+            raise RuntimeError(
+                f"invalid reconfiguration questions for GroupSpec {group.name}: "
+                f"duplicates={duplicate_reconfiguration_fields}, "
+                f"fields={unknown_reconfiguration_fields}, "
+                f"questions={unknown_reconfiguration_questions}, "
+                f"immutable={unknown_immutable_fields}, conflicts={conflicting_field_policies}"
+            )
 
     dependencies = {group.name: group.depends_on for group in registry}
     visiting: set[str] = set()
@@ -405,6 +462,11 @@ FIELD_GROUP: dict[str, str] = {
 FIELD_OWNER: dict[str, str] = {
     field: group.owner for group in GROUPS for field in group.fields
 }
+FIELD_RECONFIGURATION_QUESTION: dict[str, str] = {
+    field: question
+    for group in GROUPS
+    for field, question in group.reconfiguration_questions
+}
 GROUP_QUESTION_ORDER: tuple[tuple[str, tuple[str, ...]], ...] = tuple(
     (group.name, group.questions) for group in GROUPS if group.questions
 )
@@ -423,6 +485,31 @@ def normalize_group_name(value: object) -> str:
 def group_for_field(field_name: str) -> str:
     field = str(field_name or "").strip()
     return FIELD_GROUP.get(field, "") if field else ""
+
+
+def reconfiguration_question_for_field(field_name: str) -> str:
+    """Return the registered typed question for an explicitly edited field."""
+
+    field = str(field_name or "").strip()
+    return FIELD_RECONFIGURATION_QUESTION.get(field, "") if field else ""
+
+
+def group_registry_contract_hash() -> str:
+    """Return the content identity of field ownership and intake contracts."""
+
+    payload = [
+        {
+            "name": group.name,
+            "owner": group.owner,
+            "fields": list(group.fields),
+            "questions": list(group.questions),
+            "reconfiguration_questions": list(group.reconfiguration_questions),
+            "immutable_fields": list(group.immutable_fields),
+        }
+        for group in GROUPS
+    ]
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def fallback_groups_for_workflow(workflow_mode: str) -> tuple[GroupSpec, ...]:

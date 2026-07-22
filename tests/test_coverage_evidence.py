@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -81,6 +82,56 @@ class CoverageEvidenceTest(unittest.TestCase):
 
     def test_valid_artifact_requires_revision_exit_status_and_graph_observation(self) -> None:
         valid, reason = validate_evidence_artifact(self._artifact(), edge=self.edge, revision=self.revision)
+        self.assertTrue(valid, reason)
+
+    def test_deterministic_artifact_redacts_nested_state_before_hashing(self) -> None:
+        secret = "abcdefghijklmnopqrstuvwxyz123456"
+        seed = new_state("coverage-secret", language="en", session_purpose="coverage")
+        seed["confirmed_config"] = {
+            "CLOUD_REGION": "test-region",
+            "CLOUD_ZONE": "test-zone",
+            "LOCAL_RPC_URL": f"https://rpc.example/{secret}",
+        }
+        seed["runtime_secret"] = {
+            "nested": (f"Authorization: Bearer {secret}",),
+        }
+        question = question_for_environment(seed, "provider_deployment")
+        assert question is not None
+        before = {
+            **seed,
+            "active_group": "provider_deployment",
+            "pending_question": question,
+            "last_user_input": "n2-standard-16",
+        }
+        with capture_coverage_events() as captured:
+            observation = observe_compiled_graph_turn(
+                invoke_product_graph_turn,
+                before,
+                edge_key=self.edge["edge_key"],
+                input_value="n2-standard-16",
+            )
+        events = [event.as_dict() for event in captured]
+        artifact = build_evidence_artifact(
+            edge=self.edge,
+            evidence_class="deterministic",
+            scenario_id="redaction-scenario",
+            runner_type=COMPILED_GRAPH_RUNNER,
+            revision=self.revision,
+            input_value="n2-standard-16",
+            seed_state=seed,
+            before_state=before,
+            after_state=observation.after,
+            events=events,
+            exit_status=0,
+            outcome="passed",
+        )
+        serialized = json.dumps(artifact, ensure_ascii=False)
+        self.assertNotIn(secret, serialized)
+        self.assertIn("***REDACTED***", serialized)
+        self.assertTrue(artifact["content_redacted"])
+        valid, reason = validate_evidence_artifact(
+            artifact, edge=self.edge, revision=self.revision
+        )
         self.assertTrue(valid, reason)
 
     def test_tampering_or_revision_change_invalidates_artifact(self) -> None:
@@ -177,12 +228,24 @@ class CoverageEvidenceTest(unittest.TestCase):
                 edge=edge,
                 revision=self.revision,
                 operation_kind="preflight_smoke",
-                request={"approved_plan_id": "plan-1"},
-                result={"status": "completed"},
+                request={
+                    "approved_plan_id": "plan-1",
+                    "LOCAL_RPC_URL": (
+                        "https://rpc.example/abcdefghijklmnopqrstuvwxyz123456"
+                    ),
+                },
+                result={
+                    "status": "completed",
+                    "Authorization": "Bearer abcdefghijklmnopqrstuvwxyz123456",
+                },
                 job_id="job-1",
                 job_artifacts=(hashed,),
                 log_artifacts=(log,),
             )
+            serialized = json.dumps(artifact, ensure_ascii=False)
+            self.assertNotIn("abcdefghijklmnopqrstuvwxyz123456", serialized)
+            self.assertIn("***REDACTED***", serialized)
+            self.assertTrue(artifact["content_redacted"])
             valid, reason = validate_real_execution_evidence_artifact(
                 artifact,
                 edge=edge,

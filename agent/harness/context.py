@@ -32,6 +32,7 @@ def action_schema() -> list[dict[str, Any]]:
             "execution_phase": spec.execution_phase,
             "effect": spec.effect,
             "target_group": spec.target_group,
+            "target_field_argument": spec.target_field_argument,
             "requires_specific_change": spec.requires_specific_change,
             "incomplete_mutation_intake": spec.incomplete_mutation_intake,
             "incompatible_target_modes": list(spec.incompatible_target_modes),
@@ -43,6 +44,12 @@ def action_schema() -> list[dict[str, Any]]:
             item["allowed_topics"] = list(CONSULTATION_TOPICS)
         if item["type"] == "change_group":
             item["allowed_groups"] = list(USER_NAVIGABLE_GROUPS)
+        if item["target_field_argument"]:
+            item["allowed_config_fields"] = sorted({
+                field
+                for group in GROUPS
+                for field, _question in group.reconfiguration_questions
+            })
     return output
 
 
@@ -53,6 +60,10 @@ def group_schema() -> list[dict[str, Any]]:
             "owner": group.owner,
             "fields": list(group.fields),
             "questions": list(group.questions),
+            "reconfiguration_questions": {
+                field: question for field, question in group.reconfiguration_questions
+            },
+            "immutable_fields": list(group.immutable_fields),
             "depends_on": list(group.depends_on),
             "invalidates": list(group.invalidates),
             "category": group.category,

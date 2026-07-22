@@ -10,11 +10,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import select
 import sys
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from agent.utils.redaction import redact
 from tests.agent_live.chaos_scheduler import build_chaos_schedule
 from tests.agent_live.coverage_evidence import content_hash, repository_revision
 from tests.agent_live.dynamic_dual_ai_chaos import (
@@ -29,6 +33,39 @@ from tests.agent_live.generate_harness_coverage_ledger import build_ledger
 CONTEXT_FRAME = "CODEX_SIMULATOR_CONTEXT "
 DECISION_FRAME = "CODEX_SIMULATOR_DECISION "
 RESULT_FRAME = "CODEX_SIMULATOR_RESULT "
+DEFAULT_DECISION_TIMEOUT_SECONDS = 300.0
+
+
+class CodexSimulatorBridgeError(RuntimeError):
+    """Base error raised at the external Codex decision boundary."""
+
+
+class CodexSimulatorExternalBlockError(CodexSimulatorBridgeError):
+    """The external simulator did not deliver a decision."""
+
+
+class CodexSimulatorDecisionTimeout(CodexSimulatorExternalBlockError, TimeoutError):
+    """The external simulator exceeded its decision deadline."""
+
+
+class CodexSimulatorInputClosed(CodexSimulatorExternalBlockError):
+    """The external simulator input closed before a decision arrived."""
+
+
+class CodexSimulatorProtocolError(CodexSimulatorBridgeError):
+    """The external simulator supplied a decision that violates the frame contract."""
+
+
+class CodexSimulatorInvalidFrame(CodexSimulatorProtocolError):
+    """The decision did not use the required frame prefix."""
+
+
+class CodexSimulatorInvalidJson(CodexSimulatorProtocolError):
+    """The framed decision was not a valid JSON object."""
+
+
+class CodexSimulatorStaleResponse(CodexSimulatorProtocolError):
+    """The decision was bound to a different Agent response."""
 
 
 def _input_generation_rule(contract: Mapping[str, Any]) -> str:
@@ -64,9 +101,17 @@ def _input_generation_rule(contract: Mapping[str, Any]) -> str:
 class StdioCodexSimulator:
     """Exchange one revision-bound decision per complete Agent response."""
 
-    def __init__(self, input_stream: Any = sys.stdin, output_stream: Any = sys.stdout) -> None:
+    def __init__(
+        self,
+        input_stream: Any = sys.stdin,
+        output_stream: Any = sys.stdout,
+        *,
+        decision_timeout_seconds: float | None = None,
+    ) -> None:
         self.input_stream = input_stream
         self.output_stream = output_stream
+        self.decision_timeout_seconds = decision_timeout_seconds
+        self._input_buffer = bytearray()
 
     def __call__(self, context: SimulatorContext) -> SimulatorDecision:
         response_hash = content_hash(context.previous_agent_response)
@@ -83,12 +128,15 @@ class StdioCodexSimulator:
             "schema_version": 1,
             "session_id": context.session_id,
             "turn_index": context.turn_index,
-            "previous_agent_response": context.previous_agent_response,
+            "previous_agent_response": str(redact(context.previous_agent_response)),
             "previous_response_hash": response_hash,
             "previous_response_received_at_ns": context.previous_response_received_at_ns,
             "scheduled_target": asdict(context.scheduled_target),
             "coverage_contract": dict(context.coverage_contract),
-            "transcript": [list(item) for item in context.transcript],
+            "transcript": [
+                [str(redact(user)), str(redact(agent))]
+                for user, agent in context.transcript
+            ],
             "decision_contract": {
                 "frame_prefix": DECISION_FRAME,
                 "schema_version": 1,
@@ -112,19 +160,25 @@ class StdioCodexSimulator:
         self.output_stream.write(CONTEXT_FRAME + json.dumps(payload, ensure_ascii=False) + "\n")
         self.output_stream.flush()
 
-        line = self.input_stream.readline()
-        if not line:
-            raise RuntimeError("external Codex simulator closed before providing a decision")
+        line = self._read_decision_line()
         if not line.startswith(DECISION_FRAME):
-            raise RuntimeError("external Codex simulator decision used an invalid frame")
+            raise CodexSimulatorInvalidFrame(
+                "external Codex simulator decision used an invalid frame"
+            )
         try:
             decision = json.loads(line[len(DECISION_FRAME):])
         except json.JSONDecodeError as exc:
-            raise RuntimeError("external Codex simulator decision is not valid JSON") from exc
+            raise CodexSimulatorInvalidJson(
+                "external Codex simulator decision is not valid JSON"
+            ) from exc
         if not isinstance(decision, Mapping):
-            raise RuntimeError("external Codex simulator decision must be a JSON object")
+            raise CodexSimulatorInvalidJson(
+                "external Codex simulator decision must be a JSON object"
+            )
         if str(decision.get("previous_response_hash") or "") != response_hash:
-            raise RuntimeError("external Codex simulator decision references a stale Agent response")
+            raise CodexSimulatorStaleResponse(
+                "external Codex simulator decision references a stale Agent response"
+            )
 
         return SimulatorDecision(
             user_message=_required_text(decision, "user_message"),
@@ -136,11 +190,80 @@ class StdioCodexSimulator:
             ),
         )
 
+    def _read_decision_line(self) -> str:
+        if self.decision_timeout_seconds is None:
+            line = self.input_stream.readline()
+            if not line:
+                raise CodexSimulatorInputClosed(
+                    "external Codex simulator closed before providing a decision"
+                )
+            return str(line)
+
+        timeout = float(self.decision_timeout_seconds)
+        if timeout <= 0:
+            raise ValueError("decision_timeout_seconds must be greater than zero")
+        try:
+            fd = int(self.input_stream.fileno())
+        except (AttributeError, OSError, TypeError, ValueError):
+            # In-memory streams used by callers and tests cannot block on I/O.
+            line = self.input_stream.readline()
+            if not line:
+                raise CodexSimulatorInputClosed(
+                    "external Codex simulator closed before providing a decision"
+                )
+            return str(line)
+
+        deadline = time.monotonic() + timeout
+        was_blocking = os.get_blocking(fd)
+        os.set_blocking(fd, False)
+        try:
+            while True:
+                buffered = self._pop_buffered_line()
+                if buffered is not None:
+                    return buffered
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise CodexSimulatorDecisionTimeout(
+                        f"external Codex simulator decision timed out after {timeout:.1f}s"
+                    )
+                ready, _, _ = select.select([fd], [], [], remaining)
+                if not ready:
+                    raise CodexSimulatorDecisionTimeout(
+                        f"external Codex simulator decision timed out after {timeout:.1f}s"
+                    )
+                try:
+                    chunk = os.read(fd, 65536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    raise CodexSimulatorInputClosed(
+                        "external Codex simulator closed before providing a decision"
+                    )
+                self._input_buffer.extend(chunk)
+        finally:
+            try:
+                os.set_blocking(fd, was_blocking)
+            except OSError:
+                pass
+
+    def _pop_buffered_line(self) -> str | None:
+        newline = self._input_buffer.find(b"\n")
+        if newline < 0:
+            return None
+        raw = bytes(self._input_buffer[: newline + 1])
+        del self._input_buffer[: newline + 1]
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise CodexSimulatorInvalidFrame(
+                "external Codex simulator decision is not valid UTF-8"
+            ) from exc
+
 
 def _required_text(payload: Mapping[str, Any], key: str) -> str:
     value = str(payload.get(key) or "").strip()
     if not value:
-        raise RuntimeError(f"external Codex simulator decision requires {key}")
+        raise CodexSimulatorProtocolError(f"external Codex simulator decision requires {key}")
     return value
 
 
@@ -162,6 +285,7 @@ def run_bridge(
     session_id: str,
     service: str,
     runtime: str,
+    decision_timeout_seconds: float = DEFAULT_DECISION_TIMEOUT_SECONDS,
     input_stream: Any = sys.stdin,
     output_stream: Any = sys.stdout,
 ) -> Mapping[str, Any]:
@@ -190,7 +314,11 @@ def run_bridge(
         raise ValueError(f"unsupported bridge runtime: {runtime}")
     runner = DynamicDualAiChaosRunner(
         config,
-        StdioCodexSimulator(input_stream, output_stream),
+        StdioCodexSimulator(
+            input_stream,
+            output_stream,
+            decision_timeout_seconds=decision_timeout_seconds,
+        ),
         ledger=ledger,
         schedule=schedule,
         revision=revision,
@@ -217,6 +345,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--session-id", required=True)
     parser.add_argument("--service", default="bench")
     parser.add_argument("--runtime", choices=("docker", "linux"), default="docker")
+    parser.add_argument(
+        "--decision-timeout-seconds",
+        type=float,
+        default=DEFAULT_DECISION_TIMEOUT_SECONDS,
+    )
     return parser.parse_args(argv)
 
 
@@ -229,6 +362,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         session_id=args.session_id,
         service=args.service,
         runtime=args.runtime,
+        decision_timeout_seconds=args.decision_timeout_seconds,
     )
     return 0
 

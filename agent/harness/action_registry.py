@@ -149,6 +149,21 @@ def _validate_evidence_collection_append(action: Mapping[str, Any]) -> None:
         raise ValueError("append_evidence_collection requires exact current-turn evidence")
 
 
+def _validate_config_field_intake(action: Mapping[str, Any]) -> None:
+    from agent.workflows.group_registry import reconfiguration_question_for_field
+
+    field = str(action.get("config_field") or "").strip()
+    if not reconfiguration_question_for_field(field):
+        raise ValueError(
+            f"request_config_field_input requires a registered reconfigurable field: {field or '<missing>'}"
+        )
+
+
+def _content_hash(value: Any) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True)
 class ActionSpec:
     action_type: str
@@ -157,6 +172,7 @@ class ActionSpec:
     allowed_arguments: tuple[str, ...] = ()
     execution_phase: int = 50
     target_group: str = ""
+    target_field_argument: str = ""
     merge_identity: tuple[str, ...] = ()
     preserve_pending: bool = False
     mutation_dimension: str = ""
@@ -280,6 +296,25 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
             "non_mutation_scope",
         ),
         validator=_validate_group_navigation,
+    ),
+    ActionSpec(
+        "request_config_field_input",
+        "coordinator",
+        "Open the registered typed question for one explicitly named scalar configuration field when the user asks to change it but supplies no new value. Never copy a value from current state, discovery, examples, or defaults.",
+        ("config_field", "source_evidence"),
+        execution_phase=25,
+        target_field_argument="config_field",
+        preserve_pending=True,
+        crosses_pending_barrier=True,
+        requires_specific_change=True,
+        incomplete_mutation_intake=True,
+        required_arguments=("config_field", "source_evidence"),
+        effect="workflow_navigation",
+        semantic_support_relations=(
+            *FRAMED_OPERATION_SUPPORT_RELATIONS,
+            "non_mutation_scope",
+        ),
+        validator=_validate_config_field_intake,
     ),
     ActionSpec(
         "resume_current_flow",
@@ -630,6 +665,23 @@ def lifecycle_rejected_action_indexes(
     return tuple(rejected)
 
 
+def resolve_action_target_group(action: Mapping[str, Any]) -> str:
+    """Resolve one action's static or registry-derived workflow destination."""
+
+    spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
+    if spec is None:
+        return ""
+    if spec.target_group:
+        return str(spec.target_group)
+    if not spec.target_field_argument:
+        return ""
+    from agent.workflows.group_registry import group_for_field
+
+    return group_for_field(
+        str(action.get(spec.target_field_argument) or "").strip()
+    )
+
+
 def normalize_action_relations(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Apply registry-declared relations across one proposed transaction.
 
@@ -649,10 +701,27 @@ def normalize_action_relations(actions: list[dict[str, Any]]) -> list[dict[str, 
         for action in actions
         if isinstance(action, dict)
     )
+    intake_groups = {
+        resolve_action_target_group(action)
+        for action in actions
+        if bool(
+            getattr(
+                ACTION_BY_TYPE.get(str(action.get("type") or "")),
+                "incomplete_mutation_intake",
+                False,
+            )
+        )
+    }
+    intake_groups.discard("")
     output: list[dict[str, Any]] = []
     merge_indexes: dict[tuple[Any, ...], int] = {}
     for action in actions:
         spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
+        if (
+            str(action.get("type") or "") == "change_group"
+            and str(action.get("group") or "") in intake_groups
+        ):
+            continue
         if str(action.get("type") or "") == "resume_current_flow" and interruption_owner_present:
             continue
         if spec is not None and set(spec.suppressed_by).intersection(action_types):
@@ -680,6 +749,12 @@ TRUSTED_ACTION_METADATA_FIELDS = frozenset({
     "chain_selection_semantic_verified",
     "target_mode_semantic_verified",
     "group_navigation_semantic_verified",
+    "_semantic_admission_receipt",
+    "_proposal_field_receipts",
+    "_proposal_transaction_hashes",
+    "_admission_action_id",
+    "_transaction_action_ids",
+    "_plan_transaction_hash",
     "_origin_text",
     "_queue_origin_group",
     "_submitted_turn_index",
@@ -687,6 +762,336 @@ TRUSTED_ACTION_METADATA_FIELDS = frozenset({
     "_plan_index",
     "_merged_origin_texts",
 })
+
+SEMANTIC_ADMISSION_RECEIPT_VERSION = 2
+
+
+def action_registry_contract_hash() -> str:
+    """Return the complete deterministic action-contract identity."""
+
+    specs = []
+    for spec in ACTION_SPECS:
+        specs.append({
+            "action_type": spec.action_type,
+            "owner": spec.owner,
+            "purpose": spec.purpose,
+            "allowed_arguments": list(spec.allowed_arguments),
+            "execution_phase": spec.execution_phase,
+            "target_group": spec.target_group,
+            "target_field_argument": spec.target_field_argument,
+            "merge_identity": list(spec.merge_identity),
+            "preserve_pending": spec.preserve_pending,
+            "mutation_dimension": spec.mutation_dimension,
+            "allows_followup_actions": spec.allows_followup_actions,
+            "requires_capabilities": list(spec.requires_capabilities),
+            "provides_capabilities": list(spec.provides_capabilities),
+            "merge_mapping_fields": list(spec.merge_mapping_fields),
+            "merge_sequence_fields": list(spec.merge_sequence_fields),
+            "lifetime": spec.lifetime,
+            "effect": spec.effect,
+            "turn_local_result_roots": list(spec.turn_local_result_roots),
+            "crosses_pending_barrier": spec.crosses_pending_barrier,
+            "requires_specific_change": spec.requires_specific_change,
+            "incomplete_mutation_intake": spec.incomplete_mutation_intake,
+            "required_arguments": list(spec.required_arguments),
+            "constraints": list(spec.constraints),
+            "suppressed_by": list(spec.suppressed_by),
+            "semantic_recovery_source_argument": spec.semantic_recovery_source_argument,
+            "semantic_support_relations": list(spec.semantic_support_relations),
+            "pending_option_semantic": spec.pending_option_semantic,
+            "option_navigation_groups": list(spec.option_navigation_groups),
+            "pending_option_admission": spec.pending_option_admission,
+            "incompatible_target_modes": list(spec.incompatible_target_modes),
+            "validator": (
+                f"{spec.validator.__module__}.{spec.validator.__qualname__}"
+                if spec.validator is not None
+                else ""
+            ),
+        })
+    return _content_hash({
+        "specs": specs,
+        "argument_schemas": ACTION_ARGUMENT_SCHEMAS,
+        "semantic_scope_policies": SEMANTIC_SCOPE_POLICIES,
+        "consultation_topics": sorted(CONSULTATION_TOPICS),
+    })
+
+
+def admission_contract_hash() -> str:
+    """Bind receipts to both workflow ownership and action semantics."""
+
+    from agent.workflows.group_registry import group_registry_contract_hash
+
+    return _content_hash({
+        "group_registry_hash": group_registry_contract_hash(),
+        "action_registry_hash": action_registry_contract_hash(),
+    })
+
+
+def build_admission_transaction_hash(
+    *,
+    thread_id: str,
+    session_id: str,
+    submitted_turn_index: int,
+    actions: list[Mapping[str, Any]],
+    semantic_units: list[Mapping[str, Any]],
+    admission_action_ids: list[str],
+) -> str:
+    """Return the identity of one ordered, source-owned admission transaction."""
+
+    canonical_actions = []
+    for action in actions:
+        canonical_actions.append({
+            str(key): value
+            for key, value in action.items()
+            if key not in TRUSTED_ACTION_METADATA_FIELDS
+            and key not in ACTION_METADATA_FIELDS
+            and not str(key).startswith("_")
+        } | {"type": str(action.get("type") or "")})
+    canonical_units = [
+        {
+            "unit_id": str(unit.get("unit_id") or ""),
+            "clause_id": str(unit.get("clause_id") or ""),
+            "source_text": str(unit.get("source_text") or ""),
+            "disposition": str(unit.get("disposition") or ""),
+            "action_indexes": list(unit.get("action_indexes") or []),
+        }
+        for unit in semantic_units
+    ]
+    return _content_hash({
+        "thread_id": str(thread_id or ""),
+        "session_id": str(session_id or ""),
+        "submitted_turn_index": int(submitted_turn_index),
+        "admission_action_ids": list(admission_action_ids),
+        "actions": canonical_actions,
+        "semantic_units": canonical_units,
+    })
+
+
+def build_field_intake_admission_receipt(
+    *,
+    thread_id: str,
+    session_id: str,
+    submitted_turn_index: int,
+    transaction_hash: str,
+    admission_action_id: str,
+    config_field: str,
+    source_evidence: str,
+    source_unit_id: str,
+    source_unit_text: str,
+    source_quote: str,
+    semantic_unit_hash: str,
+    reviewer_evidence_hash: str,
+) -> dict[str, Any]:
+    """Mint one Harness-owned receipt for a value-less field edit."""
+
+    from agent.workflows.group_registry import (
+        group_for_field,
+        group_registry_contract_hash,
+        reconfiguration_question_for_field,
+    )
+
+    field = str(config_field or "").strip()
+    source = str(source_evidence or "").strip()
+    payload = {
+        "version": SEMANTIC_ADMISSION_RECEIPT_VERSION,
+        "action_type": "request_config_field_input",
+        "thread_id": str(thread_id or "").strip(),
+        "session_id": str(session_id or "").strip(),
+        "submitted_turn_index": int(submitted_turn_index),
+        "transaction_hash": str(transaction_hash or "").strip(),
+        "admission_action_id": str(admission_action_id or "").strip(),
+        "target_group": group_for_field(field),
+        "config_field": field,
+        "question_id": reconfiguration_question_for_field(field),
+        "source_hash": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        "source_unit_id": str(source_unit_id or "").strip(),
+        "source_unit_text": str(source_unit_text or ""),
+        "source_unit_hash": _content_hash(str(source_unit_text or "")),
+        "source_quote": str(source_quote or ""),
+        "semantic_unit_hash": str(semantic_unit_hash or "").strip(),
+        "reviewer_evidence_hash": str(reviewer_evidence_hash or "").strip(),
+        "registry_hash": group_registry_contract_hash(),
+        "action_contract_hash": action_registry_contract_hash(),
+        "admission_contract_hash": admission_contract_hash(),
+        "replacement_supplied": False,
+    }
+    if not all(
+        str(payload[key] or "").strip()
+        for key in (
+            "target_group",
+            "thread_id",
+            "session_id",
+            "transaction_hash",
+            "admission_action_id",
+            "config_field",
+            "question_id",
+            "source_unit_id",
+            "source_quote",
+            "semantic_unit_hash",
+            "reviewer_evidence_hash",
+        )
+    ):
+        raise ValueError("field intake admission receipt is incomplete")
+    if payload["source_quote"] not in str(source_unit_text or ""):
+        raise ValueError("field intake source quote is outside its semantic unit")
+    return {**payload, "receipt_id": _content_hash(payload)}
+
+
+def build_proposal_field_receipt(
+    *,
+    thread_id: str,
+    session_id: str,
+    submitted_turn_index: int,
+    transaction_hash: str,
+    admission_action_id: str,
+    config_field: str,
+    canonical_value: Any,
+    source_unit_id: str,
+    source_unit_text: str,
+    source_quote: str,
+) -> dict[str, Any]:
+    """Mint one Harness-owned receipt for one source-grounded config value."""
+
+    from agent.workflows.group_registry import group_for_field, group_registry_contract_hash
+
+    field = str(config_field or "").strip().upper()
+    unit_text = str(source_unit_text or "")
+    quote = str(source_quote or "")
+    payload = {
+        "version": SEMANTIC_ADMISSION_RECEIPT_VERSION,
+        "action_type": "propose_config_values",
+        "thread_id": str(thread_id or "").strip(),
+        "session_id": str(session_id or "").strip(),
+        "submitted_turn_index": int(submitted_turn_index),
+        "transaction_hash": str(transaction_hash or "").strip(),
+        "admission_action_id": str(admission_action_id or "").strip(),
+        "config_field": field,
+        "canonical_value": canonical_value,
+        "canonical_value_hash": _content_hash(canonical_value),
+        "target_group": group_for_field(field),
+        "source_unit_id": str(source_unit_id or "").strip(),
+        "source_unit_text": unit_text,
+        "source_unit_hash": _content_hash(unit_text),
+        "source_quote": quote,
+        "source_quote_hash": _content_hash(quote),
+        "registry_hash": group_registry_contract_hash(),
+        "action_contract_hash": action_registry_contract_hash(),
+        "admission_contract_hash": admission_contract_hash(),
+    }
+    if not all(str(payload[key] or "").strip() for key in (
+        "thread_id", "session_id", "transaction_hash", "admission_action_id",
+        "config_field", "source_unit_id", "source_quote",
+    )):
+        raise ValueError("proposal field receipt is incomplete")
+    if quote not in unit_text:
+        raise ValueError("proposal source quote is outside its semantic unit")
+    return {**payload, "receipt_id": _content_hash(payload)}
+
+
+def validate_field_intake_admission_receipt(
+    action: Mapping[str, Any],
+    *,
+    thread_id: str | None = None,
+    session_id: str | None = None,
+) -> None:
+    """Validate a trusted receipt against its current action and registry."""
+
+    receipt = action.get("_semantic_admission_receipt")
+    if not isinstance(receipt, Mapping):
+        raise ValueError("request_config_field_input requires a semantic admission receipt")
+    expected = build_field_intake_admission_receipt(
+        thread_id=str(receipt.get("thread_id") or ""),
+        session_id=str(receipt.get("session_id") or ""),
+        submitted_turn_index=int(receipt.get("submitted_turn_index") or 0),
+        transaction_hash=str(receipt.get("transaction_hash") or ""),
+        admission_action_id=str(receipt.get("admission_action_id") or ""),
+        config_field=str(action.get("config_field") or ""),
+        source_evidence=str(action.get("source_evidence") or ""),
+        source_unit_id=str(receipt.get("source_unit_id") or ""),
+        source_unit_text=str(receipt.get("source_unit_text") or ""),
+        source_quote=str(receipt.get("source_quote") or ""),
+        semantic_unit_hash=str(receipt.get("semantic_unit_hash") or ""),
+        reviewer_evidence_hash=str(receipt.get("reviewer_evidence_hash") or ""),
+    )
+    if dict(receipt) != expected:
+        raise ValueError("field intake semantic admission receipt does not match the action")
+    if str(action.get("_plan_transaction_hash") or "") != str(receipt.get("transaction_hash") or ""):
+        raise ValueError("field intake receipt transaction mismatch")
+    if str(action.get("_admission_action_id") or "") != str(receipt.get("admission_action_id") or ""):
+        raise ValueError("field intake receipt action identity mismatch")
+    if thread_id is not None and str(receipt.get("thread_id") or "") != str(thread_id):
+        raise ValueError("field intake receipt thread mismatch")
+    if session_id is not None and str(receipt.get("session_id") or "") != str(session_id):
+        raise ValueError("field intake receipt session mismatch")
+
+
+def validate_proposal_field_receipts(
+    action: Mapping[str, Any],
+    *,
+    thread_id: str | None = None,
+    session_id: str | None = None,
+    submitted_turn_index: int | None = None,
+) -> None:
+    """Validate every proposed field against its immutable source receipt."""
+
+    values = action.get("config_values")
+    receipts = action.get("_proposal_field_receipts")
+    if not isinstance(values, Mapping) or not values:
+        raise ValueError("propose_config_values requires non-empty config_values")
+    if not isinstance(receipts, Mapping) or set(receipts) != set(values):
+        raise ValueError("propose_config_values requires one receipt per field")
+    transaction_hashes = {
+        str(value)
+        for value in action.get("_proposal_transaction_hashes") or []
+        if str(value)
+    }
+    if not transaction_hashes:
+        transaction_hashes = {str(action.get("_plan_transaction_hash") or "")}
+    single_transaction = len(transaction_hashes) == 1
+    from agent.workflows.group_registry import group_registry_contract_hash
+
+    for field, value in values.items():
+        receipt = receipts.get(field)
+        if not isinstance(receipt, Mapping):
+            raise ValueError(f"proposal field receipt is missing: {field}")
+        unsigned = {key: item for key, item in receipt.items() if key != "receipt_id"}
+        if receipt.get("receipt_id") != _content_hash(unsigned):
+            raise ValueError(f"proposal field receipt hash mismatch: {field}")
+        if str(receipt.get("action_type") or "") != "propose_config_values":
+            raise ValueError(f"proposal field receipt action mismatch: {field}")
+        if str(receipt.get("config_field") or "") != str(field):
+            raise ValueError(f"proposal field receipt field mismatch: {field}")
+        if receipt.get("canonical_value") != value or receipt.get("canonical_value_hash") != _content_hash(value):
+            raise ValueError(f"proposal field receipt value mismatch: {field}")
+        source_unit_text = str(receipt.get("source_unit_text") or "")
+        source_quote = str(receipt.get("source_quote") or "")
+        if (
+            not source_quote
+            or source_quote not in source_unit_text
+            or receipt.get("source_unit_hash") != _content_hash(source_unit_text)
+            or receipt.get("source_quote_hash") != _content_hash(source_quote)
+        ):
+            raise ValueError(f"proposal field receipt source mismatch: {field}")
+        if str(receipt.get("transaction_hash") or "") not in transaction_hashes:
+            raise ValueError(f"proposal field receipt transaction mismatch: {field}")
+        if (
+            single_transaction
+            and str(receipt.get("admission_action_id") or "")
+            != str(action.get("_admission_action_id") or "")
+        ):
+            raise ValueError(f"proposal field receipt action identity mismatch: {field}")
+        if receipt.get("registry_hash") != group_registry_contract_hash():
+            raise ValueError(f"proposal field receipt registry mismatch: {field}")
+        if receipt.get("action_contract_hash") != action_registry_contract_hash():
+            raise ValueError(f"proposal field receipt action-contract mismatch: {field}")
+        if receipt.get("admission_contract_hash") != admission_contract_hash():
+            raise ValueError(f"proposal field receipt admission-contract mismatch: {field}")
+        if thread_id is not None and str(receipt.get("thread_id") or "") != str(thread_id):
+            raise ValueError(f"proposal field receipt thread mismatch: {field}")
+        if session_id is not None and str(receipt.get("session_id") or "") != str(session_id):
+            raise ValueError(f"proposal field receipt session mismatch: {field}")
+        if submitted_turn_index is not None and int(receipt.get("submitted_turn_index") or 0) != int(submitted_turn_index):
+            raise ValueError(f"proposal field receipt turn mismatch: {field}")
 LEGACY_ARGUMENTS_ENVELOPE_VERSION = "arguments.v1"
 _COMPATIBILITY_USAGE: Counter[str] = Counter()
 
@@ -700,6 +1105,7 @@ ACTION_ARGUMENT_SCHEMAS: dict[str, Mapping[str, Any]] = {
     "chain_text": {"type": "string", "minLength": 1},
     "clauses": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1},
     "config_values": {"type": "object"},
+    "config_field": {"type": "string", "minLength": 1},
     "conflicts": {"type": "array"},
     "evidence": {},
     "evidence_summary": {"type": "string", "minLength": 1},
@@ -727,7 +1133,10 @@ ACTION_ARGUMENT_SCHEMAS: dict[str, Mapping[str, Any]] = {
     "rpc_weights": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 1}, "minProperties": 1},
     "selected_value": {},
     "source_evidence": {"type": "string", "minLength": 1},
-    "source_format": {"type": "string", "enum": ["yaml", "json", "env", "mixed"]},
+    "source_format": {
+        "type": "string",
+        "enum": ["prose", "yaml", "json", "env", "mixed"],
+    },
     "subject": {"type": "string"},
     "sync_observe_source": {"type": "string", "enum": ["existing_local_node", "endpoint_only", "client_setup"]},
     "sync_observe_stop_condition": {"type": "string", "enum": ["until_stopped", "duration", "until_synced"]},
@@ -851,6 +1260,14 @@ def validate_action_contract(
             raise ValueError("answer_pending requires answer or selected_value")
     if spec.validator is not None:
         spec.validator(action)
+    if (
+        trusted_metadata
+        and action_type == "request_config_field_input"
+        and "_semantic_admission_receipt" in action
+    ):
+        validate_field_intake_admission_receipt(action)
+    if trusted_metadata and action_type == "propose_config_values":
+        validate_proposal_field_receipts(action)
     return action
 
 
@@ -1024,6 +1441,21 @@ def merge_semantic_actions(existing: dict[str, Any], incoming: dict[str, Any]) -
         if isinstance(new_value, dict):
             values.update(new_value)
         merged[field_name] = values
+    if str(incoming.get("type") or "") == "propose_config_values":
+        validate_proposal_field_receipts(existing)
+        validate_proposal_field_receipts(incoming)
+        receipts: dict[str, Any] = {}
+        receipts.update(dict(existing.get("_proposal_field_receipts") or {}))
+        receipts.update(dict(incoming.get("_proposal_field_receipts") or {}))
+        merged["_proposal_field_receipts"] = receipts
+        transaction_hashes: list[str] = []
+        for source in (existing, incoming):
+            values = source.get("_proposal_transaction_hashes") or [source.get("_plan_transaction_hash")]
+            for value in values:
+                transaction_hash = str(value or "").strip()
+                if transaction_hash and transaction_hash not in transaction_hashes:
+                    transaction_hashes.append(transaction_hash)
+        merged["_proposal_transaction_hashes"] = transaction_hashes
     for field_name in spec.merge_sequence_fields:
         values: list[Any] = []
         for source in (existing.get(field_name), incoming.get(field_name)):
@@ -1078,15 +1510,21 @@ def validate_action_registry() -> None:
             raise RuntimeError(
                 f"turn-local result roots require turn-local lifetime: {spec.action_type}"
             )
+        if spec.target_field_argument and spec.target_field_argument not in spec.required_arguments:
+            raise RuntimeError(
+                f"dynamic target field must be a required argument: {spec.action_type}"
+            )
         if spec.requires_specific_change and (
-            not spec.target_group or "source_evidence" not in spec.required_arguments
+            (not spec.target_group and not spec.target_field_argument)
+            or "source_evidence" not in spec.required_arguments
         ):
             raise RuntimeError(
                 "actions requiring a specific change need a target group and required "
                 f"source evidence: {spec.action_type}"
             )
         if spec.incomplete_mutation_intake and (
-            not spec.target_group or "source_evidence" not in spec.allowed_arguments
+            (not spec.target_group and not spec.target_field_argument)
+            or "source_evidence" not in spec.allowed_arguments
         ):
             raise RuntimeError(
                 "incomplete mutation intake actions need a target group and source evidence: "
@@ -1095,7 +1533,7 @@ def validate_action_registry() -> None:
     intake_groups = [
         spec.target_group
         for spec in ACTION_SPECS
-        if spec.incomplete_mutation_intake
+        if spec.incomplete_mutation_intake and spec.target_group
     ]
     if len(intake_groups) != len(set(intake_groups)):
         raise RuntimeError("only one incomplete mutation intake action is allowed per group")

@@ -1,0 +1,439 @@
+"""Bounded semantic compilation and immutable whole-plan admission.
+
+The configured model gets one compilation call and one independent admission
+call.  Admission can reject a complete candidate, but it cannot edit the
+candidate.  The caller may run one repair compilation followed by one final
+admission; this module never retries per action or per semantic unit.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass
+from typing import Any, Collection, Mapping, Sequence
+
+from ..llm.types import LLMMessage, LLMRequest, ensure_turn_active
+
+
+_ADMISSION_TOP_LEVEL_KEYS = frozenset({
+    "plan_hash",
+    "action_verdicts",
+    "unit_verdicts",
+    "reason",
+})
+_ACTION_VERDICT_KEYS = frozenset({
+    "action_id",
+    "verdict",
+    "unit_ids",
+    "evidence",
+    "reason",
+})
+_ACTION_EVIDENCE_KEYS = frozenset({
+    "unit_id",
+    "quote",
+    "relation",
+    "support_relation",
+})
+_UNIT_VERDICT_KEYS = frozenset({
+    "unit_id",
+    "verdict",
+    "owner_action_ids",
+    "evidence_quote",
+    "omitted_action_type",
+    "reason",
+})
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _content_hash(value: Any) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _strict_json_object(text: str) -> dict[str, Any]:
+    raw = str(text or "").strip()
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        if len(lines) < 3 or lines[-1].strip() != "```":
+            raise ValueError("model response has an unterminated JSON fence")
+        if lines[0].strip().lower() not in {"```", "```json"}:
+            raise ValueError("model response uses an unsupported code fence")
+        raw = "\n".join(lines[1:-1]).strip()
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("model response is not one strict JSON object") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("model response is not a JSON object")
+    return payload
+
+
+@dataclass(frozen=True)
+class ImmutableSemanticPlan:
+    """A content-addressed candidate supplied to the independent reviewer."""
+
+    plan_hash: str
+    document_json: str
+    request_json: str
+    action_ids: tuple[str, ...]
+    unit_ids: tuple[str, ...]
+
+    def document(self) -> dict[str, Any]:
+        return json.loads(self.document_json)
+
+    def request_payload(self) -> dict[str, Any]:
+        return json.loads(self.request_json)
+
+
+@dataclass(frozen=True)
+class WholePlanAdmission:
+    """Strict admission result for one immutable candidate."""
+
+    valid: bool
+    errors: tuple[str, ...]
+    action_verdicts: tuple[dict[str, Any], ...] = ()
+    unit_verdicts: tuple[dict[str, Any], ...] = ()
+    response: Mapping[str, Any] | None = None
+
+    def repair_context(self) -> dict[str, Any]:
+        return {
+            "errors": list(self.errors),
+            "action_verdicts": [dict(row) for row in self.action_verdicts],
+            "unit_verdicts": [dict(row) for row in self.unit_verdicts],
+        }
+
+
+def request_semantic_compilation(
+    provider: Any,
+    *,
+    system_prompt: str,
+    request_payload: Mapping[str, Any],
+    max_tokens: int = 3600,
+) -> str:
+    """Run exactly one semantic compiler provider call."""
+
+    ensure_turn_active()
+    response = provider.complete(LLMRequest(
+        messages=[
+            LLMMessage(role="system", content=system_prompt),
+            LLMMessage(
+                role="user",
+                content=json.dumps(request_payload, ensure_ascii=False, sort_keys=True),
+            ),
+        ],
+        temperature=0.0,
+        max_tokens=max_tokens,
+    ))
+    return _canonical_json(_strict_json_object(str(response.text or "")))
+
+
+def freeze_semantic_plan(
+    document: Mapping[str, Any],
+    *,
+    action_records: Sequence[Mapping[str, Any]],
+    unit_records: Sequence[Mapping[str, Any]],
+    review_context: Mapping[str, Any],
+) -> ImmutableSemanticPlan:
+    """Freeze one validated candidate and its registry-derived review facts."""
+
+    actions = document.get("actions")
+    units = document.get("semantic_units")
+    if not isinstance(actions, list) or not isinstance(units, list):
+        raise ValueError("semantic plan requires actions and semantic_units lists")
+    if len(action_records) != len(actions):
+        raise ValueError("semantic plan action record count mismatch")
+    if len(unit_records) != len(units):
+        raise ValueError("semantic plan unit record count mismatch")
+
+    normalized_actions = [dict(row) for row in action_records]
+    normalized_units = [dict(row) for row in unit_records]
+    action_ids = tuple(str(row.get("action_id") or "") for row in normalized_actions)
+    unit_ids = tuple(str(row.get("unit_id") or "") for row in normalized_units)
+    if any(not value for value in action_ids) or len(set(action_ids)) != len(action_ids):
+        raise ValueError("semantic plan action ids are missing or duplicated")
+    if any(not value for value in unit_ids) or len(set(unit_ids)) != len(unit_ids):
+        raise ValueError("semantic plan unit ids are missing or duplicated")
+
+    for index, row in enumerate(normalized_actions):
+        if row.get("action_index") != index or row.get("action") != actions[index]:
+            raise ValueError("semantic plan action record is not bound to the immutable action")
+        mapped = row.get("unit_ids")
+        if not isinstance(mapped, list) or any(str(value) not in unit_ids for value in mapped):
+            raise ValueError("semantic plan action record references an unknown unit")
+    for index, row in enumerate(normalized_units):
+        if row.get("unit_index") != index or row.get("unit") != units[index]:
+            raise ValueError("semantic plan unit record is not bound to the immutable unit")
+        owners = row.get("owner_action_ids")
+        if not isinstance(owners, list) or any(str(value) not in action_ids for value in owners):
+            raise ValueError("semantic plan unit record references an unknown action")
+
+    canonical_document = json.loads(_canonical_json(document))
+    canonical_context = json.loads(_canonical_json(review_context))
+    hash_input = {
+        "document": canonical_document,
+        "action_records": normalized_actions,
+        "unit_records": normalized_units,
+        "review_context": canonical_context,
+    }
+    plan_hash = _content_hash(hash_input)
+    request = {
+        "plan_hash": plan_hash,
+        "immutable_document": canonical_document,
+        "actions": normalized_actions,
+        "semantic_units": normalized_units,
+        "review_context": canonical_context,
+    }
+    return ImmutableSemanticPlan(
+        plan_hash=plan_hash,
+        document_json=_canonical_json(canonical_document),
+        request_json=_canonical_json(request),
+        action_ids=action_ids,
+        unit_ids=unit_ids,
+    )
+
+
+def whole_plan_admission_prompt(semantic_policy: str) -> str:
+    """Return the one independent immutable whole-plan admission contract."""
+
+    return (
+        "You are the independent admission authority for one immutable AnyChain typed intent plan. "
+        "You are not a planner. Never create, repair, replace, rename, remove, merge, split, or reorder an action or semantic unit. "
+        "Judge only the supplied immutable ids, actions, registry purposes, source units, pending contract, and workflow state. "
+        "Return exactly one JSON object with exactly these keys: plan_hash, action_verdicts, unit_verdicts, reason. "
+        "Echo plan_hash exactly. Return exactly one action_verdict for every supplied action_id and exactly one unit_verdict for every supplied unit_id; never add an id. "
+        "Each action_verdict is {action_id,verdict:'admit'|'reject',unit_ids:[string],evidence:[{unit_id,quote,relation:'direct'|'support',support_relation:string}],reason}. "
+        "unit_ids must exactly equal that action's supplied immutable unit_ids. An admitted action needs one evidence row for every unit_id, every quote must be a non-empty exact substring of that unit, at least one relation must be direct, and a support row may use only one supplied allowed_support_relation. Direct rows use an empty support_relation. "
+        "Each unit_verdict is {unit_id,verdict:'complete'|'context'|'unresolved'|'omitted',owner_action_ids:[string],evidence_quote:string,omitted_action_type:string,reason}. "
+        "owner_action_ids must exactly equal the supplied immutable owner_action_ids. complete is valid only when those registered actions preserve every present demand in the unit. context is valid only for a supplied context unit with no present demand. unresolved means the request is genuinely unsafe or not expressible. omitted means the unit contains a present independently actionable demand expressible by one action_schema type but missing from the immutable actions; set omitted_action_type to that exact registered type. Never propose its arguments or a replacement action. For every other verdict omitted_action_type is empty. Every evidence_quote is a non-empty exact substring of that unit. "
+        "A mapped action may be individually plausible while its unit still has an omitted demand. Questions, corrections, navigation, configuration, evidence analysis, execution approval, and pending answers are all present demands when explicitly requested. Workflow state and planner reasons are context, never user evidence. "
+        "A pending option or manual answer is admitted only when current source evidence satisfies the supplied typed pending contract. A registered group or field owner is admitted only when its declared purpose and exact target preserve the source demand. Structured syntax facts are authoritative only after the immutable compiler assigned that structured unit to the corresponding registered owner; examples or logs do not become configuration merely because they contain assignments. "
+        "Malformed ids, missing rows, duplicate rows, invented quotes, an unsupported support relation, or uncertainty must fail closed. "
+        + semantic_policy
+    )
+
+
+def request_whole_plan_admission(
+    provider: Any,
+    plan: ImmutableSemanticPlan,
+    *,
+    semantic_policy: str,
+    allowed_action_types: Collection[str],
+    max_tokens: int = 7200,
+) -> WholePlanAdmission:
+    """Run one whole-plan review and validate its strict immutable verdicts."""
+
+    ensure_turn_active()
+    response = provider.complete(LLMRequest(
+        messages=[
+            LLMMessage(role="system", content=whole_plan_admission_prompt(semantic_policy)),
+            LLMMessage(role="user", content=plan.request_json),
+        ],
+        temperature=0.0,
+        max_tokens=max_tokens,
+    ))
+    return validate_whole_plan_admission(
+        str(response.text or ""),
+        plan,
+        allowed_action_types=allowed_action_types,
+    )
+
+
+def validate_whole_plan_admission(
+    response_text: str,
+    plan: ImmutableSemanticPlan,
+    *,
+    allowed_action_types: Collection[str],
+) -> WholePlanAdmission:
+    """Validate exact reviewer cardinality, ids, grounding, and immutability."""
+
+    try:
+        payload = _strict_json_object(response_text)
+    except ValueError as exc:
+        return WholePlanAdmission(False, (str(exc),))
+
+    errors: list[str] = []
+    if set(payload) != _ADMISSION_TOP_LEVEL_KEYS:
+        errors.append("whole-plan admission has missing or undeclared top-level keys")
+    if str(payload.get("plan_hash") or "") != plan.plan_hash:
+        errors.append("whole-plan admission plan_hash mismatch")
+    if not str(payload.get("reason") or "").strip():
+        errors.append("whole-plan admission has no reason")
+
+    request = plan.request_payload()
+    action_records = {
+        str(row["action_id"]): row for row in request.get("actions") or []
+        if isinstance(row, dict) and str(row.get("action_id") or "")
+    }
+    unit_records = {
+        str(row["unit_id"]): row for row in request.get("semantic_units") or []
+        if isinstance(row, dict) and str(row.get("unit_id") or "")
+    }
+    raw_action_rows = payload.get("action_verdicts")
+    raw_unit_rows = payload.get("unit_verdicts")
+    action_rows = list(raw_action_rows) if isinstance(raw_action_rows, list) else []
+    unit_rows = list(raw_unit_rows) if isinstance(raw_unit_rows, list) else []
+    if not isinstance(raw_action_rows, list):
+        errors.append("whole-plan admission action_verdicts is not a list")
+    if not isinstance(raw_unit_rows, list):
+        errors.append("whole-plan admission unit_verdicts is not a list")
+
+    action_counts: dict[str, int] = {}
+    valid_action_rows: list[dict[str, Any]] = []
+    for raw in action_rows:
+        if not isinstance(raw, dict):
+            errors.append("whole-plan admission contains a non-object action verdict")
+            continue
+        row = dict(raw)
+        if set(row) != _ACTION_VERDICT_KEYS:
+            errors.append("whole-plan action verdict has missing or undeclared keys")
+        action_id = str(row.get("action_id") or "")
+        action_counts[action_id] = action_counts.get(action_id, 0) + 1
+        record = action_records.get(action_id)
+        if record is None:
+            errors.append(f"whole-plan admission forged action id: {action_id or '<missing>'}")
+            continue
+        expected_units = [str(value) for value in record.get("unit_ids") or []]
+        actual_units = [str(value) for value in row.get("unit_ids") or []] if isinstance(row.get("unit_ids"), list) else []
+        if actual_units != expected_units:
+            errors.append(f"whole-plan action unit ownership mismatch: {action_id}")
+        verdict = str(row.get("verdict") or "")
+        if verdict not in {"admit", "reject"}:
+            errors.append(f"whole-plan action verdict is invalid: {action_id}")
+        if not str(row.get("reason") or "").strip():
+            errors.append(f"whole-plan action verdict has no reason: {action_id}")
+        evidence = row.get("evidence")
+        evidence_rows = list(evidence) if isinstance(evidence, list) else []
+        if not isinstance(evidence, list):
+            errors.append(f"whole-plan action evidence is not a list: {action_id}")
+        seen_evidence: set[str] = set()
+        direct_count = 0
+        allowed_support = set(record.get("allowed_support_relations") or [])
+        for raw_evidence in evidence_rows:
+            if not isinstance(raw_evidence, dict):
+                errors.append(f"whole-plan action evidence is not an object: {action_id}")
+                continue
+            evidence_row = dict(raw_evidence)
+            if set(evidence_row) != _ACTION_EVIDENCE_KEYS:
+                errors.append(f"whole-plan action evidence has missing or undeclared keys: {action_id}")
+            unit_id = str(evidence_row.get("unit_id") or "")
+            if unit_id in seen_evidence:
+                errors.append(f"whole-plan action evidence duplicates unit id: {action_id}/{unit_id}")
+            seen_evidence.add(unit_id)
+            if unit_id not in expected_units:
+                errors.append(f"whole-plan action evidence forged unit id: {action_id}/{unit_id}")
+                continue
+            quote = str(evidence_row.get("quote") or "")
+            source = str((unit_records.get(unit_id) or {}).get("source_text") or "")
+            if not quote or quote not in source:
+                errors.append(f"whole-plan action evidence is not exact: {action_id}/{unit_id}")
+            relation = str(evidence_row.get("relation") or "")
+            support_relation = str(evidence_row.get("support_relation") or "")
+            if relation == "direct":
+                direct_count += 1
+                if support_relation:
+                    errors.append(f"whole-plan direct evidence declares support relation: {action_id}/{unit_id}")
+            elif relation == "support":
+                if support_relation not in allowed_support:
+                    errors.append(f"whole-plan support relation is not registered: {action_id}/{unit_id}")
+            else:
+                errors.append(f"whole-plan action evidence relation is invalid: {action_id}/{unit_id}")
+        if verdict == "admit":
+            if set(seen_evidence) != set(expected_units) or len(evidence_rows) != len(expected_units):
+                errors.append(f"whole-plan admitted action lacks exact evidence cardinality: {action_id}")
+            if direct_count < 1:
+                errors.append(f"whole-plan admitted action has no direct evidence: {action_id}")
+        valid_action_rows.append(row)
+
+    for action_id in plan.action_ids:
+        count = action_counts.get(action_id, 0)
+        if count != 1:
+            errors.append(f"whole-plan admission requires one action verdict: {action_id} ({count})")
+    returned_action_ids = tuple(
+        str(row.get("action_id") or "")
+        for row in action_rows
+        if isinstance(row, dict)
+    )
+    if returned_action_ids != plan.action_ids:
+        errors.append("whole-plan action verdict order does not match the immutable plan")
+
+    unit_counts: dict[str, int] = {}
+    valid_unit_rows: list[dict[str, Any]] = []
+    allowed_types = {str(value) for value in allowed_action_types}
+    for raw in unit_rows:
+        if not isinstance(raw, dict):
+            errors.append("whole-plan admission contains a non-object unit verdict")
+            continue
+        row = dict(raw)
+        if set(row) != _UNIT_VERDICT_KEYS:
+            errors.append("whole-plan unit verdict has missing or undeclared keys")
+        unit_id = str(row.get("unit_id") or "")
+        unit_counts[unit_id] = unit_counts.get(unit_id, 0) + 1
+        record = unit_records.get(unit_id)
+        if record is None:
+            errors.append(f"whole-plan admission forged unit id: {unit_id or '<missing>'}")
+            continue
+        expected_owners = [str(value) for value in record.get("owner_action_ids") or []]
+        actual_owners = [str(value) for value in row.get("owner_action_ids") or []] if isinstance(row.get("owner_action_ids"), list) else []
+        if actual_owners != expected_owners:
+            errors.append(f"whole-plan unit owner mismatch: {unit_id}")
+        verdict = str(row.get("verdict") or "")
+        if verdict not in {"complete", "context", "unresolved", "omitted"}:
+            errors.append(f"whole-plan unit verdict is invalid: {unit_id}")
+        quote = str(row.get("evidence_quote") or "")
+        source = str(record.get("source_text") or "")
+        if not quote or quote not in source:
+            errors.append(f"whole-plan unit evidence is not exact: {unit_id}")
+        if not str(row.get("reason") or "").strip():
+            errors.append(f"whole-plan unit verdict has no reason: {unit_id}")
+        omitted_type = str(row.get("omitted_action_type") or "")
+        if verdict == "omitted":
+            if omitted_type not in allowed_types:
+                errors.append(f"whole-plan omitted demand is not registry expressible: {unit_id}")
+        elif omitted_type:
+            errors.append(f"whole-plan non-omitted unit declares an omitted action: {unit_id}")
+        disposition = str(record.get("disposition") or "")
+        if disposition == "action" and verdict != "complete":
+            errors.append(f"whole-plan action unit is not complete: {unit_id}")
+        elif disposition == "context" and verdict != "context":
+            errors.append(f"whole-plan context unit is not context-only: {unit_id}")
+        elif disposition == "unresolved":
+            errors.append(f"whole-plan candidate retains unresolved unit: {unit_id}")
+        if verdict == "complete" and not expected_owners:
+            errors.append(f"whole-plan complete unit has no owner: {unit_id}")
+        if verdict == "context" and expected_owners:
+            errors.append(f"whole-plan context unit has an owner: {unit_id}")
+        valid_unit_rows.append(row)
+
+    for unit_id in plan.unit_ids:
+        count = unit_counts.get(unit_id, 0)
+        if count != 1:
+            errors.append(f"whole-plan admission requires one unit verdict: {unit_id} ({count})")
+    returned_unit_ids = tuple(
+        str(row.get("unit_id") or "")
+        for row in unit_rows
+        if isinstance(row, dict)
+    )
+    if returned_unit_ids != plan.unit_ids:
+        errors.append("whole-plan unit verdict order does not match the immutable plan")
+
+    if any(str(row.get("verdict") or "") != "admit" for row in valid_action_rows):
+        errors.append("whole-plan admission rejected one or more immutable actions")
+    if any(str(row.get("verdict") or "") not in {"complete", "context"} for row in valid_unit_rows):
+        errors.append("whole-plan admission found unresolved or omitted demand")
+
+    return WholePlanAdmission(
+        valid=not errors,
+        errors=tuple(dict.fromkeys(errors)),
+        action_verdicts=tuple(valid_action_rows),
+        unit_verdicts=tuple(valid_unit_rows),
+        response=payload,
+    )

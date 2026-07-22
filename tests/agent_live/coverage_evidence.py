@@ -6,7 +6,7 @@ import hashlib
 import json
 import time
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -15,9 +15,9 @@ from agent.harness.runtime_identity import repository_revision
 from agent.utils.redaction import redact
 
 
-ARTIFACT_SCHEMA_VERSION = 3
-CLI_ARTIFACT_SCHEMA_VERSION = 4
-REAL_EXECUTION_ARTIFACT_SCHEMA_VERSION = 1
+ARTIFACT_SCHEMA_VERSION = 4
+CLI_ARTIFACT_SCHEMA_VERSION = 5
+REAL_EXECUTION_ARTIFACT_SCHEMA_VERSION = 2
 TURN_OBSERVATION_SCHEMA_VERSION = 1
 PTY_DIAGNOSTIC_SCHEMA_VERSION = 1
 PTY_DIAGNOSTIC_STATUSES = {
@@ -241,13 +241,21 @@ def build_evidence_artifact(
     if outcome == "failed" and not str(error or "").strip():
         raise ValueError("failed artifact requires an error")
 
-    seed = deepcopy(dict(seed_state))
-    before = deepcopy(dict(before_state))
-    after = deepcopy(dict(after_state))
-    question = deepcopy(dict(before.get("pending_question") or {}))
-    if before.get("last_user_input") != input_value:
+    raw_seed = deepcopy(dict(seed_state))
+    raw_before = deepcopy(dict(before_state))
+    raw_after = deepcopy(dict(after_state))
+    if raw_before.get("last_user_input") != input_value:
         raise ValueError("input does not match the compiled-graph invocation state")
-    event_trace = [deepcopy(dict(event)) for event in events]
+    seed = redact(raw_seed)
+    before = redact(raw_before)
+    after = redact(raw_after)
+    safe_input = redact(deepcopy(input_value))
+    question = deepcopy(dict(before.get("pending_question") or {}))
+    event_trace = []
+    for event in events:
+        safe_event = deepcopy(dict(event))
+        safe_event["details"] = redact(dict(safe_event.get("details") or {}))
+        event_trace.append(safe_event)
     returned = _has_event(event_trace, "compiled_graph_turn_returned", edge)
     raised = _has_event(event_trace, "compiled_graph_turn_raised", edge)
     if outcome == "passed" and not returned:
@@ -260,20 +268,24 @@ def build_evidence_artifact(
     ):
         raise ValueError("runner-declared edge outcome events are forbidden")
 
+    raw_question = deepcopy(dict(raw_before.get("pending_question") or {}))
+    raw_state_diff = state_diff_between(raw_before, raw_after)
+    raw_response = deepcopy(list(raw_after.get("visible_response") or []))
+    raw_next_question = deepcopy(dict(raw_after.get("pending_question") or {}))
     state_diff = state_diff_between(before, after)
     response = deepcopy(list(after.get("visible_response") or []))
     next_question = deepcopy(dict(after.get("pending_question") or {}))
     admitted_action = _action_admission(
         edge,
         question,
-        input_value,
+        safe_input,
         admitted=(returned if admitted is None else bool(admitted)),
     )
     turn_evidence = {
         "compiled_graph_helper": COMPILED_GRAPH_RUNNER,
         "seed": seed,
         "before": before,
-        "input": deepcopy(input_value),
+        "input": safe_input,
         "admitted_action": admitted_action,
         "runtime_actions": {
             "proposed": deepcopy(list(after.get("proposed_actions") or [])),
@@ -300,7 +312,17 @@ def build_evidence_artifact(
             "commit": str(revision.get("commit") or ""),
             "worktree_hash": str(revision.get("worktree_hash") or ""),
         },
-        "input_hash": content_hash(input_value),
+        "input_hash": content_hash(safe_input),
+        "source_input_hash": content_hash(input_value),
+        "source_boundary_hashes": {
+            "before_hash": content_hash(raw_before),
+            "input_hash": content_hash(input_value),
+            "question_hash": content_hash(raw_question),
+            "after_hash": content_hash(raw_after),
+            "state_diff_hash": content_hash(raw_state_diff),
+            "response_hash": content_hash(raw_response),
+            "next_question_hash": content_hash(raw_next_question),
+        },
         "seed_state_hash": content_hash(seed),
         "before_state_hash": content_hash(before),
         "after_state_hash": content_hash(after),
@@ -310,7 +332,8 @@ def build_evidence_artifact(
         "event_trace_hash": content_hash(event_trace),
         "exit_status": int(exit_status),
         "outcome": str(outcome),
-        "error": str(error or ""),
+        "error": str(redact(error or "")),
+        "content_redacted": True,
         "started_at": started_at or _utc_timestamp(),
         "finished_at": finished_at or _utc_timestamp(),
     }
@@ -691,12 +714,30 @@ def build_pty_cli_evidence_artifact(
         dynamic_selection=dynamic_selection,
     )
 
-    turn_payload = asdict(turn)
+    safe_turn = _redacted_pty_turn(turn)
+    safe_selection = (
+        _redacted_dynamic_selection(dynamic_selection)
+        if dynamic_selection is not None
+        else None
+    )
+    safe_observation = _redacted_turn_observation(observation)
+    turn_payload = asdict(safe_turn)
     turn_payload.update({
-        "previous_response_hash": content_hash(turn.previous_agent_response),
-        "user_message_hash": content_hash(turn.user_message),
-        "agent_response_hash": content_hash(turn.agent_response),
+        "previous_response_hash": content_hash(safe_turn.previous_agent_response),
+        "user_message_hash": content_hash(safe_turn.user_message),
+        "agent_response_hash": content_hash(safe_turn.agent_response),
+        "source_previous_response_hash": content_hash(turn.previous_agent_response),
+        "source_user_message_hash": content_hash(turn.user_message),
+        "source_agent_response_hash": content_hash(turn.agent_response),
     })
+    selection_payload = None
+    if safe_selection is not None:
+        selection_payload = asdict(safe_selection)
+        selection_payload["target_coverage_ids"] = list(safe_selection.target_coverage_ids)
+        selection_payload["previous_response_hash"] = content_hash(
+            safe_turn.previous_agent_response
+        )
+    observation_payload = _turn_observation_payload(safe_observation)
     payload: dict[str, Any] = {
         "artifact_type": "pty_cli_turn",
         "schema_version": CLI_ARTIFACT_SCHEMA_VERSION,
@@ -716,17 +757,53 @@ def build_pty_cli_evidence_artifact(
         "execution_case_hash": content_hash(dict(execution_case or {})) if execution_case else "",
         "seed_receipt": dict(seed_receipt or {}),
         "seed_receipt_hash": content_hash(dict(seed_receipt or {})) if seed_receipt else "",
-        "turn_observation": _turn_observation_payload(observation),
-        "turn_observation_hash": content_hash(_turn_observation_payload(observation)),
+        "turn_observation": observation_payload,
+        "turn_observation_hash": content_hash(observation_payload),
         "outcome": "passed",
         "exit_status": 0,
         "error": "",
+        "content_redacted": True,
         "started_at": _utc_timestamp(),
         "finished_at": _utc_timestamp(),
     }
     payload["evidence_id"] = content_hash(payload)
     payload["artifact_hash"] = content_hash(payload)
     return payload
+
+
+def _redacted_pty_turn(turn: PtyCliTurnRecord) -> PtyCliTurnRecord:
+    previous = str(redact(turn.previous_agent_response))
+    user_message = str(redact(turn.user_message))
+    response = str(redact(turn.agent_response))
+    return replace(
+        turn,
+        previous_agent_response=previous,
+        user_message=user_message,
+        agent_response=response,
+        transcript_hash=pty_transcript_hash(
+            session_id=turn.session_id,
+            turn_index=turn.turn_index,
+            previous_agent_response=previous,
+            user_message=user_message,
+            agent_response=response,
+        ),
+    )
+
+
+def _redacted_dynamic_selection(
+    selection: DynamicTurnSelection,
+) -> DynamicTurnSelection:
+    return replace(
+        selection,
+        selected_message=str(redact(selection.selected_message)),
+        persona=str(redact(selection.persona)),
+        goal=str(redact(selection.goal)),
+        rationale=str(redact(selection.rationale)),
+    )
+
+
+def _redacted_turn_observation(observation: TurnObservation) -> TurnObservation:
+    return _turn_observation_from_payload(redact(_turn_observation_payload(observation)))
 
 
 def validate_pty_cli_evidence_artifact(
@@ -741,6 +818,17 @@ def validate_pty_cli_evidence_artifact(
         return False, "artifact is not PTY CLI evidence"
     if artifact.get("schema_version") != CLI_ARTIFACT_SCHEMA_VERSION:
         return False, "unsupported PTY CLI evidence schema"
+    if artifact.get("content_redacted") is not True:
+        return False, "PTY CLI evidence does not declare redaction"
+    turn_payload = artifact.get("turn")
+    if not isinstance(turn_payload, Mapping):
+        return False, "PTY evidence has no turn payload"
+    for name in (
+        "source_previous_response_hash", "source_user_message_hash",
+        "source_agent_response_hash",
+    ):
+        if not _is_sha256(str(turn_payload.get(name) or "")):
+            return False, f"PTY source boundary hash is invalid: {name}"
     evidence_class = str(artifact.get("evidence_class") or "")
     lane_error = _lane_error(edge, evidence_class)
     if lane_error:
@@ -765,7 +853,11 @@ def validate_pty_cli_evidence_artifact(
         return False, "repository revision mismatch"
 
     raw_turn = dict(artifact.get("turn") or {})
-    for derived in ("previous_response_hash", "user_message_hash", "agent_response_hash"):
+    for derived in (
+        "previous_response_hash", "user_message_hash", "agent_response_hash",
+        "source_previous_response_hash", "source_user_message_hash",
+        "source_agent_response_hash",
+    ):
         raw_turn.pop(derived, None)
     try:
         turn = PtyCliTurnRecord(**raw_turn)
@@ -1105,7 +1197,14 @@ def _validate_turn_observation(
     edge_type = str(edge.get("edge_type") or "")
     if edge_type == "action_transition":
         if baseline.pending_question_id or baseline.pending_contract:
-            raise ValueError("action-only baseline unexpectedly has a pending contract")
+            accepted = {
+                str(item)
+                for item in baseline.pending_contract.get("accepted_action_types") or ()
+            }
+            if str(edge.get("action_type") or "") not in accepted:
+                raise ValueError(
+                    "action-only baseline has an unrelated pending contract"
+                )
     elif not baseline.pending_question_id:
         raise ValueError("baseline runtime event has no pending contract")
     else:
@@ -1450,6 +1549,7 @@ def validate_evidence_artifact(
         "seed_state_hash", "before_state_hash", "after_state_hash",
         "turn_evidence", "turn_evidence_hash", "event_trace", "event_trace_hash",
         "exit_status", "outcome", "error", "started_at", "finished_at",
+        "content_redacted", "source_input_hash", "source_boundary_hashes",
     }
     missing = sorted(required - set(artifact))
     if missing:
@@ -1473,6 +1573,17 @@ def validate_evidence_artifact(
             return False, f"artifact field is empty: {field}"
     if str(artifact.get("evidence_class")) != "deterministic":
         return False, "compiled-graph artifact must use deterministic evidence"
+    if artifact.get("content_redacted") is not True:
+        return False, "compiled-graph artifact does not declare redaction"
+    source_boundary_hashes = artifact.get("source_boundary_hashes")
+    if not isinstance(source_boundary_hashes, Mapping) or any(
+        not _is_sha256(str(source_boundary_hashes.get(name) or ""))
+        for name in (
+            "before_hash", "input_hash", "question_hash", "after_hash",
+            "state_diff_hash", "response_hash", "next_question_hash",
+        )
+    ):
+        return False, "compiled-graph source boundary hashes are invalid"
     lane_error = _lane_error(edge, "deterministic")
     if lane_error:
         return False, lane_error
@@ -1486,6 +1597,7 @@ def validate_evidence_artifact(
     for field in (
         "input_hash", "seed_state_hash", "before_state_hash", "after_state_hash",
         "turn_evidence_hash", "event_trace_hash", "evidence_id", "artifact_hash",
+        "source_input_hash",
     ):
         if not _is_sha256(str(artifact.get(field) or "")):
             return False, f"artifact hash is invalid: {field}"
@@ -1700,12 +1812,16 @@ def build_real_execution_evidence_artifact(
         raise ValueError("real execution evidence requires a job id")
     if not request or not result:
         raise ValueError("real execution evidence requires request and result objects")
-    artifacts = [dict(item) for item in job_artifacts]
-    logs = [dict(item) for item in log_artifacts]
-    if not artifacts or not logs:
+    raw_artifacts = [dict(item) for item in job_artifacts]
+    raw_logs = [dict(item) for item in log_artifacts]
+    if not raw_artifacts or not raw_logs:
         raise ValueError("real execution evidence requires hashed job and log artifacts")
-    for item in (*artifacts, *logs):
+    for item in (*raw_artifacts, *raw_logs):
         _validate_hashed_artifact_identity(item, expected_job_id=str(job_id))
+    safe_request = redact(deepcopy(dict(request)))
+    safe_result = redact(deepcopy(dict(result)))
+    artifacts = redact(raw_artifacts)
+    logs = redact(raw_logs)
     payload: dict[str, Any] = {
         "artifact_type": "real_execution",
         "schema_version": REAL_EXECUTION_ARTIFACT_SCHEMA_VERSION,
@@ -1716,10 +1832,12 @@ def build_real_execution_evidence_artifact(
         "runner_type": REAL_EXECUTION_RUNNER,
         "revision": dict(revision),
         "operation_kind": operation_kind,
-        "request": deepcopy(dict(request)),
-        "request_hash": content_hash(request),
-        "result": deepcopy(dict(result)),
-        "result_hash": content_hash(result),
+        "request": safe_request,
+        "request_hash": content_hash(safe_request),
+        "source_request_hash": content_hash(request),
+        "result": safe_result,
+        "result_hash": content_hash(safe_result),
+        "source_result_hash": content_hash(result),
         "job_id": str(job_id),
         "job_artifacts": artifacts,
         "job_artifacts_hash": content_hash(artifacts),
@@ -1728,6 +1846,7 @@ def build_real_execution_evidence_artifact(
         "outcome": "passed",
         "exit_status": 0,
         "error": "",
+        "content_redacted": True,
         "started_at": started_at or _utc_timestamp(),
         "finished_at": finished_at or _utc_timestamp(),
     }
@@ -1749,6 +1868,11 @@ def validate_real_execution_evidence_artifact(
         return False, "artifact is not real execution evidence"
     if artifact.get("schema_version") != REAL_EXECUTION_ARTIFACT_SCHEMA_VERSION:
         return False, "unsupported real execution evidence schema"
+    if artifact.get("content_redacted") is not True:
+        return False, "real execution evidence does not declare redaction"
+    for name in ("source_request_hash", "source_result_hash"):
+        if not _is_sha256(str(artifact.get(name) or "")):
+            return False, f"real execution source hash is invalid: {name}"
     if artifact.get("evidence_class") != "real_execution":
         return False, "real execution evidence class is invalid"
     if artifact.get("runner_type") != REAL_EXECUTION_RUNNER:
@@ -1899,15 +2023,7 @@ def _validate_return_event(
     details = event.get("details")
     if not isinstance(details, Mapping):
         return "compiled graph return event has no details"
-    expected = {
-        "before_hash": artifact.get("before_state_hash"),
-        "input_hash": artifact.get("input_hash"),
-        "question_hash": content_hash(turn.get("question")),
-        "after_hash": artifact.get("after_state_hash"),
-        "state_diff_hash": content_hash(turn.get("state_diff")),
-        "response_hash": content_hash(turn.get("response")),
-        "next_question_hash": content_hash(turn.get("next_question")),
-    }
+    expected = dict(artifact.get("source_boundary_hashes") or {})
     mismatches = {key: (details.get(key), value) for key, value in expected.items() if details.get(key) != value}
     return f"compiled graph return hashes mismatch: {mismatches}" if mismatches else ""
 

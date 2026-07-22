@@ -19,7 +19,12 @@ from .chain_rpc import (
     cancel_chain_rpc_question,
     question_for_chain_rpc,
 )
-from .environment import apply_environment_action, apply_environment_answer, question_for_environment
+from .environment import (
+    apply_environment_action,
+    apply_environment_answer,
+    question_for_environment,
+    question_for_environment_field,
+)
 from .execution import apply_execution_action, apply_execution_answer, question_for_execution
 from .orientation import apply_orientation_action, apply_orientation_answer, opening_question
 from .performance import apply_performance_action, apply_performance_answer, question_for_performance
@@ -30,6 +35,7 @@ from .sync_observe import apply_sync_observe_action, apply_sync_observe_answer, 
 ActionHandler = Callable[[AgentGraphState, ActionProposal], HandlerResult]
 AnswerHandler = Callable[[AgentGraphState, PendingQuestion, Any, str], HandlerResult]
 QuestionFactory = Callable[[AgentGraphState, str], PendingQuestion | None]
+FieldQuestionFactory = Callable[[AgentGraphState, str, str], PendingQuestion | None]
 QuestionCanceller = Callable[[AgentGraphState, PendingQuestion], HandlerResult]
 
 
@@ -37,6 +43,7 @@ QuestionCanceller = Callable[[AgentGraphState, PendingQuestion], HandlerResult]
 class DomainRuntime:
     apply_action: ActionHandler
     question_factory: QuestionFactory | None = None
+    field_question_factory: FieldQuestionFactory | None = None
     apply_answer: AnswerHandler | None = None
     cancel_question: QuestionCanceller | None = None
 
@@ -52,6 +59,7 @@ DOMAIN_RUNTIME: dict[str, DomainRuntime] = {
     "environment": DomainRuntime(
         apply_action=apply_environment_action,
         question_factory=question_for_environment,
+        field_question_factory=question_for_environment_field,
         apply_answer=lambda state, question, value, _text: apply_environment_answer(state, question, value),
     ),
     "execution": DomainRuntime(

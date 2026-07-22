@@ -321,7 +321,9 @@ class InteractiveSignalContractTest(unittest.TestCase):
     def test_whitespace_bracketed_paste_is_a_terminal_noop(self) -> None:
         script = textwrap.dedent(
             """
-            from agent.terminal.repl import AnyChainTerminal, TerminalSession
+            import tempfile
+            from pathlib import Path
+            from agent.terminal.repl import AnyChainTerminal, TerminalSession, TerminalSessionStore
             from agent.terminal.io import TerminalIO
 
             class CountingHarness:
@@ -341,7 +343,12 @@ class InteractiveSignalContractTest(unittest.TestCase):
                 def _ensure_harness(self):
                     return self.harness
 
-            raise SystemExit(App(state=TerminalSession(language="en"), io=TerminalIO()).run())
+            with tempfile.TemporaryDirectory() as tmpdir:
+                raise SystemExit(App(
+                    state=TerminalSession(language="en"),
+                    store=TerminalSessionStore(Path(tmpdir) / "session.json"),
+                    io=TerminalIO(),
+                ).run())
             """
         )
         pid, fd = pty.fork()
@@ -375,8 +382,10 @@ class InteractiveSignalContractTest(unittest.TestCase):
     def test_busy_sigint_cancels_turn_then_idle_sigint_exits(self) -> None:
         script = textwrap.dedent(
             """
+            import tempfile
             import time
-            from agent.terminal.repl import AnyChainTerminal, TerminalSession
+            from pathlib import Path
+            from agent.terminal.repl import AnyChainTerminal, TerminalSession, TerminalSessionStore
             from agent.terminal.io import TerminalIO
 
             class BlockingHarness:
@@ -399,7 +408,12 @@ class InteractiveSignalContractTest(unittest.TestCase):
                 def _ensure_harness(self):
                     return self.harness
 
-            raise SystemExit(App(state=TerminalSession(language="en"), io=TerminalIO()).run())
+            with tempfile.TemporaryDirectory() as tmpdir:
+                raise SystemExit(App(
+                    state=TerminalSession(language="en"),
+                    store=TerminalSessionStore(Path(tmpdir) / "session.json"),
+                    io=TerminalIO(),
+                ).run())
             """
         )
         pid, fd = pty.fork()

@@ -125,7 +125,9 @@ def resume_modify_group_question(state: AgentGraphState) -> dict[str, Any]:
             {
                 "id": str(index),
                 "label": spec.name,
-                "description": ", ".join(spec.fields),
+                "description": ", ".join(
+                    field for field in spec.fields if field not in spec.immutable_fields
+                ),
                 "value": spec.name,
                 "action": {
                     "type": "change_group",

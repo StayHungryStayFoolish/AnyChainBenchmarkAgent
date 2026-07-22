@@ -1012,6 +1012,45 @@ def question_for_environment(state: AgentGraphState, group: str) -> dict[str, An
     return None
 
 
+def question_for_environment_field(
+    state: AgentGraphState,
+    group: str,
+    field: str,
+) -> dict[str, Any] | None:
+    """Build the exact registered environment question for one edited field."""
+
+    from agent.workflows.group_registry import reconfiguration_question_for_field
+
+    question_id = reconfiguration_question_for_field(field)
+    if not question_id or group_for_field(field) != group:
+        return None
+    projected = deepcopy(state)
+    confirmed = dict(projected.get("confirmed_config") or {})
+    confirmed.pop(field, None)
+    if (
+        group == "accounts_disk"
+        and field != "has_accounts_device"
+        and confirmed.get("has_accounts_device") is not True
+    ):
+        confirmed.pop("has_accounts_device", None)
+    projected.pop(field, None)
+    projected["confirmed_config"] = confirmed
+    projected.setdefault("inferred_config", {})[f"{field}_manual_required"] = True
+    question = question_for_environment(projected, group)
+    if question:
+        question = dict(question)
+        question["reconfiguration_target_field"] = field
+        if str(question.get("field") or "") == field:
+            language = str(projected.get("language") or "en")
+            question["prompt"] = localized(
+                language,
+                f"请输入新的 {field}。",
+                f"Enter the new {field}.",
+            )
+        return question
+    return None
+
+
 def apply_environment_answer(state: AgentGraphState, question: dict[str, Any], value: Any) -> HandlerResult:
     next_state: AgentGraphState = deepcopy(state)
     field = str(question.get("field") or "")

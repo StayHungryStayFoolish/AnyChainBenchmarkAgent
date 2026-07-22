@@ -20,7 +20,7 @@ from .oracle import (
 from .routing import chain_identity_confirmed, group_readiness, next_group_and_reason
 from .turns import adjudicate_turn
 from .plan_coverage import segment_user_turn
-from .action_registry import ACTION_BY_TYPE, action_crosses_pending_barrier, action_execution_phase, action_is_turn_local, action_merge_key, assign_action_ids, compile_legacy_custom_rpc_action, lifecycle_rejected_action_indexes, merge_semantic_actions, normalize_action_relations, validate_action_contract
+from .action_registry import ACTION_BY_TYPE, action_crosses_pending_barrier, action_execution_phase, action_is_turn_local, action_merge_key, assign_action_ids, compile_legacy_custom_rpc_action, lifecycle_rejected_action_indexes, merge_semantic_actions, normalize_action_relations, validate_action_contract, validate_field_intake_admission_receipt, validate_proposal_field_receipts
 from .contracts import ActionProposal, CheckpointCommand, HandlerResult, RecoveryCommand
 from .localization import localized as _localized
 from .domains.orientation import completed_group_status
@@ -67,8 +67,10 @@ from .input_values import normalize_target_mode, target_mode_evidence_matches
 from agent.workflows.group_registry import (
     GROUP_ORDER,
     GROUP_SPEC_BY_NAME,
+    group_for_field,
     invalidation_targets,
     is_user_navigable_group,
+    reconfiguration_question_for_field,
 )
 QUEUE_RESUME_PENDING_IDS = {
     "inferred_config_review",
@@ -92,6 +94,45 @@ def apply_coordinator_action(state: AgentGraphState, action: ActionProposal) -> 
             visible_result=_render_question(pending, next_state.get("language", "en")),
             pending_question=pending,
             completion="unchanged",
+            stop_after_response=True,
+        )
+    if action.action_type == "request_config_field_input":
+        field = str(action.arguments.get("config_field") or "").strip()
+        group = group_for_field(field)
+        question_id = reconfiguration_question_for_field(field)
+        if not group or not question_id:
+            return HandlerResult(blocker=f"field is not registered for typed reconfiguration: {field or '<missing>'}")
+        runtime = DOMAIN_RUNTIME.get(GROUP_OWNER.get(group, ""))
+        question = (
+            runtime.field_question_factory(next_state, group, field)
+            if runtime and runtime.field_question_factory
+            else None
+        )
+        owner_spec = GROUP_SPEC_BY_NAME.get(group)
+        if (
+            not question
+            or not owner_spec
+            or str(question.get("group") or "") != group
+            or str(question.get("id") or "") not in owner_spec.questions
+            or str(question.get("field") or "") not in owner_spec.fields
+        ):
+            return HandlerResult(blocker=f"registered field question is unavailable: {field}")
+        control = dict(next_state.get("control") or {})
+        if str(question.get("field") or "") != field:
+            control["field_reconfiguration_continuation"] = {
+                "group": group,
+                "config_field": field,
+                "prerequisite_question_id": str(question.get("id") or ""),
+            }
+        else:
+            control.pop("field_reconfiguration_continuation", None)
+        next_state["control"] = control
+        _record_group_transition(next_state, group)
+        _install_pending_question(next_state, question)
+        next_state["visible_response"] = [_render_question(question, next_state.get("language", "en"))]
+        return HandlerResult(
+            consumed_action_ids=(action.action_id,),
+            completion="blocked",
             stop_after_response=True,
         )
     if action.action_type == "change_group":
@@ -462,6 +503,7 @@ def admit_turn_step(state: AgentGraphState) -> AgentGraphState:
 
     text = str((state.get("turn_context") or {}).get("text") or "")
     actions = _validate_action_plan(state, list(state.get("proposed_actions") or []))
+    _validate_admission_transaction(state, actions, current_submission=True)
     scope = f"{state.get('thread_id') or 'default'}:{int(state.get('turn_index') or 0)}"
     actions = assign_action_ids(scope, text, actions)
     origin_group = str(state.get("active_group") or "")
@@ -1262,6 +1304,52 @@ def _has_meaningful_queue(actions: list[dict[str, Any]]) -> bool:
         for item in actions
         if (action_type := str(item.get("type") or "").strip())
     )
+
+
+def _validate_admission_transaction(
+    state: AgentGraphState,
+    actions: list[dict[str, Any]],
+    *,
+    current_submission: bool,
+) -> None:
+    """Validate Harness receipts against their session and ordered transaction."""
+
+    thread_id = str(state.get("thread_id") or "default")
+    session_id = str((state.get("session") or {}).get("id") or thread_id)
+    turn_index = int(state.get("turn_index") or 0)
+    receipt_actions = [
+        action for action in actions
+        if isinstance(action, dict) and action.get("_admission_action_id")
+    ]
+    if receipt_actions:
+        declared_orders = {
+            tuple(str(value) for value in action.get("_transaction_action_ids") or [])
+            for action in receipt_actions
+        }
+        if len(declared_orders) != 1:
+            raise StateInvariantError("admission transaction order metadata is inconsistent")
+        declared_order = next(iter(declared_orders))
+        actual_order = tuple(str(action.get("_admission_action_id") or "") for action in receipt_actions)
+        if actual_order != tuple(value for value in declared_order if value in set(actual_order)):
+            raise StateInvariantError("admission transaction action order mismatch")
+    for action in actions:
+        action_type = str(action.get("type") or "")
+        if action_type == "request_config_field_input":
+            validate_field_intake_admission_receipt(
+                action,
+                thread_id=thread_id,
+                session_id=session_id,
+            )
+            receipt = action.get("_semantic_admission_receipt") or {}
+            if current_submission and int(receipt.get("submitted_turn_index") or 0) != turn_index:
+                raise StateInvariantError("field intake receipt belongs to another turn")
+        elif action_type == "propose_config_values":
+            validate_proposal_field_receipts(
+                action,
+                thread_id=thread_id,
+                session_id=session_id,
+                submitted_turn_index=turn_index if current_submission else None,
+            )
 
 
 def _process_action_queue(
@@ -2140,6 +2228,8 @@ def _apply_evidence_outcome(
 def _apply_queue_action(state: AgentGraphState, action: dict[str, Any], text: str) -> AgentGraphState | None:
     action = validate_action_contract(action, trusted_metadata=True)
     action_type = str(action.get("type") or "unknown").strip()
+    if action_type in {"request_config_field_input", "propose_config_values"}:
+        _validate_admission_transaction(state, [action], current_submission=False)
     confidence = str(action.get("confidence") or "medium").strip().lower()
     origin_text = str(action.get("_origin_text") or text)
     if confidence == "low" and action_type not in {"greeting", "unknown"}:
@@ -2693,6 +2783,10 @@ def _apply_pending_answer(
     )
     if expected:
         verify_expected_patch(result, expected)
+    result = _resume_field_reconfiguration_after_prerequisite(
+        result,
+        answered_question=question,
+    )
     _record_admitted_action(
         result,
         {
@@ -2702,6 +2796,54 @@ def _apply_pending_answer(
         source="pending_question_contract",
     )
     return result
+
+
+def _resume_field_reconfiguration_after_prerequisite(
+    state: AgentGraphState,
+    *,
+    answered_question: PendingQuestion,
+) -> AgentGraphState:
+    """Consume one durable field-edit continuation after its prerequisite."""
+
+    control = dict(state.get("control") or {})
+    continuation = control.get("field_reconfiguration_continuation")
+    if not isinstance(continuation, dict):
+        return state
+    if str(answered_question.get("id") or "") != str(
+        continuation.get("prerequisite_question_id") or ""
+    ):
+        return state
+    group = str(continuation.get("group") or "").strip()
+    field = str(continuation.get("config_field") or "").strip()
+    if group_for_field(field) != group:
+        control.pop("field_reconfiguration_continuation", None)
+        state["control"] = control
+        return state
+    runtime = DOMAIN_RUNTIME.get(GROUP_OWNER.get(group, ""))
+    question = (
+        runtime.field_question_factory(state, group, field)
+        if runtime and runtime.field_question_factory
+        else None
+    )
+    owner_spec = GROUP_SPEC_BY_NAME.get(group)
+    if (
+        not question
+        or not owner_spec
+        or str(question.get("group") or "") != group
+        or str(question.get("id") or "") not in owner_spec.questions
+        or str(question.get("field") or "") not in owner_spec.fields
+    ):
+        return state
+    if str(question.get("field") or "") == field:
+        control.pop("field_reconfiguration_continuation", None)
+    else:
+        continuation["prerequisite_question_id"] = str(question.get("id") or "")
+        control["field_reconfiguration_continuation"] = continuation
+    state["control"] = control
+    _record_group_transition(state, group)
+    _install_pending_question(state, question)
+    state["visible_response"] = [_render_question(question, state.get("language", "en"))]
+    return state
 
 
 def _option_return_policy(question: PendingQuestion, value: Any) -> str:

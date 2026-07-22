@@ -10,16 +10,21 @@ existing tamper-evident PTY evidence contract.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
 import select
 import signal
 import subprocess
+import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from agent.utils.redaction import redact
@@ -32,6 +37,7 @@ from tests.agent_live.coverage_evidence import (
     VerifiedPostcondition,
     build_pty_cli_evidence_artifact,
     build_pty_diagnostic_artifact,
+    content_hash,
     pty_transcript_hash,
     repository_revision,
     verify_runtime_postcondition,
@@ -40,9 +46,14 @@ from tests.agent_live.coverage_evidence import (
 )
 from tests.agent_live.chaos_scheduler import (
     ChaosSchedule,
+    JourneyOutcomeContract,
+    JourneySchedule,
     ScheduledCoverageTarget,
+    journey_schedule_payload,
     validate_chaos_schedule,
+    validate_journey_schedule,
     write_chaos_schedule,
+    write_journey_schedule,
 )
 from agent.harness.plan_coverage import segment_user_turn
 
@@ -54,6 +65,13 @@ _MODEL_CONFIG_RE = re.compile(
     r"provider\s*=\s*([^,\s]+)\s*,\s*model\s*=\s*([^,\s]+)",
     re.IGNORECASE,
 )
+
+
+def _write_redacted_transcript(path: Path, lines: Sequence[str]) -> None:
+    """Persist terminal evidence only after applying the shared secret boundary."""
+
+    original = "\n".join(str(line) for line in lines).rstrip() + "\n"
+    path.write_text(str(redact(original)), encoding="utf-8")
 
 
 @dataclass(frozen=True)
@@ -85,6 +103,7 @@ class ChaosRunConfig:
     repo_root: Path
     command: tuple[str, ...]
     session_id: str = field(default_factory=lambda: f"dynamic-chaos-{uuid.uuid4().hex}")
+    execution_id: str = field(default_factory=lambda: f"chaos-{uuid.uuid4().hex}")
     session_purpose: str = "dynamic-dual-ai-chaos"
     provider: str = "deepseek"
     model: str = "deepseek-chat"
@@ -108,9 +127,14 @@ class ChaosRunConfig:
 
         root = Path(repo_root).resolve()
         session_id = str(changes.pop("session_id", f"dynamic-chaos-{uuid.uuid4().hex}"))
+        execution_id = str(changes.pop("execution_id", f"chaos-{uuid.uuid4().hex}"))
         host_runtime = root / ".agent" / "dynamic-chaos" / session_id
         container_runtime = Path("/workspace/.agent/dynamic-chaos") / session_id
         container_env = {
+            "ANYCHAIN_CHAOS_EXECUTION_ID": execution_id,
+            "ANYCHAIN_CHAOS_INNER_CLEANUP_RECEIPT_DIR": str(
+                container_runtime / "container-cleanup-receipts"
+            ),
             "ANYCHAIN_AGENT_CHECKPOINT_PATH": str(container_runtime / "checkpoints.sqlite"),
             "ANYCHAIN_AGENT_SESSION_ID": session_id,
             "ANYCHAIN_AGENT_SESSION_PURPOSE": str(
@@ -140,6 +164,7 @@ class ChaosRunConfig:
             repo_root=root,
             command=tuple(command),
             session_id=session_id,
+            execution_id=execution_id,
             runtime_root=host_runtime,
             runtime_root_in_process=container_runtime,
             transport_kind="container_pty_bridge",
@@ -152,7 +177,7 @@ class ChaosRunConfig:
         repo_root: str | Path,
         **changes: Any,
     ) -> "ChaosRunConfig":
-        """Run the product CLI directly on a Linux host through a PTY."""
+        """Run the product CLI under the Linux PTY process supervisor."""
 
         root = Path(repo_root).resolve()
         session_id = str(changes.pop("session_id", f"dynamic-chaos-{uuid.uuid4().hex}"))
@@ -160,6 +185,12 @@ class ChaosRunConfig:
         return cls(
             repo_root=root,
             command=(
+                str(root / ".venv-adk" / "bin" / "python"),
+                "-m",
+                "tests.agent_live.container_pty_bridge",
+                "--cwd",
+                str(root),
+                "--",
                 str(root / "bin" / "anychain-agent"),
                 "--state-file",
                 str(runtime / "terminal-session.json"),
@@ -169,6 +200,7 @@ class ChaosRunConfig:
             session_id=session_id,
             runtime_root=runtime,
             runtime_root_in_process=runtime,
+            transport_kind="container_pty_bridge",
             **changes,
         )
 
@@ -185,10 +217,268 @@ class ChaosRunResult:
     execution_status: str
 
 
+@dataclass(frozen=True)
+class JourneySimulatorContext:
+    """Open-journey context exposed only after one complete Agent response."""
+
+    session_id: str
+    turn_index: int
+    previous_agent_response: str
+    previous_response_received_at_ns: int
+    schedule: JourneySchedule
+    transcript: tuple[tuple[str, str], ...]
+    observed_edge_keys: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class JourneySimulatorDecision:
+    """One response-driven journey turn without a predeclared future edge."""
+
+    user_message: str
+    persona: str
+    mission: str
+    rationale: str
+    risk_factor_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class JourneyObservedEdge:
+    """One authoritative edge independently proven after a journey turn."""
+
+    edge_key: str
+    verifier_id: str
+    observed_coverage_ids: tuple[str, ...]
+    details: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class JourneyVerifierContext:
+    """Immutable facts available to an injected journey postcondition verifier."""
+
+    schedule: JourneySchedule
+    initial_event: RuntimeTurnEvent
+    current_event: RuntimeTurnEvent
+    completed_turns: tuple[PtyCliTurnRecord, ...]
+    transcript: tuple[tuple[str, str], ...]
+    observed_edge_keys: tuple[str, ...]
+    latest_turn: PtyCliTurnRecord | None
+
+
+@dataclass(frozen=True)
+class JourneyPostconditionResult:
+    """Typed result returned by one injected named journey verifier."""
+
+    postcondition_id: str
+    satisfied: bool
+    details: Mapping[str, Any] = field(default_factory=dict)
+
+
+JOURNEY_VERIFIER_REGISTRY_SCHEMA_VERSION = 1
+JOURNEY_EVIDENCE_SCHEMA_VERSION = 2
+
+
+@dataclass(frozen=True)
+class JourneyPostconditionVerifierDefinition:
+    """One named, versioned verifier eligible for formal Journey evidence."""
+
+    postcondition_id: str
+    verifier_id: str
+    verifier_version: int
+    description: str
+    verifier: "JourneyPostconditionVerifier"
+    implementation_hash: str = ""
+
+
+@dataclass(frozen=True)
+class JourneyOutcomeVerifierRegistry:
+    """Immutable authoritative registry bound into every Journey artifact."""
+
+    registry_id: str
+    definitions: Mapping[str, JourneyPostconditionVerifierDefinition]
+    schema_version: int = JOURNEY_VERIFIER_REGISTRY_SCHEMA_VERSION
+
+
+@dataclass(frozen=True)
+class JourneyVerifierBinding:
+    postcondition_id: str
+    verifier_id: str
+    verifier_version: int
+    implementation_hash: str
+
+
+@dataclass(frozen=True)
+class JourneyOutcomeVerification:
+    """Evaluation of one terminal or forbidden outcome contract."""
+
+    outcome_id: str
+    satisfied: bool
+    postconditions: tuple[JourneyPostconditionResult, ...]
+    verifier_bindings: tuple[JourneyVerifierBinding, ...]
+
+
+class JourneyTerminalClassification(str, Enum):
+    PASSED = "passed"
+    PRODUCT_FAILED = "product_failed"
+    SIMULATOR_INVALID = "simulator_invalid"
+    INFRASTRUCTURE_INTERRUPTED = "infrastructure_interrupted"
+    EXTERNALLY_BLOCKED = "externally_blocked"
+
+
+class JourneyRunError(RuntimeError):
+    classification = JourneyTerminalClassification.INFRASTRUCTURE_INTERRUPTED
+
+
+class JourneyProductFailure(JourneyRunError):
+    classification = JourneyTerminalClassification.PRODUCT_FAILED
+
+
+class JourneySimulatorInvalidError(JourneyRunError):
+    classification = JourneyTerminalClassification.SIMULATOR_INVALID
+
+
+class JourneyInfrastructureInterruptedError(JourneyRunError):
+    classification = JourneyTerminalClassification.INFRASTRUCTURE_INTERRUPTED
+
+
+class JourneyExternallyBlockedError(JourneyRunError):
+    classification = JourneyTerminalClassification.EXTERNALLY_BLOCKED
+
+
+@dataclass(frozen=True)
+class JourneyRunResult:
+    session_id: str
+    transcript_path: Path
+    schedule_path: Path
+    journey_result_path: Path
+    evidence_path: Path
+    evidence_id: str
+    turns: tuple[PtyCliTurnRecord, ...]
+    observed_edge_keys: tuple[str, ...]
+    terminal_classification: JourneyTerminalClassification
+    terminal_outcome_id: str
+
+    @property
+    def execution_status(self) -> str:
+        return self.terminal_classification.value
+
+
 class Simulator(Protocol):
     """External decision boundary; this repository provides no Codex API."""
 
     def __call__(self, context: SimulatorContext) -> SimulatorDecision | None: ...
+
+
+class JourneySimulator(Protocol):
+    def __call__(
+        self,
+        context: JourneySimulatorContext,
+    ) -> JourneySimulatorDecision | None: ...
+
+
+class JourneyPostconditionVerifier(Protocol):
+    def __call__(
+        self,
+        context: JourneyVerifierContext,
+    ) -> JourneyPostconditionResult: ...
+
+
+def build_journey_outcome_verifier_registry(
+    definitions: Sequence[JourneyPostconditionVerifierDefinition],
+) -> JourneyOutcomeVerifierRegistry:
+    """Build an immutable registry whose identity includes verifier code and version."""
+
+    if not definitions:
+        raise ValueError("Journey verifier registry requires at least one definition")
+    normalized: dict[str, JourneyPostconditionVerifierDefinition] = {}
+    for definition in definitions:
+        postcondition_id = str(definition.postcondition_id or "").strip()
+        verifier_id = str(definition.verifier_id or "").strip()
+        description = str(definition.description or "").strip()
+        if not postcondition_id or not verifier_id or not description:
+            raise ValueError(
+                "Journey verifier definitions require postcondition_id, verifier_id, and description"
+            )
+        if postcondition_id in normalized:
+            raise ValueError(f"duplicate Journey postcondition verifier: {postcondition_id}")
+        if isinstance(definition.verifier_version, bool) or definition.verifier_version <= 0:
+            raise ValueError("Journey verifier_version must be a positive integer")
+        verifier = definition.verifier
+        if not inspect.isfunction(verifier):
+            raise TypeError("formal Journey verifiers must be top-level named functions")
+        if verifier.__name__ == "<lambda>" or "<locals>" in verifier.__qualname__:
+            raise TypeError("lambda and local-closure Journey verifiers cannot qualify evidence")
+        implementation_identity = {
+            "module": verifier.__module__,
+            "qualname": verifier.__qualname__,
+            "source": _journey_verifier_source(verifier),
+        }
+        implementation_hash = content_hash(implementation_identity)
+        if definition.implementation_hash and definition.implementation_hash != implementation_hash:
+            raise ValueError(
+                f"stale implementation hash for Journey verifier {postcondition_id}"
+            )
+        normalized[postcondition_id] = JourneyPostconditionVerifierDefinition(
+            postcondition_id=postcondition_id,
+            verifier_id=verifier_id,
+            verifier_version=definition.verifier_version,
+            description=description,
+            verifier=verifier,
+            implementation_hash=implementation_hash,
+        )
+    registry_id = content_hash({
+        "schema_version": JOURNEY_VERIFIER_REGISTRY_SCHEMA_VERSION,
+        "definitions": [
+            _journey_verifier_definition_payload(normalized[key])
+            for key in sorted(normalized)
+        ],
+    })
+    return JourneyOutcomeVerifierRegistry(
+        registry_id=registry_id,
+        definitions=MappingProxyType(normalized),
+    )
+
+
+def journey_outcome_verifier_registry_payload(
+    registry: JourneyOutcomeVerifierRegistry,
+) -> dict[str, Any]:
+    return {
+        "schema_version": registry.schema_version,
+        "registry_id": registry.registry_id,
+        "definitions": [
+            _journey_verifier_definition_payload(registry.definitions[key])
+            for key in sorted(registry.definitions)
+        ],
+    }
+
+
+def validate_journey_outcome_verifier_registry(
+    registry: JourneyOutcomeVerifierRegistry,
+) -> None:
+    if registry.schema_version != JOURNEY_VERIFIER_REGISTRY_SCHEMA_VERSION:
+        raise ValueError("unsupported Journey verifier registry schema")
+    rebuilt = build_journey_outcome_verifier_registry(tuple(registry.definitions.values()))
+    if rebuilt.registry_id != registry.registry_id:
+        raise ValueError("Journey verifier registry identity is stale or was modified")
+
+
+def _journey_verifier_definition_payload(
+    definition: JourneyPostconditionVerifierDefinition,
+) -> dict[str, Any]:
+    return {
+        "postcondition_id": definition.postcondition_id,
+        "verifier_id": definition.verifier_id,
+        "verifier_version": definition.verifier_version,
+        "description": definition.description,
+        "implementation_hash": definition.implementation_hash,
+    }
+
+
+def _journey_verifier_source(verifier: Callable[..., Any]) -> str:
+    try:
+        return inspect.getsource(verifier)
+    except (OSError, TypeError):
+        code = verifier.__code__
+        return repr((code.co_code.hex(), code.co_consts, code.co_names))
 
 
 class PtyTransport(Protocol):
@@ -338,25 +628,58 @@ class ContainerPtyBridgeTransport:
         *,
         cwd: str | Path,
         poll_interval_seconds: float = 0.05,
+        execution_id: str | None = None,
+        cleanup_receipt_dir: str | Path | None = None,
     ) -> None:
         self.command = tuple(command)
         self.cwd = Path(cwd)
         self.poll_interval_seconds = poll_interval_seconds
+        self.execution_id = execution_id or f"chaos-{uuid.uuid4().hex}"
+        self.cleanup_receipt_dir = (
+            Path(cleanup_receipt_dir) if cleanup_receipt_dir is not None else None
+        )
+        self.cleanup_receipt: Mapping[str, Any] | None = None
+        self._temporary_receipt_dir: tempfile.TemporaryDirectory[str] | None = None
         self._process: subprocess.Popen[bytes] | None = None
+        self._stdout_buffer = bytearray()
+        self._stderr_buffer = bytearray()
+        self._stderr_lock = threading.Lock()
+        self._stderr_thread: threading.Thread | None = None
+        self._stderr_cap_bytes = 64 * 1024
 
     def start(self, *, env: Mapping[str, str]) -> None:
         if self._process is not None:
             raise RuntimeError("container PTY bridge transport has already started")
+        process_env = dict(env)
+        process_env.setdefault("ANYCHAIN_CHAOS_EXECUTION_ID", self.execution_id)
+        if self.cleanup_receipt_dir is None:
+            self._temporary_receipt_dir = tempfile.TemporaryDirectory(
+                prefix="anychain-container-cleanup-"
+            )
+            receipt_dir = Path(self._temporary_receipt_dir.name)
+        else:
+            receipt_dir = self.cleanup_receipt_dir
+        receipt_dir.mkdir(parents=True, exist_ok=True)
+        process_env.setdefault(
+            "ANYCHAIN_CHAOS_INNER_CLEANUP_RECEIPT_DIR", str(receipt_dir)
+        )
         self._process = subprocess.Popen(
             self.command,
             cwd=self.cwd,
-            env=dict(env),
+            env=process_env,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
             close_fds=True,
         )
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr,
+            args=(self._process,),
+            name="anychain-container-pty-stderr",
+            daemon=True,
+        )
+        self._stderr_thread.start()
 
     def read_complete_agent_response(self, *, timeout_seconds: float) -> str:
         result = self._request(
@@ -384,13 +707,26 @@ class ContainerPtyBridgeTransport:
             return
         if process.poll() is None:
             try:
-                self._request_with_process(process, {"op": "close"}, timeout_seconds=5.0)
+                response = self._request_with_process(
+                    process, {"op": "close"}, timeout_seconds=5.0
+                )
+                self.cleanup_receipt = self._validate_cleanup_receipt(
+                    response.get("cleanup_receipt")
+                )
                 process.wait(timeout=5.0)
             except (OSError, RuntimeError, subprocess.TimeoutExpired):
                 self._terminate_process_group(process)
         for stream in (process.stdin, process.stdout, process.stderr):
             if stream is not None:
                 stream.close()
+        stderr_thread = self._stderr_thread
+        self._stderr_thread = None
+        if stderr_thread is not None:
+            stderr_thread.join(timeout=1.0)
+        temporary = self._temporary_receipt_dir
+        self._temporary_receipt_dir = None
+        if temporary is not None:
+            temporary.cleanup()
 
     def _request(self, payload: Mapping[str, Any], *, timeout_seconds: float) -> dict[str, Any]:
         if self._process is None:
@@ -412,6 +748,15 @@ class ContainerPtyBridgeTransport:
         process.stdin.flush()
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
+            line = self._pop_stdout_line()
+            if line is not None:
+                response = json.loads(line.decode("utf-8"))
+                if not response.get("ok"):
+                    raise RuntimeError(
+                        "container PTY bridge operation failed: "
+                        f"{response.get('error_type')}: {response.get('error')}"
+                    )
+                return dict(response)
             if process.poll() is not None:
                 raise RuntimeError(self._exit_message(process))
             ready, _, _ = select.select(
@@ -422,16 +767,10 @@ class ContainerPtyBridgeTransport:
             )
             if not ready:
                 continue
-            line = process.stdout.readline()
-            if not line:
+            chunk = os.read(process.stdout.fileno(), 65536)
+            if not chunk:
                 continue
-            response = json.loads(line.decode("utf-8"))
-            if not response.get("ok"):
-                raise RuntimeError(
-                    "container PTY bridge operation failed: "
-                    f"{response.get('error_type')}: {response.get('error')}"
-                )
-            return dict(response)
+            self._stdout_buffer.extend(chunk)
         raise TimeoutError(
             f"timed out after {timeout_seconds:.1f}s waiting for the container PTY bridge"
         )
@@ -448,14 +787,43 @@ class ContainerPtyBridgeTransport:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=3.0)
 
-    @staticmethod
-    def _exit_message(process: subprocess.Popen[bytes]) -> str:
-        stderr = b""
-        if process.stderr is not None:
+    def _validate_cleanup_receipt(self, value: Any) -> Mapping[str, Any]:
+        if not isinstance(value, Mapping):
+            raise RuntimeError("container PTY bridge returned no cleanup receipt")
+        required = {"receipt_id", "path", "sha256", "cleaned"}
+        if set(value) != required or not bool(value.get("cleaned")):
+            raise RuntimeError("container PTY bridge returned an invalid cleanup receipt")
+        if not all(str(value.get(key) or "") for key in ("receipt_id", "path", "sha256")):
+            raise RuntimeError("container PTY bridge cleanup receipt is incomplete")
+        return dict(value)
+
+    def _pop_stdout_line(self) -> bytes | None:
+        newline = self._stdout_buffer.find(b"\n")
+        if newline < 0:
+            return None
+        line = bytes(self._stdout_buffer[:newline])
+        del self._stdout_buffer[:newline + 1]
+        return line
+
+    def _drain_stderr(self, process: subprocess.Popen[bytes]) -> None:
+        if process.stderr is None:
+            return
+        while True:
             try:
-                stderr = process.stderr.read() or b""
-            except OSError:
-                stderr = b""
+                chunk = process.stderr.read(8192)
+            except (OSError, ValueError):
+                return
+            if not chunk:
+                return
+            with self._stderr_lock:
+                self._stderr_buffer.extend(chunk)
+                overflow = len(self._stderr_buffer) - self._stderr_cap_bytes
+                if overflow > 0:
+                    del self._stderr_buffer[:overflow]
+
+    def _exit_message(self, process: subprocess.Popen[bytes]) -> str:
+        with self._stderr_lock:
+            stderr = bytes(self._stderr_buffer)
         return (
             f"container PTY bridge exited unexpectedly (exit={process.returncode}): "
             f"{stderr.decode('utf-8', errors='replace')[-2000:]}"
@@ -468,6 +836,12 @@ def transport_for_config(config: ChaosRunConfig) -> PtyTransport:
             config.command,
             cwd=config.repo_root,
             poll_interval_seconds=config.poll_interval_seconds,
+            execution_id=config.execution_id,
+            cleanup_receipt_dir=(
+                config.runtime_root / "container-cleanup-receipts"
+                if config.runtime_root is not None
+                else None
+            ),
         )
     if config.transport_kind != "direct_pty":
         raise ValueError(f"unsupported PTY transport kind: {config.transport_kind!r}")
@@ -650,7 +1024,10 @@ class DynamicDualAiChaosRunner:
                     last_complete_event = resumed_event
                     last_complete_turn = None
                     last_complete_selection = None
-                if baseline_event.pending_question_id != expected_question:
+                if (
+                    expected_question
+                    and baseline_event.pending_question_id != expected_question
+                ):
                     raise RuntimeError(
                         "reviewed checkpoint did not restore the scheduled target contract: "
                         f"expected {expected_question or '<action>'}, got "
@@ -686,14 +1063,14 @@ class DynamicDualAiChaosRunner:
                 _validate_decision(decision, scheduled_target, edge)
                 submitted_at_ns = self.clock_ns()
                 self.transport.submit_bracketed_paste(decision.user_message)
-                response = self.transport.read_complete_agent_response(
-                    timeout_seconds=self.config.response_timeout_seconds
-                )
-                response_received_ns = self.clock_ns()
                 committed_event = self.event_stream.next_event(
                     timeout_seconds=self.config.response_timeout_seconds
                 )
                 self._validate_event_revision(committed_event)
+                response = self.transport.read_complete_agent_response(
+                    timeout_seconds=self.config.response_timeout_seconds
+                )
+                response_received_ns = self.clock_ns()
 
                 transcript_data = {
                     "session_id": self.config.session_id,
@@ -963,10 +1340,7 @@ class DynamicDualAiChaosRunner:
             raise
         finally:
             self.transport.close()
-            transcript_path.write_text(
-                "\n".join(transcript_lines).rstrip() + "\n",
-                encoding="utf-8",
-            )
+            _write_redacted_transcript(transcript_path, transcript_lines)
             schedule_result_path.write_text(
                 json.dumps({
                     "schema_version": 1,
@@ -1011,6 +1385,631 @@ class DynamicDualAiChaosRunner:
         return env
 
 
+class DynamicDualAiJourneyRunner:
+    """Run an open JourneySchedule without prescribing future user turns."""
+
+    def __init__(
+        self,
+        config: ChaosRunConfig,
+        simulator: JourneySimulator,
+        *,
+        ledger: Mapping[str, Any],
+        schedule: JourneySchedule,
+        postcondition_verifier_registry: JourneyOutcomeVerifierRegistry,
+        transport: PtyTransport | None = None,
+        event_stream: RuntimeEventStream | None = None,
+        revision: Mapping[str, str] | None = None,
+        clock_ns: Callable[[], int] = time.time_ns,
+    ) -> None:
+        self.config = config
+        self.simulator = simulator
+        self.transport = transport or transport_for_config(config)
+        self.ledger = dict(ledger)
+        self.schedule = schedule
+        self.revision = dict(revision or repository_revision(config.repo_root))
+        validate_journey_schedule(schedule, revision=self.revision)
+        if dict(self.ledger.get("revision") or {}) != self.revision:
+            raise ValueError("coverage ledger revision does not match the journey revision")
+        self.edge_index = {
+            str(edge.get("edge_key") or ""): edge
+            for edge in self.ledger.get("edges") or ()
+            if str(edge.get("edge_key") or "")
+        }
+        if not isinstance(postcondition_verifier_registry, JourneyOutcomeVerifierRegistry):
+            raise TypeError(
+                "Journey runner requires an authoritative JourneyOutcomeVerifierRegistry"
+            )
+        validate_journey_outcome_verifier_registry(postcondition_verifier_registry)
+        self.postcondition_verifier_registry = postcondition_verifier_registry
+        self._validate_verifier_contracts()
+        default_event_path = (
+            (config.runtime_root or config.repo_root / ".agent" / "dynamic-chaos" / config.session_id)
+            / "turn-events.jsonl"
+        )
+        self.event_stream = event_stream or JsonlRuntimeEventStream(
+            default_event_path,
+            poll_interval_seconds=config.poll_interval_seconds,
+        )
+        self.clock_ns = clock_ns
+
+    def run(self) -> JourneyRunResult:
+        runtime_root = (self.config.runtime_root or (
+            self.config.repo_root / ".agent" / "dynamic-chaos" / self.config.session_id
+        )).resolve()
+        runtime_root.mkdir(parents=True, exist_ok=True)
+        transcript_path = runtime_root / "transcript.txt"
+        schedule_path = write_journey_schedule(self.schedule, runtime_root / "journey-schedule.json")
+        journey_result_path = runtime_root / "journey-result.json"
+        evidence_dir = runtime_root / "evidence"
+        env = self._isolated_environment(runtime_root)
+
+        from tests.agent_live.runtime_checkpoint import reviewed_scenario, seed_runtime_checkpoint
+
+        start_scenario = reviewed_scenario(self.schedule.start_scenario)
+        seed_runtime_checkpoint(
+            start_scenario.seed_state,
+            checkpoint_path=runtime_root / "checkpoints.sqlite",
+            session_id=self.config.session_id,
+            session_purpose=self.config.session_purpose,
+            scenario_id=start_scenario.scenario_id,
+            scenario_state_fingerprint=start_scenario.state_fingerprint,
+        )
+
+        transcript: list[tuple[str, str]] = []
+        transcript_lines: list[str] = []
+        turns: list[PtyCliTurnRecord] = []
+        observed_edge_keys: list[str] = []
+        turn_results: list[dict[str, Any]] = []
+        terminal_classification = JourneyTerminalClassification.INFRASTRUCTURE_INTERRUPTED
+        terminal_outcome_id = ""
+        failure_reason = ""
+        initial_event: RuntimeTurnEvent | None = None
+        initial_verification: dict[str, Any] = {}
+        observed_provider = ""
+        observed_model = ""
+
+        try:
+            self.transport.start(env=env)
+            previous_response = self.transport.read_complete_agent_response(
+                timeout_seconds=self.config.response_timeout_seconds
+            )
+            previous_received_ns = self.clock_ns()
+            observed_provider, observed_model = _provider_model_from_startup(previous_response)
+            if observed_provider != self.config.provider or observed_model != self.config.model:
+                raise JourneyInfrastructureInterruptedError(
+                    "observed provider/model does not match the configured Chaos boundary: "
+                    f"{observed_provider}/{observed_model}"
+                )
+            baseline_event = self.event_stream.baseline()
+            self._validate_event_revision(baseline_event)
+            initial_event = baseline_event
+            transcript_lines.append(previous_response)
+
+            initial_context = self._verifier_context(
+                initial_event=initial_event,
+                current_event=baseline_event,
+                turns=turns,
+                transcript=transcript,
+                observed_edge_keys=observed_edge_keys,
+                latest_turn=None,
+            )
+            initial_forbidden = self._verify_forbidden_outcomes(initial_context)
+            initial_terminal = self._verify_outcome(
+                self.schedule.terminal_outcome,
+                initial_context,
+            )
+            initial_verification = {
+                "terminal_outcome": _journey_outcome_verification_payload(
+                    initial_terminal
+                ),
+                "forbidden_outcomes": [
+                    _journey_outcome_verification_payload(item)
+                    for item in initial_forbidden
+                ],
+            }
+            initial_violation = _satisfied_journey_outcome(initial_forbidden)
+            if initial_violation is not None:
+                raise JourneyProductFailure(
+                    "journey reached forbidden outcome: " + initial_violation.outcome_id
+                )
+            if initial_terminal.satisfied:
+                terminal_classification = JourneyTerminalClassification.PASSED
+                terminal_outcome_id = initial_terminal.outcome_id
+
+            while (
+                terminal_classification != JourneyTerminalClassification.PASSED
+                and len(turns) < self.schedule.max_turns
+            ):
+                context = JourneySimulatorContext(
+                    session_id=self.config.session_id,
+                    turn_index=baseline_event.turn_index + 1,
+                    previous_agent_response=previous_response,
+                    previous_response_received_at_ns=previous_received_ns,
+                    schedule=self.schedule,
+                    transcript=tuple(transcript),
+                    observed_edge_keys=tuple(observed_edge_keys),
+                )
+                decision = self.simulator(context)
+                selected_at_ns = self.clock_ns()
+                if decision is None:
+                    raise JourneyExternallyBlockedError(
+                        "external Codex simulator did not provide a journey decision"
+                    )
+                try:
+                    _validate_journey_decision(decision, self.schedule)
+                except (TypeError, ValueError) as exc:
+                    raise JourneySimulatorInvalidError(str(exc)) from exc
+
+                submitted_at_ns = self.clock_ns()
+                self.transport.submit_bracketed_paste(decision.user_message)
+                committed_event = self.event_stream.next_event(
+                    timeout_seconds=self.config.response_timeout_seconds
+                )
+                self._validate_event_revision(committed_event)
+                response = self.transport.read_complete_agent_response(
+                    timeout_seconds=self.config.response_timeout_seconds
+                )
+                response_received_ns = self.clock_ns()
+
+                transcript_data = {
+                    "session_id": self.config.session_id,
+                    "turn_index": committed_event.turn_index,
+                    "previous_agent_response": previous_response,
+                    "user_message": decision.user_message,
+                    "agent_response": response,
+                }
+                turn = PtyCliTurnRecord(
+                    **transcript_data,
+                    provider=observed_provider,
+                    model=observed_model,
+                    before_fingerprint=committed_event.before_fingerprint,
+                    after_fingerprint=committed_event.after_fingerprint,
+                    transcript_hash=pty_transcript_hash(**transcript_data),
+                    previous_response_received_at_ns=previous_received_ns,
+                    user_message_submitted_at_ns=submitted_at_ns,
+                    agent_response_received_at_ns=response_received_ns,
+                )
+                turns.append(turn)
+                transcript.append((decision.user_message, response))
+                transcript_lines.extend((f"User> {decision.user_message}", response))
+
+                observed = self._observe_edges(baseline_event, committed_event, turn)
+                for item in observed:
+                    if item.edge_key not in observed_edge_keys:
+                        observed_edge_keys.append(item.edge_key)
+                verifier_context = self._verifier_context(
+                    initial_event=initial_event,
+                    current_event=committed_event,
+                    turns=turns,
+                    transcript=transcript,
+                    observed_edge_keys=observed_edge_keys,
+                    latest_turn=turn,
+                )
+                forbidden = self._verify_forbidden_outcomes(verifier_context)
+                terminal = self._verify_outcome(
+                    self.schedule.terminal_outcome,
+                    verifier_context,
+                )
+                turn_results.append({
+                    "turn_index": committed_event.turn_index,
+                    "selected_at_ns": selected_at_ns,
+                    "turn_identity": {
+                        "transcript_hash": turn.transcript_hash,
+                        "before_fingerprint": turn.before_fingerprint,
+                        "after_fingerprint": turn.after_fingerprint,
+                        "previous_response_received_at_ns": (
+                            turn.previous_response_received_at_ns
+                        ),
+                        "user_message_submitted_at_ns": (
+                            turn.user_message_submitted_at_ns
+                        ),
+                        "agent_response_received_at_ns": (
+                            turn.agent_response_received_at_ns
+                        ),
+                    },
+                    "decision": redact({
+                        "user_message": decision.user_message,
+                        "persona": decision.persona,
+                        "mission": decision.mission,
+                        "rationale": decision.rationale,
+                        "risk_factor_ids": list(decision.risk_factor_ids),
+                    }),
+                    "observed_edges": [
+                        {
+                            "edge_key": item.edge_key,
+                            "verifier_id": item.verifier_id,
+                            "observed_coverage_ids": list(item.observed_coverage_ids),
+                            "details": redact(dict(item.details)),
+                        }
+                        for item in observed
+                    ],
+                    "terminal_outcome": _journey_outcome_verification_payload(terminal),
+                    "forbidden_outcomes": [
+                        _journey_outcome_verification_payload(item) for item in forbidden
+                    ],
+                })
+                violated = _satisfied_journey_outcome(forbidden)
+                if violated is not None:
+                    raise JourneyProductFailure(
+                        "journey reached forbidden outcome: " + violated.outcome_id
+                    )
+                if terminal.satisfied:
+                    terminal_classification = JourneyTerminalClassification.PASSED
+                    terminal_outcome_id = terminal.outcome_id
+                    break
+
+                previous_response = response
+                previous_received_ns = response_received_ns
+                baseline_event = committed_event
+
+            if terminal_classification != JourneyTerminalClassification.PASSED:
+                raise JourneyProductFailure(
+                    "journey exhausted max_turns without satisfying terminal outcome: "
+                    f"{self.schedule.max_turns}"
+                )
+        except KeyboardInterrupt as exc:
+            terminal_classification = JourneyTerminalClassification.INFRASTRUCTURE_INTERRUPTED
+            failure_reason = "KeyboardInterrupt: operator interrupted the Journey"
+            raise JourneyInfrastructureInterruptedError(failure_reason) from exc
+        except JourneyRunError as exc:
+            terminal_classification = exc.classification
+            failure_reason = f"{type(exc).__name__}: {exc}"
+            raise
+        except Exception as exc:
+            terminal_classification = JourneyTerminalClassification.INFRASTRUCTURE_INTERRUPTED
+            failure_reason = f"{type(exc).__name__}: {exc}"
+            raise JourneyInfrastructureInterruptedError(failure_reason) from exc
+        finally:
+            try:
+                self.transport.close()
+            except Exception as close_error:
+                if not failure_reason:
+                    terminal_classification = (
+                        JourneyTerminalClassification.INFRASTRUCTURE_INTERRUPTED
+                    )
+                    failure_reason = f"{type(close_error).__name__}: {close_error}"
+            _write_redacted_transcript(transcript_path, transcript_lines)
+            safe_transcript_lines = redact(list(transcript_lines))
+            journey_payload = {
+                "schema_version": JOURNEY_EVIDENCE_SCHEMA_VERSION,
+                "artifact_type": "dynamic_dual_ai_journey_evidence",
+                "runner_type": "dynamic_dual_ai_journey",
+                "schedule_id": self.schedule.schedule_id,
+                "schedule_hash": content_hash(journey_schedule_payload(self.schedule)),
+                "journey_id": self.schedule.journey_id,
+                "revision": self.revision,
+                "verifier_registry": journey_outcome_verifier_registry_payload(
+                    self.postcondition_verifier_registry
+                ),
+                "session_id": self.config.session_id,
+                "provider": observed_provider or self.config.provider,
+                "model": observed_model or self.config.model,
+                "terminal_classification": terminal_classification.value,
+                "qualifying_evidence": (
+                    terminal_classification == JourneyTerminalClassification.PASSED
+                ),
+                "terminal_outcome_id": terminal_outcome_id,
+                "max_turns": self.schedule.max_turns,
+                "completed_turn_count": len(turns),
+                "observed_edge_keys": observed_edge_keys,
+                "failure_reason": str(redact(failure_reason)),
+                "transcript_hash": content_hash(safe_transcript_lines),
+                "source_transcript_hash": content_hash(transcript_lines),
+                "content_redacted": True,
+                "initial_verification": initial_verification,
+                "turns": turn_results,
+            }
+            evidence_id = content_hash(journey_payload)
+            evidence_artifact = {**journey_payload, "evidence_id": evidence_id}
+            evidence_artifact["artifact_hash"] = content_hash(evidence_artifact)
+            evidence_path = evidence_dir / f"journey-{evidence_id}.json"
+            evidence_path.parent.mkdir(parents=True, exist_ok=True)
+            evidence_path.write_text(
+                json.dumps(
+                    evidence_artifact,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                ) + "\n",
+                encoding="utf-8",
+            )
+            journey_result_path.write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "schedule_id": self.schedule.schedule_id,
+                    "journey_id": self.schedule.journey_id,
+                    "revision": self.revision,
+                    "execution_status": terminal_classification.value,
+                    "terminal_classification": terminal_classification.value,
+                    "terminal_outcome_id": terminal_outcome_id,
+                    "max_turns": self.schedule.max_turns,
+                    "completed_turn_count": len(turns),
+                    "observed_edge_keys": observed_edge_keys,
+                    "failure_reason": str(redact(failure_reason)),
+                    "evidence_id": evidence_id,
+                    "evidence_path": str(evidence_path),
+                    "qualifying_evidence": evidence_artifact["qualifying_evidence"],
+                    "verifier_registry_id": self.postcondition_verifier_registry.registry_id,
+                    "initial_verification": initial_verification,
+                    "turns": turn_results,
+                }, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+        return JourneyRunResult(
+            session_id=self.config.session_id,
+            transcript_path=transcript_path,
+            schedule_path=schedule_path,
+            journey_result_path=journey_result_path,
+            evidence_path=evidence_path,
+            evidence_id=evidence_id,
+            turns=tuple(turns),
+            observed_edge_keys=tuple(observed_edge_keys),
+            terminal_classification=terminal_classification,
+            terminal_outcome_id=terminal_outcome_id,
+        )
+
+    def _validate_verifier_contracts(self) -> None:
+        required_ids = {
+            *self.schedule.terminal_outcome.required_postcondition_ids,
+            *(
+                postcondition_id
+                for outcome in self.schedule.forbidden_outcomes
+                for postcondition_id in outcome.required_postcondition_ids
+            ),
+        }
+        missing = sorted(
+            required_ids - set(self.postcondition_verifier_registry.definitions)
+        )
+        if missing:
+            raise ValueError(
+                "journey schedule is missing registered postcondition verifiers: "
+                + ", ".join(missing)
+            )
+
+    def _verify_outcome(
+        self,
+        outcome: JourneyOutcomeContract,
+        context: JourneyVerifierContext,
+    ) -> JourneyOutcomeVerification:
+        results: list[JourneyPostconditionResult] = []
+        bindings: list[JourneyVerifierBinding] = []
+        for postcondition_id in outcome.required_postcondition_ids:
+            definition = self.postcondition_verifier_registry.definitions[postcondition_id]
+            result = definition.verifier(context)
+            if not isinstance(result, JourneyPostconditionResult):
+                raise TypeError(
+                    "journey postcondition verifier must return JourneyPostconditionResult: "
+                    + postcondition_id
+                )
+            if result.postcondition_id != postcondition_id:
+                raise ValueError(
+                    "journey postcondition verifier returned the wrong id: "
+                    f"expected {postcondition_id}, got {result.postcondition_id}"
+                )
+            results.append(result)
+            bindings.append(JourneyVerifierBinding(
+                postcondition_id=postcondition_id,
+                verifier_id=definition.verifier_id,
+                verifier_version=definition.verifier_version,
+                implementation_hash=definition.implementation_hash,
+            ))
+        return JourneyOutcomeVerification(
+            outcome_id=outcome.outcome_id,
+            satisfied=all(item.satisfied for item in results),
+            postconditions=tuple(results),
+            verifier_bindings=tuple(bindings),
+        )
+
+    def _verify_forbidden_outcomes(
+        self,
+        context: JourneyVerifierContext,
+    ) -> tuple[JourneyOutcomeVerification, ...]:
+        return tuple(
+            self._verify_outcome(outcome, context)
+            for outcome in self.schedule.forbidden_outcomes
+        )
+
+    def _observe_edges(
+        self,
+        baseline_event: RuntimeTurnEvent,
+        committed_event: RuntimeTurnEvent,
+        turn: PtyCliTurnRecord,
+    ) -> tuple[JourneyObservedEdge, ...]:
+        observed: list[JourneyObservedEdge] = []
+        for edge_key, edge in self.edge_index.items():
+            if edge.get("applicable") is False:
+                continue
+            try:
+                _require_scheduled_baseline_contract(baseline_event, edge)
+            except RuntimeError:
+                continue
+            verified = verify_runtime_postcondition(
+                edge,
+                baseline_event,
+                committed_event,
+                turn,
+            )
+            if not verified.passed or edge_key not in verified.observed_coverage_ids:
+                continue
+            observed.append(JourneyObservedEdge(
+                edge_key=edge_key,
+                verifier_id=verified.verifier_id,
+                observed_coverage_ids=tuple(verified.observed_coverage_ids),
+                details=dict(verified.details),
+            ))
+        return tuple(observed)
+
+    def _verifier_context(
+        self,
+        *,
+        initial_event: RuntimeTurnEvent,
+        current_event: RuntimeTurnEvent,
+        turns: Sequence[PtyCliTurnRecord],
+        transcript: Sequence[tuple[str, str]],
+        observed_edge_keys: Sequence[str],
+        latest_turn: PtyCliTurnRecord | None,
+    ) -> JourneyVerifierContext:
+        return JourneyVerifierContext(
+            schedule=self.schedule,
+            initial_event=initial_event,
+            current_event=current_event,
+            completed_turns=tuple(turns),
+            transcript=tuple(transcript),
+            observed_edge_keys=tuple(observed_edge_keys),
+            latest_turn=latest_turn,
+        )
+
+    def _validate_event_revision(self, event: RuntimeTurnEvent) -> None:
+        if dict(event.revision) != self.revision:
+            raise RuntimeError(
+                "runtime event revision does not match the scheduled journey revision"
+            )
+
+    def _isolated_environment(self, runtime_root: Path) -> dict[str, str]:
+        process_root = self.config.runtime_root_in_process or runtime_root
+        env = os.environ.copy()
+        env.update({
+            "ANYCHAIN_AGENT_CHECKPOINT_PATH": str(process_root / "checkpoints.sqlite"),
+            "ANYCHAIN_AGENT_SESSION_ID": self.config.session_id,
+            "ANYCHAIN_AGENT_SESSION_PURPOSE": self.config.session_purpose,
+            "ANYCHAIN_AGENT_JOBS_DIR": str(process_root / "jobs"),
+            "ANYCHAIN_AGENT_TURN_EVENT_FILE": str(process_root / "turn-events.jsonl"),
+        })
+        env.update({str(key): str(value) for key, value in self.config.extra_env.items()})
+        return env
+
+
+def _validate_journey_decision(
+    decision: JourneySimulatorDecision,
+    schedule: JourneySchedule,
+) -> None:
+    required = {
+        "user_message": decision.user_message,
+        "persona": decision.persona,
+        "mission": decision.mission,
+        "rationale": decision.rationale,
+    }
+    missing = sorted(name for name, value in required.items() if not str(value or "").strip())
+    if missing:
+        raise ValueError(f"journey simulator decision is missing: {', '.join(missing)}")
+    if decision.persona != schedule.persona or decision.mission != schedule.mission:
+        raise ValueError("journey simulator decision changed the scheduled persona or mission")
+    risk_factor_ids = tuple(str(item).strip() for item in decision.risk_factor_ids)
+    if any(not item for item in risk_factor_ids) or len(risk_factor_ids) != len(set(risk_factor_ids)):
+        raise ValueError("journey simulator decision has invalid risk factor ids")
+    unexpected = sorted(set(risk_factor_ids) - set(schedule.allowed_risk_factors))
+    if unexpected:
+        raise ValueError(
+            "journey simulator selected undeclared risk factors: " + ", ".join(unexpected)
+        )
+
+
+def _journey_outcome_verification_payload(
+    verification: JourneyOutcomeVerification,
+) -> dict[str, Any]:
+    return {
+        "outcome_id": verification.outcome_id,
+        "satisfied": verification.satisfied,
+        "postconditions": [
+            {
+                "postcondition_id": item.postcondition_id,
+                "satisfied": item.satisfied,
+                "details": redact(dict(item.details)),
+                "verifier": {
+                    "verifier_id": binding.verifier_id,
+                    "verifier_version": binding.verifier_version,
+                    "implementation_hash": binding.implementation_hash,
+                },
+            }
+            for item, binding in zip(
+                verification.postconditions,
+                verification.verifier_bindings,
+                strict=True,
+            )
+        ],
+    }
+
+
+def _satisfied_journey_outcome(
+    outcomes: Sequence[JourneyOutcomeVerification],
+) -> JourneyOutcomeVerification | None:
+    return next((item for item in outcomes if item.satisfied), None)
+
+
+def validate_journey_evidence_artifact(
+    artifact: Mapping[str, Any],
+    *,
+    schedule: JourneySchedule,
+    verifier_registry: JourneyOutcomeVerifierRegistry,
+    revision: Mapping[str, str],
+) -> None:
+    """Fail closed unless an artifact is authentic and qualifies this Journey."""
+
+    validate_journey_schedule(schedule, revision=revision)
+    validate_journey_outcome_verifier_registry(verifier_registry)
+    payload = dict(artifact)
+    artifact_hash = str(payload.pop("artifact_hash", ""))
+    if not artifact_hash or content_hash(payload) != artifact_hash:
+        raise ValueError("Journey evidence artifact hash is invalid")
+    evidence_id = str(payload.pop("evidence_id", ""))
+    if not evidence_id or content_hash(payload) != evidence_id:
+        raise ValueError("Journey evidence content address is invalid")
+    if int(payload.get("schema_version", 0)) != JOURNEY_EVIDENCE_SCHEMA_VERSION:
+        raise ValueError("unsupported Journey evidence schema")
+    if payload.get("artifact_type") != "dynamic_dual_ai_journey_evidence":
+        raise ValueError("invalid Journey evidence artifact type")
+    if payload.get("content_redacted") is not True:
+        raise ValueError("Journey evidence does not declare redaction")
+    if re.fullmatch(r"[0-9a-f]{64}", str(payload.get("source_transcript_hash") or "")) is None:
+        raise ValueError("Journey source transcript hash is invalid")
+    if dict(payload.get("revision") or {}) != dict(revision):
+        raise ValueError("Journey evidence revision does not match the active revision")
+    if payload.get("schedule_id") != schedule.schedule_id:
+        raise ValueError("Journey evidence schedule id does not match")
+    if payload.get("schedule_hash") != content_hash(journey_schedule_payload(schedule)):
+        raise ValueError("Journey evidence schedule hash does not match")
+    expected_registry = journey_outcome_verifier_registry_payload(verifier_registry)
+    if payload.get("verifier_registry") != expected_registry:
+        raise ValueError("Journey evidence verifier registry does not match")
+    try:
+        classification = JourneyTerminalClassification(
+            str(payload.get("terminal_classification") or "")
+        )
+    except ValueError as exc:
+        raise ValueError("Journey evidence terminal classification is invalid") from exc
+    if classification != JourneyTerminalClassification.PASSED:
+        raise ValueError("non-passing Journey artifact cannot qualify as evidence")
+    if payload.get("qualifying_evidence") is not True:
+        raise ValueError("passing Journey artifact is not marked as qualifying evidence")
+    if payload.get("terminal_outcome_id") != schedule.terminal_outcome.outcome_id:
+        raise ValueError("Journey evidence terminal outcome does not match")
+    verifications = [payload.get("initial_verification") or {}]
+    verifications.extend(payload.get("turns") or ())
+    terminal = next(
+        (
+            item.get("terminal_outcome")
+            for item in reversed(verifications)
+            if isinstance(item, Mapping)
+            and isinstance(item.get("terminal_outcome"), Mapping)
+            and item["terminal_outcome"].get("satisfied") is True
+        ),
+        None,
+    )
+    if not isinstance(terminal, Mapping):
+        raise ValueError("Journey evidence lacks a satisfied terminal verification")
+    if terminal.get("outcome_id") != schedule.terminal_outcome.outcome_id:
+        raise ValueError("Journey terminal verification identifies the wrong outcome")
+    expected_postconditions = set(schedule.terminal_outcome.required_postcondition_ids)
+    observed_postconditions = {
+        str(item.get("postcondition_id") or "")
+        for item in terminal.get("postconditions") or ()
+        if isinstance(item, Mapping) and item.get("satisfied") is True
+    }
+    if observed_postconditions != expected_postconditions:
+        raise ValueError("Journey terminal postcondition evidence is incomplete")
+
+
 
 def _require_scheduled_baseline_contract(
     event: RuntimeTurnEvent,
@@ -1021,7 +2020,12 @@ def _require_scheduled_baseline_contract(
     edge_type = str(edge.get("edge_type") or "")
     if edge_type == "action_transition":
         if event.pending_question_id or event.pending_contract:
-            raise RuntimeError("action-only target has an unrelated pending contract")
+            accepted = {
+                str(item)
+                for item in event.pending_contract.get("accepted_action_types") or ()
+            }
+            if str(edge.get("action_type") or "") not in accepted:
+                raise RuntimeError("action-only target has an unrelated pending contract")
         return
     expected_question = str(edge.get("question_id") or "")
     if event.pending_question_id != expected_question:
