@@ -1734,6 +1734,34 @@ class PlanCoverageTest(unittest.TestCase):
         )
         self.assertIs(normalized[0]["semantic_purpose_verified"], True)
 
+    def test_trusted_action_queue_exposes_one_equivalent_navigation_owner(self) -> None:
+        import json
+
+        from agent.harness.intent import _parse_action_queue
+
+        result = _parse_action_queue(json.dumps({
+            "actions": [
+                {
+                    "type": "change_group",
+                    "group": "accounts_disk",
+                    "navigation_explicit": True,
+                    "source_evidence": "open accounts disk settings",
+                    "group_navigation_semantic_verified": True,
+                },
+                {
+                    "type": "change_group",
+                    "group": "accounts_disk",
+                    "navigation_explicit": True,
+                    "source_evidence": "revise that optional disk",
+                    "group_navigation_semantic_verified": True,
+                },
+            ],
+        }), trusted_metadata=True)
+
+        self.assertEqual(len(result["actions"]), 1)
+        self.assertEqual(result["actions"][0]["group"], "accounts_disk")
+        self.assertIs(result["actions"][0]["group_navigation_semantic_verified"], True)
+
     def test_distinct_group_navigation_is_preserved(self) -> None:
         from agent.harness.action_registry import normalize_action_relations
 
@@ -4836,17 +4864,13 @@ class PlanCoverageTest(unittest.TestCase):
                 "group": "qps_profile",
                 "source_evidence": text,
                 "destination_quote": "QPS",
+                "owner_unit_ids": ["unit-1"],
             }],
         }
         provider = Mock()
-        provider.complete.return_value = SimpleNamespace(text=json.dumps({
-            "unit_reviews": [{
-                "unit_id": "unit-1",
-                "complete": True,
-                "missing_demand_quote": "",
-                "reason": "the source requests only navigation",
-            }],
-        }))
+        provider.complete.side_effect = AssertionError(
+            "generic reviewer must not reacquire the navigation owner"
+        )
 
         result = _validate_semantic_fulfillment(
             provider,
@@ -4856,7 +4880,7 @@ class PlanCoverageTest(unittest.TestCase):
         )
 
         self.assertTrue(result.valid, result.errors)
-        provider.complete.assert_called_once()
+        provider.complete.assert_not_called()
 
     def test_navigation_receipt_does_not_hide_a_concrete_destination_value(self) -> None:
         import json
@@ -4947,6 +4971,7 @@ class PlanCoverageTest(unittest.TestCase):
             "group": "qps_profile",
             "source_evidence": "Return to QPS settings",
             "destination_quote": "QPS settings",
+            "owner_unit_ids": [],
         }])
 
     def test_navigation_only_owner_intake_normalizes_to_registered_group_navigation(self) -> None:
@@ -5003,6 +5028,7 @@ class PlanCoverageTest(unittest.TestCase):
             "group": "qps_profile",
             "source_evidence": "configure QPS first",
             "destination_quote": "configure QPS first",
+            "owner_unit_ids": ["unit-1"],
         }])
 
     def test_false_positive_specific_change_is_independently_rejected(self) -> None:
@@ -8860,6 +8886,109 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
             "operation_restatement",
             ACTION_BY_TYPE["change_group"].semantic_support_relations,
         )
+
+    def test_admitted_navigation_owner_cannot_be_reinterpreted_by_generic_review(self) -> None:
+        import json
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _validate_semantic_fulfillment
+        from agent.harness.state import new_state
+
+        cases = (
+            ("Take me to accounts/state disk settings; I need to revise that optional disk.", "accounts_disk", "accounts/state disk settings"),
+            ("Open observability settings; I need to review that configuration.", "observability", "observability settings"),
+            ("Go to target mode; I need to revisit that choice.", "target_mode", "target mode"),
+        )
+        for index, (source, group, quote) in enumerate(cases):
+            with self.subTest(group=group):
+                clauses = segment_user_turn(source)
+                action = {
+                    "type": "change_group",
+                    "group": group,
+                    "navigation_explicit": True,
+                    "source_evidence": source,
+                }
+                payload = {
+                    "actions": [action],
+                    "semantic_units": [
+                        _unit(clause, unit_index, [0])
+                        for unit_index, clause in enumerate(clauses, start=1)
+                    ],
+                    "group_navigation_admissions": [{
+                        "action_index": 0,
+                        "group": group,
+                        "source_evidence": source,
+                        "destination_quote": quote,
+                        "owner_unit_ids": [
+                            f"unit-{unit_index}"
+                            for unit_index in range(1, len(clauses) + 1)
+                        ],
+                    }],
+                }
+                provider = Mock()
+                provider.complete.side_effect = AssertionError(
+                    "generic reviewer must not reacquire an admitted owner"
+                )
+
+                result = _validate_semantic_fulfillment(
+                    provider,
+                    json.dumps(payload),
+                    clauses,
+                    new_state(f"owner-receipt-{index}", language="en"),
+                )
+
+                self.assertTrue(result.valid, result.errors)
+                provider.complete.assert_not_called()
+
+    def test_invalid_navigation_receipt_does_not_bypass_generic_review(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _validate_semantic_fulfillment
+        from agent.harness.state import new_state
+
+        source = "Take me to observability settings."
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "change_group",
+                "group": "observability",
+                "navigation_explicit": True,
+                "source_evidence": source,
+            }],
+            "semantic_units": [_unit(clauses[0], 1, [0])],
+            "group_navigation_admissions": [{
+                "action_index": 0,
+                "group": "qps_profile",
+                "source_evidence": source,
+                "destination_quote": "observability settings",
+            }],
+        }
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(text=json.dumps({
+            "reviews": [{
+                "action_index": 0,
+                "supported": False,
+                "reason": "receipt destination conflicts with the action",
+            }],
+            "unit_reviews": [{
+                "unit_id": "unit-1",
+                "complete": False,
+                "missing_demand_quote": "observability settings",
+                "reason": "the represented destination is not admitted",
+            }],
+        }))
+
+        result = _validate_semantic_fulfillment(
+            provider,
+            json.dumps(payload),
+            clauses,
+            new_state("invalid-owner-receipt", language="en"),
+        )
+
+        self.assertFalse(result.valid)
+        self.assertGreaterEqual(provider.complete.call_count, 1)
 
     def test_equivalent_owner_intake_and_navigation_share_one_group_transition(self) -> None:
         from types import SimpleNamespace

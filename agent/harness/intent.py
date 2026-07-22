@@ -17,6 +17,7 @@ from .action_registry import (
     SEMANTIC_SUPPORT_RELATIONS,
     TRUSTED_ACTION_METADATA_FIELDS,
     lifecycle_rejected_action_indexes,
+    normalize_action_relations,
     semantic_scope_schema,
     validate_action_contract,
 )
@@ -644,6 +645,7 @@ def _valid_group_navigation_admissions(
 
     valid: dict[int, dict[str, Any]] = {}
     rows = payload.get("group_navigation_admissions")
+    units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
     if not isinstance(rows, list):
         return valid
     for row in rows:
@@ -656,6 +658,22 @@ def _valid_group_navigation_admissions(
         source = str(action.get("source_evidence") or "")
         group = str(action.get("group") or "")
         quote = str(row.get("destination_quote") or "").strip()
+        owner_unit_ids = [
+            str(unit_id)
+            for unit_id in row.get("owner_unit_ids", [])
+            if str(unit_id)
+        ] if isinstance(row.get("owner_unit_ids"), list) else []
+        mapped_unit_ids = {
+            str(unit.get("unit_id") or "")
+            for unit in units
+            if isinstance(unit, dict)
+            and index in (
+                unit.get("action_indexes")
+                if isinstance(unit.get("action_indexes"), list)
+                else []
+            )
+            and str(unit.get("unit_id") or "")
+        }
         if (
             str(action.get("type") or "") != "change_group"
             or not group
@@ -663,12 +681,15 @@ def _valid_group_navigation_admissions(
             or str(row.get("source_evidence") or "") != source
             or not quote
             or quote not in source
+            or not owner_unit_ids
+            or set(owner_unit_ids) != mapped_unit_ids
         ):
             continue
         valid[index] = {
             "group": group,
             "source_evidence": source,
             "destination_quote": quote,
+            "owner_unit_ids": owner_unit_ids,
             "specific_change_requested": False,
         }
     return valid
@@ -2467,9 +2488,8 @@ def _validate_semantic_fulfillment(
         for index in payload.get("consultation_admissions", [])
         if isinstance(index, int) and 0 <= index < len(actions)
     }
-    navigation_admissions = set(
-        _valid_group_navigation_admissions(payload, actions)
-    )
+    navigation_admission_receipts = _valid_group_navigation_admissions(payload, actions)
+    navigation_admissions = set(navigation_admission_receipts)
     pending_admissions = {
         int(index)
         for index in payload.get("pending_answer_admissions", [])
@@ -2512,9 +2532,21 @@ def _validate_semantic_fulfillment(
         if not isinstance(unit, dict):
             continue
         indexes = unit.get("action_indexes") if isinstance(unit.get("action_indexes"), list) else []
+        unit_id = str(unit.get("unit_id") or "")
+        navigation_owned_unit = bool(indexes) and all(
+            index in navigation_admission_receipts
+            and unit_id in navigation_admission_receipts[index]["owner_unit_ids"]
+            for index in indexes
+        )
         if indexes and all(index in pending_admissions for index in indexes):
             # The active pending contract already proved the exact option/value
             # binding. Generic mutation completeness must not veto its owner.
+            continue
+        if navigation_owned_unit:
+            # The navigation gate admitted this exact semantic-unit partition
+            # as one group-intake transaction. Generic completeness still
+            # audits mixed units and all residual operations, but cannot
+            # reinterpret these owner-bound units.
             continue
         mapped = [
             actions[index]
@@ -5490,9 +5522,10 @@ def _adjudicate_group_navigation_actions(
     has_pending_question = bool(state.get("pending_question"))
     review_payload = []
     source_by_index: dict[int, str] = {}
+    owner_unit_ids_by_index: dict[int, list[str]] = {}
     for index in review_indexes:
-        source_units = [
-            str(unit.get("source_text") or "")
+        mapped_units = [
+            unit
             for unit in units
             if isinstance(unit, dict)
             and index in (
@@ -5501,6 +5534,12 @@ def _adjudicate_group_navigation_actions(
                 else []
             )
             and str(unit.get("source_text") or "")
+        ]
+        source_units = [str(unit.get("source_text") or "") for unit in mapped_units]
+        owner_unit_ids_by_index[index] = [
+            str(unit.get("unit_id") or "")
+            for unit in mapped_units
+            if str(unit.get("unit_id") or "")
         ]
         source = " ".join(source_units).strip() or str(
             actions[index].get("source_evidence") or ""
@@ -5655,11 +5694,21 @@ def _adjudicate_group_navigation_actions(
                     continue
                 changed = True
                 source = str(actions[index].get("source_evidence") or source)
+            elif str(actions[index].get("source_evidence") or "") != source:
+                normalized = dict(actions[index])
+                normalized["source_evidence"] = source
+                try:
+                    actions[index] = validate_action_contract(normalized)
+                except ValueError:
+                    rejected[index] = "registered navigation evidence could not bind its semantic units"
+                    continue
+                changed = True
             admitted.append({
                 "action_index": index,
                 "group": proposed_group,
                 "source_evidence": source,
                 "destination_quote": destination_quote,
+                "owner_unit_ids": owner_unit_ids_by_index.get(index, []),
             })
             continue
         if backward_navigation:
@@ -7218,6 +7267,7 @@ def _parse_action_queue(text: str, *, trusted_metadata: bool = False) -> dict[st
         actions.append(action)
     if not actions:
         actions = [{"type": "unknown", "reason": "model returned no actions", "confidence": "low"}]
+    actions = normalize_action_relations(actions)
     return {
         "actions": actions,
         "clause_coverage": payload.get("clause_coverage") or [],
