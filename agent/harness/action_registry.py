@@ -601,6 +601,35 @@ CONSULTATION_TOPICS: tuple[str, ...] = (
     "execution_status",
 )
 
+CONSULTATION_TOPIC_PURPOSES: Mapping[str, str] = {
+    "identity": "Identify the Agent, its runtime role, and where it operates.",
+    "capabilities": "Explain what the Agent and benchmark product can do.",
+    "supported_chains": "List or explain supported blockchain chains.",
+    "extension": "Explain custom RPC, new-chain, or unsupported-family extension paths.",
+    "config_explanation": "Explain one current configuration field, prompt, or option.",
+    "current_config": "Report retained and confirmed workflow configuration values.",
+    "workload_config": "Report effective or default RPC methods and weights.",
+    "current_context": "Report the active workflow context and pending question.",
+    "next_action": "Explain the next workflow action or blocker.",
+    "startup_discovery": "Report values inferred by startup environment discovery.",
+    "environment_readiness": "Report environment and dependency readiness.",
+    "requirements": "Explain what the user must prepare for a test.",
+    "workflow": "Explain the benchmark workflow and configuration sequence.",
+    "mode_comparison": "Compare fake-node, real-node, and sync-observe modes.",
+    "performance_benchmark_guidance": "Recommend a mode for a stated performance goal.",
+    "execution_preflight_smoke": "Explain preflight and smoke execution semantics.",
+    "recommendation": "Recommend a safe next benchmark starting path.",
+    "reset_help": "Explain how to clear or modify retained workflow configuration.",
+    "evidence_help": "Explain how to provide logs, errors, reports, or multiline evidence.",
+    "correction": "Acknowledge and recover from an incorrect or irrelevant prior answer.",
+    "current_job": "Report whether a current or historical benchmark job exists and identify it.",
+    "job_status": "Report the status of a selected current or historical job.",
+    "execution_status": "Report workflow execution, preflight, smoke, or benchmark status.",
+}
+
+if set(CONSULTATION_TOPIC_PURPOSES) != set(CONSULTATION_TOPICS):
+    raise RuntimeError("consultation topic purposes must cover the consultation registry exactly")
+
 CONSULTATION_TOPIC_ALIASES: Mapping[str, str] = {
     "who": "identity",
     "who_are_you": "identity",

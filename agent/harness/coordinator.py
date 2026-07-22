@@ -494,6 +494,11 @@ def plan_turn_step(state: AgentGraphState) -> AgentGraphState:
         )]
         return _set_turn_phase(state, "compose", "planner_failed")
     actions = _normalized_action_queue(queue)
+    state.setdefault("turn_context", {})["pending_choice_contracts"] = [
+        dict(row)
+        for row in queue.get("pending_choice_contracts") or []
+        if isinstance(row, Mapping)
+    ]
     state["proposed_actions"] = actions
     return _set_turn_phase(state, "admit", "planner_completed")
 
@@ -595,6 +600,7 @@ def _execute_turn_local_actions(
     pending_snapshot = deepcopy(state.get("pending_question") or {})
     responses = list(state.get("visible_response") or [])
     suppress_pending_render = False
+    completed_result_count = 0
     for action in actions:
         isolated = deepcopy(state)
         isolated["action_queue"] = []
@@ -618,10 +624,13 @@ def _execute_turn_local_actions(
                 continue
             if response and response not in responses:
                 responses.append(response)
+                completed_result_count += 1
         if not pending_snapshot and routed.get("pending_question"):
             state["pending_question"] = deepcopy(routed.get("pending_question") or {})
             state["active_group"] = str(routed.get("active_group") or state.get("active_group") or "")
     state["visible_response"] = responses
+    if completed_result_count:
+        state.setdefault("turn_context", {})["turn_local_result_count"] = completed_result_count
     if pending_snapshot:
         state["pending_question"] = pending_snapshot
     if suppress_pending_render:
@@ -740,100 +749,52 @@ def _normalized_action_queue(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return output
 
 
-def _bind_declared_option_actions(
-    state: AgentGraphState,
-    actions: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Route semantic menu selections back through the option contract."""
-
-    pending = dict(state.get("pending_question") or {})
-    options = list(pending.get("options") or [])
-    if not options:
-        return actions
-    raw_matched, raw_value = contract_exact_answer(
-        str(state.get("last_user_input") or ""),
-        pending,
-    )
-    output: list[dict[str, Any]] = []
-    for action in actions:
-        action_type = str(action.get("type") or "")
-        if action_type == "answer_pending":
-            if action.get("pending_option_semantic_verified") is True:
-                reference = (
-                    action.get("selected_value")
-                    if action.get("selected_value") is not None
-                    else action.get("answer")
-                )
-                referenced = [
-                    option
-                    for option in options
-                    if option.get("value") == reference
-                    or str(option.get("id") or "") == str(reference)
-                    or str(option.get("label") or "") == str(reference)
-                ]
-                if len(referenced) == 1:
-                    normalized = dict(action)
-                    typed_value = referenced[0].get("value")
-                    normalized["answer"] = typed_value
-                    normalized["selected_value"] = typed_value
-                    normalized["selection_contract_verified"] = True
-                    output.append(normalized)
-                    continue
-            # A model may return the exact displayed option label/id while the
-            # contract stores a typed value (for example label ``Y`` and value
-            # ``True``). Resolve only against the declared option contract and
-            # carry its typed value forward; no aliases or fuzzy matching are
-            # allowed at this boundary.
-            if raw_matched:
-                normalized = dict(action)
-                normalized["answer"] = raw_value
-                normalized["selected_value"] = raw_value
-                normalized["selection_contract_verified"] = True
-                output.append(normalized)
-            else:
-                output.append(action)
-            continue
-        spec = ACTION_BY_TYPE.get(action_type)
-        semantic = str(spec.pending_option_semantic if spec else "").strip()
-        declared_option = next(
-            (
-                option for option in options
-                if semantic and str(option.get("semantic_action") or "").strip() == semantic
-            ),
-            None,
-        )
-        if declared_option is not None:
-            selected = declared_option.get("value")
-            output.append({
-                "type": "answer_pending",
-                "answer": selected,
-                "selected_value": selected,
-                "source_evidence": action.get("source_evidence"),
-                "pending_option_semantic_verified": True,
-            })
-            continue
-        # A domain action that happens to match one displayed option is not
-        # proof that the user selected that option. Keep it as a domain action
-        # so its owner-specific source-evidence guard remains authoritative.
-        output.append(action)
-    return output
-
-
-def _action_matches_declared_pending_option(
+def _canonical_pending_choice_matches(
     state: AgentGraphState,
     action: Mapping[str, Any],
 ) -> bool:
-    """Verify a semantic selection against the active typed option contract."""
+    """Verify one admitted semantic choice against its immutable contract."""
 
-    pending = state.get("pending_question") or {}
+    pending = dict(state.get("pending_question") or {})
+    selected = action.get("selected_value")
+    action_id = str(action.get("_admission_action_id") or "")
+    matches = []
+    for row in (state.get("turn_context") or {}).get("pending_choice_contracts") or []:
+        if not isinstance(row, Mapping):
+            continue
+        question = row.get("question") if isinstance(row.get("question"), Mapping) else {}
+        option = row.get("option") if isinstance(row.get("option"), Mapping) else {}
+        provenance = row.get("semantic_units") if isinstance(row.get("semantic_units"), list) else []
+        if (
+            str(question.get("id") or "") == str(pending.get("id") or "")
+            and str(question.get("group") or "") == str(pending.get("group") or "")
+            and option.get("selected_value") == selected
+            and str(row.get("admission_action_id") or "") == action_id
+            and provenance
+        ):
+            matches.append(row)
+    return len(matches) == 1
+
+
+def _bypasses_canonical_pending_choice(
+    state: AgentGraphState,
+    action: Mapping[str, Any],
+) -> bool:
+    """Reject a declared option owner that bypassed canonical admission."""
+
+    if str(action.get("type") or "") == "answer_pending":
+        return False
+    pending = dict(state.get("pending_question") or {})
     for option in pending.get("options") or []:
         declared = option.get("action") if isinstance(option, Mapping) else None
         if not isinstance(declared, Mapping):
             continue
-        if all(
-            key == "type" or action.get(key) == value
-            for key, value in declared.items()
-        ):
+        if str(declared.get("type") or "") != str(action.get("type") or ""):
+            continue
+        spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
+        if spec is None or not spec.pending_option_admission:
+            continue
+        if all(key == "type" or action.get(key) == value for key, value in declared.items()):
             return True
     return False
 
@@ -842,9 +803,12 @@ def _validate_action_plan(state: AgentGraphState, actions: list[dict[str, Any]])
     """Validate typed plan semantics without reinterpreting user language."""
     if not actions:
         return actions
-    prepared = normalize_action_relations(
-        _bind_declared_option_actions(state, [dict(item) for item in actions])
-    )
+    prepared = normalize_action_relations([dict(item) for item in actions])
+    prepared = [
+        item
+        for item in prepared
+        if not _bypasses_canonical_pending_choice(state, item)
+    ]
     lifecycle_rejected = lifecycle_rejected_action_indexes(state, prepared)
     if lifecycle_rejected:
         rejected_types = ", ".join(
@@ -855,10 +819,7 @@ def _validate_action_plan(state: AgentGraphState, actions: list[dict[str, Any]])
             f"actions incompatible with active target-mode lifecycle: {rejected_types}"
         )
     for item in prepared:
-        if (
-            item.get("pending_option_semantic_verified") is True
-            and _action_matches_declared_pending_option(state, item)
-        ):
+        if item.get("pending_option_semantic_verified") is True and _canonical_pending_choice_matches(state, item):
             item["selection_contract_verified"] = True
     identity = state.get("chain_identity") or {}
     if identity.get("case") == "case3" and identity.get("adapter_family") == "unsupported":
@@ -1111,7 +1072,7 @@ def _action_answers_pending_contract(state: AgentGraphState, action: dict[str, A
             )
         if not (
             action.get("selection_contract_verified") is True
-            or action.get("pending_option_semantic_verified") is True
+            and _canonical_pending_choice_matches(state, action)
         ):
             return False
         return True

@@ -65,6 +65,54 @@ class FilesystemDecisionBrokerTest(unittest.TestCase):
             self.assertEqual(observed[0]["user_message"], "Go back and change the region.")
             self.assertEqual(pending_requests(root), ())
 
+    def test_secret_execution_value_is_not_persisted_and_control_id_is_immutable(self) -> None:
+        secret = "runtime-secret-4821"
+        context = self._context()
+        context["scheduled_target"] = {
+            **context["scheduled_target"],
+            "edge_key": "chain_auxiliary_endpoints::RPC_API_KEY::contract-hash",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            broker = FilesystemDecisionBroker(
+                root, batch_id="batch-1", timeout_seconds=2, poll_seconds=0.01
+            )
+            observed = []
+            thread = threading.Thread(
+                target=lambda: observed.append(asyncio.run(broker("shard-12", context)))
+            )
+            thread.start()
+            deadline = time.monotonic() + 1
+            while not pending_requests(root) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            request = pending_requests(root)[0]
+            self.assertEqual(
+                request["control_identity"]["scheduled_target"]["edge_key"],
+                context["scheduled_target"]["edge_key"],
+            )
+
+            submit_decision(
+                root,
+                request_id=request["request_id"],
+                user_message=f"RPC_API_KEY={secret}",
+                rationale="Use the supplied runtime credential.",
+            )
+            thread.join(timeout=2)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(observed[0]["user_message"], f"RPC_API_KEY={secret}")
+            self.assertEqual(
+                observed[0]["target_coverage_ids"],
+                [context["scheduled_target"]["edge_key"]],
+            )
+            persisted = "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in root.rglob("*.json")
+            )
+            self.assertNotIn(secret, persisted)
+            self.assertIn("***REDACTED***", persisted)
+            self.assertEqual(list((root / "channels").glob("*.fifo")), [])
+
     def test_stale_decision_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

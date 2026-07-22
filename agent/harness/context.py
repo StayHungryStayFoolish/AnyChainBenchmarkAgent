@@ -7,6 +7,7 @@ from typing import Any
 from .action_registry import (
     ACTION_ARGUMENT_SCHEMAS,
     ACTION_SPECS,
+    CONSULTATION_TOPIC_PURPOSES,
     CONSULTATION_TOPICS,
     semantic_scope_schema,
 )
@@ -42,6 +43,7 @@ def action_schema() -> list[dict[str, Any]]:
     for item in output:
         if item["type"] == "answer_opening_question":
             item["allowed_topics"] = list(CONSULTATION_TOPICS)
+            item["topic_purposes"] = dict(CONSULTATION_TOPIC_PURPOSES)
         if item["type"] == "change_group":
             item["allowed_groups"] = list(USER_NAVIGABLE_GROUPS)
         if item["target_field_argument"]:
@@ -195,7 +197,9 @@ def build_action_resolver_prompt() -> str:
         "If one turn confirms an unresolved chain is real and also states its protocol family, answer only the current identity question with answer_pending and emit choose_adapter_family for the family; do not pre-answer a future family question. "
         "Use answer_opening_question for identity, capabilities, requirements, workflow, current context/config/job/status/next action, mode comparisons, "
         "field explanations, corrections, and general product questions. Its topic MUST be one of the allowed_topics declared in action_schema; never invent a topic. "
+        "Each independently requested consultation topic requires its own answer_opening_question action. One broad state or capability answer cannot stand in for a distinct job-history, configuration, environment, workflow, or next-action question in the same turn. "
         "Use topic=identity for who/origin questions, capabilities for what the Agent can do, and requirements for what a user must prepare. For supported_chains, omit subject unless the user asks about one specific chain name. "
+        "Use topic=current_job whenever the user asks whether a current, latest, previous, or historical benchmark job exists or asks which job is available; use job_status for the status of an identified job. These are independent from current_config and current_context, so preserve both actions when the same turn asks about jobs and retained workflow configuration. "
         "Use topic=workload_config for selected, effective, or default RPC methods and mixed-weight questions that do not request a mutation. "
         "When the user asks what the current prompt, option, field, or pending step means (for example 'what is this for?'), emit "
         "answer_opening_question with topic=config_explanation and subject equal to the pending question field or id; do not classify it as general requirements. "

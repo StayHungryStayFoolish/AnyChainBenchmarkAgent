@@ -14,6 +14,7 @@ from tempfile import TemporaryDirectory
 
 from tests.agent_live.generate_harness_coverage_ledger import (
     EVIDENCE_CLASSES,
+    LEDGER_SCHEMA_VERSION,
     MANUAL_INPUT_CLASSES,
     RUNNER_CONTRACTS,
     build_ledger,
@@ -72,6 +73,82 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
                     "required_arguments": list(spec.required_arguments),
                     "constraints": list(spec.constraints),
                 })
+
+    def test_navigation_contract_declares_immediate_and_prerequisite_deferred_routes(self) -> None:
+        edge = next(
+            item
+            for item in self.ledger["edges"]
+            if item["edge_type"] == "action_transition"
+            and item["action_type"] == "change_group"
+            and item["expected_postcondition"].get("target_group") == "sync_observe"
+        )
+
+        self.assertEqual(
+            edge["expected_postcondition"]["navigation_transition"],
+            {
+                "immediate_group": "sync_observe",
+                "prerequisite_deferred_groups": [
+                    "target_mode",
+                    "chain_identity",
+                    "endpoint_process",
+                ],
+            },
+        )
+        self.assertEqual(
+            edge["deferred_transition_contract"],
+            {
+                "requires_linked_journey": True,
+                "max_continuation_turns": 12,
+                "entry_prerequisite_groups": [
+                    "target_mode",
+                    "chain_identity",
+                    "endpoint_process",
+                ],
+                "terminal_group": "sync_observe",
+                "terminal_postcondition": {"target_group": "sync_observe"},
+                "linkage": [
+                    "same_thread",
+                    "same_revision",
+                    "contiguous_turn_index",
+                    "contiguous_fingerprint_chain",
+                ],
+            },
+        )
+
+    def test_natural_language_option_declares_contract_owner_equivalence(self) -> None:
+        natural = next(
+            item
+            for item in self.ledger["edges"]
+            if item["question_id"] == "observability_mode"
+            and item["option_value"] == "exporter"
+            and item["input_class"] == "natural_language_option"
+        )
+        exact = next(
+            item
+            for item in self.ledger["edges"]
+            if item["question_id"] == "observability_mode"
+            and item["option_value"] == "exporter"
+            and item["input_class"] == "exact_option"
+        )
+
+        self.assertEqual(
+            natural["expected_admitted_action_types"],
+            ["answer_pending", "set_observability"],
+        )
+        self.assertEqual(
+            natural["prerequisite_deferred_actions"],
+            {"set_observability": ["target_mode"]},
+        )
+        self.assertTrue(
+            natural["deferred_transition_contract"]["requires_linked_journey"]
+        )
+        self.assertEqual(
+            natural["deferred_transition_contract"]["terminal_postcondition"],
+            {"observability.mode": "exporter"},
+        )
+        self.assertEqual(exact["expected_admitted_action_types"], ["answer_pending"])
+        self.assertEqual(exact["prerequisite_deferred_actions"], {})
+        self.assertEqual(exact["deferred_transition_contract"], {})
 
     def test_source_grounded_navigation_actions_declare_non_mutation_scope(self) -> None:
         from agent.harness.action_registry import ACTION_SPECS
@@ -569,7 +646,10 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
             "status": "failed",
             "evidence_ids": ["missing.json"],
         }
-        rejected_failure = build_ledger({"schema_version": 4, "edges": [edge]}, revision=self.revision)
+        rejected_failure = build_ledger(
+            {"schema_version": LEDGER_SCHEMA_VERSION - 1, "edges": [edge]},
+            revision=self.revision,
+        )
         restored_failure = next(
             item for item in rejected_failure["edges"] if item["edge_key"] == edge["edge_key"]
         )
@@ -612,14 +692,17 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
                 "status": "passed",
                 "evidence_ids": [str(artifact_path)],
             }
-            merged = build_ledger({"schema_version": 5, "edges": [edge]}, revision=self.revision)
+            merged = build_ledger(
+                {"schema_version": LEDGER_SCHEMA_VERSION, "edges": [edge]},
+                revision=self.revision,
+            )
             restored = next(item for item in merged["edges"] if item["edge_key"] == edge["edge_key"])
             self.assertEqual(restored["evidence"]["deterministic"]["status"], "passed")
             self.assertEqual(restored["evidence"]["deterministic"]["evidence_ids"], [str(artifact_path)])
 
             changed_revision = {"commit": "other", "worktree_hash": "b" * 64}
             invalidated = build_ledger(
-                {"schema_version": 5, "edges": [edge]},
+                {"schema_version": LEDGER_SCHEMA_VERSION, "edges": [edge]},
                 revision=changed_revision,
             )
             restored = next(item for item in invalidated["edges"] if item["edge_key"] == edge["edge_key"])

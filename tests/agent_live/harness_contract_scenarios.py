@@ -551,6 +551,8 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
         )
 
     observability_state = new_state("coverage-observability", language=language, session_purpose="coverage")
+    observability_state["target_mode"] = "fake-node"
+    observability_state["workflow_mode"] = "rpc_benchmark"
     observability = question_for_performance(observability_state, "observability")
     if observability:
         add("observability", observability_state, observability)

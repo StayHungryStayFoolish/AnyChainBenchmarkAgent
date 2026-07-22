@@ -616,6 +616,11 @@ def _append_unstructured_regions(regions: list[tuple[str, str]], text: str) -> N
 
 
 def _line_looks_structured(line: str) -> bool:
+    # A standalone endpoint is prose input, not a YAML ``scheme: value`` pair.
+    # URL semantics are decided by the planner; this boundary only identifies
+    # transport syntax.
+    if _URL_RE.fullmatch(line):
+        return False
     return bool(
         re.match(r"^(?:export\s+)?[A-Za-z_][A-Za-z0-9_.-]*\s*=", line)
         or re.match(r"^[A-Za-z_][A-Za-z0-9_.-]*\s*:", line)

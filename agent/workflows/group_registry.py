@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Iterable, Literal
+from typing import Any, Iterable, Literal
 
 
 NavigationEntry = Literal["question_or_status", "action_only"]
@@ -287,6 +287,7 @@ GROUPS: tuple[GroupSpec, ...] = (
         owner="performance",
         fields=("observability",),
         questions=("observability_mode",),
+        depends_on=("target_mode",),
         invalidates=("preflight_smoke_execution", "job_monitoring"),
         product_node="observability",
     ),
@@ -450,6 +451,73 @@ def validate_group_registry(groups: Iterable[GroupSpec]) -> tuple[GroupSpec, ...
     for name in names:
         visit(name)
     return registry
+
+
+def navigation_prerequisites(group: GroupSpec) -> tuple[str, ...]:
+    """Return every group that can visibly defer public navigation.
+
+    A workflow-mode mismatch is resolved through ``target_mode`` before the
+    destination's declared dependencies. Keep this ordering aligned with the
+    coordinator's prerequisite routing contract.
+    """
+
+    prerequisites: list[str] = []
+    if group.workflow_modes:
+        prerequisites.append("target_mode")
+    prerequisites.extend(group.depends_on)
+    return tuple(dict.fromkeys(prerequisites))
+
+
+def validate_action_group_requirements(
+    groups: Iterable[GroupSpec],
+    action_specs: Iterable[Any],
+) -> None:
+    """Reject action prerequisites that their destination group does not own.
+
+    ActionSpec remains owned by the Harness action registry. This validation
+    accepts structural objects to avoid coupling the pure group registry back
+    to that module while still providing one cross-registry consistency gate.
+    """
+
+    registry = validate_group_registry(groups)
+    by_name = {group.name: group for group in registry}
+
+    def transitive_dependencies(group_name: str) -> set[str]:
+        discovered: set[str] = set()
+        pending = list(by_name[group_name].depends_on)
+        while pending:
+            dependency = pending.pop()
+            if dependency in discovered:
+                continue
+            discovered.add(dependency)
+            pending.extend(by_name[dependency].depends_on)
+        return discovered
+
+    for action in action_specs:
+        action_type = str(getattr(action, "action_type", "") or "")
+        target_group = str(getattr(action, "target_group", "") or "")
+        requirements = {
+            str(item)
+            for item in (getattr(action, "requires_capabilities", ()) or ())
+            if str(item)
+        }
+        if not target_group:
+            continue
+        if target_group not in by_name:
+            raise RuntimeError(
+                f"ActionSpec {action_type or '<unknown>'} targets unknown GroupSpec "
+                f"{target_group}"
+            )
+        unknown_requirements = sorted(requirements - set(by_name))
+        missing_dependencies = sorted(
+            requirements - transitive_dependencies(target_group)
+        )
+        if unknown_requirements or missing_dependencies:
+            raise RuntimeError(
+                f"ActionSpec {action_type or '<unknown>'} prerequisites conflict "
+                f"with GroupSpec {target_group}: unknown={unknown_requirements}, "
+                f"missing_dependencies={missing_dependencies}"
+            )
 
 
 GROUPS = validate_group_registry(GROUPS)

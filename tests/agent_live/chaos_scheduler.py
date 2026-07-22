@@ -15,8 +15,9 @@ from typing import Any, Mapping, Sequence
 from tests.agent_live.coverage_evidence import content_hash
 
 
-CHAOS_SCHEDULE_SCHEMA_VERSION = 3
+CHAOS_SCHEDULE_SCHEMA_VERSION = 4
 JOURNEY_SCHEDULE_SCHEMA_VERSION = 1
+DEFAULT_DEFERRED_CONTINUATION_TURN_BUDGET = 12
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,7 @@ class ScheduledCoverageTarget:
     sequence_id: str = ""
     tuple_ids: tuple[str, ...] = ()
     scenario_id: str = ""
+    continuation_turn_budget: int = 0
 
 
 @dataclass(frozen=True)
@@ -107,6 +109,24 @@ def build_chaos_schedule(
             raise ValueError(
                 f"schedule scenario is not authoritative for edge: {scenario_id} -> {edge_key}"
             )
+        deferred_contract = dict(edge.get("deferred_transition_contract") or {})
+        requires_continuation = deferred_contract.get("requires_linked_journey") is True
+        declared_budget = deferred_contract.get(
+            "max_continuation_turns",
+            DEFAULT_DEFERRED_CONTINUATION_TURN_BUDGET if requires_continuation else 0,
+        )
+        if isinstance(declared_budget, bool) or not isinstance(declared_budget, int):
+            raise ValueError(f"invalid deferred continuation budget: {edge_key}")
+        continuation_turn_budget = int(declared_budget)
+        if requires_continuation and continuation_turn_budget <= 0:
+            raise ValueError(f"deferred edge has no executable continuation budget: {edge_key}")
+        if not requires_continuation and continuation_turn_budget != 0:
+            raise ValueError(f"immediate edge declares a continuation budget: {edge_key}")
+        requested_budget = raw.get("continuation_turn_budget")
+        if requested_budget is not None and int(requested_budget) != continuation_turn_budget:
+            raise ValueError(
+                f"schedule cannot override ledger continuation budget: {edge_key}"
+            )
         scheduled.append(ScheduledCoverageTarget(
             target_id=target_id,
             edge_key=edge_key,
@@ -115,6 +135,7 @@ def build_chaos_schedule(
             sequence_id=str(raw.get("sequence_id") or ""),
             tuple_ids=tuple(str(item) for item in raw.get("tuple_ids") or ()),
             scenario_id=scenario_id,
+            continuation_turn_budget=continuation_turn_budget,
         ))
     if not scheduled:
         raise ValueError("Chaos schedule has no coverage targets")

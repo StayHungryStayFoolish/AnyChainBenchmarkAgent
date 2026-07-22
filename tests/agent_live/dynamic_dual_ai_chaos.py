@@ -98,6 +98,15 @@ class SimulatorDecision:
     target_coverage_ids: tuple[str, ...]
 
 
+class SimulatorTerminalClassification(str, Enum):
+    PASSED = "passed"
+    SIMULATOR_INVALID = "simulator_invalid"
+
+
+class SimulatorDecisionInvalid(ValueError):
+    """A simulator turn violated its immutable scheduled contract."""
+
+
 @dataclass(frozen=True)
 class ChaosRunConfig:
     repo_root: Path
@@ -1101,6 +1110,11 @@ class DynamicDualAiChaosRunner:
                 turns.append(turn)
                 transcript.append((decision.user_message, response))
                 transcript_lines.extend((f"User> {decision.user_message}", response))
+                root_previous_response = previous_response
+                root_committed_event = committed_event
+                continuation_events: list[RuntimeTurnEvent] = []
+                continuation_turns: list[PtyCliTurnRecord] = []
+                continuation_selections: list[DynamicTurnSelection] = []
                 last_complete_response = response
                 last_complete_event = committed_event
                 last_complete_turn = turn
@@ -1164,6 +1178,122 @@ class DynamicDualAiChaosRunner:
                         "diagnostic_id": verification_error["diagnostic_id"],
                     })
                     raise
+                while (
+                    not verified_postcondition.passed
+                    and _verification_requires_continuation(verified_postcondition)
+                    and len(continuation_events)
+                    < scheduled_target.continuation_turn_budget
+                    and len(turns) < self.config.max_turns
+                ):
+                    continuation_contract = {
+                        **dict(edge),
+                        "execution_phase": "linked_prerequisite_continuation",
+                        "continuation": {
+                            "turn_number": len(continuation_events) + 1,
+                            "turn_budget": scheduled_target.continuation_turn_budget,
+                            "terminal_postcondition": dict(
+                                (edge.get("deferred_transition_contract") or {}).get(
+                                    "terminal_postcondition"
+                                )
+                                or edge.get("expected_postcondition")
+                                or {}
+                            ),
+                            "current_pending_question_id": committed_event.pending_question_id,
+                            "current_pending_contract": dict(committed_event.pending_contract),
+                            "selection_rule": (
+                                "Read the complete current Agent response, choose one natural "
+                                "next user turn that advances its prerequisite workflow, and do "
+                                "not assume or pre-generate later answers."
+                            ),
+                        },
+                    }
+                    continuation_context = SimulatorContext(
+                        session_id=self.config.session_id,
+                        turn_index=committed_event.turn_index + 1,
+                        previous_agent_response=response,
+                        previous_response_received_at_ns=response_received_ns,
+                        scheduled_target=scheduled_target,
+                        transcript=tuple(transcript),
+                        coverage_contract=continuation_contract,
+                    )
+                    continuation_decision = self.simulator(continuation_context)
+                    continuation_selected_at_ns = self.clock_ns()
+                    if continuation_decision is None:
+                        raise RuntimeError(
+                            "external Codex simulator did not provide a continuation decision"
+                        )
+                    _validate_continuation_decision(
+                        continuation_decision,
+                        scheduled_target,
+                    )
+                    continuation_submitted_at_ns = self.clock_ns()
+                    self.transport.submit_bracketed_paste(
+                        continuation_decision.user_message
+                    )
+                    continuation_event = self.event_stream.next_event(
+                        timeout_seconds=self.config.response_timeout_seconds
+                    )
+                    self._validate_event_revision(continuation_event)
+                    continuation_response = self.transport.read_complete_agent_response(
+                        timeout_seconds=self.config.response_timeout_seconds
+                    )
+                    continuation_received_ns = self.clock_ns()
+                    continuation_transcript_data = {
+                        "session_id": self.config.session_id,
+                        "turn_index": continuation_event.turn_index,
+                        "previous_agent_response": response,
+                        "user_message": continuation_decision.user_message,
+                        "agent_response": continuation_response,
+                    }
+                    continuation_turn = PtyCliTurnRecord(
+                        **continuation_transcript_data,
+                        provider=observed_provider,
+                        model=observed_model,
+                        before_fingerprint=continuation_event.before_fingerprint,
+                        after_fingerprint=continuation_event.after_fingerprint,
+                        transcript_hash=pty_transcript_hash(
+                            **continuation_transcript_data
+                        ),
+                        previous_response_received_at_ns=response_received_ns,
+                        user_message_submitted_at_ns=continuation_submitted_at_ns,
+                        agent_response_received_at_ns=continuation_received_ns,
+                    )
+                    continuation_selection = DynamicTurnSelection(
+                        persona=continuation_decision.persona,
+                        goal=continuation_decision.goal,
+                        selected_message=continuation_decision.user_message,
+                        rationale=continuation_decision.rationale,
+                        target_coverage_ids=tuple(
+                            continuation_decision.target_coverage_ids
+                        ),
+                        selected_at_ns=continuation_selected_at_ns,
+                    )
+                    continuation_events.append(continuation_event)
+                    continuation_turns.append(continuation_turn)
+                    continuation_selections.append(continuation_selection)
+                    turns.append(continuation_turn)
+                    transcript.append(
+                        (continuation_decision.user_message, continuation_response)
+                    )
+                    transcript_lines.extend((
+                        f"User> {continuation_decision.user_message}",
+                        continuation_response,
+                    ))
+                    response = continuation_response
+                    response_received_ns = continuation_received_ns
+                    committed_event = continuation_event
+                    last_complete_response = response
+                    last_complete_event = committed_event
+                    last_complete_turn = continuation_turn
+                    last_complete_selection = continuation_selection
+                    verified_postcondition = _verify_declared_postconditions(
+                        baseline_event,
+                        root_committed_event,
+                        turn,
+                        edge_index=self.edge_index,
+                        target_coverage_ids=selection.target_coverage_ids,
+                        continuation_events=continuation_events,
+                    )
                 if not verified_postcondition.passed:
                     errors = verified_postcondition.details.get("errors") or ()
                     failure_reason = (
@@ -1182,8 +1312,8 @@ class DynamicDualAiChaosRunner:
                             reason=failure_reason,
                             last_complete_response=response,
                             last_complete_event=committed_event,
-                            completed_turn=turn,
-                            dynamic_selection=selection,
+                            completed_turn=last_complete_turn,
+                            dynamic_selection=last_complete_selection,
                             verified_postcondition=verified_postcondition,
                         )
                     )
@@ -1210,7 +1340,7 @@ class DynamicDualAiChaosRunner:
                     target_edge_key=str(edge.get("edge_key") or ""),
                     target_contract_hash=str(edge.get("contract_hash") or ""),
                     target_variant_hash=str(edge.get("contract_variant_hash") or ""),
-                    prior_agent_response=previous_response,
+                    prior_agent_response=root_previous_response,
                     simulator_decision={
                         "persona": selection.persona,
                         "goal": selection.goal,
@@ -1226,11 +1356,26 @@ class DynamicDualAiChaosRunner:
                     model=observed_model,
                     before_turn_index=baseline_event.turn_index,
                     after_turn_index=committed_event.turn_index,
-                    before_state_fingerprint=committed_event.before_fingerprint,
+                    before_state_fingerprint=root_committed_event.before_fingerprint,
                     after_state_fingerprint=committed_event.after_fingerprint,
                     pending_contract=dict(baseline_event.pending_contract),
-                    runtime_events=(baseline_event, committed_event),
+                    runtime_events=(
+                        baseline_event,
+                        root_committed_event,
+                        *continuation_events,
+                    ),
                     verified_postcondition=verified_postcondition,
+                    continuation_turns=tuple(continuation_turns),
+                    continuation_simulator_decisions=tuple({
+                        "persona": item.persona,
+                        "goal": item.goal,
+                        "selected_message": item.selected_message,
+                        "rationale": item.rationale,
+                        "target_coverage_ids": list(item.target_coverage_ids),
+                        "selected_at_ns": item.selected_at_ns,
+                        "simulator": item.simulator,
+                        "selection_mode": item.selection_mode,
+                    } for item in continuation_selections),
                 )
                 artifact = build_pty_cli_evidence_artifact(
                     edge=edge,
@@ -1268,6 +1413,8 @@ class DynamicDualAiChaosRunner:
                         pending_contract=observation.pending_contract,
                         runtime_events=observation.runtime_events,
                         verified_postcondition=observation.verified_postcondition,
+                        continuation_turns=observation.continuation_turns,
+                        continuation_simulator_decisions=(),
                     )
                     real_cli_artifact = build_pty_cli_evidence_artifact(
                         edge=edge,
@@ -2060,15 +2207,15 @@ def _validate_decision(
     }
     missing = sorted(name for name, value in required.items() if not str(value or "").strip())
     if missing:
-        raise ValueError(f"simulator decision is missing: {', '.join(missing)}")
+        raise SimulatorDecisionInvalid(f"simulator decision is missing: {', '.join(missing)}")
     if not decision.target_coverage_ids or any(
         not str(item or "").strip() for item in decision.target_coverage_ids
     ):
-        raise ValueError("simulator decision requires target coverage ids")
+        raise SimulatorDecisionInvalid("simulator decision requires target coverage ids")
     if target.edge_key not in decision.target_coverage_ids:
-        raise ValueError("simulator decision does not target the scheduled ledger edge")
+        raise SimulatorDecisionInvalid("simulator decision does not target the scheduled ledger edge")
     if decision.persona != target.persona or decision.goal != target.goal:
-        raise ValueError("simulator decision changed the scheduled persona or goal")
+        raise SimulatorDecisionInvalid("simulator decision changed the scheduled persona or goal")
     _validate_declared_input_class(decision.user_message, coverage_contract)
 
 
@@ -2083,13 +2230,13 @@ def _validate_declared_input_class(
     shapes = {clause.input_shape for clause in clauses}
     if input_class == "multiline_prose":
         if "\n" not in user_message or not clauses or shapes != {"prose"}:
-            raise ValueError(
+            raise SimulatorDecisionInvalid(
                 "simulator decision does not exercise multiline_prose: "
                 "expected multiple prose lines without a structured data block"
             )
     elif input_class == "structured_json_yaml_env_curl":
         if "structured" not in shapes:
-            raise ValueError(
+            raise SimulatorDecisionInvalid(
                 "simulator decision does not exercise structured_json_yaml_env_curl: "
                 "expected a parseable structured input region"
             )
@@ -2102,6 +2249,7 @@ def _verify_declared_postconditions(
     *,
     edge_index: Mapping[str, Mapping[str, Any]],
     target_coverage_ids: Sequence[str],
+    continuation_events: Sequence[RuntimeTurnEvent] = (),
 ) -> VerifiedPostcondition:
     """Verify every coverage claim attached to one response-driven user turn."""
 
@@ -2109,15 +2257,22 @@ def _verify_declared_postconditions(
     missing = tuple(edge_key for edge_key in edge_keys if edge_key not in edge_index)
     if missing:
         raise ValueError(f"simulator declared unknown coverage ids: {', '.join(missing)}")
-    results = [
-        verify_runtime_postcondition(
+    results = []
+    for edge_key in edge_keys:
+        arguments = (
             edge_index[edge_key],
             baseline_event,
             committed_event,
             turn,
         )
-        for edge_key in edge_keys
-    ]
+        if continuation_events:
+            result = verify_runtime_postcondition(
+                *arguments,
+                continuation_events=continuation_events,
+            )
+        else:
+            result = verify_runtime_postcondition(*arguments)
+        results.append(result)
     primary = results[0]
     errors = [
         f"{edge_key}: {error}"
@@ -2153,6 +2308,57 @@ def _verify_declared_postconditions(
             for artifact in result.job_artifacts
         ),
     )
+
+
+def _verification_requires_continuation(
+    verification: VerifiedPostcondition,
+) -> bool:
+    """Return whether every failing target is safely awaiting its linked terminal."""
+
+    target_results = tuple(
+        dict(item)
+        for item in (
+            verification.details.get("declared_target_results") or {}
+        ).values()
+    )
+    if not target_results:
+        return False
+    awaiting = False
+    for result in target_results:
+        errors = tuple(result.get("errors") or ())
+        if not errors:
+            continue
+        if result.get("continuation_eligible") is not True:
+            return False
+        awaiting = True
+    return awaiting
+
+
+def _validate_continuation_decision(
+    decision: SimulatorDecision,
+    target: ScheduledCoverageTarget,
+) -> None:
+    """Validate a response-driven continuation without reusing the entry input lane."""
+
+    required = {
+        "user_message": decision.user_message,
+        "persona": decision.persona,
+        "goal": decision.goal,
+        "rationale": decision.rationale,
+    }
+    missing = sorted(name for name, value in required.items() if not str(value or "").strip())
+    if missing:
+        raise SimulatorDecisionInvalid(
+            f"continuation simulator decision is missing: {', '.join(missing)}"
+        )
+    if target.edge_key not in decision.target_coverage_ids:
+        raise SimulatorDecisionInvalid(
+            "continuation simulator decision lost the scheduled ledger edge"
+        )
+    if decision.persona != target.persona or decision.goal != target.goal:
+        raise SimulatorDecisionInvalid(
+            "continuation simulator decision changed the scheduled persona or goal"
+        )
 
 
 def _clean_terminal_text(raw: bytes) -> str:

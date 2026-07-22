@@ -15,14 +15,51 @@ LANGGRAPH_AVAILABLE = importlib.util.find_spec("langgraph") is not None
 
 
 def _admitted_mock_plan(state, text, payload):
-    """Mint the same immutable field receipts as the production intent boundary."""
+    """Mint the same immutable receipts as the production intent boundary."""
 
     from agent.harness.action_registry import (
+        ACTION_BY_TYPE,
         build_admission_transaction_hash,
         build_proposal_field_receipt,
     )
 
     actions = deepcopy(list(payload.get("actions") or []))
+    pending = dict(state.get("pending_question") or {})
+    options = [item for item in pending.get("options") or [] if isinstance(item, dict)]
+    selected_options: dict[int, dict] = {}
+    for index, action in enumerate(actions):
+        if not isinstance(action, dict):
+            continue
+        option = {}
+        if str(action.get("type") or "") == "answer_pending":
+            selected = action.get("selected_value")
+            option = next((item for item in options if item.get("value") == selected), {})
+        else:
+            spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
+            if spec is not None and spec.pending_option_admission:
+                option = next((
+                    item
+                    for item in options
+                    if isinstance(item.get("action"), dict)
+                    and str(item["action"].get("type") or "") == str(action.get("type") or "")
+                    and all(
+                        key == "type" or action.get(key) == value
+                        for key, value in item["action"].items()
+                    )
+                ), {})
+        if not option:
+            continue
+        selected = option.get("value")
+        actions[index] = {
+            "type": "answer_pending",
+            "answer": selected,
+            "selected_value": selected,
+            "source_evidence": str(action.get("source_evidence") or text),
+            "pending_option_semantic_verified": True,
+            "semantic_purpose_verified": True,
+            "confidence": str(action.get("confidence") or "medium"),
+        }
+        selected_options[index] = option
     thread_id = str(state.get("thread_id") or "default")
     session_id = str((state.get("session") or {}).get("id") or thread_id)
     turn_index = int(state.get("turn_index") or 0)
@@ -65,11 +102,60 @@ def _admitted_mock_plan(state, text, payload):
             )
         action["_proposal_transaction_hashes"] = [transaction_hash]
         action["_proposal_field_receipts"] = receipts
-    return {"actions": actions}
+    pending_choice_contracts = [
+        {
+            "action_index": index,
+            "admission_action_id": action_ids[index],
+            "question": {
+                "id": str(pending.get("id") or ""),
+                "group": str(pending.get("group") or ""),
+                "contract_version": pending.get("contract_version"),
+            },
+            "option": {
+                "id": str(option.get("id") or ""),
+                "selected_value": option.get("value"),
+            },
+            "semantic_units": [{
+                "unit_id": semantic_units[index]["unit_id"],
+                "clause_id": semantic_units[index]["clause_id"],
+                "source_text": semantic_units[index]["source_text"],
+            }],
+        }
+        for index, option in selected_options.items()
+    ]
+    return {
+        "actions": actions,
+        "pending_choice_contracts": pending_choice_contracts,
+    }
 
 
 def _admitted_mock_resolver(payload):
     return lambda state, text: _admitted_mock_plan(state, text, payload)
+
+
+def _invoke_with_admitted_actions(process_turn, state, actions):
+    """Execute a graph-contract turn without making a live model call."""
+
+    payload = {"actions": actions}
+    with patch(
+        "agent.harness.coordinator.resolve_action_queue",
+        side_effect=_admitted_mock_resolver(payload),
+    ):
+        return process_turn(state)
+
+
+def _invoke_with_rpc_evidence(process_turn, state, evidence):
+    return _invoke_with_admitted_actions(
+        process_turn,
+        state,
+        [{
+            "type": "rpc_catalog_command",
+            "catalog_command": "append_evidence",
+            "rpc_schema_evidence": evidence,
+            "source_evidence": evidence,
+            "confidence": "high",
+        }],
+    )
 
 
 def _commit_result(state, result, *, owner: str):
@@ -978,11 +1064,12 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
 
         with patch(
             "agent.harness.coordinator.resolve_action_queue",
-            return_value={"actions": [{
-                "type": "resume_current_flow",
+            return_value=_admitted_mock_plan(state, state["last_user_input"], {"actions": [{
+                "type": "answer_pending",
+                "selected_value": "continue",
                 "source_evidence": "Continue the saved configuration",
                 "confidence": "high",
-            }]},
+            }]}),
         ):
             result = process_turn(state)
 
@@ -1590,7 +1677,18 @@ network:
         }
         state["last_user_input"] = '{"ACCOUNTS_DEVICE":"/dev/nvme1n1"}'
 
-        result = process_turn(state)
+        result = _invoke_with_admitted_actions(
+            process_turn,
+            state,
+            [{
+                "type": "propose_config_values",
+                "source_format": "json",
+                "config_values": {"ACCOUNTS_DEVICE": "/dev/nvme1n1"},
+                "unmapped_values": {},
+                "source_evidence": state["last_user_input"],
+                "confidence": "high",
+            }],
+        )
 
         self.assertEqual(result["pending_question"]["id"], "inferred_config_review")
         self.assertNotIn("ACCOUNTS_DEVICE", result["confirmed_config"])
@@ -1623,7 +1721,18 @@ network:
         }
         state["last_user_input"] = "CLOUD_REGION: us-1\nCLOUD_ZONE: us-1-z"
 
-        result = process_turn(state)
+        result = _invoke_with_admitted_actions(
+            process_turn,
+            state,
+            [{
+                "type": "propose_config_values",
+                "source_format": "yaml",
+                "config_values": {"CLOUD_REGION": "us-1", "CLOUD_ZONE": "us-1-z"},
+                "unmapped_values": {},
+                "source_evidence": state["last_user_input"],
+                "confidence": "high",
+            }],
+        )
 
         self.assertEqual(result["pending_question"]["id"], "inferred_config_review")
         self.assertEqual(
@@ -1659,14 +1768,14 @@ network:
         state["last_user_input"] = 'Use these values, then explain fake-node.\n{"CLOUD_REGION":"us-1"}'
 
         with patch("agent.harness.coordinator.resolve_action_queue") as resolver:
-            resolver.return_value = {
+            resolver.return_value = _admitted_mock_plan(state, state["last_user_input"], {
                 "actions": [{
                     "type": "answer_opening_question",
                     "topic": "mode_comparison",
                     "source_evidence": "explain fake-node",
                     "confidence": "high",
                 }]
-            }
+            })
             result = process_turn(state)
 
         resolver.assert_called_once()
@@ -1880,8 +1989,9 @@ network:
             "provider_deployment", proposal, language="en"
         )
         state["last_user_input"] = "Yes, apply only those inferred values and then continue."
-        with patch("agent.harness.coordinator.resolve_action_queue") as resolver:
-            resolver.return_value = {
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            side_effect=_admitted_mock_resolver({
                 "actions": [{
                     "type": "answer_pending",
                     "selected_value": True,
@@ -1891,7 +2001,8 @@ network:
                     "confidence": "high",
                     "source_evidence": state["last_user_input"],
                 }]
-            }
+            }),
+        ):
             result = process_turn(state)
 
         self.assertEqual(result["confirmed_config"]["CLOUD_REGION"], "asia-east1")
@@ -2368,7 +2479,18 @@ network:
         }
         state["last_user_input"] = "MACHINE_TYPE=n2-standard-16"
 
-        result = process_turn(state)
+        result = _invoke_with_admitted_actions(
+            process_turn,
+            state,
+            [{
+                "type": "propose_config_values",
+                "source_format": "env",
+                "config_values": {"MACHINE_TYPE": "n2-standard-16"},
+                "unmapped_values": {},
+                "source_evidence": state["last_user_input"],
+                "confidence": "high",
+            }],
+        )
 
         self.assertNotIn("MACHINE_TYPE", result["confirmed_config"])
         self.assertNotEqual(result["confirmed_config"].get("CLOUD_ZONE"), "MACHINE_TYPE=n2-standard-16")
@@ -2395,7 +2517,22 @@ network:
         state["active_group"] = "provider_deployment"
         state["last_user_input"] = "CLOUD_REGION=us-1, CLOUD_ZONE=us-1-z, MACHINE_TYPE=n2"
 
-        result = process_turn(state)
+        result = _invoke_with_admitted_actions(
+            process_turn,
+            state,
+            [{
+                "type": "propose_config_values",
+                "source_format": "env",
+                "config_values": {
+                    "CLOUD_REGION": "us-1",
+                    "CLOUD_ZONE": "us-1-z",
+                    "MACHINE_TYPE": "n2",
+                },
+                "unmapped_values": {},
+                "source_evidence": state["last_user_input"],
+                "confidence": "high",
+            }],
+        )
 
         self.assertNotIn("CLOUD_REGION", result["confirmed_config"])
         self.assertEqual(result["pending_question"]["id"], "inferred_config_review")
@@ -3714,9 +3851,9 @@ network:
         with (
             _patch(
                 "agent.harness.coordinator.resolve_action_queue",
-                return_value={"actions": [
+                return_value=_admitted_mock_plan(state, state["last_user_input"], {"actions": [
                     {"type": "answer_pending", "answer": "N", "selected_value": False, "source_evidence": "N", "pending_option_semantic_verified": True, "semantic_purpose_verified": True, "confidence": "high"},
-                ]},
+                ]}),
             ) as resolver,
         ):
             result = process_turn(state)
@@ -4250,8 +4387,13 @@ network:
             "active_group": "workload_rpc",
         })
         state["pending_question"] = question_for_chain_rpc(state, "workload_rpc") or {}
-        actions = [
-            {"type": "answer_pending", "selected_value": "single", "source_evidence": "single", "selection_contract_verified": True},
+        admitted = _admitted_mock_plan(state, "single quick", {"actions": [
+            {"type": "answer_pending", "selected_value": "single", "source_evidence": "single"},
+        ]})
+        state.setdefault("turn_context", {})["pending_choice_contracts"] = admitted[
+            "pending_choice_contracts"
+        ]
+        actions = admitted["actions"] + [
             {"type": "set_rpc_mode", "rpc_mode": "single", "source_evidence": "single"},
             {"type": "set_qps_mode", "qps_mode": "quick", "source_evidence": "quick"},
         ]
@@ -6027,14 +6169,14 @@ network:
 
         detoured["last_user_input"] = "Yes, the configured BSC chain is what I meant."
         with patch("agent.harness.coordinator.resolve_action_queue") as resolver:
-            resolver.return_value = {"actions": [{
+            resolver.side_effect = _admitted_mock_resolver({"actions": [{
                 "type": "answer_pending",
                 "selected_value": "confirm_known_chain",
                 "source_evidence": "Yes, the configured BSC chain is what I meant.",
                 "pending_option_semantic_verified": True,
                 "semantic_purpose_verified": True,
                 "confidence": "high",
-            }]}
+            }]})
             resumed = process_turn(detoured)
 
         self.assertEqual(resumed["chain_identity"]["canonical"], "bsc")
@@ -6217,12 +6359,12 @@ network:
         with (
             patch(
                 "agent.harness.coordinator.resolve_action_queue",
-                return_value={
+                side_effect=_admitted_mock_resolver({
                     "actions": [
                         {"type": "answer_pending", "answer": "这是真实链", "selected_value": "choose_protocol", "source_evidence": "它应该是 EVM/jsonrpc", "pending_option_semantic_verified": True, "semantic_purpose_verified": True, "confidence": "high"},
                         {"type": "choose_adapter_family", "adapter_family": "jsonrpc", "confidence": "high"},
                     ]
-                },
+                }),
             ),
         ):
             result = process_turn(state)
@@ -6267,10 +6409,10 @@ network:
         with (
             patch(
                 "agent.harness.coordinator.resolve_action_queue",
-                return_value={"actions": [
+                side_effect=_admitted_mock_resolver({"actions": [
                     {"type": "answer_pending", "answer": "jsonrpc", "selected_value": "jsonrpc", "source_evidence": "EVM/jsonrpc", "pending_option_semantic_verified": True, "semantic_purpose_verified": True, "confidence": "high"},
                     {"type": "answer_opening_question", "topic": "config_explanation", "subject": "new_chain_endpoint", "confidence": "high"},
-                ]},
+                ]}),
             ),
         ):
             result = process_turn(state)
@@ -6685,7 +6827,7 @@ network:
 
         with patch(
             "agent.harness.coordinator.resolve_action_queue",
-            return_value={"actions": [{
+            side_effect=_admitted_mock_resolver({"actions": [{
                 "type": "answer_pending",
                 "answer": "replace defaults",
                 "selected_value": "mixed_replace",
@@ -6693,7 +6835,7 @@ network:
                 "pending_option_semantic_verified": True,
                 "semantic_purpose_verified": True,
                 "confidence": "high",
-            }]},
+            }]}),
         ):
             result = process_turn(state)
 
@@ -7063,6 +7205,17 @@ network:
                     "source_evidence": state["last_user_input"],
                     "confidence": "high",
                 }]},
+            ), patch(
+                "agent.harness.domains.rpc_endpoint.extract_rpc_schema_from_evidence",
+                return_value={
+                    "status": "draft",
+                    "evidence_kind": "request_schema",
+                    "method": "eth_blockNumber",
+                    "params": [],
+                    "params_json": [],
+                    "response_summary": "unknown",
+                    "confidence": "high",
+                },
             ):
                 state = process_turn(state)
             self.assertEqual(state["custom_rpc"]["status"], "schema_needs_confirmation")
@@ -7083,13 +7236,13 @@ network:
         state["last_user_input"] = "eth_blockNumber=70,eth_getBalance=20"
         with patch(
             "agent.harness.coordinator.resolve_action_queue",
-            return_value={"actions": [{
+            side_effect=_admitted_mock_resolver({"actions": [{
                 "type": "answer_pending",
                 "answer": state["last_user_input"],
                 "source_evidence": state["last_user_input"],
                 "semantic_purpose_verified": True,
                 "confidence": "high",
-            }]},
+            }]}),
         ):
             state = process_turn(state)
         self.assertEqual(state["custom_rpc"]["status"], "needs_weights")
@@ -7098,13 +7251,13 @@ network:
         state["last_user_input"] = "eth_blockNumber=70,eth_getBalance=30"
         with patch(
             "agent.harness.coordinator.resolve_action_queue",
-            return_value={"actions": [{
+            side_effect=_admitted_mock_resolver({"actions": [{
                 "type": "answer_pending",
                 "answer": state["last_user_input"],
                 "source_evidence": state["last_user_input"],
                 "semantic_purpose_verified": True,
                 "confidence": "high",
-            }]},
+            }]}),
         ):
             state = process_turn(state)
         self.assertEqual(state["custom_rpc"]["status"], "validated")
@@ -7292,7 +7445,7 @@ network:
 
         with patch("agent.harness.domains.rpc_endpoint.extract_rpc_schema_from_evidence", return_value=draft):
             state["last_user_input"] = "curl --data '{\"method\":\"eth_getBalance\",\"params\":[\"0x0000000000000000000000000000000000000000\",\"latest\"]}'"
-            state = process_turn(state)
+            state = _invoke_with_rpc_evidence(process_turn, state, state["last_user_input"])
 
         self.assertEqual(state["custom_rpc"]["status"], "schema_needs_confirmation")
         self.assertEqual(state["pending_question"]["id"], "custom_rpc_parameter_confirm")
@@ -7332,7 +7485,7 @@ network:
         }
         with patch("agent.harness.domains.rpc_endpoint.extract_rpc_schema_from_evidence", return_value=extracted) as extractor, patch("agent.harness.domains.rpc_endpoint.validate_rpc_endpoint") as probe:
             state["last_user_input"] = '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'
-            state = process_turn(state)
+            state = _invoke_with_rpc_evidence(process_turn, state, state["last_user_input"])
 
         extractor.assert_called_once()
         probe.assert_not_called()
@@ -7366,7 +7519,7 @@ network:
         request = '{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x0000000000000000000000000000000000000000","latest"],"id":1}'
         with patch("agent.harness.domains.rpc_endpoint.extract_rpc_schema_from_evidence", return_value=extracted), patch("agent.harness.domains.rpc_endpoint.validate_rpc_endpoint") as probe:
             state["last_user_input"] = request
-            state = process_turn(state)
+            state = _invoke_with_rpc_evidence(process_turn, state, request)
 
         probe.assert_not_called()
         draft = _catalog_draft(state)
@@ -8332,7 +8485,7 @@ response:
         )
         with patch(
             "agent.harness.coordinator.resolve_action_queue",
-            return_value={"actions": [{
+            side_effect=_admitted_mock_resolver({"actions": [{
                 "type": "answer_pending",
                 "answer": False,
                 "selected_value": False,
@@ -8340,7 +8493,7 @@ response:
                 "pending_option_semantic_verified": True,
                 "semantic_purpose_verified": True,
                 "confidence": "high",
-            }]},
+            }]}),
         ):
             result = process_turn(state)
 
@@ -8415,7 +8568,7 @@ response:
         state["last_user_input"] = "Reject this observed response; I will correct the evidence."
         with patch(
             "agent.harness.coordinator.resolve_action_queue",
-            return_value={"actions": [{
+            side_effect=_admitted_mock_resolver({"actions": [{
                 "type": "answer_pending",
                 "answer": False,
                 "selected_value": False,
@@ -8423,7 +8576,7 @@ response:
                 "pending_option_semantic_verified": True,
                 "semantic_purpose_verified": True,
                 "confidence": "high",
-            }]},
+            }]}),
         ):
             result = process_turn(state)
 
@@ -9077,12 +9230,12 @@ response:
         with (
             patch(
                 "agent.harness.coordinator.resolve_action_queue",
-                return_value={"actions": [
+                side_effect=_admitted_mock_resolver({"actions": [
                     {"type": "answer_pending", "answer": "够了", "selected_value": "finish", "source_evidence": "够了", "pending_option_semantic_verified": True, "semantic_purpose_verified": True, "confidence": "high"},
                     {"type": "start_custom_rpc", "workload_scope": "mixed_replace", "rpc_weights": {"eth_chainId": 100}, "finish_methods": True, "confidence": "high"},
                     {"type": "set_qps_mode", "qps_mode": "quick", "mutation_explicit": True, "source_evidence": "quick", "confidence": "high"},
                     {"type": "set_observability", "observability_mode": "disabled", "mutation_explicit": True, "source_evidence": "Grafana 不开", "confidence": "high"},
-                ]},
+                ]}),
             ),
         ):
             result = process_turn(state)
@@ -9505,6 +9658,50 @@ response:
         self.assertEqual(len(result.get("visible_response") or []), 1)
         self.assertIn("original config/chains template: unchanged", response)
 
+    def test_current_config_and_job_history_remain_distinct_consultation_results(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.graph import _next_result
+        from agent.harness.state import new_state
+
+        state = new_state("compound-consultation", language="en")
+        state["last_user_input"] = (
+            "Do I have any saved configuration or previous jobs? "
+            "Show me the concrete current status."
+        )
+        state["active_group"] = "opening"
+        state["pending_question"] = {
+            "id": "opening_next_action",
+            "group": "opening",
+            "kind": "numbered_choice",
+            "options": [],
+        }
+
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            return_value={"actions": [
+                {
+                    "type": "answer_opening_question",
+                    "topic": "current_config",
+                    "confidence": "high",
+                },
+                {
+                    "type": "answer_opening_question",
+                    "topic": "current_job",
+                    "confidence": "high",
+                },
+            ]},
+        ), patch("agent.harness.domains.orientation.list_jobs", return_value=[]):
+            result = process_turn(state)
+
+        response = "\n".join(result.get("visible_response") or [])
+        self.assertIn("Current state:", response)
+        self.assertIn("No historical job", response)
+        self.assertEqual((result.get("pending_question") or {}).get("id"), "opening_next_action")
+        next_result = _next_result(result)
+        self.assertEqual(next_result.get("kind"), "result")
+        self.assertTrue(next_result.get("pending_overlay"))
+        self.assertEqual(next_result.get("question_id"), "opening_next_action")
+
     def test_specific_workload_consultation_absorbs_generic_config_responses(self) -> None:
         from agent.harness.coordinator import _drop_conflicting_answer_actions
         from agent.harness.state import new_state
@@ -9638,6 +9835,18 @@ response:
                     "rpc_schema_evidence": state["last_user_input"],
                     "confidence": "high",
                 }]},
+            ),
+            patch(
+                "agent.harness.domains.rpc_endpoint.extract_rpc_schema_from_evidence",
+                return_value={
+                    "status": "draft",
+                    "evidence_kind": "parameter_schema",
+                    "method": "eth_chainId",
+                    "params": [],
+                    "params_json": [],
+                    "response_summary": "unknown",
+                    "confidence": "high",
+                },
             ),
             patch("agent.harness.domains.rpc_endpoint.validate_rpc_endpoint", return_value=probe),
         ):
@@ -10219,7 +10428,16 @@ response:
         }
         state["last_user_input"] = "什么意思？你在讲什么"
 
-        result = process_turn(state)
+        result = _invoke_with_admitted_actions(
+            process_turn,
+            state,
+            [{
+                "type": "answer_opening_question",
+                "topic": "current_context",
+                "source_evidence": state["last_user_input"],
+                "confidence": "high",
+            }],
+        )
 
         self.assertEqual(result["secondary_handoff"]["evidence"], ["protocol: weird-p2p"])
         self.assertNotIn("已记录第", "\n".join(result.get("visible_response") or []))
@@ -10394,7 +10612,25 @@ response:
         }
         state["last_user_input"] = "我还想用 fake-node 测 solana"
 
-        result = process_turn(state)
+        result = _invoke_with_admitted_actions(
+            process_turn,
+            state,
+            [
+                {
+                    "type": "choose_target_mode",
+                    "target_mode": "fake-node",
+                    "target_mode_explicit": True,
+                    "source_evidence": "fake-node",
+                    "confidence": "high",
+                },
+                {
+                    "type": "choose_chain",
+                    "chain_text": "solana",
+                    "source_evidence": "solana",
+                    "confidence": "high",
+                },
+            ],
+        )
         text = "\n".join(result["visible_response"])
 
         self.assertIn("I inferred these candidate config values", text)
@@ -11348,10 +11584,10 @@ response:
         with (
             patch("agent.harness.coordinator.resolve_action_queue") as resolver,
         ):
-            resolver.return_value = {"actions": [
+            resolver.side_effect = _admitted_mock_resolver({"actions": [
                 {"type": "answer_pending", "answer": "没有 accounts 盘", "selected_value": False, "source_evidence": "没有 accounts 盘", "pending_option_semantic_verified": True, "semantic_purpose_verified": True, "confidence": "high"},
                 {"type": "answer_opening_question", "topic": "requirements", "confidence": "high"},
-            ]}
+            ]})
             result = process_turn(state)
 
         self.assertIs(result["confirmed_config"]["has_accounts_device"], False)
@@ -11389,7 +11625,7 @@ response:
 
         with patch(
             "agent.harness.coordinator.resolve_action_queue",
-            return_value={"actions": [{"type": "answer_pending", "answer": "没有 accounts 盘", "selected_value": False, "source_evidence": "没有 accounts 盘", "pending_option_semantic_verified": True, "semantic_purpose_verified": True, "confidence": "high"}]},
+            side_effect=_admitted_mock_resolver({"actions": [{"type": "answer_pending", "answer": "没有 accounts 盘", "selected_value": False, "source_evidence": "没有 accounts 盘", "pending_option_semantic_verified": True, "semantic_purpose_verified": True, "confidence": "high"}]}),
         ):
             result = process_turn(state)
 
@@ -12362,6 +12598,8 @@ response:
                         "source_evidence": "fake-node",
                         "pending_option_semantic_verified": True,
                         "semantic_purpose_verified": True,
+                        "_admission_action_id": "opening-choice-1",
+                        "_transaction_action_ids": ["opening-choice-1"],
                         "confidence": "high",
                     },
                     {
@@ -12384,7 +12622,18 @@ response:
                         "source_evidence": "quick",
                         "confidence": "high",
                     },
-                ]
+                ],
+                "pending_choice_contracts": [{
+                    "action_index": 0,
+                    "admission_action_id": "opening-choice-1",
+                    "question": {"id": "opening_next_action", "group": "opening"},
+                    "option": {"id": "fake-node", "selected_value": "fake-node"},
+                    "semantic_units": [{
+                        "unit_id": "unit-1",
+                        "clause_id": "clause-1",
+                        "source_text": "Use the fake-node option and set Solana mixed quick",
+                    }],
+                }],
             }
             result = process_turn(state)
 
@@ -12392,7 +12641,7 @@ response:
         self.assertEqual((result.get("chain_identity") or {}).get("canonical"), "solana")
         self.assertNotIn("the pending answer is empty", "\n".join(result.get("visible_response") or []))
 
-    def test_declared_option_action_is_bound_to_pending_contract_without_phrase_aliases(self) -> None:
+    def test_declared_option_owner_cannot_bypass_canonical_pending_contract(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
         from agent.harness.domains.orientation import opening_question
         from agent.harness.state import new_state
@@ -12414,10 +12663,8 @@ response:
         ):
             result = process_turn(state)
 
-        self.assertEqual(result.get("target_mode"), "fake-node")
-        self.assertEqual(result.get("workflow_mode"), "rpc_benchmark")
-        admitted = (result.get("turn_context") or {}).get("admitted_actions") or []
-        self.assertIn("choose_target_mode", {item.get("type") for item in admitted})
+        self.assertEqual(result.get("target_mode"), "")
+        self.assertEqual((result.get("pending_question") or {}).get("id"), "opening_next_action")
 
     def test_declared_option_binding_rejects_source_evidence_outside_current_turn(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
@@ -12475,13 +12722,25 @@ response:
         with patch(
             "agent.harness.coordinator.resolve_action_queue",
             return_value={"actions": [{
-                "type": "choose_target_mode",
-                "target_mode": "sync-observe",
-                "target_mode_explicit": True,
+                "type": "answer_pending",
+                "answer": "sync-observe",
+                "selected_value": "sync-observe",
                 "source_evidence": "Watch the running node catch up to chain head.",
                 "pending_option_semantic_verified": True,
                 "semantic_purpose_verified": True,
+                "_admission_action_id": "target-mode-choice-1",
+                "_transaction_action_ids": ["target-mode-choice-1"],
                 "confidence": "medium",
+            }], "pending_choice_contracts": [{
+                "action_index": 0,
+                "admission_action_id": "target-mode-choice-1",
+                "question": {"id": "target_mode_select", "group": "target_mode"},
+                "option": {"id": "sync-observe", "selected_value": "sync-observe"},
+                "semantic_units": [{
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "source_text": "Watch the running node catch up to chain head.",
+                }],
             }]},
         ):
             result = process_turn(state)
@@ -13040,7 +13299,7 @@ response:
         })
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
-            result = process_turn(state)
+            result = process_turn(state, allow_semantic_resolver=True)
 
         self.assertEqual(
             result["active_group"],
@@ -13844,7 +14103,7 @@ response:
 
         with patch(
             "agent.harness.coordinator.resolve_action_queue",
-            return_value={"actions": [{
+            side_effect=_admitted_mock_resolver({"actions": [{
                 "type": "answer_pending",
                 "answer": True,
                 "selected_value": True,
@@ -13852,7 +14111,7 @@ response:
                 "pending_option_semantic_verified": True,
                 "semantic_purpose_verified": True,
                 "confidence": "medium",
-            }]},
+            }]}),
         ):
             result = process_turn(state)
 

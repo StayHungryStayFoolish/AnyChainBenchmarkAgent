@@ -9,6 +9,9 @@ import threading
 import time
 import unittest
 from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from tests.agent_live.chaos_scheduler import ScheduledCoverageTarget
 from tests.agent_live.codex_simulator_bridge import (
@@ -21,9 +24,14 @@ from tests.agent_live.codex_simulator_bridge import (
     CodexSimulatorProtocolError,
     CodexSimulatorStaleResponse,
     StdioCodexSimulator,
+    RESULT_FRAME,
+    run_bridge,
 )
 from tests.agent_live.coverage_evidence import content_hash
-from tests.agent_live.dynamic_dual_ai_chaos import SimulatorContext
+from tests.agent_live.dynamic_dual_ai_chaos import (
+    SimulatorContext,
+    SimulatorDecisionInvalid,
+)
 
 
 class StdioCodexSimulatorTest(unittest.TestCase):
@@ -236,6 +244,51 @@ class StdioCodexSimulatorTest(unittest.TestCase):
             stream.close()
 
         self.assertEqual(decision.user_message, "请使用 fake-node。")
+
+    def test_bridge_emits_typed_simulator_invalid_terminal_result(self) -> None:
+        output = io.StringIO()
+        runtime_root = Path("/tmp/codex-simulator-invalid")
+        config = SimpleNamespace(
+            runtime_root=runtime_root,
+            repo_root=Path("/repo"),
+            session_id="session-invalid",
+        )
+        schedule = SimpleNamespace(targets=(object(),))
+        runner = SimpleNamespace(
+            run=lambda: (_ for _ in ()).throw(
+                SimulatorDecisionInvalid("declared multiline input was structured")
+            )
+        )
+        with patch(
+            "tests.agent_live.codex_simulator_bridge.repository_revision",
+            return_value={"commit": "abc", "worktree_hash": "d" * 64},
+        ), patch(
+            "tests.agent_live.codex_simulator_bridge.build_ledger", return_value={}
+        ), patch(
+            "tests.agent_live.codex_simulator_bridge.build_chaos_schedule",
+            return_value=schedule,
+        ), patch(
+            "tests.agent_live.codex_simulator_bridge.ChaosRunConfig.docker",
+            return_value=config,
+        ), patch(
+            "tests.agent_live.codex_simulator_bridge.DynamicDualAiChaosRunner",
+            return_value=runner,
+        ):
+            payload = run_bridge(
+                repo_root=Path("/repo"),
+                targets=({},),
+                seed=1,
+                session_id="session-invalid",
+                service="bench",
+                runtime="docker",
+                output_stream=output,
+            )
+
+        self.assertEqual(payload["terminal_classification"], "simulator_invalid")
+        self.assertEqual(payload["execution_status"], "incomplete")
+        framed = json.loads(output.getvalue()[len(RESULT_FRAME):])
+        self.assertEqual(framed, payload)
+        self.assertIn("SimulatorDecisionInvalid", payload["failure_reason"])
 
 
 if __name__ == "__main__":

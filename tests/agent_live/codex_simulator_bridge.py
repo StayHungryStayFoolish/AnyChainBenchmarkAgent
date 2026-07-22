@@ -26,6 +26,8 @@ from tests.agent_live.dynamic_dual_ai_chaos import (
     DynamicDualAiChaosRunner,
     SimulatorContext,
     SimulatorDecision,
+    SimulatorDecisionInvalid,
+    SimulatorTerminalClassification,
 )
 from tests.agent_live.generate_harness_coverage_ledger import build_ledger
 
@@ -323,15 +325,32 @@ def run_bridge(
         schedule=schedule,
         revision=revision,
     )
-    result = runner.run()
-    payload = {
-        "session_id": result.session_id,
-        "execution_status": result.execution_status,
-        "schedule_path": str(result.schedule_path),
-        "schedule_result_path": str(result.schedule_result_path),
-        "transcript_path": str(result.transcript_path),
-        "evidence_paths": [str(path) for path in result.evidence_paths],
-    }
+    try:
+        result = runner.run()
+        payload = {
+            "session_id": result.session_id,
+            "execution_status": result.execution_status,
+            "terminal_classification": SimulatorTerminalClassification.PASSED.value,
+            "failure_reason": "",
+            "schedule_path": str(result.schedule_path),
+            "schedule_result_path": str(result.schedule_result_path),
+            "transcript_path": str(result.transcript_path),
+            "evidence_paths": [str(path) for path in result.evidence_paths],
+        }
+    except (SimulatorDecisionInvalid, CodexSimulatorProtocolError) as exc:
+        runtime_root = Path(config.runtime_root or (
+            config.repo_root / ".agent" / "dynamic-chaos" / config.session_id
+        )).resolve()
+        payload = {
+            "session_id": config.session_id,
+            "execution_status": "incomplete",
+            "terminal_classification": SimulatorTerminalClassification.SIMULATOR_INVALID.value,
+            "failure_reason": str(redact(f"{type(exc).__name__}: {exc}")),
+            "schedule_path": str(runtime_root / "schedule.json"),
+            "schedule_result_path": str(runtime_root / "schedule-result.json"),
+            "transcript_path": str(runtime_root / "transcript.txt"),
+            "evidence_paths": [],
+        }
     output_stream.write(RESULT_FRAME + json.dumps(payload, ensure_ascii=False) + "\n")
     output_stream.flush()
     return payload

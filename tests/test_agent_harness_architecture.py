@@ -2435,7 +2435,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
         self.assertEqual(provider.complete.call_count, 4)
         self.assertEqual(result["actions"][0]["type"], "clarify_unresolved")
 
-    def test_pending_option_materializes_registered_single_rpc_effect(self) -> None:
+    def test_pending_option_keeps_single_rpc_effect_behind_canonical_contract(self) -> None:
         from agent.harness.domains.chain_rpc import question_for_chain_rpc
         from agent.harness.intent import resolve_action_queue
 
@@ -2463,11 +2463,12 @@ class HarnessStateInvariantTest(unittest.TestCase):
             result = resolve_action_queue(state, text)
 
         self.assertEqual(provider.complete.call_count, 2)
-        self.assertEqual(result["actions"][0]["type"], "set_rpc_mode")
-        self.assertEqual(result["actions"][0]["rpc_mode"], "single")
+        self.assertEqual(result["actions"][0]["type"], "answer_pending")
+        self.assertEqual(result["actions"][0]["selected_value"], "single")
         self.assertTrue(result["actions"][0]["pending_option_semantic_verified"])
+        self.assertEqual(result["pending_choice_contracts"][0]["option"]["selected_value"], "single")
 
-    def test_pending_option_admits_registered_mixed_rpc_effect(self) -> None:
+    def test_pending_owner_action_is_normalized_to_canonical_mixed_choice(self) -> None:
         from agent.harness.domains.chain_rpc import question_for_chain_rpc
         from agent.harness.intent import resolve_action_queue
 
@@ -2495,9 +2496,10 @@ class HarnessStateInvariantTest(unittest.TestCase):
             result = resolve_action_queue(state, text)
 
         self.assertEqual(provider.complete.call_count, 2)
-        self.assertEqual(result["actions"][0]["type"], "set_rpc_mode")
-        self.assertEqual(result["actions"][0]["rpc_mode"], "mixed")
+        self.assertEqual(result["actions"][0]["type"], "answer_pending")
+        self.assertEqual(result["actions"][0]["selected_value"], "mixed")
         self.assertTrue(result["actions"][0]["pending_option_semantic_verified"])
+        self.assertEqual(result["pending_choice_contracts"][0]["option"]["selected_value"], "mixed")
 
     def test_pending_manual_value_is_typed_grounded_and_admitted(self) -> None:
         from agent.harness.intent import resolve_action_queue

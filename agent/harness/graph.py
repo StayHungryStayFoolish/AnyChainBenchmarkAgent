@@ -317,13 +317,24 @@ def _leaf_value_hashes(value: Any, prefix: tuple[str, ...] = ()) -> dict[str, st
 
 def _next_result(state: Mapping[str, Any]) -> dict[str, Any]:
     pending = dict(state.get("pending_question") or {})
+    responses = list(state.get("visible_response") or [])
+    turn_local_result_count = int(
+        (state.get("turn_context") or {}).get("turn_local_result_count") or 0
+    )
+    if pending and turn_local_result_count:
+        return {
+            "kind": "result",
+            "response_count": turn_local_result_count,
+            "pending_overlay": True,
+            "question_id": str(pending.get("id") or ""),
+            "group": str(pending.get("group") or ""),
+        }
     if pending:
         return {
             "kind": "question",
             "question_id": str(pending.get("id") or ""),
             "group": str(pending.get("group") or ""),
         }
-    responses = list(state.get("visible_response") or [])
     job = dict(state.get("job") or {})
     return {
         "kind": "result",

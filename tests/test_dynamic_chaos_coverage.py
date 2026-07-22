@@ -248,7 +248,7 @@ class DynamicChaosCoverageTest(unittest.TestCase):
             dynamic=True,
             after_turn_index=1,
         )
-        with self.assertRaisesRegex(ValueError, "advance exactly one turn"):
+        with self.assertRaisesRegex(ValueError, "complete event chain"):
             build_pty_cli_evidence_artifact(
                 edge=self.edge,
                 evidence_class="dynamic_dual_ai",

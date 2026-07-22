@@ -38,6 +38,14 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertEqual(len(clauses), 1)
         self.assertEqual(clauses[0].input_shape, "structured")
 
+    def test_standalone_url_is_not_misclassified_as_a_yaml_key(self) -> None:
+        clauses = segment_user_turn(
+            "Use this endpoint only for schema validation:\nhttp://fake-node:19000"
+        )
+
+        self.assertEqual([item.input_shape for item in clauses], ["prose", "prose"])
+        self.assertEqual(clauses[-1].text, "http://fake-node:19000")
+
 
 
 
@@ -55,7 +63,7 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertTrue(question["options"][1]["manual_entry"])
 
 
-    def test_verified_option_reference_is_bound_to_typed_contract_value_before_dispatch(self) -> None:
+    def test_canonical_pending_choice_receipt_authorizes_exact_typed_value(self) -> None:
         from agent.harness.coordinator import _validate_action_plan
         from agent.harness.state import new_state
 
@@ -76,17 +84,74 @@ class PlanCoverageTest(unittest.TestCase):
         actions = [{
             "type": "answer_pending",
             "answer": "100",
-            "selected_value": "1",
+            "selected_value": "100",
             "source_evidence": state["last_user_input"],
             "pending_option_semantic_verified": True,
             "semantic_purpose_verified": True,
+            "_admission_action_id": "admitted-choice-1",
         }]
+        state["turn_context"] = {"pending_choice_contracts": [{
+            "action_index": 0,
+            "admission_action_id": "admitted-choice-1",
+            "question": {
+                "id": "detected-size",
+                "group": "ledger_disk",
+                "contract_version": 1,
+            },
+            "option": {"id": "1", "selected_value": "100"},
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": state["last_user_input"],
+            }],
+        }]}
 
         prepared = _validate_action_plan(state, actions)
 
         self.assertEqual(prepared[0]["selected_value"], "100")
         self.assertEqual(prepared[0]["answer"], "100")
         self.assertIs(prepared[0]["selection_contract_verified"], True)
+
+    def test_pending_choice_without_exact_canonical_receipt_is_rejected(self) -> None:
+        from agent.harness.coordinator import _validate_action_plan
+        from agent.harness.state import new_state
+
+        state = new_state("missing-pending-choice-receipt", language="en")
+        state["last_user_input"] = "Use the detected value."
+        state["pending_question"] = {
+            "id": "detected-size",
+            "group": "ledger_disk",
+            "field": "DATA_VOL_SIZE",
+            "kind": "yes_no",
+            "options": [{
+                "id": "1",
+                "label": "Y",
+                "value": "100",
+                "action": {"type": "answer_pending"},
+            }],
+            "manual_input_allowed": False,
+        }
+        action = {
+            "type": "answer_pending",
+            "answer": "100",
+            "selected_value": "100",
+            "source_evidence": state["last_user_input"],
+            "pending_option_semantic_verified": True,
+            "semantic_purpose_verified": True,
+            "_admission_action_id": "admitted-choice-1",
+        }
+        forged = {
+            "action_index": 0,
+            "admission_action_id": "admitted-choice-1",
+            "question": {"id": "different-question", "group": "ledger_disk"},
+            "option": {"id": "1", "selected_value": "100"},
+            "semantic_units": [{"unit_id": "unit-1", "source_text": state["last_user_input"]}],
+        }
+
+        for contracts in ([], [forged]):
+            with self.subTest(contracts=contracts):
+                state["turn_context"] = {"pending_choice_contracts": contracts}
+                self.assertEqual(_validate_action_plan(state, [action]), [])
 
     def test_rpc_mode_coverage_scenario_has_required_workflow_prerequisites(self) -> None:
         from tests.agent_live.harness_contract_scenarios import question_scenarios

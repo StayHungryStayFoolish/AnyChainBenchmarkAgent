@@ -16,9 +16,9 @@ from agent.utils.redaction import redact
 
 
 ARTIFACT_SCHEMA_VERSION = 4
-CLI_ARTIFACT_SCHEMA_VERSION = 5
+CLI_ARTIFACT_SCHEMA_VERSION = 6
 REAL_EXECUTION_ARTIFACT_SCHEMA_VERSION = 2
-TURN_OBSERVATION_SCHEMA_VERSION = 1
+TURN_OBSERVATION_SCHEMA_VERSION = 2
 PTY_DIAGNOSTIC_SCHEMA_VERSION = 1
 PTY_DIAGNOSTIC_STATUSES = {
     "failed_attempt": frozenset({
@@ -121,6 +121,8 @@ class TurnObservation:
     pending_contract: Mapping[str, Any]
     runtime_events: tuple[RuntimeTurnEvent, ...]
     verified_postcondition: VerifiedPostcondition
+    continuation_turns: tuple[PtyCliTurnRecord, ...] = ()
+    continuation_simulator_decisions: tuple[Mapping[str, Any], ...] = ()
     schema_version: int = TURN_OBSERVATION_SCHEMA_VERSION
 
 
@@ -1111,6 +1113,14 @@ def _turn_observation_from_payload(payload: Mapping[str, Any]) -> TurnObservatio
         )
         for item in values.get("runtime_events") or ()
     )
+    values["continuation_turns"] = tuple(
+        PtyCliTurnRecord(**dict(item))
+        for item in values.get("continuation_turns") or ()
+    )
+    values["continuation_simulator_decisions"] = tuple(
+        dict(item)
+        for item in values.get("continuation_simulator_decisions") or ()
+    )
     raw_postcondition = dict(values.get("verified_postcondition") or {})
     raw_postcondition["observed_coverage_ids"] = tuple(
         raw_postcondition.get("observed_coverage_ids") or ()
@@ -1159,39 +1169,62 @@ def _validate_turn_observation(
         raise ValueError("turn observation provider identity is missing")
     if observation.before_turn_index < 0:
         raise ValueError("turn observation before turn index is invalid")
-    if observation.after_turn_index != observation.before_turn_index + 1:
-        raise ValueError("turn observation event did not advance exactly one turn")
-    if turn.turn_index != observation.after_turn_index:
-        raise ValueError("PTY and runtime turn indexes disagree")
-    if len(observation.runtime_events) != 2:
-        raise ValueError("turn observation requires baseline and committed runtime events")
-    baseline, committed = observation.runtime_events
-    _validate_runtime_event(baseline)
-    _validate_runtime_event(committed)
-    if dict(baseline.revision) != dict(observation.revision):
-        raise ValueError("baseline runtime event revision mismatch")
-    if dict(committed.revision) != dict(observation.revision):
-        raise ValueError("committed runtime event revision mismatch")
-    if committed.event_type not in {"turn_committed", "turn_recovered"}:
-        raise ValueError("new runtime event is not a committed turn")
-    if baseline.thread_id != turn.session_id or committed.thread_id != turn.session_id:
-        raise ValueError("runtime event thread does not match the PTY session")
-    if baseline.session_purpose != committed.session_purpose:
-        raise ValueError("runtime event session purpose changed")
+    if len(observation.runtime_events) < 2:
+        raise ValueError("turn observation requires a baseline and at least one committed event")
+    baseline, committed, *continuation_events = observation.runtime_events
+    expected_after_index = observation.before_turn_index + len(observation.runtime_events) - 1
+    if observation.after_turn_index != expected_after_index:
+        raise ValueError("turn observation indexes do not cover its complete event chain")
+    if turn.turn_index != observation.before_turn_index + 1:
+        raise ValueError("root PTY turn does not immediately follow the baseline")
+    if len(observation.continuation_turns) != len(continuation_events):
+        raise ValueError("continuation PTY turns do not match continuation runtime events")
+    for event in observation.runtime_events:
+        _validate_runtime_event(event)
+        if dict(event.revision) != dict(observation.revision):
+            raise ValueError("runtime event revision mismatch within linked journey")
+        if event.thread_id != turn.session_id:
+            raise ValueError("runtime event thread does not match the PTY session")
+        if event.session_purpose != baseline.session_purpose:
+            raise ValueError("runtime event session purpose changed")
+    for previous, current in zip(
+        observation.runtime_events,
+        observation.runtime_events[1:],
+    ):
+        if current.event_type not in {"turn_committed", "turn_recovered"}:
+            raise ValueError("linked runtime event is not a committed turn")
+        if current.turn_index != previous.turn_index + 1:
+            raise ValueError("linked runtime event turn indexes are not contiguous")
+        if current.before_fingerprint != previous.after_fingerprint:
+            raise ValueError("linked runtime event fingerprint chain is stale")
     if baseline.turn_index != observation.before_turn_index:
         raise ValueError("baseline runtime event turn index is stale")
-    if committed.turn_index != observation.after_turn_index:
-        raise ValueError("committed runtime event turn index is stale")
-    if committed.before_fingerprint != baseline.after_fingerprint:
-        raise ValueError("runtime event fingerprint chain is stale")
+    terminal_event = observation.runtime_events[-1]
+    if terminal_event.turn_index != observation.after_turn_index:
+        raise ValueError("terminal runtime event turn index is stale")
     if observation.before_state_fingerprint != committed.before_fingerprint:
         raise ValueError("turn observation before fingerprint mismatch")
-    if observation.after_state_fingerprint != committed.after_fingerprint:
+    if observation.after_state_fingerprint != terminal_event.after_fingerprint:
         raise ValueError("turn observation after fingerprint mismatch")
     if turn.before_fingerprint != committed.before_fingerprint:
         raise ValueError("PTY before fingerprint was not observed from the committed event")
     if turn.after_fingerprint != committed.after_fingerprint:
         raise ValueError("PTY after fingerprint was not observed from the committed event")
+    for continuation_turn, continuation_event in zip(
+        observation.continuation_turns,
+        continuation_events,
+    ):
+        _validate_pty_turn_record(continuation_turn)
+        if continuation_turn.session_id != turn.session_id:
+            raise ValueError("continuation PTY turn changed session identity")
+        if continuation_turn.provider != turn.provider or continuation_turn.model != turn.model:
+            raise ValueError("continuation PTY turn changed provider identity")
+        if continuation_turn.turn_index != continuation_event.turn_index:
+            raise ValueError("continuation PTY and runtime turn indexes disagree")
+        if continuation_turn.before_fingerprint != continuation_event.before_fingerprint:
+            raise ValueError("continuation PTY before fingerprint mismatch")
+        if continuation_turn.after_fingerprint != continuation_event.after_fingerprint:
+            raise ValueError("continuation PTY after fingerprint mismatch")
     if dict(observation.pending_contract) != dict(baseline.pending_contract):
         raise ValueError("pending contract is not bound to the baseline runtime event")
     edge_type = str(edge.get("edge_type") or "")
@@ -1225,8 +1258,26 @@ def _validate_turn_observation(
             raise ValueError("turn observation simulator decision mismatch")
         if observation.target_edge_key not in dynamic_selection.target_coverage_ids:
             raise ValueError("dynamic selection did not target the authoritative edge key")
+        if len(observation.continuation_simulator_decisions) != len(
+            observation.continuation_turns
+        ):
+            raise ValueError("continuation simulator decisions do not match continuation turns")
+        for continuation_turn, raw_selection in zip(
+            observation.continuation_turns,
+            observation.continuation_simulator_decisions,
+        ):
+            selection_values = dict(raw_selection)
+            selection_values["target_coverage_ids"] = tuple(
+                selection_values.get("target_coverage_ids") or ()
+            )
+            continuation_selection = DynamicTurnSelection(**selection_values)
+            _validate_dynamic_selection(continuation_turn, continuation_selection)
+            if observation.target_edge_key not in continuation_selection.target_coverage_ids:
+                raise ValueError("continuation selection lost the authoritative edge target")
     elif observation.simulator_decision:
         raise ValueError("real CLI observation must not claim a simulator decision")
+    elif observation.continuation_simulator_decisions:
+        raise ValueError("real CLI observation must not claim continuation simulator decisions")
 
     postcondition = observation.verified_postcondition
     if not postcondition.verifier_id.strip():
@@ -1281,14 +1332,18 @@ def verify_runtime_postcondition(
     baseline: RuntimeTurnEvent,
     committed: RuntimeTurnEvent,
     turn: PtyCliTurnRecord,
+    *,
+    continuation_events: Iterable[RuntimeTurnEvent] = (),
 ) -> VerifiedPostcondition:
-    """Verify one live turn from product-emitted transition facts.
+    """Verify an immediate turn or a linked deferred-transition journey.
 
     This verifier is fixed by the evidence module. Callers cannot replace it
-    with a callback that simply declares the scheduled edge successful.
+    with a callback that simply declares the scheduled edge successful. A
+    prerequisite-deferred first turn never qualifies by itself.
     """
 
     errors: list[str] = []
+    linked_events = tuple(continuation_events)
     if committed.before_fingerprint != baseline.after_fingerprint:
         errors.append("runtime fingerprint chain did not advance from the baseline")
     if committed.turn_index != baseline.turn_index + 1:
@@ -1299,7 +1354,34 @@ def verify_runtime_postcondition(
     if not admitted and not rejection_expected:
         errors.append("runtime emitted no admitted typed action")
     scheduled_action = str(edge.get("action_type") or "")
-    if edge_type in {"action_transition", "question_option"} and scheduled_action and scheduled_action not in admitted:
+    navigation_transition_outcome = ""
+    expected_admitted_actions = {
+        str(item)
+        for item in edge.get("expected_admitted_action_types") or ()
+        if str(item)
+    }
+    if edge_type == "question_option" and expected_admitted_actions:
+        declared_by_pending = {
+            str(item)
+            for item in baseline.pending_contract.get("accepted_action_types") or ()
+            if str(item)
+        }
+        undeclared_equivalents = sorted(expected_admitted_actions - declared_by_pending)
+        if undeclared_equivalents:
+            errors.append(
+                "option-owner equivalence was not declared by the pending contract: "
+                + ", ".join(undeclared_equivalents)
+            )
+        if not expected_admitted_actions.intersection(admitted):
+            errors.append(
+                "no declared option-owner action was admitted: expected one of "
+                f"{sorted(expected_admitted_actions)}"
+            )
+    elif (
+        edge_type in {"action_transition", "question_option"}
+        and scheduled_action
+        and scheduled_action not in admitted
+    ):
         errors.append(f"scheduled action was not admitted: {scheduled_action}")
     if edge_type == "action_transition" and scheduled_action == "change_group":
         navigation_targets = {
@@ -1317,11 +1399,41 @@ def verify_runtime_postcondition(
                 "change_group admitted the wrong destination: "
                 f"expected={expected_target}, admitted={sorted(navigation_targets)}"
             )
-        elif visible_group not in navigation_targets:
-            errors.append(
-                "change_group destination was not observed: "
-                f"visible={visible_group or '<none>'}, admitted={sorted(navigation_targets)}"
+        else:
+            navigation_contract = dict(
+                (edge.get("expected_postcondition") or {}).get("navigation_transition") or {}
             )
+            admitted_target = next(iter(navigation_targets)) if len(navigation_targets) == 1 else ""
+            immediate_group = str(
+                navigation_contract.get("immediate_group")
+                or expected_target
+                or admitted_target
+                or ""
+            )
+            deferred_groups = {
+                str(item)
+                for item in navigation_contract.get("prerequisite_deferred_groups") or ()
+                if str(item)
+            }
+            deferred_target_observed = bool(
+                expected_target
+                and _postcondition_value_matches(
+                    committed.after_value_hashes,
+                    "control.deferred_group",
+                    expected_target,
+                )
+            )
+            if visible_group == immediate_group and not deferred_target_observed:
+                navigation_transition_outcome = "immediate"
+            elif deferred_target_observed and visible_group in deferred_groups:
+                navigation_transition_outcome = "prerequisite_deferred"
+            else:
+                errors.append(
+                    "change_group destination was not observed as either immediate or "
+                    "prerequisite-deferred: "
+                    f"visible={visible_group or '<none>'}, target={expected_target or '<none>'}, "
+                    f"prerequisites={sorted(deferred_groups)}"
+                )
     if edge_type == "manual_input":
         expected_question = str(edge.get("question_id") or "")
         if expected_question and baseline.pending_question_id != expected_question:
@@ -1344,6 +1456,31 @@ def verify_runtime_postcondition(
     expected = dict(edge.get("expected_postcondition") or {})
     expected_paths: list[str] = []
     structured_review_keys: list[str] = []
+    deferred_option_action = ""
+    deferred_option_prerequisite = ""
+    if edge_type == "question_option":
+        deferred_contract = {
+            str(action_type): tuple(str(item) for item in prerequisites if str(item))
+            for action_type, prerequisites in (
+                edge.get("prerequisite_deferred_actions") or {}
+            ).items()
+        }
+        visible_group = str(
+            (committed.next_result or {}).get("group") or committed.active_group or ""
+        )
+        for action_type in admitted:
+            prerequisites = deferred_contract.get(action_type, ())
+            if (
+                action_type in committed.action_queue_types
+                and visible_group in prerequisites
+            ):
+                deferred_option_action = action_type
+                deferred_option_prerequisite = visible_group
+                if committed.pending_contract.get("resume_action_queue") is not True:
+                    errors.append(
+                        "prerequisite-deferred option did not preserve the queue barrier"
+                    )
+                break
     if scheduled_action == "propose_config_values" and turn is not None:
         from agent.harness.domains.environment import extract_structured_input_candidates
 
@@ -1365,18 +1502,26 @@ def verify_runtime_postcondition(
     if edge_type == "question_option":
         for path, value in expected.items():
             expected_paths.append(str(path))
-            if not _postcondition_value_matches(
+            if deferred_option_action:
+                if _path_value_hashes(committed.after_value_hashes, str(path)) != _path_value_hashes(
+                    baseline.after_value_hashes, str(path)
+                ):
+                    errors.append(
+                        f"prerequisite-deferred option mutated its destination early: {path}"
+                    )
+            elif not _postcondition_value_matches(
                 committed.after_value_hashes,
                 str(path),
                 value,
             ):
                 errors.append(f"expected postcondition was not observed: {path}")
-        _verify_runtime_state_relations(
-            tuple(edge.get("expected_state_relations") or ()),
-            baseline,
-            committed,
-            errors,
-        )
+        if not deferred_option_action:
+            _verify_runtime_state_relations(
+                tuple(edge.get("expected_state_relations") or ()),
+                baseline,
+                committed,
+                errors,
+            )
     elif edge_type == "manual_input":
         path = str(expected.get("path") or "").strip()
         if path:
@@ -1435,12 +1580,116 @@ def verify_runtime_postcondition(
     if not state_diff:
         errors.append("runtime emitted no state transition")
 
+    deferred_transition = bool(
+        navigation_transition_outcome == "prerequisite_deferred"
+        or deferred_option_action
+    )
+    terminal_event = committed
+    journey_status = "not_required"
+    pre_journey_errors = tuple(errors)
+    linkage_errors: tuple[str, ...] = ()
+    if deferred_transition:
+        journey_status = "awaiting_terminal_postcondition"
+        if not linked_events:
+            errors.append(
+                "prerequisite-deferred transition requires linked multi-turn "
+                "terminal postcondition evidence"
+            )
+        else:
+            previous = committed
+            linkage_error_start = len(errors)
+            for index, event in enumerate(linked_events, start=1):
+                if event.thread_id != committed.thread_id:
+                    errors.append(f"linked journey event {index} changed thread identity")
+                if event.session_purpose != committed.session_purpose:
+                    errors.append(f"linked journey event {index} changed session purpose")
+                if dict(event.revision) != dict(committed.revision):
+                    errors.append(f"linked journey event {index} changed repository revision")
+                if event.turn_index != previous.turn_index + 1:
+                    errors.append(f"linked journey event {index} is not the next turn")
+                if event.before_fingerprint != previous.after_fingerprint:
+                    errors.append(
+                        f"linked journey event {index} broke the fingerprint chain"
+                    )
+                previous = event
+            linkage_errors = tuple(errors[linkage_error_start:])
+            terminal_event = linked_events[-1]
+            terminal_visible_group = str(
+                (terminal_event.next_result or {}).get("group")
+                or terminal_event.active_group
+                or ""
+            )
+            if navigation_transition_outcome == "prerequisite_deferred":
+                target_group = str(expected.get("target_group") or "")
+                if terminal_visible_group != target_group:
+                    errors.append(
+                        "linked navigation journey did not reach its terminal group: "
+                        f"expected={target_group or '<none>'}, "
+                        f"visible={terminal_visible_group or '<none>'}"
+                    )
+                if _path_value_hashes(
+                    terminal_event.after_value_hashes,
+                    "control.deferred_group",
+                ):
+                    errors.append("linked navigation journey did not clear its deferred target")
+            if deferred_option_action:
+                for path, value in expected.items():
+                    if not _postcondition_value_matches(
+                        terminal_event.after_value_hashes,
+                        str(path),
+                        value,
+                    ):
+                        errors.append(
+                            f"linked option journey did not reach terminal postcondition: {path}"
+                        )
+                if deferred_option_action in terminal_event.action_queue_types:
+                    errors.append("linked option journey did not drain its deferred action")
+                _verify_runtime_state_relations(
+                    tuple(edge.get("expected_state_relations") or ()),
+                    baseline,
+                    terminal_event,
+                    errors,
+                )
+            if not terminal_event.next_result:
+                errors.append("linked journey emitted no terminal question or result")
+            if not errors:
+                journey_status = "terminal_postcondition_observed"
+
+    continuation_eligible = bool(
+        deferred_transition
+        and journey_status == "awaiting_terminal_postcondition"
+        and not pre_journey_errors
+        and not linkage_errors
+    )
+
     edge_key = str(edge.get("edge_key") or "")
+    observed_actions = tuple(dict.fromkeys(
+        action_type
+        for event in (committed, *linked_events)
+        for action_type in event.admitted_action_types
+        if action_type
+    ))
+    combined_state_diff = {
+        path: hashes
+        for event in (committed, *linked_events)
+        for path, hashes in event.state_diff_hashes.items()
+    }
     details = {
         "baseline_question_id": baseline.pending_question_id,
         "committed_question_id": committed.pending_question_id,
         "expected_postcondition_paths": sorted(expected_paths),
         "expected_admitted": edge.get("expected_admitted"),
+        "transition_outcome": (
+            navigation_transition_outcome
+            or ("prerequisite_deferred" if deferred_option_action else "immediate")
+        ),
+        "deferred_action": deferred_option_action,
+        "deferred_prerequisite": deferred_option_prerequisite,
+        "journey_status": journey_status,
+        "continuation_eligible": continuation_eligible,
+        "pre_journey_errors": list(pre_journey_errors),
+        "linkage_errors": list(linkage_errors),
+        "linked_turn_count": len(linked_events),
         "structured_review_keys": sorted(structured_review_keys),
         "rejection_observed": bool(rejection_expected and not errors),
         "errors": errors,
@@ -1449,9 +1698,9 @@ def verify_runtime_postcondition(
         verifier_id="anychain.runtime-transition-proof.v1",
         passed=not errors,
         observed_coverage_ids=(edge_key,) if not errors and edge_key else (),
-        admitted_typed_actions=admitted,
-        state_diff=state_diff,
-        next_question_or_result=next_result,
+        admitted_typed_actions=observed_actions,
+        state_diff=combined_state_diff,
+        next_question_or_result=dict(terminal_event.next_result or {}),
         details=details,
     )
 

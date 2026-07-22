@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from types import SimpleNamespace
 import unittest
 
 from agent.harness.contracts import StateDelta
@@ -16,6 +17,7 @@ from agent.workflows.group_registry import (
     USER_NAVIGABLE_GROUPS,
     fallback_groups_for_workflow,
     group_for_field,
+    validate_action_group_requirements,
     validate_group_registry,
 )
 
@@ -110,6 +112,39 @@ class GroupRegistryAuthorityTests(unittest.TestCase):
         for group in GROUPS:
             self.assertLessEqual(set(group.depends_on), names, group.name)
             self.assertLessEqual(set(group.invalidates), names, group.name)
+
+    def test_action_prerequisites_must_be_declared_by_the_target_group(self) -> None:
+        groups = (
+            GroupSpec(name="target_mode", owner="chain_rpc"),
+            GroupSpec(name="observability", owner="performance"),
+        )
+        action = SimpleNamespace(
+            action_type="set_observability",
+            target_group="observability",
+            requires_capabilities=("target_mode",),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "missing_dependencies.*target_mode"):
+            validate_action_group_requirements(groups, (action,))
+
+        validate_action_group_requirements(
+            (
+                groups[0],
+                GroupSpec(
+                    name="observability",
+                    owner="performance",
+                    depends_on=("target_mode",),
+                ),
+            ),
+            (action,),
+        )
+
+    def test_production_action_and_group_prerequisites_are_consistent(self) -> None:
+        from agent.harness.action_registry import ACTION_SPECS
+
+        validate_action_group_requirements(GROUPS, ACTION_SPECS)
+        observability = next(group for group in GROUPS if group.name == "observability")
+        self.assertEqual(observability.depends_on, ("target_mode",))
 
     def test_workflow_metadata_preserves_order_and_excludes_rpc_groups_from_sync(self) -> None:
         rpc = [group.name for group in fallback_groups_for_workflow("rpc_benchmark")]

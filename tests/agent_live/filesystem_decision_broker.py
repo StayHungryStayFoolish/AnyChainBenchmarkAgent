@@ -12,7 +12,9 @@ import asyncio
 import hashlib
 import json
 import os
+import select
 import signal
+import stat
 import threading
 import time
 from pathlib import Path
@@ -26,7 +28,7 @@ from tests.agent_live.batch_orchestrator import (
 )
 
 
-BROKER_SCHEMA_VERSION = 1
+BROKER_SCHEMA_VERSION = 2
 
 
 class FilesystemDecisionBroker:
@@ -58,6 +60,23 @@ class FilesystemDecisionBroker:
         with self._lock:
             sequence = self._sequence_by_shard.get(shard_id, 0) + 1
             self._sequence_by_shard[shard_id] = sequence
+        channel_id = _content_hash({
+            "batch_id": self.batch_id,
+            "shard_id": str(shard_id),
+            "sequence": sequence,
+            "previous_response_hash": response_hash,
+        })
+        channel_path = self.root / "channels" / f"{channel_id}.fifo"
+        channel_path.parent.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(channel_path, 0o600)
+        channel_fd = os.open(
+            channel_path,
+            os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
+        )
+        if not stat.S_ISFIFO(os.fstat(channel_fd).st_mode):
+            os.close(channel_fd)
+            channel_path.unlink(missing_ok=True)
+            raise ExternalDecisionBlocked("broker decision channel is not a FIFO")
         unsigned = {
             "schema_version": BROKER_SCHEMA_VERSION,
             "batch_id": self.batch_id,
@@ -66,6 +85,8 @@ class FilesystemDecisionBroker:
             "previous_response_hash": response_hash,
             "context_hash": _content_hash(context),
             "context": redact(dict(context)),
+            "control_identity": _control_identity(context),
+            "decision_channel": str(channel_path),
             "created_at_ns": time.time_ns(),
         }
         request_id = _content_hash(unsigned)
@@ -74,22 +95,46 @@ class FilesystemDecisionBroker:
 
         decision_path = self.root / "decisions" / f"{request_id}.json"
         deadline = time.monotonic() + self.timeout_seconds
-        while time.monotonic() < deadline:
-            if decision_path.is_file():
-                decision_record = _load_json(decision_path)
-                decision = _validate_decision_record(request, decision_record)
-                receipt_unsigned = {
-                    "schema_version": BROKER_SCHEMA_VERSION,
-                    "request_id": request_id,
-                    "decision_hash": _content_hash(decision),
-                    "consumed_at_ns": time.time_ns(),
-                }
-                _write_immutable_json(
-                    self.root / "consumed" / f"{request_id}.json",
-                    {"receipt_id": _content_hash(receipt_unsigned), **receipt_unsigned},
-                )
-                return decision
-            await asyncio.sleep(self.poll_seconds)
+        wire_buffer = bytearray()
+        try:
+            while time.monotonic() < deadline:
+                try:
+                    chunk = os.read(channel_fd, 65536)
+                except BlockingIOError:
+                    chunk = b""
+                if chunk:
+                    wire_buffer.extend(chunk)
+                if decision_path.is_file() and b"\n" in wire_buffer:
+                    raw, _, remainder = wire_buffer.partition(b"\n")
+                    if remainder.strip():
+                        raise ExternalDecisionBlocked(
+                            "external decision channel emitted more than one payload"
+                        )
+                    try:
+                        execution_payload = json.loads(raw.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        raise ExternalDecisionBlocked(
+                            "external decision channel payload is invalid"
+                        ) from exc
+                    decision_record = _load_json(decision_path)
+                    decision = _validate_decision_record(
+                        request, decision_record, execution_payload
+                    )
+                    receipt_unsigned = {
+                        "schema_version": BROKER_SCHEMA_VERSION,
+                        "request_id": request_id,
+                        "decision_hash": _content_hash(decision),
+                        "consumed_at_ns": time.time_ns(),
+                    }
+                    _write_immutable_json(
+                        self.root / "consumed" / f"{request_id}.json",
+                        {"receipt_id": _content_hash(receipt_unsigned), **receipt_unsigned},
+                    )
+                    return decision
+                await asyncio.sleep(self.poll_seconds)
+        finally:
+            os.close(channel_fd)
+            channel_path.unlink(missing_ok=True)
         raise ExternalDecisionBlocked(
             f"external Codex decision timed out for request {request_id}"
         )
@@ -115,16 +160,19 @@ def submit_decision(
 ) -> Path:
     broker_root = Path(root).resolve()
     request = _load_json(broker_root / "requests" / f"{request_id}.json")
-    context = request.get("context")
-    if not isinstance(context, Mapping):
-        raise ValueError("broker request has no context")
+    _validate_request_record(request, request_id=request_id)
+    control_identity = request.get("control_identity")
+    if not isinstance(control_identity, Mapping):
+        raise ValueError("broker request has no immutable control identity")
     response_hash = str(request.get("previous_response_hash") or "")
-    message = str(redact(str(user_message))).strip()
-    reason = str(redact(str(rationale))).strip()
+    message = str(user_message).strip()
+    reason = str(rationale).strip()
     if not message or not reason:
         raise ValueError("decision requires a user message and rationale")
-    if isinstance(context.get("schedule"), Mapping):
-        schedule = context["schedule"]
+    if control_identity.get("lane") == "journey":
+        schedule = control_identity.get("schedule")
+        if not isinstance(schedule, Mapping):
+            raise ValueError("Journey broker request has no immutable schedule identity")
         decision = {
             "previous_response_hash": response_hash,
             "user_message": message,
@@ -134,7 +182,7 @@ def submit_decision(
             "risk_factor_ids": [str(item) for item in risk_factor_ids],
         }
     else:
-        target = context.get("scheduled_target")
+        target = control_identity.get("scheduled_target")
         if not isinstance(target, Mapping):
             raise ValueError("edge broker request has no scheduled target")
         decision = {
@@ -145,21 +193,45 @@ def submit_decision(
             "rationale": reason,
             "target_coverage_ids": [str(target.get("edge_key") or "")],
         }
+    execution_payload_hash = _content_hash(decision)
+    audit_decision = {
+        **decision,
+        "user_message": str(redact(message)),
+        "rationale": str(redact(reason)),
+    }
     record_unsigned = {
         "schema_version": BROKER_SCHEMA_VERSION,
         "request_id": request_id,
         "previous_response_hash": response_hash,
-        "decision": decision,
+        "decision": audit_decision,
+        "execution_payload_hash": execution_payload_hash,
         "submitted_at_ns": time.time_ns(),
     }
     record = {"record_id": _content_hash(record_unsigned), **record_unsigned}
     path = broker_root / "decisions" / f"{request_id}.json"
     _write_immutable_json(path, record)
+    channel_path = Path(str(request.get("decision_channel") or ""))
+    expected_channel = (broker_root / "channels").resolve()
+    try:
+        channel_path.resolve().relative_to(expected_channel)
+    except (ValueError, OSError) as exc:
+        raise ValueError("broker decision channel escaped its root") from exc
+    wire = {
+        "request_id": request_id,
+        "previous_response_hash": response_hash,
+        "execution_payload_hash": execution_payload_hash,
+        "decision": decision,
+    }
+    _write_channel_payload(
+        channel_path, (_canonical_json(wire) + "\n").encode("utf-8")
+    )
     return path
 
 
 def _validate_decision_record(
-    request: Mapping[str, Any], record: Mapping[str, Any]
+    request: Mapping[str, Any],
+    record: Mapping[str, Any],
+    execution_payload: Mapping[str, Any],
 ) -> Mapping[str, Any]:
     unsigned = {key: value for key, value in record.items() if key != "record_id"}
     if str(record.get("record_id") or "") != _content_hash(unsigned):
@@ -169,12 +241,81 @@ def _validate_decision_record(
     expected = str(request.get("previous_response_hash") or "")
     if str(record.get("previous_response_hash") or "") != expected:
         raise ExternalDecisionBlocked("external decision record is bound to a stale response")
-    decision = record.get("decision")
+    if str(execution_payload.get("request_id") or "") != str(request.get("request_id") or ""):
+        raise ExternalDecisionBlocked("external execution payload belongs to another request")
+    if str(execution_payload.get("previous_response_hash") or "") != expected:
+        raise ExternalDecisionBlocked("external execution payload is bound to a stale response")
+    decision = execution_payload.get("decision")
     if not isinstance(decision, Mapping):
         raise ExternalDecisionBlocked("external decision record has no decision object")
     if str(decision.get("previous_response_hash") or "") != expected:
         raise ExternalDecisionBlocked("external decision is bound to a stale response")
+    expected_payload_hash = str(record.get("execution_payload_hash") or "")
+    if str(execution_payload.get("execution_payload_hash") or "") != expected_payload_hash:
+        raise ExternalDecisionBlocked("external execution payload identity is stale")
+    if _content_hash(decision) != expected_payload_hash:
+        raise ExternalDecisionBlocked("external execution decision was modified")
+    expected_audit = {
+        **decision,
+        "user_message": str(redact(str(decision.get("user_message") or ""))),
+        "rationale": str(redact(str(decision.get("rationale") or ""))),
+    }
+    if record.get("decision") != expected_audit:
+        raise ExternalDecisionBlocked("external decision audit record does not match execution")
     return dict(decision)
+
+
+def _validate_request_record(request: Mapping[str, Any], *, request_id: str) -> None:
+    if request.get("schema_version") != BROKER_SCHEMA_VERSION:
+        raise ValueError("unsupported broker request schema")
+    unsigned = {key: value for key, value in request.items() if key != "request_id"}
+    if str(request.get("request_id") or "") != _content_hash(unsigned):
+        raise ValueError("broker request identity is stale")
+    if str(request.get("request_id") or "") != str(request_id):
+        raise ValueError("broker request id does not match its path")
+
+
+def _write_channel_payload(path: Path, payload: bytes, *, timeout_seconds: float = 5.0) -> None:
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
+    )
+    if not stat.S_ISFIFO(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise ValueError("external decision channel is not a FIFO")
+    view = memoryview(payload)
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        while view:
+            try:
+                written = os.write(descriptor, view)
+            except BlockingIOError:
+                written = 0
+            if written:
+                view = view[written:]
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("external decision channel write timed out")
+            select.select((), (descriptor,), (), min(remaining, 0.05))
+    finally:
+        os.close(descriptor)
+
+
+def _control_identity(context: Mapping[str, Any]) -> dict[str, Any]:
+    """Project immutable scheduler identity outside the redaction data plane."""
+
+    schedule = context.get("schedule")
+    if isinstance(schedule, Mapping):
+        return {"lane": "journey", "schedule": dict(schedule)}
+    target = context.get("scheduled_target")
+    if not isinstance(target, Mapping):
+        raise ExternalDecisionBlocked("broker context has no scheduled control identity")
+    return {"lane": "edge", "scheduled_target": dict(target)}
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _content_hash(value: Any) -> str:

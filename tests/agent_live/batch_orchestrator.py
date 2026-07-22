@@ -43,6 +43,7 @@ from tests.agent_live.journey_simulator_bridge import (
 )
 from tests.agent_live.dynamic_dual_ai_chaos import (
     JourneyTerminalClassification,
+    SimulatorTerminalClassification,
     validate_journey_evidence_artifact,
 )
 from tests.agent_live.container_process_guard import (
@@ -1115,6 +1116,8 @@ def _classify(
         return "infrastructure_interrupted", str(artifacts["validation_error"])
     if artifacts.get("product_failure"):
         return "product_failed", str(artifacts["product_failure"])
+    if artifacts.get("terminal_classification") == SimulatorTerminalClassification.SIMULATOR_INVALID.value:
+        return "simulator_invalid", str(artifacts.get("failure_reason") or "simulator decision invalid")
     if shard.lane == "journey":
         status = str(artifacts.get("execution_status") or "")
         if status == JourneyTerminalClassification.PASSED.value and exit_code == 0:
@@ -1150,7 +1153,8 @@ def _artifact_hashes(
         "transcript_hash": "", "schedule_result_hash": "",
         "evidence_hashes": (), "diagnostic_hashes": (),
         "evidence_ids": (), "diagnostic_ids": (),
-        "execution_status": "", "product_failure": "", "validation_error": "",
+        "execution_status": "", "terminal_classification": "", "failure_reason": "",
+        "product_failure": "", "validation_error": "",
     }
     if shard is None:
         return empty
@@ -1250,6 +1254,8 @@ def _artifact_hashes(
             "evidence_ids": tuple(evidence_ids),
             "diagnostic_ids": tuple(diagnostic_ids),
             "execution_status": status,
+            "terminal_classification": str(data.get("terminal_classification") or ""),
+            "failure_reason": str(data.get("failure_reason") or ""),
             "product_failure": product_failure,
             "validation_error": "",
         }
@@ -1360,7 +1366,7 @@ def _validate_result_frame(
         return
     required = {
         "session_id", "execution_status", "schedule_path", "schedule_result_path",
-        "transcript_path", "evidence_paths",
+        "transcript_path", "evidence_paths", "terminal_classification", "failure_reason",
     }
     if set(payload) != required:
         raise RuntimeError(
@@ -1371,6 +1377,22 @@ def _validate_result_frame(
         raise RuntimeError("worker result belongs to another session")
     if payload.get("execution_status") not in {"complete", "incomplete"}:
         raise RuntimeError("worker result has an invalid execution status")
+    try:
+        terminal = SimulatorTerminalClassification(
+            str(payload.get("terminal_classification") or "")
+        )
+    except ValueError as exc:
+        raise RuntimeError("worker terminal classification is invalid") from exc
+    if (terminal is SimulatorTerminalClassification.PASSED) != (
+        payload.get("execution_status") == "complete"
+    ):
+        raise RuntimeError("worker terminal classification contradicts execution status")
+    if terminal is SimulatorTerminalClassification.PASSED and payload.get("failure_reason"):
+        raise RuntimeError("passed worker result cannot include a failure reason")
+    if terminal is SimulatorTerminalClassification.SIMULATOR_INVALID and not str(
+        payload.get("failure_reason") or ""
+    ).strip():
+        raise RuntimeError("simulator_invalid worker result requires a failure reason")
     if not isinstance(payload.get("evidence_paths"), list):
         raise RuntimeError("worker result evidence_paths must be a list")
     roots = _worker_runtime_roots(manifest, shard)

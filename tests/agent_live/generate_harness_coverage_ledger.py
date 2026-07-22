@@ -43,7 +43,7 @@ EVIDENCE_CLASSES = (
     "dynamic_dual_ai",
     "real_execution",
 )
-LEDGER_SCHEMA_VERSION = 5
+LEDGER_SCHEMA_VERSION = 7
 EVIDENCE_STATUSES = (
     "not_run",
     "passed",
@@ -386,10 +386,17 @@ def _new_edge(
     deterministic_case_available: bool = False,
     expected_admitted: bool | None = None,
     interrupts_pending_contract: bool = False,
+    expected_admitted_action_types: Iterable[str] = (),
+    prerequisite_deferred_actions: Mapping[str, Iterable[str]] | None = None,
 ) -> dict[str, Any]:
     execution_required = (
         edge_type == "action_transition" and action_type in REAL_EXECUTION_ACTIONS
     )
+    normalized_deferred_actions = {
+        str(action_type): list(dict.fromkeys(str(item) for item in prerequisites if str(item)))
+        for action_type, prerequisites in (prerequisite_deferred_actions or {}).items()
+        if str(action_type)
+    }
     edge = {
         "edge_key": _edge_key(group, question_id, variant_hash, input_class, option_or_action),
         "edge_type": edge_type,
@@ -415,6 +422,30 @@ def _new_edge(
         "deterministic_case_available": bool(deterministic_case_available),
         "expected_admitted": expected_admitted,
         "interrupts_pending_contract": bool(interrupts_pending_contract),
+        "expected_admitted_action_types": sorted({
+            str(item) for item in expected_admitted_action_types if str(item)
+        }),
+        "prerequisite_deferred_actions": normalized_deferred_actions,
+        "deferred_transition_contract": (
+            {
+                "requires_linked_journey": True,
+                "max_continuation_turns": 12,
+                "entry_prerequisite_groups": sorted({
+                    prerequisite
+                    for prerequisites in normalized_deferred_actions.values()
+                    for prerequisite in prerequisites
+                }),
+                "terminal_postcondition": dict(expected_postcondition or {}),
+                "linkage": [
+                    "same_thread",
+                    "same_revision",
+                    "contiguous_turn_index",
+                    "contiguous_fingerprint_chain",
+                ],
+            }
+            if normalized_deferred_actions
+            else {}
+        ),
         "execution_case_ids": [],
         "execution_case_hash": "",
         "deterministic_test_id": "",
@@ -679,10 +710,13 @@ def build_ledger(
     revision: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     from agent.harness.action_registry import ACTION_SPECS
-    from agent.workflows.group_registry import USER_NAVIGABLE_GROUPS
-    from agent.workflows.group_registry import GROUPS
+    from agent.workflows.group_registry import GROUPS, USER_NAVIGABLE_GROUPS
+    from agent.workflows.group_registry import navigation_prerequisites
+    from agent.workflows.group_registry import validate_action_group_requirements
 
+    validate_action_group_requirements(GROUPS, ACTION_SPECS)
     group_by_name = {group.name: group for group in GROUPS}
+    action_by_type = {spec.action_type: spec for spec in ACTION_SPECS}
     active_revision = dict(revision or repository_revision(REPO_ROOT))
     registered_questions = {
         (group.name, question_id)
@@ -706,6 +740,29 @@ def build_ledger(
             postcondition_overrides = variant.get("option_postcondition_overrides") or {}
             option_id = str(option.get("id") or "")
             for input_class in ("exact_option", "natural_language_option"):
+                declared_actions = {action_type}
+                if input_class == "natural_language_option":
+                    accepted = {
+                        str(item)
+                        for item in contract.get("accepted_action_types") or ()
+                        if str(item)
+                    }
+                    declared_actions.update(
+                        candidate
+                        for candidate in accepted
+                        if candidate in action_by_type
+                        and action_by_type[candidate].owner == owner
+                        and (
+                            not action_by_type[candidate].target_group
+                            or action_by_type[candidate].target_group == group
+                        )
+                    )
+                deferred_actions = {
+                    candidate: tuple(action_by_type[candidate].requires_capabilities)
+                    for candidate in declared_actions
+                    if candidate in action_by_type
+                    and action_by_type[candidate].requires_capabilities
+                }
                 variant_edges.append(_new_edge(
                     group=group,
                     question_id=variant["question_id"],
@@ -733,6 +790,8 @@ def build_ledger(
                     ),
                     return_policy=str(option.get("return_policy") or "fallback"),
                     applicability_reason="visible option contract",
+                    expected_admitted_action_types=declared_actions,
+                    prerequisite_deferred_actions=deferred_actions,
                 ))
         if contract.get("manual_input_allowed"):
             for input_class in MANUAL_INPUT_CLASSES:
@@ -843,6 +902,12 @@ def build_ledger(
         action_group = spec.target_group or f"@action_only/{spec.owner}"
         destinations = USER_NAVIGABLE_GROUPS if spec.action_type == "change_group" else (spec.target_group,)
         for destination in destinations:
+            destination_spec = group_by_name.get(destination)
+            deferred_prerequisites = (
+                navigation_prerequisites(destination_spec)
+                if spec.action_type == "change_group" and destination_spec is not None
+                else ()
+            )
             action_hash = hashlib.sha256(_canonical_json({
                 "action_type": spec.action_type,
                 "owner": spec.owner,
@@ -851,6 +916,7 @@ def build_ledger(
                 "execution_phase": spec.execution_phase,
                 "target_group": spec.target_group,
                 "navigation_destination": destination if spec.action_type == "change_group" else "",
+                "navigation_prerequisites": list(deferred_prerequisites),
                 "merge_identity": list(spec.merge_identity),
                 "preserve_pending": spec.preserve_pending,
                 "mutation_dimension": spec.mutation_dimension,
@@ -905,10 +971,36 @@ def build_ledger(
                 expected_postcondition={
                     "target_group": expected_group,
                     "provides_capabilities": list(spec.provides_capabilities),
+                    **(
+                        {
+                            "navigation_transition": {
+                                "immediate_group": destination,
+                                "prerequisite_deferred_groups": list(deferred_prerequisites),
+                            }
+                        }
+                        if spec.action_type == "change_group"
+                        else {}
+                    ),
                 },
                 scenario_ids=action_scenario_ids.get(spec.action_type, ()),
                 executable_scenario_ids=action_scenario_ids.get(spec.action_type, ()),
             )
+            if spec.action_type == "change_group" and deferred_prerequisites:
+                edge["deferred_transition_contract"] = {
+                    "requires_linked_journey": True,
+                    "max_continuation_turns": 12,
+                    "entry_prerequisite_groups": list(deferred_prerequisites),
+                    "terminal_group": destination,
+                    "terminal_postcondition": {
+                        "target_group": destination,
+                    },
+                    "linkage": [
+                        "same_thread",
+                        "same_revision",
+                        "contiguous_turn_index",
+                        "contiguous_fingerprint_chain",
+                    ],
+                }
             edge["semantic_recovery_source_argument"] = (
                 spec.semantic_recovery_source_argument
             )

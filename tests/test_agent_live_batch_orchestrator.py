@@ -14,6 +14,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent.harness.runtime_identity import repository_revision
@@ -30,8 +31,11 @@ from tests.agent_live.batch_orchestrator import (
     ExternalDecisionBlocked,
     ShardResult,
     TimeoutPolicy,
+    _RunState,
     _append_discovery_results,
+    _classify,
     _scan_batch_execution_ids,
+    _validate_result_frame,
     freeze_batch_manifest,
     load_frozen_manifest,
     run_batch,
@@ -262,6 +266,8 @@ if args.mode == "path-escape":
 result_frame = RESULT + json.dumps({
     "session_id": ("another-session" if args.mode == "forged-session" else args.session),
     "execution_status": execution_status,
+    "terminal_classification": "passed",
+    "failure_reason": "",
     "schedule_path": str(schedule),
     "transcript_path": str(result_transcript),
     "schedule_result_path": str(schedule_result),
@@ -282,6 +288,54 @@ sys.exit(exit_code)
 
 
 class BatchOrchestratorTests(unittest.TestCase):
+    def test_typed_worker_result_classifies_simulator_invalid_without_stderr(self) -> None:
+        classification, reason = _classify(
+            None,
+            SimpleNamespace(lane="edge", target_ids=("target-1",)),
+            _RunState(),
+            0,
+            True,
+            {
+                "validation_error": "",
+                "product_failure": "",
+                "terminal_classification": "simulator_invalid",
+                "failure_reason": "SimulatorDecisionInvalid: wrong input shape",
+            },
+        )
+
+        self.assertEqual(classification, "simulator_invalid")
+        self.assertEqual(reason, "SimulatorDecisionInvalid: wrong input shape")
+
+    def test_simulator_invalid_terminal_frame_is_schema_valid(self) -> None:
+        self._write_targets(1)
+        manifest = freeze_batch_manifest(
+            repo_root=self.root,
+            targets_dir=self.targets,
+            manifest_path=self.root / ".agent" / "typed-invalid-manifest.json",
+            runtime_base=self.root / ".agent" / "typed-invalid-runtime",
+            shard_count=1,
+            command_factory=self._factory(
+                ["pass"], self.root / ".agent" / "typed-invalid-markers"
+            ),
+        )
+        shard = manifest.shards[0]
+        runtime = Path(shard.runtime_root)
+        runtime.mkdir(parents=True, exist_ok=True)
+        for filename in ("schedule.json", "schedule-result.json", "transcript.txt"):
+            (runtime / filename).write_text("{}\n", encoding="utf-8")
+        payload = {
+            "session_id": shard.session_id,
+            "execution_status": "incomplete",
+            "terminal_classification": "simulator_invalid",
+            "failure_reason": "SimulatorDecisionInvalid: wrong input shape",
+            "schedule_path": str(runtime / "schedule.json"),
+            "schedule_result_path": str(runtime / "schedule-result.json"),
+            "transcript_path": str(runtime / "transcript.txt"),
+            "evidence_paths": [],
+        }
+
+        _validate_result_frame(manifest, shard, payload)
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)

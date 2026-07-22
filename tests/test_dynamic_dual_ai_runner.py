@@ -29,6 +29,7 @@ from tests.agent_live.dynamic_dual_ai_chaos import (
     ContainerPtyBridgeTransport,
     SimulatorContext,
     SimulatorDecision,
+    SimulatorDecisionInvalid,
     SubprocessPtyTransport,
     _complete_agent_response,
     _validate_decision,
@@ -71,6 +72,23 @@ class SimulatorInputClassAdmissionTest(unittest.TestCase):
             self._target(),
             {"input_class": "multiline_prose"},
         )
+
+    def test_multiline_prose_accepts_a_standalone_url_line(self) -> None:
+        _validate_decision(
+            self._decision(
+                "Use this endpoint only for schema validation:\nhttp://fake-node:19000"
+            ),
+            self._target(),
+            {"input_class": "multiline_prose"},
+        )
+
+    def test_input_class_violation_has_a_typed_simulator_error(self) -> None:
+        with self.assertRaises(SimulatorDecisionInvalid):
+            _validate_decision(
+                self._decision("NETWORK_INTERFACE=eth0\nUse the primary interface."),
+                self._target(),
+                {"input_class": "multiline_prose"},
+            )
 
     def test_structured_lane_requires_structured_region(self) -> None:
         with self.assertRaisesRegex(ValueError, "structured_json_yaml_env_curl"):
@@ -832,6 +850,159 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 [],
             )
 
+    def test_runner_executes_response_driven_deferred_continuation_before_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            edge = {
+                **EDGE,
+                "edge_key": "@action_only/coordinator::::variant::action_only_transition::action:change_group:sync_observe",
+                "edge_type": "action_transition",
+                "question_id": "",
+                "action_type": "change_group",
+                "expected_postcondition": {
+                    "target_group": "sync_observe",
+                    "navigation_transition": {
+                        "immediate_group": "sync_observe",
+                        "prerequisite_deferred_groups": ["target_mode"],
+                    },
+                },
+                "deferred_transition_contract": {
+                    "requires_linked_journey": True,
+                    "max_continuation_turns": 3,
+                    "entry_prerequisite_groups": ["target_mode"],
+                    "terminal_group": "sync_observe",
+                    "terminal_postcondition": {"target_group": "sync_observe"},
+                    "linkage": [
+                        "same_thread",
+                        "same_revision",
+                        "contiguous_turn_index",
+                        "contiguous_fingerprint_chain",
+                    ],
+                },
+                "executable_scenario_ids": [],
+            }
+            ledger = {"revision": REVISION, "edges": [edge]}
+            schedule = build_chaos_schedule(
+                ledger,
+                revision=REVISION,
+                seed=276,
+                targets=[{
+                    "target_id": "deferred-sync-observe",
+                    "edge_key": edge["edge_key"],
+                    "persona": "operator",
+                    "goal": "switch to sync-observe and satisfy its live prerequisite",
+                }],
+            )
+            baseline = replace(
+                self._event(1, "a" * 64, "b" * 64, ""),
+                active_group="opening",
+                pending_contract={},
+                admitted_action_types=(),
+                state_diff_hashes={},
+            )
+            deferred = replace(
+                self._event(2, "b" * 64, "c" * 64, "target_mode_select"),
+                active_group="target_mode",
+                admitted_action_types=("change_group",),
+                admitted_action_targets=({"type": "change_group", "group": "sync_observe"},),
+                state_diff_hashes={
+                    "control.deferred_group": {"before": "", "after": "d" * 64},
+                    "active_group": {"before": "1" * 64, "after": "2" * 64},
+                },
+                after_value_hashes={
+                    "control.deferred_group": content_hash("sync_observe"),
+                },
+                next_result={
+                    "kind": "question",
+                    "question_id": "target_mode_select",
+                    "group": "target_mode",
+                },
+            )
+            terminal = replace(
+                self._event(3, "c" * 64, "d" * 64, "sync_observe_source"),
+                active_group="sync_observe",
+                admitted_action_types=("choose_target_mode",),
+                state_diff_hashes={
+                    "target_mode": {"before": "", "after": "3" * 64},
+                    "control.deferred_group": {"before": "d" * 64, "after": ""},
+                    "active_group": {"before": "2" * 64, "after": "4" * 64},
+                },
+                after_value_hashes={},
+                next_result={
+                    "kind": "question",
+                    "question_id": "sync_observe_source",
+                    "group": "sync_observe",
+                },
+            )
+            transport = FakeTransport([
+                "Agent> Model config: provider=deepseek, model=deepseek-chat, auth=api_key\n"
+                "Agent> What would you like to change?",
+                "Agent> Choose fake-node, real-node, or sync-observe prerequisites.",
+                "Agent> sync-observe selected. Choose the observation source.",
+            ])
+            seen: list[SimulatorContext] = []
+
+            def simulator(context: SimulatorContext) -> SimulatorDecision:
+                seen.append(context)
+                if len(seen) == 1:
+                    self.assertNotIn("execution_phase", context.coverage_contract)
+                    message = "Switch this workflow to sync-observe."
+                else:
+                    self.assertEqual(
+                        context.coverage_contract["execution_phase"],
+                        "linked_prerequisite_continuation",
+                    )
+                    self.assertIn("Choose fake-node", context.previous_agent_response)
+                    self.assertEqual(
+                        list((root / ".agent/dynamic-chaos/contract-session/evidence").glob("*.json")),
+                        [],
+                    )
+                    message = "Use real-node so sync-observe can continue."
+                return SimulatorDecision(
+                    user_message=message,
+                    persona=context.scheduled_target.persona,
+                    goal=context.scheduled_target.goal,
+                    rationale="Selected only after reading the current complete CLI response.",
+                    target_coverage_ids=(context.scheduled_target.edge_key,),
+                )
+
+            runner = DynamicDualAiChaosRunner(
+                ChaosRunConfig.linux(root, session_id="contract-session"),
+                simulator,
+                ledger=ledger,
+                schedule=schedule,
+                transport=transport,
+                event_stream=FakeEventStream([baseline, deferred, terminal]),
+                revision=REVISION,
+                clock_ns=OrderedClock(),
+            )
+
+            result = runner.run()
+
+            self.assertEqual(result.execution_status, "complete")
+            self.assertEqual(len(seen), 2)
+            self.assertEqual(transport.submitted, [
+                "Switch this workflow to sync-observe.",
+                "Use real-node so sync-observe can continue.",
+            ])
+            self.assertEqual(len(result.turns), 2)
+            self.assertEqual(len(result.evidence_paths), 2)
+            artifact = json.loads(result.evidence_paths[0].read_text(encoding="utf-8"))
+            valid, reason = validate_pty_cli_evidence_artifact(
+                artifact,
+                edge=edge,
+                revision=REVISION,
+            )
+            self.assertTrue(valid, reason)
+            observation = artifact["turn_observation"]
+            self.assertEqual(len(observation["runtime_events"]), 3)
+            self.assertEqual(len(observation["continuation_turns"]), 1)
+            self.assertEqual(
+                observation["verified_postcondition"]["details"]
+                ["declared_target_results"][edge["edge_key"]]["journey_status"],
+                "terminal_postcondition_observed",
+            )
+
     def test_later_transport_failure_preserves_only_the_prior_complete_turn(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -1378,6 +1549,227 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
         verified = verify_runtime_postcondition(edge, baseline, committed, None)  # type: ignore[arg-type]
 
         self.assertTrue(verified.passed, verified.details)
+
+    def test_change_group_edge_accepts_declared_prerequisite_deferred_destination(self) -> None:
+        edge = {
+            **EDGE,
+            "edge_key": "@action_only/coordinator::change_group::sync-observe-deferred",
+            "question_id": "",
+            "edge_type": "action_transition",
+            "action_type": "change_group",
+            "expected_postcondition": {
+                "target_group": "sync_observe",
+                "navigation_transition": {
+                    "immediate_group": "sync_observe",
+                    "prerequisite_deferred_groups": [
+                        "target_mode",
+                        "chain_identity",
+                        "endpoint_process",
+                    ],
+                },
+            },
+        }
+        baseline = self._event(1, "a" * 64, "b" * 64, "")
+        committed = replace(
+            self._event(2, "b" * 64, "c" * 64, "target_mode_select"),
+            active_group="target_mode",
+            admitted_action_types=("change_group",),
+            admitted_action_targets=({"type": "change_group", "group": "sync_observe"},),
+            state_diff_hashes={
+                "control.deferred_group": {"before": "", "after": "d" * 64},
+                "active_group": {"before": "", "after": "e" * 64},
+            },
+            after_value_hashes={
+                "control.deferred_group": content_hash("sync_observe"),
+            },
+            next_result={
+                "kind": "question",
+                "question_id": "target_mode_select",
+                "group": "target_mode",
+            },
+        )
+
+        intermediate = verify_runtime_postcondition(edge, baseline, committed, None)  # type: ignore[arg-type]
+
+        self.assertFalse(intermediate.passed)
+        self.assertEqual(intermediate.observed_coverage_ids, ())
+        self.assertEqual(
+            intermediate.details["journey_status"],
+            "awaiting_terminal_postcondition",
+        )
+        self.assertIn(
+            "requires linked multi-turn terminal postcondition evidence",
+            " ".join(intermediate.details["errors"]),
+        )
+
+        terminal = replace(
+            self._event(3, "c" * 64, "d" * 64, "sync_observe_source"),
+            active_group="sync_observe",
+            admitted_action_types=("answer_pending",),
+            state_diff_hashes={
+                "active_group": {"before": "e" * 64, "after": "f" * 64},
+                "control.deferred_group": {"before": "d" * 64, "after": ""},
+            },
+            after_value_hashes={},
+            next_result={
+                "kind": "question",
+                "question_id": "sync_observe_source",
+                "group": "sync_observe",
+            },
+        )
+        verified = verify_runtime_postcondition(
+            edge,
+            baseline,
+            committed,
+            None,  # type: ignore[arg-type]
+            continuation_events=(terminal,),
+        )
+
+        self.assertTrue(verified.passed, verified.details)
+        self.assertEqual(verified.details["transition_outcome"], "prerequisite_deferred")
+        self.assertEqual(
+            verified.details["journey_status"],
+            "terminal_postcondition_observed",
+        )
+
+        broken_link = replace(terminal, before_fingerprint="9" * 64)
+        rejected = verify_runtime_postcondition(
+            edge,
+            baseline,
+            committed,
+            None,  # type: ignore[arg-type]
+            continuation_events=(broken_link,),
+        )
+        self.assertFalse(rejected.passed)
+        self.assertIn("broke the fingerprint chain", " ".join(rejected.details["errors"]))
+
+    def test_natural_language_option_accepts_declared_deferred_owner_action(self) -> None:
+        edge = {
+            **EDGE,
+            "edge_key": "observability::observability_mode::owner-deferred",
+            "question_id": "observability_mode",
+            "edge_type": "question_option",
+            "action_type": "answer_pending",
+            "expected_admitted_action_types": ["answer_pending", "set_observability"],
+            "prerequisite_deferred_actions": {
+                "set_observability": ["target_mode"],
+            },
+            "expected_postcondition": {"observability.mode": "exporter"},
+        }
+        baseline = replace(
+            self._event(1, "a" * 64, "b" * 64, "observability_mode"),
+            active_group="observability",
+            pending_contract={
+                "id": "observability_mode",
+                "accepted_action_types": ["answer_pending", "set_observability"],
+            },
+            after_value_hashes={},
+        )
+        committed = replace(
+            self._event(2, "b" * 64, "c" * 64, "target_mode_select"),
+            active_group="target_mode",
+            pending_contract={
+                "id": "target_mode_select",
+                "resume_action_queue": True,
+            },
+            admitted_action_types=("set_observability", "request_target_mode_selection"),
+            action_queue_types=("set_observability",),
+            state_diff_hashes={
+                "action_queue": {"before": "", "after": "d" * 64},
+                "active_group": {"before": "", "after": "e" * 64},
+            },
+            after_value_hashes={},
+            next_result={
+                "kind": "question",
+                "question_id": "target_mode_select",
+                "group": "target_mode",
+            },
+        )
+
+        intermediate = verify_runtime_postcondition(edge, baseline, committed, None)  # type: ignore[arg-type]
+
+        self.assertFalse(intermediate.passed)
+        self.assertEqual(intermediate.observed_coverage_ids, ())
+        self.assertEqual(
+            intermediate.details["journey_status"],
+            "awaiting_terminal_postcondition",
+        )
+
+        terminal = replace(
+            self._event(3, "c" * 64, "d" * 64, "CLOUD_REGION"),
+            active_group="provider_deployment",
+            admitted_action_types=("choose_target_mode", "set_observability"),
+            action_queue_types=(),
+            state_diff_hashes={
+                "target_mode": {"before": "", "after": "e" * 64},
+                "observability.mode": {"before": "", "after": "f" * 64},
+            },
+            after_value_hashes={
+                "observability.mode": content_hash("exporter"),
+            },
+            next_result={
+                "kind": "question",
+                "question_id": "CLOUD_REGION",
+                "group": "provider_deployment",
+            },
+        )
+        verified = verify_runtime_postcondition(
+            edge,
+            baseline,
+            committed,
+            None,  # type: ignore[arg-type]
+            continuation_events=(terminal,),
+        )
+
+        self.assertTrue(verified.passed, verified.details)
+        self.assertEqual(verified.details["transition_outcome"], "prerequisite_deferred")
+        self.assertEqual(verified.details["deferred_action"], "set_observability")
+        self.assertEqual(
+            verified.details["journey_status"],
+            "terminal_postcondition_observed",
+        )
+
+        missing_terminal_value = replace(terminal, after_value_hashes={})
+        rejected_terminal = verify_runtime_postcondition(
+            edge,
+            baseline,
+            committed,
+            None,  # type: ignore[arg-type]
+            continuation_events=(missing_terminal_value,),
+        )
+        self.assertFalse(rejected_terminal.passed)
+        self.assertIn(
+            "did not reach terminal postcondition",
+            " ".join(rejected_terminal.details["errors"]),
+        )
+
+        not_deferred = replace(committed, action_queue_types=())
+        rejected = verify_runtime_postcondition(edge, baseline, not_deferred, None)  # type: ignore[arg-type]
+        self.assertFalse(rejected.passed)
+        self.assertIn(
+            "expected postcondition was not observed",
+            " ".join(rejected.details["errors"]),
+        )
+
+        undeclared = replace(
+            baseline,
+            pending_contract={
+                "id": "observability_mode",
+                "accepted_action_types": ["answer_pending"],
+            },
+        )
+        undeclared_result = verify_runtime_postcondition(
+            edge,
+            undeclared,
+            committed,
+            None,  # type: ignore[arg-type]
+            continuation_events=(terminal,),
+        )
+        self.assertFalse(undeclared_result.passed)
+        self.assertIn(
+            "not declared by the pending contract",
+            " ".join(undeclared_result.details["errors"]),
+        )
 
     def test_unknown_or_stale_scheduler_target_is_rejected_before_cli_start(self) -> None:
         ledger = self._ledger()

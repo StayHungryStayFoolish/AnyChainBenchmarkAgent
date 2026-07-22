@@ -13,12 +13,14 @@ from ..onboarding.families import SUPPORTED_FAMILIES
 from .action_registry import (
     ACTION_BY_TYPE,
     ACTION_SPECS,
+    CONSULTATION_TOPIC_PURPOSES,
     CONSULTATION_TOPICS,
     SEMANTIC_SUPPORT_RELATIONS,
     TRUSTED_ACTION_METADATA_FIELDS,
     build_admission_transaction_hash,
     build_field_intake_admission_receipt,
     build_proposal_field_receipt,
+    canonical_consultation_topic,
     lifecycle_rejected_action_indexes,
     normalize_action_relations,
     resolve_action_target_group,
@@ -69,6 +71,7 @@ ADAPTER_FAMILY_HINT_ENUM = "|".join(ADAPTER_FAMILIES + ["unsupported", "unknown"
 ALLOWED_ACTION_TYPES = [spec.action_type for spec in ACTION_SPECS]
 
 _ADMISSION_RECEIPT_KEYS = frozenset({
+    "pending_choice_contracts",
     "pending_answer_admissions",
     "pending_support_unit_ids",
     "chain_selection_admissions",
@@ -133,11 +136,22 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
             state,
             clauses,
         )
-        if admission is not None and admission.valid and plan is not None:
+        pending_choice_unresolved = bool(
+            admission is not None
+            and admission.valid
+            and plan is not None
+            and _admitted_plan_requires_pending_choice_adjudication(plan, admission, state)
+        )
+        if admission is not None and admission.valid and plan is not None and not pending_choice_unresolved:
             try:
                 return _admitted_action_queue(plan, admission, state)
             except ValueError as exc:
                 admission_errors = (*admission_errors, f"receipt attachment failed: {exc}")
+        if pending_choice_unresolved:
+            admission_errors = (
+                *admission_errors,
+                "active pending choice remains unresolved after whole-plan admission",
+            )
 
         repair_payload = {
             "invalid_output": _parse_json_object(candidate),
@@ -149,9 +163,14 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
             "action_schema": action_schema(),
             "original_request": request_payload,
         }
+        active_choice = bool((state.get("pending_question") or {}).get("options"))
         repaired_response, repair_errors = _compile_semantic_candidate(
             provider,
-            system_prompt=_action_plan_repair_prompt(),
+            system_prompt=(
+                _pending_choice_adjudication_prompt()
+                if active_choice
+                else _action_plan_repair_prompt()
+            ),
             request_payload=repair_payload,
         )
         repaired, repaired_validation = _prepare_bounded_semantic_candidate(
@@ -227,8 +246,8 @@ def _prepare_bounded_semantic_candidate(
         )
         candidate = _materialize_absent_semantic_units(candidate, clauses)
         candidate = _canonicalize_candidate_config_proposals(candidate)
-        candidate = _materialize_pending_owner_actions(candidate, state)
         candidate = _reset_candidate_action_ids(candidate)
+        candidate = _canonicalize_pending_choice_actions(candidate, state)
         candidate = _mark_pending_owner_candidates(candidate, state)
         validation = _validate_action_document(candidate, clauses, state)
         validation = _validate_action_source_grounding(candidate, validation)
@@ -285,33 +304,124 @@ def _canonicalize_candidate_config_proposals(text: str) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
-def _materialize_pending_owner_actions(text: str, state: AgentGraphState) -> str:
-    """Compile model-selected pending options into their declared typed effects."""
+def _canonicalize_pending_choice_actions(text: str, state: AgentGraphState) -> str:
+    """Bind every semantic option selection to one canonical pending answer.
+
+    The compiler may describe a selection as ``answer_pending`` or as the
+    option's declared owner action.  Both representations become the same
+    pre-admission action.  The owner action is intentionally not executed here;
+    the pending-question contract dispatches it after whole-plan admission.
+    """
 
     pending = dict(state.get("pending_question") or {})
-    if not pending:
+    options = [item for item in pending.get("options") or [] if isinstance(item, dict)]
+    if not options:
         return text
     payload = _parse_json_object(text)
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    contracts: list[dict[str, Any]] = []
     for index, action in enumerate(actions):
-        if not isinstance(action, dict) or str(action.get("type") or "") != "answer_pending":
+        if not isinstance(action, dict):
             continue
-        option = _declared_option_for_pending_answer(action, pending)
+        option = _matching_pending_option(action, state)
         if not option:
             continue
-        declared = dict(option.get("action") or {})
-        if str(declared.get("type") or "") in {"", "answer_pending"}:
-            normalized = dict(action)
-            normalized["selected_value"] = option.get("value")
-            actions[index] = normalized
-            continue
+        action_type = str(action.get("type") or "")
+        if action_type != "answer_pending":
+            spec = ACTION_BY_TYPE.get(action_type)
+            if spec is None or not spec.pending_option_admission:
+                continue
+        units = _source_units_for_action(payload, index)
+        if not units:
+            raise ValueError("pending choice has no mapped semantic-unit provenance")
         source = str(action.get("source_evidence") or "").strip()
-        materialized = _materialize_pending_option_action(declared, source)
-        if materialized is None:
-            raise ValueError("pending option declares an invalid typed owner action")
-        actions[index] = materialized
+        if not any(source and source in str(unit.get("source_text") or "") for unit in units):
+            source = str(units[0].get("source_text") or "").strip()
+        if not source:
+            raise ValueError("pending choice has no exact semantic-unit source")
+        selected = option.get("value")
+        actions[index] = {
+            "type": "answer_pending",
+            "answer": selected,
+            "selected_value": selected,
+            "source_evidence": source,
+            "confidence": str(action.get("confidence") or "medium"),
+        }
+        contracts.append({
+            "action_index": index,
+            "question": {
+                "id": str(pending.get("id") or ""),
+                "group": str(pending.get("group") or ""),
+                "contract_version": pending.get("contract_version"),
+            },
+            "option": {
+                "id": str(option.get("id") or ""),
+                "selected_value": selected,
+            },
+            "semantic_units": [
+                {
+                    "unit_id": str(unit.get("unit_id") or ""),
+                    "clause_id": str(unit.get("clause_id") or ""),
+                    "source_text": str(unit.get("source_text") or ""),
+                }
+                for unit in units
+            ],
+        })
+    if len(contracts) > 1:
+        raise ValueError("multiple actions claim the active pending choice")
     payload["actions"] = actions
+    if contracts:
+        payload["pending_choice_contracts"] = contracts
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _pending_choice_contract_for_action(
+    payload: Mapping[str, Any],
+    action_index: int,
+) -> dict[str, Any]:
+    matches = [
+        dict(row)
+        for row in payload.get("pending_choice_contracts") or []
+        if isinstance(row, Mapping) and row.get("action_index") == action_index
+    ]
+    if len(matches) > 1:
+        raise ValueError("pending choice has duplicate canonical contracts")
+    return matches[0] if matches else {}
+
+
+def _validate_pending_choice_contracts(
+    payload: Mapping[str, Any],
+    state: AgentGraphState,
+) -> tuple[str, ...]:
+    pending = dict(state.get("pending_question") or {})
+    errors: list[str] = []
+    actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    for index, action in enumerate(actions):
+        if not isinstance(action, Mapping) or str(action.get("type") or "") != "answer_pending":
+            continue
+        option = _declared_option_for_pending_answer(dict(action), pending)
+        if not option:
+            continue
+        contract = _pending_choice_contract_for_action(payload, index)
+        question = contract.get("question") if isinstance(contract.get("question"), Mapping) else {}
+        selected = (
+            contract.get("option", {}).get("selected_value")
+            if isinstance(contract.get("option"), Mapping)
+            else None
+        )
+        units = contract.get("semantic_units") if isinstance(contract.get("semantic_units"), list) else []
+        mapped_units = _source_units_for_action(payload, index)
+        if not contract:
+            errors.append(f"action {index} pending choice lacks canonical contract")
+        elif str(question.get("id") or "") != str(pending.get("id") or ""):
+            errors.append(f"action {index} pending choice question identity differs from active contract")
+        elif selected != option.get("value") or selected != action.get("selected_value"):
+            errors.append(f"action {index} pending choice selected value differs from canonical contract")
+        elif not units or [str(unit.get("unit_id") or "") for unit in units if isinstance(unit, Mapping)] != [
+            str(unit.get("unit_id") or "") for unit in mapped_units
+        ]:
+            errors.append(f"action {index} pending choice provenance differs from mapped semantic units")
+    return tuple(errors)
 
 
 def _reset_candidate_action_ids(text: str) -> str:
@@ -400,6 +510,38 @@ def _review_bounded_semantic_candidate(
         allowed_action_types=ALLOWED_ACTION_TYPES,
     )
     return plan, admission, admission.errors
+
+
+def _admitted_plan_requires_pending_choice_adjudication(
+    plan: ImmutableSemanticPlan,
+    admission: WholePlanAdmission,
+    state: AgentGraphState,
+) -> bool:
+    """Detect admitted-but-unresolved work at an active choice boundary."""
+
+    pending = dict(state.get("pending_question") or {})
+    if not pending.get("options"):
+        return False
+    payload = plan.document()
+    if payload.get("pending_choice_contracts"):
+        return False
+    actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    if any(
+        isinstance(action, Mapping) and str(action.get("type") or "") == "clarify_unresolved"
+        for action in actions
+    ):
+        return True
+    units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
+    if any(
+        isinstance(unit, Mapping) and str(unit.get("disposition") or "") == "unresolved"
+        for unit in units
+    ):
+        return True
+    return any(
+        str(row.get("verdict") or "") in {"unresolved", "omitted"}
+        for row in admission.unit_verdicts
+        if isinstance(row, Mapping)
+    )
 
 
 def _freeze_bounded_semantic_plan(
@@ -511,6 +653,11 @@ def _admitted_action_queue(
     navigation_rows: list[dict[str, Any]] = []
     field_rows: list[dict[str, Any]] = []
     action_ids = list(plan.action_ids)
+    pending_choice_contracts = [
+        dict(row)
+        for row in payload.get("pending_choice_contracts") or []
+        if isinstance(row, Mapping)
+    ]
     for index, action in enumerate(actions):
         if not isinstance(action, dict):
             raise ValueError("admitted immutable plan contains a non-object action")
@@ -545,6 +692,25 @@ def _admitted_action_queue(
                 "semantic_unit_hash": _semantic_unit_hash_for_action(payload, index),
                 "reviewer_evidence_hash": _content_hash(row),
             })
+    for contract in pending_choice_contracts:
+        index = contract.get("action_index")
+        if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(actions):
+            raise ValueError("canonical pending choice references an invalid action")
+        action = actions[index]
+        row = action_rows.get(action_ids[index]) or {}
+        provenance = contract.get("semantic_units") if isinstance(contract.get("semantic_units"), list) else []
+        provenance_ids = [
+            str(unit.get("unit_id") or "")
+            for unit in provenance
+            if isinstance(unit, Mapping)
+        ]
+        reviewer_ids = [str(value) for value in row.get("unit_ids") or []]
+        if provenance_ids != reviewer_ids:
+            raise ValueError("canonical pending choice provenance differs from admitted semantic units")
+        if str(action.get("type") or "") != "answer_pending":
+            raise ValueError("canonical pending choice does not reference answer_pending")
+        contract["admission_action_id"] = action_ids[index]
+    payload["pending_choice_contracts"] = pending_choice_contracts
     payload.update({
         "admission_action_ids": action_ids,
         "pending_answer_admissions": pending_indexes,
@@ -558,8 +724,24 @@ def _admitted_action_queue(
         json.dumps(payload, ensure_ascii=False, sort_keys=True),
         state,
     )
+    admitted_payload = _parse_json_object(admitted)
+    admitted_actions = (
+        admitted_payload.get("actions")
+        if isinstance(admitted_payload.get("actions"), list)
+        else []
+    )
+    for contract in admitted_payload.get("pending_choice_contracts") or []:
+        if not isinstance(contract, dict):
+            continue
+        index = contract.get("action_index")
+        if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(admitted_actions):
+            raise ValueError("canonical pending choice lost its admitted action")
+        action = admitted_actions[index]
+        if not isinstance(action, Mapping) or not str(action.get("_admission_action_id") or ""):
+            raise ValueError("canonical pending choice has no final admission action id")
+        contract["admission_action_id"] = str(action.get("_admission_action_id"))
     return _parse_action_queue(
-        admitted,
+        json.dumps(admitted_payload, ensure_ascii=False, sort_keys=True),
         trusted_metadata=True,
         normalize_relations=False,
     )
@@ -1201,6 +1383,8 @@ def _validate_action_document(
             )
             rejected_action_indexes.add(index)
     coverage = validate_plan_coverage(payload, clauses)
+    if state is not None:
+        action_errors.extend(_validate_pending_choice_contracts(payload, state))
     if not action_errors:
         return coverage
     return PlanCoverageResult(
@@ -1248,6 +1432,15 @@ def _semantic_action_purpose(
         )
     if action_type == "answer_pending" and state:
         return "Supply a source-grounded answer that actually satisfies the active typed pending contract."
+    if action_type == "answer_opening_question":
+        topic = canonical_consultation_topic(action.get("topic"))
+        subject = str(action.get("subject") or "").strip()
+        subject_scope = f" for the exact subject {subject!r}" if subject else ""
+        topic_purpose = CONSULTATION_TOPIC_PURPOSES.get(topic, "Answer the selected read-only topic.")
+        return (
+            f"Answer only the user's independent read-only consultation topic {topic!r}"
+            f"{subject_scope}: {topic_purpose} This purpose does not answer a different consultation topic."
+        )
     if action_type in {"choose_chain", "change_chain"}:
         candidates = [
             str(item).strip()
@@ -1555,48 +1748,6 @@ def _attach_semantic_admission_receipts(
 
 
 
-def _materialize_pending_option_action(
-    declared: dict[str, Any],
-    source_quote: str,
-) -> dict[str, Any] | None:
-    """Compile one admitted semantic option into its registered typed effect."""
-
-    action_type = str(declared.get("type") or "")
-    spec = ACTION_BY_TYPE.get(action_type)
-    if spec is None or action_type == "answer_pending":
-        return None
-    candidate = dict(declared)
-    if "source_evidence" in spec.allowed_arguments:
-        candidate["source_evidence"] = source_quote
-    if "mutation_explicit" in spec.allowed_arguments and "mutation_explicit" not in candidate:
-        candidate["mutation_explicit"] = True
-    if "target_mode_explicit" in spec.allowed_arguments and "target_mode_explicit" not in candidate:
-        candidate["target_mode_explicit"] = True
-    try:
-        validate_action_contract(candidate)
-    except ValueError:
-        return None
-    return candidate
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def _manual_answer_has_literal_source(action: dict[str, Any], user_text: str) -> bool:
     """Prove that a normalized manual answer occurs in exact source evidence."""
 
@@ -1812,7 +1963,7 @@ def _semantic_fulfillment_prompt(*, review_kind: str = "both") -> str:
         "A registered operation performs the effect stated by its authoritative declared_purpose. Never require operation_arguments to repeat, simulate, or prove that effect; arguments carry only source-selected values and evidence required by that operation. In particular, a lifecycle command may legitimately have only source evidence as its argument while its declared purpose defines the state transition. "
         "When an active evidence collection exists, an explicit source demand to pause or suspend that collection is independent from navigation or configuration and requires a purpose that pauses while preserving it. Navigation alone is incomplete for that demand. An explicit request to resume a paused collection likewise requires a resume purpose. "
         "A custom-RPC-entry purpose is supported when the source explicitly asks to start, add, supply, or configure a custom RPC method workflow. It intentionally carries no endpoint, method identity, or schema payload; requiring those facts at entry would skip later typed collection questions. A discussion-only question about whether custom RPC is possible does not support entry. "
-        "A read-only consultation purpose is supported only when the source asks for an answer, explanation, comparison, status, preparation guidance, or similar information. It is not supported when the source explicitly requests only a selection, mutation, navigation, execution, or evidence-ingestion operation. "
+        "A read-only consultation purpose is supported only when the source asks for an answer, explanation, comparison, status, preparation guidance, or similar information. It is not supported when the source explicitly requests only a selection, mutation, navigation, execution, or evidence-ingestion operation. Distinct consultation subjects remain independent demands: a purpose that reports workflow configuration or pending context does not report whether a current or historical benchmark job exists, and a job-status purpose does not report retained workflow configuration. A compound unit asking for both is complete only when mapped purposes explicitly cover both subjects. "
         + GROUP_NAVIGATION_SEMANTIC_POLICY
         + "A target-mode-intake purpose is supported when the source has a benchmark or observation goal but leaves fake-node, real-node, or sync-observe unresolved, including explicit indecision between modes. It intentionally asks a later typed question and requires no selected mode in the source. "
         "A chain-candidate-intake purpose is supported when the source presents one or more tentative benchmark-chain candidates without committing to one. It intentionally preserves candidates for a later typed confirmation question and is not a chain mutation. "
@@ -1850,6 +2001,22 @@ def _action_plan_repair_prompt() -> str:
         "When a source selects or navigates to a configuration group and also asks to alter one registered scalar field without supplying a replacement value, preserve the field request with request_config_field_input using that exact field and source evidence. Do not copy the current, detected, default, or example value into propose_config_values."
         "When adjacent clauses reject the current mutually exclusive workflow and explicitly select a replacement, one choose_target_mode action for the replacement may preserve both clauses. Map both semantic units to that same action index; do not invent a cancellation action or leave the rejection unresolved."
         "Never add answer_pending merely because a pending question exists. Add it only when the exact source text actually answers that typed question contract. When validation rejects an operation as incompatible with the active target-mode lifecycle and the same source supplies a value for the active typed question, preserve that value with answer_pending; never retry the incompatible operation."
+    )
+
+
+def _pending_choice_adjudication_prompt() -> str:
+    """Return the single bounded adjudication contract for an active choice."""
+
+    return (
+        _action_plan_repair_prompt()
+        + " The original_request contains one active pending question with its exact typed options. "
+        "Re-adjudicate the complete user turn once. If any semantic unit selects one declared option, "
+        "represent that selection only as answer_pending with selected_value exactly equal to that "
+        "option's declared value and source_evidence copied from the selecting semantic unit. Do not "
+        "emit the option's owner action. Preserve every unrelated, interrupting, or compound demand as "
+        "its own registered action and preserve all semantic-unit mappings. If the active choice is not "
+        "resolved by the source, leave it unresolved rather than guessing. Return one complete plan; this "
+        "is the only focused adjudication and the entire result remains subject to whole-plan admission."
     )
 
 
@@ -2279,5 +2446,6 @@ def _parse_action_queue(
     return {
         "actions": actions,
         "clause_coverage": payload.get("clause_coverage") or [],
+        "pending_choice_contracts": payload.get("pending_choice_contracts") or [],
         "reason": payload.get("reason") or payload.get("reasoning") or "",
     }
