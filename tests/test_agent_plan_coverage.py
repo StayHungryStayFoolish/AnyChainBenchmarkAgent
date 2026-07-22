@@ -10586,6 +10586,142 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         }])
         self.assertEqual(recovered["semantic_units"][0]["action_indexes"], [0])
 
+    def test_group_selector_owns_registry_intake_for_the_same_destination(self) -> None:
+        from agent.harness.domains.orientation import resume_modify_group_question
+        from agent.harness.intent import _action_competes_with_pending_options
+        from agent.harness.state import new_state
+
+        state = new_state("selector-intake-ownership", language="en")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+        })
+        pending = resume_modify_group_question(state)
+        options = list(pending.get("options") or [])
+
+        self.assertTrue(_action_competes_with_pending_options(
+            {"type": "request_target_mode_selection"},
+            pending,
+            options,
+        ))
+        self.assertTrue(_action_competes_with_pending_options(
+            {"type": "request_chain_selection"},
+            pending,
+            options,
+        ))
+        self.assertTrue(_action_competes_with_pending_options(
+            {"type": "request_target_change"},
+            pending,
+            options,
+        ))
+        self.assertFalse(_action_competes_with_pending_options(
+            {
+                "type": "choose_target_mode",
+                "target_mode": "real-node",
+                "target_mode_explicit": True,
+                "source_evidence": "use real-node",
+            },
+            pending,
+            options,
+        ))
+
+    def test_group_selector_compiles_unique_registry_intake_to_declared_navigation(self) -> None:
+        from unittest.mock import Mock
+
+        from agent.harness.domains.orientation import resume_modify_group_question
+        from agent.harness.intent import _reconcile_pending_owner_mutations
+        from agent.harness.state import new_state
+
+        state = new_state("selector-intake-compile", language="en")
+        state.update({"target_mode": "fake-node", "workflow_mode": "rpc_benchmark"})
+        state["pending_question"] = resume_modify_group_question(state)
+        clause = segment_user_turn("Let's change the target mode.")[0]
+        payload = {
+            "actions": [{
+                "type": "request_target_mode_selection",
+                "source_evidence": "Let's change the target mode.",
+            }],
+            "semantic_units": [self._unit(clause, "unit-1", [0])],
+        }
+
+        result_text, changed = _reconcile_pending_owner_mutations(
+            Mock(),
+            json.dumps(payload),
+            state,
+            "Let's change the target mode.",
+        )
+        result = json.loads(result_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(result["actions"], [{
+            "type": "change_group",
+            "group": "target_mode",
+            "navigation_explicit": True,
+            "source_evidence": "Let's change the target mode.",
+        }])
+        self.assertEqual(result["pending_answer_admissions"], [0])
+
+    def test_group_selector_does_not_compile_concrete_mutation_as_navigation(self) -> None:
+        from agent.harness.domains.orientation import resume_modify_group_question
+        from agent.harness.intent import _unique_pending_intake_destination
+        from agent.harness.state import new_state
+
+        state = new_state("selector-concrete-mutation", language="en")
+        state.update({"target_mode": "fake-node", "workflow_mode": "rpc_benchmark"})
+        options = list(resume_modify_group_question(state).get("options") or [])
+
+        self.assertIsNone(_unique_pending_intake_destination({
+            "type": "choose_target_mode",
+            "target_mode": "real-node",
+            "target_mode_explicit": True,
+            "source_evidence": "switch to real-node",
+        }, options))
+
+    def test_group_selector_does_not_guess_multi_destination_intake(self) -> None:
+        from agent.harness.domains.orientation import resume_modify_group_question
+        from agent.harness.intent import _unique_pending_intake_destination
+        from agent.harness.state import new_state
+
+        state = new_state("selector-ambiguous-intake", language="en")
+        state.update({"target_mode": "fake-node", "workflow_mode": "rpc_benchmark"})
+        options = list(resume_modify_group_question(state).get("options") or [])
+
+        self.assertIsNone(_unique_pending_intake_destination({
+            "type": "request_target_change",
+        }, options))
+
+    def test_group_navigation_adjudicator_does_not_rewrite_pending_owner_effect(self) -> None:
+        from unittest.mock import Mock
+
+        from agent.harness.domains.orientation import resume_modify_group_question
+        from agent.harness.intent import _adjudicate_group_navigation_actions
+        from agent.harness.state import new_state
+
+        state = new_state("selector-single-owner", language="en")
+        state.update({"target_mode": "fake-node", "workflow_mode": "rpc_benchmark"})
+        state["pending_question"] = resume_modify_group_question(state)
+        payload = {
+            "actions": [{
+                "type": "change_group",
+                "group": "target_mode",
+                "navigation_explicit": True,
+                "source_evidence": "Let's change the target mode.",
+            }],
+            "pending_answer_admissions": [0],
+            "semantic_units": [],
+        }
+        provider = Mock()
+
+        result_text, changed = _adjudicate_group_navigation_actions(
+            provider,
+            json.dumps(payload),
+            state,
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(json.loads(result_text), payload)
+        provider.complete.assert_not_called()
+
     def test_declared_pending_option_reuses_existing_equivalent_domain_effect(self) -> None:
         import json
         from types import SimpleNamespace

@@ -26,15 +26,21 @@ class GroupSpec:
     product_node: str = ""
     category: str = "setup"
     workflow_modes: tuple[str, ...] = ()
+    target_modes: tuple[str, ...] = ()
     fallback: bool = True
     navigation_entry: NavigationEntry = "question_or_status"
+    resume_selector: bool = True
 
 
 GROUPS: tuple[GroupSpec, ...] = (
     GroupSpec(
         name="opening",
         owner="orientation",
-        questions=("opening_next_action", "resume_harness_session"),
+        questions=(
+            "opening_next_action",
+            "resume_harness_session",
+            "resume_modify_group",
+        ),
         product_node="opening",
     ),
     GroupSpec(
@@ -166,6 +172,7 @@ GROUPS: tuple[GroupSpec, ...] = (
         depends_on=("target_mode", "chain_identity"),
         invalidates=("target_samples_fixtures", "preflight_smoke_execution", "job_monitoring"),
         product_node="endpoint_process",
+        target_modes=("real-node", "sync-observe"),
     ),
     GroupSpec(
         name="chain_auxiliary_endpoints",
@@ -185,6 +192,8 @@ GROUPS: tuple[GroupSpec, ...] = (
             "RPC_API_KEY",
         ),
         product_node="real_node_endpoint",
+        target_modes=("real-node", "sync-observe"),
+        resume_selector=False,
     ),
     GroupSpec(
         name="workload_rpc",
@@ -199,6 +208,7 @@ GROUPS: tuple[GroupSpec, ...] = (
         invalidates=("target_samples_fixtures", "preflight_smoke_execution", "job_monitoring"),
         product_node="rpc_workload",
         workflow_modes=("rpc_benchmark",),
+        target_modes=("fake-node", "real-node"),
     ),
     GroupSpec(
         name="target_samples_fixtures",
@@ -209,6 +219,8 @@ GROUPS: tuple[GroupSpec, ...] = (
         invalidates=("preflight_smoke_execution", "job_monitoring"),
         product_node="custom_rpc",
         workflow_modes=("rpc_benchmark",),
+        target_modes=("fake-node", "real-node"),
+        resume_selector=False,
     ),
     GroupSpec(
         name="qps_profile",
@@ -219,6 +231,7 @@ GROUPS: tuple[GroupSpec, ...] = (
         invalidates=("preflight_smoke_execution", "job_monitoring"),
         product_node="rpc_workload",
         workflow_modes=("rpc_benchmark",),
+        target_modes=("fake-node", "real-node"),
     ),
     GroupSpec(
         name="sync_observe",
@@ -238,6 +251,7 @@ GROUPS: tuple[GroupSpec, ...] = (
         ),
         product_node="sync_observe",
         workflow_modes=("sync_observe",),
+        target_modes=("sync-observe",),
     ),
     GroupSpec(
         name="observability",
@@ -266,6 +280,7 @@ GROUPS: tuple[GroupSpec, ...] = (
         questions=("preflight_smoke_confirm",),
         product_node="preflight_smoke",
         category="execution",
+        resume_selector=False,
     ),
     GroupSpec(
         name="job_monitoring",
@@ -309,6 +324,7 @@ GROUPS: tuple[GroupSpec, ...] = (
 
 
 SUPPORTED_WORKFLOW_MODES = frozenset({"rpc_benchmark", "sync_observe"})
+SUPPORTED_TARGET_MODES = frozenset({"fake-node", "real-node", "sync-observe"})
 
 
 def validate_group_registry(groups: Iterable[GroupSpec]) -> tuple[GroupSpec, ...]:
@@ -348,11 +364,13 @@ def validate_group_registry(groups: Iterable[GroupSpec]) -> tuple[GroupSpec, ...
         unknown_dependencies = sorted(set(group.depends_on) - known)
         unknown_invalidations = sorted(set(group.invalidates) - known)
         unknown_modes = sorted(set(group.workflow_modes) - SUPPORTED_WORKFLOW_MODES)
-        if unknown_dependencies or unknown_invalidations or unknown_modes:
+        unknown_target_modes = sorted(set(group.target_modes) - SUPPORTED_TARGET_MODES)
+        if unknown_dependencies or unknown_invalidations or unknown_modes or unknown_target_modes:
             raise RuntimeError(
                 f"invalid GroupSpec metadata for {group.name}: "
                 f"dependencies={unknown_dependencies}, "
-                f"invalidations={unknown_invalidations}, modes={unknown_modes}"
+                f"invalidations={unknown_invalidations}, modes={unknown_modes}, "
+                f"target_modes={unknown_target_modes}"
             )
         if group.name in group.depends_on:
             raise RuntimeError(f"GroupSpec {group.name} cannot depend on itself")

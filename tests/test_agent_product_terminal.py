@@ -258,7 +258,7 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
 
         self.assertEqual(session.current_question_id, "")
 
-    def test_terminal_resume_modify_clears_pending_but_keeps_confirmed_config(self) -> None:
+    def test_terminal_resume_modify_installs_group_selector_and_keeps_confirmed_config(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -279,7 +279,13 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
 
             snapshot = runtime.snapshot()
             self.assertEqual(snapshot["confirmed_config"]["CLOUD_REGION"], "asia-east1")
-            self.assertEqual(snapshot["pending_question"], {})
+            self.assertEqual(snapshot["pending_question"]["id"], "resume_modify_group")
+            self.assertEqual(snapshot["pending_question"]["group"], "opening")
+            self.assertTrue(snapshot["pending_question"]["queue_barrier"])
+            self.assertTrue(all(
+                (option.get("action") or {}).get("type") == "change_group"
+                for option in snapshot["pending_question"]["options"]
+            ))
             self.assertEqual(snapshot["active_group"], "opening")
 
     def test_terminal_resume_continue_restores_exact_pending_contract(self) -> None:

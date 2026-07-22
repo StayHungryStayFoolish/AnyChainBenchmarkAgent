@@ -16,7 +16,7 @@ from unittest.mock import patch
 from agent.harness.domains.environment import question_for_environment
 from agent.harness.domains.chain_rpc import question_for_chain_rpc
 from agent.harness.domains.execution import question_for_execution
-from agent.harness.domains.orientation import opening_question
+from agent.harness.domains.orientation import opening_question, resume_modify_group_question
 from agent.harness.domains.performance import question_for_performance
 from agent.harness.domains.recovery import question_for_recovery
 from agent.harness.domains.sync_observe import question_for_sync_observe
@@ -315,6 +315,66 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
         resume_question(resume_qps_state),
         option_postcondition_overrides={"1": {"resume_context": {}}},
         option_relation_overrides=resume_relations,
+    )
+
+    resume_modify_state = new_state(
+        "coverage-resume-modify-group",
+        language=language,
+        session_purpose="coverage",
+    )
+    resume_modify_state.update({
+        "target_mode": "fake-node",
+        "workflow_mode": "rpc_benchmark",
+        "chain_identity": {
+            "raw": "bsc",
+            "canonical": "bsc",
+            "status": "confirmed",
+        },
+        "confirmed_config": {"CLOUD_REGION": "asia-east1"},
+    })
+    resume_modify = resume_modify_group_question(resume_modify_state)
+    resume_modify_destinations = {
+        "target_mode": "target_mode",
+        "chain_identity": "chain_identity",
+        "provider_deployment": "provider_deployment",
+        "ledger_disk": "ledger_disk",
+        "accounts_disk": "accounts_disk",
+        "network": "network",
+        "endpoint_process": "endpoint_process",
+        "chain_auxiliary_endpoints": "chain_auxiliary_endpoints",
+        "workload_rpc": "workload_rpc",
+        # The reviewed seed has no RPC mode, so this destination first enters
+        # its declared workload prerequisite.
+        "target_samples_fixtures": "workload_rpc",
+        "qps_profile": "qps_profile",
+        "observability": "observability",
+        "advanced_tuning": "advanced_tuning",
+        "preflight_smoke_execution": "preflight_smoke_execution",
+    }
+    resume_modify_next_questions = {
+        "target_mode": "target_mode_select",
+        "chain_identity": "chain_change_input",
+        "provider_deployment": "CLOUD_ZONE",
+        "ledger_disk": "LEDGER_DEVICE",
+        "accounts_disk": "has_accounts_device",
+        "network": "network_interface",
+        "workload_rpc": "rpc_mode",
+        "qps_profile": "benchmark_mode",
+        "observability": "observability_mode",
+        "advanced_tuning": "advanced_tuning_confirm",
+        "preflight_smoke_execution": "preflight_smoke_confirm",
+    }
+    add(
+        "resume_modify_group",
+        resume_modify_state,
+        resume_modify,
+        option_postcondition_overrides={
+            str(option["id"]): {
+                "active_group": resume_modify_destinations[str(option["value"])],
+                "pending_question.id": resume_modify_next_questions[str(option["value"])],
+            }
+            for option in resume_modify["options"]
+        },
     )
 
     detected_state = new_state("coverage-provider-detected", language=language, session_purpose="coverage")

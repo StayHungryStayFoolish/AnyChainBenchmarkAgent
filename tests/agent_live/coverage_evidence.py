@@ -1108,6 +1108,16 @@ def _validate_turn_observation(
             raise ValueError("action-only baseline unexpectedly has a pending contract")
     elif not baseline.pending_question_id:
         raise ValueError("baseline runtime event has no pending contract")
+    else:
+        expected_question = str(edge.get("question_id") or "")
+        if baseline.pending_question_id != expected_question:
+            raise ValueError("baseline pending question does not match the target edge")
+        from tests.agent_live.generate_harness_coverage_ledger import contract_variant_hash
+
+        if contract_variant_hash(baseline.pending_contract) != str(
+            edge.get("contract_hash") or ""
+        ):
+            raise ValueError("baseline pending contract hash does not match the target edge")
     if dynamic_selection is not None:
         if dict(observation.simulator_decision) != {
             **asdict(dynamic_selection),

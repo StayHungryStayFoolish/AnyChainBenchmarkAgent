@@ -4152,6 +4152,7 @@ def _reconcile_pending_owner_mutations(
         for index in payload.get("pending_answer_admissions", [])
         if isinstance(index, int) and 0 <= index < len(actions)
     }
+    compiled_indexes: set[int] = set()
     reviews: list[dict[str, Any]] = []
     for index, action in enumerate(actions):
         if not isinstance(action, dict):
@@ -4160,18 +4161,6 @@ def _reconcile_pending_owner_mutations(
             continue
         action_type = str(action.get("type") or "")
         spec = ACTION_BY_TYPE.get(action_type)
-        matches_declared_option = any(
-            isinstance(item.get("action"), dict)
-            and _same_declared_pending_effect(action, dict(item["action"]))
-            for item in options
-        )
-        if (
-            spec is None
-            or (action_type in accepted_types and not matches_declared_option)
-            or spec.lifetime != "durable"
-            or not _action_competes_with_pending_options(action, pending, options)
-        ):
-            continue
         source_units = [
             str(unit.get("source_text") or "")
             for unit in units
@@ -4184,6 +4173,29 @@ def _reconcile_pending_owner_mutations(
             and str(unit.get("source_text") or "")
         ]
         source = " ".join(source_units).strip() or str(action.get("source_evidence") or "").strip()
+        destination_option = _unique_pending_intake_destination(action, options)
+        if destination_option is not None and source:
+            compiled = _materialize_pending_option_action(
+                dict(destination_option.get("action") or {}),
+                source,
+            )
+            if compiled is not None:
+                actions[index] = compiled
+                existing_admissions.add(index)
+                compiled_indexes.add(index)
+                continue
+        matches_declared_option = any(
+            isinstance(item.get("action"), dict)
+            and _same_declared_pending_effect(action, dict(item["action"]))
+            for item in options
+        )
+        if (
+            spec is None
+            or (action_type in accepted_types and not matches_declared_option)
+            or spec.lifetime != "durable"
+            or not _action_competes_with_pending_options(action, pending, options)
+        ):
+            continue
         if not source:
             continue
         reviews.append({
@@ -4202,8 +4214,12 @@ def _reconcile_pending_owner_mutations(
             "proposed_matches_declared_effect": matches_declared_option,
             "source_text": source,
         })
+    if compiled_indexes:
+        payload["actions"] = actions
+        payload["pending_answer_admissions"] = sorted(existing_admissions)
+        text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     if not reviews:
-        return text, False
+        return text, bool(compiled_indexes)
 
     result = _request_pending_owner_reviews(provider, reviews)
     rows = result.get("reviews") if isinstance(result.get("reviews"), list) else []
@@ -4217,7 +4233,7 @@ def _reconcile_pending_owner_mutations(
         for row in rows
         if isinstance(row, dict) and isinstance(row.get("action_index"), int)
     }
-    changed = False
+    changed = bool(compiled_indexes)
     admitted_indexes = set(existing_admissions)
     rejected_indexes: set[int] = set()
     for review in reviews:
@@ -4273,6 +4289,32 @@ def _reconcile_pending_owner_mutations(
     return json.dumps(payload, ensure_ascii=False, sort_keys=True), True
 
 
+def _unique_pending_intake_destination(
+    action: dict[str, Any],
+    options: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Return the sole selector option owned by an incomplete intake action.
+
+    Registry intake actions open one group without selecting a concrete value.
+    When a finite selector already declares that exact destination, compiling
+    to its declared navigation effect keeps one control-plane owner. Actions
+    that can navigate to several groups remain ambiguous and require semantic
+    owner adjudication.
+    """
+
+    spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
+    if spec is None or not spec.incomplete_mutation_intake or not spec.target_group:
+        return None
+    matches = [
+        option
+        for option in options
+        if isinstance(option.get("action"), dict)
+        and str(option["action"].get("type") or "") == "change_group"
+        and str(option["action"].get("group") or "") == spec.target_group
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _action_competes_with_pending_options(
     action: dict[str, Any],
     pending: dict[str, Any],
@@ -4303,6 +4345,18 @@ def _action_competes_with_pending_options(
             spec.mutation_dimension
             and declared_spec.mutation_dimension
             and spec.mutation_dimension == declared_spec.mutation_dimension
+        ):
+            return True
+        if (
+            str(declared.get("type") or "") == "change_group"
+            and (
+                (
+                    spec.incomplete_mutation_intake
+                    and spec.target_group
+                    and str(declared.get("group") or "") == spec.target_group
+                )
+                or str(declared.get("group") or "") in spec.option_navigation_groups
+            )
         ):
             return True
         if action_type == "change_group":
@@ -5535,10 +5589,17 @@ def _adjudicate_group_navigation_actions(
     payload.pop("group_navigation_admissions", None)
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
     units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
+    pending_owner_admissions = {
+        int(index)
+        for index in payload.get("pending_answer_admissions", [])
+        if isinstance(index, int) and 0 <= index < len(actions)
+    }
     review_indexes: list[int] = []
     review_specs: dict[int, Any] = {}
     for index, action in enumerate(actions):
         if not isinstance(action, dict):
+            continue
+        if index in pending_owner_admissions and _matching_pending_option(action, state):
             continue
         action_type = str(action.get("type") or "")
         spec = ACTION_BY_TYPE.get(action_type)

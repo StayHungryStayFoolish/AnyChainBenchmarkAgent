@@ -663,6 +663,7 @@ class DynamicDualAiChaosRunner:
                     raise RuntimeError(
                         f"scheduled edge disappeared from authoritative ledger: {scheduled_target.edge_key}"
                     )
+                _require_scheduled_baseline_contract(baseline_event, edge)
                 context = SimulatorContext(
                     session_id=self.config.session_id,
                     turn_index=baseline_event.turn_index + 1,
@@ -1009,6 +1010,30 @@ class DynamicDualAiChaosRunner:
         env.update({str(key): str(value) for key, value in self.config.extra_env.items()})
         return env
 
+
+
+def _require_scheduled_baseline_contract(
+    event: RuntimeTurnEvent,
+    edge: Mapping[str, Any],
+) -> None:
+    """Bind every scheduled edge to its exact runtime baseline contract."""
+
+    edge_type = str(edge.get("edge_type") or "")
+    if edge_type == "action_transition":
+        if event.pending_question_id or event.pending_contract:
+            raise RuntimeError("action-only target has an unrelated pending contract")
+        return
+    expected_question = str(edge.get("question_id") or "")
+    if event.pending_question_id != expected_question:
+        raise RuntimeError(
+            "scheduled target question does not match the runtime baseline: "
+            f"expected {expected_question or '<none>'}, got "
+            f"{event.pending_question_id or '<none>'}"
+        )
+    from tests.agent_live.generate_harness_coverage_ledger import contract_variant_hash
+
+    if contract_variant_hash(event.pending_contract) != str(edge.get("contract_hash") or ""):
+        raise RuntimeError("scheduled target contract hash does not match the runtime baseline")
 
 
 def encode_bracketed_paste(message: str) -> bytes:

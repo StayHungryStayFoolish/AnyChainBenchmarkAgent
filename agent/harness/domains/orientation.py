@@ -10,6 +10,7 @@ from typing import Any
 
 from agent.knowledge.entry_contract import ALL_RUNTIME_FIELDS
 from agent.knowledge.chain_identity import canonicalize_chain_scalar, repo_chain_names
+from agent.workflows.group_registry import GROUPS
 from agent.validators.rpc_workload import default_workload
 from agent.runners.job_manager import get_job, list_jobs
 from ..action_registry import canonical_consultation_topic
@@ -88,6 +89,60 @@ def resume_question(state: AgentGraphState) -> dict[str, Any]:
     if state.get("action_queue"):
         question["resume_action_queue"] = True
     return question
+
+
+def resume_modify_group_question(state: AgentGraphState) -> dict[str, Any]:
+    """Build the typed destination selector for a resumed configuration.
+
+    The workflow registry owns which destinations exist and which modes they
+    apply to. Each option delegates the actual transition to the coordinator's
+    ``change_group`` action, preserving one navigation authority.
+    """
+
+    language = str(state.get("language") or "en")
+    workflow_mode = str(state.get("workflow_mode") or "").strip()
+    target_mode = str(state.get("target_mode") or "").strip()
+    destinations = [
+        spec
+        for spec in GROUPS
+        if spec.name != "opening"
+        and spec.navigation_entry == "question_or_status"
+        and spec.resume_selector
+        and (not spec.workflow_modes or not workflow_mode or workflow_mode in spec.workflow_modes)
+        and (not spec.target_modes or not target_mode or target_mode in spec.target_modes)
+    ]
+    prompt = localized(
+        language,
+        "已保留确认值。请选择要修改的配置组，也可以用自然语言说明要修改什么。",
+        "Confirmed values were kept. Choose the configuration group to modify, or describe the change in natural language.",
+    )
+    return choice_question(
+        "opening",
+        "resume_modify_group",
+        prompt,
+        field="resume_modify_group",
+        options=[
+            {
+                "id": str(index),
+                "label": spec.name,
+                "description": ", ".join(spec.fields),
+                "value": spec.name,
+                "action": {
+                    "type": "change_group",
+                    "group": spec.name,
+                    "navigation_explicit": True,
+                },
+                "completion_effect": (
+                    f"Delegate navigation to the registered {spec.name} workflow group."
+                ),
+                "expected_patch": {},
+                "return_policy": "fallback",
+            }
+            for index, spec in enumerate(destinations, start=1)
+        ],
+        accepted_action_types=("change_group",),
+        queue_barrier=True,
+    )
 
 
 def apply_orientation_action(state: AgentGraphState, action: ActionProposal) -> HandlerResult:
@@ -229,16 +284,12 @@ def apply_orientation_answer(
                 stop_after_response=True,
             )
         if value == "modify":
+            modify_question = resume_modify_group_question(state)
             return HandlerResult(
                 delta=StateDelta.set_values({"resume_context": {}}),
-                visible_result=localized(
-                    language,
-                    "已保留确认值。请直接说明要修改链、模式、磁盘、网络、RPC、QPS、可观测性或其他配置组。",
-                    "Confirmed values were kept. Name the chain, mode, disk, network, RPC, QPS, observability, or other group to modify.",
-                ),
-                clear_pending=True,
+                pending_question=modify_question,
                 next_group="opening",
-                completion="completed",
+                completion="blocked",
                 stop_after_response=True,
             )
         resume_context = dict(state.get("resume_context") or {})

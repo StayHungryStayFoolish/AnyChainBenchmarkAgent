@@ -36,6 +36,7 @@ from tests.agent_live.dynamic_dual_ai_chaos import (
     encode_bracketed_paste,
     transport_for_config,
 )
+from tests.agent_live.generate_harness_coverage_ledger import contract_variant_hash
 
 
 class SimulatorInputClassAdmissionTest(unittest.TestCase):
@@ -135,7 +136,7 @@ class DeclaredTargetSetVerificationTest(unittest.TestCase):
 
 EDGE = {
     "edge_key": "opening::opening_next_action::fake_node::option",
-    "contract_hash": "contract-hash",
+    "contract_hash": contract_variant_hash({"id": "opening_next_action"}),
     "contract_variant_hash": "variant-hash",
     "question_id": "opening_next_action",
     "applicable": True,
@@ -302,7 +303,7 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 transport=transport,
                 event_stream=FakeEventStream([
                     self._event(1, "a" * 64, "b" * 64, "opening_next_action"),
-                    self._event(2, "b" * 64, "c" * 64, "chain_select"),
+                    self._event(2, "b" * 64, "c" * 64, "opening_next_action"),
                 ]),
                 revision=REVISION,
                 clock_ns=OrderedClock(),
@@ -433,6 +434,7 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 **EDGE,
                 "edge_key": "opening::resume_harness_session::variant::natural_language_option::option:3",
                 "question_id": "resume_harness_session",
+                "contract_hash": contract_variant_hash({"id": "resume_harness_session"}),
                 "edge_type": "question_option",
                 "action_type": "answer_pending",
                 "option_id": "3",
@@ -502,7 +504,7 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             )
             self.assertEqual(len(seen), 1)
 
-    def test_seeded_action_runner_uses_product_modification_waiting_state(self) -> None:
+    def test_action_edge_rejects_product_modification_waiting_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             action_edge = {
@@ -530,14 +532,14 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             transport = FakeTransport([
                 "Agent> Model config: provider=deepseek, model=deepseek-chat, auth=api_key\n"
                 "Agent> Previous configuration found. Continue it?",
-                "Agent> Confirmed values were kept. Name the area to modify.",
+                "Agent> Confirmed values were kept. Choose the typed action to perform.",
                 "Agent> Saved sync-observe as a later workflow goal.",
             ])
             seen: list[SimulatorContext] = []
 
             def simulator(context: SimulatorContext) -> SimulatorDecision:
                 seen.append(context)
-                self.assertIn("Name the area to modify", context.previous_agent_response)
+                self.assertIn("Choose the typed action", context.previous_agent_response)
                 self.assertNotIn("Previous configuration", context.previous_agent_response)
                 return SimulatorDecision(
                     user_message="Finish this benchmark first, then observe node synchronization.",
@@ -549,10 +551,14 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
 
             startup = self._event(1, "a" * 64, "b" * 64, "resume_harness_session")
             waiting = replace(
-                self._event(2, "b" * 64, "c" * 64, ""),
+                self._event(2, "b" * 64, "c" * 64, "typed_action_intake"),
                 admitted_action_types=("answer_pending",),
                 state_diff_hashes={"pending_question": {"before": "a" * 64, "after": "b" * 64}},
-                next_result={"kind": "result", "status": "waiting_for_modification"},
+                pending_contract={
+                    "id": "typed_action_intake",
+                    "accepted_action_types": ["queue_workflow_goal"],
+                },
+                next_result={"kind": "question", "question_id": "typed_action_intake"},
             )
             committed = replace(
                 self._event(3, "c" * 64, "d" * 64, ""),
@@ -572,14 +578,14 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             )
 
             with patch("tests.agent_live.runtime_checkpoint.seed_runtime_checkpoint"):
-                result = runner.run()
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "reviewed checkpoint did not restore the scheduled target contract",
+                ):
+                    runner.run()
 
-            self.assertEqual(result.execution_status, "complete")
-            self.assertEqual(
-                transport.submitted,
-                ["2", "Finish this benchmark first, then observe node synchronization."],
-            )
-            self.assertEqual(len(seen), 1)
+            self.assertEqual(transport.submitted, ["2"])
+            self.assertEqual(seen, [])
 
     def test_missing_provider_identity_fails_closed_without_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -799,7 +805,7 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 transport=transport,
                 event_stream=FakeEventStream([
                     self._event(1, "a" * 64, "b" * 64, "opening_next_action"),
-                    self._event(2, "b" * 64, "c" * 64, "chain_select"),
+                    self._event(2, "b" * 64, "c" * 64, "opening_next_action"),
                 ]),
                 revision=REVISION,
                 clock_ns=OrderedClock(),
@@ -870,7 +876,7 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                     "Agent> Which chain?",
                 ]),
                 event_stream=FakeEventStream([
-                    self._event(1, "a" * 64, "b" * 64, "CLOUD_REGION"),
+                    self._event(1, "a" * 64, "b" * 64, ""),
                     self._event(2, "b" * 64, "c" * 64, "chain_select"),
                 ]),
                 revision=REVISION,

@@ -1077,7 +1077,11 @@ class HarnessQuestionContractTest(unittest.TestCase):
         from agent.harness.domains.environment import question_for_environment
         from agent.harness.domains.environment import config_proposal_review_question
         from agent.harness.domains.execution import question_for_execution
-        from agent.harness.domains.orientation import opening_question, resume_question
+        from agent.harness.domains.orientation import (
+            opening_question,
+            resume_modify_group_question,
+            resume_question,
+        )
         from agent.harness.domains.performance import question_for_performance
         from agent.harness.domains.recovery import question_for_recovery
         from agent.harness.domains.sync_observe import question_for_sync_observe
@@ -1139,6 +1143,16 @@ class HarnessQuestionContractTest(unittest.TestCase):
         return [
             ("opening", lambda language: opening_question(_state(language))),
             ("resume", lambda language: resume_question(_state(language, target_mode="fake-node"))),
+            (
+                "resume_modify_group",
+                lambda language: resume_modify_group_question(
+                    _state(
+                        language,
+                        target_mode="fake-node",
+                        workflow_mode="rpc_benchmark",
+                    )
+                ),
+            ),
             (
                 "resume_quarantine",
                 lambda language: resume_question(
@@ -1660,7 +1674,8 @@ class HarnessQuestionContractTest(unittest.TestCase):
                         self.assertIn(action.get("type"), ACTION_BY_TYPE)
                         self.assertTrue(
                             option.get("expected_patch")
-                            or option.get("return_policy") == "stop_after_response",
+                            or option.get("return_policy") == "stop_after_response"
+                            or action.get("type") != "answer_pending",
                             f"{question['id']}/{option.get('id')} has no postcondition",
                         )
                     rendered = render_question(question, language)

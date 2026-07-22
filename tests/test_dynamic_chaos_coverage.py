@@ -19,13 +19,17 @@ from tests.agent_live.coverage_evidence import (
     pty_transcript_hash,
     validate_pty_cli_evidence_artifact,
 )
+from tests.agent_live.generate_harness_coverage_ledger import contract_variant_hash
 
 
 class DynamicChaosCoverageTest(unittest.TestCase):
     def setUp(self) -> None:
+        pending_contract = {"id": "opening_next_action"}
         self.edge = {
             "edge_key": "opening::opening_next_action::start_fake::option",
-            "contract_hash": "contract",
+            "edge_type": "question_option",
+            "question_id": "opening_next_action",
+            "contract_hash": contract_variant_hash(pending_contract),
             "contract_variant_hash": "variant",
             "evidence": {
                 "real_cli": {"required": True, "applicability_reason": "PTY contract"},

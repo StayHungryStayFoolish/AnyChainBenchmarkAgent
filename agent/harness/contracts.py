@@ -191,7 +191,14 @@ class QuestionContract:
         for option in self.options:
             if not option.action.action_type:
                 raise ValueError(f"{self.question_id}/{option.option_id} has no action")
-            if not option.expected_patch and option.return_policy != "stop_after_response":
+            delegated_transition = (
+                option.action.action_type != "answer_pending"
+            )
+            if (
+                not option.expected_patch
+                and option.return_policy != "stop_after_response"
+                and not delegated_transition
+            ):
                 raise ValueError(f"{self.question_id}/{option.option_id} has no postcondition")
 
 

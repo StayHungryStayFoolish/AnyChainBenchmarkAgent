@@ -135,7 +135,7 @@ def apply_coordinator_action(state: AgentGraphState, action: ActionProposal) -> 
                 ),
                 completion="completed",
             )
-        next_state = _activate_group_question(next_state, group)
+        next_state = _activate_group_question(next_state, group, reconfigure=True)
         return HandlerResult(
             consumed_action_ids=(action.action_id,),
             completion="blocked" if next_state.get("pending_question") else "completed",
@@ -2410,7 +2410,34 @@ def _remove_rendered_question(state: AgentGraphState, question: PendingQuestion)
     ]
 
 
-def _activate_group_question(state: AgentGraphState, group: str, *, record_history: bool = True) -> AgentGraphState:
+def _reconfiguration_question(state: AgentGraphState, group: str) -> PendingQuestion | None:
+    """Ask a domain's first owned question without discarding confirmed state.
+
+    The projection is used only to construct the question. The real state and
+    its evidence remain intact until the owning domain applies the user's
+    replacement value and dependency invalidation.
+    """
+
+    spec = GROUP_SPEC_BY_NAME.get(group)
+    if spec is None or not spec.fields:
+        return None
+    projected = deepcopy(state)
+    confirmed = dict(projected.get("confirmed_config") or {})
+    for field in spec.fields:
+        confirmed.pop(field, None)
+        projected.pop(field, None)
+    projected["confirmed_config"] = confirmed
+    projected.setdefault("group_states", {}).setdefault(group, {})["status"] = "reconfiguring"
+    return _question_for_group(projected, group)
+
+
+def _activate_group_question(
+    state: AgentGraphState,
+    group: str,
+    *,
+    record_history: bool = True,
+    reconfigure: bool = False,
+) -> AgentGraphState:
     _record_group_transition(state, group, record_history=record_history)
     state.setdefault("group_states", {}).setdefault(group, {})["status"] = "in_progress"
     # An explicit navigation to chain identity means "choose or change the
@@ -2418,6 +2445,8 @@ def _activate_group_question(state: AgentGraphState, group: str, *, record_histo
     # value until the user's replacement is confirmed; the chain owner then
     # applies dependency invalidation atomically.
     question = _question_for_group(state, group)
+    if reconfigure and not question:
+        question = _reconfiguration_question(state, group)
     if question:
         _install_pending_question(state, question)
         state["visible_response"] = [_render_question(question, state.get("language", "en"))]
@@ -2622,10 +2651,12 @@ def _apply_pending_answer(
             "selection_contract_verified": True,
             "_origin_text": text,
         }
-        dispatch_state = state
-        if return_policy == "stop_after_response":
-            dispatch_state = deepcopy(state)
-            dispatch_state["pending_question"] = {}
+        # A declared option action consumes the question that authorized it.
+        # Whether the turn stops afterwards is a separate return-policy
+        # concern; coupling the two leaves the old selector installed while a
+        # valid follow-up action is queued behind it.
+        dispatch_state = deepcopy(state)
+        dispatch_state["pending_question"] = {}
         result = _apply_queue_action(dispatch_state, action, text)
         if result is None:
             raise RuntimeError(f"option action was not executable: {question_id}/{value}")

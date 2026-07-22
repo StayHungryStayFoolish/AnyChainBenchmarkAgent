@@ -1656,7 +1656,7 @@ network:
         self.assertFalse(result["confirmed_config"]["has_accounts_device"])
         self.assertEqual(result["pending_question"]["id"], "DATA_VOL_SIZE")
 
-    def test_jump_to_empty_group_keeps_explicit_destination_visible_until_next_turn(self) -> None:
+    def test_jump_to_completed_optional_group_reopens_its_owned_question(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
         from agent.harness.state import new_state
 
@@ -1680,20 +1680,9 @@ network:
             resolver.return_value = {"actions": [{"type": "change_group", "group": "accounts_disk", "navigation_explicit": True, "source_evidence": "回到 accounts 配置", "confidence": "high"}]}
             result = process_turn(state)
 
-        self.assertIn("`accounts_disk`", "\n".join(result.get("visible_response") or []))
-        self.assertIn("没有需要确认的阻塞项", "\n".join(result.get("visible_response") or []))
         self.assertEqual(result["active_group"], "accounts_disk")
-        self.assertFalse(result.get("pending_question"))
-
-        result["last_user_input"] = "继续默认配置流程"
-        with patch(
-            "agent.harness.coordinator.resolve_action_queue",
-            return_value={"actions": []},
-        ):
-            resumed = process_turn(result)
-
-        self.assertEqual(resumed["active_group"], "ledger_disk")
-        self.assertEqual(resumed["pending_question"]["id"], "DATA_VOL_SIZE")
+        self.assertEqual(result["pending_question"]["id"], "has_accounts_device")
+        self.assertFalse(result["confirmed_config"]["has_accounts_device"])
 
     def test_optional_endpoint_navigation_does_not_advance_fallback_in_same_turn(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
@@ -2587,7 +2576,7 @@ network:
         self.assertEqual(result["pending_question"]["id"], "CLOUD_REGION")
         self.assertIn("已禁用", "\n".join(result["visible_response"]))
 
-    def test_completed_observability_group_reports_status_when_revisited(self) -> None:
+    def test_completed_observability_group_reopens_owned_question_when_revisited(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
         from agent.harness.state import new_state
 
@@ -2611,8 +2600,8 @@ network:
             resolver.return_value = {"actions": [{"type": "change_group", "group": "observability", "navigation_explicit": True, "source_evidence": "回到可观测性配置", "confidence": "high"}]}
             result = process_turn(state)
 
-        self.assertEqual(result["pending_question"], {})
-        self.assertIn("disabled", "\n".join(result["visible_response"]))
+        self.assertEqual(result["pending_question"]["id"], "observability_mode")
+        self.assertEqual(result["observability"]["mode"], "disabled")
 
     def test_sync_observe_multi_action_clarifies_invalid_demo_source_transactionally(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
@@ -5791,7 +5780,7 @@ network:
         self.assertEqual(result["pending_question"]["id"], "chain")
         self.assertEqual(result["control"]["deferred_group"], "workload_rpc")
 
-    def test_completed_public_group_jump_renders_status_without_fallback(self) -> None:
+    def test_completed_public_group_jump_reopens_group_without_mutating_value(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
         from agent.harness.state import new_state
 
@@ -5818,8 +5807,8 @@ network:
             result = process_turn(state)
 
         self.assertEqual(result["active_group"], "qps_profile")
-        self.assertFalse(result.get("pending_question"))
-        self.assertIn("quick", "\n".join(result["visible_response"]))
+        self.assertEqual(result["pending_question"]["id"], "benchmark_mode")
+        self.assertEqual(result["qps_profile"]["mode"], "quick")
 
     def test_unknown_chain_uses_identity_gate_not_partial_coercion(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
@@ -14382,6 +14371,150 @@ response:
             item.get("type") == "answer_pending"
             for item in context.get("admitted_actions") or []
         ))
+
+    def test_resume_modify_installs_registry_owned_group_selector(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.domains.orientation import resume_question
+        from agent.harness.state import new_state
+        from agent.workflows.group_registry import GROUP_SPEC_BY_NAME, is_user_navigable_group
+
+        state = new_state("resume-modify-selector", language="en")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "chain_identity": {"canonical": "bsc", "status": "supported"},
+            "last_user_input": "2",
+        })
+        state["pending_question"] = resume_question(state)
+
+        result = process_turn(state)
+        pending = result.get("pending_question") or {}
+        option_groups = [
+            str((item.get("action") or {}).get("group") or "")
+            for item in pending.get("options") or []
+        ]
+
+        self.assertEqual(pending.get("id"), "resume_modify_group")
+        self.assertEqual(pending.get("group"), "opening")
+        self.assertTrue(pending.get("queue_barrier"))
+        self.assertIn("change_group", pending.get("accepted_action_types") or [])
+        self.assertNotIn("opening", option_groups)
+        self.assertIn("target_mode", option_groups)
+        self.assertIn("accounts_disk", option_groups)
+        self.assertIn("observability", option_groups)
+        self.assertIn("qps_profile", option_groups)
+        self.assertNotIn("endpoint_process", option_groups)
+        self.assertNotIn("chain_auxiliary_endpoints", option_groups)
+        self.assertNotIn("target_samples_fixtures", option_groups)
+        self.assertNotIn("preflight_smoke_execution", option_groups)
+        self.assertNotIn("sync_observe", option_groups)
+        self.assertTrue(all(is_user_navigable_group(group) for group in option_groups))
+        self.assertTrue(all(
+            not GROUP_SPEC_BY_NAME[group].workflow_modes
+            or "rpc_benchmark" in GROUP_SPEC_BY_NAME[group].workflow_modes
+            for group in option_groups
+        ))
+
+    def test_resume_modify_exact_group_selection_executes_declared_navigation(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.domains.orientation import resume_question
+        from agent.harness.state import new_state
+
+        state = new_state("resume-modify-observability", language="en")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "chain_identity": {"canonical": "bsc", "status": "supported"},
+            "last_user_input": "2",
+        })
+        state["pending_question"] = resume_question(state)
+        result = process_turn(state)
+        result["last_user_input"] = "observability"
+
+        result = process_turn(result)
+
+        self.assertEqual(result.get("active_group"), "observability")
+        self.assertEqual((result.get("pending_question") or {}).get("id"), "observability_mode")
+        self.assertTrue(any(
+            item.get("type") == "change_group"
+            and item.get("group") == "observability"
+            for item in (result.get("turn_context") or {}).get("admitted_actions") or []
+        ))
+
+    def test_resume_modify_reopens_completed_observability_contract(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.domains.orientation import resume_question
+        from agent.harness.state import new_state
+
+        state = new_state("resume-reconfigure-observability", language="en")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "chain_identity": {"canonical": "bsc", "status": "supported"},
+            "observability": {"mode": "disabled"},
+            "last_user_input": "2",
+        })
+        state["pending_question"] = resume_question(state)
+        result = process_turn(state)
+        result["last_user_input"] = "observability"
+
+        result = process_turn(result)
+
+        self.assertEqual(result.get("observability"), {"mode": "disabled"})
+        self.assertEqual(result.get("active_group"), "observability")
+        self.assertEqual((result.get("pending_question") or {}).get("id"), "observability_mode")
+
+    def test_resume_modify_reopens_completed_provider_without_mutating_confirmed_values(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.domains.orientation import resume_question
+        from agent.harness.state import new_state
+
+        confirmed = {
+            "CLOUD_PROVIDER": "gcp",
+            "CLOUD_REGION": "asia-east1",
+            "CLOUD_ZONE": "asia-east1-c",
+            "MACHINE_TYPE": "n2-standard-16",
+        }
+        state = new_state("resume-reconfigure-provider", language="en")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "chain_identity": {"canonical": "bsc", "status": "supported"},
+            "confirmed_config": dict(confirmed),
+            "last_user_input": "2",
+        })
+        state["pending_question"] = resume_question(state)
+        result = process_turn(state)
+        result["last_user_input"] = "provider_deployment"
+
+        result = process_turn(result)
+
+        self.assertEqual(result.get("confirmed_config"), confirmed)
+        self.assertEqual(result.get("active_group"), "provider_deployment")
+        self.assertEqual((result.get("pending_question") or {}).get("id"), "CLOUD_REGION")
+
+    def test_resume_modify_reopens_confirmed_chain_at_typed_change_contract(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.domains.orientation import resume_question
+        from agent.harness.state import new_state
+
+        state = new_state("resume-reconfigure-chain", language="en")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "chain_identity": {"canonical": "bsc", "status": "supported"},
+            "confirmed_config": {"BLOCKCHAIN_NODE": "bsc"},
+            "last_user_input": "2",
+        })
+        state["pending_question"] = resume_question(state)
+        result = process_turn(state)
+        result["last_user_input"] = "chain_identity"
+
+        result = process_turn(result)
+
+        self.assertEqual((result.get("chain_identity") or {}).get("canonical"), "bsc")
+        self.assertEqual(result.get("active_group"), "chain_identity")
+        self.assertEqual((result.get("pending_question") or {}).get("id"), "chain_change_input")
 
     def test_semantic_answer_uses_declared_option_label_for_typed_value(self) -> None:
         from unittest.mock import patch

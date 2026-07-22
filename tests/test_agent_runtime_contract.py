@@ -66,7 +66,7 @@ class AgentRuntimeContractTest(unittest.TestCase):
                     OptionContract(
                         option_id="1",
                         value="noop",
-                        action=ActionProposal(action_id="a1", action_type="unknown"),
+                        action=ActionProposal(action_id="a1", action_type="answer_pending"),
                         expected_patch={},
                     ),
                 ),
