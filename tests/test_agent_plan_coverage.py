@@ -500,7 +500,7 @@ class PlanCoverageTest(unittest.TestCase):
                 "type": "choose_target_mode",
                 "target_mode": "fake-node",
                 "target_mode_explicit": True,
-                "source_evidence": "simulated node",
+                "source_evidence": "fake-node",
             }],
             "semantic_units": [],
             "target_mode_selection_admissions": [0],
@@ -522,6 +522,25 @@ class PlanCoverageTest(unittest.TestCase):
         source = "I want to test BNB with fake-node and inspect supported methods"
 
         self.assertTrue(target_mode_evidence_matches("fake-node", "fake-node", source))
+
+    def test_mutating_enum_values_use_registry_grounding(self) -> None:
+        from agent.harness.action_registry import semantic_grounding_arguments
+
+        examples = {
+            "choose_target_mode": {"target_mode": "fake-node"},
+            "set_rpc_mode": {"rpc_mode": "single"},
+            "set_qps_mode": {"qps_mode": "quick"},
+            "set_observability": {"observability_mode": "disabled"},
+            "set_sync_observe_source": {"sync_observe_source": "endpoint_only"},
+            "choose_adapter_family": {"adapter_family": "jsonrpc"},
+            "set_accounts_presence": {"has_accounts_device": False},
+        }
+        for action_type, arguments in examples.items():
+            with self.subTest(action_type=action_type):
+                self.assertEqual(
+                    semantic_grounding_arguments({"type": action_type, **arguments}),
+                    tuple(arguments),
+                )
 
 
 

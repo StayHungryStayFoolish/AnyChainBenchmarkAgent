@@ -27,6 +27,8 @@ _ACTION_VERDICT_KEYS = frozenset({
     "verdict",
     "unit_ids",
     "evidence",
+    "grounded_arguments",
+    "pending_answer_argument",
     "reason",
 })
 _ACTION_EVIDENCE_KEYS = frozenset({
@@ -34,6 +36,10 @@ _ACTION_EVIDENCE_KEYS = frozenset({
     "quote",
     "relation",
     "support_relation",
+})
+_GROUNDED_ARGUMENT_KEYS = frozenset({
+    "argument",
+    "evidence_quote",
 })
 _UNIT_VERDICT_KEYS = frozenset({
     "unit_id",
@@ -210,10 +216,12 @@ def whole_plan_admission_prompt(semantic_policy: str) -> str:
         "Judge only the supplied immutable ids, actions, registry purposes, source units, pending contract, and workflow state. "
         "Return exactly one JSON object with exactly these keys: plan_hash, action_verdicts, unit_verdicts, reason. "
         "Echo plan_hash exactly. Return exactly one action_verdict for every supplied action_id and exactly one unit_verdict for every supplied unit_id; never add an id. "
-        "Each action_verdict is {action_id,verdict:'admit'|'reject',unit_ids:[string],evidence:[{unit_id,quote,relation:'direct'|'support',support_relation:string}],reason}. "
+        "Each action_verdict is {action_id,verdict:'admit'|'reject',unit_ids:[string],evidence:[{unit_id,quote,relation:'direct'|'support',support_relation:string}],grounded_arguments:[{argument:string,evidence_quote:string}],pending_answer_argument:string,reason}. "
         "unit_ids must exactly equal that action's supplied immutable unit_ids. An admitted action needs one evidence row for every unit_id, every quote must be a non-empty exact substring of that unit, at least one relation must be direct, and a support row may use only one supplied allowed_support_relation. Direct rows use an empty support_relation. "
-        "Each unit_verdict is {unit_id,verdict:'complete'|'context'|'unresolved'|'omitted',owner_action_ids:[string],evidence_quote:string,omitted_action_type:string,reason}. "
-        "owner_action_ids must exactly equal the supplied immutable owner_action_ids. complete is valid only when those registered actions preserve every present demand in the unit. context is valid only for a supplied context unit with no present demand. unresolved means the request is genuinely unsafe or not expressible. omitted means the unit contains a present independently actionable demand expressible by one action_schema type but missing from the immutable actions; set omitted_action_type to that exact registered type. Never propose its arguments or a replacement action. For every other verdict omitted_action_type is empty. Every evidence_quote is a non-empty exact substring of that unit. "
+        "grounded_arguments must contain exactly one row for every supplied required_value_grounding_argument and no other argument. Its evidence_quote must be a non-empty exact substring of one owned source unit that semantically selects the exact immutable operation_arguments value. Merely naming the argument or dimension, asking to change it without selecting a value, stating a generic benchmark goal, or relying on workflow state does not ground a concrete value. Natural-language equivalents may ground a value only when they unambiguously select that exact value. Actions with no required value-grounding arguments return an empty list. "
+        "pending_answer_argument is empty unless the supplied active pending question allows manual input and exactly one supplied pending_value_candidate semantically answers that question. When it does, set pending_answer_argument to that candidate's exact candidate_id. A syntax-compatible value for an unrelated interruption is not an answer. Never invent a candidate id or rewrite the action. "
+        "Each unit_verdict is {unit_id,verdict:'complete'|'support'|'context'|'unresolved'|'omitted',owner_action_ids:[string],evidence_quote:string,omitted_action_type:string,reason}. "
+        "owner_action_ids must exactly equal the supplied immutable owner_action_ids. complete is valid only when the unit directly expresses a present demand preserved by every registered owner action. support is valid only when the unit does not independently request another action, every owner action cites it with relation=support and a supplied allowed_support_relation, and each owner action has direct evidence in another unit. context is valid only for a supplied context unit with no present demand and no owner. unresolved means the request is genuinely unsafe or not expressible. omitted means the unit contains a present independently actionable demand expressible by one action_schema type but missing from the immutable actions; set omitted_action_type to that exact registered type. Never propose its arguments or a replacement action. For every other verdict omitted_action_type is empty. Every evidence_quote is a non-empty exact substring of that unit. "
         "A mapped action may be individually plausible while its unit still has an omitted demand. Questions, corrections, navigation, configuration, evidence analysis, execution approval, and pending answers are all present demands when explicitly requested. Workflow state and planner reasons are context, never user evidence. "
         "A pending option or manual answer is admitted only when current source evidence satisfies the supplied typed pending contract. A registered group or field owner is admitted only when its declared purpose and exact target preserve the source demand. Structured syntax facts are authoritative only after the immutable compiler assigned that structured unit to the corresponding registered owner; examples or logs do not become configuration merely because they contain assignments. "
         "Malformed ids, missing rows, duplicate rows, invented quotes, an unsupported support relation, or uncertainty must fail closed. "
@@ -288,6 +296,7 @@ def validate_whole_plan_admission(
 
     action_counts: dict[str, int] = {}
     valid_action_rows: list[dict[str, Any]] = []
+    admitted_evidence_relations: dict[tuple[str, str], str] = {}
     for raw in action_rows:
         if not isinstance(raw, dict):
             errors.append("whole-plan admission contains a non-object action verdict")
@@ -314,6 +323,45 @@ def validate_whole_plan_admission(
         evidence_rows = list(evidence) if isinstance(evidence, list) else []
         if not isinstance(evidence, list):
             errors.append(f"whole-plan action evidence is not a list: {action_id}")
+        grounding = row.get("grounded_arguments")
+        grounding_rows = list(grounding) if isinstance(grounding, list) else []
+        if not isinstance(grounding, list):
+            errors.append(f"whole-plan grounded_arguments is not a list: {action_id}")
+        expected_grounding = [
+            str(value)
+            for value in record.get("required_value_grounding_arguments") or []
+        ]
+        grounding_counts: dict[str, int] = {}
+        owned_sources = [
+            str((unit_records.get(unit_id) or {}).get("source_text") or "")
+            for unit_id in expected_units
+        ]
+        for raw_grounding in grounding_rows:
+            if not isinstance(raw_grounding, dict):
+                errors.append(f"whole-plan grounded argument is not an object: {action_id}")
+                continue
+            grounding_row = dict(raw_grounding)
+            if set(grounding_row) != _GROUNDED_ARGUMENT_KEYS:
+                errors.append(f"whole-plan grounded argument has missing or undeclared keys: {action_id}")
+            argument = str(grounding_row.get("argument") or "")
+            grounding_counts[argument] = grounding_counts.get(argument, 0) + 1
+            quote = str(grounding_row.get("evidence_quote") or "")
+            if argument not in expected_grounding:
+                errors.append(f"whole-plan grounded argument is undeclared: {action_id}/{argument or '<missing>'}")
+            if not quote or not any(quote in source for source in owned_sources):
+                errors.append(f"whole-plan grounded argument evidence is not exact: {action_id}/{argument or '<missing>'}")
+        if [str(item.get("argument") or "") for item in grounding_rows if isinstance(item, dict)] != expected_grounding:
+            errors.append(f"whole-plan grounded argument order or cardinality mismatch: {action_id}")
+        if any(grounding_counts.get(argument, 0) != 1 for argument in expected_grounding):
+            errors.append(f"whole-plan required argument is not grounded exactly once: {action_id}")
+        pending_argument = str(row.get("pending_answer_argument") or "")
+        pending_candidates = [
+            str(value.get("candidate_id") or "")
+            for value in record.get("pending_value_candidates") or []
+            if isinstance(value, Mapping)
+        ]
+        if pending_argument and pending_argument not in pending_candidates:
+            errors.append(f"whole-plan pending answer argument is undeclared: {action_id}/{pending_argument}")
         seen_evidence: set[str] = set()
         direct_count = 0
         allowed_support = set(record.get("allowed_support_relations") or [])
@@ -351,6 +399,13 @@ def validate_whole_plan_admission(
                 errors.append(f"whole-plan admitted action lacks exact evidence cardinality: {action_id}")
             if direct_count < 1:
                 errors.append(f"whole-plan admitted action has no direct evidence: {action_id}")
+            for evidence_row in evidence_rows:
+                if not isinstance(evidence_row, dict):
+                    continue
+                unit_id = str(evidence_row.get("unit_id") or "")
+                relation = str(evidence_row.get("relation") or "")
+                if unit_id in expected_units and relation in {"direct", "support"}:
+                    admitted_evidence_relations[(action_id, unit_id)] = relation
         valid_action_rows.append(row)
 
     for action_id in plan.action_ids:
@@ -386,7 +441,7 @@ def validate_whole_plan_admission(
         if actual_owners != expected_owners:
             errors.append(f"whole-plan unit owner mismatch: {unit_id}")
         verdict = str(row.get("verdict") or "")
-        if verdict not in {"complete", "context", "unresolved", "omitted"}:
+        if verdict not in {"complete", "support", "context", "unresolved", "omitted"}:
             errors.append(f"whole-plan unit verdict is invalid: {unit_id}")
         quote = str(row.get("evidence_quote") or "")
         source = str(record.get("source_text") or "")
@@ -401,14 +456,26 @@ def validate_whole_plan_admission(
         elif omitted_type:
             errors.append(f"whole-plan non-omitted unit declares an omitted action: {unit_id}")
         disposition = str(record.get("disposition") or "")
-        if disposition == "action" and verdict != "complete":
-            errors.append(f"whole-plan action unit is not complete: {unit_id}")
+        if disposition == "action" and verdict not in {"complete", "support"}:
+            errors.append(f"whole-plan action unit is neither complete nor support: {unit_id}")
         elif disposition == "context" and verdict != "context":
             errors.append(f"whole-plan context unit is not context-only: {unit_id}")
         elif disposition == "unresolved":
             errors.append(f"whole-plan candidate retains unresolved unit: {unit_id}")
         if verdict == "complete" and not expected_owners:
             errors.append(f"whole-plan complete unit has no owner: {unit_id}")
+        if verdict == "complete" and any(
+            admitted_evidence_relations.get((owner, unit_id)) != "direct"
+            for owner in expected_owners
+        ):
+            errors.append(f"whole-plan complete unit is not direct for every owner: {unit_id}")
+        if verdict == "support" and not expected_owners:
+            errors.append(f"whole-plan support unit has no owner: {unit_id}")
+        if verdict == "support" and any(
+            admitted_evidence_relations.get((owner, unit_id)) != "support"
+            for owner in expected_owners
+        ):
+            errors.append(f"whole-plan support unit is not support for every owner: {unit_id}")
         if verdict == "context" and expected_owners:
             errors.append(f"whole-plan context unit has an owner: {unit_id}")
         valid_unit_rows.append(row)
@@ -427,7 +494,7 @@ def validate_whole_plan_admission(
 
     if any(str(row.get("verdict") or "") != "admit" for row in valid_action_rows):
         errors.append("whole-plan admission rejected one or more immutable actions")
-    if any(str(row.get("verdict") or "") not in {"complete", "context"} for row in valid_unit_rows):
+    if any(str(row.get("verdict") or "") not in {"complete", "support", "context"} for row in valid_unit_rows):
         errors.append("whole-plan admission found unresolved or omitted demand")
 
     return WholePlanAdmission(

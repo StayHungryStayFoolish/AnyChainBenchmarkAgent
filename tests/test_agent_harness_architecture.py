@@ -72,6 +72,14 @@ def _whole_plan_admission_payload(request: Any) -> dict[str, Any]:
             "verdict": "admit",
             "unit_ids": list(action["unit_ids"]),
             "evidence": evidence,
+            "grounded_arguments": [
+                {
+                    "argument": argument,
+                    "evidence_quote": str(units[action["unit_ids"][0]]["source_text"]),
+                }
+                for argument in action.get("required_value_grounding_arguments") or []
+            ],
+            "pending_answer_argument": "",
             "reason": "the immutable registered action preserves its source units",
         })
     unit_verdicts = []
@@ -308,7 +316,218 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
         })
         result = self._validate(omitted)
         self.assertFalse(result.valid)
-        self.assertIn("not complete", "; ".join(result.errors))
+        self.assertIn("neither complete nor support", "; ".join(result.errors))
+
+    def test_registered_support_unit_is_admitted_without_becoming_context(self) -> None:
+        from agent.harness.intent import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import (
+            freeze_semantic_plan,
+            validate_whole_plan_admission,
+        )
+
+        support_text = "Use this endpoint only to validate the method."
+        direct_text = "http://fake-node:8545"
+        action = {
+            "type": "rpc_catalog_command",
+            "catalog_command": "set_endpoint",
+            "rpc_endpoint": direct_text,
+            "source_evidence": direct_text,
+        }
+        units = [
+            {
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": support_text,
+                "disposition": "action",
+                "action_indexes": [0],
+            },
+            {
+                "unit_id": "unit-2",
+                "clause_id": "clause-2",
+                "source_text": direct_text,
+                "disposition": "action",
+                "action_indexes": [0],
+            },
+        ]
+        document = {"actions": [action], "semantic_units": units}
+        plan = freeze_semantic_plan(
+            document,
+            action_records=[{
+                "action_id": "action-1",
+                "action_index": 0,
+                "action": action,
+                "unit_ids": ["unit-1", "unit-2"],
+                "allowed_support_relations": ["operation_restatement"],
+            }],
+            unit_records=[
+                {
+                    "unit_id": unit["unit_id"],
+                    "unit_index": index,
+                    "unit": unit,
+                    "source_text": unit["source_text"],
+                    "disposition": "action",
+                    "owner_action_ids": ["action-1"],
+                }
+                for index, unit in enumerate(units)
+            ],
+            review_context={"pending_question": {}},
+        )
+        payload = {
+            "plan_hash": plan.plan_hash,
+            "action_verdicts": [{
+                "action_id": "action-1",
+                "verdict": "admit",
+                "unit_ids": ["unit-1", "unit-2"],
+                "evidence": [
+                    {
+                        "unit_id": "unit-1",
+                        "quote": support_text,
+                        "relation": "support",
+                        "support_relation": "operation_restatement",
+                    },
+                    {
+                        "unit_id": "unit-2",
+                        "quote": direct_text,
+                        "relation": "direct",
+                        "support_relation": "",
+                    },
+                ],
+                "grounded_arguments": [],
+                "pending_answer_argument": "",
+                "reason": "one supporting unit frames one direct endpoint value",
+            }],
+            "unit_verdicts": [
+                {
+                    "unit_id": "unit-1",
+                    "verdict": "support",
+                    "owner_action_ids": ["action-1"],
+                    "evidence_quote": support_text,
+                    "omitted_action_type": "",
+                    "reason": "the unit scopes the direct endpoint operation",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "verdict": "complete",
+                    "owner_action_ids": ["action-1"],
+                    "evidence_quote": direct_text,
+                    "omitted_action_type": "",
+                    "reason": "the unit directly supplies the endpoint",
+                },
+            ],
+            "reason": "the immutable plan preserves both units",
+        }
+
+        result = validate_whole_plan_admission(
+            json.dumps(payload),
+            plan,
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+        self.assertTrue(result.valid, result.errors)
+
+        no_owner = deepcopy(payload)
+        no_owner["unit_verdicts"][0]["owner_action_ids"] = []
+        self.assertFalse(validate_whole_plan_admission(
+            json.dumps(no_owner),
+            plan,
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        ).valid)
+
+        wrong_relation = deepcopy(payload)
+        wrong_relation["unit_verdicts"][0]["verdict"] = "complete"
+        result = validate_whole_plan_admission(
+            json.dumps(wrong_relation),
+            plan,
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+        self.assertFalse(result.valid)
+        self.assertIn("not direct for every owner", "; ".join(result.errors))
+
+    def test_required_value_grounding_has_exact_argument_cardinality(self) -> None:
+        from agent.harness.intent import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import (
+            freeze_semantic_plan,
+            validate_whole_plan_admission,
+        )
+
+        source = "Use the simulated-node workflow."
+        action = {
+            "type": "choose_target_mode",
+            "target_mode": "fake-node",
+            "target_mode_explicit": True,
+            "source_evidence": source,
+        }
+        unit = {
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "disposition": "action",
+            "action_indexes": [0],
+        }
+        plan = freeze_semantic_plan(
+            {"actions": [action], "semantic_units": [unit]},
+            action_records=[{
+                "action_id": "action-1",
+                "action_index": 0,
+                "action": action,
+                "unit_ids": ["unit-1"],
+                "allowed_support_relations": [],
+                "required_value_grounding_arguments": ["target_mode"],
+            }],
+            unit_records=[{
+                "unit_id": "unit-1",
+                "unit_index": 0,
+                "unit": unit,
+                "source_text": source,
+                "disposition": "action",
+                "owner_action_ids": ["action-1"],
+            }],
+            review_context={"pending_question": {}},
+        )
+        payload = {
+            "plan_hash": plan.plan_hash,
+            "action_verdicts": [{
+                "action_id": "action-1",
+                "verdict": "admit",
+                "unit_ids": ["unit-1"],
+                "evidence": [{
+                    "unit_id": "unit-1",
+                    "quote": source,
+                    "relation": "direct",
+                    "support_relation": "",
+                }],
+                "grounded_arguments": [{
+                    "argument": "target_mode",
+                    "evidence_quote": "simulated-node workflow",
+                }],
+                "pending_answer_argument": "",
+                "reason": "the source selects the concrete target mode",
+            }],
+            "unit_verdicts": [{
+                "unit_id": "unit-1",
+                "verdict": "complete",
+                "owner_action_ids": ["action-1"],
+                "evidence_quote": source,
+                "omitted_action_type": "",
+                "reason": "the concrete selection is preserved",
+            }],
+            "reason": "the immutable plan is grounded",
+        }
+        valid = validate_whole_plan_admission(
+            json.dumps(payload),
+            plan,
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+        self.assertTrue(valid.valid, valid.errors)
+
+        missing = deepcopy(payload)
+        missing["action_verdicts"][0]["grounded_arguments"] = []
+        result = validate_whole_plan_admission(
+            json.dumps(missing),
+            plan,
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+        self.assertFalse(result.valid)
+        self.assertIn("grounded argument order or cardinality mismatch", "; ".join(result.errors))
 
 
 def _rpc_catalog(

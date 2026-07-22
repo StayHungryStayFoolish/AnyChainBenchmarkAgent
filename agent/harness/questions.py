@@ -9,7 +9,12 @@ from typing import Any
 from agent.knowledge.chain_identity import canonicalize_chain_scalar, repo_chain_names
 from .action_registry import ACTION_BY_TYPE
 from .contracts import ActionProposal, OptionContract, QuestionContract
-from .input_values import has_rpc_wire_evidence, looks_like_wire_method_identity, parse_weight_spec
+from .input_values import (
+    extract_url_candidates,
+    has_rpc_wire_evidence,
+    looks_like_wire_method_identity,
+    parse_weight_spec,
+)
 from .localization import localized
 
 
@@ -252,7 +257,7 @@ def exact_answer(text: str, question: dict[str, Any]) -> tuple[bool, Any]:
             if normalized in {"n", "no"} and len(options) > 1:
                 return True, options[1].get("value")
     if question.get("manual_input_allowed") and answer_fits_pending(raw, question):
-        return True, normalize_scalar(raw)
+        return True, coerce_pending_answer(raw, question)
     return False, None
 
 
@@ -325,14 +330,16 @@ def value_satisfies_pending_contract(value: Any, question: dict[str, Any]) -> bo
     planning has isolated it from surrounding prose.
     """
 
-    raw = _strip_scalar(str(value or ""))
-    if not raw:
-        return False
     if pending_option_value_exists(value, question):
         return True
     if question.get("manual_input_allowed") is not True:
         return False
     validation = question.get("validation") or {}
+    if str(validation.get("input_mode") or "") == "rpc_weights":
+        return bool(parse_weight_spec(value))
+    raw = _strip_scalar(str(value or ""))
+    if not raw:
+        return False
     value_type = str(validation.get("value_type") or "")
     if value_type == "evidence_contribution":
         max_length = int(validation.get("max_length") or 65536)
@@ -360,6 +367,26 @@ def value_satisfies_pending_contract(value: Any, question: dict[str, Any]) -> bo
     }:
         return literal_matches_validation(raw, validation)
     return answer_fits_pending(raw, question)
+
+
+def typed_pending_value_candidates(
+    text: str,
+    question: dict[str, Any],
+) -> tuple[str, ...]:
+    """Expose deterministic syntax candidates without deciding user intent."""
+
+    if question.get("manual_input_allowed") is not True:
+        return ()
+    validation = question.get("validation") or {}
+    if str(question.get("kind") or "") == "url" or str(
+        validation.get("value_type") or ""
+    ) == "url":
+        return tuple(
+            candidate
+            for candidate in extract_url_candidates(text)
+            if value_satisfies_pending_contract(candidate, question)
+        )
+    return ()
 
 
 def pending_contract_allows_semantic_scalar_normalization(
@@ -472,7 +499,7 @@ def answer_fits_pending(text: str, question: dict[str, Any]) -> bool:
                 or _is_structured_evidence_literal(text)
             )
         if input_mode == "rpc_weights":
-            return bool(parse_weight_spec(text) or _first_number_text(raw))
+            return bool(parse_weight_spec(text))
         if raw.casefold() in {"y", "yes", "n", "no"}:
             return False
         if manual_literal_violation(raw, question):
@@ -511,6 +538,11 @@ def coerce_pending_answer(text: str, question: dict[str, Any]) -> Any:
     """Convert an admitted literal to the exact option/domain value."""
 
     raw = _strip_scalar(text)
+    validation = question.get("validation") or {}
+    if str(validation.get("input_mode") or "") == "rpc_weights":
+        weights = parse_weight_spec(text)
+        if weights:
+            return weights
     options = question.get("options") or []
     if raw.isdigit() and options:
         index = int(raw) - 1
@@ -599,14 +631,6 @@ def matches_numbered_option(raw: str, question: dict[str, Any]) -> bool:
         if lowered in values:
             return True
     return False
-
-
-def _first_number_text(value: Any) -> str:
-    match = re.search(r"[0-9]+(?:\.[0-9]+)?", str(value or ""))
-    if not match:
-        return ""
-    number = float(match.group(0))
-    return str(int(number)) if number.is_integer() else str(number)
 
 
 def _strip_scalar(value: str) -> str:

@@ -413,7 +413,7 @@ def build_pty_diagnostic_artifact(record: PtyDiagnosticRecord) -> dict[str, Any]
         else None
     )
     safe_postcondition = (
-        redact(_verified_postcondition_payload(record.verified_postcondition))
+        _redacted_verified_postcondition_payload(record.verified_postcondition)
         if record.verified_postcondition is not None
         else None
     )
@@ -641,6 +641,31 @@ def _verified_postcondition_payload(postcondition: VerifiedPostcondition) -> dic
     return payload
 
 
+def _redacted_verified_postcondition_payload(
+    postcondition: VerifiedPostcondition,
+) -> dict[str, Any]:
+    """Redact business content while preserving immutable coverage identity."""
+
+    payload = _verified_postcondition_payload(postcondition)
+    payload["state_diff"] = redact(dict(postcondition.state_diff))
+    payload["next_question_or_result"] = redact(
+        dict(postcondition.next_question_or_result)
+    )
+    details = dict(postcondition.details)
+    declared = details.pop("declared_target_results", None)
+    safe_details = redact(details)
+    if isinstance(declared, Mapping):
+        safe_details["declared_target_results"] = {
+            str(coverage_id): redact(dict(result))
+            if isinstance(result, Mapping)
+            else redact(result)
+            for coverage_id, result in declared.items()
+        }
+    payload["details"] = safe_details
+    payload["job_artifacts"] = [redact(dict(item)) for item in postcondition.job_artifacts]
+    return payload
+
+
 def build_pty_cli_evidence_artifact(
     *,
     edge: Mapping[str, Any],
@@ -805,7 +830,39 @@ def _redacted_dynamic_selection(
 
 
 def _redacted_turn_observation(observation: TurnObservation) -> TurnObservation:
-    return _turn_observation_from_payload(redact(_turn_observation_payload(observation)))
+    payload = _turn_observation_payload(observation)
+    payload["prior_agent_response"] = str(redact(observation.prior_agent_response))
+    payload["exact_user_turn"] = str(redact(observation.exact_user_turn))
+    payload["simulator_decision"] = _redacted_simulator_decision(
+        observation.simulator_decision
+    )
+    payload["continuation_turns"] = [
+        asdict(_redacted_pty_turn(turn))
+        for turn in observation.continuation_turns
+    ]
+    payload["continuation_simulator_decisions"] = [
+        _redacted_simulator_decision(decision)
+        for decision in observation.continuation_simulator_decisions
+    ]
+    payload["verified_postcondition"] = _redacted_verified_postcondition_payload(
+        observation.verified_postcondition
+    )
+    return _turn_observation_from_payload(payload)
+
+
+def _redacted_simulator_decision(decision: Mapping[str, Any]) -> dict[str, Any]:
+    """Project simulator content separately from coverage identity."""
+
+    payload = {
+        str(key): redact(value)
+        for key, value in decision.items()
+        if str(key) != "target_coverage_ids"
+    }
+    if "target_coverage_ids" in decision:
+        payload["target_coverage_ids"] = [
+            str(value) for value in decision.get("target_coverage_ids") or ()
+        ]
+    return payload
 
 
 def validate_pty_cli_evidence_artifact(

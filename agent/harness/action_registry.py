@@ -192,6 +192,7 @@ class ActionSpec:
     suppressed_by: tuple[str, ...] = ()
     semantic_recovery_source_argument: str = ""
     semantic_support_relations: tuple[str, ...] = ()
+    semantic_value_grounding_arguments: tuple[str, ...] = ()
     pending_option_semantic: str = ""
     option_navigation_groups: tuple[str, ...] = ()
     pending_option_admission: bool = True
@@ -255,7 +256,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
             "non_mutation_scope",
         ),
     ),
-    ActionSpec("choose_target_mode", "chain_rpc", "Select fake-node, real-node, or sync-observe only when the user explicitly requests that mutation.", ("target_mode", "target_mode_explicit", "source_evidence"), 10, "target_mode", mutation_dimension="target_mode", provides_capabilities=("target_mode",), required_arguments=("target_mode", "target_mode_explicit", "source_evidence"), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS),
+    ActionSpec("choose_target_mode", "chain_rpc", "Select fake-node, real-node, or sync-observe only when the user explicitly requests that mutation.", ("target_mode", "target_mode_explicit", "source_evidence"), 10, "target_mode", mutation_dimension="target_mode", provides_capabilities=("target_mode",), required_arguments=("target_mode", "target_mode_explicit", "source_evidence"), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS, semantic_value_grounding_arguments=("target_mode",)),
     ActionSpec("choose_chain", "chain_rpc", "Select a chain when none is confirmed, or expose multiple candidates without choosing silently.", ("chain_text", "chain_candidates", "source_evidence", "chain_exists", "canonical_chain_name", "adapter_family", "possible_known_chain", "evidence_summary"), 20, "chain_identity", mutation_dimension="chain", provides_capabilities=("chain_identity",), required_arguments=("source_evidence",), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS, validator=_validate_chain_selection),
     ActionSpec("change_chain", "chain_rpc", "Request a different chain when one is confirmed, or expose multiple candidates without choosing silently.", ("chain_text", "chain_candidates", "source_evidence", "chain_exists", "canonical_chain_name", "adapter_family", "possible_known_chain", "evidence_summary"), 20, "chain_identity", mutation_dimension="chain", provides_capabilities=("chain_identity",), required_arguments=("source_evidence",), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS, validator=_validate_chain_selection),
     ActionSpec(
@@ -397,7 +398,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         required_arguments=("rpc_mode", "mutation_explicit", "source_evidence"),
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
     ),
-    ActionSpec("choose_adapter_family", "chain_rpc", "Confirm the adapter family for an already identified unknown chain.", ("adapter_family",), 22, "chain_identity", required_arguments=("adapter_family",)),
+    ActionSpec("choose_adapter_family", "chain_rpc", "Confirm the adapter family for an already identified unknown chain.", ("adapter_family",), 22, "chain_identity", required_arguments=("adapter_family",), semantic_value_grounding_arguments=("adapter_family",)),
     ActionSpec(
         "rpc_catalog_command",
         "chain_rpc",
@@ -474,7 +475,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
     ActionSpec("reject_preflight_smoke", "execution", "Pause before preflight/smoke without submitting a job."),
     ActionSpec("approve_final_benchmark", "execution", "Approve final real-node benchmark submission after isolated smoke success.", effect="execution"),
     ActionSpec("reject_final_benchmark", "execution", "Pause after successful real-node smoke without submitting the final benchmark."),
-    ActionSpec("set_accounts_presence", "environment", "Confirm whether a separate accounts/state disk exists.", ("has_accounts_device",), target_group="accounts_disk", required_arguments=("has_accounts_device",)),
+    ActionSpec("set_accounts_presence", "environment", "Confirm whether a separate accounts/state disk exists.", ("has_accounts_device",), target_group="accounts_disk", required_arguments=("has_accounts_device",), semantic_value_grounding_arguments=("has_accounts_device",)),
     ActionSpec(
         "propose_config_values",
         "environment",
@@ -827,6 +828,7 @@ def action_registry_contract_hash() -> str:
             "suppressed_by": list(spec.suppressed_by),
             "semantic_recovery_source_argument": spec.semantic_recovery_source_argument,
             "semantic_support_relations": list(spec.semantic_support_relations),
+            "semantic_value_grounding_arguments": list(spec.semantic_value_grounding_arguments),
             "pending_option_semantic": spec.pending_option_semantic,
             "option_navigation_groups": list(spec.option_navigation_groups),
             "pending_option_admission": spec.pending_option_admission,
@@ -1385,6 +1387,37 @@ def action_effect(action: Mapping[str, Any]) -> ActionEffect:
 
     spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
     return spec.effect if spec is not None else "configuration_mutation"
+
+
+def semantic_grounding_arguments(action: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return source-grounded operation values declared by the registry.
+
+    Concrete enum selections are always source facts for mutating operations;
+    planner metadata such as ``source_format`` and explicitness receipts are
+    excluded. Specs may additionally declare dynamic or boolean values whose
+    legal vocabulary cannot be derived from the JSON argument schema.
+    """
+
+    spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
+    if spec is None or spec.effect == "read_only":
+        return ()
+    required = [
+        argument
+        for argument in spec.semantic_value_grounding_arguments
+        if argument in action
+    ]
+    for argument in spec.allowed_arguments:
+        if (
+            argument not in action
+            or argument in required
+            or argument == "source_format"
+            or argument.endswith("_explicit")
+        ):
+            continue
+        schema = ACTION_ARGUMENT_SCHEMAS.get(argument) or {}
+        if schema.get("enum"):
+            required.append(argument)
+    return tuple(required)
 
 
 def semantic_scope_schema() -> list[dict[str, Any]]:

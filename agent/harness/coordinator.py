@@ -809,6 +809,10 @@ def _validate_action_plan(state: AgentGraphState, actions: list[dict[str, Any]])
         for item in prepared
         if not _bypasses_canonical_pending_choice(state, item)
     ]
+    for item in prepared:
+        if item.get("pending_option_semantic_verified") is True and _canonical_pending_choice_matches(state, item):
+            item["selection_contract_verified"] = True
+    prepared = _resolve_pending_answer_invalidation_conflicts(state, prepared)
     lifecycle_rejected = lifecycle_rejected_action_indexes(state, prepared)
     if lifecycle_rejected:
         rejected_types = ", ".join(
@@ -818,9 +822,6 @@ def _validate_action_plan(state: AgentGraphState, actions: list[dict[str, Any]])
         raise StateInvariantError(
             f"actions incompatible with active target-mode lifecycle: {rejected_types}"
         )
-    for item in prepared:
-        if item.get("pending_option_semantic_verified") is True and _canonical_pending_choice_matches(state, item):
-            item["selection_contract_verified"] = True
     identity = state.get("chain_identity") or {}
     if identity.get("case") == "case3" and identity.get("adapter_family") == "unsupported":
         # An unsupported-family handoff cannot also mutate the RPC catalog.
@@ -841,7 +842,6 @@ def _validate_action_plan(state: AgentGraphState, actions: list[dict[str, Any]])
         # valid actions and surface a false "no safe action" response.
         prepared = [item for item in prepared if str(item.get("type") or "") != "unknown"]
     prepared = _drop_conflicting_answer_actions(state, prepared)
-    prepared = _drop_answers_to_pending_invalidated_by_plan(state, prepared)
     if state.get("target_mode"):
         # A free-standing model request cannot reopen replacement of a
         # confirmed mode. Declared menu choices have already been rebound to
@@ -978,22 +978,30 @@ def _validate_action_plan(state: AgentGraphState, actions: list[dict[str, Any]])
     return _ensure_action_prerequisites(state, prepared)
 
 
-def _drop_answers_to_pending_invalidated_by_plan(
+def _resolve_pending_answer_invalidation_conflicts(
     state: AgentGraphState,
     actions: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Reject answers bound to a question made stale by the same transaction."""
+    """Resolve pending answers against invalidating sibling mutations."""
 
     pending_group = str((state.get("pending_question") or {}).get("group") or "").strip()
     if not pending_group:
         return actions
+    invalidating: list[dict[str, Any]] = []
     for action in actions:
+        if str(action.get("type") or "") == "answer_pending":
+            continue
         spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
         if spec is None or not spec.mutation_dimension:
             continue
         source_group = str(spec.target_group or spec.mutation_dimension).strip()
         if pending_group in set(invalidation_targets(source_group)):
-            return [item for item in actions if str(item.get("type") or "") != "answer_pending"]
+            invalidating.append(action)
+    if invalidating:
+        return [
+            item for item in actions
+            if str(item.get("type") or "") != "answer_pending"
+        ]
     return actions
 
 
@@ -1079,7 +1087,8 @@ def _action_answers_pending_contract(state: AgentGraphState, action: dict[str, A
     selected = action.get("selected_value")
     if isinstance(selected, str) and not selected.strip():
         selected = None
-    answer = str(selected if selected is not None else action.get("answer") or "").strip()
+    raw_answer = selected if selected is not None else action.get("answer")
+    answer = str(raw_answer or "").strip()
     evidence = str(action.get("source_evidence") or "").strip()
     user_text = str(state.get("last_user_input") or "")
     declared_option = _pending_option_value_exists(selected, pending)
@@ -1099,10 +1108,10 @@ def _action_answers_pending_contract(state: AgentGraphState, action: dict[str, A
     if answer.casefold() in reserved_identifiers:
         return False
     return bool(
-        answer
+        raw_answer not in (None, "")
         and (
             declared_option
-            or _value_satisfies_pending_contract(answer, pending)
+            or _value_satisfies_pending_contract(raw_answer, pending)
         )
     )
 
@@ -2285,7 +2294,7 @@ def _dispatch_pending_action(state: AgentGraphState, action: dict[str, Any]) -> 
     if isinstance(selected, str) and not selected.strip():
         selected = None
     choice_question = str(pending.get("kind") or "") in {"numbered_choice", "yes_no"}
-    interpreted = str(selected) if selected is not None else answer
+    interpreted: Any = selected if selected is not None else raw_answer
     if not choice_question and not interpreted:
         return _apply_handler_result(
             state,

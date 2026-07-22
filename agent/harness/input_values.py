@@ -164,6 +164,25 @@ def extract_url_candidate(value: Any) -> str:
     return match.group(0).rstrip(".,;，。；") if match else ""
 
 
+def extract_url_candidates(value: Any) -> tuple[str, ...]:
+    """Return every distinct endpoint token found in source order."""
+
+    text = str(value or "")
+    matches = re.findall(
+        r"\b(?:https?|wss?)://[^\s'\"`，。；;]+"
+        r"|\b(?:localhost|127\.0\.0\.1|\[[0-9a-fA-F:]+\]|[A-Za-z0-9.-]+):"
+        r"[0-9]{2,5}(?:/[^\s'\"`，。；;]*)?",
+        text,
+        flags=re.IGNORECASE,
+    )
+    output: list[str] = []
+    for match in matches:
+        candidate = match.rstrip(".,;，。；")
+        if looks_like_url_value(candidate) and candidate not in output:
+            output.append(candidate)
+    return tuple(output)
+
+
 def extract_json_values(value: Any) -> list[Any]:
     """Decode every valid JSON object or array embedded in a value."""
 
@@ -395,6 +414,9 @@ def parse_weight_spec(value: Any) -> dict[str, int]:
     membership and total-weight rules remain with the workload domain.
     """
 
+    direct_value = _weight_mapping(value)
+    if direct_value is not None:
+        return direct_value
     text = str(value or "").strip()
     if not text:
         return {}

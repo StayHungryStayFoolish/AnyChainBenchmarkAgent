@@ -17,6 +17,9 @@ from agent.harness.domains.environment import question_for_environment
 from agent.harness.state import new_state
 from tests.agent_live.coverage_evidence import (
     COMPILED_GRAPH_RUNNER,
+    TurnObservation,
+    VerifiedPostcondition,
+    _redacted_turn_observation,
     build_evidence_artifact,
     build_real_execution_evidence_artifact,
     validate_evidence_artifact,
@@ -26,6 +29,59 @@ from tests.agent_live.graph_turn import invoke_product_graph_turn
 
 
 class CoverageEvidenceTest(unittest.TestCase):
+    def test_redaction_preserves_coverage_identity_that_names_secret_fields(self) -> None:
+        edge_key = "chain_auxiliary_endpoints::RPC_API_KEY::contract-hash"
+        secret = "runtime-secret-4821"
+        postcondition = VerifiedPostcondition(
+            verifier_id="unit",
+            passed=True,
+            observed_coverage_ids=(edge_key,),
+            admitted_typed_actions=("answer_pending",),
+            state_diff={"confirmed_config.RPC_API_KEY": secret},
+            next_question_or_result={},
+            details={
+                "credential": f"RPC_API_KEY={secret}",
+                "declared_target_results": {
+                    edge_key: {"credential": f"RPC_API_KEY={secret}"},
+                },
+            },
+        )
+        observation = TurnObservation(
+            seed=1,
+            revision=self.revision,
+            target_edge_key=edge_key,
+            target_contract_hash="contract",
+            target_variant_hash="variant",
+            prior_agent_response="Enter the credential.",
+            simulator_decision={
+                "target_coverage_ids": [edge_key],
+                "user_message": f"RPC_API_KEY={secret}",
+            },
+            exact_user_turn=f"RPC_API_KEY={secret}",
+            provider="deepseek",
+            model="deepseek-chat",
+            before_turn_index=1,
+            after_turn_index=2,
+            before_state_fingerprint="a" * 64,
+            after_state_fingerprint="b" * 64,
+            pending_contract={},
+            runtime_events=(),
+            verified_postcondition=postcondition,
+        )
+
+        safe = _redacted_turn_observation(observation)
+        serialized = json.dumps(safe, default=lambda value: value.__dict__)
+
+        self.assertEqual(safe.target_edge_key, edge_key)
+        self.assertEqual(safe.simulator_decision["target_coverage_ids"], [edge_key])
+        self.assertEqual(safe.verified_postcondition.observed_coverage_ids, (edge_key,))
+        self.assertIn(
+            edge_key,
+            safe.verified_postcondition.details["declared_target_results"],
+        )
+        self.assertNotIn(secret, serialized)
+        self.assertIn("***REDACTED***", serialized)
+
     def setUp(self) -> None:
         self.edge = {
             "edge_key": "provider_deployment::MACHINE_TYPE::variant::valid_literal::manual",

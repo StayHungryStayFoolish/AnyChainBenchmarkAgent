@@ -24,6 +24,7 @@ from .action_registry import (
     lifecycle_rejected_action_indexes,
     normalize_action_relations,
     resolve_action_target_group,
+    semantic_grounding_arguments,
     semantic_scope_accepts_action,
     semantic_scope_schema,
     validate_action_contract,
@@ -45,6 +46,7 @@ from .questions import (
     exact_answer,
     pending_contract_allows_semantic_scalar_normalization,
     pending_option_value_exists,
+    typed_pending_value_candidates,
     value_satisfies_pending_contract,
 )
 from .semantic_compiler import (
@@ -164,15 +166,23 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
             "original_request": request_payload,
         }
         active_pending_contract = bool(state.get("pending_question"))
-        repaired_response, repair_errors = _compile_semantic_candidate(
-            provider,
-            system_prompt=(
-                _pending_contract_adjudication_prompt()
-                if active_pending_contract
-                else _action_plan_repair_prompt()
-            ),
-            request_payload=repair_payload,
+        admitted_pending_answer = (
+            _canonicalize_admitted_pending_argument(plan, admission, state)
+            if pending_contract_unresolved and plan is not None and admission is not None
+            else None
         )
+        if admitted_pending_answer is not None:
+            repaired_response, repair_errors = admitted_pending_answer, ()
+        else:
+            repaired_response, repair_errors = _compile_semantic_candidate(
+                provider,
+                system_prompt=(
+                    _pending_contract_adjudication_prompt()
+                    if active_pending_contract
+                    else _action_plan_repair_prompt()
+                ),
+                request_payload=repair_payload,
+            )
         repaired, repaired_validation = _prepare_bounded_semantic_candidate(
             repaired_response,
             state,
@@ -187,11 +197,31 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
             state,
             clauses,
         )
-        if final_admission is not None and final_admission.valid and repaired_plan is not None:
+        final_pending_unresolved = bool(
+            final_admission is not None
+            and final_admission.valid
+            and repaired_plan is not None
+            and _admitted_plan_requires_pending_contract_adjudication(
+                repaired_plan,
+                final_admission,
+                state,
+            )
+        )
+        if (
+            final_admission is not None
+            and final_admission.valid
+            and repaired_plan is not None
+            and not final_pending_unresolved
+        ):
             try:
                 return _admitted_action_queue(repaired_plan, final_admission, state)
             except ValueError as exc:
                 final_errors = (*final_errors, f"receipt attachment failed: {exc}")
+        if final_pending_unresolved:
+            final_errors = (
+                *final_errors,
+                "focused adjudication did not consume the active pending contract",
+            )
         return _unresolved_action_queue(
             clauses,
             (*repaired_validation.errors, *final_errors),
@@ -203,6 +233,70 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
             "actions": [{"type": "unknown", "reason": f"action queue resolver failed: {type(exc).__name__}", "confidence": "low"}],
             "reason": "resolver failed",
         }
+
+
+def _canonicalize_admitted_pending_argument(
+    plan: ImmutableSemanticPlan,
+    admission: WholePlanAdmission,
+    state: AgentGraphState,
+) -> str | None:
+    """Convert one independently admitted pending-value argument to its owner."""
+
+    pending = dict(state.get("pending_question") or {})
+    if pending.get("manual_input_allowed") is not True:
+        return None
+    payload = plan.document()
+    request = plan.request_payload()
+    actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    records = {
+        str(record.get("action_id") or ""): record
+        for record in request.get("actions") or []
+        if isinstance(record, Mapping)
+    }
+    candidates: list[tuple[int, Any, Mapping[str, Any]]] = []
+    for index, row in enumerate(admission.action_verdicts):
+        candidate_id = str(row.get("pending_answer_argument") or "")
+        if not candidate_id or index >= len(actions) or not isinstance(actions[index], Mapping):
+            continue
+        record = records.get(str(row.get("action_id") or "")) or {}
+        candidate = next(
+            (
+                item for item in record.get("pending_value_candidates") or []
+                if isinstance(item, Mapping)
+                and str(item.get("candidate_id") or "") == candidate_id
+            ),
+            None,
+        )
+        if candidate is None or not value_satisfies_pending_contract(candidate.get("value"), pending):
+            raise ValueError("admitted pending argument does not satisfy the active contract")
+        candidates.append((index, candidate.get("value"), row))
+    if not candidates:
+        return None
+    if len(candidates) != 1:
+        raise ValueError("whole-plan admission selected multiple pending answer arguments")
+    index, pending_value, row = candidates[0]
+    original = dict(actions[index])
+    source = str(original.get("source_evidence") or "").strip()
+    if not source:
+        direct = next(
+            (
+                evidence for evidence in row.get("evidence") or []
+                if isinstance(evidence, Mapping)
+                and str(evidence.get("relation") or "") == "direct"
+                and str(evidence.get("quote") or "").strip()
+            ),
+            {},
+        )
+        source = str(direct.get("quote") or "").strip()
+    actions[index] = {
+        "type": "answer_pending",
+        "answer": pending_value,
+        "source_evidence": source,
+        "confidence": str(original.get("confidence") or "medium"),
+    }
+    payload["actions"] = actions
+    payload.pop("admission_action_ids", None)
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
 def _compile_semantic_candidate(
@@ -315,7 +409,7 @@ def _canonicalize_pending_choice_actions(text: str, state: AgentGraphState) -> s
 
     pending = dict(state.get("pending_question") or {})
     options = [item for item in pending.get("options") or [] if isinstance(item, dict)]
-    if not options:
+    if not options and not isinstance(pending.get("manual_action"), Mapping):
         return text
     payload = _parse_json_object(text)
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
@@ -324,6 +418,21 @@ def _canonicalize_pending_choice_actions(text: str, state: AgentGraphState) -> s
         if not isinstance(action, dict):
             continue
         option = _matching_pending_option(action, state)
+        manual_value = None if option else _matching_pending_manual_value(action, pending)
+        if manual_value is not None:
+            source = str(action.get("source_evidence") or "").strip()
+            units = _source_units_for_action(payload, index)
+            if not source or not any(
+                source in str(unit.get("source_text") or "") for unit in units
+            ):
+                continue
+            actions[index] = {
+                "type": "answer_pending",
+                "answer": manual_value,
+                "source_evidence": source,
+                "confidence": str(action.get("confidence") or "medium"),
+            }
+            continue
         if not option:
             continue
         action_type = str(action.get("type") or "")
@@ -372,7 +481,67 @@ def _canonicalize_pending_choice_actions(text: str, state: AgentGraphState) -> s
     payload["actions"] = actions
     if contracts:
         payload["pending_choice_contracts"] = contracts
+    payload = _coalesce_equivalent_manual_pending_answers(payload, pending)
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _coalesce_equivalent_manual_pending_answers(
+    payload: dict[str, Any],
+    pending: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Merge duplicate typed answers while preserving every source-unit owner.
+
+    A compound manual value may be repeated by the semantic compiler with a
+    different exact evidence excerpt for each source unit. The pending
+    contract owns one value, so those equivalent operations are one immutable
+    action with multiple source units, not competing mutations.
+    """
+
+    if pending.get("manual_input_allowed") is not True:
+        return payload
+    actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    first_by_value: dict[str, int] = {}
+    retained: list[Any] = []
+    old_to_new: dict[int, int] = {}
+    changed = False
+    for old_index, action in enumerate(actions):
+        if not isinstance(action, Mapping) or str(action.get("type") or "") != "answer_pending":
+            old_to_new[old_index] = len(retained)
+            retained.append(action)
+            continue
+        option = _declared_option_for_pending_answer(dict(action), dict(pending))
+        answer = action.get("answer")
+        if option or not value_satisfies_pending_contract(answer, dict(pending)):
+            old_to_new[old_index] = len(retained)
+            retained.append(action)
+            continue
+        identity = json.dumps(answer, ensure_ascii=False, sort_keys=True, default=str)
+        prior = first_by_value.get(identity)
+        if prior is None:
+            prior = len(retained)
+            first_by_value[identity] = prior
+            retained.append(action)
+        else:
+            changed = True
+        old_to_new[old_index] = prior
+    if not changed:
+        return payload
+    payload["actions"] = retained
+    for unit in payload.get("semantic_units") or []:
+        if not isinstance(unit, dict) or not isinstance(unit.get("action_indexes"), list):
+            continue
+        unit["action_indexes"] = list(dict.fromkeys(
+            old_to_new[index]
+            for index in unit["action_indexes"]
+            if isinstance(index, int) and index in old_to_new
+        ))
+    for contract in payload.get("pending_choice_contracts") or []:
+        if not isinstance(contract, dict):
+            continue
+        index = contract.get("action_index")
+        if isinstance(index, int) and index in old_to_new:
+            contract["action_index"] = old_to_new[index]
+    return payload
 
 
 def _pending_choice_contract_for_action(
@@ -545,16 +714,16 @@ def _admitted_plan_requires_pending_contract_adjudication(
         )
     if pending.get("manual_input_allowed") is not True:
         return False
-    pending_group = str(pending.get("group") or "").strip()
-    same_owner_group = any(
-        isinstance(action, Mapping)
-        and resolve_action_target_group(dict(action)) == pending_group
-        for action in actions
+    reviewer_selected_pending_owner = any(
+        str(row.get("pending_answer_argument") or "")
+        for row in admission.action_verdicts
+        if isinstance(row, Mapping)
     )
-    # A same-group mutation may be a direct restatement of the value requested
-    # by the active manual question. The focused reviewer, not a field-specific
-    # heuristic, decides whether it is an answer or an independent mutation.
-    return bool(same_owner_group or unresolved or any(
+    # The independent reviewer has already compared every typed candidate with
+    # the active pending contract. An admitted mutation with no selected
+    # pending argument is an interruption and must retain normal cross-group
+    # routing instead of being forced to consume an unrelated question.
+    return bool(reviewer_selected_pending_owner or unresolved or any(
         isinstance(action, Mapping) and str(action.get("type") or "") == "clarify_unresolved"
         for action in actions
     ))
@@ -578,6 +747,7 @@ def _freeze_bounded_semantic_plan(
         for unit in units
     ]
     action_records: list[dict[str, Any]] = []
+    pending = dict(state.get("pending_question") or {})
     for index, action in enumerate(actions):
         if not isinstance(action, dict):
             raise ValueError("immutable semantic plan contains a non-object action")
@@ -588,6 +758,11 @@ def _freeze_bounded_semantic_plan(
         if not target_group and str(action.get("type") or "") == "change_group":
             target_group = str(action.get("group") or "")
         target_spec = GROUP_SPEC_BY_NAME.get(target_group)
+        operation_arguments = _semantic_operation_arguments(action)
+        pending_value_candidates = _pending_operation_value_candidates(
+            operation_arguments,
+            pending,
+        )
         action_records.append({
             "action_id": action_ids[index],
             "action_index": index,
@@ -597,8 +772,12 @@ def _freeze_bounded_semantic_plan(
             "registry_target_group": target_group,
             "registry_target_group_owner": target_spec.owner if target_spec is not None else "",
             "declared_purpose": _semantic_action_purpose(action, spec.purpose, state),
-            "operation_arguments": _semantic_operation_arguments(action),
+            "operation_arguments": operation_arguments,
             "allowed_support_relations": list(spec.semantic_support_relations),
+            "required_value_grounding_arguments": list(
+                semantic_grounding_arguments(action)
+            ),
+            "pending_value_candidates": pending_value_candidates,
             "unit_ids": [
                 unit_ids[unit_index]
                 for unit_index, owners in enumerate(unit_owner_indexes)
@@ -631,6 +810,34 @@ def _freeze_bounded_semantic_plan(
             "semantic_scope_schema": semantic_scope_schema(),
         },
     )
+
+
+def _pending_operation_value_candidates(
+    operation_arguments: Mapping[str, Any],
+    pending: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Expose typed operation values without assigning pending ownership."""
+
+    if pending.get("manual_input_allowed") is not True:
+        return []
+    output: list[dict[str, Any]] = []
+    for argument, value in operation_arguments.items():
+        values: list[tuple[tuple[str, ...], Any]] = [((), value)]
+        if isinstance(value, Mapping):
+            values.extend(
+                ((str(key),), nested)
+                for key, nested in value.items()
+            )
+        for path, candidate in values:
+            if not value_satisfies_pending_contract(candidate, dict(pending)):
+                continue
+            output.append({
+                "candidate_id": f"candidate-{len(output)}",
+                "argument": str(argument),
+                "path": list(path),
+                "value": candidate,
+            })
+    return output
 
 
 def _semantic_unit_owner_indexes(
@@ -681,7 +888,13 @@ def _admitted_action_queue(
         row = action_rows.get(action_ids[index])
         if row is None:
             raise ValueError("admitted immutable plan is missing an action verdict")
-        if _action_owns_pending_candidate(action, state):
+        if _action_owns_pending_candidate(action, state) or _admitted_manual_answer_owns_pending(
+            action,
+            state,
+            payload,
+            index,
+            row,
+        ):
             pending_indexes.append(index)
         if action_type in {"choose_chain", "change_chain"}:
             chain_indexes.append(index)
@@ -760,6 +973,39 @@ def _admitted_action_queue(
         json.dumps(admitted_payload, ensure_ascii=False, sort_keys=True),
         trusted_metadata=True,
         normalize_relations=False,
+    )
+
+
+def _admitted_manual_answer_owns_pending(
+    action: Mapping[str, Any],
+    state: AgentGraphState,
+    payload: Mapping[str, Any],
+    action_index: int,
+    admission_row: Mapping[str, Any],
+) -> bool:
+    """Bind a semantically normalized value after independent admission."""
+
+    pending = dict(state.get("pending_question") or {})
+    if (
+        str(action.get("type") or "") != "answer_pending"
+        or pending.get("manual_input_allowed") is not True
+        or not value_satisfies_pending_contract(action.get("answer"), pending)
+    ):
+        return False
+    source = str(action.get("source_evidence") or "").strip()
+    units = _source_units_for_action(payload, action_index)
+    admitted_unit_ids = {
+        str(unit_id)
+        for unit_id in admission_row.get("unit_ids") or []
+        if str(unit_id)
+    }
+    return bool(
+        source
+        and any(
+            str(unit.get("unit_id") or "") in admitted_unit_ids
+            and source in str(unit.get("source_text") or "")
+            for unit in units
+        )
     )
 
 
@@ -1504,7 +1750,54 @@ def _matching_pending_option(
             for key, value in declared.items()
         ):
             return option
+    candidate_spec = ACTION_BY_TYPE.get(action_type)
+    explicit_flags = [
+        key for key in action if str(key).endswith("_explicit")
+    ]
+    if candidate_spec is None or not explicit_flags or any(
+        action.get(key) is not False for key in explicit_flags
+    ):
+        return {}
+    for option in options:
+        declared = option.get("action")
+        if not isinstance(declared, dict):
+            continue
+        declared_spec = ACTION_BY_TYPE.get(str(declared.get("type") or ""))
+        if (
+            declared_spec is not None
+            and declared_spec.incomplete_mutation_intake
+            and declared_spec.target_group
+            and declared_spec.target_group == candidate_spec.target_group
+        ):
+            return option
     return {}
+
+
+def _matching_pending_manual_value(
+    action: Mapping[str, Any],
+    pending: Mapping[str, Any],
+) -> Any:
+    """Return a value supplied through the question's declared manual owner."""
+
+    declared = pending.get("manual_action")
+    if not isinstance(declared, Mapping):
+        return None
+    if str(action.get("type") or "") != str(declared.get("type") or ""):
+        return None
+    value_argument = str(declared.get("value_argument") or "").strip()
+    if not value_argument or value_argument not in action:
+        return None
+    spec = ACTION_BY_TYPE.get(str(declared.get("type") or ""))
+    allowed_arguments = set(spec.allowed_arguments if spec is not None else ())
+    for key, value in declared.items():
+        if key in {"type", "value_argument"}:
+            continue
+        if key not in allowed_arguments:
+            continue
+        if action.get(key) != value:
+            return None
+    value = action.get(value_argument)
+    return value if value_satisfies_pending_contract(value, dict(pending)) else None
 
 
 def _declared_option_for_pending_answer(
@@ -2004,6 +2297,7 @@ def _action_plan_repair_prompt() -> str:
         "action_indexes:[zero-based indexes], reason}. Split prose only when exact contiguous anchors cover every word. "
         "When conjunctions or framing make a lossless split uncertain, use one full-clause unit mapped to every preserving typed action. "
         "Keep structured clauses atomic. Anchors may omit only punctuation or whitespace between units; never omit prose. "
+        "Every action source_evidence must be a short exact excerpt contained wholly inside one semantic unit mapped to that action. Never span, concatenate, or quote across neighboring units; map neighboring support units to the action separately. "
         "Introductory, framing, and trailing prose around a structured block must have its own semantic unit mapped to the block-consuming action, be context only when it contains no present operation and will pass independent context admission, or be explicitly unresolved when the relationship is unclear. Structured clauses can never be context. "
         "structured_candidates are deterministic syntax facts for their clause. When that clause is configuration/review input, preserve config_values and unmapped_values in propose_config_values, route workflow_values through their typed workflow actions, and map the atomic clause to every action needed to preserve it. A same-turn instruction to review or apply that partial configuration and continue asking for required values not supplied is processing scope of propose_config_values; map it to that proposal without adding resume_current_flow, bypassing review, or leaving it unresolved. "
         "Use only semantic_scope_schema constraints. consultation_only maps only read-only consultation actions. no_configuration_mutation may map read-only inspection and workflow navigation but not configuration changes. no_execution may map non-execution actions. Judge these constraints from action_schema.effect, never action lifetime. "
@@ -2031,7 +2325,9 @@ def _pending_contract_adjudication_prompt() -> str:
         "source_evidence copied from the selecting semantic unit. If the question accepts manual input "
         "and a semantic unit supplies a value satisfying its typed validation, represent that value only "
         "as answer_pending with answer equal to the exact extracted value and source_evidence copied from "
-        "the supplying semantic unit. Do not emit a domain owner mutation for the same answer. Preserve "
+        "the supplying semantic unit. pending_typed_candidates are syntax-only candidates derived from the "
+        "question's declared validation; use one only when the source semantically selects it, and never "
+        "guess among multiple candidates. Do not emit a domain owner mutation for the same answer. Preserve "
         "every unrelated, interrupting, or compound demand as its own registered action and preserve all "
         "semantic-unit mappings. If the active question is not resolved by the source, leave it unresolved "
         "rather than guessing. Return one complete plan; this is the only focused adjudication and the "
@@ -2057,6 +2353,7 @@ def _action_queue_payload(state: AgentGraphState, text: str) -> dict[str, Any]:
                 "clause_id": clause.clause_id,
                 **candidates,
             })
+    pending = dict(state.get("pending_question") or {})
     return {
         "user_text": raw,
         "clauses": [clause.as_dict() for clause in clauses],
@@ -2066,6 +2363,9 @@ def _action_queue_payload(state: AgentGraphState, text: str) -> dict[str, Any]:
             "contains_json_delimiters": "{" in raw and "}" in raw,
         },
         "structured_candidates": structured_candidates,
+        "pending_typed_candidates": list(
+            typed_pending_value_candidates(raw, pending)
+        ),
         "action_schema": action_schema(),
         "semantic_scope_schema": semantic_scope_schema(),
         "group_schema": group_schema(),

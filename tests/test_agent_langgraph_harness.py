@@ -301,6 +301,50 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
             ["set_qps_mode", "set_observability"],
         )
 
+    def test_cross_group_qps_change_survives_target_mode_prerequisite(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("cross-group-prerequisite", language="en")
+        state.update({
+            "active_group": "endpoint_process",
+            "custom_rpc": {"status": "needs_endpoint"},
+            "pending_question": {
+                "id": "custom_rpc_endpoint",
+                "group": "endpoint_process",
+                "kind": "url",
+                "manual_input_allowed": True,
+                "validation": {"value_type": "url"},
+            },
+            "last_user_input": "Switch the QPS profile to quick.",
+        })
+        actions = {"actions": [{
+            "type": "set_qps_mode",
+            "qps_mode": "quick",
+            "mutation_explicit": True,
+            "source_evidence": "QPS profile to quick",
+            "semantic_purpose_verified": True,
+            "confidence": "high",
+        }]}
+
+        with patch("agent.harness.coordinator.resolve_action_queue", return_value=actions):
+            result = process_turn(state)
+
+        self.assertEqual(result["pending_question"]["id"], "target_mode_select")
+        self.assertEqual(
+            [(item["type"], item.get("qps_mode")) for item in result["action_queue"]],
+            [("set_qps_mode", "quick")],
+        )
+        self.assertFalse(result.get("qps_profile"))
+
+        result["last_user_input"] = "fake-node"
+        result = process_turn(result)
+
+        self.assertEqual(result["target_mode"], "fake-node")
+        self.assertEqual(result["qps_profile"]["mode"], "quick")
+        self.assertEqual(result["pending_question"]["id"], "qps_profile_confirm")
+        self.assertEqual(result["action_queue"], [])
+
     def test_single_free_text_resolver_is_the_action_queue(self) -> None:
         """Architecture audit: the older single-action resolver generation
 
@@ -13265,11 +13309,19 @@ response:
                             "verdict": "admit",
                             "unit_ids": list(action["unit_ids"]),
                             "evidence": evidence,
+                            "grounded_arguments": [
+                                {
+                                    "argument": argument,
+                                    "evidence_quote": operation,
+                                }
+                                for argument in action.get("required_value_grounding_arguments") or []
+                            ],
+                            "pending_answer_argument": "",
                             "reason": "the immutable action preserves both source units",
                         }],
                         "unit_verdicts": [{
                             "unit_id": row["unit_id"],
-                            "verdict": "complete",
+                            "verdict": "complete" if row["source_text"] == operation else "support",
                             "owner_action_ids": list(row["owner_action_ids"]),
                             "evidence_quote": row["source_text"],
                             "omitted_action_type": "",

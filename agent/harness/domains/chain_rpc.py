@@ -879,7 +879,7 @@ def apply_chain_rpc_answer(
         _set_single_workload(next_state, normalize_scalar(value), "new_chain" if question_id.startswith("new_chain") else "custom_rpc")
         return _answer_result(state, next_state)
     if question_id in {"custom_rpc_weights", "new_chain_custom_weights"}:
-        _apply_weights(next_state, question_id, user_text or value)
+        _apply_weights(next_state, question_id, value)
         return _answer_result(state, next_state, completion="in_progress" if not (next_state.get("workload") or {}).get("confirmed") else "completed")
     if question_id == "new_chain_runtime_choice":
         if value == "use_verified_endpoint_real_node":
