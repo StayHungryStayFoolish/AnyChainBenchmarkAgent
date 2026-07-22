@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -658,6 +659,168 @@ class BatchOrchestratorTests(unittest.TestCase):
         self.assertEqual(index.classification_counts["externally_blocked"], 1)
         self.assertEqual(len(broker_threads), 1)
         self.assertNotEqual(broker_threads[0], main_thread)
+
+    def test_batch_cancellation_awaits_shard_cleanup_and_writes_interrupted_index(self) -> None:
+        self._write_targets(1)
+        markers = self.root / ".agent" / "cancel-markers"
+        manifest = freeze_batch_manifest(
+            repo_root=self.root,
+            targets_dir=self.targets,
+            manifest_path=self.root / ".agent" / "cancel-manifest.json",
+            runtime_base=self.root / ".agent" / "cancel-runtime",
+            shard_count=1,
+            command_factory=self._factory(["pass"], markers),
+            timeout_policy=TimeoutPolicy(
+                shard_seconds=5, decision_seconds=5, cleanup_seconds=1
+            ),
+        )
+        result_path = self.root / ".agent" / "cancel-index.json"
+
+        async def blocked_broker(_shard_id, _context):
+            await asyncio.sleep(60)
+            raise AssertionError("cancelled broker resumed")
+
+        async def scenario():
+            task = asyncio.create_task(run_batch(
+                manifest,
+                broker=blocked_broker,
+                result_index_path=result_path,
+            ))
+            marker = markers / "01"
+            deadline = asyncio.get_running_loop().time() + 2
+            while not marker.exists():
+                if asyncio.get_running_loop().time() >= deadline:
+                    self.fail("worker did not start before cancellation")
+                await asyncio.sleep(0.01)
+            task.cancel()
+            return await task
+
+        index = asyncio.run(scenario())
+
+        self.assertEqual(index.execution_status, "infrastructure_interrupted")
+        self.assertEqual(index.classification_counts["infrastructure_interrupted"], 1)
+        self.assertTrue(result_path.is_file())
+        self.assertTrue(index.batch_survivor_proof["cleaned"])
+        receipt = json.loads(Path(index.shards[0].cleanup_receipt_path).read_text())
+        self.assertTrue(receipt["cleaned"])
+        self.assertIn("batch cancellation requested", index.shards[0].reason)
+
+    def test_batch_interruption_event_converges_without_cancelling_batch_owner(self) -> None:
+        self._write_targets(1)
+        markers = self.root / ".agent" / "interrupt-markers"
+        manifest = freeze_batch_manifest(
+            repo_root=self.root,
+            targets_dir=self.targets,
+            manifest_path=self.root / ".agent" / "interrupt-manifest.json",
+            runtime_base=self.root / ".agent" / "interrupt-runtime",
+            shard_count=1,
+            command_factory=self._factory(["pass"], markers),
+            timeout_policy=TimeoutPolicy(
+                shard_seconds=5, decision_seconds=5, cleanup_seconds=1
+            ),
+        )
+        result_path = self.root / ".agent" / "interrupt-index.json"
+
+        async def blocked_broker(_shard_id, _context):
+            await asyncio.sleep(60)
+            raise AssertionError("interrupted broker resumed")
+
+        async def scenario():
+            interruption_event = asyncio.Event()
+            task = asyncio.create_task(run_batch(
+                manifest,
+                broker=blocked_broker,
+                result_index_path=result_path,
+                interruption_event=interruption_event,
+            ))
+            marker = markers / "01"
+            deadline = asyncio.get_running_loop().time() + 2
+            while not marker.exists():
+                if asyncio.get_running_loop().time() >= deadline:
+                    self.fail("worker did not start before interruption")
+                await asyncio.sleep(0.01)
+            interruption_event.set()
+            self.assertFalse(task.cancelled())
+            return await task
+
+        index = asyncio.run(scenario())
+
+        self.assertEqual(index.execution_status, "infrastructure_interrupted")
+        self.assertEqual(index.classification_counts["infrastructure_interrupted"], 1)
+        self.assertTrue(index.batch_survivor_proof["cleaned"])
+        self.assertTrue(result_path.is_file())
+        receipt = json.loads(Path(index.shards[0].cleanup_receipt_path).read_text())
+        self.assertTrue(receipt["cleaned"])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "formal control plane is Linux-only")
+    def test_filesystem_broker_process_sigterm_persists_truthful_cleanup(self) -> None:
+        self._write_targets(1)
+        markers = self.root / ".agent" / "signal-markers"
+        manifest_path = self.root / ".agent" / "signal-manifest.json"
+        result_path = self.root / ".agent" / "signal-index.json"
+        broker_root = self.root / ".agent" / "signal-broker"
+        manifest = freeze_batch_manifest(
+            repo_root=self.root,
+            targets_dir=self.targets,
+            manifest_path=manifest_path,
+            runtime_base=self.root / ".agent" / "signal-runtime",
+            shard_count=1,
+            command_factory=self._factory(["pass"], markers),
+            timeout_policy=TimeoutPolicy(
+                shard_seconds=10, decision_seconds=10, cleanup_seconds=1
+            ),
+        )
+        source_root = Path(__file__).resolve().parents[1]
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(source_root)
+        process = subprocess.Popen(
+            (
+                sys.executable,
+                "-m",
+                "tests.agent_live.filesystem_decision_broker",
+                "run",
+                "--manifest",
+                str(manifest_path),
+                "--result-index",
+                str(result_path),
+                "--broker-root",
+                str(broker_root),
+                "--decision-timeout",
+                "10",
+            ),
+            cwd=source_root,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 3
+            request_dir = broker_root / "requests"
+            while not tuple(request_dir.glob("*.json")):
+                if process.poll() is not None:
+                    stdout, stderr = process.communicate()
+                    self.fail(f"broker exited before signal: {stdout}\n{stderr}")
+                if time.monotonic() >= deadline:
+                    self.fail("broker did not publish a response-bound request")
+                time.sleep(0.01)
+            process.send_signal(signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=5)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=2)
+
+        self.assertEqual(process.returncode, 128 + signal.SIGTERM, (stdout, stderr))
+        self.assertTrue(result_path.is_file())
+        index = json.loads(result_path.read_text())
+        self.assertEqual(index["execution_status"], "infrastructure_interrupted")
+        self.assertTrue(index["batch_survivor_proof"]["cleaned"])
+        shard = index["shards"][0]
+        self.assertEqual(shard["classification"], "infrastructure_interrupted")
+        receipt = json.loads(Path(shard["cleanup_receipt_path"]).read_text())
+        self.assertTrue(receipt["cleaned"])
+        self.assertEqual(receipt["execution_id"], manifest.shards[0].execution_id)
 
     def test_run_revalidates_frozen_target_before_discovery_append(self) -> None:
         self._write_targets(1)

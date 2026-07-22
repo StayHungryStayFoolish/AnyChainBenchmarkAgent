@@ -260,8 +260,10 @@ def _canonicalize_semantic_units(
 
     Character offsets are control metadata, not semantic model output. The
     model identifies units with exact source excerpts; the Harness resolves a
-    unique ordered placement and attaches only punctuation/whitespace between
-    anchors. Any omitted prose or ambiguous placement remains invalid.
+    unique ordered placement and expands prose units into a lossless partition.
+    This ensures conjunctions and other unclaimed prose remain visible to the
+    independent whole-plan reviewer instead of forcing a second compiler call.
+    Structured input remains atomic, and ambiguous placement remains invalid.
     """
 
     canonical = list(raw_units)
@@ -318,7 +320,11 @@ def _canonicalize_semantic_units(
                 continue
             placements = placement_sets[0]
         else:
-            placement_sets = _unique_anchor_placements(clause.text, anchors)
+            placement_sets = _unique_anchor_placements(
+                clause.text,
+                anchors,
+                allow_unclaimed_intervals=True,
+            )
             if not placement_sets:
                 errors.append(f"source anchors do not cover {clause_id} without omitted prose")
                 continue
@@ -347,6 +353,8 @@ def _canonicalize_semantic_units(
 def _unique_anchor_placements(
     text: str,
     anchors: Sequence[str],
+    *,
+    allow_unclaimed_intervals: bool = False,
 ) -> list[list[tuple[int, int]]]:
     solutions: list[list[tuple[int, int]]] = []
 
@@ -354,13 +362,13 @@ def _unique_anchor_placements(
         if len(solutions) > 1:
             return
         if index == len(anchors):
-            if _separator_only(text[cursor:]):
+            if allow_unclaimed_intervals or _separator_only(text[cursor:]):
                 solutions.append(list(placements))
             return
         anchor = anchors[index]
         position = text.find(anchor, cursor)
         while position >= 0:
-            if _separator_only(text[cursor:position]):
+            if allow_unclaimed_intervals or _separator_only(text[cursor:position]):
                 end = position + len(anchor)
                 placements.append((position, end))
                 visit(index + 1, end, placements)

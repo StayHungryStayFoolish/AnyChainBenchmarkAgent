@@ -1183,27 +1183,66 @@ class PlanCoverageTest(unittest.TestCase):
         result = validate_plan_coverage({"actions": actions, "semantic_units": units}, clauses)
         self.assertTrue(result.valid, result.errors)
 
-    def test_semantic_unit_partition_rejects_a_source_gap(self) -> None:
+    def test_prose_anchor_partition_keeps_unclaimed_text_visible_to_reviewer(self) -> None:
+        from agent.harness.plan_coverage import _canonicalize_semantic_units
+
         clauses = segment_user_turn("configure quick then disable metrics")
         text = clauses[0].text
-        result = validate_plan_coverage(
-            {
-                "actions": [{"type": "set_qps_mode", "qps_mode": "quick"}],
-                "semantic_units": [{
-                    "unit_id": "unit-1",
-                    "clause_id": clauses[0].clause_id,
-                    "start": 0,
-                    "end": text.index(" then"),
-                    "source_text": text[:text.index(" then")],
-                    "disposition": "action",
-                    "action_indexes": [0],
-                    "reason": "qps",
-                }],
-            },
-            clauses,
+        units, errors = _canonicalize_semantic_units([{
+            "unit_id": "unit-1",
+            "clause_id": clauses[0].clause_id,
+            "source_text": "configure quick",
+            "disposition": "action",
+            "action_indexes": [0],
+            "reason": "qps",
+        }], {clauses[0].clause_id: clauses[0]})
+
+        self.assertEqual(errors, [])
+        self.assertEqual(units[0]["source_text"], text)
+        self.assertIn("then disable metrics", units[0]["source_text"])
+
+    def test_compound_prose_conjunctions_do_not_discard_registered_actions(self) -> None:
+        clauses = segment_user_turn(
+            "Use fake-node for BSC, choose the quick QPS profile, and disable observability."
         )
-        self.assertFalse(result.valid)
-        self.assertTrue(any("omitted prose" in error for error in result.errors))
+        actions = [
+            {"type": "choose_target_mode", "target_mode": "fake-node"},
+            {"type": "choose_chain", "chain_text": "BSC"},
+            {"type": "set_qps_mode", "qps_mode": "quick"},
+            {"type": "set_observability", "observability_mode": "disabled"},
+        ]
+        units = [
+            {
+                "unit_id": "unit-1",
+                "clause_id": clauses[0].clause_id,
+                "source_text": "Use fake-node for BSC",
+                "disposition": "action",
+                "action_indexes": [0, 1],
+                "reason": "mode and chain",
+            },
+            {
+                "unit_id": "unit-2",
+                "clause_id": clauses[0].clause_id,
+                "source_text": "choose the quick QPS profile",
+                "disposition": "action",
+                "action_indexes": [2],
+                "reason": "qps",
+            },
+            {
+                "unit_id": "unit-3",
+                "clause_id": clauses[0].clause_id,
+                "source_text": "disable observability",
+                "disposition": "action",
+                "action_indexes": [3],
+                "reason": "observability",
+            },
+        ]
+
+        result = validate_plan_coverage(
+            {"actions": actions, "semantic_units": units}, clauses
+        )
+
+        self.assertTrue(result.valid, result.errors)
 
     def test_harness_derives_unicode_spans_for_compound_consultation(self) -> None:
         clauses = segment_user_turn(

@@ -558,6 +558,7 @@ async def run_batch(
     broker: DecisionBroker,
     result_index_path: str | Path,
     verify_revision: bool = True,
+    interruption_event: asyncio.Event | None = None,
 ) -> BatchResultIndex:
     """Run every frozen shard once and wait for every shard to terminate."""
 
@@ -569,7 +570,34 @@ async def run_batch(
         raise FileExistsError(f"batch result index is immutable: {index_path}")
 
     tasks = [asyncio.create_task(_run_shard(frozen, shard, broker)) for shard in frozen.shards]
-    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+    batch_interrupted = False
+    try:
+        gather = asyncio.gather(*tasks, return_exceptions=True)
+        if interruption_event is None:
+            raw_results = await gather
+        else:
+            interruption_wait = asyncio.create_task(interruption_event.wait())
+            try:
+                done, _pending = await asyncio.wait(
+                    (gather, interruption_wait),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if interruption_wait in done and interruption_event.is_set():
+                    batch_interrupted = True
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                raw_results = await gather
+            finally:
+                if not interruption_wait.done():
+                    interruption_wait.cancel()
+                await asyncio.gather(interruption_wait, return_exceptions=True)
+    except asyncio.CancelledError:
+        batch_interrupted = True
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
     results: list[ShardResult] = []
     for shard, raw in zip(frozen.shards, raw_results, strict=True):
         if isinstance(raw, BaseException):
@@ -617,7 +645,9 @@ async def run_batch(
         for result in results
     )
     execution_status = (
-        "discovery_complete" if cleanup_complete else "infrastructure_interrupted"
+        "discovery_complete"
+        if cleanup_complete and not batch_interrupted
+        else "infrastructure_interrupted"
     )
     unsigned = {
         "batch_id": frozen.batch_id,
@@ -720,6 +750,9 @@ async def _run_shard(
     except asyncio.TimeoutError:
         state.forced_classification = "infrastructure_interrupted"
         state.reason = "shard wall-clock timeout"
+    except asyncio.CancelledError:
+        state.forced_classification = "infrastructure_interrupted"
+        state.reason = "batch cancellation requested"
     except Exception as exc:
         state.forced_classification = "infrastructure_interrupted"
         state.reason = f"{type(exc).__name__}: {exc}"

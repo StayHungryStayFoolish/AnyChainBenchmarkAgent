@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import json
 import os
+import signal
 import threading
 import time
 from pathlib import Path
@@ -50,7 +51,7 @@ class FilesystemDecisionBroker:
         self._lock = threading.Lock()
         self._sequence_by_shard: dict[str, int] = {}
 
-    def __call__(self, shard_id: str, context: Mapping[str, Any]) -> Mapping[str, Any]:
+    async def __call__(self, shard_id: str, context: Mapping[str, Any]) -> Mapping[str, Any]:
         response_hash = str(context.get("previous_response_hash") or "").strip()
         if len(response_hash) != 64:
             raise ExternalDecisionBlocked("broker context has no valid response hash")
@@ -88,7 +89,7 @@ class FilesystemDecisionBroker:
                     {"receipt_id": _content_hash(receipt_unsigned), **receipt_unsigned},
                 )
                 return decision
-            time.sleep(self.poll_seconds)
+            await asyncio.sleep(self.poll_seconds)
         raise ExternalDecisionBlocked(
             f"external Codex decision timed out for request {request_id}"
         )
@@ -238,12 +239,51 @@ def main(argv: Sequence[str] | None = None) -> int:
         batch_id=manifest.batch_id,
         timeout_seconds=args.decision_timeout,
     )
-    asyncio.run(run_batch(
+    interrupted_by = asyncio.run(_run_with_signal_cleanup(
         manifest,
         broker=broker,
         result_index_path=args.result_index,
     ))
-    return 0
+    return 128 + interrupted_by if interrupted_by else 0
+
+
+async def _run_with_signal_cleanup(
+    manifest: Any,
+    *,
+    broker: FilesystemDecisionBroker,
+    result_index_path: str | Path,
+) -> int:
+    """Translate process signals into one awaited batch cancellation path."""
+
+    loop = asyncio.get_running_loop()
+    interrupted_by = 0
+    interruption_event = asyncio.Event()
+
+    def interrupt(signum: int) -> None:
+        nonlocal interrupted_by
+        if interrupted_by:
+            return
+        interrupted_by = signum
+        interruption_event.set()
+
+    installed: list[int] = []
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(signum, interrupt, signum)
+            installed.append(signum)
+        except (NotImplementedError, RuntimeError):
+            continue
+    try:
+        await run_batch(
+            manifest,
+            broker=broker,
+            result_index_path=result_index_path,
+            interruption_event=interruption_event,
+        )
+    finally:
+        for signum in installed:
+            loop.remove_signal_handler(signum)
+    return interrupted_by
 
 
 if __name__ == "__main__":
