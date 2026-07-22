@@ -34,6 +34,7 @@ from .plan_coverage import PlanCoverageResult, TurnClause, segment_user_turn, va
 from .questions import (
     answer_fits_pending,
     exact_answer,
+    pending_contract_allows_semantic_scalar_normalization,
     pending_option_value_exists,
     value_satisfies_pending_contract,
 )
@@ -1414,9 +1415,13 @@ def _recover_declared_pending_option_semantics(
                 for unit_id in supporting
             })
         else:
-            if not owner_unit_id or not _manual_answer_has_literal_source(
+            literal_source = _manual_answer_has_literal_source(
                 {"answer": answer, "source_evidence": quote},
-                candidate_sources[owner_unit_id],
+                candidate_sources.get(owner_unit_id, ""),
+            )
+            if not owner_unit_id or not (
+                literal_source
+                or pending_contract_allows_semantic_scalar_normalization(pending)
             ):
                 return plan_text, False
             accepted_manual[owner_unit_id] = (answer, quote)

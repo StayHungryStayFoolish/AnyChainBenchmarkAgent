@@ -11153,6 +11153,320 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
             "source_evidence": "http://geth-dev:8545",
         }])
 
+    def test_declared_pending_contract_recovers_semantic_typed_scalar(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.questions import manual_question
+        from agent.harness.state import new_state
+
+        source = "Set the unified monitoring interval to five seconds."
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [{
+                "type": "clarify_unresolved",
+                "clause": source,
+                "source_evidence": source,
+            }],
+            "semantic_units": [
+                self._unit(clauses[0], "unit-1", [0], disposition="unresolved")
+            ],
+        }
+        state = new_state("pending-semantic-scalar", language="en")
+        state["pending_question"] = manual_question(
+            "advanced_tuning",
+            "advanced_tuning_adjust_value",
+            "Enter the value for the selected advanced setting.",
+            field="advanced_tuning_adjust_value",
+            validation={"value_type": "positive_number"},
+        )
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps({
+                "decision": "manual_value",
+                "answer": "5",
+                "evidence_quote": source,
+                "supporting_unit_ids": [],
+                "independent_unit_ids": [],
+                "reason": "the typed value is five seconds",
+            })),
+            SimpleNamespace(text=json.dumps({
+                "decision": "manual_value",
+                "answer": "5",
+                "evidence_quote": "five seconds",
+                "supporting_unit_ids": [],
+                "independent_unit_ids": [],
+                "reason": "the canonical positive number is 5",
+            })),
+        ]
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            PlanCoverageResult(
+                valid=False,
+                errors=("unresolved typed scalar",),
+                unresolved_clauses=(source,),
+                rejected_action_indexes=(0,),
+                incomplete_unit_ids=("unit-1",),
+            ),
+            clauses=clauses,
+            user_text=source,
+        )
+        recovered = json.loads(recovered_text)
+
+        self.assertTrue(changed)
+        self.assertEqual(recovered["actions"], [{
+            "type": "answer_pending",
+            "answer": "5",
+            "source_evidence": source,
+        }])
+        self.assertEqual(recovered["pending_answer_admissions"], [0])
+
+    def test_semantic_scalar_recovery_is_not_available_to_literal_text_contracts(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.questions import manual_question
+        from agent.harness.state import new_state
+
+        source = "Use the value described as five seconds."
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [],
+            "semantic_units": [
+                self._unit(clauses[0], "unit-1", [], disposition="unresolved")
+            ],
+        }
+        state = new_state("pending-literal-text", language="en")
+        state["pending_question"] = manual_question(
+            "environment_hardware",
+            "machine_type",
+            "Enter the machine type.",
+            field="MACHINE_TYPE",
+            validation={"value_type": "bounded_text", "max_length": 80},
+        )
+        verdict = SimpleNamespace(text=json.dumps({
+            "decision": "manual_value",
+            "answer": "5",
+            "evidence_quote": "five seconds",
+            "supporting_unit_ids": [],
+            "independent_unit_ids": [],
+            "reason": "normalized text",
+        }))
+        provider = Mock()
+        provider.complete.side_effect = [verdict, verdict]
+
+        recovered_text, changed = _recover_declared_pending_option_semantics(
+            provider,
+            json.dumps(payload),
+            state,
+            PlanCoverageResult(
+                valid=False,
+                errors=("unresolved text",),
+                unresolved_clauses=(source,),
+                incomplete_unit_ids=("unit-1",),
+            ),
+            clauses=clauses,
+            user_text=source,
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(json.loads(recovered_text), payload)
+
+    def test_semantic_scalar_recovery_is_contract_generic(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.questions import manual_question
+        from agent.harness.state import new_state
+
+        cases = (
+            {
+                "name": "environment integer",
+                "group": "environment_hardware",
+                "validation": "positive_integer",
+                "source": "Use six worker threads.",
+                "answer": "6",
+                "quote_1": "Use six worker threads.",
+                "quote_2": "six worker threads",
+                "supporting": [],
+            },
+            {
+                "name": "performance decimal",
+                "group": "performance_mode",
+                "validation": "positive_number",
+                "source": "Set bandwidth ceiling to 12.5 gigabits.",
+                "answer": "12.5",
+                "quote_1": "Set bandwidth ceiling to 12.5 gigabits.",
+                "quote_2": "12.5 gigabits",
+                "supporting": [],
+            },
+            {
+                "name": "sync observe multiline",
+                "group": "sync_observe",
+                "validation": "positive_number",
+                "source": "For the sync observer:\nset the interval to seven seconds.",
+                "answer": "7",
+                "quote_1": "set the interval to seven seconds.",
+                "quote_2": "seven seconds",
+                "supporting": ["unit-1"],
+            },
+        )
+        for case in cases:
+            with self.subTest(case["name"]):
+                clauses = segment_user_turn(case["source"])
+                units = [
+                    self._unit(
+                        clause,
+                        f"unit-{index}",
+                        [],
+                        disposition="unresolved",
+                    )
+                    for index, clause in enumerate(clauses, start=1)
+                ]
+                payload = {"actions": [], "semantic_units": units}
+                state = new_state(f"semantic-{case['name']}", language="en")
+                state["pending_question"] = manual_question(
+                    case["group"],
+                    "generic_typed_value",
+                    "Enter the requested value.",
+                    field="generic_typed_value",
+                    validation={"value_type": case["validation"]},
+                )
+                verdicts = [
+                    SimpleNamespace(text=json.dumps({
+                        "decision": "manual_value",
+                        "answer": case["answer"],
+                        "evidence_quote": quote,
+                        "supporting_unit_ids": case["supporting"],
+                        "independent_unit_ids": [],
+                        "reason": "one source-grounded typed scalar",
+                    }))
+                    for quote in (case["quote_1"], case["quote_2"])
+                ]
+                provider = Mock()
+                provider.complete.side_effect = verdicts
+
+                recovered_text, changed = _recover_declared_pending_option_semantics(
+                    provider,
+                    json.dumps(payload),
+                    state,
+                    PlanCoverageResult(
+                        valid=False,
+                        errors=("unresolved typed scalar",),
+                        unresolved_clauses=tuple(clause.text for clause in clauses),
+                        incomplete_unit_ids=tuple(unit["unit_id"] for unit in units),
+                    ),
+                    clauses=clauses,
+                    user_text=case["source"],
+                )
+
+                self.assertTrue(changed)
+                self.assertEqual(
+                    json.loads(recovered_text)["actions"][-1]["answer"],
+                    case["answer"],
+                )
+
+    def test_semantic_scalar_recovery_fails_closed(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.questions import manual_question
+        from agent.harness.state import new_state
+
+        source = "Set the interval to five or six seconds."
+        clauses = segment_user_turn(source)
+        payload = {
+            "actions": [],
+            "semantic_units": [
+                self._unit(clauses[0], "unit-1", [], disposition="unresolved")
+            ],
+        }
+        state = new_state("semantic-scalar-fail-closed", language="en")
+        state["pending_question"] = manual_question(
+            "sync_observe",
+            "generic_typed_value",
+            "Enter the requested value.",
+            field="generic_typed_value",
+            validation={"value_type": "positive_number"},
+        )
+        coverage = PlanCoverageResult(
+            valid=False,
+            errors=("unresolved typed scalar",),
+            unresolved_clauses=(source,),
+            incomplete_unit_ids=("unit-1",),
+        )
+
+        cases = (
+            (
+                "adjudicator disagreement",
+                {
+                    "decision": "manual_value",
+                    "answer": "5",
+                    "evidence_quote": "five",
+                },
+                {
+                    "decision": "manual_value",
+                    "answer": "6",
+                    "evidence_quote": "six",
+                },
+            ),
+            (
+                "conflicting values",
+                {"decision": "ambiguous", "answer": "", "evidence_quote": source},
+                {"decision": "ambiguous", "answer": "", "evidence_quote": source},
+            ),
+            (
+                "invalid zero",
+                {"decision": "manual_value", "answer": "0", "evidence_quote": source},
+                {"decision": "manual_value", "answer": "0", "evidence_quote": source},
+            ),
+            (
+                "missing exact evidence",
+                {"decision": "manual_value", "answer": "5", "evidence_quote": "not present"},
+                {"decision": "manual_value", "answer": "5", "evidence_quote": "not present"},
+            ),
+        )
+        for name, first, second in cases:
+            with self.subTest(name):
+                provider = Mock()
+                provider.complete.side_effect = [
+                    SimpleNamespace(text=json.dumps({
+                        **verdict,
+                        "option_id": "",
+                        "supporting_unit_ids": [],
+                        "independent_unit_ids": [],
+                        "reason": name,
+                    }))
+                    for verdict in (first, second)
+                ]
+
+                recovered_text, changed = _recover_declared_pending_option_semantics(
+                    provider,
+                    json.dumps(payload),
+                    state,
+                    coverage,
+                    clauses=clauses,
+                    user_text=source,
+                )
+
+                self.assertFalse(changed)
+                self.assertEqual(json.loads(recovered_text), payload)
+
     def test_declared_pending_contract_can_bind_supporting_context(self) -> None:
         import json
         from types import SimpleNamespace

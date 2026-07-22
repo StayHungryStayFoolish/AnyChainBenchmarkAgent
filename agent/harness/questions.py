@@ -19,6 +19,11 @@ def _question_validation(kind: str, validation: dict[str, Any] | None) -> dict[s
         return {"value_type": "evidence_contribution", "max_length": 65536}
     if kind == "manual_value" and not field_validation:
         return {"value_type": "scalar_token", "max_length": 180}
+    if str(field_validation.get("value_type") or "") in {
+        "positive_number",
+        "positive_integer",
+    }:
+        field_validation.setdefault("normalization", "semantic_scalar")
     return field_validation
 
 
@@ -355,6 +360,24 @@ def value_satisfies_pending_contract(value: Any, question: dict[str, Any]) -> bo
     }:
         return literal_matches_validation(raw, validation)
     return answer_fits_pending(raw, question)
+
+
+def pending_contract_allows_semantic_scalar_normalization(
+    question: dict[str, Any],
+) -> bool:
+    """Return whether the typed question declares semantic scalar coercion."""
+
+    validation = question.get("validation") or {}
+    declared = str(validation.get("normalization") or "")
+    if declared:
+        return declared == "semantic_scalar"
+    # Checkpoints created before this capability was made explicit still carry
+    # the typed numeric schema. Preserve their semantics without relying on a
+    # question id, field name, language, or value vocabulary.
+    return str(validation.get("value_type") or "") in {
+        "positive_number",
+        "positive_integer",
+    }
 
 
 def manual_literal_violation(value: str, question: dict[str, Any]) -> dict[str, Any]:
