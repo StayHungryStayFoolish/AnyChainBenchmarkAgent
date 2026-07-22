@@ -522,12 +522,17 @@ def apply_chain_rpc_action(state: AgentGraphState, action: ActionProposal) -> Ha
                 "请输入要测试的链名。",
                 "Enter the chain name to test.",
             )
+        manual_action_type = "change_chain" if current_chain else "choose_chain"
         _set_control(next_state, 'pending_question', manual_question(
             "chain_identity",
             "chain_change_input",
             prompt,
             field="chain_change_input",
             accepted_action_types=("choose_chain", "change_chain"),
+            manual_action={
+                "type": manual_action_type,
+                "value_argument": "chain_text",
+            },
             queue_barrier=True,
             evidence_path="chain_identity.change_candidate.canonical",
         ))

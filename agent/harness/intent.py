@@ -1042,6 +1042,20 @@ def _recover_declared_pending_option_semantics(
         for unit in units
         if isinstance(unit, dict)
     ).strip()
+    manual_template = dict(pending.get("manual_action") or {})
+    manual_action_type = str(manual_template.get("type") or "")
+    manual_action_spec = ACTION_BY_TYPE.get(manual_action_type)
+    declared_manual_owner = {
+        "action_type": manual_action_type,
+        "purpose": manual_action_spec.purpose if manual_action_spec is not None else "",
+        "value_argument": str(manual_template.get("value_argument") or ""),
+        "use_complete_turn": manual_template.get("use_complete_turn") is True,
+        "semantic_support_relations": list(
+            manual_action_spec.semantic_support_relations
+            if manual_action_spec is not None
+            else ()
+        ),
+    }
     adjudication_contract = (
         "Adjudicate the complete user turn against only the finite contract declared by the active "
         "AnyChain pending question. Decide ownership before assigning individual semantic units. "
@@ -1090,6 +1104,7 @@ def _recover_declared_pending_option_semantics(
             "validation": pending.get("validation") or {},
             "manual_input_allowed": manual_allowed,
             "completion_effect": str(pending.get("completion_effect") or ""),
+            "declared_manual_owner": declared_manual_owner,
         },
         "available_options": available,
         "admitted_anchors": anchors,
@@ -4278,6 +4293,8 @@ def _materialize_pending_manual_owner_actions(
     for index in sorted(answer_indexes):
         answer = actions[index]
         selected = answer.get("selected_value")
+        if selected in (None, ""):
+            selected = answer.get("answer")
         if not use_complete_turn and selected in (None, ""):
             continue
         evidence = str(answer.get("source_evidence") or "").strip()

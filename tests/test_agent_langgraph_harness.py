@@ -6257,6 +6257,10 @@ network:
             set(initial_result["pending_question"]["accepted_action_types"]),
             {"answer_pending", "choose_chain", "change_chain"},
         )
+        self.assertEqual(
+            initial_result["pending_question"]["manual_action"],
+            {"type": "choose_chain", "value_argument": "chain_text"},
+        )
         self.assertIn("chain name to test", initial_result["pending_question"]["prompt"])
         self.assertNotIn("replacement", initial_result["pending_question"]["prompt"])
 
@@ -6273,6 +6277,233 @@ network:
             set(replacement_result["pending_question"]["accepted_action_types"]),
             {"answer_pending", "choose_chain", "change_chain"},
         )
+        self.assertEqual(
+            replacement_result["pending_question"]["manual_action"],
+            {"type": "change_chain", "value_argument": "chain_text"},
+        )
+
+    def test_multiline_replacement_chain_is_owned_by_declared_pending_action(self) -> None:
+        import json
+        from types import SimpleNamespace
+
+        from agent.harness.intent import (
+            _materialize_pending_manual_owner_actions,
+            _recover_declared_pending_option_semantics,
+        )
+        from agent.harness.plan_coverage import PlanCoverageResult, TurnClause
+        from agent.harness.state import new_state
+
+        operation = "Replace the current chain."
+        value = "Use ethereum as the new chain name."
+        constraint = "Keep bsc only until I confirm this candidate."
+        user_text = "\n".join((operation, value, constraint))
+        units = [
+            {
+                "unit_id": f"unit-{index}",
+                "clause_id": f"clause-{index}",
+                "source_text": source,
+                "disposition": "unresolved",
+                "action_indexes": [index - 1],
+                "reason": "planner did not map the pending-owned turn",
+            }
+            for index, source in enumerate((operation, value, constraint), start=1)
+        ]
+        plan = json.dumps({
+            "actions": [
+                {
+                    "type": "clarify_unresolved",
+                    "unresolved_text": source,
+                    "source_evidence": source,
+                }
+                for source in (operation, value, constraint)
+            ],
+            "semantic_units": units,
+        })
+        verdict = {
+            "decision": "manual_value",
+            "option_id": "",
+            "answer": "ethereum",
+            "evidence_quote": value,
+            "supporting_unit_ids": ["unit-1", "unit-2", "unit-3"],
+            "independent_unit_ids": [],
+            "reason": "one replacement value with operation and staging support",
+        }
+
+        class Provider:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def complete(self, request: object) -> object:
+                self.requests.append(request)
+                return SimpleNamespace(text=json.dumps(verdict))
+
+        provider = Provider()
+        state = new_state("multiline-chain-owner", language="en")
+        state["chain_identity"] = {
+            "raw": "bsc", "canonical": "bsc", "status": "confirmed", "case": "known"
+        }
+        state["pending_question"] = {
+            "id": "chain_change_input",
+            "group": "chain_identity",
+            "kind": "manual_value",
+            "field": "chain_change_input",
+            "prompt": "Enter the replacement chain name.",
+            "manual_input_allowed": True,
+            "options": [],
+            "accepted_action_types": ["answer_pending", "choose_chain", "change_chain"],
+            "manual_action": {"type": "change_chain", "value_argument": "chain_text"},
+            "validation": {"value_type": "scalar_token", "max_length": 180},
+        }
+        clauses = tuple(
+            TurnClause(f"clause-{index}", source)
+            for index, source in enumerate((operation, value, constraint), start=1)
+        )
+        validation = PlanCoverageResult(
+            valid=False,
+            errors=("unresolved semantic units",),
+            unresolved_clauses=(operation, value, constraint),
+            incomplete_unit_ids=("unit-1", "unit-2", "unit-3"),
+        )
+
+        recovered, changed = _recover_declared_pending_option_semantics(
+            provider, plan, state, validation, clauses, user_text
+        )
+        self.assertTrue(changed)
+        request_payload = json.loads(provider.requests[0].messages[-1].content)
+        self.assertEqual(
+            request_payload["pending_question"]["declared_manual_owner"]["action_type"],
+            "change_chain",
+        )
+        materialized, changed = _materialize_pending_manual_owner_actions(
+            recovered, state, user_text
+        )
+        self.assertTrue(changed)
+        payload = json.loads(materialized)
+        self.assertEqual([action["type"] for action in payload["actions"]], ["change_chain"])
+        self.assertEqual(payload["actions"][0]["chain_text"], "ethereum")
+        self.assertEqual(payload["actions"][0]["source_evidence"], value)
+        self.assertEqual(
+            [unit["action_indexes"] for unit in payload["semantic_units"]],
+            [[], [0], []],
+        )
+
+    def test_declared_manual_owner_materializes_recovered_non_chain_answer(self) -> None:
+        import json
+
+        from agent.harness.intent import _materialize_pending_manual_owner_actions
+        from agent.harness.state import new_state
+
+        source = "Use https://rpc.example.invalid for validation."
+        state = new_state("manual-owner-endpoint", language="en")
+        state["pending_question"] = {
+            "id": "custom_rpc_endpoint",
+            "group": "endpoint_process",
+            "kind": "manual_value",
+            "field": "custom_rpc_endpoint",
+            "manual_input_allowed": True,
+            "options": [],
+            "manual_action": {
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_endpoint",
+                "value_argument": "rpc_endpoint",
+            },
+        }
+        plan = json.dumps({
+            "actions": [{
+                "type": "answer_pending",
+                "answer": "https://rpc.example.invalid",
+                "source_evidence": source,
+            }],
+            "pending_answer_admissions": [0],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": source,
+                "disposition": "action",
+                "action_indexes": [0],
+            }],
+        })
+
+        materialized, changed = _materialize_pending_manual_owner_actions(
+            plan, state, source
+        )
+
+        self.assertTrue(changed)
+        action = json.loads(materialized)["actions"][0]
+        self.assertEqual(action["type"], "rpc_catalog_command")
+        self.assertEqual(action["catalog_command"], "set_endpoint")
+        self.assertEqual(action["rpc_endpoint"], "https://rpc.example.invalid")
+
+    def test_pending_manual_owner_does_not_absorb_ambiguous_multiline_values(self) -> None:
+        import json
+        from types import SimpleNamespace
+
+        from agent.harness.intent import _recover_declared_pending_option_semantics
+        from agent.harness.plan_coverage import PlanCoverageResult, TurnClause
+        from agent.harness.state import new_state
+
+        sources = (
+            "Replace the current chain with ethereum.",
+            "Use polygon instead.",
+        )
+        plan = json.dumps({
+            "actions": [
+                {
+                    "type": "clarify_unresolved",
+                    "unresolved_text": source,
+                    "source_evidence": source,
+                }
+                for source in sources
+            ],
+            "semantic_units": [
+                {
+                    "unit_id": f"unit-{index}",
+                    "clause_id": f"clause-{index}",
+                    "source_text": source,
+                    "disposition": "unresolved",
+                    "action_indexes": [index - 1],
+                }
+                for index, source in enumerate(sources, start=1)
+            ],
+        })
+        provider = SimpleNamespace(complete=lambda _request: SimpleNamespace(text=json.dumps({
+            "decision": "ambiguous",
+            "option_id": "",
+            "answer": "",
+            "evidence_quote": sources[0],
+            "supporting_unit_ids": [],
+            "independent_unit_ids": ["unit-1", "unit-2"],
+            "reason": "two conflicting replacement values",
+        })))
+        state = new_state("ambiguous-chain-owner", language="en")
+        state["pending_question"] = {
+            "id": "chain_change_input",
+            "group": "chain_identity",
+            "kind": "manual_value",
+            "field": "chain_change_input",
+            "prompt": "Enter the replacement chain name.",
+            "manual_input_allowed": True,
+            "options": [],
+            "manual_action": {"type": "change_chain", "value_argument": "chain_text"},
+            "validation": {"value_type": "scalar_token", "max_length": 180},
+        }
+        clauses = tuple(
+            TurnClause(f"clause-{index}", source)
+            for index, source in enumerate(sources, start=1)
+        )
+        validation = PlanCoverageResult(
+            valid=False,
+            errors=("unresolved semantic units",),
+            unresolved_clauses=sources,
+            incomplete_unit_ids=("unit-1", "unit-2"),
+        )
+
+        recovered, changed = _recover_declared_pending_option_semantics(
+            provider, plan, state, validation, clauses, "\n".join(sources)
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(json.loads(recovered), json.loads(plan))
 
     def test_case2_compound_rpc_evidence_preserves_endpoint_and_requests_schema_review(self) -> None:
         from agent.harness.domains.chain_rpc import apply_chain_rpc_answer
