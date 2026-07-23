@@ -229,6 +229,154 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         self.assertEqual(result["actions"][0]["type"], "answer_pending")
         self.assertEqual(result["actions"][0]["selected_value"], "target_mode")
 
+    def test_declared_option_id_is_canonicalized_to_its_value(self) -> None:
+        from agent.harness.intent import _canonicalize_pending_choice_actions
+        from agent.harness.plan_coverage import segment_user_turn
+
+        state = _state(active_group="chain_auxiliary_endpoints")
+        state["pending_question"] = {
+            "contract_version": 1,
+            "id": "OPTIONAL_FIELD",
+            "group": "chain_auxiliary_endpoints",
+            "kind": "manual_value",
+            "field": "OPTIONAL_FIELD",
+            "manual_input_allowed": True,
+            "options": [{
+                "id": "skip",
+                "label": "Skip (not configured)",
+                "value": "none",
+                "action": {"type": "answer_pending"},
+            }],
+            "manual_action": {"type": "answer_pending", "value_argument": "answer"},
+            "validation": {"value_type": "scalar_token"},
+        }
+        text = "Skip it."
+        clause = segment_user_turn(text)[0]
+        candidate = json.dumps({
+            "actions": [{
+                "type": "answer_pending",
+                "answer": "skip",
+                "source_evidence": "Skip",
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": clause.clause_id,
+                "source_text": clause.text,
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "declared option id",
+            }],
+        })
+
+        canonical = json.loads(_canonicalize_pending_choice_actions(candidate, state))
+
+        self.assertEqual(canonical["actions"][0]["answer"], "none")
+        self.assertEqual(canonical["actions"][0]["selected_value"], "none")
+        self.assertEqual(
+            canonical["pending_choice_contracts"][0]["option"]["selected_value"],
+            "none",
+        )
+
+    def test_focused_adjudication_absorbs_option_rationale_only(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        state = _recovery_state()
+        text = "Choose pause; the evidence must remain available."
+        first = {
+            "actions": [
+                {
+                    "type": "answer_pending",
+                    "selected_value": "cancel",
+                    "source_evidence": "Choose pause",
+                },
+                {
+                    "type": "answer_opening_question",
+                    "topic": "config_explanation",
+                    "subject": "failure evidence",
+                    "source_evidence": "the evidence must remain available",
+                },
+            ],
+            "semantic_units": [
+                {
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "source_text": "Choose pause",
+                    "disposition": "action",
+                    "action_indexes": [0],
+                    "reason": "declared selection",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "clause_id": "clause-2",
+                    "source_text": "the evidence must remain available",
+                    "disposition": "action",
+                    "action_indexes": [1],
+                    "reason": "untrusted rationale classification",
+                },
+            ],
+        }
+        focused = deepcopy(first)
+        focused["actions"] = [deepcopy(first["actions"][0])]
+        focused["semantic_units"][1]["action_indexes"] = [0]
+        focused["semantic_units"][1]["reason"] = "rationale supporting the selection"
+        provider = _provider([first, focused])
+
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
+        self.assertEqual(provider.complete.call_count, 4)
+        self.assertEqual([item["type"] for item in result["actions"]], ["answer_pending"])
+        self.assertEqual(result["actions"][0]["selected_value"], "cancel")
+
+    def test_focused_adjudication_preserves_real_question_after_option(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        state = _recovery_state()
+        text = "Choose pause; what evidence will be preserved?"
+        document = {
+            "actions": [
+                {
+                    "type": "answer_pending",
+                    "selected_value": "cancel",
+                    "source_evidence": "Choose pause",
+                },
+                {
+                    "type": "answer_opening_question",
+                    "topic": "config_explanation",
+                    "subject": "failure evidence",
+                    "source_evidence": "what evidence will be preserved?",
+                },
+            ],
+            "semantic_units": [
+                {
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "source_text": "Choose pause",
+                    "disposition": "action",
+                    "action_indexes": [0],
+                    "reason": "declared selection",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "clause_id": "clause-2",
+                    "source_text": "what evidence will be preserved?",
+                    "disposition": "action",
+                    "action_indexes": [1],
+                    "reason": "independent consultation",
+                },
+            ],
+        }
+        provider = _provider([document, document])
+
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
+        self.assertEqual(provider.complete.call_count, 4)
+        self.assertEqual(
+            [item["type"] for item in result["actions"]],
+            ["answer_pending", "answer_opening_question"],
+        )
+
     def test_semantic_review_derives_incomplete_intake_from_registry(self) -> None:
         from agent.harness.domains.chain_rpc_questions import _target_change_scope_question
         from agent.harness.intent import (
@@ -939,6 +1087,7 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
             if "plan_hash" not in json.loads(request.messages[1].content)
         ]
         self.assertIn("only focused adjudication", compiler_prompts[1])
+        self.assertIn("adjacent prose only gives the reason", compiler_prompts[1])
         self.assertEqual(result["actions"][0]["type"], "answer_pending")
         self.assertEqual(result["actions"][0]["selected_value"], "cancel")
         self.assertEqual(result["pending_choice_contracts"][0]["question"]["id"], "failure_recovery_action")

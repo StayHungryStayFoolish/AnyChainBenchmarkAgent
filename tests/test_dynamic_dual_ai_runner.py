@@ -588,7 +588,7 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             )
             self.assertEqual(len(seen), 1)
 
-    def test_action_edge_uses_registered_pending_action_contract(self) -> None:
+    def test_action_edge_can_interrupt_unrelated_startup_overlay_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             action_edge = {
@@ -640,7 +640,7 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 state_diff_hashes={"pending_question": {"before": "a" * 64, "after": "b" * 64}},
                 pending_contract={
                     "id": "typed_action_intake",
-                    "accepted_action_types": ["queue_workflow_goal"],
+                    "accepted_action_types": ["answer_pending"],
                 },
                 next_result={"kind": "question", "question_id": "typed_action_intake"},
             )

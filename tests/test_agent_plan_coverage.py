@@ -1095,7 +1095,10 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertTrue(any("does not select an exact declared option" in error for error in result.errors))
 
     def test_pending_choice_accepts_exact_declared_label(self) -> None:
-        from agent.harness.intent import _validate_action_document
+        from agent.harness.intent import (
+            _canonicalize_pending_choice_actions,
+            _validate_action_document,
+        )
         from agent.harness.state import new_state
 
         text = "Use defaults"
@@ -1111,7 +1114,11 @@ class PlanCoverageTest(unittest.TestCase):
             "semantic_units": [_unit(clauses[0], 1, [0])],
         }
 
-        result = _validate_action_document(__import__("json").dumps(payload), clauses, state)
+        candidate = _canonicalize_pending_choice_actions(
+            __import__("json").dumps(payload),
+            state,
+        )
+        result = _validate_action_document(candidate, clauses, state)
 
         self.assertTrue(result.valid, result.errors)
 

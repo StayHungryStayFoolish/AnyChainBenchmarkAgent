@@ -2166,13 +2166,11 @@ def _require_scheduled_baseline_contract(
 
     edge_type = str(edge.get("edge_type") or "")
     if edge_type == "action_transition":
-        if event.pending_question_id or event.pending_contract:
-            accepted = {
-                str(item)
-                for item in event.pending_contract.get("accepted_action_types") or ()
-            }
-            if str(edge.get("action_type") or "") not in accepted:
-                raise RuntimeError("action-only target has an unrelated pending contract")
+        # Action transitions are semantic interruptions. A real product CLI
+        # may overlay a startup/resume or fallback question on the reviewed
+        # checkpoint before Codex submits that action. Product admission and
+        # the transition postcondition, not the old question's answer list,
+        # decide whether the interruption is valid.
         return
     expected_question = str(edge.get("question_id") or "")
     if event.pending_question_id != expected_question:

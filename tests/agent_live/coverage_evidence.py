@@ -1283,19 +1283,9 @@ def _validate_turn_observation(
     if dict(observation.pending_contract) != dict(baseline.pending_contract):
         raise ValueError("pending contract is not bound to the baseline runtime event")
     edge_type = str(edge.get("edge_type") or "")
-    if edge_type == "action_transition":
-        if baseline.pending_question_id or baseline.pending_contract:
-            accepted = {
-                str(item)
-                for item in baseline.pending_contract.get("accepted_action_types") or ()
-            }
-            if str(edge.get("action_type") or "") not in accepted:
-                raise ValueError(
-                    "action-only baseline has an unrelated pending contract"
-                )
-    elif not baseline.pending_question_id:
+    if edge_type != "action_transition" and not baseline.pending_question_id:
         raise ValueError("baseline runtime event has no pending contract")
-    else:
+    elif edge_type != "action_transition":
         expected_question = str(edge.get("question_id") or "")
         if baseline.pending_question_id != expected_question:
             raise ValueError("baseline pending question does not match the target edge")

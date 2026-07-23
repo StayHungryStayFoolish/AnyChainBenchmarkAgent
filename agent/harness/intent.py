@@ -158,7 +158,7 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
         if pending_contract_unresolved:
             admission_errors = (
                 *admission_errors,
-                "active pending contract remains unresolved after whole-plan admission",
+                "active pending answer coexists with sibling actions; focused adjudication must remove every sibling that is only rationale for that answer and preserve every genuinely independent sibling",
             )
 
         repair_payload = {
@@ -926,10 +926,18 @@ def _admitted_plan_requires_pending_contract_adjudication(
         == action.get("selected_value", action.get("answer"))
         for index, action in enumerate(actions)
     )
-    if payload.get("pending_choice_contracts") or any(
+    has_pending_owner = bool(payload.get("pending_choice_contracts")) or any(
         isinstance(action, dict) and _action_owns_pending_candidate(action, state)
         for action in actions
-    ):
+    )
+    if has_pending_owner and len(actions) > 1 and not focused_adjudication:
+        # A broad compiler may split a declared selection from adjacent prose.
+        # The focused adjudicator, which sees the complete pending contract,
+        # owns the semantic distinction between rationale and an independent
+        # sibling operation. Do not let a broadly admitted compound plan bypass
+        # that ownership boundary.
+        return True
+    if has_pending_owner:
         return False
     invalid_pending_answer = any(
         isinstance(action, Mapping)
@@ -2082,6 +2090,21 @@ def _declared_option_for_pending_answer(
         ),
         {},
     )
+    if (
+        not option
+        and ("selected_value" not in action or action.get("selected_value") is None)
+        and action.get("answer") not in (None, "")
+    ):
+        answer_selects_option, answer_value = exact_answer(str(action.get("answer")), pending)
+        if answer_selects_option:
+            option = next(
+                (
+                    item
+                    for item in pending.get("options") or []
+                    if isinstance(item, dict) and item.get("value") == answer_value
+                ),
+                {},
+            )
     if not option or "selected_value" not in action or action.get("selected_value") is None:
         return option
     answer = action.get("answer")
@@ -2527,13 +2550,14 @@ def _semantic_fulfillment_prompt(*, review_kind: str = "both") -> str:
         "A registered operation performs the effect stated by its authoritative declared_purpose. Never require operation_arguments to repeat, simulate, or prove that effect; arguments carry only source-selected values and evidence required by that operation. In particular, a lifecycle command may legitimately have only source evidence as its argument while its declared purpose defines the state transition. "
         "When an active evidence collection exists, an explicit source demand to pause or suspend that collection is independent from navigation or configuration and requires a purpose that pauses while preserving it. Navigation alone is incomplete for that demand. An explicit request to resume a paused collection likewise requires a resume purpose. "
         "A custom-RPC-entry purpose is supported when the source explicitly asks to start, add, supply, or configure a custom RPC method workflow. It intentionally carries no endpoint, method identity, or schema payload; requiring those facts at entry would skip later typed collection questions. A discussion-only question about whether custom RPC is possible does not support entry. "
-        "A read-only consultation purpose is supported only when the source asks for an answer, explanation, comparison, status, preparation guidance, or similar information. It is not supported when the source explicitly requests only a selection, mutation, navigation, execution, or evidence-ingestion operation. Distinct consultation subjects remain independent demands: a purpose that reports workflow configuration or pending context does not report whether a current or historical benchmark job exists, and a job-status purpose does not report retained workflow configuration. A compound unit asking for both is complete only when mapped purposes explicitly cover both subjects. "
+        "A read-only consultation purpose is supported only when the source asks for an answer, explanation, comparison, status, preparation guidance, or similar information. It is not supported when the source explicitly requests only a selection, mutation, navigation, execution, or evidence-ingestion operation. A declarative reason attached to a pending-option selection does not become a consultation merely because it explains that selection; when it has no independent question or requested effect, it is support for the pending-answer purpose and a proposed consultation over that reason is unsupported. Distinct consultation subjects remain independent demands: a purpose that reports workflow configuration or pending context does not report whether a current or historical benchmark job exists, and a job-status purpose does not report retained workflow configuration. A compound unit asking for both is complete only when mapped purposes explicitly cover both subjects. "
         + GROUP_NAVIGATION_SEMANTIC_POLICY
         + "When an action record has registry_incomplete_mutation_intake=true, its authoritative declared_purpose intentionally opens a later typed intake. Admit it when the source explicitly requests the initial selection or replacement described by that purpose but supplies no concrete value; do not require the value that the later question exists to collect. When such an action is the declared owner of an active pending option, selecting that option is sufficient source support for the intake purpose. "
         "A chain-candidate-intake purpose is supported when the source presents one or more tentative benchmark-chain candidates without committing to one. It intentionally preserves candidates for a later typed confirmation question and is not a chain mutation. "
         "A QPS-customization purpose requires an explicit request to alter, tune, override, or avoid defaults of one or more QPS profile values, even when concrete numbers arrive later. Merely visiting the QPS area without requesting a profile-value change is navigation. "
         "A wire-method-selection purpose requires an actual callable wire method, not merely a schema field named method or method_id. An endpoint-selection purpose requires an explicitly selected validation endpoint, not an example or documentation URL. A secondary-development evidence purpose likewise requires new protocol, endpoint, request, response, or official-document evidence. A pending-answer purpose must actually answer the supplied pending contract. Reset and execution "
-        "approval require explicit authorization. For each unit_review, complete is true only when mapped operations collectively preserve every explicit selection, mutation, consultation, evidence request, and navigation demand in source_text; one mapped purpose may be valid while the set is still incomplete. When complete is false, missing_demand_quote must be the shortest non-empty exact substring of source_text that states one omitted independently actionable demand; otherwise it must be empty. A committed named benchmark chain requires a declared purpose that selects that exact chain. A tentative chain candidate may instead be completely preserved by a declared intake purpose that asks the user to resolve candidates, while a chain mentioned only in a support question needs no chain mutation or intake purpose. When a schema-evidence pending question identifies an existing catalog draft, deictic source text such as 'this method has no parameters' or 'it returns a hex value' contributes parameter/response evidence to that current draft and may support an evidence-ingestion purpose; it still cannot support a wire-method-selection purpose unless the source itself names the wire method. Do not repair, route, invent, rename, or classify an operation."
+        "approval require explicit authorization. A declared pending option plus adjacent prose that only explains why that same option was selected is one supported pending-answer purpose: the option selection is direct evidence and the reason may be explanatory_context or operation_restatement support. The reason is not an omitted demand unless it independently asks, changes, contradicts, navigates, or selects something else. "
+        "For each unit_review, complete is true only when mapped operations collectively preserve every explicit selection, mutation, consultation, evidence request, and navigation demand in source_text; one mapped purpose may be valid while the set is still incomplete. When complete is false, missing_demand_quote must be the shortest non-empty exact substring of source_text that states one omitted independently actionable demand; otherwise it must be empty. A committed named benchmark chain requires a declared purpose that selects that exact chain. A tentative chain candidate may instead be completely preserved by a declared intake purpose that asks the user to resolve candidates, while a chain mentioned only in a support question needs no chain mutation or intake purpose. When a schema-evidence pending question identifies an existing catalog draft, deictic source text such as 'this method has no parameters' or 'it returns a hex value' contributes parameter/response evidence to that current draft and may support an evidence-ingestion purpose; it still cannot support a wire-method-selection purpose unless the source itself names the wire method. Do not repair, route, invent, rename, or classify an operation."
     )
 
 
@@ -2565,6 +2589,7 @@ def _action_plan_repair_prompt() -> str:
         "When validation rejects request_qps_customization because the source only asks to visit or configure the QPS area before another area, replace it with change_group(qps_profile) and exact source_evidence; do not leave that representable navigation unresolved."
         "When a source selects or navigates to a configuration group and also asks to alter one registered scalar field without supplying a replacement value, preserve the field request with request_config_field_input using that exact field and source evidence. Do not copy the current, detected, default, or example value into propose_config_values."
         "When adjacent clauses reject the current mutually exclusive workflow and explicitly select a replacement, one choose_target_mode action for the replacement may preserve both clauses. Map both semantic units to that same action index; do not invent a cancellation action or leave the rejection unresolved."
+        "When validation rejects a consultation because its source is only the declarative reason for a declared pending-option selection, map that reason as explanatory_context or operation_restatement support to the answer_pending action. Do not recreate the consultation or leave the reason unresolved. A real question, requested effect, contradiction, different selection, or sibling value remains independent."
         "Never add answer_pending merely because a pending question exists. Add it only when the exact source text actually answers that typed question contract. When validation rejects an operation as incompatible with the active target-mode lifecycle and the same source supplies a value for the active typed question, preserve that value with answer_pending; never retry the incompatible operation."
     )
 
@@ -2582,6 +2607,18 @@ def _pending_contract_adjudication_prompt() -> str:
         "For a declared option, emit answer_pending with selected_value exactly equal to that option's "
         "declared value. For manual input, emit answer_pending with answer equal to one exact extracted "
         "value that satisfies validation. A pending_typed_candidate is syntax evidence, not permission. "
+        "When the source selects exactly one declared option and adjacent prose only gives the reason for "
+        "that same selection, emit one answer_pending and map both the direct selection and its explanatory "
+        "support to that action. Do not leave the reason unresolved and do not require the reason to repeat "
+        "the option label. This rule is language-independent and applies to numbered and yes/no choices. "
+        "The invalid_output action list is untrusted: when it contains answer_pending plus another action, "
+        "reclassify that sibling from the source instead of retaining it automatically. Never emit "
+        "answer_opening_question for declarative rationale that asks no question and requests no separate "
+        "effect; map it only as support for answer_pending. For example, 'select no; this deployment has no "
+        "separate disk' is one pending answer, while 'select no; explain what a separate disk changes' also "
+        "contains an independent consultation. "
+        "A question, contradiction, different selection, concrete sibling value, navigation request, or "
+        "other operation is not a reason and must retain its own typed owner. "
         + PENDING_CANDIDATE_SEMANTIC_POLICY
         + "Partial request, response, "
         "documentation, endpoint, or protocol evidence is a valid manual contribution when the pending "
@@ -2609,7 +2646,11 @@ def _action_queue_prompt() -> str:
         + GROUP_NAVIGATION_SEMANTIC_POLICY
         + " A structured_candidates row containing config_values is one propose_config_values review "
         "transaction even when a field matches the active pending question. Never map that structured "
-        "configuration clause to answer_pending; inferred review owns confirmation."
+        "configuration clause to answer_pending; inferred review owns confirmation. "
+        "Final pending-option ownership check: a declarative reason adjoining one selected option is support "
+        "for that answer_pending action, never answer_opening_question. Only an actual request for information "
+        "creates a consultation. Example: 'select no; this deployment has no separate disk' is one pending "
+        "answer; 'select no; explain what a separate disk changes' also contains a consultation."
     )
 
 
