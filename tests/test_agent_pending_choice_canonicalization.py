@@ -434,6 +434,10 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
             "preserve the complete original_request.user_text",
             provider.complete.call_args_list[0].args[0].messages[0].content,
         )
+        self.assertIn(
+            "never label a unit context while also assigning it an action owner",
+            provider.complete.call_args_list[0].args[0].messages[0].content,
+        )
         self.assertEqual([item["type"] for item in result["actions"]], ["answer_pending"])
         self.assertEqual(result["actions"][0]["answer"], text)
 
