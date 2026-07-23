@@ -34,6 +34,7 @@ class GroupSpec:
     fallback: bool = True
     navigation_entry: NavigationEntry = "question_or_status"
     resume_selector: bool = True
+    generic_navigation: bool = True
 
 
 GROUPS: tuple[GroupSpec, ...] = (
@@ -46,6 +47,8 @@ GROUPS: tuple[GroupSpec, ...] = (
             "resume_modify_group",
         ),
         product_node="opening",
+        resume_selector=False,
+        generic_navigation=False,
     ),
     GroupSpec(
         name="target_mode",
@@ -541,7 +544,9 @@ GROUP_QUESTION_ORDER: tuple[tuple[str, tuple[str, ...]], ...] = tuple(
 GROUP_TO_PRODUCT_NODE: dict[str, str] = {group.name: group.product_node for group in GROUPS if group.product_node}
 GROUP_SPEC_BY_NAME: dict[str, GroupSpec] = {group.name: group for group in GROUPS}
 USER_NAVIGABLE_GROUPS: tuple[str, ...] = tuple(
-    group.name for group in GROUPS if group.navigation_entry == "question_or_status"
+    group.name
+    for group in GROUPS
+    if group.navigation_entry == "question_or_status" and group.generic_navigation
 )
 
 
@@ -573,6 +578,9 @@ def group_registry_contract_hash() -> str:
             "questions": list(group.questions),
             "reconfiguration_questions": list(group.reconfiguration_questions),
             "immutable_fields": list(group.immutable_fields),
+            "navigation_entry": group.navigation_entry,
+            "resume_selector": group.resume_selector,
+            "generic_navigation": group.generic_navigation,
         }
         for group in GROUPS
     ]

@@ -929,12 +929,18 @@ class BatchOrchestratorTests(unittest.TestCase):
 
     def test_default_worker_command_uses_docker_linux_boundary(self) -> None:
         self._write_targets(1)
+        timeout_policy = TimeoutPolicy(
+            shard_seconds=20,
+            decision_seconds=7,
+            cleanup_seconds=2,
+        )
         manifest = freeze_batch_manifest(
             repo_root=self.root,
             targets_dir=self.targets,
             manifest_path=self.root / ".agent" / "docker-manifest.json",
             runtime_base=self.root / ".agent" / "docker-runtime",
             shard_count=1,
+            timeout_policy=timeout_policy,
         )
         command = manifest.shards[0].command
         self.assertEqual(command[:2], ("docker", "exec"))
@@ -948,6 +954,11 @@ class BatchOrchestratorTests(unittest.TestCase):
         ))
         self.assertIn("blockchain-node-benchmark-bench-1", command)
         self.assertIn("/workspace/.agent/targets/01.json", command)
+        timeout_index = command.index("--decision-timeout-seconds")
+        self.assertGreater(
+            float(command[timeout_index + 1]),
+            timeout_policy.decision_seconds,
+        )
 
     def test_batch_execution_rejects_non_linux_control_plane(self) -> None:
         self._write_targets(1)

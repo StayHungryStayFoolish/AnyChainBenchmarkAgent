@@ -79,6 +79,7 @@ def group_schema() -> list[dict[str, Any]]:
             "invalidates": list(group.invalidates),
             "category": group.category,
             "navigation_entry": group.navigation_entry,
+            "generic_navigation": group.generic_navigation,
             "entry_actions": [
                 {
                     "type": spec.action_type,

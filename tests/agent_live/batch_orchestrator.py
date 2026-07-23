@@ -266,7 +266,13 @@ def freeze_batch_manifest(
         str(edge.get("edge_key") or ""): edge
         for edge in ledger.get("edges") or ()
     }
-    factory = command_factory or _default_command_factory(root, worker_runtime=worker_runtime)
+    factory = command_factory or _default_command_factory(
+        root,
+        worker_runtime=worker_runtime,
+        decision_timeout_seconds=(
+            timeout_policy.decision_seconds + max(timeout_policy.cleanup_seconds, 1.0)
+        ),
+    )
     batch_nonce = hashlib.sha256(
         f"{revision}|{seed_base}|{shard_count}|{time.time_ns()}".encode()
     ).hexdigest()[:16]
@@ -507,7 +513,11 @@ def validate_frozen_manifest(
             raise ValueError(f"container cleanup receipt directory changed: {shard.shard_id}")
         _validate_bound_docker_environment(shard, Path(manifest.repo_root))
         if manifest.formal_profile:
-            _validate_formal_linux_command(shard, Path(manifest.repo_root))
+            _validate_formal_linux_command(
+                shard,
+                Path(manifest.repo_root),
+                broker_decision_timeout_seconds=manifest.timeout_policy.decision_seconds,
+            )
     ledger = build_ledger(revision=manifest.revision)
     for shard in manifest.shards:
         target_payload = _load_json(Path(shard.target_path))
@@ -1760,7 +1770,12 @@ def _validate_bound_docker_environment(
         raise ValueError(f"Docker command lost its cleanup receipt directory: {shard.shard_id}")
 
 
-def _validate_formal_linux_command(shard: FrozenShardSpec, repo_root: Path) -> None:
+def _validate_formal_linux_command(
+    shard: FrozenShardSpec,
+    repo_root: Path,
+    *,
+    broker_decision_timeout_seconds: float,
+) -> None:
     """Keep formal workers on the frozen in-container Linux implementation."""
 
     expected_module = (
@@ -1789,6 +1804,25 @@ def _validate_formal_linux_command(shard: FrozenShardSpec, repo_root: Path) -> N
             raise ValueError(f"formal shard command lost {flag}: {shard.shard_id}")
         if command[positions[0] + 1] != expected:
             raise ValueError(f"formal shard command changed {flag}: {shard.shard_id}")
+    timeout_positions = [
+        index for index, value in enumerate(command)
+        if value == "--decision-timeout-seconds"
+    ]
+    if len(timeout_positions) != 1 or timeout_positions[0] + 1 >= len(command):
+        raise ValueError(
+            f"formal shard command lost --decision-timeout-seconds: {shard.shard_id}"
+        )
+    try:
+        worker_timeout = float(command[timeout_positions[0] + 1])
+    except ValueError as exc:
+        raise ValueError(
+            f"formal shard command has an invalid decision timeout: {shard.shard_id}"
+        ) from exc
+    if worker_timeout <= broker_decision_timeout_seconds:
+        raise ValueError(
+            "formal worker decision timeout must exceed the broker timeout: "
+            f"{shard.shard_id}"
+        )
 
 
 def _docker_exec_insert_index(command: Sequence[str]) -> int | None:
@@ -2127,7 +2161,12 @@ def _guard_canonical_json(value: Mapping[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
-def _default_command_factory(repo_root: Path, *, worker_runtime: str) -> CommandFactory:
+def _default_command_factory(
+    repo_root: Path,
+    *,
+    worker_runtime: str,
+    decision_timeout_seconds: float,
+) -> CommandFactory:
     def factory(
         index: int,
         target: Path,
@@ -2160,6 +2199,7 @@ def _default_command_factory(repo_root: Path, *, worker_runtime: str) -> Command
                 python, "-m", "tests.agent_live.codex_simulator_bridge",
                 "--targets", str(target_for_worker), "--repo-root", worker_root,
                 "--seed", str(seed), "--session-id", session, "--runtime", "linux",
+                "--decision-timeout-seconds", str(decision_timeout_seconds),
             )
         _, registry_import = _journey_target(payload)
         return (*base,
@@ -2169,6 +2209,7 @@ def _default_command_factory(repo_root: Path, *, worker_runtime: str) -> Command
             "--repo-root", worker_root, "--seed", str(seed),
             "--expected-schedule-id", schedule_id,
             "--session-id", session, "--runtime", "linux",
+            "--decision-timeout-seconds", str(decision_timeout_seconds),
         )
     return factory
 

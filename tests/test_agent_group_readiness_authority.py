@@ -81,6 +81,7 @@ class GroupRegistryAuthorityTests(unittest.TestCase):
             ))
 
     def test_only_configuration_entry_groups_are_public_navigation_destinations(self) -> None:
+        self.assertNotIn("opening", USER_NAVIGABLE_GROUPS)
         self.assertNotIn("job_monitoring", USER_NAVIGABLE_GROUPS)
         self.assertNotIn("failure_recovery", USER_NAVIGABLE_GROUPS)
         self.assertNotIn("error_evidence_analysis", USER_NAVIGABLE_GROUPS)
