@@ -74,6 +74,15 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertEqual(len(clauses), 1)
         self.assertEqual(clauses[0].input_shape, "structured")
 
+    def test_labeled_nested_structured_block_preserves_source_indentation(self) -> None:
+        source = "accounts disk:\n  ACCOUNTS_VOL_TYPE: hyperdisk-balanced"
+
+        clauses = segment_user_turn(source)
+
+        self.assertEqual(len(clauses), 1)
+        self.assertEqual(clauses[0].input_shape, "structured")
+        self.assertEqual(clauses[0].text, source)
+
     def test_standalone_url_is_not_misclassified_as_a_yaml_key(self) -> None:
         clauses = segment_user_turn(
             "Use this endpoint only for schema validation:\nhttp://fake-node:19000"

@@ -976,7 +976,7 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         self.assertEqual(result["actions"][0]["type"], "answer_pending")
         self.assertEqual(result["actions"][0]["answer"], "eth_accounts")
 
-    def test_reviewer_must_explicitly_select_the_focused_typed_candidate(self) -> None:
+    def test_admitted_unique_typed_candidate_gets_canonical_reviewer_receipt(self) -> None:
         from agent.harness.intent import resolve_action_queue
 
         text = "The custom JSON-RPC method is eth_accounts."
@@ -1010,7 +1010,87 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
 
+        self.assertEqual(provider.complete.call_count, 2)
+        self.assertEqual(result["actions"][0]["type"], "answer_pending")
+        self.assertEqual(result["actions"][0]["answer"], "eth_accounts")
+
+    def test_admitted_semantic_grounding_uses_unique_exact_direct_receipt(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        text = "Disable observability for this run."
+        state = _state(active_group="observability", target_mode="fake-node")
+        state["pending_question"] = {
+            "id": "observability_mode",
+            "group": "observability",
+            "kind": "numbered_choice",
+            "field": "observability_mode",
+            "manual_input_allowed": False,
+            "options": [
+                {
+                    "id": "1",
+                    "label": "Disabled",
+                    "value": "disabled",
+                    "action": {"type": "answer_pending"},
+                }
+            ],
+            "accepted_action_types": ["answer_pending", "set_observability"],
+            "validation": {},
+        }
+        document = _document({
+            "type": "set_observability",
+            "observability_mode": "disabled",
+            "mutation_explicit": True,
+            "source_evidence": text,
+        }, text)
+        provider = Mock()
+
+        def complete(request: Any) -> SimpleNamespace:
+            payload = json.loads(request.messages[1].content)
+            if "plan_hash" not in payload:
+                return SimpleNamespace(text=json.dumps(document))
+            response = json.loads(_admission_response(request).text)
+            response["action_verdicts"][0]["grounded_arguments"][0][
+                "evidence_quote"
+            ] = "disabled"
+            return SimpleNamespace(text=json.dumps(response))
+
+        provider.complete.side_effect = complete
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
+        self.assertEqual(provider.complete.call_count, 2)
+        self.assertEqual(result["actions"][0]["type"], "set_observability")
+        self.assertEqual(result["actions"][0]["observability_mode"], "disabled")
+
+    def test_exact_source_grounding_is_not_repaired_from_semantic_evidence(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        text = "Validate the eth_accounts RPC method."
+        state = _state(active_group="endpoint_process")
+        document = _document({
+            "type": "rpc_catalog_command",
+            "catalog_command": "set_method",
+            "rpc_method": "eth_accounts",
+            "source_evidence": text,
+        }, text)
+        provider = Mock()
+
+        def complete(request: Any) -> SimpleNamespace:
+            payload = json.loads(request.messages[1].content)
+            if "plan_hash" not in payload:
+                return SimpleNamespace(text=json.dumps(document))
+            response = json.loads(_admission_response(request).text)
+            response["action_verdicts"][0]["grounded_arguments"][0][
+                "evidence_quote"
+            ] = "invented method evidence"
+            return SimpleNamespace(text=json.dumps(response))
+
+        provider.complete.side_effect = complete
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
         self.assertEqual(provider.complete.call_count, 4)
+        self.assertEqual(result["actions"][0]["type"], "clarify_unresolved")
 
     def test_structured_pending_config_uses_review_proposal_not_direct_answer(self) -> None:
         from agent.harness.intent import resolve_action_queue

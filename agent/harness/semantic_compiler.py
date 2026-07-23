@@ -290,6 +290,11 @@ def validate_whole_plan_admission(
         str(row["unit_id"]): row for row in request.get("semantic_units") or []
         if isinstance(row, dict) and str(row.get("unit_id") or "")
     }
+    payload = _canonicalize_admission_receipts(
+        payload,
+        action_records=action_records,
+        unit_records=unit_records,
+    )
     raw_action_rows = payload.get("action_verdicts")
     raw_unit_rows = payload.get("unit_verdicts")
     action_rows = list(raw_action_rows) if isinstance(raw_action_rows, list) else []
@@ -537,3 +542,83 @@ def validate_whole_plan_admission(
         unit_verdicts=tuple(valid_unit_rows),
         response=payload,
     )
+
+
+def _canonicalize_admission_receipts(
+    payload: dict[str, Any],
+    *,
+    action_records: Mapping[str, Mapping[str, Any]],
+    unit_records: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Normalize uniquely derivable reviewer wire receipts.
+
+    The reviewer remains the semantic admission authority. This boundary only
+    repairs redundant receipt fields after an explicit ``admit`` verdict when
+    the immutable plan and exact direct evidence leave no choice. Rejections,
+    missing rows, ambiguous candidates, and exact-source values remain
+    untouched so the strict validator can fail closed.
+    """
+
+    action_rows = payload.get("action_verdicts")
+    if not isinstance(action_rows, list):
+        return payload
+    for raw_row in action_rows:
+        if not isinstance(raw_row, dict) or str(raw_row.get("verdict") or "") != "admit":
+            continue
+        action_id = str(raw_row.get("action_id") or "")
+        record = action_records.get(action_id)
+        if not isinstance(record, Mapping):
+            continue
+        immutable_action = (
+            record.get("action")
+            if isinstance(record.get("action"), Mapping)
+            else {}
+        )
+        candidates = [
+            item
+            for item in record.get("pending_value_candidates") or []
+            if isinstance(item, Mapping) and str(item.get("candidate_id") or "")
+        ]
+        if (
+            str(immutable_action.get("type") or "") == "answer_pending"
+            and not str(raw_row.get("pending_answer_argument") or "")
+            and len(candidates) == 1
+        ):
+            raw_row["pending_answer_argument"] = str(candidates[0]["candidate_id"])
+
+        evidence_rows = [
+            item
+            for item in raw_row.get("evidence") or []
+            if isinstance(item, Mapping)
+            and str(item.get("relation") or "") == "direct"
+        ]
+        exact_direct_quotes = []
+        for evidence in evidence_rows:
+            unit_id = str(evidence.get("unit_id") or "")
+            source = str((unit_records.get(unit_id) or {}).get("source_text") or "")
+            quote = str(evidence.get("quote") or "")
+            if quote and quote in source and quote not in exact_direct_quotes:
+                exact_direct_quotes.append(quote)
+        if len(exact_direct_quotes) != 1:
+            continue
+        owned_sources = [
+            str((unit_records.get(str(unit_id)) or {}).get("source_text") or "")
+            for unit_id in record.get("unit_ids") or []
+        ]
+        exact_arguments = {
+            str(value)
+            for value in record.get("exact_source_value_arguments") or []
+        }
+        for grounding in raw_row.get("grounded_arguments") or []:
+            if not isinstance(grounding, dict):
+                continue
+            argument = str(grounding.get("argument_name") or "")
+            quote = str(grounding.get("evidence_quote") or "")
+            if (
+                argument
+                and argument not in exact_arguments
+                and quote
+                and not any(quote in source for source in owned_sources)
+            ):
+                grounding["evidence_quote"] = exact_direct_quotes[0]
+    return payload

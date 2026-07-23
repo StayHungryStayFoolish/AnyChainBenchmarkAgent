@@ -655,7 +655,7 @@ def _append_unstructured_regions(regions: list[tuple[str, str]], text: str) -> N
                     index += 1
                     continue
                 break
-            regions.append(("\n".join(block).strip(), "structured"))
+            regions.append(("\n".join(block), "structured"))
             continue
         if _line_looks_structured(stripped):
             run = [line]
@@ -670,7 +670,7 @@ def _append_unstructured_regions(regions: list[tuple[str, str]], text: str) -> N
             # whether an error label, example, or documentation fragment is
             # configuration at all.
             flush_prose()
-            regions.append(("\n".join(run).strip(), "structured"))
+            regions.append(("\n".join(run), "structured"))
             index = lookahead
             continue
         prose.append(line)
