@@ -229,6 +229,77 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         self.assertEqual(result["actions"][0]["type"], "answer_pending")
         self.assertEqual(result["actions"][0]["selected_value"], "target_mode")
 
+    def test_semantic_review_derives_incomplete_intake_from_registry(self) -> None:
+        from agent.harness.domains.chain_rpc_questions import _target_change_scope_question
+        from agent.harness.intent import (
+            _freeze_bounded_semantic_plan,
+            _semantic_fulfillment_prompt,
+        )
+        from agent.harness.plan_coverage import segment_user_turn
+
+        state = _state(
+            active_group="workload_rpc",
+            target_mode="fake-node",
+            workflow_mode="rpc_benchmark",
+        )
+        state["pending_question"] = _target_change_scope_question(state)
+        text = "I need to change the fake-node / real-node / sync-observe target mode."
+        clauses = tuple(segment_user_turn(text))
+        candidate = json.dumps({
+            "actions": [{
+                "type": "request_target_mode_selection",
+                "source_evidence": text,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": clauses[0].clause_id,
+                "source_text": text,
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "the source requests target-mode replacement intake",
+            }],
+        })
+
+        plan = _freeze_bounded_semantic_plan(candidate, state, clauses)
+        record = plan.request_payload()["actions"][0]
+        policy = _semantic_fulfillment_prompt()
+
+        self.assertIs(record["registry_incomplete_mutation_intake"], True)
+        self.assertIs(record["registry_pending_option_admission"], True)
+        self.assertIn("initial selection or replacement", record["declared_purpose"])
+        self.assertIn("registry_incomplete_mutation_intake=true", policy)
+        self.assertNotIn("A target-mode-intake purpose", policy)
+
+    def test_non_intake_action_is_not_marked_as_incomplete_intake(self) -> None:
+        from agent.harness.intent import _freeze_bounded_semantic_plan
+        from agent.harness.plan_coverage import segment_user_turn
+
+        state = _state(active_group="opening")
+        text = "Explain what this Agent can do."
+        clauses = tuple(segment_user_turn(text))
+        candidate = json.dumps({
+            "actions": [{
+                "type": "answer_opening_question",
+                "topic": "capabilities",
+                "source_evidence": text,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": clauses[0].clause_id,
+                "source_text": text,
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "read-only consultation",
+            }],
+        })
+
+        plan = _freeze_bounded_semantic_plan(candidate, state, clauses)
+
+        self.assertIs(
+            plan.request_payload()["actions"][0]["registry_incomplete_mutation_intake"],
+            False,
+        )
+
     def test_reviewer_candidate_cannot_replace_a_domain_action(self) -> None:
         from agent.harness.intent import resolve_action_queue
 
