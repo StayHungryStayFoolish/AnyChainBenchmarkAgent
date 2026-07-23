@@ -117,6 +117,7 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
     try:
         provider = provider_from_config()
         request_payload = _action_queue_payload(state, text)
+        active_pending_contract = bool(state.get("pending_question"))
         clauses = tuple(
             TurnClause(
                 str(item["clause_id"]),
@@ -127,7 +128,11 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
         )
         raw_response, compilation_errors = _compile_semantic_candidate(
             provider,
-            system_prompt=_action_queue_prompt(),
+            system_prompt=(
+                _pending_contract_adjudication_prompt()
+                if active_pending_contract
+                else _action_queue_prompt()
+            ),
             request_payload=request_payload,
         )
         candidate, validation = _prepare_bounded_semantic_candidate(
@@ -148,7 +153,12 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
             admission is not None
             and admission.valid
             and plan is not None
-            and _admitted_plan_requires_pending_contract_adjudication(plan, admission, state)
+            and _admitted_plan_requires_pending_contract_adjudication(
+                plan,
+                admission,
+                state,
+                focused_adjudication=active_pending_contract,
+            )
         )
         if admission is not None and admission.valid and plan is not None and not pending_contract_unresolved:
             try:
@@ -171,7 +181,6 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
             "action_schema": action_schema(),
             "original_request": request_payload,
         }
-        active_pending_contract = bool(state.get("pending_question"))
         repaired_response, repair_errors = _compile_semantic_candidate(
             provider,
             system_prompt=(
@@ -2622,7 +2631,17 @@ def _pending_contract_adjudication_prompt() -> str:
         + PENDING_CANDIDATE_SEMANTIC_POLICY
         + "Partial request, response, "
         "documentation, endpoint, or protocol evidence is a valid manual contribution when the pending "
-        "contract declares an evidence owner; do not require all evidence at once. Do not emit the domain "
+        "contract declares an evidence owner; do not require all evidence at once. When that contribution "
+        "spans multiple clauses, preserve the complete original_request.user_text as the one manual evidence "
+        "value and map every evidence-content clause to its owner. Clauses stating which request, response, "
+        "parameter, or documentation parts are currently available or absent are evidence-completeness "
+        "support for that same owner; they are not disposable context and must not become unresolved. "
+        "The authoritative clauses expose an evidence_contribution as one atomic semantic unit, so both the "
+        "action's value argument and source_evidence must preserve that complete exact unit. For other "
+        "non-atomic inputs, source_evidence remains one exact excerpt from one mapped unit and must never "
+        "span units. Emit exactly one owner representation for the contribution: answer_pending "
+        "or the pending contract's declared manual_action, never both. "
+        "Do not emit the domain "
         "manual owner as a duplicate of answer_pending. A structured_candidates row containing config_values "
         "is always one propose_config_values review transaction, including when one field matches the active "
         "pending question. Never convert that structured clause to answer_pending; inferred review owns its "
@@ -2657,7 +2676,19 @@ def _action_queue_prompt() -> str:
 def _action_queue_payload(state: AgentGraphState, text: str) -> dict[str, Any]:
     raw = str(text or "")
     non_empty_lines = [line for line in raw.splitlines() if line.strip()]
-    clauses = segment_user_turn(raw)
+    pending = dict(state.get("pending_question") or {})
+    normalized_raw = raw.replace("\r\n", "\n").replace("\r", "\n").strip()
+    pending_validation = dict(pending.get("validation") or {})
+    atomic_evidence_contribution = bool(
+        normalized_raw
+        and pending.get("manual_input_allowed") is True
+        and str(pending_validation.get("value_type") or "") == "evidence_contribution"
+    )
+    clauses = (
+        (TurnClause("clause-1", normalized_raw, "prose"),)
+        if atomic_evidence_contribution
+        else segment_user_turn(raw)
+    )
     structured_candidates = []
     for clause in clauses:
         if clause.input_shape != "structured":
@@ -2668,7 +2699,6 @@ def _action_queue_payload(state: AgentGraphState, text: str) -> dict[str, Any]:
                 "clause_id": clause.clause_id,
                 **candidates,
             })
-    pending = dict(state.get("pending_question") or {})
     pending_candidates: list[Any] = list(typed_pending_value_candidates(raw, pending))
     unique_pending_candidates: list[Any] = []
     seen_pending_candidates: set[str] = set()

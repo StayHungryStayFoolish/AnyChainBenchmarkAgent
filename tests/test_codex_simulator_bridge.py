@@ -275,7 +275,12 @@ class StdioCodexSimulatorTest(unittest.TestCase):
             repo_root=Path("/repo"),
             session_id="session-invalid",
         )
-        schedule = SimpleNamespace(targets=(object(),))
+        schedule = SimpleNamespace(targets=(ScheduledCoverageTarget(
+            target_id="simulator-invalid",
+            edge_key="opening::fake-node",
+            persona="operator",
+            goal="exercise invalid simulator classification",
+        ),))
         runner = SimpleNamespace(
             run=lambda: (_ for _ in ()).throw(
                 SimulatorDecisionInvalid("declared multiline input was structured")
@@ -311,6 +316,57 @@ class StdioCodexSimulatorTest(unittest.TestCase):
         framed = json.loads(output.getvalue()[len(RESULT_FRAME):])
         self.assertEqual(framed, payload)
         self.assertIn("SimulatorDecisionInvalid", payload["failure_reason"])
+
+    def test_bridge_reserves_declared_deferred_continuation_turns(self) -> None:
+        output = io.StringIO()
+        target = ScheduledCoverageTarget(
+            target_id="deferred-navigation",
+            edge_key="@action_only/coordinator::change_group",
+            persona="operator",
+            goal="reach a group after satisfying prerequisites",
+            continuation_turn_budget=3,
+        )
+        schedule = SimpleNamespace(targets=(target,))
+        config = SimpleNamespace(
+            runtime_root=Path("/tmp/codex-simulator-deferred"),
+            repo_root=Path("/repo"),
+            session_id="session-deferred",
+        )
+        runner = SimpleNamespace(run=lambda: SimpleNamespace(
+            session_id="session-deferred",
+            execution_status="complete",
+            schedule_path=Path("/tmp/schedule.json"),
+            schedule_result_path=Path("/tmp/result.json"),
+            transcript_path=Path("/tmp/transcript.txt"),
+            evidence_paths=(),
+        ))
+        with patch(
+            "tests.agent_live.codex_simulator_bridge.repository_revision",
+            return_value={"commit": "abc", "worktree_hash": "d" * 64},
+        ), patch(
+            "tests.agent_live.codex_simulator_bridge.build_ledger", return_value={}
+        ), patch(
+            "tests.agent_live.codex_simulator_bridge.build_chaos_schedule",
+            return_value=schedule,
+        ), patch(
+            "tests.agent_live.codex_simulator_bridge.ChaosRunConfig.linux",
+            return_value=config,
+        ) as linux_config, patch(
+            "tests.agent_live.codex_simulator_bridge.DynamicDualAiChaosRunner",
+            return_value=runner,
+        ):
+            payload = run_bridge(
+                repo_root=Path("/repo"),
+                targets=({},),
+                seed=1,
+                session_id="session-deferred",
+                service="bench",
+                runtime="linux",
+                output_stream=output,
+            )
+
+        self.assertEqual(payload["execution_status"], "complete")
+        self.assertEqual(linux_config.call_args.kwargs["max_turns"], 4)
 
 
 if __name__ == "__main__":

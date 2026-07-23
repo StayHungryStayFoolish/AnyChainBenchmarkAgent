@@ -309,18 +309,22 @@ def run_bridge(
         seed=seed,
         targets=targets,
     )
+    max_turns = sum(
+        1 + int(target.continuation_turn_budget)
+        for target in schedule.targets
+    )
     if runtime == "linux":
         config = ChaosRunConfig.linux(
             repo_root,
             session_id=session_id,
-            max_turns=len(schedule.targets),
+            max_turns=max_turns,
         )
     elif runtime == "docker":
         config = ChaosRunConfig.docker(
             repo_root,
             service=service,
             session_id=session_id,
-            max_turns=len(schedule.targets),
+            max_turns=max_turns,
         )
     else:
         raise ValueError(f"unsupported bridge runtime: {runtime}")

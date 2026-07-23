@@ -282,20 +282,12 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
 
         state = _recovery_state()
         text = "Choose pause; the evidence must remain available."
-        first = {
-            "actions": [
-                {
-                    "type": "answer_pending",
-                    "selected_value": "cancel",
-                    "source_evidence": "Choose pause",
-                },
-                {
-                    "type": "answer_opening_question",
-                    "topic": "config_explanation",
-                    "subject": "failure evidence",
-                    "source_evidence": "the evidence must remain available",
-                },
-            ],
+        focused = {
+            "actions": [{
+                "type": "answer_pending",
+                "selected_value": "cancel",
+                "source_evidence": "Choose pause",
+            }],
             "semantic_units": [
                 {
                     "unit_id": "unit-1",
@@ -310,21 +302,21 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
                     "clause_id": "clause-2",
                     "source_text": "the evidence must remain available",
                     "disposition": "action",
-                    "action_indexes": [1],
-                    "reason": "untrusted rationale classification",
+                    "action_indexes": [0],
+                    "reason": "rationale supporting the selection",
                 },
             ],
         }
-        focused = deepcopy(first)
-        focused["actions"] = [deepcopy(first["actions"][0])]
-        focused["semantic_units"][1]["action_indexes"] = [0]
-        focused["semantic_units"][1]["reason"] = "rationale supporting the selection"
-        provider = _provider([first, focused])
+        provider = _provider([focused])
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
 
-        self.assertEqual(provider.complete.call_count, 4)
+        self.assertEqual(provider.complete.call_count, 2)
+        self.assertIn(
+            "only focused adjudication",
+            provider.complete.call_args_list[0].args[0].messages[0].content,
+        )
         self.assertEqual([item["type"] for item in result["actions"]], ["answer_pending"])
         self.assertEqual(result["actions"][0]["selected_value"], "cancel")
 
@@ -371,11 +363,79 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
 
-        self.assertEqual(provider.complete.call_count, 4)
+        self.assertEqual(provider.complete.call_count, 2)
         self.assertEqual(
             [item["type"] for item in result["actions"]],
             ["answer_pending", "answer_opening_question"],
         )
+
+    def test_focused_adjudication_owns_complete_multiline_manual_evidence(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        text = (
+            "Official protocol notes say requests use a binary P2P envelope.\n"
+            "I only have the request-side documentation right now."
+        )
+        state = _state(active_group="chain_identity")
+        state["pending_question"] = {
+            "id": "case3_protocol_evidence",
+            "group": "chain_identity",
+            "kind": "evidence",
+            "field": "case3_protocol_evidence",
+            "manual_input_allowed": True,
+            "options": [],
+            "accepted_action_types": [
+                "answer_pending",
+                "secondary_handoff_command",
+            ],
+            "manual_action": {
+                "type": "secondary_handoff_command",
+                "handoff_command": "append_evidence",
+                "value_argument": "handoff_evidence",
+            },
+            "validation": {
+                "max_length": 65536,
+                "value_type": "evidence_contribution",
+            },
+        }
+        document = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": text,
+                "source_evidence": text,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": text,
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "the typed evidence contract owns one atomic contribution",
+            }],
+        }
+        provider = _provider([document])
+
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
+        self.assertEqual(provider.complete.call_count, 2)
+        compiler_payload = json.loads(
+            provider.complete.call_args_list[0].args[0].messages[1].content
+        )
+        self.assertEqual(
+            compiler_payload["clauses"],
+            [{
+                "clause_id": "clause-1",
+                "text": text,
+                "input_shape": "prose",
+            }],
+        )
+        self.assertIn(
+            "preserve the complete original_request.user_text",
+            provider.complete.call_args_list[0].args[0].messages[0].content,
+        )
+        self.assertEqual([item["type"] for item in result["actions"]], ["answer_pending"])
+        self.assertEqual(result["actions"][0]["answer"], text)
 
     def test_semantic_review_derives_incomplete_intake_from_registry(self) -> None:
         from agent.harness.domains.chain_rpc_questions import _target_change_scope_question
