@@ -74,8 +74,8 @@ class BenchmarkPipelineTest(unittest.TestCase):
 
         env = plan["execution"]["environment"]
         materialized = plan["materialized_config"]
-        self.assertEqual(request["local_rpc_url"], "http://geth-dev:8545")
-        self.assertEqual(env["LOCAL_RPC_URL"], "http://geth-dev:8545")
+        self.assertNotIn("local_rpc_url", request)
+        self.assertEqual(env["LOCAL_RPC_URL"], "")
         self.assertEqual(env["SYNC_OBSERVE_RPC_URL"], "http://geth-dev:8545")
         self.assertEqual(env["NODE_PROMETHEUS_METRICS_URL"], "http://geth-dev:6060/debug/metrics/prometheus")
         self.assertEqual(materialized["SYNC_OBSERVE_RPC_URL"], "http://geth-dev:8545")

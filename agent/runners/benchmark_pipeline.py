@@ -499,7 +499,6 @@ def _structured_request(
         request["sync_observe_source"] = sync_observe_source
     if sync_observe_rpc_url:
         request["sync_observe_rpc_url"] = sync_observe_rpc_url
-        request["local_rpc_url"] = sync_observe_rpc_url
         request["sync_observe_rpc_url_ready"] = bool(sync_observe_rpc_url_ready)
     if node_process_identity:
         request["node_process_identity"] = node_process_identity
