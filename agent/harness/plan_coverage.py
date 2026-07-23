@@ -49,6 +49,13 @@ class PlanCoverageResult:
     incomplete_unit_ids: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class SemanticPartitionResult:
+    valid: bool
+    units: tuple[dict[str, Any], ...]
+    errors: tuple[str, ...]
+
+
 def segment_user_turn(text: str) -> tuple[TurnClause, ...]:
     """Split one complete turn without interpreting product intent.
 
@@ -92,6 +99,57 @@ def segment_user_turn(text: str) -> tuple[TurnClause, ...]:
     return tuple(
         TurnClause(f"clause-{index}", value, shape)
         for index, (value, shape) in enumerate(parts, start=1)
+    )
+
+
+def validate_semantic_partition(
+    raw_units: Sequence[Any],
+    clauses: Sequence[TurnClause],
+) -> SemanticPartitionResult:
+    """Validate and canonicalize a lossless Stage A source partition."""
+
+    expected = {clause.clause_id: clause for clause in clauses}
+    canonical, errors = _canonicalize_semantic_units(raw_units, expected)
+    seen_ids: set[str] = set()
+    seen_clauses: set[str] = set()
+    last_clause_index = -1
+    clause_indexes = {
+        clause.clause_id: index for index, clause in enumerate(clauses)
+    }
+    output: list[dict[str, Any]] = []
+    for raw in canonical:
+        if not isinstance(raw, Mapping):
+            errors.append("semantic partition contains a non-object unit")
+            continue
+        unit = dict(raw)
+        unit_id = str(unit.get("unit_id") or "").strip()
+        clause_id = str(unit.get("clause_id") or "").strip()
+        if not unit_id:
+            errors.append("semantic partition unit has no unit_id")
+        elif unit_id in seen_ids:
+            errors.append(f"duplicate semantic partition unit id: {unit_id}")
+        else:
+            seen_ids.add(unit_id)
+        if clause_id not in expected:
+            errors.append(f"semantic partition references unknown clause: {clause_id}")
+        else:
+            seen_clauses.add(clause_id)
+            clause_index = clause_indexes[clause_id]
+            if clause_index < last_clause_index:
+                errors.append(
+                    f"semantic partition reorders clauses at unit: {unit_id}"
+                )
+            last_clause_index = max(last_clause_index, clause_index)
+        if not str(unit.get("source_text") or ""):
+            errors.append(f"semantic partition unit has empty source_text: {unit_id}")
+        output.append(unit)
+    for clause_id in expected:
+        if clause_id not in seen_clauses:
+            errors.append(f"semantic partition omits clause: {clause_id}")
+    return SemanticPartitionResult(
+        valid=not errors,
+        units=tuple(output),
+        errors=tuple(dict.fromkeys(errors)),
     )
 
 
@@ -363,10 +421,27 @@ def _canonicalize_semantic_units(
                 errors.append(f"structured source anchors are ambiguous in {clause_id}")
                 continue
             placements = placement_sets[0]
+            unit_spans = [
+                (
+                    0 if unit_offset == 0 else placements[unit_offset][0],
+                    (
+                        placements[unit_offset + 1][0]
+                        if unit_offset + 1 < len(placements)
+                        else len(clause.text)
+                    ),
+                )
+                for unit_offset in range(len(units))
+            ]
         else:
+            unique_anchors: list[str] = []
+            anchor_group_indexes: list[int] = []
+            for anchor in anchors:
+                if not unique_anchors or anchor != unique_anchors[-1]:
+                    unique_anchors.append(anchor)
+                anchor_group_indexes.append(len(unique_anchors) - 1)
             placement_sets = _unique_anchor_placements(
                 clause.text,
-                anchors,
+                unique_anchors,
                 allow_unclaimed_intervals=True,
             )
             if not placement_sets:
@@ -376,14 +451,24 @@ def _canonicalize_semantic_units(
                 errors.append(f"source anchors are ambiguous in {clause_id}")
                 continue
             placements = placement_sets[0]
+            group_spans = [
+                (
+                    0 if group_index == 0 else placements[group_index][0],
+                    (
+                        placements[group_index + 1][0]
+                        if group_index + 1 < len(placements)
+                        else len(clause.text)
+                    ),
+                )
+                for group_index in range(len(unique_anchors))
+            ]
+            unit_spans = [
+                group_spans[group_index]
+                for group_index in anchor_group_indexes
+            ]
 
         for unit_offset, raw_index in enumerate(indexes):
-            start = 0 if unit_offset == 0 else placements[unit_offset][0]
-            end = (
-                placements[unit_offset + 1][0]
-                if unit_offset + 1 < len(placements)
-                else len(clause.text)
-            )
+            start, end = unit_spans[unit_offset]
             normalized = dict(raw_units[raw_index])
             normalized.update({
                 "start": start,

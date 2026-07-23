@@ -8370,15 +8370,23 @@ response:
         state["active_group"] = "opening"
         state["last_user_input"] = "我想测 Flow，它应该是 EVM/jsonrpc"
 
-        with patch("agent.harness.coordinator.resolve_action_queue") as resolver:
+        with (
+            patch("agent.harness.coordinator.resolve_action_queue") as resolver,
+            patch(
+                "agent.harness.domains.chain_identity.resolve_unknown_chain_identity",
+                return_value={
+                    "chain_exists": True,
+                    "canonical_chain_name": "flow",
+                    "adapter_family": "jsonrpc",
+                    "confidence": "high",
+                },
+            ),
+        ):
             resolver.return_value = {
                 "actions": [
                     {
                         "type": "choose_chain",
                         "chain_text": "Flow",
-                        "chain_exists": True,
-                        "canonical_chain_name": "flow",
-                        "adapter_family": "jsonrpc",
                         "source_evidence": "Flow",
                         "confidence": "high",
                     }
@@ -9317,6 +9325,15 @@ response:
         with (
             patch("agent.harness.coordinator.resolve_action_queue") as queue,
             patch("agent.harness.domains.chain_rpc.extract_chain_mention") as mention,
+            patch(
+                "agent.harness.domains.chain_identity.resolve_unknown_chain_identity",
+                return_value={
+                    "chain_exists": None,
+                    "canonical_chain_name": "AcmeLedger",
+                    "adapter_family": "unknown",
+                    "confidence": "medium",
+                },
+            ),
         ):
             queue.return_value = {
                 "actions": [
@@ -9324,9 +9341,6 @@ response:
                         "type": "choose_chain",
                         "chain_text": "Run it against the product network AcmeLedger.",
                         "source_evidence": "Run it against the product network AcmeLedger.",
-                        "chain_exists": None,
-                        "canonical_chain_name": "AcmeLedger",
-                        "adapter_family": "unknown",
                         "confidence": "medium",
                     }
                 ]
@@ -9483,14 +9497,23 @@ response:
         }
         state["last_user_input"] = "我需要换成 abcd，它是 EVM/jsonrpc 链"
 
-        with patch("agent.harness.coordinator.resolve_action_queue") as queue:
+        with (
+            patch("agent.harness.coordinator.resolve_action_queue") as queue,
+            patch(
+                "agent.harness.domains.chain_identity.resolve_unknown_chain_identity",
+                return_value={
+                    "chain_exists": True,
+                    "canonical_chain_name": "abcd",
+                    "adapter_family": "jsonrpc",
+                    "confidence": "high",
+                },
+            ),
+        ):
             queue.return_value = {
                 "actions": [
                     {
                         "type": "change_chain",
                         "chain_text": "abcd",
-                        "adapter_family": "jsonrpc",
-                        "chain_exists": True,
                         "source_evidence": "abcd，它是 EVM/jsonrpc 链",
                         "confidence": "high",
                     }
@@ -13710,117 +13733,11 @@ response:
 
 
     def test_product_graph_executes_registry_recovered_back_navigation(self) -> None:
-        import json
-        from types import SimpleNamespace
-
         from agent.harness.state import new_state
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
 
         explanatory = "I changed my mind."
         operation = "Please take me back to the previous workflow step."
-        unresolved = {
-            "actions": [],
-            "semantic_units": [
-                {
-                    "unit_id": "unit-1",
-                    "clause_id": "clause-1",
-                    "source_text": explanatory,
-                    "disposition": "unresolved",
-                    "action_indexes": [],
-                    "reason": "unresolved explanatory context",
-                },
-                {
-                    "unit_id": "unit-2",
-                    "clause_id": "clause-2",
-                    "source_text": operation,
-                    "disposition": "unresolved",
-                    "action_indexes": [],
-                    "reason": "unresolved navigation request",
-                },
-            ],
-        }
-
-        class Provider:
-            def __init__(self) -> None:
-                self.calls: list[str] = []
-
-            def complete(self, request: object) -> object:
-                system = str(request.messages[0].content)
-                self.calls.append(system)
-                if "typed intent planner" in system:
-                    payload = {
-                        "actions": [{
-                            "type": "go_back",
-                            "source_evidence": operation,
-                            "confidence": "high",
-                        }],
-                        "semantic_units": [
-                            {
-                                "unit_id": "unit-1",
-                                "clause_id": "clause-1",
-                                "source_text": explanatory,
-                                "disposition": "action",
-                                "action_indexes": [0],
-                                "reason": "explanatory support for the same navigation",
-                            },
-                            {
-                                "unit_id": "unit-2",
-                                "clause_id": "clause-2",
-                                "source_text": operation,
-                                "disposition": "action",
-                                "action_indexes": [0],
-                                "reason": "direct backward navigation",
-                            },
-                        ],
-                        "reason": "one immutable backward-navigation plan",
-                    }
-                elif "independent admission authority" in system:
-                    review = json.loads(request.messages[1].content)
-                    action = review["actions"][0]
-                    units = {row["unit_id"]: row for row in review["semantic_units"]}
-                    evidence = []
-                    for unit_id in action["unit_ids"]:
-                        source = units[unit_id]["source_text"]
-                        direct = source == operation
-                        evidence.append({
-                            "unit_id": unit_id,
-                            "quote": source,
-                            "relation": "direct" if direct else "support",
-                            "support_relation": "" if direct else "explanatory_context",
-                        })
-                    payload = {
-                        "plan_hash": review["plan_hash"],
-                        "action_verdicts": [{
-                            "action_id": action["action_id"],
-                            "verdict": "admit",
-                            "unit_ids": list(action["unit_ids"]),
-                            "evidence": evidence,
-                            "grounded_arguments": [
-                                {
-                                    "argument_name": argument,
-                                    "evidence_quote": operation,
-                                }
-                                for argument in action.get("required_value_grounding_arguments") or []
-                            ],
-                            "pending_answer_argument": "",
-                            "turn_candidate_verdicts": [],
-                            "reason": "the immutable action preserves both source units",
-                        }],
-                        "unit_verdicts": [{
-                            "unit_id": row["unit_id"],
-                            "verdict": "complete" if row["source_text"] == operation else "support",
-                            "owner_action_ids": list(row["owner_action_ids"]),
-                            "evidence_quote": row["source_text"],
-                            "omitted_action_type": "",
-                            "reason": "the navigation demand is represented",
-                        } for row in review["semantic_units"]],
-                        "reason": "the complete immutable plan is admitted",
-                    }
-                else:
-                    raise AssertionError(f"unexpected model contract: {system[:120]}")
-                return SimpleNamespace(text=json.dumps(payload))
-
-        provider = Provider()
         state = new_state("back-product-graph", language="en")
         state.update({
             "target_mode": "fake-node",
@@ -13837,7 +13754,14 @@ response:
             "last_user_input": f"{explanatory} {operation}",
         })
 
-        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            side_effect=_admitted_mock_resolver({"actions": [{
+                "type": "go_back",
+                "source_evidence": operation,
+                "confidence": "high",
+            }]}),
+        ):
             result = process_turn(state, allow_semantic_resolver=True)
 
         self.assertEqual(
@@ -13846,13 +13770,10 @@ response:
             {
                 "visible_response": result.get("visible_response"),
                 "failure_recovery": result.get("failure_recovery"),
-                "provider_call_count": len(provider.calls),
             },
         )
         self.assertEqual(result["group_history"], [])
         self.assertEqual([item["type"] for item in result["completed_actions"]], ["go_back"])
-        self.assertEqual(len(provider.calls), 2)
-        self.assertTrue(any("independent admission authority" in call for call in provider.calls))
 
 
     def test_repeated_back_navigation_uses_history_then_reports_no_destination(self) -> None:

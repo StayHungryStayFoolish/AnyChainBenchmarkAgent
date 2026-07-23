@@ -22,7 +22,7 @@ from tests.agent_live.generate_harness_coverage_ledger import build_ledger
 
 
 SCHEMA_VERSION = 1
-IMPLEMENTED_THROUGH_PHASE = 1
+IMPLEMENTED_THROUGH_PHASE = 2
 
 
 def _run(command: Sequence[str]) -> dict[str, Any]:
@@ -85,16 +85,56 @@ def _g0_source() -> dict[str, Any]:
     }
 
 
+def _phase2_source() -> dict[str, Any]:
+    from agent.harness import coordinator
+    from agent.harness.hierarchical_planner import resolve_product_action_queue
+
+    checks = [
+        _run((
+            sys.executable,
+            "-m",
+            "unittest",
+            "tests.test_agent_hierarchical_planner",
+            "tests.test_agent_plan_coverage",
+            "tests.test_agent_pending_choice_canonicalization",
+            "tests.test_agent_planner_risk",
+        )),
+    ]
+    product_entry_is_hierarchical = (
+        coordinator.resolve_action_queue is resolve_product_action_queue
+    )
+    return {
+        "phase": 2,
+        "product_entry_is_hierarchical": product_entry_is_hierarchical,
+        "checks": checks,
+        "status": (
+            "passed"
+            if product_entry_is_hierarchical
+            and all(check["passed"] for check in checks)
+            else "failed"
+        ),
+    }
+
+
 def build_report(through_phase: int) -> dict[str, Any]:
     inventory = build_ledger(None)
     g0 = _g0_source()
+    phase_checks = {
+        "1": {"status": "passed"},
+        "2": _phase2_source(),
+    }
     requested_supported = through_phase <= IMPLEMENTED_THROUGH_PHASE
+    requested_phase_checks_pass = all(
+        phase_checks[str(phase)]["status"] == "passed"
+        for phase in range(1, min(through_phase, IMPLEMENTED_THROUGH_PHASE) + 1)
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "authority": "tests/agent_live/run_product_acceptance.py",
         "through_phase": through_phase,
         "implemented_through_phase": IMPLEMENTED_THROUGH_PHASE,
         "provider_authority": "raw_evidence_only",
+        "phase_checks": phase_checks,
         "inventory": {
             "revision": inventory["revision"],
             "summary": inventory["summary"],
@@ -111,7 +151,9 @@ def build_report(through_phase: int) -> dict[str, Any]:
         },
         "status": (
             "passed"
-            if requested_supported and g0["status"] == "passed"
+            if requested_supported
+            and g0["status"] == "passed"
+            and requested_phase_checks_pass
             else "incomplete"
             if not requested_supported
             else "failed"

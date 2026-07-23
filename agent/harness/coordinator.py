@@ -11,8 +11,8 @@ from typing import Any, Mapping
 from .state import AgentGraphState, PendingQuestion, RESET_PRESERVED_KEYS, new_state
 from .intent import (
     ALLOWED_GROUPS,
-    resolve_action_queue,
 )
+from .hierarchical_planner import resolve_product_action_queue as resolve_action_queue
 from .oracle import (
     compute_next_action,
     format_recommended_next_action,

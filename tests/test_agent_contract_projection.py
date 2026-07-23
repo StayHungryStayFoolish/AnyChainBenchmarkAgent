@@ -82,8 +82,8 @@ class AgentContractProjectionTest(unittest.TestCase):
             "tests.agent_live.run_product_acceptance._g0_source",
             return_value={"gate": "G0", "status": "passed"},
         ):
-            phase_one = build_report(1)
-            future = build_report(2)
+            phase_one = build_report(2)
+            future = build_report(3)
         self.assertEqual(
             phase_one["authority"],
             "tests/agent_live/run_product_acceptance.py",

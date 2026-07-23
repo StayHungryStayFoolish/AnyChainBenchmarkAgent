@@ -269,6 +269,7 @@ def _prepare_bounded_semantic_candidate(
     user_text: str,
     *,
     extra_errors: tuple[str, ...] = (),
+    pending_choice_unit_ids: frozenset[str] | None = None,
 ) -> tuple[str, PlanCoverageResult]:
     """Apply only deterministic ownership and registry policy before review."""
 
@@ -282,14 +283,59 @@ def _prepare_bounded_semantic_candidate(
         candidate = _materialize_absent_semantic_units(candidate, clauses)
         candidate = _canonicalize_candidate_config_proposals(candidate)
         candidate = _reset_candidate_action_ids(candidate)
-        candidate = _canonicalize_pending_choice_actions(candidate, state)
-        candidate = _mark_pending_owner_candidates(candidate, state)
+        candidate = _canonicalize_pending_choice_actions(
+            candidate,
+            state,
+            eligible_unit_ids=pending_choice_unit_ids,
+        )
+        candidate = _mark_pending_owner_candidates(
+            candidate,
+            state,
+            eligible_unit_ids=pending_choice_unit_ids,
+        )
         validation = _validate_action_document(candidate, clauses, state)
     except ValueError as exc:
         candidate = "{}"
         validation = _invalid_plan_coverage(clauses, (str(exc),))
     if extra_errors:
         validation = _merge_plan_errors(validation, extra_errors)
+    return candidate, validation
+
+
+def prepare_hierarchical_candidate(
+    raw_response: str,
+    state: AgentGraphState,
+    clauses: tuple[TurnClause, ...],
+    *,
+    pending_choice_unit_ids: frozenset[str],
+) -> tuple[str, PlanCoverageResult]:
+    """Prepare Stage A/B output without invoking legacy planner repair.
+
+    Hierarchical planning already owns source partitioning, owner routing, and
+    action compilation. This boundary may apply registry/state policy and the
+    typed pending contract, but it must not synthesize omitted semantic units,
+    reinterpret structured ownership, or repair planner output.
+    """
+
+    try:
+        candidate = _prepare_untrusted_action_document(raw_response)
+        _reject_conflicting_pending_representations(candidate)
+        candidate = _apply_state_plan_policy(candidate, state)
+        candidate = _reset_candidate_action_ids(candidate)
+        candidate = _canonicalize_pending_choice_actions(
+            candidate,
+            state,
+            eligible_unit_ids=pending_choice_unit_ids,
+        )
+        candidate = _mark_pending_owner_candidates(
+            candidate,
+            state,
+            eligible_unit_ids=pending_choice_unit_ids,
+        )
+        validation = _validate_action_document(candidate, clauses, state)
+    except ValueError as exc:
+        candidate = "{}"
+        validation = _invalid_plan_coverage(clauses, (str(exc),))
     return candidate, validation
 
 
@@ -655,7 +701,12 @@ def _canonicalize_candidate_config_proposals(text: str) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
-def _canonicalize_pending_choice_actions(text: str, state: AgentGraphState) -> str:
+def _canonicalize_pending_choice_actions(
+    text: str,
+    state: AgentGraphState,
+    *,
+    eligible_unit_ids: frozenset[str] | None = None,
+) -> str:
     """Bind every semantic option selection to one canonical pending answer.
 
     The compiler may describe a selection as ``answer_pending`` or as the
@@ -673,6 +724,12 @@ def _canonicalize_pending_choice_actions(text: str, state: AgentGraphState) -> s
     contracts: list[dict[str, Any]] = []
     for index, action in enumerate(actions):
         if not isinstance(action, dict):
+            continue
+        units = _source_units_for_action(payload, index)
+        if eligible_unit_ids is not None and not any(
+            str(unit.get("unit_id") or "") in eligible_unit_ids
+            for unit in units
+        ):
             continue
         option = _matching_pending_option(action, state)
         manual_value = None
@@ -706,7 +763,6 @@ def _canonicalize_pending_choice_actions(text: str, state: AgentGraphState) -> s
             spec = ACTION_BY_TYPE.get(action_type)
             if spec is None or not spec.pending_option_admission:
                 continue
-        units = _source_units_for_action(payload, index)
         if not units:
             raise ValueError("pending choice has no mapped semantic-unit provenance")
         source = str(action.get("source_evidence") or "").strip()
@@ -871,13 +927,28 @@ def _reset_candidate_action_ids(text: str) -> str:
     )
 
 
-def _mark_pending_owner_candidates(text: str, state: AgentGraphState) -> str:
+def _mark_pending_owner_candidates(
+    text: str,
+    state: AgentGraphState,
+    *,
+    eligible_unit_ids: frozenset[str] | None = None,
+) -> str:
     payload = _parse_json_object(text)
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
     admitted = [
         index
         for index, action in enumerate(actions)
-        if isinstance(action, dict) and _action_owns_pending_candidate(action, state)
+        if (
+            isinstance(action, dict)
+            and (
+                eligible_unit_ids is None
+                or any(
+                    str(unit.get("unit_id") or "") in eligible_unit_ids
+                    for unit in _source_units_for_action(payload, index)
+                )
+            )
+            and _action_owns_pending_candidate(action, state)
+        )
     ]
     if len(admitted) > 1:
         raise ValueError("multiple actions claim the active pending-question owner")
@@ -951,18 +1022,29 @@ def _review_bounded_semantic_candidate(
     validation: PlanCoverageResult,
     state: AgentGraphState,
     clauses: tuple[TurnClause, ...],
+    *,
+    allowed_action_types: frozenset[str] | None = None,
 ) -> tuple[ImmutableSemanticPlan | None, WholePlanAdmission | None, tuple[str, ...]]:
     if not validation.valid:
         return None, None, tuple(validation.errors)
     try:
-        plan = _freeze_bounded_semantic_plan(candidate, state, clauses)
+        plan = _freeze_bounded_semantic_plan(
+            candidate,
+            state,
+            clauses,
+            allowed_action_types=allowed_action_types,
+        )
     except ValueError as exc:
         return None, None, (str(exc),)
     admission = request_whole_plan_admission(
         provider,
         plan,
         semantic_policy=_semantic_fulfillment_prompt(),
-        allowed_action_types=ALLOWED_ACTION_TYPES,
+        allowed_action_types=(
+            sorted(allowed_action_types)
+            if allowed_action_types is not None
+            else ALLOWED_ACTION_TYPES
+        ),
     )
     return plan, admission, admission.errors
 
@@ -1072,6 +1154,8 @@ def _freeze_bounded_semantic_plan(
     text: str,
     state: AgentGraphState,
     clauses: tuple[TurnClause, ...],
+    *,
+    allowed_action_types: frozenset[str] | None = None,
 ) -> ImmutableSemanticPlan:
     payload = _parse_json_object(text)
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
@@ -1212,10 +1296,14 @@ def _freeze_bounded_semantic_plan(
         action_records=action_records,
         unit_records=unit_records,
         review_context={
+            "original_request": {
+                "user_text": "\n".join(clause.text for clause in clauses),
+                "clauses": [clause.as_dict() for clause in clauses],
+            },
             "pending_question": state.get("pending_question") or {},
             "turn_pending_value_candidates": turn_pending_value_candidates,
             "workflow_state": workflow_snapshot(state),
-            "action_schema": action_schema(),
+            "action_schema": action_schema(action_types=allowed_action_types),
             "group_schema": group_schema(),
             "semantic_scope_schema": semantic_scope_schema(),
         },

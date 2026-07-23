@@ -49,6 +49,17 @@ EVIDENCE_OPERATION_SUPPORT_RELATIONS = (
     *FRAMED_OPERATION_SUPPORT_RELATIONS,
     "evidence_completeness",
 )
+SEMANTIC_OPERATIONS = frozenset({
+    "pending_answer",
+    "consultation",
+    "navigation",
+    "administrative",
+    "domain_request",
+    "evidence_analysis",
+    "report_analysis",
+    "context",
+    "unresolved",
+})
 
 
 SEMANTIC_SCOPE_POLICIES: dict[str, dict[str, Any]] = {
@@ -194,6 +205,8 @@ class ActionSpec:
     execution_phase: int = 50
     target_group: str = ""
     target_field_argument: str = ""
+    compiler_groups: tuple[str, ...] = ()
+    semantic_operations: tuple[str, ...] = ("domain_request",)
     merge_identity: tuple[str, ...] = ()
     preserve_pending: bool = False
     mutation_dimension: str = ""
@@ -245,6 +258,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         execution_phase=5,
         lifetime="turn_local",
         effect="read_only",
+        semantic_operations=("consultation",),
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
     ),
     ActionSpec(
@@ -255,6 +269,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         execution_phase=2,
         lifetime="turn_local",
         effect="workflow_state_mutation",
+        semantic_operations=("administrative",),
         required_arguments=("language", "source_evidence"),
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
         semantic_value_grounding_arguments=("language",),
@@ -267,10 +282,11 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         execution_phase=1,
         lifetime="turn_local",
         effect="read_only",
+        semantic_operations=("unresolved",),
         required_arguments=("clauses",),
     ),
-    ActionSpec("reset_session", "orientation", "Clear workflow configuration while preserving the workflow job receipt; startup discovery and historical jobs remain external read models.", execution_phase=0, effect="workflow_state_mutation"),
-    ActionSpec("ask_capabilities", "orientation", "Explain supported product capabilities from framework facts.", execution_phase=5, lifetime="turn_local", effect="read_only"),
+    ActionSpec("reset_session", "orientation", "Clear workflow configuration while preserving the workflow job receipt; startup discovery and historical jobs remain external read models.", execution_phase=0, effect="workflow_state_mutation", semantic_operations=("administrative",)),
+    ActionSpec("ask_capabilities", "orientation", "Explain supported product capabilities from framework facts.", execution_phase=5, lifetime="turn_local", effect="read_only", semantic_operations=("consultation",)),
     ActionSpec(
         "answer_opening_question",
         "orientation",
@@ -282,14 +298,15 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         lifetime="turn_local",
         effect="read_only",
         required_arguments=("topic",),
+        semantic_operations=("consultation",),
         semantic_support_relations=(
             *FRAMED_OPERATION_SUPPORT_RELATIONS,
             "non_mutation_scope",
         ),
     ),
     ActionSpec("choose_target_mode", "chain_rpc", "Select fake-node, real-node, or sync-observe only when the user explicitly requests that mutation.", ("target_mode", "target_mode_explicit", "source_evidence"), 10, "target_mode", mutation_dimension="target_mode", provides_capabilities=("target_mode",), required_arguments=("target_mode", "target_mode_explicit", "source_evidence"), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS, semantic_value_grounding_arguments=("target_mode",)),
-    ActionSpec("choose_chain", "chain_rpc", "Select a chain when none is confirmed, or expose multiple candidates without choosing silently.", ("chain_text", "chain_candidates", "source_evidence", "chain_exists", "canonical_chain_name", "adapter_family", "possible_known_chain", "evidence_summary"), 20, "chain_identity", mutation_dimension="chain", provides_capabilities=("chain_identity",), required_arguments=("source_evidence",), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS, validator=_validate_chain_selection),
-    ActionSpec("change_chain", "chain_rpc", "Request a different chain when one is confirmed, or expose multiple candidates without choosing silently.", ("chain_text", "chain_candidates", "source_evidence", "chain_exists", "canonical_chain_name", "adapter_family", "possible_known_chain", "evidence_summary"), 20, "chain_identity", mutation_dimension="chain", provides_capabilities=("chain_identity",), required_arguments=("source_evidence",), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS, validator=_validate_chain_selection),
+    ActionSpec("choose_chain", "chain_rpc", "Select a user-supplied raw chain name when none is confirmed, or expose multiple user-supplied candidates without choosing silently. Chain existence, canonical identity, and protocol research belong to the chain-identity domain after this action.", ("chain_text", "chain_candidates", "source_evidence"), 20, "chain_identity", mutation_dimension="chain", provides_capabilities=("chain_identity",), required_arguments=("source_evidence",), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS, validator=_validate_chain_selection),
+    ActionSpec("change_chain", "chain_rpc", "Request a user-supplied raw replacement chain, or expose multiple user-supplied candidates without choosing silently. Chain existence, canonical identity, and protocol research belong to the chain-identity domain after this action.", ("chain_text", "chain_candidates", "source_evidence"), 20, "chain_identity", mutation_dimension="chain", provides_capabilities=("chain_identity",), required_arguments=("source_evidence",), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS, validator=_validate_chain_selection),
     ActionSpec(
         "request_chain_selection",
         "chain_rpc",
@@ -328,6 +345,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
             "non_mutation_scope",
         ),
         validator=_validate_group_navigation,
+        semantic_operations=("navigation",),
     ),
     ActionSpec(
         "request_config_field_input",
@@ -347,6 +365,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
             "non_mutation_scope",
         ),
         validator=_validate_config_field_intake,
+        semantic_operations=("navigation",),
     ),
     ActionSpec(
         "resume_current_flow",
@@ -359,6 +378,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         required_arguments=("source_evidence",),
         suppressed_by=("change_group", "go_back"),
         pending_option_semantic="continue_current_flow",
+        semantic_operations=("navigation",),
         semantic_support_relations=(
             *FRAMED_OPERATION_SUPPORT_RELATIONS,
             "non_mutation_scope",
@@ -371,6 +391,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         ("source_evidence",),
         effect="workflow_navigation",
         semantic_recovery_source_argument="source_evidence",
+        semantic_operations=("navigation",),
         semantic_support_relations=(
             *FRAMED_OPERATION_SUPPORT_RELATIONS,
             "non_mutation_scope",
@@ -387,6 +408,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         required_arguments=("target_mode", "source_evidence"),
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
         semantic_value_grounding_arguments=("target_mode",),
+        semantic_operations=("administrative",),
     ),
     ActionSpec(
         "activate_next_workflow_goal",
@@ -402,6 +424,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
             *FRAMED_OPERATION_SUPPORT_RELATIONS,
             "non_mutation_scope",
         ),
+        semantic_operations=("administrative",),
     ),
     ActionSpec(
         "discard_next_workflow_goal",
@@ -417,6 +440,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
             *FRAMED_OPERATION_SUPPORT_RELATIONS,
             "non_mutation_scope",
         ),
+        semantic_operations=("administrative",),
     ),
     ActionSpec(
         "set_rpc_mode",
@@ -484,15 +508,16 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         semantic_value_grounding_arguments=("workload_scope",),
         validator=_validate_rpc_workload_command,
     ),
-    ActionSpec("use_default_workload", "chain_rpc", "Accept the active chain template workload.", execution_phase=40, requires_capabilities=("target_mode", "chain_identity")),
-    ActionSpec("configure_workload_weights", "chain_rpc", "Configure mixed weights for the active template or custom methods.", execution_phase=40, requires_capabilities=("target_mode", "chain_identity")),
+    ActionSpec("use_default_workload", "chain_rpc", "Accept the active chain template workload.", execution_phase=40, compiler_groups=("workload_rpc",), requires_capabilities=("target_mode", "chain_identity")),
+    ActionSpec("configure_workload_weights", "chain_rpc", "Configure mixed weights for the active template or custom methods.", execution_phase=40, compiler_groups=("workload_rpc",), requires_capabilities=("target_mode", "chain_identity")),
     ActionSpec(
         "request_target_change",
         "chain_rpc",
         "Open a typed choice for changing the chain or target mode.",
+        compiler_groups=("workload_rpc",),
         option_navigation_groups=("chain_identity", "target_mode"),
     ),
-    ActionSpec("cancel_target_change", "chain_rpc", "Return to workload configuration without changing chain or target mode."),
+    ActionSpec("cancel_target_change", "chain_rpc", "Return to workload configuration without changing chain or target mode.", compiler_groups=("workload_rpc",)),
     ActionSpec("set_qps_mode", "performance", "Select quick, standard, or intensive profile. Do not use set_qps_override unless concrete numeric values were supplied.", ("qps_mode", "mutation_explicit", "source_evidence"), 50, "qps_profile", preserve_pending=True, mutation_dimension="qps_profile", requires_capabilities=("target_mode",), crosses_pending_barrier=True, required_arguments=("qps_mode", "mutation_explicit", "source_evidence"), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS, semantic_value_grounding_arguments=("qps_mode",)),
     ActionSpec("request_qps_customization", "performance", "Enter QPS customization when the user wants to adjust the selected profile but has not supplied every numeric value yet.", ("qps_fields", "source_evidence"), 50, "qps_profile", preserve_pending=True, mutation_dimension="qps_profile", requires_capabilities=("target_mode",), crosses_pending_barrier=True, requires_specific_change=True, required_arguments=("source_evidence",), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS),
     ActionSpec("set_qps_override", "performance", "Apply concrete QPS profile overrides only when qps_overrides contains user-supplied numeric values. For an adjustment request without values, use request_qps_customization.", ("qps_overrides",), 50, "qps_profile", preserve_pending=True, mutation_dimension="qps_profile", requires_capabilities=("target_mode",), crosses_pending_barrier=True, required_arguments=("qps_overrides",)),
@@ -511,10 +536,10 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         semantic_value_grounding_arguments=("sync_observe_stop_condition",),
         validator=_validate_sync_observe_options,
     ),
-    ActionSpec("approve_preflight_smoke", "execution", "Approve one idempotent preflight/smoke submission.", effect="execution"),
-    ActionSpec("reject_preflight_smoke", "execution", "Pause before preflight/smoke without submitting a job."),
-    ActionSpec("approve_final_benchmark", "execution", "Approve final real-node benchmark submission after isolated smoke success.", effect="execution"),
-    ActionSpec("reject_final_benchmark", "execution", "Pause after successful real-node smoke without submitting the final benchmark."),
+    ActionSpec("approve_preflight_smoke", "execution", "Approve one idempotent preflight/smoke submission.", compiler_groups=("preflight_smoke_execution",), effect="execution"),
+    ActionSpec("reject_preflight_smoke", "execution", "Pause before preflight/smoke without submitting a job.", compiler_groups=("preflight_smoke_execution",)),
+    ActionSpec("approve_final_benchmark", "execution", "Approve final real-node benchmark submission after isolated smoke success.", compiler_groups=("job_monitoring",), effect="execution"),
+    ActionSpec("reject_final_benchmark", "execution", "Pause after successful real-node smoke without submitting the final benchmark.", compiler_groups=("job_monitoring",)),
     ActionSpec("set_accounts_presence", "environment", "Confirm whether a separate accounts/state disk exists.", ("has_accounts_device",), target_group="accounts_disk", required_arguments=("has_accounts_device",), semantic_value_grounding_arguments=("has_accounts_device",)),
     ActionSpec(
         "propose_config_values",
@@ -522,6 +547,12 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         "Propose values extracted from natural language, YAML, JSON, env, or tables; after user review, normal fallback asks for required values that the partial input did not supply.",
         ("config_values", "unmapped_values", "conflicts", "source_format", "source_evidence"),
         25,
+        compiler_groups=(
+            "provider_deployment",
+            "ledger_disk",
+            "accounts_disk",
+            "network",
+        ),
         preserve_pending=True,
         merge_mapping_fields=("config_values", "unmapped_values"),
         merge_sequence_fields=("conflicts",),
@@ -540,6 +571,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         required_state_values=("active",),
         state_transition_resolver=_evidence_append_transition,
         validator=_validate_evidence_collection_append,
+        semantic_operations=("evidence_analysis",),
     ),
     ActionSpec(
         "finish_evidence_collection",
@@ -554,6 +586,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         required_state_values=("active",),
         state_transition_path=("evidence_collection", "status"),
         state_transition_value=None,
+        semantic_operations=("evidence_analysis",),
     ),
     ActionSpec(
         "pause_evidence_collection",
@@ -568,6 +601,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         required_state_values=("active",),
         state_transition_path=("evidence_collection", "status"),
         state_transition_value="paused",
+        semantic_operations=("evidence_analysis",),
     ),
     ActionSpec(
         "resume_evidence_collection",
@@ -582,6 +616,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         required_state_values=("paused",),
         state_transition_path=("evidence_collection", "status"),
         state_transition_value="active",
+        semantic_operations=("evidence_analysis",),
     ),
     ActionSpec(
         "cancel_evidence_collection",
@@ -596,6 +631,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         required_state_values=("active", "paused"),
         state_transition_path=("evidence_collection", "status"),
         state_transition_value=None,
+        semantic_operations=("evidence_analysis",),
     ),
     ActionSpec(
         "analyze_evidence",
@@ -609,6 +645,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         crosses_pending_barrier=True,
         semantic_recovery_source_argument="evidence",
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
+        semantic_operations=("evidence_analysis",),
     ),
     ActionSpec(
         "analyze_report",
@@ -620,18 +657,20 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         lifetime="turn_local",
         effect="read_only",
         turn_local_result_roots=("report_context",),
+        semantic_operations=("report_analysis",),
     ),
-    ActionSpec("correct_failure", "recovery", "Reopen only the policy-declared affected configuration group."),
+    ActionSpec("correct_failure", "recovery", "Reopen only the policy-declared affected configuration group.", compiler_groups=("failure_recovery",)),
     ActionSpec(
         "inspect_failure",
         "recovery",
         "Inspect structured failure evidence without changing workflow configuration.",
+        compiler_groups=("failure_recovery",),
         effect="read_only",
     ),
-    ActionSpec("retry_failure", "recovery", "Clear a retryable external-service failure without executing a benchmark side effect."),
-    ActionSpec("cancel_failure_recovery", "recovery", "Pause recovery while preserving evidence and confirmed configuration."),
-    ActionSpec("answer_pending", "coordinator", "Answer the active typed question after interpreting non-exact user language.", ("answer", "selected_value", "source_evidence"), 0, required_arguments=("source_evidence",), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS),
-    ActionSpec("unknown", "orientation", "Report that no safe action could be resolved.", ("reason",), effect="read_only", required_arguments=("reason",)),
+    ActionSpec("retry_failure", "recovery", "Clear a retryable external-service failure without executing a benchmark side effect.", compiler_groups=("failure_recovery",)),
+    ActionSpec("cancel_failure_recovery", "recovery", "Pause recovery while preserving evidence and confirmed configuration.", compiler_groups=("failure_recovery",)),
+    ActionSpec("answer_pending", "coordinator", "Answer the active typed question after interpreting non-exact user language.", ("answer", "selected_value", "source_evidence"), 0, required_arguments=("source_evidence",), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS, semantic_operations=("pending_answer",)),
+    ActionSpec("unknown", "orientation", "Report that no safe action could be resolved.", ("reason",), effect="read_only", required_arguments=("reason",), semantic_operations=("unresolved",)),
 )
 
 
@@ -732,7 +771,11 @@ def project_action_specs(
         spec
         for spec in ACTION_SPECS
         if (owners is None or spec.owner in owners)
-        and (groups is None or spec.target_group in groups)
+        and (
+            groups is None
+            or spec.target_group in groups
+            or bool(groups.intersection(spec.compiler_groups))
+        )
         and (lifetimes is None or spec.lifetime in lifetimes)
         and (action_types is None or spec.action_type in action_types)
     )
@@ -913,6 +956,8 @@ def action_registry_contract_hash() -> str:
             "execution_phase": spec.execution_phase,
             "target_group": spec.target_group,
             "target_field_argument": spec.target_field_argument,
+            "compiler_groups": list(spec.compiler_groups),
+            "semantic_operations": list(spec.semantic_operations),
             "merge_identity": list(spec.merge_identity),
             "preserve_pending": spec.preserve_pending,
             "mutation_dimension": spec.mutation_dimension,
@@ -1757,6 +1802,8 @@ def merge_semantic_actions(existing: dict[str, Any], incoming: dict[str, Any]) -
 
 
 def validate_action_registry() -> None:
+    from agent.workflows.group_registry import GROUP_SPEC_BY_NAME
+
     names = [spec.action_type for spec in ACTION_SPECS]
     if len(names) != len(set(names)):
         raise RuntimeError("duplicate Harness action type")
@@ -1769,6 +1816,22 @@ def validate_action_registry() -> None:
             )
         if len(spec.allowed_arguments) != len(set(spec.allowed_arguments)):
             raise RuntimeError(f"duplicate allowed action argument: {spec.action_type}")
+        if len(spec.compiler_groups) != len(set(spec.compiler_groups)):
+            raise RuntimeError(f"duplicate compiler group: {spec.action_type}")
+        if len(spec.semantic_operations) != len(set(spec.semantic_operations)):
+            raise RuntimeError(f"duplicate semantic operation: {spec.action_type}")
+        if not spec.semantic_operations:
+            raise RuntimeError(f"action has no semantic operation: {spec.action_type}")
+        unknown_compiler_groups = set(spec.compiler_groups) - set(GROUP_SPEC_BY_NAME)
+        unknown_semantic_operations = (
+            set(spec.semantic_operations) - SEMANTIC_OPERATIONS
+        )
+        if unknown_compiler_groups or unknown_semantic_operations:
+            raise RuntimeError(
+                f"invalid compiler authority for {spec.action_type}: "
+                f"groups={sorted(unknown_compiler_groups)}, "
+                f"operations={sorted(unknown_semantic_operations)}"
+            )
         missing_schemas = set(spec.allowed_arguments) - set(ACTION_ARGUMENT_SCHEMAS)
         if missing_schemas:
             raise RuntimeError(

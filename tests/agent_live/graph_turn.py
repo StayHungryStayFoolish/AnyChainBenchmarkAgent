@@ -25,6 +25,7 @@ def invoke_product_graph_turn(
 
     from agent.harness.domains.rpc_catalog import migrate_legacy_catalog
     from agent.harness import coordinator, intent
+    from agent.harness import hierarchical_planner
     from agent.harness.domains import analysis, chain_identity, recovery, rpc_endpoint
 
     current = deepcopy(dict(state))
@@ -33,7 +34,7 @@ def invoke_product_graph_turn(
         (
             "agent.harness.coordinator.resolve_action_queue",
             coordinator.resolve_action_queue,
-            intent.resolve_action_queue,
+            hierarchical_planner.resolve_product_action_queue,
         ),
         (
             "agent.harness.domains.chain_identity.resolve_unknown_chain_identity",
@@ -57,15 +58,16 @@ def invoke_product_graph_turn(
         ),
     )
     with ExitStack() as stack:
-        if not allow_semantic_resolver:
-            for target, active, original in guarded_entries:
-                if active is original:
-                    stack.enter_context(patch(
-                        target,
-                        side_effect=AssertionError(
-                            "deterministic graph turn attempted to call a live model entry"
-                        ),
-                    ))
+        for index, (target, active, original) in enumerate(guarded_entries):
+            if active is original and not (
+                index == 0 and allow_semantic_resolver
+            ):
+                stack.enter_context(patch(
+                    target,
+                    side_effect=AssertionError(
+                        "deterministic graph turn attempted to call a live model entry"
+                    ),
+                ))
         result = dict(build_graph(None).invoke(current))
     validate_state(result)
     return result

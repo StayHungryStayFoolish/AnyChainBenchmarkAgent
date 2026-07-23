@@ -69,6 +69,8 @@ def _action_spec_schema(spec: ActionSpec) -> dict[str, Any]:
         "effect": spec.effect,
         "target_group": spec.target_group,
         "target_field_argument": spec.target_field_argument,
+        "compiler_groups": list(spec.compiler_groups),
+        "semantic_operations": list(spec.semantic_operations),
         "requires_specific_change": spec.requires_specific_change,
         "incomplete_mutation_intake": spec.incomplete_mutation_intake,
         "entry_intake": spec.entry_intake,
@@ -144,9 +146,69 @@ def workflow_snapshot(state: AgentGraphState) -> dict[str, Any]:
         "workflow_goals": state.get("workflow_goals") or [],
         "group_states": state.get("group_states") or {},
         "current_job": state.get("job") or {},
+        "report_context": state.get("report_context") or {},
         "framework_summary": _planner_framework_summary(state.get("framework_summary") or {}),
         "web_research": _planner_web_research(state.get("web_research") or {}),
     }
+
+
+_OWNER_STATE_ROOTS: dict[str, tuple[str, ...]] = {
+    "analysis": ("evidence_collection", "current_job", "report_context"),
+    "chain_rpc": (
+        "target_mode",
+        "workflow_mode",
+        "chain_identity",
+        "rpc_mode",
+        "custom_rpc",
+        "endpoint_evidence",
+        "secondary_handoff",
+        "framework_summary",
+        "web_research",
+    ),
+    "coordinator": (
+        "interruption_stack",
+        "action_queue",
+        "workflow_goals",
+        "group_states",
+        "invalidated_groups",
+    ),
+    "environment": ("confirmed_config", "inferred_config"),
+    "execution": ("current_job",),
+    "orientation": ("current_job", "framework_summary"),
+    "performance": ("qps_profile", "observability"),
+    "recovery": ("current_job",),
+    "sync_observe": ("sync_observe",),
+}
+
+
+def owner_workflow_snapshot(
+    state: AgentGraphState,
+    owner: str,
+    *,
+    groups: frozenset[str] | None = None,
+) -> dict[str, Any]:
+    """Project only state that one owner may need while compiling commands."""
+
+    snapshot = workflow_snapshot(state)
+    selected_groups = groups or frozenset(
+        group.name for group in GROUPS if group.owner == owner
+    )
+    output: dict[str, Any] = {
+        "language": snapshot["language"],
+        "active_group": snapshot["active_group"],
+        "active_subgroup": snapshot["active_subgroup"],
+        "pending_question": snapshot["pending_question"],
+        "selected_groups": sorted(selected_groups),
+        "selected_group_states": {
+            name: value
+            for name, value in snapshot["group_states"].items()
+            if name in selected_groups
+        },
+    }
+    for key in _OWNER_STATE_ROOTS.get(owner, ()):
+        if key in snapshot:
+            output[key] = snapshot[key]
+    return output
 
 
 def _planner_evidence_collection(collection: dict[str, Any]) -> dict[str, Any]:

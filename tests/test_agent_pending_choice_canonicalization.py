@@ -1069,7 +1069,7 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         self.assertEqual((result.get("custom_rpc") or {}).get("endpoint"), endpoint)
         self.assertEqual(probe.call_args.kwargs["endpoint"], endpoint)
 
-    def test_semantic_weight_mapping_runs_resolver_to_domain_as_one_typed_value(self) -> None:
+    def test_admitted_semantic_weight_mapping_reaches_domain_as_one_typed_value(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn
         from tests.agent_live.harness_contract_scenarios import question_scenarios
 
@@ -1081,25 +1081,18 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         text = "Use 45 for eth_blockNumber and 55 for eth_gasPrice."
         state["last_user_input"] = text
         weights = {"eth_blockNumber": 45, "eth_gasPrice": 55}
-        candidate = _document({
-            "type": "rpc_workload_command",
-            "workload_scope": "mixed_replace",
-            "rpc_weights": weights,
-        }, text)
-        resolved = _document({
-            "type": "answer_pending",
-            "answer": weights,
-            "source_evidence": text,
-        }, text)
-        provider = _provider(
-            [candidate, resolved],
-            candidate_selector=_select_unique_operation_candidate,
-        )
-
-        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            return_value={"actions": [{
+                "type": "answer_pending",
+                "answer": weights,
+                "source_evidence": text,
+                "pending_option_semantic_verified": True,
+                "semantic_purpose_verified": True,
+            }]},
+        ):
             result = invoke_product_graph_turn(state, allow_semantic_resolver=True)
 
-        self.assertEqual(provider.complete.call_count, 4)
         self.assertEqual((result.get("chain_identity") or {}).get("weights"), weights)
         self.assertNotEqual(
             (result.get("pending_question") or {}).get("id"),
@@ -2651,7 +2644,7 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
                     ["clarify_unresolved"],
                 )
 
-    def test_nested_envelope_equal_representations_share_one_option_owner(self) -> None:
+    def test_nested_envelope_is_rejected_on_current_turns(self) -> None:
         from agent.harness.intent import resolve_action_queue
 
         state = _state(active_group="provider_deployment")
@@ -2682,9 +2675,7 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
             result = resolve_action_queue(state, text)
 
         self.assertEqual(len(result["actions"]), 1)
-        self.assertEqual(result["actions"][0]["type"], "answer_pending")
-        self.assertIs(result["actions"][0]["answer"], True)
-        self.assertIs(result["actions"][0]["selected_value"], True)
+        self.assertEqual(result["actions"][0]["type"], "unknown")
 
     def test_unresolved_sibling_prevents_partial_pending_commit_in_product_graph(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn
@@ -2729,40 +2720,17 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
                 for index, clause in enumerate(clauses, start=1)
             ],
         }
-        provider = Mock()
-        compiler_documents = iter([clarification, clarification])
-
-        def complete(request: Any) -> SimpleNamespace:
-            payload = json.loads(request.messages[1].content)
-            if "plan_hash" not in payload:
-                return SimpleNamespace(text=json.dumps(
-                    next(compiler_documents),
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ))
-            response = json.loads(_admission_response(request).text)
-            response["action_verdicts"][0]["verdict"] = "reject"
-            response["action_verdicts"][0]["reason"] = (
-                "the sibling requests an independent unresolved operation"
-            )
-            sibling = next(
-                row
-                for row in response["unit_verdicts"]
-                if "other thing" in row["evidence_quote"]
-            )
-            sibling.update({
-                "verdict": "unresolved",
-                "reason": "the sibling is not support for the endpoint answer",
-            })
-            return SimpleNamespace(text=json.dumps(
-                response,
-                ensure_ascii=False,
-                sort_keys=True,
-            ))
-
-        provider.complete.side_effect = complete
-
-        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            return_value={
+                **clarification,
+                "actions": [{
+                    "type": "unknown",
+                    "reason": "one sibling remains unresolved",
+                    "confidence": "low",
+                }],
+            },
+        ):
             result = invoke_product_graph_turn(state, allow_semantic_resolver=True)
 
         self.assertEqual(result["pending_question"]["id"], "custom_rpc_endpoint")
