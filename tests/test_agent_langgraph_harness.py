@@ -4291,6 +4291,7 @@ network:
             "kind": "yes_no",
             "field": "inferred_config_review",
             "options": [{"label": "Y", "value": True}, {"label": "N", "value": False}],
+            "accepted_action_types": ["answer_pending", "propose_config_values"],
         }
         state["last_user_input"] = "Y"
         result = process_turn(state)
@@ -10844,10 +10845,22 @@ response:
             "kind": "yes_no",
             "field": "inferred_config_review",
             "options": [{"label": "Y", "value": True}, {"label": "N", "value": False}],
+            "accepted_action_types": ["answer_pending", "propose_config_values"],
         }
         state["last_user_input"] = "CLOUD_ZONE: asia-east1-c"
 
-        result = process_turn(state)
+        result = _invoke_with_admitted_actions(
+            process_turn,
+            state,
+            [{
+                "type": "propose_config_values",
+                "source_format": "yaml",
+                "config_values": {"CLOUD_ZONE": "asia-east1-c"},
+                "unmapped_values": {},
+                "source_evidence": state["last_user_input"],
+                "confidence": "high",
+            }],
+        )
 
         proposal = result["inferred_config"]["pending_review"]["config_values"]
         self.assertEqual(proposal["CLOUD_REGION"], "asia-east1")
@@ -10856,7 +10869,18 @@ response:
         self.assertIn("CLOUD_ZONE", "\n".join(result["visible_response"]))
 
         result["last_user_input"] = "MACHINE_TYPE=n2-standard-16"
-        merged = process_turn(result)
+        merged = _invoke_with_admitted_actions(
+            process_turn,
+            result,
+            [{
+                "type": "propose_config_values",
+                "source_format": "env",
+                "config_values": {"MACHINE_TYPE": "n2-standard-16"},
+                "unmapped_values": {},
+                "source_evidence": result["last_user_input"],
+                "confidence": "high",
+            }],
+        )
 
         proposal = merged["inferred_config"]["pending_review"]["config_values"]
         self.assertEqual(proposal["CLOUD_REGION"], "asia-east1")
@@ -10864,6 +10888,69 @@ response:
         self.assertEqual(proposal["MACHINE_TYPE"], "n2-standard-16")
         self.assertEqual(merged["pending_question"]["id"], "inferred_config_review")
         self.assertIn("MACHINE_TYPE", "\n".join(merged["visible_response"]))
+
+    def test_pending_config_fragment_and_consultation_share_one_admitted_plan(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.state import new_state
+
+        state = new_state("pending-review-compound-turn", language="en")
+        state["active_group"] = "provider_deployment"
+        state["inferred_config"] = {
+            "pending_review": {
+                "config_values": {"CLOUD_ZONE": "us-east1-b"},
+                "unmapped_values": {},
+                "source_format": "mixed",
+                "reason": "initial fragment",
+            }
+        }
+        state["pending_question"] = {
+            "id": "inferred_config_review",
+            "group": "provider_deployment",
+            "kind": "yes_no",
+            "field": "inferred_config_review",
+            "options": [{"label": "Y", "value": True}, {"label": "N", "value": False}],
+            "accepted_action_types": ["answer_pending", "propose_config_values"],
+        }
+        state["last_user_input"] = (
+            "CLOUD_REGION=us-east1\n"
+            "Also explain what this Agent can do."
+        )
+
+        result = _invoke_with_admitted_actions(
+            process_turn,
+            state,
+            [
+                {
+                    "type": "propose_config_values",
+                    "source_format": "env",
+                    "config_values": {"CLOUD_REGION": "us-east1"},
+                    "unmapped_values": {},
+                    "source_evidence": "CLOUD_REGION=us-east1",
+                    "confidence": "high",
+                },
+                {
+                    "type": "answer_opening_question",
+                    "topic": "agent_capabilities",
+                    "source_evidence": "Also explain what this Agent can do.",
+                    "confidence": "high",
+                },
+            ],
+        )
+
+        proposal = result["inferred_config"]["pending_review"]["config_values"]
+        self.assertEqual(proposal["CLOUD_ZONE"], "us-east1-b")
+        self.assertEqual(proposal["CLOUD_REGION"], "us-east1")
+        self.assertEqual(result["pending_question"]["id"], "inferred_config_review")
+        self.assertEqual(
+            {
+                item.get("type")
+                for item in (result.get("turn_context") or {}).get("admitted_actions") or []
+            },
+            {"propose_config_values", "answer_opening_question"},
+        )
+        rendered = "\n".join(result.get("visible_response") or [])
+        self.assertIn("AnyChain Benchmark Agent", rendered)
+        self.assertIn("CLOUD_REGION", rendered)
 
     def test_terminal_style_fragmented_config_paste_maps_common_short_fields(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
@@ -10884,20 +10971,33 @@ response:
             "kind": "yes_no",
             "field": "inferred_config_review",
             "options": [{"label": "Y", "value": True}, {"label": "N", "value": False}],
+            "accepted_action_types": ["answer_pending", "propose_config_values"],
         }
-        for line in [
-            "zone: asia-east1-c",
-            "machine_type: n2-standard-16",
-            "ledger_device: vda",
-            "data_vol_type: hyperdisk-balanced,",
-            "data_vol_size: 926GiB",
-            "iops: 20000 IOPS",
-            "throughput: 1000 MiB/s",
-            "interface: eth0",
-            "bandwidth: 100Gbps",
-        ]:
+        fragments = [
+            ("zone: asia-east1-c", "CLOUD_ZONE", "asia-east1-c"),
+            ("machine_type: n2-standard-16", "MACHINE_TYPE", "n2-standard-16"),
+            ("ledger_device: vda", "LEDGER_DEVICE", "vda"),
+            ("data_vol_type: hyperdisk-balanced,", "DATA_VOL_TYPE", "hyperdisk-balanced"),
+            ("data_vol_size: 926GiB", "DATA_VOL_SIZE", "926"),
+            ("iops: 20000 IOPS", "DATA_VOL_MAX_IOPS", "20000"),
+            ("throughput: 1000 MiB/s", "DATA_VOL_MAX_THROUGHPUT", "1000"),
+            ("interface: eth0", "NETWORK_INTERFACE", "eth0"),
+            ("bandwidth: 100Gbps", "NETWORK_MAX_BANDWIDTH_GBPS", "100"),
+        ]
+        for line, field, value in fragments:
             state["last_user_input"] = line
-            state = process_turn(state)
+            state = _invoke_with_admitted_actions(
+                process_turn,
+                state,
+                [{
+                    "type": "propose_config_values",
+                    "source_format": "mixed",
+                    "config_values": {field: value},
+                    "unmapped_values": {},
+                    "source_evidence": line,
+                    "confidence": "high",
+                }],
+            )
 
         proposal = state["inferred_config"]["pending_review"]["config_values"]
         self.assertEqual(proposal["CLOUD_REGION"], "asia-east1")

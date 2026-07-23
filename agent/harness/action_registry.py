@@ -1319,8 +1319,9 @@ def normalize_action_envelope(raw: dict[str, Any]) -> dict[str, Any]:
     """Normalize a model action into the registry's flat wire contract.
 
     Nested ``arguments`` is the measured ``arguments.v1`` compatibility path.
-    The current wire contract is flat. Explicit top-level values win and the
-    compatibility object cannot overwrite action identity or audit metadata.
+    The current wire contract is flat. Duplicate argument representations must
+    agree; the compatibility object cannot overwrite action identity or audit
+    metadata.
     """
 
     action = dict(raw)
@@ -1329,7 +1330,12 @@ def normalize_action_envelope(raw: dict[str, Any]) -> dict[str, Any]:
         _COMPATIBILITY_USAGE[LEGACY_ARGUMENTS_ENVELOPE_VERSION] += 1
         for key, value in nested.items():
             if key not in {"type", "intent", "action_id", "confidence", "reason"}:
-                action.setdefault(str(key), value)
+                normalized_key = str(key)
+                if normalized_key in action and action[normalized_key] != value:
+                    raise ValueError(
+                        f"conflicting flat and arguments.v1 values for {normalized_key}"
+                    )
+                action.setdefault(normalized_key, value)
     if "type" not in action and "intent" in action:
         action["type"] = action["intent"]
     action.pop("intent", None)
@@ -1397,6 +1403,26 @@ def validate_action_contract(
     if trusted_metadata and action_type == "propose_config_values":
         validate_proposal_field_receipts(action)
     return action
+
+
+def validate_action_transaction_contract(
+    actions: list[Mapping[str, Any]],
+) -> None:
+    """Reject plans that would clarify and partially commit the same turn."""
+
+    action_types = [
+        str(action.get("type") or "").strip()
+        for action in actions
+        if isinstance(action, Mapping)
+    ]
+    if "clarify_unresolved" in action_types and any(
+        action_type != "clarify_unresolved"
+        for action_type in action_types
+    ):
+        raise ValueError(
+            "clarify_unresolved is a whole-turn transaction barrier and cannot "
+            "coexist with another action"
+        )
 
 
 def _normalize_action_values(action: dict[str, Any]) -> None:

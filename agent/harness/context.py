@@ -12,6 +12,7 @@ from .action_registry import (
     semantic_scope_schema,
 )
 from .state import AgentGraphState
+from .semantic_policy import PENDING_CANDIDATE_SEMANTIC_POLICY
 
 from agent.workflows.group_registry import GROUPS, USER_NAVIGABLE_GROUPS
 
@@ -185,8 +186,8 @@ def build_action_resolver_prompt() -> str:
         "revise earlier state, paste evidence, or combine several of those. Preserve unresolved work. "
         "Use answer_pending only when the user is actually answering the active pending question in natural language. Put the complete answer in its answer argument. "
         "An answer_pending action owns only the value for the question that existed when the turn began. It never owns or absorbs a sibling endpoint, method, schema fact, workload choice, field value, or navigation demand for a later step. Preserve each such independently actionable fact with its own registered typed action even when it appears in the same sentence or the answer will create that later question. "
-        "Syntax candidates are not selections. A value mentioned only as an example, quotation, rejected option, negated operation, correction target, or value the user explicitly says not to apply does not answer the pending question. Preserve any independent explanation or correction demand instead. "
-        "If the same turn explicitly changes a dependency dimension that invalidates the active pending question (for example changing chain or target mode while an old endpoint question is active), do not emit answer_pending for that stale question. Emit the explicit mutation actions first and preserve every supplied value in its owner action: use propose_config_values for named configuration fields such as LOCAL_RPC_URL, rpc_catalog_command for custom-RPC endpoint/method/schema evidence, and rpc_workload_command for scope/weights. The Harness will pause for any required change confirmation; never bind a new value to the old context. "
+        + PENDING_CANDIDATE_SEMANTIC_POLICY
+        + "If the same turn explicitly changes a dependency dimension that invalidates the active pending question (for example changing chain or target mode while an old endpoint question is active), do not emit answer_pending for that stale question. Emit the explicit mutation actions first and preserve every supplied value in its owner action: use propose_config_values for named configuration fields such as LOCAL_RPC_URL, rpc_catalog_command for custom-RPC endpoint/method/schema evidence, and rpc_workload_command for scope/weights. The Harness will pause for any required change confirmation; never bind a new value to the old context. "
         "If the user asks whether a prior request was retained, what is complete or missing, what the current state is, or what happens next, emit answer_opening_question with the matching current_config/current_context/next_action topic even while a pending question exists. Preserve that pending question; do not emit answer_pending unless the same turn also supplies its answer. "
         "When an action spec requires source_evidence, use a short exact excerpt contained wholly inside one semantic unit mapped to that action; never span or concatenate neighboring units even when they support the same action. For manual scalar fields, the proposed answer itself must occur in that evidence; never copy a value from workflow_state into a new answer. "
         "For a choice question, set selected_value to exactly one value declared by pending_question.options; never invent a value. "

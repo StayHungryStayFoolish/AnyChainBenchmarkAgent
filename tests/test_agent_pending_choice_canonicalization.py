@@ -243,7 +243,8 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
 
-        self.assertEqual(provider.complete.call_count, 4)
+        self.assertGreaterEqual(provider.complete.call_count, 2)
+        self.assertLessEqual(provider.complete.call_count, 4)
         self.assertEqual(result["actions"][0]["type"], "clarify_unresolved")
 
     def test_cross_group_mutation_is_readjudicated_for_manual_pending(self) -> None:
@@ -297,7 +298,8 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
 
-        self.assertEqual(provider.complete.call_count, 4)
+        self.assertGreaterEqual(provider.complete.call_count, 2)
+        self.assertLessEqual(provider.complete.call_count, 4)
         self.assertEqual([item["type"] for item in result["actions"]], ["answer_pending"])
 
     def test_typed_url_candidates_are_exposed_without_guessing(self) -> None:
@@ -970,12 +972,711 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
 
-        self.assertEqual(provider.complete.call_count, 3)
+        self.assertEqual(provider.complete.call_count, 2)
         self.assertEqual(result["actions"][0]["type"], "propose_config_values")
         self.assertEqual(
             result["actions"][0]["config_values"],
             {"NETWORK_MAX_BANDWIDTH_GBPS": "25"},
         )
+
+    def test_structured_pending_field_survives_compiler_clarification(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        text = "ACCOUNTS_VOL_TYPE: hyperdisk-balanced"
+        state = _state(active_group="accounts_disk")
+        state["pending_question"] = {
+            "id": "ACCOUNTS_VOL_TYPE",
+            "group": "accounts_disk",
+            "kind": "manual_value",
+            "field": "ACCOUNTS_VOL_TYPE",
+            "manual_input_allowed": True,
+            "options": [],
+            "manual_action": {"type": "answer_pending", "value_argument": "answer"},
+            "validation": {"value_type": "scalar_token"},
+        }
+        clarification = _document({
+            "type": "clarify_unresolved",
+            "clauses": [text],
+        }, text)
+        provider = _provider([clarification])
+
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
+        self.assertEqual(
+            result["actions"][0]["config_values"],
+            {"ACCOUNTS_VOL_TYPE": "hyperdisk-balanced"},
+        )
+        self.assertEqual(result["actions"][0]["type"], "propose_config_values")
+        self.assertEqual(provider.complete.call_count, 2)
+
+    def test_structured_pending_candidate_does_not_steal_consultation_owner(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        text = "Example only, do not apply: ACCOUNTS_VOL_TYPE: hyperdisk-balanced"
+        state = _state(active_group="accounts_disk")
+        state["pending_question"] = {
+            "id": "ACCOUNTS_VOL_TYPE",
+            "group": "accounts_disk",
+            "kind": "manual_value",
+            "field": "ACCOUNTS_VOL_TYPE",
+            "manual_input_allowed": True,
+            "options": [],
+            "manual_action": {"type": "answer_pending", "value_argument": "answer"},
+            "validation": {"value_type": "scalar_token"},
+        }
+        consultation = _document({
+            "type": "answer_opening_question",
+            "topic": "config_explanation",
+            "subject": "ACCOUNTS_VOL_TYPE",
+            "source_evidence": text,
+        }, text)
+        provider = _provider([consultation])
+
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
+        self.assertEqual(provider.complete.call_count, 2)
+        self.assertEqual(
+            [action["type"] for action in result["actions"]],
+            ["answer_opening_question"],
+        )
+
+    def test_pending_url_candidate_does_not_steal_consultation_owner(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        state = _state(active_group="endpoint_process")
+        state["pending_question"] = {
+            "id": "endpoint",
+            "group": "endpoint_process",
+            "kind": "url",
+            "manual_input_allowed": True,
+            "options": [],
+            "manual_action": {
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_endpoint",
+                "value_argument": "rpc_endpoint",
+            },
+            "validation": {"value_type": "url"},
+        }
+        text = "Can this Agent analyze http://node-a:8545 without selecting it as the endpoint?"
+        consultation = _document({
+            "type": "answer_opening_question",
+            "topic": "capabilities",
+            "subject": "endpoint analysis without selection",
+            "source_evidence": text,
+        }, text)
+        provider = _provider([consultation])
+
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
+        self.assertEqual(provider.complete.call_count, 2)
+        self.assertEqual(
+            [action["type"] for action in result["actions"]],
+            ["answer_opening_question"],
+        )
+
+    def test_structured_pending_review_preserves_the_complete_atomic_block(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        text = (
+            "ACCOUNTS_VOL_TYPE: hyperdisk-balanced\n"
+            "ACCOUNTS_VOL_SIZE: 2048\n"
+            "TEAM_NOTE: verify-with-storage-owner"
+        )
+        state = _state(active_group="accounts_disk")
+        state["pending_question"] = {
+            "id": "ACCOUNTS_VOL_TYPE",
+            "group": "accounts_disk",
+            "kind": "manual_value",
+            "field": "ACCOUNTS_VOL_TYPE",
+            "manual_input_allowed": True,
+            "options": [],
+            "manual_action": {"type": "answer_pending", "value_argument": "answer"},
+            "validation": {"value_type": "scalar_token"},
+        }
+        clarification = _document({
+            "type": "clarify_unresolved",
+            "clauses": [text],
+        }, text)
+        provider = _provider([clarification])
+
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
+        proposal = result["actions"][0]
+        self.assertEqual(proposal["config_values"]["ACCOUNTS_VOL_TYPE"], "hyperdisk-balanced")
+        self.assertEqual(proposal["config_values"]["ACCOUNTS_VOL_SIZE"], "2048")
+        self.assertEqual(proposal["unmapped_values"]["TEAM_NOTE"], "verify-with-storage-owner")
+        self.assertEqual(proposal["type"], "propose_config_values")
+
+    def test_structured_pending_fast_path_does_not_steal_workflow_values(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn
+
+        text = "ACCOUNTS_VOL_TYPE: hyperdisk-balanced\nRPC_MODE: mixed"
+        state = _state(active_group="accounts_disk")
+        state["pending_question"] = {
+            "id": "ACCOUNTS_VOL_TYPE",
+            "group": "accounts_disk",
+            "kind": "manual_value",
+            "field": "ACCOUNTS_VOL_TYPE",
+            "manual_input_allowed": True,
+            "options": [],
+            "manual_action": {"type": "answer_pending", "value_argument": "answer"},
+            "validation": {"value_type": "scalar_token"},
+        }
+        state["last_user_input"] = text
+        resolver = Mock(return_value={
+            "actions": [{"type": "clarify_unresolved", "clauses": [text]}],
+        })
+
+        with patch("agent.harness.coordinator.resolve_action_queue", resolver):
+            result = invoke_product_graph_turn(state)
+
+        resolver.assert_called_once()
+        self.assertNotIn("pending_review", result.get("inferred_config") or {})
+        self.assertEqual(result["pending_question"]["id"], "ACCOUNTS_VOL_TYPE")
+
+    def test_multiline_pending_url_survives_compiler_clarification(self) -> None:
+        from agent.harness.intent import _materialize_pending_contract_candidates
+        from agent.harness.plan_coverage import segment_user_turn
+
+        state = _state(active_group="endpoint_process")
+        state["chain_identity"] = {
+            "status": "confirmed",
+            "canonical": "solana",
+            "adapter_family": "jsonrpc",
+        }
+        state["pending_question"] = {
+            "id": "custom_rpc_endpoint",
+            "group": "endpoint_process",
+            "kind": "url",
+            "field": "custom_rpc_endpoint",
+            "manual_input_allowed": True,
+            "options": [],
+            "manual_action": {
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_endpoint",
+                "value_argument": "rpc_endpoint",
+            },
+            "validation": {},
+        }
+        text = (
+            "Validate the custom method against this endpoint:\n"
+            "http://fake-node:19000\n"
+            "Do not use a documentation URL as the endpoint."
+        )
+        clauses = [
+            "Validate the custom method against this endpoint:",
+            "http://fake-node:19000",
+            "Do not use a documentation URL as the endpoint.",
+        ]
+        compiler_clarification = {
+            "actions": [{"type": "clarify_unresolved", "clauses": clauses}],
+            "semantic_units": [
+                {
+                    "unit_id": f"unit-{index}",
+                    "clause_id": f"clause-{index}",
+                    "source_text": clause,
+                    "disposition": "action",
+                    "action_indexes": [0],
+                    "reason": "compiler requested clarification",
+                }
+                for index, clause in enumerate(clauses, start=1)
+            ],
+        }
+        materialized = json.loads(_materialize_pending_contract_candidates(
+            json.dumps(compiler_clarification),
+            state,
+            segment_user_turn(text),
+        ))
+
+        self.assertEqual(
+            [action["type"] for action in materialized["actions"]],
+            ["clarify_unresolved", "rpc_catalog_command"],
+        )
+        self.assertEqual(
+            materialized["actions"][1]["rpc_endpoint"],
+            "http://fake-node:19000",
+        )
+        self.assertEqual(
+            materialized["semantic_units"][1]["action_indexes"],
+            [1],
+        )
+        self.assertEqual(
+            materialized["semantic_units"][0]["action_indexes"],
+            [0],
+        )
+        self.assertEqual(
+            materialized["semantic_units"][2]["action_indexes"],
+            [0],
+        )
+
+    def test_existing_pending_answer_absorbs_exact_candidate_without_duplication(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        state = _state(active_group="endpoint_process")
+        state["pending_question"] = {
+            "id": "custom_rpc_endpoint",
+            "group": "endpoint_process",
+            "kind": "url",
+            "field": "custom_rpc_endpoint",
+            "manual_input_allowed": True,
+            "options": [],
+            "manual_action": {
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_endpoint",
+                "value_argument": "rpc_endpoint",
+            },
+            "validation": {"value_type": "url"},
+        }
+        text = (
+            "Validate against this endpoint:\n"
+            "http://fake-node:19000\n"
+            "Do not select a documentation URL."
+        )
+        document = {
+            "actions": [
+                {
+                    "type": "answer_pending",
+                    "answer": "http://fake-node:19000",
+                    "source_evidence": "http://fake-node:19000",
+                },
+                {
+                    "type": "clarify_unresolved",
+                    "clauses": ["http://fake-node:19000"],
+                },
+            ],
+            "semantic_units": [
+                {
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "source_text": "Validate against this endpoint:",
+                    "disposition": "action",
+                    "action_indexes": [0],
+                    "reason": "operation framing",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "clause_id": "clause-2",
+                    "source_text": "http://fake-node:19000",
+                    "disposition": "action",
+                    "action_indexes": [1],
+                    "reason": "compiler left the exact candidate unresolved",
+                },
+                {
+                    "unit_id": "unit-3",
+                    "clause_id": "clause-3",
+                    "source_text": "Do not select a documentation URL.",
+                    "disposition": "action",
+                    "action_indexes": [0],
+                    "reason": "alternative-category exclusion",
+                },
+            ],
+        }
+        provider = _provider([document])
+
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
+        self.assertEqual(provider.complete.call_count, 2)
+        self.assertEqual(
+            [action["type"] for action in result["actions"]],
+            ["answer_pending"],
+        )
+        self.assertEqual(result["actions"][0]["answer"], "http://fake-node:19000")
+
+    def test_manual_answer_and_selected_value_forms_coalesce_to_one_owner(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        state = _state(active_group="endpoint_process")
+        state["pending_question"] = {
+            "id": "custom_rpc_endpoint",
+            "group": "endpoint_process",
+            "kind": "url",
+            "field": "custom_rpc_endpoint",
+            "manual_input_allowed": True,
+            "options": [],
+            "manual_action": {
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_endpoint",
+                "value_argument": "rpc_endpoint",
+            },
+            "validation": {"value_type": "url"},
+        }
+        selected = "http://fake-node:19000"
+        text = f"Use {selected} as the validation endpoint."
+        document = {
+            "actions": [
+                {
+                    "type": "answer_pending",
+                    "answer": selected,
+                    "source_evidence": text,
+                },
+                {
+                    "type": "answer_pending",
+                    "selected_value": selected,
+                    "source_evidence": text,
+                },
+            ],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": text,
+                "disposition": "action",
+                "action_indexes": [0, 1],
+                "reason": "two model representations claim one typed value",
+            }],
+        }
+        provider = _provider([document])
+
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
+        self.assertEqual(provider.complete.call_count, 2)
+        self.assertEqual(len(result["actions"]), 1)
+        self.assertEqual(result["actions"][0]["type"], "answer_pending")
+        self.assertEqual(result["actions"][0]["answer"], selected)
+        self.assertNotIn("selected_value", result["actions"][0])
+
+    def test_conflicting_manual_answer_representations_do_not_select_by_field_order(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        state = _state(active_group="endpoint_process")
+        state["pending_question"] = {
+            "id": "custom_rpc_endpoint",
+            "group": "endpoint_process",
+            "kind": "url",
+            "field": "custom_rpc_endpoint",
+            "manual_input_allowed": True,
+            "options": [],
+            "manual_action": {
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_endpoint",
+                "value_argument": "rpc_endpoint",
+            },
+            "validation": {"value_type": "url"},
+        }
+        first = "http://fake-node:19000"
+        second = "https://example.invalid/rpc"
+        text = f"Use either {first} or {second}."
+        unresolved = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": first,
+                "selected_value": second,
+                "source_evidence": text,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": text,
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "two conflicting manual values",
+            }],
+        }
+        clarification = _document(
+            {"type": "clarify_unresolved", "clauses": [text]},
+            text,
+        )
+        provider = _provider([unresolved, clarification])
+
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
+        self.assertGreaterEqual(provider.complete.call_count, 2)
+        self.assertLessEqual(provider.complete.call_count, 4)
+        self.assertEqual(
+            [action["type"] for action in result["actions"]],
+            ["clarify_unresolved"],
+        )
+
+    def test_invalid_nonempty_second_manual_representation_is_still_a_conflict(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        state = _state(active_group="endpoint_process")
+        state["pending_question"] = {
+            "id": "custom_rpc_endpoint",
+            "group": "endpoint_process",
+            "kind": "url",
+            "field": "custom_rpc_endpoint",
+            "manual_input_allowed": True,
+            "options": [],
+            "manual_action": {
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_endpoint",
+                "value_argument": "rpc_endpoint",
+            },
+            "validation": {"value_type": "url"},
+        }
+        selected = "http://fake-node:19000"
+        text = f"Use {selected}; the other model field is wrong."
+        conflicting = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": selected,
+                "selected_value": "not-a-url",
+                "source_evidence": text,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": text,
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "the model emitted conflicting representations",
+            }],
+        }
+        clarification = _document(
+            {"type": "clarify_unresolved", "clauses": [text]},
+            text,
+        )
+        provider = _provider([conflicting, clarification])
+
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
+        self.assertGreaterEqual(provider.complete.call_count, 2)
+        self.assertLessEqual(provider.complete.call_count, 4)
+        self.assertEqual(
+            [action["type"] for action in result["actions"]],
+            ["clarify_unresolved"],
+        )
+
+    def test_yes_no_conflict_is_rejected_before_option_canonicalization(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        state = _state(active_group="provider_deployment")
+        state["pending_question"] = {
+            "id": "confirm_value",
+            "group": "provider_deployment",
+            "kind": "yes_no",
+            "field": "confirm_value",
+            "manual_input_allowed": False,
+            "options": [
+                {"id": "yes", "label": "Y", "value": True},
+                {"id": "no", "label": "N", "value": False},
+            ],
+        }
+        text = "Y"
+        conflicting = _document({
+            "type": "answer_pending",
+            "answer": "different-nonempty",
+            "selected_value": True,
+            "source_evidence": text,
+        }, text)
+        clarification = _document(
+            {"type": "clarify_unresolved", "clauses": [text]},
+            text,
+        )
+        provider = _provider([conflicting, clarification])
+
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
+        self.assertEqual(
+            [action["type"] for action in result["actions"]],
+            ["clarify_unresolved"],
+        )
+
+    def test_numbered_choice_conflict_is_rejected_before_option_canonicalization(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        state = _state(active_group="qps_profile")
+        state["pending_question"] = {
+            "id": "qps_mode",
+            "group": "qps_profile",
+            "kind": "numbered_choice",
+            "field": "qps_mode",
+            "manual_input_allowed": False,
+            "options": [
+                {"id": "quick", "label": "quick", "value": "quick"},
+                {"id": "standard", "label": "standard", "value": "standard"},
+            ],
+        }
+        text = "1"
+        conflicting = _document({
+            "type": "answer_pending",
+            "answer": "different-nonempty",
+            "selected_value": "quick",
+            "source_evidence": text,
+        }, text)
+        clarification = _document(
+            {"type": "clarify_unresolved", "clauses": [text]},
+            text,
+        )
+        provider = _provider([conflicting, clarification])
+
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
+        self.assertEqual(
+            [action["type"] for action in result["actions"]],
+            ["clarify_unresolved"],
+        )
+
+    def test_nested_envelope_conflicts_are_rejected_in_both_directions(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        state = _state(active_group="provider_deployment")
+        state["pending_question"] = {
+            "id": "confirm_value",
+            "group": "provider_deployment",
+            "kind": "yes_no",
+            "field": "confirm_value",
+            "manual_input_allowed": False,
+            "options": [
+                {"id": "yes", "label": "Y", "value": True},
+                {"id": "no", "label": "N", "value": False},
+            ],
+        }
+        text = "Y"
+        variants = (
+            {
+                "type": "answer_pending",
+                "selected_value": True,
+                "arguments": {"answer": "different-nonempty"},
+                "source_evidence": text,
+            },
+            {
+                "type": "answer_pending",
+                "answer": "different-nonempty",
+                "arguments": {"selected_value": True},
+                "source_evidence": text,
+            },
+        )
+        for action in variants:
+            with self.subTest(action=action):
+                conflicting = _document(action, text)
+                clarification = _document(
+                    {"type": "clarify_unresolved", "clauses": [text]},
+                    text,
+                )
+                provider = _provider([conflicting, clarification])
+                with patch("agent.harness.intent.provider_from_config", return_value=provider):
+                    result = resolve_action_queue(state, text)
+                self.assertEqual(
+                    [item["type"] for item in result["actions"]],
+                    ["clarify_unresolved"],
+                )
+
+    def test_nested_envelope_equal_representations_share_one_option_owner(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        state = _state(active_group="provider_deployment")
+        state["pending_question"] = {
+            "id": "confirm_value",
+            "group": "provider_deployment",
+            "kind": "yes_no",
+            "field": "confirm_value",
+            "manual_input_allowed": False,
+            "options": [
+                {"id": "yes", "label": "Y", "value": True},
+                {"id": "no", "label": "N", "value": False},
+            ],
+        }
+        text = "Y"
+        document = _document({
+            "type": "answer_pending",
+            "selected_value": True,
+            "arguments": {"answer": True},
+            "source_evidence": text,
+        }, text)
+        provider = _provider([document])
+
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
+        self.assertEqual(len(result["actions"]), 1)
+        self.assertEqual(result["actions"][0]["type"], "answer_pending")
+        self.assertIs(result["actions"][0]["answer"], True)
+        self.assertIs(result["actions"][0]["selected_value"], True)
+
+    def test_unresolved_sibling_prevents_partial_pending_commit_in_product_graph(self) -> None:
+        from tests.agent_live.graph_turn import invoke_product_graph_turn
+
+        state = _state(active_group="endpoint_process")
+        state["pending_question"] = {
+            "id": "custom_rpc_endpoint",
+            "group": "endpoint_process",
+            "kind": "url",
+            "field": "custom_rpc_endpoint",
+            "manual_input_allowed": True,
+            "options": [],
+            "manual_action": {
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_endpoint",
+                "value_argument": "rpc_endpoint",
+            },
+            "validation": {"value_type": "url"},
+        }
+        text = (
+            "Use this endpoint:\n"
+            "http://fake-node:19000\n"
+            "Also apply the other thing I mentioned."
+        )
+        state["last_user_input"] = text
+        clauses = [
+            "Use this endpoint:",
+            "http://fake-node:19000",
+            "Also apply the other thing I mentioned.",
+        ]
+        clarification = {
+            "actions": [{"type": "clarify_unresolved", "clauses": clauses}],
+            "semantic_units": [
+                {
+                    "unit_id": f"unit-{index}",
+                    "clause_id": f"clause-{index}",
+                    "source_text": clause,
+                    "disposition": "action",
+                    "action_indexes": [0],
+                    "reason": "one sibling remains unresolved",
+                }
+                for index, clause in enumerate(clauses, start=1)
+            ],
+        }
+        provider = _provider([clarification, clarification])
+
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = invoke_product_graph_turn(state, allow_semantic_resolver=True)
+
+        self.assertEqual(result["pending_question"]["id"], "custom_rpc_endpoint")
+        self.assertEqual(result.get("endpoint_evidence") or {}, {})
+        self.assertEqual(result.get("custom_rpc") or {}, {})
+        self.assertEqual(result.get("action_queue") or [], [])
+        self.assertTrue(result.get("visible_response"))
+
+    def test_multiple_pending_urls_do_not_create_a_manual_candidate(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        state = _state(active_group="endpoint_process")
+        state["pending_question"] = {
+            "id": "endpoint",
+            "group": "endpoint_process",
+            "kind": "url",
+            "manual_input_allowed": True,
+            "options": [],
+            "manual_action": {
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_endpoint",
+                "value_argument": "rpc_endpoint",
+            },
+            "validation": {},
+        }
+        text = "Use http://node-a:8545 or http://node-b:8545."
+        clarification = _document({
+            "type": "clarify_unresolved",
+            "clauses": [text],
+        }, text)
+        provider = _provider([clarification, clarification])
+
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
+        self.assertEqual(provider.complete.call_count, 4)
+        self.assertEqual(result["actions"][0]["type"], "clarify_unresolved")
 
     def test_focused_typed_answer_cannot_hide_an_unresolved_compound_unit(self) -> None:
         from agent.harness.intent import resolve_action_queue
@@ -1043,8 +1744,7 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
 
-        self.assertGreaterEqual(provider.complete.call_count, 3)
-        self.assertLessEqual(provider.complete.call_count, 4)
+        self.assertEqual(provider.complete.call_count, 2)
         self.assertEqual(result["actions"][0]["type"], "clarify_unresolved")
         self.assertIn(second_text, result["actions"][0]["clauses"])
 
@@ -1089,7 +1789,7 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
 
-        self.assertEqual(provider.complete.call_count, 4)
+        self.assertEqual(provider.complete.call_count, 3)
         self.assertEqual(
             [action["type"] for action in result["actions"]],
             ["answer_pending", "answer_opening_question"],

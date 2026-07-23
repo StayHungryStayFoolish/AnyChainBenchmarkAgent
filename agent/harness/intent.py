@@ -23,11 +23,13 @@ from .action_registry import (
     canonical_consultation_topic,
     lifecycle_rejected_action_indexes,
     normalize_action_relations,
+    normalize_action_envelope,
     resolve_action_target_group,
     semantic_grounding_arguments,
     semantic_scope_accepts_action,
     semantic_scope_schema,
     validate_action_contract,
+    validate_action_transaction_contract,
 )
 from .context import action_schema, build_action_resolver_prompt, group_schema, workflow_snapshot
 from .domains.environment import (
@@ -56,6 +58,7 @@ from .semantic_compiler import (
     request_whole_plan_admission,
 )
 from .state import AgentGraphState
+from .semantic_policy import PENDING_CANDIDATE_SEMANTIC_POLICY
 from agent.workflows.group_registry import (
     GROUP_SPEC_BY_NAME,
     USER_NAVIGABLE_GROUPS,
@@ -261,7 +264,9 @@ def _prepare_bounded_semantic_candidate(
 
     try:
         candidate = _prepare_untrusted_action_document(raw_response)
+        _reject_conflicting_pending_representations(candidate)
         candidate = _apply_state_plan_policy(candidate, state)
+        candidate = _materialize_pending_contract_candidates(candidate, state, clauses)
         candidate = _reconcile_structured_candidate_ownership(candidate, clauses, state)
         candidate = _remove_empty_config_proposals(candidate)
         candidate = _materialize_absent_semantic_units(candidate, clauses)
@@ -276,6 +281,266 @@ def _prepare_bounded_semantic_candidate(
     if extra_errors:
         validation = _merge_plan_errors(validation, extra_errors)
     return candidate, validation
+
+
+def _materialize_pending_contract_candidates(
+    text: str,
+    state: AgentGraphState,
+    clauses: tuple[TurnClause, ...],
+) -> str:
+    """Preserve parser-derived pending candidates for independent review.
+
+    The semantic compiler decides intent, but it must not be the only place
+    where a source-exact value can enter the immutable plan.  When the active
+    typed contract and deterministic syntax parser identify one compatible
+    candidate, this boundary exposes the declared owner action as a candidate
+    to the whole-plan reviewer.  Nothing is executed here: examples,
+    negations, conflicts, and unrelated values still fail independent
+    admission.
+    """
+
+    pending = dict(state.get("pending_question") or {})
+    manual = pending.get("manual_action")
+    if pending.get("manual_input_allowed") is not True:
+        return text
+
+    payload = _parse_json_object(text)
+    actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    units = payload.get("semantic_units") if isinstance(payload.get("semantic_units"), list) else []
+
+    # A structured configuration block remains one review transaction. The
+    # parser may expose it only when the compiler left that exact atomic clause
+    # clarification-only. Existing semantic owners are authoritative.
+    pending_field = str(pending.get("field") or "").strip().upper()
+    if pending_field:
+        for clause in clauses:
+            if clause.input_shape != "structured":
+                continue
+            structured = extract_structured_input_candidates(clause.text) or {}
+            config_values = dict(structured.get("config_values") or {})
+            normalized_fields = {
+                str(key).strip().upper()
+                for key in config_values
+            }
+            clause_units = _candidate_clause_units(units, clause.clause_id)
+            clause_has_proposal = any(
+                isinstance(index, int)
+                and not isinstance(index, bool)
+                and 0 <= index < len(actions)
+                and isinstance(actions[index], Mapping)
+                and str(actions[index].get("type") or "") == "propose_config_values"
+                for unit in clause_units
+                for index in unit.get("action_indexes") or []
+            )
+            if (
+                pending_field not in normalized_fields
+                or clause_has_proposal
+                or not clause_units
+                or not _units_have_only_allowed_owners(
+                    clause_units,
+                    actions,
+                    allowed_types={"clarify_unresolved", "answer_pending"},
+                )
+            ):
+                continue
+            proposal_index = len(actions)
+            actions.append({
+                "type": "propose_config_values",
+                "source_format": str(structured.get("source_format") or "mixed"),
+                "config_values": config_values,
+                "unmapped_values": dict(structured.get("unmapped_values") or {}),
+                "source_evidence": clause.text,
+                "confidence": "high",
+                "reason": "structured syntax candidate awaits independent semantic admission",
+            })
+            _assign_candidate_owner(
+                clause_units,
+                proposal_index,
+                reason="structured configuration candidate awaits independent semantic admission",
+            )
+            payload["actions"] = actions
+            payload["semantic_units"] = units
+            return _remove_orphan_candidate_actions(
+                payload,
+                removable_types={"clarify_unresolved", "answer_pending"},
+            )
+
+    if not isinstance(manual, Mapping):
+        return text
+    typed_rows: list[tuple[TurnClause, Any]] = []
+    seen: set[str] = set()
+    for clause in clauses:
+        for value in typed_pending_value_candidates(clause.text, pending):
+            identity = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            typed_rows.append((clause, value))
+    if len(typed_rows) != 1:
+        return text
+    candidate_clause, candidate_value = typed_rows[0]
+    candidate_units = _candidate_clause_units(units, candidate_clause.clause_id)
+    matching_indexes = [
+        index
+        for index, action in enumerate(actions)
+        if isinstance(action, Mapping)
+        and _pending_action_value(action, pending) == candidate_value
+    ]
+    if len(matching_indexes) == 1:
+        existing_index = matching_indexes[0]
+        existing = actions[existing_index]
+        source = str(existing.get("source_evidence") or "").strip()
+        if not source:
+            existing["source_evidence"] = (
+                str(candidate_value)
+                if str(candidate_value) in candidate_clause.text
+                else candidate_clause.text
+            )
+        if candidate_units and _units_have_only_allowed_owners(
+            candidate_units,
+            actions,
+            allowed_types={"clarify_unresolved"},
+        ):
+            _assign_candidate_owner(
+                candidate_units,
+                existing_index,
+                reason="source-exact typed candidate belongs to the existing pending owner",
+            )
+        payload["actions"] = actions
+        payload["semantic_units"] = units
+        return _remove_orphan_candidate_actions(payload)
+    if (
+        not candidate_units
+        or not _units_have_only_allowed_owners(
+            candidate_units,
+            actions,
+            allowed_types={"clarify_unresolved"},
+        )
+    ):
+        return text
+    action_type = str(manual.get("type") or "").strip()
+    value_argument = str(manual.get("value_argument") or "").strip()
+    spec = ACTION_BY_TYPE.get(action_type)
+    if spec is None or not value_argument or value_argument not in spec.allowed_arguments:
+        return text
+    candidate_action = {
+        str(key): value
+        for key, value in manual.items()
+        if str(key) not in {"value_argument", "use_complete_turn"}
+    }
+    candidate_action[value_argument] = candidate_value
+    candidate_action["source_evidence"] = (
+        str(candidate_value)
+        if str(candidate_value) in candidate_clause.text
+        else candidate_clause.text
+    )
+    candidate_action["confidence"] = "high"
+    candidate_action["reason"] = "typed pending contract exposes a source-exact manual candidate"
+    candidate_index = len(actions)
+    actions.append(candidate_action)
+
+    _assign_candidate_owner(
+        candidate_units,
+        candidate_index,
+        reason="typed pending candidate awaits independent semantic admission",
+    )
+    payload["actions"] = actions
+    payload["semantic_units"] = units
+    return _remove_orphan_candidate_actions(payload)
+
+
+def _pending_action_value(
+    action: Mapping[str, Any],
+    pending: Mapping[str, Any],
+) -> Any:
+    """Return one valid manual value already owned by a pending action."""
+
+    if str(action.get("type") or "") == "answer_pending":
+        return _manual_value_from_answer_pending(action, pending)
+    return _matching_pending_manual_value(action, pending)
+
+
+def _candidate_clause_units(
+    units: list[Any],
+    clause_id: str,
+) -> list[dict[str, Any]]:
+    """Return mutable semantic units for one source-exact clause."""
+
+    return [
+        unit
+        for unit in units
+        if isinstance(unit, dict)
+        and str(unit.get("clause_id") or "") == clause_id
+    ]
+
+
+def _units_have_only_allowed_owners(
+    units: list[dict[str, Any]],
+    actions: list[Any],
+    *,
+    allowed_types: set[str],
+) -> bool:
+    """Allow candidate exposure only when no semantic owner would be stolen."""
+
+    for unit in units:
+        owner_indexes = [
+            index
+            for index in unit.get("action_indexes") or []
+            if isinstance(index, int) and not isinstance(index, bool)
+        ]
+        if not owner_indexes:
+            return False
+        if any(
+            index < 0
+            or index >= len(actions)
+            or not isinstance(actions[index], Mapping)
+            or str(actions[index].get("type") or "") not in allowed_types
+            for index in owner_indexes
+        ):
+            return False
+    return True
+
+
+def _assign_candidate_owner(
+    units: list[dict[str, Any]],
+    action_index: int,
+    *,
+    reason: str,
+) -> None:
+    """Replace clarification ownership for only the candidate's exact clause."""
+
+    for unit in units:
+        unit["action_indexes"] = [action_index]
+        unit["disposition"] = "action"
+        unit["reason"] = reason
+
+
+def _remove_orphan_candidate_actions(
+    payload: dict[str, Any],
+    *,
+    removable_types: set[str] | None = None,
+) -> str:
+    """Drop superseded candidate owners only after all their units moved."""
+
+    actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    removable = removable_types or {"clarify_unresolved"}
+    referenced = {
+        index
+        for unit in payload.get("semantic_units") or []
+        if isinstance(unit, Mapping)
+        for index in unit.get("action_indexes") or []
+        if isinstance(index, int)
+    }
+    orphaned = tuple(
+        index for index, action in enumerate(actions)
+        if isinstance(action, Mapping)
+        and str(action.get("type") or "") in removable
+        and index not in referenced
+    )
+    normalized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    if orphaned:
+        normalized, _ = _remove_action_indexes(normalized, orphaned)
+    return normalized
 
 
 def _materialize_absent_semantic_units(
@@ -343,7 +608,13 @@ def _canonicalize_pending_choice_actions(text: str, state: AgentGraphState) -> s
         if not isinstance(action, dict):
             continue
         option = _matching_pending_option(action, state)
-        manual_value = None if option else _matching_pending_manual_value(action, pending)
+        manual_value = None
+        if not option:
+            manual_value = (
+                _manual_value_from_answer_pending(action, pending)
+                if str(action.get("type") or "") == "answer_pending"
+                else _matching_pending_manual_value(action, pending)
+            )
         if manual_value is not None:
             source = str(action.get("source_evidence") or "").strip()
             units = _source_units_for_action(payload, index)
@@ -351,12 +622,15 @@ def _canonicalize_pending_choice_actions(text: str, state: AgentGraphState) -> s
                 source in str(unit.get("source_text") or "") for unit in units
             ):
                 continue
-            actions[index] = {
+            canonical = {
                 "type": "answer_pending",
                 "answer": manual_value,
                 "source_evidence": source,
                 "confidence": str(action.get("confidence") or "medium"),
             }
+            if not _manual_answer_has_literal_source(canonical, source):
+                continue
+            actions[index] = canonical
             continue
         if not option:
             continue
@@ -435,17 +709,21 @@ def _coalesce_equivalent_manual_pending_answers(
             retained.append(action)
             continue
         option = _declared_option_for_pending_answer(dict(action), dict(pending))
-        answer = action.get("answer")
-        if option or not value_satisfies_pending_contract(answer, dict(pending)):
+        answer = _manual_value_from_answer_pending(action, pending)
+        if option or answer is None:
             old_to_new[old_index] = len(retained)
             retained.append(action)
             continue
+        canonical = dict(action)
+        canonical["answer"] = answer
+        canonical.pop("selected_value", None)
         identity = json.dumps(answer, ensure_ascii=False, sort_keys=True, default=str)
         prior = first_by_value.get(identity)
         if prior is None:
             prior = len(retained)
             first_by_value[identity] = prior
-            retained.append(action)
+            retained.append(canonical)
+            changed = changed or canonical != dict(action)
         else:
             changed = True
         old_to_new[old_index] = prior
@@ -554,12 +832,15 @@ def _action_owns_pending_candidate(
         return bool(option and (spec is None or spec.pending_option_admission))
     if _declared_option_for_pending_answer(action, pending):
         return True
-    answer = str(action.get("answer") or "").strip()
+    answer = _manual_value_from_answer_pending(action, pending)
+    if answer is None:
+        return False
+    canonical = dict(action)
+    canonical["answer"] = answer
     source = str(action.get("source_evidence") or "")
     return bool(
         pending.get("manual_input_allowed") is True
-        and value_satisfies_pending_contract(answer, pending)
-        and _manual_answer_has_literal_source(action, source)
+        and _manual_answer_has_literal_source(canonical, source)
     )
 
 
@@ -1400,6 +1681,10 @@ def _validate_action_document(
         return validate_plan_coverage({}, clauses)
     action_errors: list[str] = []
     rejected_action_indexes: set[int] = set()
+    try:
+        validate_action_transaction_contract(payload["actions"])
+    except ValueError as exc:
+        action_errors.append(str(exc))
     pending = dict((state or {}).get("pending_question") or {})
     pending_admissions = {
         int(index)
@@ -1414,6 +1699,12 @@ def _validate_action_document(
             validate_action_contract(raw)
         except ValueError as exc:
             action_errors.append(f"action {index} contract invalid: {exc}")
+            rejected_action_indexes.add(index)
+            continue
+        if _answer_pending_representation_conflict(raw):
+            action_errors.append(
+                f"action {index} answer_pending has conflicting answer and selected_value representations"
+            )
             rejected_action_indexes.add(index)
             continue
         if (
@@ -1685,6 +1976,81 @@ def _matching_pending_manual_value(
             return None
     value = action.get(value_argument)
     return value if value_satisfies_pending_contract(value, dict(pending)) else None
+
+
+def _manual_value_from_answer_pending(
+    action: Mapping[str, Any],
+    pending: Mapping[str, Any],
+) -> Any:
+    """Return one unambiguous manual value from either model representation.
+
+    Models may place a manual pending value in ``answer`` or
+    ``selected_value``. The typed pending contract, not the model's choice of
+    field, owns the canonical representation. Conflicting valid values remain
+    unresolved instead of being selected by field order.
+    """
+
+    if str(action.get("type") or "") != "answer_pending":
+        return None
+    supplied: list[Any] = []
+    identities: set[str] = set()
+    for key in ("answer", "selected_value"):
+        if key not in action:
+            continue
+        value = action.get(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        normalized = value.strip() if isinstance(value, str) else value
+        identity = json.dumps(normalized, ensure_ascii=False, sort_keys=True, default=str)
+        if identity in identities:
+            continue
+        identities.add(identity)
+        supplied.append(normalized)
+    if len(supplied) != 1:
+        return None
+    value = supplied[0]
+    return value if value_satisfies_pending_contract(value, dict(pending)) else None
+
+
+def _answer_pending_representation_conflict(action: Mapping[str, Any]) -> bool:
+    """Return whether answer and selected_value carry different nonempty facts."""
+
+    if str(action.get("type") or "") != "answer_pending":
+        return False
+    supplied: list[Any] = []
+    for key in ("answer", "selected_value"):
+        if key not in action:
+            continue
+        value = action.get(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        supplied.append(value.strip() if isinstance(value, str) else value)
+    if len(supplied) < 2:
+        return False
+    identities = {
+        json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        for value in supplied
+    }
+    return len(identities) > 1
+
+
+def _reject_conflicting_pending_representations(text: str) -> None:
+    """Reject raw model contradictions before any canonicalization can erase them."""
+
+    payload = _parse_json_object(text)
+    actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+    conflicting = [
+        index
+        for index, action in enumerate(actions)
+        if isinstance(action, Mapping)
+        and _answer_pending_representation_conflict(action)
+    ]
+    if conflicting:
+        joined = ", ".join(str(index) for index in conflicting)
+        raise ValueError(
+            "answer_pending has conflicting answer and selected_value "
+            f"representations at action indexes: {joined}"
+        )
 
 
 def _declared_option_for_pending_answer(
@@ -2213,10 +2579,9 @@ def _pending_contract_adjudication_prompt() -> str:
         "every independent consultation, mutation, navigation, or evidence demand already present. "
         "For a declared option, emit answer_pending with selected_value exactly equal to that option's "
         "declared value. For manual input, emit answer_pending with answer equal to one exact extracted "
-        "value that satisfies validation. A pending_typed_candidate is syntax evidence, not permission: "
-        "select it only when the source actually supplies it as the answer. A candidate mentioned only as "
-        "an example, quotation, rejected option, negated operation, correction target, or value the user "
-        "explicitly says not to apply is not an answer. Partial request, response, "
+        "value that satisfies validation. A pending_typed_candidate is syntax evidence, not permission. "
+        + PENDING_CANDIDATE_SEMANTIC_POLICY
+        + "Partial request, response, "
         "documentation, endpoint, or protocol evidence is a valid manual contribution when the pending "
         "contract declares an evidence owner; do not require all evidence at once. Do not emit the domain "
         "manual owner as a duplicate of answer_pending. A structured_candidates row containing config_values "
@@ -2572,7 +2937,7 @@ def _prepare_untrusted_action_document(text: str) -> str:
                 and key not in TRUSTED_ACTION_METADATA_FIELDS
                 and not str(key).startswith("_")
             }
-        cleaned.append(action)
+        cleaned.append(normalize_action_envelope(action))
     if isinstance(payload.get("actions"), list):
         payload["actions"] = cleaned
     units = payload.get("semantic_units")

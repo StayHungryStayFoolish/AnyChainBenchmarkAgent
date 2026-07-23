@@ -20,14 +20,13 @@ from .oracle import (
 from .routing import chain_identity_confirmed, group_readiness, next_group_and_reason
 from .turns import adjudicate_turn
 from .plan_coverage import segment_user_turn
-from .action_registry import ACTION_BY_TYPE, action_crosses_pending_barrier, action_execution_phase, action_is_turn_local, action_merge_key, assign_action_ids, compile_legacy_custom_rpc_action, lifecycle_rejected_action_indexes, merge_semantic_actions, normalize_action_relations, validate_action_contract, validate_field_intake_admission_receipt, validate_proposal_field_receipts
+from .action_registry import ACTION_BY_TYPE, action_crosses_pending_barrier, action_execution_phase, action_is_turn_local, action_merge_key, assign_action_ids, compile_legacy_custom_rpc_action, lifecycle_rejected_action_indexes, merge_semantic_actions, normalize_action_relations, validate_action_contract, validate_action_transaction_contract, validate_field_intake_admission_receipt, validate_proposal_field_receipts
 from .contracts import ActionProposal, CheckpointCommand, HandlerResult, RecoveryCommand
 from .localization import localized as _localized
 from .domains.orientation import completed_group_status
 from .domains.environment import (
     apply_inferred_config_review,
     config_proposal_review_question,
-    merge_config_proposal_from_text,
 )
 from .domains.chain_rpc import apply_chain_rpc_action
 from .domains.chain_rpc_support import is_existing_family_lifecycle
@@ -390,10 +389,6 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
 
     pending = state.get("pending_question") or {}
     input_shape = str((state.get("turn_context") or {}).get("input_shape") or "prose")
-    if str(pending.get("id") or "") == "inferred_config_review":
-        merged = _merge_pending_config_proposal_from_text(state, text)
-        if merged:
-            return _set_turn_phase(merged, "compose", "merged_config_proposal")
 
     # Evidence framing is a terminal transport concern: collect a complete
     # multiline block before asking the semantic planner to classify it. The
@@ -565,6 +560,13 @@ def admit_turn_step(state: AgentGraphState) -> AgentGraphState:
         accepted_types
         and any(str(item.get("type") or "") in accepted_types for item in durable_actions)
     )
+    extends_active_config_review = bool(
+        str(pending.get("id") or "") == "inferred_config_review"
+        and any(
+            str(item.get("type") or "") == "propose_config_values"
+            for item in durable_actions
+        )
+    )
     if answers_active_semantic_contract and not pending.get("resume_action_queue"):
         # A pre-Harness checkpoint may contain an unadmitted command with no
         # plan identity. It must never outrank a current-turn action accepted
@@ -585,6 +587,7 @@ def admit_turn_step(state: AgentGraphState) -> AgentGraphState:
     if (
         str(pending.get("id") or "") == "inferred_config_review"
         and not any(str(item.get("type") or "") == "answer_pending" for item in durable_actions)
+        and not extends_active_config_review
         and not (ordered_queue and action_crosses_pending_barrier(ordered_queue[0]))
     ):
         state["action_queue"] = ordered_queue
@@ -721,23 +724,6 @@ def _copy_state(state: AgentGraphState) -> AgentGraphState:
     return output
 
 
-def _merge_pending_config_proposal_from_text(state: AgentGraphState, text: str) -> AgentGraphState | None:
-    inferred = state.setdefault("inferred_config", {})
-    current = inferred.get("pending_review") if isinstance(inferred.get("pending_review"), dict) else {}
-    merged = merge_config_proposal_from_text(current, text)
-    if merged is None:
-        return None
-    inferred["pending_review"] = merged
-    current_group = str((state.get("pending_question") or {}).get("group") or state.get("active_group") or "provider_deployment")
-    state["pending_question"] = config_proposal_review_question(
-        current_group,
-        merged,
-        language=str(state.get("language") or "en"),
-    )
-    state["visible_response"] = [_render_question(state["pending_question"], state.get("language", "en"))]
-    return state
-
-
 def _normalized_action_queue(payload: dict[str, Any]) -> list[dict[str, Any]]:
     raw_actions = payload.get("actions") if isinstance(payload, dict) else None
     if isinstance(raw_actions, dict):
@@ -820,6 +806,17 @@ def _validate_action_plan(state: AgentGraphState, actions: list[dict[str, Any]])
     if not actions:
         return actions
     prepared = normalize_action_relations([dict(item) for item in actions])
+    try:
+        validate_action_transaction_contract(prepared)
+    except ValueError:
+        # The semantic resolver normally repairs this before admission. Keep a
+        # fail-closed boundary for stale checkpoints or invalid integrations:
+        # clarification is atomic, so no sibling may mutate state.
+        prepared = [
+            item
+            for item in prepared
+            if str(item.get("type") or "") == "clarify_unresolved"
+        ]
     prepared = [
         item
         for item in prepared

@@ -258,6 +258,13 @@ def apply_environment_action(state: AgentGraphState, action: ActionProposal) -> 
                 consumed_action_ids=(action.action_id,),
                 completion="completed",
             )
+        pending = state.get("pending_question") or {}
+        current = (state.get("inferred_config") or {}).get("pending_review")
+        if (
+            str(pending.get("id") or "") == "inferred_config_review"
+            and isinstance(current, dict)
+        ):
+            proposal = merge_config_proposals(current, proposal)
         return propose_config_assignments_for_review(
             state,
             proposal,
@@ -453,6 +460,7 @@ def config_proposal_review_question(group: str, proposal: dict[str, Any], *, lan
             {"label": "Y", "value": True, "expected_patch": {"inferred_config.pending_review": {}}},
             {"label": "N", "value": False, "expected_patch": {"inferred_config.pending_review": {}}},
         ],
+        accepted_action_types=("propose_config_values",),
         queue_barrier=True,
     )
 

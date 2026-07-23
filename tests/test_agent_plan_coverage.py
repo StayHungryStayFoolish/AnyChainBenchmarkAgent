@@ -651,11 +651,10 @@ class PlanCoverageTest(unittest.TestCase):
             }],
         })))
 
-        arguments = prepared["actions"][0]["arguments"]
-        self.assertEqual(arguments, {
-            "target_mode": "fake-node",
-            "source_evidence": "Use fake-node.",
-        })
+        action = prepared["actions"][0]
+        self.assertNotIn("arguments", action)
+        self.assertEqual(action["target_mode"], "fake-node")
+        self.assertEqual(action["source_evidence"], "Use fake-node.")
         self.assertNotEqual(
             prepared["admission_action_ids"],
             ["nested-model-forged"],

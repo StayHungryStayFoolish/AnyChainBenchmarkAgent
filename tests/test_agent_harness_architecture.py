@@ -1478,6 +1478,50 @@ class HarnessArchitectureTest(unittest.TestCase):
             ["clarify_unresolved"],
         )
 
+    def test_clarification_is_a_whole_turn_transaction_barrier(self) -> None:
+        from agent.harness.action_registry import validate_action_transaction_contract
+        from agent.harness.coordinator import _validate_action_plan
+
+        with self.assertRaisesRegex(ValueError, "whole-turn transaction barrier"):
+            validate_action_transaction_contract([
+                {
+                    "type": "clarify_unresolved",
+                    "clauses": ["Clarify the remaining request."],
+                },
+                {
+                    "type": "answer_pending",
+                    "answer": "http://fake-node:19000",
+                    "source_evidence": "http://fake-node:19000",
+                },
+            ])
+
+        validate_action_transaction_contract([
+            {
+                "type": "clarify_unresolved",
+                "clauses": ["Clarify the first unresolved request."],
+            },
+            {
+                "type": "clarify_unresolved",
+                "clauses": ["Clarify the second unresolved request."],
+            },
+        ])
+
+        admitted = _validate_action_plan(_state(), [
+            {
+                "type": "clarify_unresolved",
+                "clauses": ["Clarify the unresolved request."],
+            },
+            {
+                "type": "answer_pending",
+                "answer": "http://fake-node:19000",
+                "source_evidence": "http://fake-node:19000",
+            },
+        ])
+        self.assertEqual(
+            [action["type"] for action in admitted],
+            ["clarify_unresolved"],
+        )
+
     def test_durable_config_proposals_merge_independent_fields_across_turns(self) -> None:
         from agent.harness.coordinator import _merge_durable_action_queue
 
@@ -1596,6 +1640,24 @@ class HarnessArchitectureTest(unittest.TestCase):
 
         self.assertEqual(normalized["type"], "set_qps_mode")
         self.assertEqual(normalized["qps_mode"], "quick")
+
+    def test_nested_arguments_cannot_conflict_with_flat_arguments(self) -> None:
+        from agent.harness.action_registry import normalize_action_envelope
+
+        with self.assertRaisesRegex(ValueError, "conflicting flat and arguments.v1"):
+            normalize_action_envelope({
+                "type": "answer_pending",
+                "answer": "Y",
+                "arguments": {"answer": "N"},
+            })
+
+        normalized = normalize_action_envelope({
+            "type": "answer_pending",
+            "answer": "Y",
+            "arguments": {"answer": "Y"},
+        })
+        self.assertEqual(normalized["answer"], "Y")
+        self.assertNotIn("arguments", normalized)
 
     def test_workload_consultation_is_specific_and_non_mutating(self) -> None:
         from agent.harness.domains.orientation import answer_consultation
