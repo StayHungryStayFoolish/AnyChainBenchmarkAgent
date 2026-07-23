@@ -23,7 +23,7 @@ from .action_registry import (
     canonical_consultation_topic,
     lifecycle_rejected_action_indexes,
     normalize_action_relations,
-    normalize_action_envelope,
+    normalize_current_action_envelope,
     resolve_action_target_group,
     semantic_grounding_arguments,
     semantic_scope_accepts_action,
@@ -3204,7 +3204,7 @@ def _prepare_untrusted_action_document(text: str) -> str:
                 and key not in TRUSTED_ACTION_METADATA_FIELDS
                 and not str(key).startswith("_")
             }
-        cleaned.append(normalize_action_envelope(action))
+        cleaned.append(normalize_current_action_envelope(action))
     if isinstance(payload.get("actions"), list):
         payload["actions"] = cleaned
     units = payload.get("semantic_units")

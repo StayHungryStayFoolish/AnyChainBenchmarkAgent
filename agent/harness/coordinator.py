@@ -20,7 +20,7 @@ from .oracle import (
 from .routing import chain_identity_confirmed, group_readiness, next_group_and_reason
 from .turns import adjudicate_turn
 from .plan_coverage import segment_user_turn
-from .action_registry import ACTION_BY_TYPE, action_crosses_pending_barrier, action_execution_phase, action_is_turn_local, action_merge_key, assign_action_ids, compile_legacy_custom_rpc_action, lifecycle_rejected_action_indexes, merge_semantic_actions, normalize_action_relations, validate_action_contract, validate_action_transaction_contract, validate_field_intake_admission_receipt, validate_proposal_field_receipts
+from .action_registry import ACTION_BY_TYPE, action_crosses_pending_barrier, action_execution_phase, action_is_turn_local, action_merge_key, assign_action_ids, lifecycle_rejected_action_indexes, merge_semantic_actions, normalize_action_relations, validate_action_contract, validate_action_transaction_contract, validate_field_intake_admission_receipt, validate_proposal_field_receipts
 from .contracts import ActionProposal, CheckpointCommand, HandlerResult, RecoveryCommand
 from .localization import localized as _localized
 from .domains.orientation import completed_group_status
@@ -731,13 +731,8 @@ def _normalized_action_queue(payload: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(raw_actions, list):
         return []
     output: list[dict[str, Any]] = []
-    compiled_actions = [
-        compiled
-        for raw in raw_actions[:12]
-        if isinstance(raw, dict)
-        for compiled in compile_legacy_custom_rpc_action(raw)
-    ]
-    for raw in compiled_actions[:12]:
+    current_actions = [raw for raw in raw_actions[:12] if isinstance(raw, dict)]
+    for raw in current_actions:
         try:
             # The resolver is the sole producer of trusted admission receipts.
             # Model documents are validated before those receipts are attached.

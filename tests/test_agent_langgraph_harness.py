@@ -2617,9 +2617,17 @@ network:
                         "confidence": "high",
                     },
                     {
-                        "type": "start_custom_rpc",
-                        "rpc_method": "eth_chainId",
+                        "type": "rpc_catalog_command",
+                        "catalog_command": "set_endpoint",
                         "rpc_endpoint": "http://fake-node:19000",
+                        "source_evidence": state["last_user_input"],
+                        "confidence": "high",
+                    },
+                    {
+                        "type": "rpc_catalog_command",
+                        "catalog_command": "set_method",
+                        "rpc_method": "eth_chainId",
+                        "source_evidence": state["last_user_input"],
                         "confidence": "high",
                     },
                 ]
@@ -2660,9 +2668,17 @@ network:
             resolver.return_value = {
                 "actions": [
                     {
-                        "type": "start_custom_rpc",
-                        "rpc_method": "eth_chainId",
+                        "type": "rpc_catalog_command",
+                        "catalog_command": "set_endpoint",
                         "rpc_endpoint": "http://fake-node:19000",
+                        "source_evidence": state["last_user_input"],
+                        "confidence": "high",
+                    },
+                    {
+                        "type": "rpc_catalog_command",
+                        "catalog_command": "set_method",
+                        "rpc_method": "eth_chainId",
+                        "source_evidence": state["last_user_input"],
                         "confidence": "high",
                     },
                     {
@@ -6281,7 +6297,7 @@ network:
         with patch("agent.harness.coordinator.resolve_action_queue") as resolver:
             resolver.return_value = {
                 "actions": [
-                    {"type": "start_custom_rpc", "rpc_endpoint": "endpoint", "source_evidence": state["last_user_input"], "reason": "validate a custom method first", "confidence": "high"},
+                    {"type": "rpc_catalog_command", "catalog_command": "enter", "source_evidence": state["last_user_input"], "reason": "validate a custom method first", "confidence": "high"},
                 ]
             }
             with patch("agent.harness.domains.rpc_endpoint.validate_rpc_endpoint") as probe:
@@ -9519,7 +9535,7 @@ response:
                 "agent.harness.coordinator.resolve_action_queue",
                 return_value={"actions": [
                     {"type": "answer_pending", "answer": "够了", "selected_value": "finish", "source_evidence": "够了", "confidence": "high"},
-                    {"type": "start_custom_rpc", "workload_scope": "mixed_replace", "rpc_weights": {"eth_chainId": 100}, "finish_methods": True, "confidence": "high"},
+                    {"type": "rpc_workload_command", "workload_scope": "mixed_replace", "rpc_weights": {"eth_chainId": 100}, "finish_methods": True, "confidence": "high"},
                 ]},
             ),
         ):
@@ -9567,7 +9583,7 @@ response:
                 "agent.harness.coordinator.resolve_action_queue",
                 side_effect=_admitted_mock_resolver({"actions": [
                     {"type": "answer_pending", "answer": "够了", "selected_value": "finish", "source_evidence": "够了", "pending_option_semantic_verified": True, "semantic_purpose_verified": True, "confidence": "high"},
-                    {"type": "start_custom_rpc", "workload_scope": "mixed_replace", "rpc_weights": {"eth_chainId": 100}, "finish_methods": True, "confidence": "high"},
+                    {"type": "rpc_workload_command", "workload_scope": "mixed_replace", "rpc_weights": {"eth_chainId": 100}, "finish_methods": True, "confidence": "high"},
                     {"type": "set_qps_mode", "qps_mode": "quick", "mutation_explicit": True, "source_evidence": "quick", "confidence": "high"},
                     {"type": "set_observability", "observability_mode": "disabled", "mutation_explicit": True, "source_evidence": "Grafana 不开", "confidence": "high"},
                 ]}),
@@ -9856,7 +9872,7 @@ response:
         with patch(
             "agent.harness.coordinator.resolve_action_queue",
             return_value={"actions": [
-                {"type": "start_custom_rpc", "source_evidence": state["last_user_input"], "confidence": "high"},
+                {"type": "rpc_catalog_command", "catalog_command": "enter", "source_evidence": state["last_user_input"], "confidence": "high"},
                 {"type": "change_group", "group": "endpoint_process", "navigation_explicit": True, "source_evidence": state["last_user_input"], "confidence": "high"},
             ]},
         ):
@@ -9880,7 +9896,8 @@ response:
         with patch(
             "agent.harness.coordinator.resolve_action_queue",
             return_value={"actions": [{
-                "type": "start_custom_rpc",
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_endpoint",
                 "rpc_endpoint": "http://geth-dev:8545",
                 "source_evidence": state["last_user_input"],
                 "confidence": "high",

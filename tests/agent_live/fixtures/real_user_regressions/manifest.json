@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "source_revision": "52ee0b8",
+  "files": [
+    {
+      "path": "tests/agent_live/fixtures/real_user_regressions/cases.json",
+      "sha256": "e71dd432312eae9baab9bf7a15f1c8f0241128f74f29113aaf338caadb1827a6",
+      "case_count": 15,
+      "sanitized": true
+    }
+  ]
+}

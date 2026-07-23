@@ -9,6 +9,9 @@ from .action_registry import (
     ACTION_SPECS,
     CONSULTATION_TOPIC_PURPOSES,
     CONSULTATION_TOPICS,
+    ActionLifetime,
+    ActionSpec,
+    project_action_specs,
     semantic_scope_schema,
 )
 from .state import AgentGraphState
@@ -17,37 +20,22 @@ from .semantic_policy import PENDING_CANDIDATE_SEMANTIC_POLICY
 from agent.workflows.group_registry import GROUPS, USER_NAVIGABLE_GROUPS
 
 
-def action_schema() -> list[dict[str, Any]]:
+def action_schema(
+    *,
+    owners: frozenset[str] | None = None,
+    groups: frozenset[str] | None = None,
+    lifetimes: frozenset[ActionLifetime] | None = None,
+    action_types: frozenset[str] | None = None,
+) -> list[dict[str, Any]]:
+    specs = project_action_specs(
+        owners=owners,
+        groups=groups,
+        lifetimes=lifetimes,
+        action_types=action_types,
+    )
     output = [
-        {
-            "type": spec.action_type,
-            "owner": spec.owner,
-            "purpose": spec.purpose,
-            "allowed_arguments": list(spec.allowed_arguments),
-            "required_arguments": list(spec.required_arguments),
-            "argument_schemas": {
-                name: dict(ACTION_ARGUMENT_SCHEMAS[name])
-                for name in spec.allowed_arguments
-            },
-            "constraints": list(spec.constraints),
-            "suppressed_by": list(spec.suppressed_by),
-            "execution_phase": spec.execution_phase,
-            "effect": spec.effect,
-            "target_group": spec.target_group,
-            "target_field_argument": spec.target_field_argument,
-            "requires_specific_change": spec.requires_specific_change,
-            "incomplete_mutation_intake": spec.incomplete_mutation_intake,
-            "entry_intake": spec.entry_intake,
-            "entry_intake_purpose": spec.entry_intake_purpose,
-            "entry_intake_arguments": dict(spec.entry_intake_arguments),
-            "incompatible_target_modes": list(spec.incompatible_target_modes),
-            "required_state_path": list(spec.required_state_path),
-            "required_state_values": list(spec.required_state_values),
-            "state_transition_path": list(spec.state_transition_path),
-            "state_transition_value": spec.state_transition_value,
-            "exact_source_value_arguments": list(spec.exact_source_value_arguments),
-        }
-        for spec in ACTION_SPECS
+        _action_spec_schema(spec)
+        for spec in specs
     ]
     for item in output:
         if item["type"] == "answer_opening_question":
@@ -62,6 +50,37 @@ def action_schema() -> list[dict[str, Any]]:
                 for field, _question in group.reconfiguration_questions
             })
     return output
+
+
+def _action_spec_schema(spec: ActionSpec) -> dict[str, Any]:
+    return {
+        "type": spec.action_type,
+        "owner": spec.owner,
+        "purpose": spec.purpose,
+        "allowed_arguments": list(spec.allowed_arguments),
+        "required_arguments": list(spec.required_arguments),
+        "argument_schemas": {
+            name: dict(ACTION_ARGUMENT_SCHEMAS[name])
+            for name in spec.allowed_arguments
+        },
+        "constraints": list(spec.constraints),
+        "suppressed_by": list(spec.suppressed_by),
+        "execution_phase": spec.execution_phase,
+        "effect": spec.effect,
+        "target_group": spec.target_group,
+        "target_field_argument": spec.target_field_argument,
+        "requires_specific_change": spec.requires_specific_change,
+        "incomplete_mutation_intake": spec.incomplete_mutation_intake,
+        "entry_intake": spec.entry_intake,
+        "entry_intake_purpose": spec.entry_intake_purpose,
+        "entry_intake_arguments": dict(spec.entry_intake_arguments),
+        "incompatible_target_modes": list(spec.incompatible_target_modes),
+        "required_state_path": list(spec.required_state_path),
+        "required_state_values": list(spec.required_state_values),
+        "state_transition_path": list(spec.state_transition_path),
+        "state_transition_value": spec.state_transition_value,
+        "exact_source_value_arguments": list(spec.exact_source_value_arguments),
+    }
 
 
 def group_schema() -> list[dict[str, Any]]:

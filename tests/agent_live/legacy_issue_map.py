@@ -18,6 +18,7 @@ Run this file directly to validate the map and print a JSON report.
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from dataclasses import asdict, dataclass
@@ -278,7 +279,24 @@ def report() -> dict[str, object]:
     }
 
 
-if __name__ == "__main__":
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
     payload = report()
-    print(json.dumps(payload, indent=2, ensure_ascii=False))
-    raise SystemExit(1 if payload["validation_errors"] else 0)
+    serialized = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(serialized, encoding="utf-8")
+        print(json.dumps({
+            "output": str(args.output),
+            "items": len(payload["items"]),
+            "validation_errors": len(payload["validation_errors"]),
+        }, sort_keys=True))
+    else:
+        print(serialized, end="")
+    return 1 if payload["validation_errors"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -153,11 +153,12 @@ class ActionContractAuthorityTest(unittest.TestCase):
         from agent.harness.action_registry import (
             LEGACY_ARGUMENTS_ENVELOPE_VERSION,
             compatibility_usage,
+            normalize_action_envelope,
             validate_action_contract,
         )
 
         before = compatibility_usage().get(LEGACY_ARGUMENTS_ENVELOPE_VERSION, 0)
-        action = validate_action_contract({
+        action = normalize_action_envelope({
             "type": "answer_opening_question",
             "arguments": {"topic": "current_config"},
         })
@@ -166,6 +167,11 @@ class ActionContractAuthorityTest(unittest.TestCase):
             compatibility_usage()[LEGACY_ARGUMENTS_ENVELOPE_VERSION],
             before + 1,
         )
+        with self.assertRaisesRegex(ValueError, "arguments.v1 is retired"):
+            validate_action_contract({
+                "type": "answer_opening_question",
+                "arguments": {"topic": "current_config"},
+            })
 
     def test_prompt_defers_field_requirements_to_action_schema(self) -> None:
         from agent.harness.context import build_action_resolver_prompt

@@ -718,6 +718,26 @@ STATE_AUDIT_TOPICS = frozenset({"current_config", "current_context", "next_actio
 
 ACTION_BY_TYPE = {spec.action_type: spec for spec in ACTION_SPECS}
 
+
+def project_action_specs(
+    *,
+    owners: frozenset[str] | None = None,
+    groups: frozenset[str] | None = None,
+    lifetimes: frozenset[ActionLifetime] | None = None,
+    action_types: frozenset[str] | None = None,
+) -> tuple[ActionSpec, ...]:
+    """Return one deterministic registry projection for a bounded planner."""
+
+    return tuple(
+        spec
+        for spec in ACTION_SPECS
+        if (owners is None or spec.owner in owners)
+        and (groups is None or spec.target_group in groups)
+        and (lifetimes is None or spec.lifetime in lifetimes)
+        and (action_types is None or spec.action_type in action_types)
+    )
+
+
 for _spec in ACTION_SPECS:
     _unknown_support_relations = (
         set(_spec.semantic_support_relations) - SEMANTIC_SUPPORT_RELATIONS
@@ -1413,6 +1433,18 @@ def normalize_action_envelope(raw: dict[str, Any]) -> dict[str, Any]:
     return action
 
 
+def normalize_current_action_envelope(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize the current flat action wire contract without legacy repair."""
+
+    action = dict(raw)
+    if "arguments" in action:
+        raise ValueError("arguments.v1 is retired for current-turn actions")
+    if "type" not in action and "intent" in action:
+        action["type"] = action["intent"]
+    action.pop("intent", None)
+    return action
+
+
 def compatibility_usage() -> dict[str, int]:
     """Return a snapshot of legacy action-envelope usage."""
 
@@ -1426,7 +1458,7 @@ def validate_action_contract(
 ) -> dict[str, Any]:
     """Normalize and validate one model action against its ActionSpec."""
 
-    action = normalize_action_envelope(raw)
+    action = normalize_current_action_envelope(raw)
     action_type = str(action.get("type") or "").strip()
     spec = ACTION_BY_TYPE.get(action_type)
     if spec is None:
