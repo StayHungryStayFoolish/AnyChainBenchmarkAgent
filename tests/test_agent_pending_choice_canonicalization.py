@@ -6,7 +6,7 @@ import json
 import unittest
 from copy import deepcopy
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 from unittest.mock import Mock, patch
 
 
@@ -18,9 +18,24 @@ def _state(**updates: Any) -> dict[str, Any]:
     return state
 
 
-def _admission_response(request: Any) -> SimpleNamespace:
+CandidateSelector = Callable[[dict[str, Any], dict[str, dict[str, Any]]], str]
+
+
+def _admission_response(
+    request: Any,
+    *,
+    candidate_selector: CandidateSelector | None = None,
+) -> SimpleNamespace:
     review = json.loads(request.messages[1].content)
     units = {str(row["unit_id"]): row for row in review["semantic_units"]}
+    selected_identities = {
+        str(action["action_id"]): (
+            candidate_selector(action, units)
+            if candidate_selector is not None
+            else ""
+        )
+        for action in review["actions"]
+    }
     return SimpleNamespace(text=json.dumps({
         "plan_hash": review["plan_hash"],
         "action_verdicts": [
@@ -45,9 +60,22 @@ def _admission_response(request: Any) -> SimpleNamespace:
                     for argument in action.get("required_value_grounding_arguments") or []
                 ],
                 "pending_answer_argument": (
-                    action["pending_value_candidates"][0]["candidate_id"]
-                    if len(action.get("pending_value_candidates") or []) == 1
-                    else ""
+                    next(
+                        (
+                            str(candidate["candidate_id"])
+                            for candidate in action.get("pending_value_candidates") or []
+                            if str(candidate.get("identity") or "")
+                            == selected_identities[str(action["action_id"])]
+                        ),
+                        "",
+                    )
+                ),
+                "turn_candidate_verdicts": _turn_candidate_verdicts(
+                    action,
+                    units,
+                    selected_identity=selected_identities[
+                        str(action["action_id"])
+                    ],
                 ),
                 "reason": "the immutable action preserves all mapped source units",
             }
@@ -56,7 +84,11 @@ def _admission_response(request: Any) -> SimpleNamespace:
         "unit_verdicts": [
             {
                 "unit_id": unit["unit_id"],
-                "verdict": "unresolved" if unit["disposition"] == "unresolved" else "complete",
+                "verdict": (
+                    "unresolved"
+                    if unit["disposition"] == "unresolved"
+                    else "complete"
+                ),
                 "owner_action_ids": list(unit["owner_action_ids"]),
                 "evidence_quote": str(unit["source_text"]),
                 "omitted_action_type": "",
@@ -68,14 +100,74 @@ def _admission_response(request: Any) -> SimpleNamespace:
     }, ensure_ascii=False, sort_keys=True))
 
 
-def _provider(documents: list[dict[str, Any]]) -> Mock:
+def _turn_candidate_verdicts(
+    action: dict[str, Any],
+    units: dict[str, dict[str, Any]],
+    *,
+    selected_identity: str = "",
+) -> list[dict[str, Any]]:
+    pending = list(action.get("pending_value_candidates") or [])
+    candidates = list(action.get("turn_pending_value_candidates") or [])
+    if not pending or not candidates:
+        return []
+    sources = [
+        str(units[unit_id]["source_text"])
+        for unit_id in action.get("unit_ids") or []
+    ]
+    return [
+        {
+            "candidate_id": str(candidate["candidate_id"]),
+            "verdict": (
+                "selected"
+                if (
+                    selected_identity
+                    and candidate.get("identity") == selected_identity
+                )
+                else "not_selected"
+            ),
+            "evidence_quote": next(
+                (
+                    str(units[unit_id]["source_text"])
+                    for unit_id in candidate.get("source_unit_ids") or []
+                    if unit_id in units
+                ),
+                sources[0],
+            ),
+            "reason": "the fixture preserves the candidate's source role",
+        }
+        for candidate in candidates
+    ]
+
+
+def _select_unique_operation_candidate(
+    action: dict[str, Any],
+    _units: dict[str, dict[str, Any]],
+) -> str:
+    """Explicit positive-fixture reviewer decision."""
+
+    candidates = list(action.get("pending_value_candidates") or [])
+    return (
+        str(candidates[0].get("identity") or "")
+        if len(candidates) == 1
+        else ""
+    )
+
+
+def _provider(
+    documents: list[dict[str, Any]],
+    *,
+    candidate_selector: CandidateSelector | None = None,
+) -> Mock:
     provider = Mock()
     compiler_documents = iter(documents)
 
     def complete(request: Any) -> SimpleNamespace:
         payload = json.loads(request.messages[1].content)
         if "plan_hash" in payload and "immutable_document" in payload:
-            return _admission_response(request)
+            return _admission_response(
+                request,
+                candidate_selector=candidate_selector,
+            )
         return SimpleNamespace(text=json.dumps(next(compiler_documents), ensure_ascii=False, sort_keys=True))
 
     provider.complete.side_effect = complete
@@ -195,7 +287,10 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
             "answer": "http://fake-node:8545",
             "source_evidence": "http://fake-node:8545",
         }, text)
-        provider = _provider([document, resolved])
+        provider = _provider(
+            [document, resolved],
+            candidate_selector=_select_unique_operation_candidate,
+        )
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
@@ -413,7 +508,10 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
                 "reason": "the typed evidence contract owns one atomic contribution",
             }],
         }
-        provider = _provider([document])
+        provider = _provider(
+            [document],
+            candidate_selector=_select_unique_operation_candidate,
+        )
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
@@ -576,7 +674,10 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
             }],
             "semantic_units": units,
         }
-        provider = _provider([first, resolved])
+        provider = _provider(
+            [first, resolved],
+            candidate_selector=_select_unique_operation_candidate,
+        )
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
@@ -609,6 +710,38 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         self.assertEqual(
             many["pending_typed_candidates"],
             ["http://fake-node:8545", "https://example.invalid/rpc"],
+        )
+
+    def test_typed_scalar_candidates_are_collected_per_authoritative_clause(self) -> None:
+        from agent.harness.intent import _action_queue_payload
+
+        state = _state(active_group="network")
+        state["pending_question"] = {
+            "id": "network_interface",
+            "group": "network",
+            "kind": "device",
+            "field": "NETWORK_INTERFACE",
+            "manual_input_allowed": True,
+            "manual_action": {
+                "type": "answer_pending",
+                "value_argument": "answer",
+            },
+            "validation": {"value_type": "scalar_token"},
+        }
+
+        one = _action_queue_payload(
+            state,
+            "Use this interface for the benchmark:\neth0",
+        )
+        conflicting = _action_queue_payload(
+            state,
+            "Compare these two candidates:\neth0\neth1",
+        )
+
+        self.assertEqual(one["pending_typed_candidates"], ["eth0"])
+        self.assertEqual(
+            conflicting["pending_typed_candidates"],
+            ["eth0", "eth1"],
         )
 
     def test_same_unit_explicit_mutation_invalidates_the_old_pending_answer(self) -> None:
@@ -680,7 +813,10 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
             "mutation_explicit": True,
             "source_evidence": text,
         }, text)
-        provider = _provider([document])
+        provider = _provider(
+            [document],
+            candidate_selector=_select_unique_operation_candidate,
+        )
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
@@ -750,7 +886,10 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
             "answer": "75",
             "source_evidence": text,
         }, text)
-        provider = _provider([first, resolved])
+        provider = _provider(
+            [first, resolved],
+            candidate_selector=_select_unique_operation_candidate,
+        )
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
@@ -818,7 +957,10 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
                 },
             ],
         }
-        provider = _provider([first, repaired])
+        provider = _provider(
+            [first, repaired],
+            candidate_selector=_select_unique_operation_candidate,
+        )
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
@@ -949,7 +1091,10 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
             "answer": weights,
             "source_evidence": text,
         }, text)
-        provider = _provider([candidate, resolved])
+        provider = _provider(
+            [candidate, resolved],
+            candidate_selector=_select_unique_operation_candidate,
+        )
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = invoke_product_graph_turn(state, allow_semantic_resolver=True)
@@ -1050,7 +1195,10 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
             "answer": "12",
             "source_evidence": text,
         }, text)
-        provider = _provider([first, resolved])
+        provider = _provider(
+            [first, resolved],
+            candidate_selector=_select_unique_operation_candidate,
+        )
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
@@ -1099,7 +1247,10 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
             "answer": "75",
             "source_evidence": "Start at 75 QPS.",
         }
-        provider = _provider([first, resolved])
+        provider = _provider(
+            [first, resolved],
+            candidate_selector=_select_unique_operation_candidate,
+        )
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
@@ -1180,7 +1331,10 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
             "answer": "eth_accounts",
             "source_evidence": "eth_accounts",
         }, text)
-        provider = _provider([invalid, resolved])
+        provider = _provider(
+            [invalid, resolved],
+            candidate_selector=_select_unique_operation_candidate,
+        )
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
@@ -1189,7 +1343,7 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         self.assertEqual(result["actions"][0]["type"], "answer_pending")
         self.assertEqual(result["actions"][0]["answer"], "eth_accounts")
 
-    def test_admitted_unique_typed_candidate_gets_canonical_reviewer_receipt(self) -> None:
+    def test_missing_reviewer_selection_receipt_fails_closed(self) -> None:
         from agent.harness.intent import resolve_action_queue
 
         text = "The custom JSON-RPC method is eth_accounts."
@@ -1223,9 +1377,530 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
 
-        self.assertEqual(provider.complete.call_count, 2)
+        self.assertEqual(provider.complete.call_count, 4)
+        self.assertEqual(
+            [action["type"] for action in result["actions"]],
+            ["clarify_unresolved"],
+        )
+
+    def test_non_pending_navigation_argument_is_not_a_pending_candidate(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        text = "Take me to the QPS profile."
+        state = _state(active_group="network")
+        state["pending_question"] = {
+            "id": "network_interface",
+            "group": "network",
+            "kind": "device",
+            "field": "NETWORK_INTERFACE",
+            "manual_input_allowed": True,
+            "options": [],
+            "validation": {"value_type": "scalar_token"},
+        }
+        document = _document({
+            "type": "change_group",
+            "group": "qps_profile",
+            "navigation_explicit": True,
+            "source_evidence": text,
+        }, text)
+        provider = _provider(
+            [document],
+            candidate_selector=_select_unique_operation_candidate,
+        )
+
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
+        self.assertEqual(
+            [action["type"] for action in result["actions"]],
+            ["change_group"],
+        )
+
+    def test_unrelated_configuration_mutation_is_not_a_pending_candidate(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        text = "Switch the benchmark to fake-node."
+        state = _state(active_group="network")
+        state["pending_question"] = {
+            "id": "network_interface",
+            "group": "network",
+            "kind": "device",
+            "field": "NETWORK_INTERFACE",
+            "manual_input_allowed": True,
+            "structured_config_key": "NETWORK_INTERFACE",
+            "options": [],
+            "validation": {"value_type": "scalar_token"},
+        }
+        document = _document({
+            "type": "choose_target_mode",
+            "target_mode": "fake-node",
+            "target_mode_explicit": True,
+            "target_mode_semantic_verified": True,
+            "source_evidence": text,
+        }, text)
+        provider = Mock()
+
+        def complete(request: Any) -> SimpleNamespace:
+            payload = json.loads(request.messages[1].content)
+            if "plan_hash" not in payload:
+                return SimpleNamespace(text=json.dumps(document))
+            action = payload["actions"][0]
+            self.assertEqual(action["pending_value_candidates"], [])
+            self.assertEqual(action["turn_pending_value_candidates"], [])
+            return _admission_response(request)
+
+        provider.complete.side_effect = complete
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
+        self.assertEqual(
+            [action["type"] for action in result["actions"]],
+            ["choose_target_mode"],
+        )
+
+    def test_same_clause_independent_units_are_not_transferred_by_adjacency(self) -> None:
+        from agent.harness.intent import _materialize_pending_contract_candidates
+        from agent.harness.plan_coverage import segment_user_turn
+
+        text = "Use eth0 and explain the quick QPS profile."
+        state = _state(active_group="network")
+        state["pending_question"] = {
+            "id": "network_interface",
+            "group": "network",
+            "kind": "device",
+            "field": "NETWORK_INTERFACE",
+            "manual_input_allowed": True,
+            "options": [],
+            "manual_action": {
+                "type": "answer_pending",
+                "value_argument": "answer",
+            },
+            "validation": {"value_type": "scalar_token"},
+        }
+        document = {
+            "actions": [
+                {"type": "clarify_unresolved", "clauses": [text]},
+                {
+                    "type": "answer_opening_question",
+                    "topic": "config_explanation",
+                    "subject": "quick QPS profile",
+                    "source_evidence": text,
+                },
+            ],
+            "semantic_units": [
+                {
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "source_text": text,
+                    "disposition": "action",
+                    "action_indexes": [0],
+                },
+                {
+                    "unit_id": "unit-2",
+                    "clause_id": "clause-1",
+                    "source_text": text,
+                    "disposition": "action",
+                    "action_indexes": [1],
+                },
+            ],
+        }
+
+        materialized = json.loads(_materialize_pending_contract_candidates(
+            json.dumps(document),
+            state,
+            segment_user_turn(text),
+        ))
+
+        self.assertEqual(
+            [action["type"] for action in materialized["actions"]],
+            ["clarify_unresolved", "answer_opening_question"],
+        )
+        self.assertEqual(
+            [unit["action_indexes"] for unit in materialized["semantic_units"]],
+            [[0], [1]],
+        )
+
+    def test_equal_candidate_identities_are_scoped_per_action_owner(self) -> None:
+        from agent.harness.intent import _freeze_bounded_semantic_plan
+        from agent.harness.plan_coverage import segment_user_turn
+
+        text = "eth0\neth0"
+        state = _state(active_group="network")
+        state["pending_question"] = {
+            "id": "network_interface",
+            "group": "network",
+            "kind": "device",
+            "field": "NETWORK_INTERFACE",
+            "manual_input_allowed": True,
+            "options": [],
+            "validation": {"value_type": "scalar_token"},
+        }
+        document = {
+            "actions": [
+                {
+                    "type": "answer_pending",
+                    "answer": "eth0",
+                    "source_evidence": "eth0",
+                },
+                {
+                    "type": "answer_pending",
+                    "answer": "eth0",
+                    "source_evidence": "eth0",
+                },
+            ],
+            "semantic_units": [
+                {
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "source_text": "eth0",
+                    "disposition": "action",
+                    "action_indexes": [0],
+                },
+                {
+                    "unit_id": "unit-2",
+                    "clause_id": "clause-2",
+                    "source_text": "eth0",
+                    "disposition": "action",
+                    "action_indexes": [1],
+                },
+            ],
+        }
+
+        frozen = _freeze_bounded_semantic_plan(
+            json.dumps(document),
+            state,
+            segment_user_turn(text),
+        ).request_payload()
+
+        self.assertEqual(
+            frozen["actions"][0]["turn_pending_value_candidates"][0][
+                "source_unit_ids"
+            ],
+            ["unit-1"],
+        )
+        self.assertEqual(
+            frozen["actions"][1]["turn_pending_value_candidates"][0][
+                "source_unit_ids"
+            ],
+            ["unit-2"],
+        )
+
+    def test_lowercase_structured_key_requires_explicit_contract_binding(self) -> None:
+        from agent.harness.intent import _freeze_bounded_semantic_plan
+        from agent.harness.questions import manual_question
+        from agent.harness.plan_coverage import segment_user_turn
+
+        text = "customField: eth0"
+        state = _state(active_group="network")
+        state["pending_question"] = manual_question(
+            "network",
+            "custom_field",
+            "Enter customField.",
+            field="customField",
+            structured_config_key="customField",
+        )
+        document = _document({
+            "type": "propose_config_values",
+            "config_values": {"customField": "eth0"},
+            "unmapped_values": {},
+            "source_format": "yaml",
+            "source_evidence": text,
+        }, text)
+
+        frozen = _freeze_bounded_semantic_plan(
+            json.dumps(document),
+            state,
+            segment_user_turn(text),
+        ).request_payload()
+
+        self.assertEqual(
+            frozen["actions"][0]["pending_value_candidates"][0]["value"],
+            "eth0",
+        )
+
+    def test_candidate_binding_contract_rejects_unregistered_sources(self) -> None:
+        from agent.harness.questions import manual_question
+
+        with self.assertRaisesRegex(ValueError, "unknown candidate binding"):
+            manual_question(
+                "network",
+                "bad_binding",
+                "Enter a value.",
+                field="value",
+                candidate_bindings=({
+                    "type": "not_registered",
+                    "value_argument": "value",
+                },),
+            )
+        with self.assertRaisesRegex(ValueError, "is not registered as a business value"):
+            manual_question(
+                "network",
+                "metadata_binding",
+                "Enter a value.",
+                field="value",
+                candidate_bindings=({
+                    "type": "set_qps_mode",
+                    "value_argument": "source_evidence",
+                },),
+            )
+        with self.assertRaisesRegex(ValueError, "cannot declare mapping_key"):
+            manual_question(
+                "network",
+                "scalar_mapping_binding",
+                "Enter a value.",
+                field="value",
+                candidate_bindings=({
+                    "type": "set_sync_observe_options",
+                    "value_argument": "sync_observe_duration_seconds",
+                    "mapping_key": "duration",
+                },),
+            )
+        with self.assertRaisesRegex(ValueError, "is not registered as a business value"):
+            manual_question(
+                "network",
+                "control_argument_binding",
+                "Enter a value.",
+                field="value",
+                candidate_bindings=({
+                    "type": "choose_target_mode",
+                    "value_argument": "target_mode_explicit",
+                },),
+            )
+        with self.assertRaisesRegex(ValueError, "invalid mapping_key"):
+            manual_question(
+                "qps_profile",
+                "invalid_qps_key",
+                "Enter a value.",
+                field="value",
+                candidate_bindings=({
+                    "type": "set_qps_override",
+                    "value_argument": "qps_overrides",
+                    "mapping_key": "NOT_A_QPS_FIELD",
+                },),
+            )
+        with self.assertRaisesRegex(ValueError, "requires mapping_key"):
+            manual_question(
+                "qps_profile",
+                "missing_qps_key",
+                "Enter a value.",
+                field="value",
+                candidate_bindings=({
+                    "type": "set_qps_override",
+                    "value_argument": "qps_overrides",
+                },),
+            )
+
+    def test_persisted_unknown_candidate_binding_is_quarantined(self) -> None:
+        from agent.harness.state import STATE_SCHEMA_VERSION, migrate_state
+
+        migrated = migrate_state(
+            {
+                "schema_version": STATE_SCHEMA_VERSION,
+                "pending_question": {
+                    "contract_version": 2,
+                    "id": "stale_question",
+                    "manual_input_allowed": True,
+                    "accepted_action_types": [
+                        "answer_pending",
+                        "removed_action",
+                    ],
+                    "candidate_bindings": [{
+                        "type": "removed_action",
+                        "value_argument": "value",
+                    }],
+                },
+            },
+            thread_id="candidate-binding-migration",
+            language="en",
+            session_purpose="user",
+        )
+
+        self.assertEqual(migrated["pending_question"], {})
+        self.assertTrue(any(
+            event.get("event") == "checkpoint_pending_actions_quarantined"
+            and "removed_action" in str(event.get("contract_error") or "")
+            for event in migrated.get("audit_events") or []
+        ))
+
+    def test_persisted_invalid_known_candidate_binding_is_quarantined(self) -> None:
+        from agent.harness.state import STATE_SCHEMA_VERSION, migrate_state
+
+        migrated = migrate_state(
+            {
+                "schema_version": STATE_SCHEMA_VERSION,
+                "pending_question": {
+                    "contract_version": 2,
+                    "id": "invalid_qps_binding",
+                    "manual_input_allowed": True,
+                    "accepted_action_types": [
+                        "answer_pending",
+                        "set_qps_override",
+                    ],
+                    "candidate_bindings": [{
+                        "type": "set_qps_override",
+                        "value_argument": "qps_overrides",
+                        "mapping_key": "NOT_A_QPS_FIELD",
+                    }],
+                },
+            },
+            thread_id="candidate-binding-known-invalid",
+            language="en",
+            session_purpose="user",
+        )
+
+        self.assertEqual(migrated["pending_question"], {})
+        self.assertTrue(any(
+            event.get("event") == "checkpoint_pending_actions_quarantined"
+            and "invalid mapping_key" in str(event.get("contract_error") or "")
+            for event in migrated.get("audit_events") or []
+        ))
+
+    def test_pre_v10_pending_contract_is_regenerated(self) -> None:
+        from agent.harness.state import migrate_state
+
+        migrated = migrate_state(
+            {
+                "schema_version": 9,
+                "pending_question": {
+                    "contract_version": 1,
+                    "id": "qps_adjust_value",
+                    "group": "qps_profile",
+                    "kind": "manual_value",
+                    "field": "qps_adjust_value",
+                    "manual_input_allowed": True,
+                    "accepted_action_types": ["answer_pending"],
+                    "options": [],
+                    "validation": {"value_type": "positive_number"},
+                },
+            },
+            thread_id="candidate-binding-v10-migration",
+            language="en",
+            session_purpose="user",
+        )
+
+        self.assertEqual(migrated["pending_question"], {})
+        self.assertTrue(any(
+            event.get("event")
+            == "checkpoint_pending_contract_regeneration_required"
+            and event.get("from_schema_version") == 9
+            for event in migrated.get("audit_events") or []
+        ))
+
+    def test_current_schema_rejects_contract_v1_pending_question(self) -> None:
+        from agent.harness.state import STATE_SCHEMA_VERSION, migrate_state
+
+        migrated = migrate_state(
+            {
+                "schema_version": STATE_SCHEMA_VERSION,
+                "pending_question": {
+                    "contract_version": 1,
+                    "id": "stale_v1",
+                    "manual_input_allowed": True,
+                    "accepted_action_types": ["answer_pending"],
+                },
+            },
+            thread_id="candidate-binding-current-v1",
+            language="en",
+            session_purpose="user",
+        )
+
+        self.assertEqual(migrated["pending_question"], {})
+        self.assertEqual(
+            migrated["checkpoint_recovery"]["status"],
+            "quarantined",
+        )
+
+    def test_numeric_pending_candidate_uses_contract_identity(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        text = "100"
+        state = _state(active_group="network")
+        state["pending_question"] = {
+            "id": "network_bandwidth",
+            "group": "network",
+            "kind": "manual_value",
+            "field": "NETWORK_MAX_BANDWIDTH_GBPS",
+            "manual_input_allowed": True,
+            "structured_config_key": "NETWORK_MAX_BANDWIDTH_GBPS",
+            "options": [],
+            "validation": {"value_type": "positive_number"},
+        }
+        document = _document({
+            "type": "answer_pending",
+            "answer": 100,
+            "source_evidence": text,
+        }, text)
+        provider = _provider(
+            [document],
+            candidate_selector=_select_unique_operation_candidate,
+        )
+
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
         self.assertEqual(result["actions"][0]["type"], "answer_pending")
-        self.assertEqual(result["actions"][0]["answer"], "eth_accounts")
+        self.assertEqual(result["actions"][0]["answer"], 100)
+
+    def test_turn_candidates_are_scoped_to_the_pending_owner_units(self) -> None:
+        from agent.harness.intent import resolve_action_queue
+
+        text = "Use eth0.\nSet CLOUD_REGION to us-east1."
+        state = _state(active_group="network")
+        state["pending_question"] = {
+            "id": "network_interface",
+            "group": "network",
+            "kind": "device",
+            "field": "NETWORK_INTERFACE",
+            "manual_input_allowed": True,
+            "options": [],
+            "validation": {"value_type": "scalar_token"},
+        }
+        document = {
+            "actions": [
+                {
+                    "type": "answer_pending",
+                    "answer": "eth0",
+                    "source_evidence": "eth0",
+                },
+                {
+                    "type": "propose_config_values",
+                    "source_format": "prose",
+                    "config_values": {"CLOUD_REGION": "us-east1"},
+                    "unmapped_values": {},
+                    "source_evidence": "Set CLOUD_REGION to us-east1.",
+                },
+            ],
+            "semantic_units": [
+                {
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "source_text": "Use eth0.",
+                    "disposition": "action",
+                    "action_indexes": [0],
+                    "reason": "pending answer",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "clause_id": "clause-2",
+                    "source_text": "Set CLOUD_REGION to us-east1.",
+                    "disposition": "action",
+                    "action_indexes": [1],
+                    "reason": "independent configuration mutation",
+                },
+            ],
+        }
+        provider = _provider(
+            [document],
+            candidate_selector=_select_unique_operation_candidate,
+        )
+
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
+        self.assertEqual(
+            [action["type"] for action in result["actions"]],
+            ["answer_pending", "propose_config_values"],
+        )
 
     def test_admitted_semantic_grounding_uses_unique_exact_direct_receipt(self) -> None:
         from agent.harness.intent import resolve_action_queue
@@ -1316,6 +1991,7 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
             "kind": "manual_value",
             "field": "NETWORK_MAX_BANDWIDTH_GBPS",
             "manual_input_allowed": True,
+            "structured_config_key": "NETWORK_MAX_BANDWIDTH_GBPS",
             "options": [],
             "validation": {"value_type": "positive_number"},
         }
@@ -1331,7 +2007,10 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
             "source_format": "yaml",
             "source_evidence": text,
         }, text)
-        provider = _provider([direct, proposal])
+        provider = _provider(
+            [direct, proposal],
+            candidate_selector=_select_unique_operation_candidate,
+        )
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
@@ -1354,6 +2033,7 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
             "kind": "manual_value",
             "field": "ACCOUNTS_VOL_TYPE",
             "manual_input_allowed": True,
+            "structured_config_key": "ACCOUNTS_VOL_TYPE",
             "options": [],
             "manual_action": {"type": "answer_pending", "value_argument": "answer"},
             "validation": {"value_type": "scalar_token"},
@@ -1362,7 +2042,10 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
             "type": "clarify_unresolved",
             "clauses": [text],
         }, text)
-        provider = _provider([clarification])
+        provider = _provider(
+            [clarification],
+            candidate_selector=_select_unique_operation_candidate,
+        )
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
@@ -1373,6 +2056,37 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         )
         self.assertEqual(result["actions"][0]["type"], "propose_config_values")
         self.assertEqual(provider.complete.call_count, 2)
+
+    def test_environment_factory_admits_its_declared_structured_field(self) -> None:
+        from agent.harness.domains.environment import question_for_environment
+        from agent.harness.intent import resolve_action_queue
+
+        text = "NETWORK_INTERFACE: eth0"
+        state = _state(
+            active_group="network",
+            discovery={"network": {"interfaces": ["eth0"]}},
+        )
+        state["pending_question"] = question_for_environment(
+            state,
+            "network",
+        ) or {}
+        clarification = _document({
+            "type": "clarify_unresolved",
+            "clauses": [text],
+        }, text)
+        provider = _provider(
+            [clarification],
+            candidate_selector=_select_unique_operation_candidate,
+        )
+
+        with patch("agent.harness.intent.provider_from_config", return_value=provider):
+            result = resolve_action_queue(state, text)
+
+        self.assertEqual(
+            result["actions"][0]["config_values"],
+            {"NETWORK_INTERFACE": "eth0"},
+        )
+        self.assertEqual(result["actions"][0]["type"], "propose_config_values")
 
     def test_structured_pending_candidate_does_not_steal_consultation_owner(self) -> None:
         from agent.harness.intent import resolve_action_queue
@@ -1385,6 +2099,7 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
             "kind": "manual_value",
             "field": "ACCOUNTS_VOL_TYPE",
             "manual_input_allowed": True,
+            "structured_config_key": "ACCOUNTS_VOL_TYPE",
             "options": [],
             "manual_action": {"type": "answer_pending", "value_argument": "answer"},
             "validation": {"value_type": "scalar_token"},
@@ -1456,6 +2171,7 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
             "kind": "manual_value",
             "field": "ACCOUNTS_VOL_TYPE",
             "manual_input_allowed": True,
+            "structured_config_key": "ACCOUNTS_VOL_TYPE",
             "options": [],
             "manual_action": {"type": "answer_pending", "value_argument": "answer"},
             "validation": {"value_type": "scalar_token"},
@@ -1464,7 +2180,10 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
             "type": "clarify_unresolved",
             "clauses": [text],
         }, text)
-        provider = _provider([clarification])
+        provider = _provider(
+            [clarification],
+            candidate_selector=_select_unique_operation_candidate,
+        )
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
@@ -1486,6 +2205,7 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
             "kind": "manual_value",
             "field": "ACCOUNTS_VOL_TYPE",
             "manual_input_allowed": True,
+            "structured_config_key": "ACCOUNTS_VOL_TYPE",
             "options": [],
             "manual_action": {"type": "answer_pending", "value_argument": "answer"},
             "validation": {"value_type": "scalar_token"},
@@ -1576,7 +2296,6 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
             materialized["semantic_units"][2]["action_indexes"],
             [0],
         )
-
     def test_existing_pending_answer_absorbs_exact_candidate_without_duplication(self) -> None:
         from agent.harness.intent import resolve_action_queue
 
@@ -1639,7 +2358,10 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
                 },
             ],
         }
-        provider = _provider([document])
+        provider = _provider(
+            [document],
+            candidate_selector=_select_unique_operation_candidate,
+        )
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
@@ -1693,7 +2415,10 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
                 "reason": "two model representations claim one typed value",
             }],
         }
-        provider = _provider([document])
+        provider = _provider(
+            [document],
+            candidate_selector=_select_unique_operation_candidate,
+        )
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
@@ -1948,7 +2673,10 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
             "arguments": {"answer": True},
             "source_evidence": text,
         }, text)
-        provider = _provider([document])
+        provider = _provider(
+            [document],
+            candidate_selector=_select_unique_operation_candidate,
+        )
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
@@ -2001,7 +2729,38 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
                 for index, clause in enumerate(clauses, start=1)
             ],
         }
-        provider = _provider([clarification, clarification])
+        provider = Mock()
+        compiler_documents = iter([clarification, clarification])
+
+        def complete(request: Any) -> SimpleNamespace:
+            payload = json.loads(request.messages[1].content)
+            if "plan_hash" not in payload:
+                return SimpleNamespace(text=json.dumps(
+                    next(compiler_documents),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ))
+            response = json.loads(_admission_response(request).text)
+            response["action_verdicts"][0]["verdict"] = "reject"
+            response["action_verdicts"][0]["reason"] = (
+                "the sibling requests an independent unresolved operation"
+            )
+            sibling = next(
+                row
+                for row in response["unit_verdicts"]
+                if "other thing" in row["evidence_quote"]
+            )
+            sibling.update({
+                "verdict": "unresolved",
+                "reason": "the sibling is not support for the endpoint answer",
+            })
+            return SimpleNamespace(text=json.dumps(
+                response,
+                ensure_ascii=False,
+                sort_keys=True,
+            ))
+
+        provider.complete.side_effect = complete
 
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = invoke_product_graph_turn(state, allow_semantic_resolver=True)
@@ -2278,6 +3037,22 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         self.assertEqual(
             typed_pending_value_candidates(evidence, evidence_question),
             (evidence,),
+        )
+        scalar_question = {
+            "kind": "device",
+            "manual_input_allowed": True,
+            "validation": {"value_type": "scalar_token"},
+        }
+        self.assertEqual(
+            typed_pending_value_candidates("eth0", scalar_question),
+            ("eth0",),
+        )
+        self.assertEqual(
+            typed_pending_value_candidates(
+                "Use this interface for the benchmark:",
+                scalar_question,
+            ),
+            (),
         )
 
 

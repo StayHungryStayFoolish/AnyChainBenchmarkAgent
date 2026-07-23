@@ -48,7 +48,53 @@ def _state(language: str = "en", **updates: Any) -> dict[str, Any]:
     return state
 
 
-def _whole_plan_admission_payload(request: Any) -> dict[str, Any]:
+def _turn_candidate_verdicts(
+    action: dict[str, Any],
+    units: dict[str, dict[str, Any]],
+    *,
+    selected_identity: str = "",
+) -> list[dict[str, Any]]:
+    pending = list(action.get("pending_value_candidates") or [])
+    candidates = list(action.get("turn_pending_value_candidates") or [])
+    if not pending or not candidates:
+        return []
+    sources = [
+        str(units[unit_id]["source_text"])
+        for unit_id in action.get("unit_ids") or []
+    ]
+    return [
+        {
+            "candidate_id": str(candidate["candidate_id"]),
+            "verdict": (
+                "selected"
+                if (
+                    selected_identity
+                    and candidate.get("identity") == selected_identity
+                )
+                else "not_selected"
+            ),
+            "evidence_quote": next(
+                (
+                    str(units[unit_id]["source_text"])
+                    for unit_id in candidate.get("source_unit_ids") or []
+                    if unit_id in units
+                ),
+                sources[0],
+            ),
+            "reason": "the fixture preserves the candidate's source role",
+        }
+        for candidate in candidates
+    ]
+
+
+def _whole_plan_admission_payload(
+    request: Any,
+    *,
+    candidate_selector: Callable[
+        [dict[str, Any], dict[str, dict[str, Any]]],
+        str,
+    ] | None = None,
+) -> dict[str, Any]:
     """Build one valid immutable verdict from the actual reviewer request."""
 
     review = json.loads(request.messages[1].content)
@@ -58,6 +104,11 @@ def _whole_plan_admission_payload(request: Any) -> dict[str, Any]:
     }
     action_verdicts = []
     for action in review["actions"]:
+        selected_identity = (
+            candidate_selector(action, units)
+            if candidate_selector is not None
+            else ""
+        )
         evidence = [
             {
                 "unit_id": unit_id,
@@ -80,9 +131,20 @@ def _whole_plan_admission_payload(request: Any) -> dict[str, Any]:
                 for argument in action.get("required_value_grounding_arguments") or []
             ],
             "pending_answer_argument": (
-                action["pending_value_candidates"][0]["candidate_id"]
-                if len(action.get("pending_value_candidates") or []) == 1
-                else ""
+                next(
+                    (
+                        str(candidate["candidate_id"])
+                        for candidate in action.get("pending_value_candidates") or []
+                        if str(candidate.get("identity") or "")
+                        == selected_identity
+                    ),
+                    "",
+                )
+            ),
+            "turn_candidate_verdicts": _turn_candidate_verdicts(
+                action,
+                units,
+                selected_identity=selected_identity,
             ),
             "reason": "the immutable registered action preserves its source units",
         })
@@ -105,17 +167,46 @@ def _whole_plan_admission_payload(request: Any) -> dict[str, Any]:
     }
 
 
-def _whole_plan_admission_response(request: Any) -> SimpleNamespace:
+def _whole_plan_admission_response(
+    request: Any,
+    *,
+    candidate_selector: Callable[
+        [dict[str, Any], dict[str, dict[str, Any]]],
+        str,
+    ] | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(text=json.dumps(
-        _whole_plan_admission_payload(request),
+        _whole_plan_admission_payload(
+            request,
+            candidate_selector=candidate_selector,
+        ),
         ensure_ascii=False,
         sort_keys=True,
     ))
 
 
+def _select_unique_operation_candidate(
+    action: dict[str, Any],
+    _units: dict[str, dict[str, Any]],
+) -> str:
+    """Explicit positive-fixture reviewer decision."""
+
+    candidates = list(action.get("pending_value_candidates") or [])
+    return (
+        str(candidates[0].get("identity") or "")
+        if len(candidates) == 1
+        else ""
+    )
+
+
 def _bounded_intent_provider(
     compiler_documents: list[str | dict[str, Any]],
     admission_responses: list[Callable[[Any], SimpleNamespace]] | None = None,
+    *,
+    candidate_selector: Callable[
+        [dict[str, Any], dict[str, dict[str, Any]]],
+        str,
+    ] | None = None,
 ) -> Mock:
     """Return a provider whose compiler and admission calls share one channel."""
 
@@ -126,8 +217,13 @@ def _bounded_intent_provider(
     def complete(request: Any) -> SimpleNamespace:
         request_payload = json.loads(request.messages[1].content)
         if "plan_hash" in request_payload and "immutable_document" in request_payload:
-            builder = next(admissions, _whole_plan_admission_response)
-            return builder(request)
+            builder = next(admissions, None)
+            if builder is not None:
+                return builder(request)
+            return _whole_plan_admission_response(
+                request,
+                candidate_selector=candidate_selector,
+            )
         document = next(documents)
         text = document if isinstance(document, str) else json.dumps(
             document,
@@ -406,6 +502,7 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
                 ],
                 "grounded_arguments": [],
                 "pending_answer_argument": "",
+                "turn_candidate_verdicts": [],
                 "reason": "one supporting unit frames one direct endpoint value",
             }],
             "unit_verdicts": [
@@ -452,7 +549,10 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
             allowed_action_types=ALLOWED_ACTION_TYPES,
         )
         self.assertFalse(result.valid)
-        self.assertIn("not direct for every owner", "; ".join(result.errors))
+        self.assertIn(
+            "complete unit is not direct",
+            "; ".join(result.errors),
+        )
 
     def test_required_value_grounding_has_exact_argument_cardinality(self) -> None:
         from agent.harness.intent import ALLOWED_ACTION_TYPES
@@ -512,6 +612,7 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
                     "evidence_quote": "simulated-node workflow",
                 }],
                 "pending_answer_argument": "",
+                "turn_candidate_verdicts": [],
                 "reason": "the source selects the concrete target mode",
             }],
             "unit_verdicts": [{
@@ -659,6 +760,158 @@ def _admitted_field_intake_action(
 
 
 class HarnessArchitectureTest(unittest.TestCase):
+    def test_pending_admission_requires_complete_turn_candidate_receipts(self) -> None:
+        from agent.harness.intent import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import (
+            freeze_semantic_plan,
+            validate_whole_plan_admission,
+        )
+
+        source = "Do not use eth0. Use eth1 instead."
+        action = {
+            "type": "answer_pending",
+            "answer": "eth1",
+            "source_evidence": source,
+        }
+        unit = {
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "disposition": "action",
+            "action_indexes": [0],
+        }
+        plan = freeze_semantic_plan(
+            {"actions": [action], "semantic_units": [unit]},
+            action_records=[{
+                "action_id": "action-1",
+                "action_index": 0,
+                "action": action,
+                "operation_arguments": {"answer": "eth1"},
+                "unit_ids": ["unit-1"],
+                "allowed_support_relations": [],
+                "required_value_grounding_arguments": [],
+                "exact_source_value_arguments": [],
+                "pending_value_candidates": [{
+                    "candidate_id": "candidate-0",
+                    "argument": "answer",
+                    "identity": "scalar:eth1",
+                    "path": [],
+                    "value": "eth1",
+                }],
+                "turn_pending_value_candidates": [
+                    {
+                        "candidate_id": "turn-candidate-0",
+                        "identity": "scalar:eth0",
+                        "source_unit_ids": ["unit-1"],
+                        "value": "eth0",
+                    },
+                    {
+                        "candidate_id": "turn-candidate-1",
+                        "identity": "scalar:eth1",
+                        "source_unit_ids": ["unit-1"],
+                        "value": "eth1",
+                    },
+                ],
+            }],
+            unit_records=[{
+                "unit_id": "unit-1",
+                "unit_index": 0,
+                "unit": unit,
+                "source_text": source,
+                "disposition": "action",
+                "owner_action_ids": ["action-1"],
+            }],
+            review_context={"pending_question": {}},
+        )
+        payload = {
+            "plan_hash": plan.plan_hash,
+            "action_verdicts": [{
+                "action_id": "action-1",
+                "verdict": "admit",
+                "unit_ids": ["unit-1"],
+                "evidence": [{
+                    "unit_id": "unit-1",
+                    "quote": source,
+                    "relation": "direct",
+                    "support_relation": "",
+                }],
+                "grounded_arguments": [],
+                "pending_answer_argument": "candidate-0",
+                "turn_candidate_verdicts": [
+                    {
+                        "candidate_id": "turn-candidate-0",
+                        "verdict": "not_selected",
+                        "evidence_quote": "Do not use eth0.",
+                        "reason": "the source explicitly rejects this value",
+                    },
+                    {
+                        "candidate_id": "turn-candidate-1",
+                        "verdict": "selected",
+                        "evidence_quote": "Use eth1 instead.",
+                        "reason": "the source explicitly selects this value",
+                    },
+                ],
+                "reason": "the correction selects exactly one candidate",
+            }],
+            "unit_verdicts": [{
+                "unit_id": "unit-1",
+                "verdict": "complete",
+                "owner_action_ids": ["action-1"],
+                "evidence_quote": source,
+                "omitted_action_type": "",
+                "reason": "the pending answer preserves the correction",
+            }],
+            "reason": "reviewed",
+        }
+        admitted = validate_whole_plan_admission(
+            json.dumps(payload),
+            plan,
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+        self.assertTrue(admitted.valid, admitted.errors)
+
+        forged_candidate_quote = deepcopy(payload)
+        forged_candidate_quote["action_verdicts"][0][
+            "turn_candidate_verdicts"
+        ][1]["evidence_quote"] = "Use"
+        rejected = validate_whole_plan_admission(
+            json.dumps(forged_candidate_quote),
+            plan,
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+        self.assertFalse(rejected.valid)
+        self.assertIn(
+            "turn candidate evidence is not exact",
+            "; ".join(rejected.errors),
+        )
+
+        missing = deepcopy(payload)
+        missing["action_verdicts"][0]["turn_candidate_verdicts"].pop()
+        rejected = validate_whole_plan_admission(
+            json.dumps(missing),
+            plan,
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+        self.assertFalse(rejected.valid)
+        self.assertIn(
+            "turn candidate order or cardinality mismatch",
+            "; ".join(rejected.errors),
+        )
+
+        wrong_selected = deepcopy(payload)
+        wrong_selected["action_verdicts"][0]["turn_candidate_verdicts"][0]["verdict"] = "selected"
+        wrong_selected["action_verdicts"][0]["turn_candidate_verdicts"][1]["verdict"] = "not_selected"
+        rejected = validate_whole_plan_admission(
+            json.dumps(wrong_selected),
+            plan,
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+        self.assertFalse(rejected.valid)
+        self.assertIn(
+            "lacks one matching turn candidate",
+            "; ".join(rejected.errors),
+        )
+
     def test_evidence_collection_actions_require_their_registered_lifecycle(self) -> None:
         from agent.harness.action_registry import lifecycle_rejected_action_indexes
         from agent.harness.state import new_state
@@ -771,6 +1024,7 @@ class HarnessArchitectureTest(unittest.TestCase):
                     "evidence_quote": "https://first.example/rpc",
                 }],
                 "pending_answer_argument": "",
+                "turn_candidate_verdicts": [],
                 "reason": "endpoint selection",
             }],
             "unit_verdicts": [{
@@ -800,6 +1054,24 @@ class HarnessArchitectureTest(unittest.TestCase):
             allowed_action_types=ALLOWED_ACTION_TYPES,
         )
         self.assertTrue(accepted.valid, accepted.errors)
+
+    def test_structured_candidate_evidence_rejects_wrong_explicit_values(self) -> None:
+        from agent.harness.semantic_compiler import (
+            _quote_supports_pending_candidate,
+        )
+
+        source = "eth_a=10, eth_b=90"
+        self.assertFalse(_quote_supports_pending_candidate(
+            source,
+            {
+                "identity": (
+                    'rpc_weights:{"eth_a":70,"eth_b":30}'
+                ),
+                "value": {"eth_a": 70, "eth_b": 30},
+            },
+            {},
+            [source],
+        ))
 
     def test_go_back_cancels_field_reconfiguration_continuation(self) -> None:
         from agent.harness.coordinator import apply_coordinator_action
@@ -889,14 +1161,16 @@ class HarnessArchitectureTest(unittest.TestCase):
         self.assertEqual(migrated["active_group"], "workload_rpc")
         self.assertEqual(migrated["action_queue"], [])
         events = migrated["audit_events"]
-        self.assertEqual(events[-1]["event"], "checkpoint_pending_actions_quarantined")
-        self.assertEqual(events[-1]["unsupported_action_types"], ["start_custom_rpc"])
+        self.assertEqual(
+            events[-1]["event"],
+            "checkpoint_pending_contract_regeneration_required",
+        )
 
     def test_checkpoint_migration_preserves_current_pending_action_contracts(self) -> None:
         from agent.harness.state import migrate_state
 
         pending = {
-            "contract_version": 1,
+            "contract_version": 2,
             "id": "current-choice",
             "group": "opening",
             "kind": "numbered_choice",
@@ -940,14 +1214,18 @@ class HarnessArchitectureTest(unittest.TestCase):
             {
                 "active_group": "opening",
                 "pending_question": {
+                    "contract_version": 2,
                     "id": "resume_harness_session",
                     "group": "opening",
                     "kind": "numbered_choice",
+                    "field": "resume_harness_session",
+                    "manual_input_allowed": False,
                     "options": [{
                         "id": "1",
                         "value": "continue",
                         "action": {"type": "answer_pending", "answer": "continue"},
                     }],
+                    "accepted_action_types": ["answer_pending"],
                 },
                 "resume_context": {
                     "active_group": "workload_rpc",
@@ -963,7 +1241,10 @@ class HarnessArchitectureTest(unittest.TestCase):
         self.assertEqual(migrated["resume_context"]["pending_question"], {})
         event = migrated["audit_events"][-1]
         self.assertEqual(event["location"], "resume_context")
-        self.assertEqual(event["unsupported_action_types"], ["start_custom_rpc"])
+        self.assertEqual(
+            event["event"],
+            "checkpoint_pending_contract_regeneration_required",
+        )
 
     def test_state_policy_removes_inapplicable_evidence_pause_without_losing_navigation(self) -> None:
         from agent.harness.intent import _apply_state_plan_policy
@@ -2253,6 +2534,81 @@ class HarnessQuestionContractTest(unittest.TestCase):
             self.assertTrue(value_satisfies_pending_contract("replacement-value", question))
             self.assertFalse(value_satisfies_pending_contract("replacement value", question))
 
+    def test_manual_questions_declare_domain_candidate_sources(self) -> None:
+        from agent.harness.domains.chain_rpc_questions import _weights_question
+        from agent.harness.domains.environment import question_for_environment
+        from agent.harness.domains.performance import question_for_performance
+        from agent.harness.domains.sync_observe import question_for_sync_observe
+
+        environment = _state(
+            "en",
+            confirmed_config={
+                "CLOUD_REGION": "test-region",
+                "CLOUD_ZONE": "test-zone",
+                "MACHINE_TYPE": "test-machine",
+            },
+            discovery={"network": {"interfaces": ["eth0"]}},
+        )
+        network_question = question_for_environment(environment, "network")
+        self.assertEqual(
+            network_question["structured_config_key"],
+            "NETWORK_INTERFACE",
+        )
+        self.assertIn(
+            "propose_config_values",
+            network_question["accepted_action_types"],
+        )
+
+        qps = _state(
+            "en",
+            target_mode="fake-node",
+            qps_profile={
+                "mode": "quick",
+                "default_decision_made": True,
+                "adjust_field": "INITIAL_QPS",
+            },
+        )
+        qps_question = question_for_performance(qps, "qps_profile")
+        self.assertEqual(qps_question["candidate_bindings"], [{
+            "type": "set_qps_override",
+            "value_argument": "qps_overrides",
+            "mapping_key": "INITIAL_QPS",
+        }])
+
+        weights = _state(
+            "en",
+            chain_identity={"canonical": "bsc"},
+            custom_rpc={
+                "status": "needs_weights",
+                "method": "eth_blockNumber",
+            },
+        )
+        weight_question = _weights_question(weights, "custom_rpc")
+        self.assertEqual(weight_question["candidate_bindings"], [{
+            "type": "rpc_workload_command",
+            "value_argument": "rpc_weights",
+        }])
+
+        sync = _state(
+            "en",
+            workflow_mode="sync_observe",
+            target_mode="sync-observe",
+            confirmed_config={
+                "SYNC_OBSERVE_RPC_URL": "http://geth-dev:8545",
+                "MAINNET_RPC_URL_REVIEWED": True,
+            },
+            endpoint_evidence={"sync_rpc_url_ready": True},
+            sync_observe={
+                "source": "endpoint_only",
+                "stop_condition": "duration",
+            },
+        )
+        sync_question = question_for_sync_observe(sync)
+        self.assertEqual(sync_question["candidate_bindings"], [{
+            "type": "set_sync_observe_options",
+            "value_argument": "sync_observe_duration_seconds",
+        }])
+
     def test_model_pending_admission_uses_extracted_value_contract(self) -> None:
         from agent.harness.coordinator import (
             _action_answers_pending_contract,
@@ -2944,7 +3300,7 @@ class HarnessQuestionContractTest(unittest.TestCase):
                 self.assertEqual(english.get("id"), chinese.get("id"))
                 for language, question in questions.items():
                     assert question is not None
-                    self.assertEqual(question.get("contract_version"), 1)
+                    self.assertEqual(question.get("contract_version"), 2)
                     self.assertTrue(question.get("options"))
                     for option in question["options"]:
                         action = option.get("action") or {}
@@ -3088,7 +3444,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
                 },
                 text,
             ),
-        ])
+        ], candidate_selector=_select_unique_operation_candidate)
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(_state(), text)
 
@@ -3294,7 +3650,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
                 },
                 text,
             ),
-        ])
+        ], candidate_selector=_select_unique_operation_candidate)
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
 

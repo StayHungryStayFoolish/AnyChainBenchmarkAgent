@@ -100,6 +100,11 @@ def question_for_performance(state: AgentGraphState, group: str) -> dict[str, An
                 localized(language, f"请输入 {qps.get('adjust_field')} 的值。", f"Enter the value for {qps.get('adjust_field')}."),
                 field="qps_adjust_value",
                 validation={"value_type": "positive_number"},
+                candidate_bindings=({
+                    "type": "set_qps_override",
+                    "value_argument": "qps_overrides",
+                    "mapping_key": str(qps.get("adjust_field") or ""),
+                },),
             )
         return None
     if group == "observability":

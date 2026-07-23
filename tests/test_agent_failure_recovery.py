@@ -298,7 +298,7 @@ class FailureRecoveryTest(unittest.TestCase):
             language="en",
             session_purpose="user",
         )
-        self.assertEqual(state["schema_version"], 9)
+        self.assertEqual(state["schema_version"], 10)
         self.assertEqual(state["failure_recovery"], {})
 
     def test_blocked_approved_preflight_activates_recovery(self) -> None:

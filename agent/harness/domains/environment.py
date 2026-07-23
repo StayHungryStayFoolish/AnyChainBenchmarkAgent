@@ -951,6 +951,7 @@ def question_for_environment(state: AgentGraphState, group: str) -> dict[str, An
                     field=env_key,
                     kind="yes_no",
                     manual_input_allowed=True,
+                    structured_config_key=env_key,
                     validation={"value_type": "scalar_token"},
                     options=[
                         {"label": "Y", "value": detected},
@@ -967,6 +968,7 @@ def question_for_environment(state: AgentGraphState, group: str) -> dict[str, An
                 env_key,
                 question_prompts.text_for(prompt_key, language=language),
                 field=env_key,
+                structured_config_key=env_key,
                 validation={"value_type": "scalar_token"},
             )
         return None
@@ -998,6 +1000,7 @@ def question_for_environment(state: AgentGraphState, group: str) -> dict[str, An
                     field="NETWORK_INTERFACE",
                     kind="device",
                     manual_input_allowed=True,
+                    structured_config_key="NETWORK_INTERFACE",
                     validation={"value_type": "scalar_token"},
                     options=[{"label": f"{item}{' (default)' if item == default else ''}", "value": item} for item in interfaces],
                 )
@@ -1007,6 +1010,7 @@ def question_for_environment(state: AgentGraphState, group: str) -> dict[str, An
                 question_prompts.text_for("network_interface", language=language),
                 field="NETWORK_INTERFACE",
                 kind="device",
+                structured_config_key="NETWORK_INTERFACE",
                 validation={"value_type": "scalar_token"},
             )
         if not confirmed.get("NETWORK_MAX_BANDWIDTH_GBPS"):
@@ -1015,6 +1019,7 @@ def question_for_environment(state: AgentGraphState, group: str) -> dict[str, An
                 "NETWORK_MAX_BANDWIDTH_GBPS",
                 question_prompts.text_for("network_max_bandwidth_gbps", language=language),
                 field="NETWORK_MAX_BANDWIDTH_GBPS",
+                structured_config_key="NETWORK_MAX_BANDWIDTH_GBPS",
                 validation={"value_type": "positive_number"},
             )
     return None
@@ -1131,6 +1136,7 @@ def _disk_question(state: AgentGraphState, *, prefix: str, device_key: str, grou
                 field=device_key,
                 kind="device",
                 manual_input_allowed=True,
+                structured_config_key=device_key,
                 validation={"value_type": "scalar_token"},
                 options=[{"label": f"{item['name']} ({item.get('size') or '?'}, {item.get('type') or '?'})", "value": item["name"]} for item in candidates],
             )
@@ -1140,6 +1146,7 @@ def _disk_question(state: AgentGraphState, *, prefix: str, device_key: str, grou
             localized(language, f"请输入 {device_key}。", f"Enter {device_key}."),
             field=device_key,
             kind="device",
+            structured_config_key=device_key,
             validation={"value_type": "scalar_token"},
         )
     fields = (
@@ -1162,6 +1169,7 @@ def _disk_question(state: AgentGraphState, *, prefix: str, device_key: str, grou
                     field=env_key,
                     kind="yes_no",
                     manual_input_allowed=True,
+                    structured_config_key=env_key,
                     validation={"value_type": "positive_number"},
                     options=[
                         {"label": "Y", "value": inferred},
@@ -1179,6 +1187,7 @@ def _disk_question(state: AgentGraphState, *, prefix: str, device_key: str, grou
             env_key,
             question_prompts.text_for(prompt_key, language=language),
             field=env_key,
+            structured_config_key=env_key,
             validation={"value_type": value_type},
         )
     return None

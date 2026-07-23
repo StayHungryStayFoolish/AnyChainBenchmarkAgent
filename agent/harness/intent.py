@@ -47,6 +47,7 @@ from .questions import (
     exact_answer,
     pending_contract_allows_semantic_scalar_normalization,
     pending_option_value_exists,
+    pending_value_identity,
     typed_pending_value_candidates,
     value_satisfies_pending_contract,
 )
@@ -320,15 +321,17 @@ def _materialize_pending_contract_candidates(
     # A structured configuration block remains one review transaction. The
     # parser may expose it only when the compiler left that exact atomic clause
     # clarification-only. Existing semantic owners are authoritative.
-    pending_field = str(pending.get("field") or "").strip().upper()
-    if pending_field:
+    structured_config_key = str(
+        pending.get("structured_config_key") or ""
+    ).strip()
+    if structured_config_key:
         for clause in clauses:
             if clause.input_shape != "structured":
                 continue
             structured = extract_structured_input_candidates(clause.text) or {}
             config_values = dict(structured.get("config_values") or {})
             normalized_fields = {
-                str(key).strip().upper()
+                str(key).strip().casefold()
                 for key in config_values
             }
             clause_units = _candidate_clause_units(units, clause.clause_id)
@@ -342,9 +345,9 @@ def _materialize_pending_contract_candidates(
                 for index in unit.get("action_indexes") or []
             )
             if (
-                pending_field not in normalized_fields
+                structured_config_key.casefold() not in normalized_fields
                 or clause_has_proposal
-                or not clause_units
+                or len(clause_units) != 1
                 or not _units_have_only_allowed_owners(
                     clause_units,
                     actions,
@@ -388,27 +391,35 @@ def _materialize_pending_contract_candidates(
     if len(typed_rows) != 1:
         return text
     candidate_clause, candidate_value = typed_rows[0]
-    candidate_units = _candidate_clause_units(units, candidate_clause.clause_id)
+    candidate_units = _exact_candidate_units(
+        units,
+        candidate_clause.clause_id,
+        candidate_value,
+    )
+    candidate_identity = pending_value_identity(candidate_value, pending)
     matching_indexes = [
         index
         for index, action in enumerate(actions)
         if isinstance(action, Mapping)
-        and _pending_action_value(action, pending) == candidate_value
+        and pending_value_identity(_pending_action_value(action, pending), pending)
+        == candidate_identity
     ]
     if len(matching_indexes) == 1:
         existing_index = matching_indexes[0]
         existing = actions[existing_index]
-        source = str(existing.get("source_evidence") or "").strip()
-        if not source:
-            existing["source_evidence"] = (
-                str(candidate_value)
-                if str(candidate_value) in candidate_clause.text
-                else candidate_clause.text
-            )
-        if candidate_units and _units_have_only_allowed_owners(
+        # One non-atomic typed candidate has one authoritative direct clause.
+        # Explanatory siblings are represented by semantic-unit support
+        # ownership, never by concatenating several clauses into one grounding
+        # string.
+        existing["source_evidence"] = (
+            str(candidate_value)
+            if str(candidate_value) in candidate_clause.text
+            else candidate_clause.text
+        )
+        if candidate_units and _units_are_pending_or_clarification_owned(
             candidate_units,
             actions,
-            allowed_types={"clarify_unresolved"},
+            existing_index,
         ):
             _assign_candidate_owner(
                 candidate_units,
@@ -483,6 +494,25 @@ def _candidate_clause_units(
     ]
 
 
+def _exact_candidate_units(
+    units: list[Any],
+    clause_id: str,
+    candidate_value: Any,
+) -> list[dict[str, Any]]:
+    """Return one uniquely identifiable unit containing the candidate literal."""
+
+    clause_units = _candidate_clause_units(units, clause_id)
+    literal = str(candidate_value).strip()
+    if not literal:
+        return []
+    matching = [
+        unit
+        for unit in clause_units
+        if literal in str(unit.get("source_text") or "")
+    ]
+    return matching if len(matching) == 1 else []
+
+
 def _units_have_only_allowed_owners(
     units: list[dict[str, Any]],
     actions: list[Any],
@@ -522,6 +552,34 @@ def _assign_candidate_owner(
         unit["action_indexes"] = [action_index]
         unit["disposition"] = "action"
         unit["reason"] = reason
+
+
+def _units_are_pending_or_clarification_owned(
+    units: list[dict[str, Any]],
+    actions: list[Any],
+    pending_action_index: int,
+) -> bool:
+    """Return true when exact-unit reassignment cannot steal another owner."""
+
+    for unit in units:
+        owner_indexes = [
+            index
+            for index in unit.get("action_indexes") or []
+            if isinstance(index, int) and not isinstance(index, bool)
+        ]
+        if not owner_indexes:
+            return False
+        for index in owner_indexes:
+            if index == pending_action_index:
+                continue
+            if (
+                index < 0
+                or index >= len(actions)
+                or not isinstance(actions[index], Mapping)
+                or str(actions[index].get("type") or "") != "clarify_unresolved"
+            ):
+                return False
+    return True
 
 
 def _remove_orphan_candidate_actions(
@@ -1029,6 +1087,34 @@ def _freeze_bounded_semantic_plan(
     ]
     action_records: list[dict[str, Any]] = []
     pending = dict(state.get("pending_question") or {})
+    turn_pending_value_candidates: list[dict[str, Any]] = []
+    turn_candidate_by_identity: dict[str, dict[str, Any]] = {}
+    for clause in clauses:
+        for value in typed_pending_value_candidates(clause.text, pending):
+            identity = pending_value_identity(value, pending)
+            if not identity:
+                continue
+            source_unit_ids = [
+                unit_ids[index]
+                for index, unit in enumerate(units)
+                if isinstance(unit, Mapping)
+                and str(unit.get("clause_id") or "") == clause.clause_id
+            ]
+            existing = turn_candidate_by_identity.get(identity)
+            if existing is not None:
+                existing["source_unit_ids"] = list(dict.fromkeys([
+                    *existing["source_unit_ids"],
+                    *source_unit_ids,
+                ]))
+                continue
+            candidate = {
+                "candidate_id": f"turn-candidate-{len(turn_pending_value_candidates)}",
+                "identity": identity,
+                "value": value,
+                "source_unit_ids": source_unit_ids,
+            }
+            turn_candidate_by_identity[identity] = candidate
+            turn_pending_value_candidates.append(candidate)
     for index, action in enumerate(actions):
         if not isinstance(action, dict):
             raise ValueError("immutable semantic plan contains a non-object action")
@@ -1040,10 +1126,52 @@ def _freeze_bounded_semantic_plan(
             target_group = str(action.get("group") or "")
         target_spec = GROUP_SPEC_BY_NAME.get(target_group)
         operation_arguments = _semantic_operation_arguments(action)
-        pending_value_candidates = _pending_operation_value_candidates(
+        owned_unit_ids = [
+            unit_ids[unit_index]
+            for unit_index, owners in enumerate(unit_owner_indexes)
+            if index in owners
+        ]
+        scoped_turn_candidates = [
+            {
+                **candidate,
+                "source_unit_ids": [
+                    unit_id
+                    for unit_id in candidate["source_unit_ids"]
+                    if unit_id in owned_unit_ids
+                ],
+            }
+            for candidate in turn_pending_value_candidates
+            if any(
+                unit_id in owned_unit_ids
+                for unit_id in candidate["source_unit_ids"]
+            )
+        ]
+        scoped_candidate_identities = {
+            str(candidate.get("identity") or "")
+            for candidate in scoped_turn_candidates
+        }
+        operation_candidates = _pending_operation_value_candidates(
+            action,
             operation_arguments,
             pending,
         )
+        pending_value_candidates = list(operation_candidates)
+        action_turn_candidates = list(scoped_turn_candidates)
+        for candidate in operation_candidates:
+            identity = str(candidate.get("identity") or "")
+            if identity in scoped_candidate_identities:
+                continue
+            action_turn_candidates.append({
+                "candidate_id": (
+                    f"action-{index + 1}-operation-candidate-"
+                    f"{len(action_turn_candidates)}"
+                ),
+                "identity": identity,
+                "value": candidate.get("value"),
+                "source_unit_ids": owned_unit_ids,
+            })
+        if not pending_value_candidates:
+            action_turn_candidates = []
         action_records.append({
             "action_id": action_ids[index],
             "action_index": index,
@@ -1062,11 +1190,8 @@ def _freeze_bounded_semantic_plan(
             ),
             "exact_source_value_arguments": list(spec.exact_source_value_arguments),
             "pending_value_candidates": pending_value_candidates,
-            "unit_ids": [
-                unit_ids[unit_index]
-                for unit_index, owners in enumerate(unit_owner_indexes)
-                if index in owners
-            ],
+            "turn_pending_value_candidates": action_turn_candidates,
+            "unit_ids": owned_unit_ids,
         })
     unit_records = [
         {
@@ -1088,6 +1213,7 @@ def _freeze_bounded_semantic_plan(
         unit_records=unit_records,
         review_context={
             "pending_question": state.get("pending_question") or {},
+            "turn_pending_value_candidates": turn_pending_value_candidates,
             "workflow_state": workflow_snapshot(state),
             "action_schema": action_schema(),
             "group_schema": group_schema(),
@@ -1097,37 +1223,87 @@ def _freeze_bounded_semantic_plan(
 
 
 def _pending_operation_value_candidates(
+    action: Mapping[str, Any],
     operation_arguments: Mapping[str, Any],
     pending: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
-    """Expose typed operation values without assigning pending ownership."""
+    """Expose only operation values eligible to answer the active contract.
+
+    Candidate eligibility follows declared ownership. A direct pending owner
+    contributes only its declared value argument. Structured configuration and
+    domain mutations contribute only values explicitly named by the active
+    question contract. Metadata and navigation arguments never become
+    pending-answer candidates.
+    """
 
     if pending.get("manual_input_allowed") is not True:
         return []
+    action_type = str(action.get("type") or "")
+    manual = pending.get("manual_action")
+    manual_type = str(manual.get("type") or "") if isinstance(manual, Mapping) else ""
+    manual_argument = (
+        str(manual.get("value_argument") or "")
+        if isinstance(manual, Mapping)
+        else ""
+    )
     output: list[dict[str, Any]] = []
     seen_values: set[str] = set()
-    for argument, value in operation_arguments.items():
-        if str(argument) in {"source_evidence", "reason"}:
-            continue
-        values: list[tuple[tuple[str, ...], Any]] = [((), value)]
-        if isinstance(value, Mapping):
-            values.extend(
-                ((str(key),), nested)
-                for key, nested in value.items()
+    eligible_arguments: list[tuple[str, tuple[str, ...], Any]] = []
+    if action_type == "answer_pending":
+        for argument in ("selected_value", "answer"):
+            if argument in operation_arguments:
+                eligible_arguments.append((argument, (), operation_arguments[argument]))
+    elif manual_type and action_type == manual_type and manual_argument:
+        if manual_argument in operation_arguments:
+            eligible_arguments.append(
+                (manual_argument, (), operation_arguments[manual_argument])
             )
-        for path, candidate in values:
-            if not value_satisfies_pending_contract(candidate, dict(pending)):
+    elif (
+        action_type == "propose_config_values"
+        and str(pending.get("structured_config_key") or "").strip()
+    ):
+        structured_key = str(pending["structured_config_key"]).strip()
+        config_values = operation_arguments.get("config_values")
+        if isinstance(config_values, Mapping):
+            for key, value in config_values.items():
+                if str(key).strip().casefold() == structured_key.casefold():
+                    eligible_arguments.append(
+                        ("config_values", (str(key),), value)
+                    )
+    else:
+        for binding in pending.get("candidate_bindings") or []:
+            if not isinstance(binding, Mapping):
                 continue
-            identity = json.dumps(candidate, ensure_ascii=False, sort_keys=True, default=str)
-            if identity in seen_values:
+            if str(binding.get("type") or "") != action_type:
                 continue
-            seen_values.add(identity)
-            output.append({
-                "candidate_id": f"candidate-{len(output)}",
-                "argument": str(argument),
-                "path": list(path),
-                "value": candidate,
-            })
+            argument = str(binding.get("value_argument") or "")
+            if argument not in operation_arguments:
+                continue
+            value = operation_arguments[argument]
+            mapping_key = str(binding.get("mapping_key") or "")
+            if mapping_key:
+                if not isinstance(value, Mapping) or mapping_key not in value:
+                    continue
+                eligible_arguments.append(
+                    (argument, (mapping_key,), value[mapping_key])
+                )
+            else:
+                eligible_arguments.append((argument, (), value))
+
+    for argument, path, candidate in eligible_arguments:
+        if not value_satisfies_pending_contract(candidate, dict(pending)):
+            continue
+        identity = pending_value_identity(candidate, dict(pending))
+        if not identity or identity in seen_values:
+            continue
+        seen_values.add(identity)
+        output.append({
+            "candidate_id": f"candidate-{len(output)}",
+            "argument": str(argument),
+            "identity": identity,
+            "path": list(path),
+            "value": candidate,
+        })
     return output
 
 
@@ -2713,7 +2889,11 @@ def _action_queue_payload(state: AgentGraphState, text: str) -> dict[str, Any]:
                 "clause_id": clause.clause_id,
                 **candidates,
             })
-    pending_candidates: list[Any] = list(typed_pending_value_candidates(raw, pending))
+    pending_candidates: list[Any] = [
+        value
+        for clause in clauses
+        for value in typed_pending_value_candidates(clause.text, pending)
+    ]
     unique_pending_candidates: list[Any] = []
     seen_pending_candidates: set[str] = set()
     for value in pending_candidates:

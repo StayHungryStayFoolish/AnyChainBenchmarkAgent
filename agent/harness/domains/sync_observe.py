@@ -115,6 +115,10 @@ def question_for_sync_observe(state: AgentGraphState) -> dict[str, Any] | None:
             field="sync_observe_duration_seconds",
             kind="positive_integer",
             validation={"value_type": "positive_integer"},
+            candidate_bindings=({
+                "type": "set_sync_observe_options",
+                "value_argument": "sync_observe_duration_seconds",
+            },),
         )
     return None
 

@@ -485,6 +485,7 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         """
 
         from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.domains.performance import question_for_performance
         from agent.harness.state import new_state
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -512,14 +513,10 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
             initial["qps_profile"] = {"mode": "quick", "confirmed": True}
             initial["observability"] = {"mode": "disabled"}
             initial["active_group"] = "advanced_tuning"
-            initial["pending_question"] = {
-                "id": "advanced_tuning_confirm",
-                "group": "advanced_tuning",
-                "kind": "yes_no",
-                "field": "advanced_tuning_confirmed",
-                "options": [{"label": "Y", "value": True}, {"label": "N", "value": False}],
-                "manual_input_allowed": False,
-            }
+            initial["pending_question"] = question_for_performance(
+                initial,
+                "advanced_tuning",
+            )
             runtime.graph.update_state({"configurable": {"thread_id": "unit-thread"}}, initial)
 
             state = runtime.invoke("N", language="en")
@@ -7336,7 +7333,7 @@ network:
         base["confirmed_config"] = {"BLOCKCHAIN_NODE": "solana"}
 
         rpc_question = _question_for_group(base, "workload_rpc")
-        self.assertEqual(rpc_question["contract_version"], 1)
+        self.assertEqual(rpc_question["contract_version"], 2)
         state = _apply_pending_answer(deepcopy(base), "1", rpc_question)
         self.assertEqual(state["rpc_mode"], "single")
         self.assertEqual(state["pending_question"]["id"], "workload_confirm")
@@ -13789,6 +13786,7 @@ response:
                                 for argument in action.get("required_value_grounding_arguments") or []
                             ],
                             "pending_answer_argument": "",
+                            "turn_candidate_verdicts": [],
                             "reason": "the immutable action preserves both source units",
                         }],
                         "unit_verdicts": [{

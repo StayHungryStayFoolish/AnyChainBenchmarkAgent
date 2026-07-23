@@ -27,6 +27,8 @@ class PendingQuestion(TypedDict, total=False):
     next_on_invalid: str
     manual_input_allowed: bool
     structured_input_owner: bool
+    structured_config_key: str
+    candidate_bindings: list[dict[str, Any]]
     accepted_action_types: list[str]
     manual_action: dict[str, Any]
     requires_capabilities: list[str]
@@ -120,7 +122,7 @@ RESET_PRESERVED_KEYS = (
 
 DEFAULT_GROUP_ORDER = list(GROUP_ORDER)
 
-STATE_SCHEMA_VERSION = 9
+STATE_SCHEMA_VERSION = 10
 
 
 class UnsupportedStateVersion(RuntimeError):
@@ -178,6 +180,7 @@ def migrate_state(
 
     migrate_legacy_catalog(fresh)
     _migrate_legacy_action_queue(fresh)
+    _migrate_pending_question_contract_v10(fresh, raw_version)
     _quarantine_unsupported_pending_actions(fresh)
     fresh["schema_version"] = STATE_SCHEMA_VERSION
     _normalize_mode_exclusive_state(fresh)
@@ -225,45 +228,76 @@ def _migrate_legacy_action_queue(state: AgentGraphState) -> None:
     })
 
 
+def _migrate_pending_question_contract_v10(
+    state: AgentGraphState,
+    raw_version: int,
+) -> None:
+    """Discard pre-v10 prompts so the graph regenerates declared ownership."""
+
+    locations: list[tuple[str, dict[str, Any]]] = []
+    pending = state.get("pending_question")
+    if (
+        raw_version < 10
+        and
+        isinstance(pending, dict)
+        and pending
+        and int(pending.get("contract_version") or 0) == 1
+    ):
+        locations.append(("top_level", pending))
+        state["pending_question"] = {}
+    resume = state.get("resume_context")
+    if isinstance(resume, dict):
+        resumed = resume.get("pending_question")
+        if (
+            raw_version < 10
+            and
+            isinstance(resumed, dict)
+            and resumed
+            and int(resumed.get("contract_version") or 0) == 1
+        ):
+            locations.append(("resume_context", resumed))
+            updated = dict(resume)
+            updated["pending_question"] = {}
+            state["resume_context"] = updated
+    for location, question in locations:
+        state.setdefault("audit_events", []).append({
+            "event": "checkpoint_pending_contract_regeneration_required",
+            "from_schema_version": raw_version,
+            "location": location,
+            "question_id": str(question.get("id") or ""),
+        })
+
+
 def _quarantine_unsupported_pending_actions(state: AgentGraphState) -> None:
-    """Drop persisted questions whose action contracts are no longer executable."""
+    """Drop persisted questions that fail the current complete contract."""
 
-    from .action_registry import ACTION_BY_TYPE
-
-    def unsupported_actions(pending: Any) -> list[str]:
-        if not isinstance(pending, dict) or not pending:
-            return []
-        declared: set[str] = set()
-        manual = pending.get("manual_action")
-        if isinstance(manual, dict):
-            declared.add(str(manual.get("type") or ""))
-        for option in pending.get("options") or []:
-            if not isinstance(option, dict):
-                continue
-            action = option.get("action")
-            if isinstance(action, dict):
-                declared.add(str(action.get("type") or ""))
-        return sorted(
-            action_type
-            for action_type in declared
-            if action_type and action_type not in ACTION_BY_TYPE
-        )
+    from .questions import validate_pending_question_contract
 
     candidates: list[tuple[str, dict[str, Any], str]] = []
     pending = state.get("pending_question")
-    if isinstance(pending, dict):
+    if isinstance(pending, dict) and pending:
         candidates.append(("pending_question", pending, "top_level"))
     resume_context = state.get("resume_context")
     if isinstance(resume_context, dict):
         resumed = resume_context.get("pending_question")
-        if isinstance(resumed, dict):
+        if isinstance(resumed, dict) and resumed:
             candidates.append(("pending_question", resumed, "resume_context"))
     for key, candidate, location in candidates:
-        unsupported = unsupported_actions(candidate)
-        if not unsupported:
+        try:
+            validate_pending_question_contract(candidate)
+        except (TypeError, ValueError) as exc:
+            contract_error = str(exc)
+        else:
             continue
         if location == "top_level":
             state[key] = {}
+            state["checkpoint_recovery"] = {
+                "status": "quarantined",
+                "error_type": "PendingQuestionContractError",
+                "safe_confirmed_config": dict(
+                    state.get("confirmed_config") or {}
+                ),
+            }
         else:
             updated = dict(state.get("resume_context") or {})
             updated[key] = {}
@@ -272,7 +306,7 @@ def _quarantine_unsupported_pending_actions(state: AgentGraphState) -> None:
             "event": "checkpoint_pending_actions_quarantined",
             "location": location,
             "question_id": str(candidate.get("id") or ""),
-            "unsupported_action_types": unsupported,
+            "contract_error": contract_error,
         })
 
 

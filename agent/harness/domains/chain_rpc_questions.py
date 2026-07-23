@@ -591,6 +591,10 @@ def _weights_question(state: AgentGraphState, case: str) -> dict[str, Any]:
         field=question_id,
         validation={"input_mode": "rpc_weights"},
         structured_input_owner=True,
+        candidate_bindings=({
+            "type": "rpc_workload_command",
+            "value_argument": "rpc_weights",
+        },),
     )
 
 

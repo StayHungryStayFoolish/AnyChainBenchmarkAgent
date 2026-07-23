@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Collection, Mapping, Sequence
 
 from ..llm.types import LLMMessage, LLMRequest, ensure_turn_active
+from .input_values import parse_weight_spec
 from .semantic_policy import PENDING_CANDIDATE_SEMANTIC_POLICY
 
 
@@ -30,6 +32,7 @@ _ACTION_VERDICT_KEYS = frozenset({
     "evidence",
     "grounded_arguments",
     "pending_answer_argument",
+    "turn_candidate_verdicts",
     "reason",
 })
 _ACTION_EVIDENCE_KEYS = frozenset({
@@ -41,6 +44,12 @@ _ACTION_EVIDENCE_KEYS = frozenset({
 _GROUNDED_ARGUMENT_KEYS = frozenset({
     "argument_name",
     "evidence_quote",
+})
+_TURN_CANDIDATE_VERDICT_KEYS = frozenset({
+    "candidate_id",
+    "verdict",
+    "evidence_quote",
+    "reason",
 })
 _UNIT_VERDICT_KEYS = frozenset({
     "unit_id",
@@ -64,6 +73,99 @@ def _canonical_json(value: Any) -> str:
 
 def _content_hash(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _quote_supports_pending_candidate(
+    quote: str,
+    candidate: Mapping[str, Any],
+    pending: Mapping[str, Any],
+    source_texts: Sequence[str],
+) -> bool:
+    """Require reviewer evidence to identify the candidate it adjudicates."""
+
+    text = str(quote or "").strip()
+    identity = str(candidate.get("identity") or "")
+    value = candidate.get("value")
+    if not text or not identity:
+        return False
+    exact_source_quote = any(text == source for source in source_texts)
+    if identity.startswith(("rpc_weights:", "json:")):
+        parsed = parse_weight_spec(text)
+        candidate_mapping = (
+            parse_weight_spec(value)
+            if identity.startswith("rpc_weights:")
+            else value
+        )
+        if parsed and _canonical_json(parsed) == _canonical_json(candidate_mapping):
+            return True
+        if not exact_source_quote or not isinstance(candidate_mapping, Mapping):
+            return False
+        collective = "\n".join(source_texts).casefold()
+        collective_mapping = parse_weight_spec(collective)
+        if collective_mapping:
+            return _canonical_json(collective_mapping) == _canonical_json(
+                candidate_mapping
+            )
+        for key, item in candidate_mapping.items():
+            key_sources = [
+                source
+                for source in source_texts
+                if str(key).casefold() in source.casefold()
+            ]
+            if not key_sources:
+                return False
+            numeric_literals = [
+                number
+                for source in key_sources
+                for number in re.findall(r"(?<![\w.])[0-9]+(?:\.[0-9]+)?(?![\w.])", source)
+            ]
+            if numeric_literals and str(item) not in numeric_literals:
+                return False
+        return True
+    if identity.startswith(("integer:", "number:")):
+        literal = identity.split(":", 1)[1]
+        literal_match = bool(
+            re.search(
+                rf"(?<![0-9.]){re.escape(literal)}(?![0-9.])",
+                text,
+            )
+        )
+        if literal_match:
+            return True
+        appears_in_source = any(
+            re.search(
+                rf"(?<![0-9.]){re.escape(literal)}(?![0-9.])",
+                source,
+            )
+            for source in source_texts
+        )
+        return exact_source_quote and not appears_in_source
+    candidate_literals: list[str] = []
+    if identity.startswith(("scalar:", "enum:")):
+        candidate_literals.append(str(value))
+    if identity.startswith("option:"):
+        for option in pending.get("options") or []:
+            if not isinstance(option, Mapping) or option.get("value") != value:
+                continue
+            candidate_literals.extend(
+                str(option.get(key) or "")
+                for key in ("id", "label", "value")
+            )
+    for literal in candidate_literals:
+        token = literal.strip()
+        if token and re.search(
+            rf"(?<![\w]){re.escape(token)}(?![\w])",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            return True
+    appears_in_source = any(
+        literal.strip().casefold() in source.casefold()
+        for literal in candidate_literals
+        for source in source_texts
+        if literal.strip()
+    )
+    return exact_source_quote and not appears_in_source
 
 
 def _strict_json_object(text: str) -> dict[str, Any]:
@@ -217,17 +319,17 @@ def whole_plan_admission_prompt(semantic_policy: str) -> str:
         "Judge only the supplied immutable ids, actions, registry purposes, source units, pending contract, and workflow state. "
         "Return exactly one JSON object with exactly these keys: plan_hash, action_verdicts, unit_verdicts, reason. "
         "Echo plan_hash exactly. Return exactly one action_verdict for every supplied action_id and exactly one unit_verdict for every supplied unit_id; never add an id. "
-        "Each action_verdict is {action_id,verdict:'admit'|'reject',unit_ids:[string],evidence:[{unit_id,quote,relation:'direct'|'support',support_relation:string}],grounded_arguments:[{argument_name:string,evidence_quote:string}],pending_answer_argument:string,reason}. "
+        "Each action_verdict is {action_id,verdict:'admit'|'reject',unit_ids:[string],evidence:[{unit_id,quote,relation:'direct'|'support',support_relation:string}],grounded_arguments:[{argument_name:string,evidence_quote:string}],pending_answer_argument:string,turn_candidate_verdicts:[{candidate_id:string,verdict:'selected'|'not_selected',evidence_quote:string,reason:string}],reason}. "
         "unit_ids must exactly equal that action's supplied immutable unit_ids. An admitted action needs one evidence row for every unit_id, every quote must be a non-empty exact substring of that unit, at least one relation must be direct, and a support row may use only one supplied allowed_support_relation. Direct rows use an empty support_relation. "
         "grounded_arguments must contain exactly one row for every supplied required_value_grounding_argument and no other row. argument_name is the exact required_value_grounding_argument name copied verbatim, never an explanation or value. Its evidence_quote must be a non-empty exact substring of one owned source unit that semantically selects the exact immutable operation_arguments value. Merely naming the argument or dimension, asking to change it without selecting a value, stating a generic benchmark goal, or relying on workflow state does not ground a concrete value. Natural-language equivalents may ground a value only when they unambiguously select that exact value. Actions with no required value-grounding arguments return an empty list. "
-        "pending_answer_argument is empty unless the supplied active pending question allows manual input and exactly one supplied pending_value_candidate semantically answers that question. When it does, set pending_answer_argument to that candidate's exact candidate_id. A syntax-compatible value for an unrelated interruption is not an answer. A candidate mentioned only as an example, quotation, rejected option, negated operation, correction target, or value the user says not to apply is not an answer. Never invent a candidate id or rewrite the action. "
+        "pending_answer_argument is empty unless the supplied active pending question allows manual input and exactly one supplied pending_value_candidate semantically answers that question. When it does, set pending_answer_argument to that candidate's exact candidate_id. Each action record also supplies turn_pending_value_candidates scoped to source units owned by that action. For every action with non-empty pending_value_candidates return exactly one turn_candidate_verdict for every supplied turn candidate in supplied order; actions with no pending_value_candidates return an empty list. Each evidence_quote must be a non-empty exact substring of one candidate source unit. For a parser-derived literal it contains the literal; for a semantically normalized number, map, or enum it must be the exact phrase that selects that canonical value. Each reason must explain the source role rather than repeat the verdict. Exactly one row may be selected, and it must have the same contract-owned identity as the immutable operation value selected by pending_answer_argument; every other row is not_selected. Evaluate the selected operation against the complete scoped set, not only its operation argument. When two or more candidates exist, admit one only when the source explicitly distinguishes it as selected and distinguishes every other value as rejected, old, example-only, or otherwise not selected. A comparison, conjunction, disjunction, slash-separated list, or bare sequence is unresolved and must reject the pending answer rather than arbitrarily labeling one selected. A syntax-compatible value for an unrelated interruption is not an answer. A candidate mentioned only as an example, quotation, rejected option, negated operation, correction target, or value the user says not to apply is not an answer. Never invent a candidate id or rewrite the action. "
         "Each unit_verdict is {unit_id,verdict:'complete'|'support'|'context'|'unresolved'|'omitted',owner_action_ids:[string],evidence_quote:string,omitted_action_type:string,reason}. "
         "owner_action_ids must exactly equal the supplied immutable owner_action_ids. complete is valid only when the unit directly expresses a present demand preserved by every registered owner action. support is valid only when the unit does not independently request another action, every owner action cites it with relation=support and a supplied allowed_support_relation, and each owner action has direct evidence in another unit. context is valid only for a supplied context unit with no present demand and no owner. unresolved means the request is genuinely unsafe or not expressible. omitted means the unit contains a present independently actionable demand expressible by one action_schema type but missing from the immutable actions; set omitted_action_type to that exact registered type. Never propose its arguments or a replacement action. For every other verdict omitted_action_type is empty. Every evidence_quote is a non-empty exact substring of that unit. "
         "The action evidence and unit verdict are one consistency contract, not independent guesses. For each owned unit: if every owner action cites that unit as direct, its unit verdict is complete; if every owner action cites it as support, its unit verdict is support. Never return complete for a support-cited unit or support for a direct-cited unit. "
         "A mapped action may be individually plausible while its unit still has an omitted demand. Questions, corrections, navigation, configuration, evidence analysis, execution approval, and pending answers are all present demands when explicitly requested. Workflow state and planner reasons are context, never user evidence. "
         "A pending option or manual answer is admitted only when current source evidence satisfies the supplied typed pending contract. "
         + PENDING_CANDIDATE_SEMANTIC_POLICY
-        + "A registered group or field owner is admitted only when its declared purpose and exact target preserve the source demand. Structured syntax facts are authoritative only after the immutable compiler assigned that structured unit to the corresponding registered owner, or after a clarification-only compiler unit exposed the same exact atomic clause as a provisional candidate for this independent review; examples, negations, consultations, or logs do not become configuration merely because they contain assignments. "
+        + "A registered group or field owner is admitted only when its declared purpose and exact target preserve the source demand. Structured syntax facts are authoritative only after the immutable compiler assigned that structured unit to the corresponding registered owner, or after a clarification-only compiler unit exposed the same exact atomic clause as a typed candidate for this independent review; examples, negations, consultations, or logs do not become configuration merely because they contain assignments. "
         "A pending-answer owner covers only the answer to the question that existed at turn start. If its owned unit also states any independently actionable value, evidence, mutation, consultation, or navigation for a later step, the unit is complete only when the immutable plan includes every corresponding registered owner action; otherwise return omitted for that unit. Never treat creation of a later typed question as preservation of an explicit value already present in the current source. "
         "Malformed ids, missing rows, duplicate rows, invented quotes, an unsupported support relation, or uncertainty must fail closed. "
         + semantic_policy
@@ -399,6 +501,136 @@ def validate_whole_plan_admission(
         ):
             errors.append(
                 f"whole-plan admitted pending answer lacks one explicit typed candidate selection: {action_id}"
+            )
+        raw_turn_verdicts = row.get("turn_candidate_verdicts")
+        turn_verdicts = (
+            list(raw_turn_verdicts)
+            if isinstance(raw_turn_verdicts, list)
+            else []
+        )
+        if not isinstance(raw_turn_verdicts, list):
+            errors.append(
+                f"whole-plan turn_candidate_verdicts is not a list: {action_id}"
+            )
+        turn_candidates = [
+            dict(value)
+            for value in record.get("turn_pending_value_candidates") or []
+            if isinstance(value, Mapping)
+            and str(value.get("candidate_id") or "")
+        ]
+        expected_turn_ids = [
+            str(value["candidate_id"])
+            for value in turn_candidates
+        ]
+        requires_turn_verdicts = bool(pending_candidates and turn_candidates)
+        review_context = plan.request_payload().get("review_context")
+        pending_question = (
+            review_context.get("pending_question")
+            if isinstance(review_context, Mapping)
+            and isinstance(review_context.get("pending_question"), Mapping)
+            else {}
+        )
+        actual_turn_ids: list[str] = []
+        selected_turn_identities: list[str] = []
+        for raw_turn_verdict in turn_verdicts:
+            if not isinstance(raw_turn_verdict, dict):
+                errors.append(
+                    f"whole-plan turn candidate verdict is not an object: {action_id}"
+                )
+                continue
+            turn_row = dict(raw_turn_verdict)
+            if set(turn_row) != _TURN_CANDIDATE_VERDICT_KEYS:
+                errors.append(
+                    f"whole-plan turn candidate verdict has missing or undeclared keys: {action_id}"
+                )
+            candidate_id = str(turn_row.get("candidate_id") or "")
+            actual_turn_ids.append(candidate_id)
+            candidate = next(
+                (
+                    value
+                    for value in turn_candidates
+                    if str(value["candidate_id"]) == candidate_id
+                ),
+                None,
+            )
+            candidate_verdict = str(turn_row.get("verdict") or "")
+            if candidate_verdict not in {"selected", "not_selected"}:
+                errors.append(
+                    f"whole-plan turn candidate verdict is invalid: {action_id}/{candidate_id}"
+                )
+            evidence_quote = str(turn_row.get("evidence_quote") or "")
+            candidate_value = candidate.get("value") if candidate is not None else None
+            candidate_source_units = (
+                [
+                    str(value)
+                    for value in candidate.get("source_unit_ids") or []
+                ]
+                if candidate is not None
+                else []
+            )
+            candidate_source_texts = [
+                str(
+                    (unit_records.get(unit_id) or {}).get("source_text")
+                    or ""
+                )
+                for unit_id in candidate_source_units
+            ]
+            if (
+                candidate is None
+                or not evidence_quote
+                or not candidate_source_units
+                or any(unit_id not in expected_units for unit_id in candidate_source_units)
+                or not any(
+                    evidence_quote
+                    in str(
+                        (unit_records.get(unit_id) or {}).get("source_text")
+                        or ""
+                    )
+                    for unit_id in candidate_source_units
+                )
+                or not _quote_supports_pending_candidate(
+                    evidence_quote,
+                    candidate,
+                    pending_question,
+                    candidate_source_texts,
+                )
+            ):
+                errors.append(
+                    f"whole-plan turn candidate evidence is not exact: {action_id}/{candidate_id}"
+                )
+            if not str(turn_row.get("reason") or "").strip():
+                errors.append(
+                    f"whole-plan turn candidate verdict has no reason: {action_id}/{candidate_id}"
+                )
+            if candidate_verdict == "selected" and candidate is not None:
+                selected_turn_identities.append(str(candidate.get("identity") or ""))
+        if requires_turn_verdicts:
+            if actual_turn_ids != expected_turn_ids:
+                errors.append(
+                    f"whole-plan turn candidate order or cardinality mismatch: {action_id}"
+                )
+            selected_operation_identity = next(
+                (
+                    str(value.get("identity") or "")
+                    for value in record.get("pending_value_candidates") or []
+                    if isinstance(value, Mapping)
+                    and str(value.get("candidate_id") or "") == pending_argument
+                ),
+                None,
+            )
+            if (
+                verdict == "admit"
+                and (
+                    len(selected_turn_identities) != 1
+                    or selected_turn_identities[0] != selected_operation_identity
+                )
+            ):
+                errors.append(
+                    f"whole-plan admitted pending answer lacks one matching turn candidate: {action_id}"
+                )
+        elif turn_verdicts:
+            errors.append(
+                f"whole-plan non-pending action declares turn candidate verdicts: {action_id}"
             )
         seen_evidence: set[str] = set()
         direct_count = 0
@@ -574,18 +806,6 @@ def _canonicalize_admission_receipts(
             if isinstance(record.get("action"), Mapping)
             else {}
         )
-        candidates = [
-            item
-            for item in record.get("pending_value_candidates") or []
-            if isinstance(item, Mapping) and str(item.get("candidate_id") or "")
-        ]
-        if (
-            str(immutable_action.get("type") or "") == "answer_pending"
-            and not str(raw_row.get("pending_answer_argument") or "")
-            and len(candidates) == 1
-        ):
-            raw_row["pending_answer_argument"] = str(candidates[0]["candidate_id"])
-
         evidence_rows = [
             item
             for item in raw_row.get("evidence") or []

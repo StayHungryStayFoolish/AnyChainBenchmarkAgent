@@ -1273,6 +1273,77 @@ ACTION_ARGUMENT_SCHEMAS: dict[str, Mapping[str, Any]] = {
     "workload_scope": {"type": "string", "enum": ["single_replace", "mixed_replace", "mixed_add"]},
 }
 
+CANDIDATE_BINDING_SCHEMAS: dict[str, Mapping[str, Mapping[str, Any]]] = {
+    "rpc_workload_command": {
+        "rpc_weights": {
+            "mapping_mode": "whole_value",
+        },
+    },
+    "set_qps_override": {
+        "qps_overrides": {
+            "mapping_mode": "required_key",
+            "mapping_keys": ("INITIAL_QPS", "MAX_QPS", "QPS_STEP", "DURATION"),
+        },
+    },
+    "set_sync_observe_options": {
+        "sync_observe_duration_seconds": {
+            "mapping_mode": "scalar",
+        },
+    },
+}
+
+
+def validate_candidate_binding_contract(raw: Mapping[str, Any]) -> dict[str, str]:
+    """Validate one question-to-action candidate binding against the registry."""
+
+    binding = {
+        "type": str(raw.get("type") or "").strip(),
+        "value_argument": str(raw.get("value_argument") or "").strip(),
+    }
+    mapping_key = str(raw.get("mapping_key") or "").strip()
+    action_type = binding["type"]
+    value_argument = binding["value_argument"]
+    spec = ACTION_BY_TYPE.get(action_type)
+    if spec is None:
+        raise ValueError(
+            f"unknown candidate binding action type: {action_type or '<missing>'}"
+        )
+    if not value_argument or value_argument not in spec.allowed_arguments:
+        raise ValueError(
+            f"candidate binding {action_type} requires an allowed value_argument"
+        )
+    binding_schema = (
+        CANDIDATE_BINDING_SCHEMAS.get(action_type, {}).get(value_argument)
+    )
+    if binding_schema is None:
+        raise ValueError(
+            f"candidate binding {action_type}.{value_argument} is not "
+            "registered as a business value"
+        )
+    mapping_mode = str(binding_schema.get("mapping_mode") or "")
+    if mapping_mode == "required_key":
+        allowed_keys = {
+            str(value) for value in binding_schema.get("mapping_keys") or ()
+        }
+        if not mapping_key:
+            raise ValueError(
+                f"candidate binding {action_type}.{value_argument} "
+                "requires mapping_key"
+            )
+        if mapping_key not in allowed_keys:
+            raise ValueError(
+                f"candidate binding {action_type}.{value_argument} has "
+                f"invalid mapping_key: {mapping_key}"
+            )
+    elif mapping_key:
+        raise ValueError(
+            f"candidate binding {action_type}.{value_argument} "
+            "cannot declare mapping_key"
+        )
+    if mapping_key:
+        binding["mapping_key"] = mapping_key
+    return binding
+
 
 def compile_legacy_custom_rpc_action(raw: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Compile the retired omnibus action into ordered catalog/workload commands."""

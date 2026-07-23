@@ -171,19 +171,35 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
 
     def test_harness_snapshot_and_reset_support_terminal_resume_gate(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.state import new_state
 
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime = AnyChainGraphRuntime(thread_id="resume-contract", checkpoint_path=Path(tmpdir) / "checkpoint.sqlite")
-            runtime._persist_state(
-                {
-                    "target_mode": "fake-node",
-                    "workflow_mode": "rpc_benchmark",
-                    "chain_identity": {"canonical": "bsc", "status": "confirmed"},
-                    "confirmed_config": {"CLOUD_REGION": "asia-east1"},
-                    "pending_question": {"id": "CLOUD_ZONE", "group": "provider_deployment", "kind": "manual_value", "prompt": "Confirm CLOUD_ZONE."},
-                    "active_group": "provider_deployment",
-                }
-            )
+            persisted = new_state("resume-contract")
+            persisted.update({
+                "target_mode": "fake-node",
+                "workflow_mode": "rpc_benchmark",
+                "chain_identity": {"canonical": "bsc", "status": "confirmed"},
+                "confirmed_config": {"CLOUD_REGION": "asia-east1"},
+                "pending_question": {
+                    "contract_version": 2,
+                    "id": "CLOUD_ZONE",
+                    "group": "provider_deployment",
+                    "kind": "manual_value",
+                    "prompt": "Confirm CLOUD_ZONE.",
+                    "field": "CLOUD_ZONE",
+                    "manual_input_allowed": True,
+                    "manual_action": {
+                        "type": "answer_pending",
+                        "value_argument": "answer",
+                    },
+                    "accepted_action_types": ["answer_pending"],
+                    "options": [],
+                    "validation": {"value_type": "scalar_token"},
+                },
+                "active_group": "provider_deployment",
+            })
+            runtime._persist_state(persisted)
 
             snapshot = runtime.snapshot()
             self.assertEqual(snapshot["target_mode"], "fake-node")
@@ -260,20 +276,20 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
 
     def test_terminal_resume_modify_installs_group_selector_and_keeps_confirmed_config(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.state import new_state
 
         with tempfile.TemporaryDirectory() as tmpdir:
             checkpoint = Path(tmpdir) / "checkpoint.sqlite"
             runtime = AnyChainGraphRuntime(thread_id="resume-modify", checkpoint_path=checkpoint)
-            runtime._persist_state(
-                {
-                    "target_mode": "fake-node",
-                    "workflow_mode": "rpc_benchmark",
-                    "chain_identity": {"canonical": "bsc", "status": "confirmed"},
-                    "confirmed_config": {"CLOUD_REGION": "asia-east1"},
-                    "pending_question": {"id": "CLOUD_ZONE", "group": "provider_deployment", "kind": "manual_value", "prompt": "Confirm CLOUD_ZONE."},
-                    "active_group": "provider_deployment",
-                }
-            )
+            persisted = new_state("resume-modify")
+            persisted.update({
+                "target_mode": "fake-node",
+                "workflow_mode": "rpc_benchmark",
+                "chain_identity": {"canonical": "bsc", "status": "confirmed"},
+                "confirmed_config": {"CLOUD_REGION": "asia-east1"},
+                "active_group": "provider_deployment",
+            })
+            runtime._persist_state(persisted)
             runtime.prepare_resume_offer(language="en")
             runtime.invoke("2", language="en")
 
@@ -290,11 +306,13 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
 
     def test_terminal_resume_continue_restores_exact_pending_contract(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.state import new_state
 
         with tempfile.TemporaryDirectory() as tmpdir:
             checkpoint = Path(tmpdir) / "checkpoint.sqlite"
             runtime = AnyChainGraphRuntime(thread_id="resume-continue", checkpoint_path=checkpoint)
             original = {
+                "contract_version": 2,
                 "id": "unknown_chain_identity_confirm",
                 "group": "chain_identity",
                 "kind": "numbered_choice",
@@ -315,15 +333,15 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
                 ],
                 "accepted_action_types": ["answer_pending"],
             }
-            runtime._persist_state(
-                {
-                    "target_mode": "fake-node",
-                    "workflow_mode": "rpc_benchmark",
-                    "chain_identity": {"raw": "Flow", "canonical": "flow", "status": "needs_identity_confirmation"},
-                    "pending_question": original,
-                    "active_group": "chain_identity",
-                }
-            )
+            persisted = new_state("resume-continue")
+            persisted.update({
+                "target_mode": "fake-node",
+                "workflow_mode": "rpc_benchmark",
+                "chain_identity": {"raw": "Flow", "canonical": "flow", "status": "needs_identity_confirmation"},
+                "pending_question": original,
+                "active_group": "chain_identity",
+            })
+            runtime._persist_state(persisted)
             runtime.prepare_resume_offer(language="en")
             state = runtime.invoke("1", language="en")
 
@@ -336,6 +354,8 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
     def test_terminal_resume_continue_never_restores_retired_pending_action(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
         from agent.harness.action_registry import ACTION_BY_TYPE
+        from agent.harness.domains.orientation import resume_question
+        from agent.harness.state import new_state
 
         with tempfile.TemporaryDirectory() as tmpdir:
             checkpoint = Path(tmpdir) / "checkpoint.sqlite"
@@ -343,46 +363,32 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
                 thread_id="resume-retired-pending",
                 checkpoint_path=checkpoint,
             )
-            runtime._persist_state(
-                {
-                    "target_mode": "fake-node",
-                    "workflow_mode": "rpc_benchmark",
-                    "chain_identity": {
-                        "canonical": "bsc",
-                        "status": "confirmed",
-                    },
-                    "active_group": "opening",
+            persisted = new_state("resume-retired-pending")
+            persisted.update({
+                "target_mode": "fake-node",
+                "workflow_mode": "rpc_benchmark",
+                "chain_identity": {
+                    "canonical": "bsc",
+                    "status": "confirmed",
+                },
+                "active_group": "opening",
+                "resume_context": {
+                    "active_group": "workload_rpc",
                     "pending_question": {
-                        "id": "resume_harness_session",
-                        "group": "opening",
+                        "contract_version": 1,
+                        "id": "legacy-custom-rpc-choice",
+                        "group": "workload_rpc",
                         "kind": "numbered_choice",
-                        "field": "resume_harness_session",
-                        "manual_input_allowed": False,
                         "options": [{
                             "id": "1",
-                            "label": "Continue",
-                            "value": "continue",
-                            "action": {
-                                "type": "answer_pending",
-                                "answer": "continue",
-                            },
+                            "value": "custom_rpc",
+                            "action": {"type": "start_custom_rpc"},
                         }],
                     },
-                    "resume_context": {
-                        "active_group": "workload_rpc",
-                        "pending_question": {
-                            "id": "legacy-custom-rpc-choice",
-                            "group": "workload_rpc",
-                            "kind": "numbered_choice",
-                            "options": [{
-                                "id": "1",
-                                "value": "custom_rpc",
-                                "action": {"type": "start_custom_rpc"},
-                            }],
-                        },
-                    },
-                }
-            )
+                },
+            })
+            persisted["pending_question"] = resume_question(persisted)
+            runtime._persist_state(persisted)
             state = runtime.invoke("1", language="en")
 
         self.assertNotEqual(
@@ -396,11 +402,13 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
 
     def test_terminal_resume_continue_preserves_deferred_action_queue(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.state import new_state
 
         with tempfile.TemporaryDirectory() as tmpdir:
             checkpoint = Path(tmpdir) / "checkpoint.sqlite"
             runtime = AnyChainGraphRuntime(thread_id="resume-queue", checkpoint_path=checkpoint)
             original = {
+                "contract_version": 2,
                 "id": "custom_rpc_method",
                 "group": "endpoint_process",
                 "kind": "manual_value",
@@ -409,24 +417,33 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
                 "manual_input_allowed": True,
                 "queue_barrier": True,
                 "resume_action_queue": True,
+                "manual_action": {
+                    "type": "answer_pending",
+                    "value_argument": "answer",
+                },
+                "accepted_action_types": ["answer_pending"],
+                "options": [],
+                "validation": {"value_type": "scalar_token"},
             }
-            runtime._persist_state(
-                {
-                    "target_mode": "fake-node",
-                    "workflow_mode": "rpc_benchmark",
-                    "chain_identity": {"canonical": "bsc", "status": "confirmed"},
-                    "pending_question": original,
-                    "active_group": "endpoint_process",
-                    "action_queue": [
-                        {
-                            "action_id": "obs-deferred",
-                            "type": "set_observability",
-                            "observability_mode": "disabled",
-                            "confidence": "high",
-                        }
-                    ],
-                }
-            )
+            persisted = new_state("resume-queue")
+            persisted.update({
+                "target_mode": "fake-node",
+                "workflow_mode": "rpc_benchmark",
+                "chain_identity": {"canonical": "bsc", "status": "confirmed"},
+                "pending_question": original,
+                "active_group": "endpoint_process",
+                "action_queue": [
+                    {
+                        "action_id": "obs-deferred",
+                        "type": "set_observability",
+                        "observability_mode": "disabled",
+                        "mutation_explicit": True,
+                        "source_evidence": "Disable observability.",
+                        "confidence": "high",
+                    }
+                ],
+            })
+            runtime._persist_state(persisted)
             runtime.prepare_resume_offer(language="en")
             state = runtime.invoke("1", language="en")
 

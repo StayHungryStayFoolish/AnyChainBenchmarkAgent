@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import json
 import re
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from agent.knowledge.chain_identity import canonicalize_chain_scalar, repo_chain_names
-from .action_registry import ACTION_BY_TYPE
+from .action_registry import (
+    ACTION_BY_TYPE,
+    validate_candidate_binding_contract,
+)
 from .contracts import ActionProposal, OptionContract, QuestionContract
 from .input_values import (
     extract_rpc_method_token_candidates,
@@ -60,6 +64,99 @@ def _manual_owner_contract(
     return declared
 
 
+def _candidate_binding_contract(
+    *,
+    manual_input_allowed: bool,
+    candidate_bindings: tuple[dict[str, Any], ...],
+) -> list[dict[str, Any]]:
+    """Validate declarative domain-action sources for pending candidates."""
+
+    if candidate_bindings and not manual_input_allowed:
+        raise ValueError("candidate_bindings require manual_input_allowed")
+    declared: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for raw in candidate_bindings:
+        binding = validate_candidate_binding_contract(raw)
+        action_type = binding["type"]
+        value_argument = binding["value_argument"]
+        mapping_key = binding.get("mapping_key", "")
+        identity = (action_type, value_argument, mapping_key)
+        if identity in seen:
+            raise ValueError(f"duplicate candidate binding: {identity}")
+        seen.add(identity)
+        declared.append(binding)
+    return declared
+
+
+def validate_pending_question_contract(question: dict[str, Any]) -> dict[str, Any]:
+    """Validate one complete pending-question contract at every trust boundary."""
+
+    if int(question.get("contract_version") or 0) != 2:
+        raise ValueError("pending question requires contract_version 2")
+    candidate_bindings = tuple(
+        dict(value)
+        for value in question.get("candidate_bindings") or []
+        if isinstance(value, dict)
+    )
+    if len(candidate_bindings) != len(question.get("candidate_bindings") or []):
+        raise ValueError("candidate_bindings must contain only objects")
+    declared_bindings = _candidate_binding_contract(
+        manual_input_allowed=question.get("manual_input_allowed") is True,
+        candidate_bindings=candidate_bindings,
+    )
+    manual = question.get("manual_action")
+    declared_manual = _manual_owner_contract(
+        manual_input_allowed=question.get("manual_input_allowed") is True,
+        manual_action=dict(manual) if isinstance(manual, dict) else None,
+    )
+    structured_key = str(question.get("structured_config_key") or "").strip()
+    if structured_key and question.get("manual_input_allowed") is not True:
+        raise ValueError("structured_config_key requires manual_input_allowed")
+    declared_types = {
+        "answer_pending",
+        *(str(value.get("type") or "") for value in declared_bindings),
+        *(
+            [str(declared_manual.get("type") or "")]
+            if declared_manual
+            else []
+        ),
+        *(["propose_config_values"] if structured_key else []),
+    }
+    for option in question.get("options") or []:
+        if not isinstance(option, dict):
+            raise ValueError("question options must contain only objects")
+        action = option.get("action")
+        if isinstance(action, dict):
+            declared_types.add(str(action.get("type") or ""))
+    accepted = {
+        str(value)
+        for value in question.get("accepted_action_types") or []
+        if str(value)
+    }
+    unknown = sorted(
+        action_type
+        for action_type in accepted | declared_types
+        if action_type and action_type not in ACTION_BY_TYPE
+    )
+    if unknown:
+        raise ValueError(
+            "question contract declares unknown action types: "
+            + ", ".join(unknown)
+        )
+    missing = sorted(declared_types - accepted - {""})
+    if missing:
+        raise ValueError(
+            "question contract omits accepted action types: "
+            + ", ".join(missing)
+        )
+    normalized = dict(question)
+    if declared_bindings:
+        normalized["candidate_bindings"] = declared_bindings
+    if declared_manual:
+        normalized["manual_action"] = declared_manual
+    return normalized
+
+
 def manual_question(
     group: str,
     question_id: str,
@@ -77,6 +174,8 @@ def manual_question(
     evidence_path: str = "",
     rejection_evidence_value: Any = None,
     structured_input_owner: bool = False,
+    structured_config_key: str = "",
+    candidate_bindings: tuple[dict[str, Any], ...] = (),
 ) -> dict[str, Any]:
     field_validation = _question_validation(kind, validation)
     declared_manual_action = _manual_owner_contract(
@@ -84,8 +183,16 @@ def manual_question(
         manual_action=manual_action,
     )
     declared_action_type = str(declared_manual_action.get("type") or "").strip()
-    return {
-        "contract_version": 1,
+    declared_bindings = _candidate_binding_contract(
+        manual_input_allowed=True,
+        candidate_bindings=candidate_bindings,
+    )
+    declared_binding_types = {
+        str(binding["type"]) for binding in declared_bindings
+    }
+    structured_key = str(structured_config_key or "").strip()
+    return validate_pending_question_contract({
+        "contract_version": 2,
         "id": question_id,
         "group": group,
         "kind": kind,
@@ -93,11 +200,15 @@ def manual_question(
         "field": field,
         "manual_input_allowed": True,
         **({"structured_input_owner": True} if structured_input_owner else {}),
+        **({"structured_config_key": structured_key} if structured_key else {}),
+        **({"candidate_bindings": declared_bindings} if declared_bindings else {}),
         "options": [],
         "accepted_action_types": sorted({
             "answer_pending",
             *accepted_action_types,
             *([declared_action_type] if declared_action_type else []),
+            *declared_binding_types,
+            *(["propose_config_values"] if structured_key else []),
         }),
         **({"manual_action": declared_manual_action} if declared_manual_action else {}),
         "queue_barrier": queue_barrier,
@@ -111,7 +222,7 @@ def manual_question(
             if rejection_evidence_value is not None
             else {}
         ),
-    }
+    })
 
 
 def choice_question(
@@ -132,12 +243,24 @@ def choice_question(
     completion_effect: str = "",
     evidence_path: str = "",
     rejection_evidence_value: Any = None,
+    structured_config_key: str = "",
+    candidate_bindings: tuple[dict[str, Any], ...] = (),
 ) -> dict[str, Any]:
     declared_manual_action = _manual_owner_contract(
         manual_input_allowed=manual_input_allowed,
         manual_action=manual_action,
     )
     declared_action_type = str(declared_manual_action.get("type") or "").strip()
+    declared_bindings = _candidate_binding_contract(
+        manual_input_allowed=manual_input_allowed,
+        candidate_bindings=candidate_bindings,
+    )
+    declared_binding_types = {
+        str(binding["type"]) for binding in declared_bindings
+    }
+    structured_key = str(structured_config_key or "").strip()
+    if structured_key and not manual_input_allowed:
+        raise ValueError("structured_config_key requires manual_input_allowed")
     contracts: list[OptionContract] = []
     rendered: list[dict[str, Any]] = []
     for index, raw in enumerate(options, start=1):
@@ -203,20 +326,24 @@ def choice_question(
         manual_input_allowed=manual_input_allowed,
         requires_capabilities=requires_capabilities,
     )
-    return {
-        "contract_version": 1,
+    return validate_pending_question_contract({
+        "contract_version": 2,
         "id": question_id,
         "group": group,
         "kind": kind,
         "prompt": prompt,
         "field": field,
         "manual_input_allowed": manual_input_allowed,
+        **({"structured_config_key": structured_key} if structured_key else {}),
+        **({"candidate_bindings": declared_bindings} if declared_bindings else {}),
         "options": rendered,
         "accepted_action_types": sorted(
             {
                 "answer_pending",
                 *accepted_action_types,
                 *([declared_action_type] if declared_action_type else []),
+                *declared_binding_types,
+                *(["propose_config_values"] if structured_key else []),
                 *(str(option["action"].get("type") or "") for option in rendered),
             }
             - {""}
@@ -233,7 +360,7 @@ def choice_question(
             if rejection_evidence_value is not None
             else {}
         ),
-    }
+    })
 
 
 def exact_answer(text: str, question: dict[str, Any]) -> tuple[bool, Any]:
@@ -370,6 +497,52 @@ def value_satisfies_pending_contract(value: Any, question: dict[str, Any]) -> bo
     return answer_fits_pending(raw, question)
 
 
+def pending_value_identity(value: Any, question: dict[str, Any]) -> str:
+    """Return one contract-owned identity for an already valid value."""
+
+    if not value_satisfies_pending_contract(value, question):
+        return ""
+    for option in question.get("options") or []:
+        if isinstance(option, dict) and option.get("value") == value:
+            return "option:" + json.dumps(
+                option.get("value"),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+    validation = dict(question.get("validation") or {})
+    value_type = str(validation.get("value_type") or "")
+    raw = _strip_scalar(str(value))
+    if value_type == "positive_integer":
+        return f"integer:{int(raw)}"
+    if value_type == "positive_number":
+        try:
+            number = Decimal(raw).normalize()
+        except InvalidOperation:
+            return ""
+        return f"number:{format(number, 'f')}"
+    if value_type == "enum":
+        return f"enum:{raw.casefold()}"
+    if value_type == "json":
+        parsed = value if isinstance(value, (dict, list)) else json.loads(raw)
+        return "json:" + json.dumps(
+            parsed,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    if str(validation.get("input_mode") or "") == "rpc_weights":
+        parsed = parse_weight_spec(value)
+        return "rpc_weights:" + json.dumps(
+            parsed,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    return f"scalar:{raw}"
+
+
 def typed_pending_value_candidates(
     text: str,
     question: dict[str, Any],
@@ -399,6 +572,9 @@ def typed_pending_value_candidates(
         ))
     if str(validation.get("value_type") or "") == "evidence_contribution":
         return (str(text or "").strip(),) if has_rpc_wire_evidence(text) else ()
+    literal = _strip_scalar(text)
+    if literal_matches_validation(literal, validation):
+        return (literal,)
     return ()
 
 
