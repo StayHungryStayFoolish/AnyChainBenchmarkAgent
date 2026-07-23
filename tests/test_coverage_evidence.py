@@ -264,6 +264,7 @@ class CoverageEvidenceTest(unittest.TestCase):
             "edge_key": "@action_only/execution::::variant::action_only_transition::approve",
             "contract_hash": "execution-contract",
             "contract_variant_hash": "execution-variant",
+            "action_type": "approve_preflight_smoke",
             "evidence": {
                 "real_execution": {
                     "required": True,
@@ -275,16 +276,40 @@ class CoverageEvidenceTest(unittest.TestCase):
             job_dir = Path(tmpdir) / "job-1"
             job_dir.mkdir()
             job_file = job_dir / "job.json"
+            plan_file = job_dir / "plan.json"
             log_file = job_dir / "benchmark.log"
+            summary_file = job_dir / "summary.json"
+            performance_file = job_dir / "performance.csv"
+            html_file = job_dir / "report.html"
+            proxy_file = job_dir / "proxy.csv"
+            vegeta_file = job_dir / "vegeta.json"
             job_file.write_text('{"job_id":"job-1","status":"completed"}\n', encoding="utf-8")
+            plan_file.write_text(json.dumps({
+                "workflow_type": "rpc_benchmark",
+                "execution": {
+                    "command": ["./blockchain_node_benchmark.sh", "--quick", "--single"],
+                },
+                "execution_provenance": {
+                    "scenario_id": "rpc_real_node_smoke",
+                    "operation": "real_node_smoke",
+                },
+            }), encoding="utf-8")
             log_file.write_text("benchmark completed\n", encoding="utf-8")
-            hashed = {"path": str(job_file), "sha256": hashlib.sha256(job_file.read_bytes()).hexdigest()}
+            for path in (summary_file, performance_file, html_file, proxy_file, vegeta_file):
+                path.write_text("evidence\n", encoding="utf-8")
+            hashed = [
+                {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                for path in (job_file, plan_file)
+            ]
             log = {"path": str(log_file), "sha256": hashlib.sha256(log_file.read_bytes()).hexdigest()}
             artifact = build_real_execution_evidence_artifact(
                 edge=edge,
                 revision=self.revision,
+                scenario_id="rpc_real_node_smoke",
                 operation_kind="preflight_smoke",
                 request={
+                    "scenario_id": "rpc_real_node_smoke",
+                    "service_operation": "real_node_smoke",
                     "approved_plan_id": "plan-1",
                     "LOCAL_RPC_URL": (
                         "https://rpc.example/abcdefghijklmnopqrstuvwxyz123456"
@@ -293,9 +318,18 @@ class CoverageEvidenceTest(unittest.TestCase):
                 result={
                     "status": "completed",
                     "Authorization": "Bearer abcdefghijklmnopqrstuvwxyz123456",
+                    "observed_job": {
+                        "artifacts": {
+                            "summary_json": str(summary_file),
+                            "performance_csv": str(performance_file),
+                            "html_report": str(html_file),
+                            "proxy_method_csv": str(proxy_file),
+                            "vegeta_json": str(vegeta_file),
+                        },
+                    },
                 },
                 job_id="job-1",
-                job_artifacts=(hashed,),
+                job_artifacts=hashed,
                 log_artifacts=(log,),
             )
             serialized = json.dumps(artifact, ensure_ascii=False)
@@ -322,6 +356,7 @@ class CoverageEvidenceTest(unittest.TestCase):
             "edge_key": "@action_only/execution::::variant::action_only_transition::approve",
             "contract_hash": "execution-contract",
             "contract_variant_hash": "execution-variant",
+            "action_type": "approve_preflight_smoke",
             "evidence": {"real_execution": {"required": True, "applicability_reason": "side effect"}},
         }
         missing = {"path": "/tmp/job-forged/job.json", "sha256": "b" * 64}
@@ -329,6 +364,7 @@ class CoverageEvidenceTest(unittest.TestCase):
             build_real_execution_evidence_artifact(
                 edge=edge,
                 revision=self.revision,
+                scenario_id="rpc_real_node_smoke",
                 operation_kind="preflight_smoke",
                 request={"approved_plan_id": "plan-1"},
                 result={"status": "completed"},

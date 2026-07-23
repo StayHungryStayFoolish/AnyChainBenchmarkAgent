@@ -24,6 +24,7 @@ from agent.runners.application_service import (
     ExecutionRequest,
 )
 from agent.runners.job_manager import get_job
+from agent.runners.execution_scenarios import EXECUTION_SCENARIOS
 from tests.agent_live.coverage_evidence import (
     build_real_execution_evidence_artifact,
     validate_real_execution_evidence_artifact,
@@ -32,10 +33,7 @@ from tests.agent_live.coverage_evidence import (
 from tests.agent_live.generate_harness_coverage_ledger import build_ledger
 
 TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "partial", "cancelled"})
-EXECUTION_CASES = (
-    ("approve_preflight_smoke", "preflight_smoke", ExecutionOperation.REAL_NODE_SMOKE),
-    ("approve_final_benchmark", "final_benchmark", ExecutionOperation.FINAL_BENCHMARK),
-)
+OPERATION_BY_VALUE = {operation.value: operation for operation in ExecutionOperation}
 
 
 def _sha256(path: Path) -> str:
@@ -98,15 +96,17 @@ def _edge_by_action(ledger: Mapping[str, Any], action_type: str) -> Mapping[str,
 
 def execute_required_edges(
     *,
-    plan_file: Path,
+    rpc_plan_file: Path,
+    sync_plan_file: Path,
     jobs_dir: Path,
     evidence_dir: Path,
     timeout_seconds: float,
 ) -> list[Path]:
     if not sys.platform.startswith("linux"):
         raise RuntimeError("real execution evidence is supported only on Linux")
-    if not plan_file.is_file():
-        raise FileNotFoundError(f"approved plan not found: {plan_file}")
+    for plan_file in (rpc_plan_file, sync_plan_file):
+        if not plan_file.is_file():
+            raise FileNotFoundError(f"approved plan not found: {plan_file}")
     if jobs_dir.exists() and any(jobs_dir.iterdir()):
         raise RuntimeError(f"real execution jobs directory must be fresh: {jobs_dir}")
     jobs_dir.mkdir(parents=True, exist_ok=True)
@@ -114,10 +114,13 @@ def execute_required_edges(
     ledger = build_ledger(revision=revision)
     service = BenchmarkExecutionService()
     written: list[Path] = []
-    plan_hash = _sha256(plan_file)
-
-    for action_type, operation_kind, service_operation in EXECUTION_CASES:
-        edge = _edge_by_action(ledger, action_type)
+    for scenario in EXECUTION_SCENARIOS:
+        if not scenario.real_evidence_required:
+            continue
+        plan_file = sync_plan_file if scenario.workflow_type == "sync_observe" else rpc_plan_file
+        plan_hash = _sha256(plan_file)
+        service_operation = OPERATION_BY_VALUE[scenario.operation]
+        edge = _edge_by_action(ledger, scenario.action_type)
         started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         request = ExecutionRequest(
             operation=service_operation,
@@ -141,7 +144,8 @@ def execute_required_edges(
             )
         job_artifacts, log_artifacts = _job_evidence_files(final_job)
         request_payload = {
-            "action_type": action_type,
+            "action_type": scenario.action_type,
+            "scenario_id": scenario.scenario_id,
             "service_operation": service_operation.value,
             "approved": True,
             "approved_plan_file": str(plan_file.resolve()),
@@ -152,7 +156,8 @@ def execute_required_edges(
         artifact = build_real_execution_evidence_artifact(
             edge=edge,
             revision=revision,
-            operation_kind=operation_kind,
+            scenario_id=scenario.scenario_id,
+            operation_kind=scenario.operation_kind,
             request=request_payload,
             result=result_payload,
             job_id=job_id,
@@ -174,7 +179,8 @@ def execute_required_edges(
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--plan", required=True, type=Path)
+    parser.add_argument("--rpc-plan", required=True, type=Path)
+    parser.add_argument("--sync-plan", required=True, type=Path)
     parser.add_argument("--jobs-dir", required=True, type=Path)
     parser.add_argument("--evidence-dir", required=True, type=Path)
     parser.add_argument("--timeout", type=float, default=300.0)
@@ -184,7 +190,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     paths = execute_required_edges(
-        plan_file=args.plan.resolve(),
+        rpc_plan_file=args.rpc_plan.resolve(),
+        sync_plan_file=args.sync_plan.resolve(),
         jobs_dir=args.jobs_dir.resolve(),
         evidence_dir=args.evidence_dir.resolve(),
         timeout_seconds=args.timeout,

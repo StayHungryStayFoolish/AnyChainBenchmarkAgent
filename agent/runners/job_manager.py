@@ -390,6 +390,15 @@ def _discover_completed_artifacts(plan: dict[str, Any], env: dict[str, str]) -> 
     html = _latest_file(root / "reports", "performance_report_*.html")
     if html:
         artifacts["html_report"] = str(html)
+    html_en = _latest_file(root / "reports", "performance_report_en_*.html")
+    if html_en:
+        artifacts["html_report_en"] = str(html_en)
+    html_zh = _latest_file(root / "reports", "performance_report_zh_*.html")
+    if html_zh:
+        artifacts["html_report_zh"] = str(html_zh)
+    sync_timeline = root / "reports" / "sync_execution_timeline.png"
+    if sync_timeline.is_file():
+        artifacts["sync_timeline_chart"] = str(sync_timeline)
     performance = _latest_file(root / "logs", "performance_*.csv")
     if performance:
         artifacts["performance_csv"] = str(performance)

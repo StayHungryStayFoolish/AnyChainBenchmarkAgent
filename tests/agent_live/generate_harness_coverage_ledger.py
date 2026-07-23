@@ -34,6 +34,7 @@ from tests.agent_live.harness_contract_scenarios import (
     question_scenarios,
 )
 from agent.harness.domains.environment import CONFIG_PROPOSAL_FIELDS
+from agent.runners.execution_scenarios import scenarios_for_action
 
 
 EVIDENCE_CLASSES = (
@@ -43,7 +44,7 @@ EVIDENCE_CLASSES = (
     "dynamic_dual_ai",
     "real_execution",
 )
-LEDGER_SCHEMA_VERSION = 7
+LEDGER_SCHEMA_VERSION = 8
 EVIDENCE_STATUSES = (
     "not_run",
     "passed",
@@ -100,7 +101,7 @@ RUNNER_CONTRACTS = {
     "real_execution": {
         "status": "implemented",
         "producer": "tests/agent_live/execute_real_execution_ledger.py",
-        "artifact_schema": "real_execution_evidence.v1",
+        "artifact_schema": "real_execution_evidence.v3",
         "gap": "",
     },
 }
@@ -238,7 +239,7 @@ def _evidence(edge: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     for evidence_class in EVIDENCE_CLASSES:
         required, reason = evidence_applicability(edge, evidence_class)
-        result[evidence_class] = {
+        lane = {
             "required": required,
             "applicability_reason": reason,
             "status": "passed" if evidence_class == "catalog" else (
@@ -246,6 +247,13 @@ def _evidence(edge: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
             ),
             "evidence_ids": [],
         }
+        if evidence_class == "real_execution" and required:
+            lane["required_scenario_ids"] = [
+                spec.scenario_id
+                for spec in scenarios_for_action(str(edge.get("action_type") or ""))
+            ]
+            lane["scenario_evidence"] = {}
+        result[evidence_class] = lane
     return result
 
 
@@ -491,6 +499,45 @@ def _merge_existing_evidence(
             if status == "not_applicable":
                 continue
             references = [str(item) for item in old.get("evidence_ids") or []]
+            if evidence_class == "real_execution":
+                lane = edge["evidence"][evidence_class]
+                required_scenarios = set(lane.get("required_scenario_ids") or ())
+                for reference in references:
+                    artifact, _reason = load_valid_evidence_reference(
+                        reference,
+                        edge=edge,
+                        revision=revision,
+                    )
+                    if not artifact or artifact.get("evidence_class") != evidence_class:
+                        continue
+                    scenario_id = str(artifact.get("scenario_id") or "")
+                    if scenario_id not in required_scenarios:
+                        continue
+                    outcome = str(artifact.get("outcome") or "")
+                    scenario_lane = lane["scenario_evidence"].setdefault(
+                        scenario_id,
+                        {"status": "not_run", "evidence_ids": []},
+                    )
+                    scenario_lane["status"] = outcome
+                    scenario_lane["evidence_ids"].append(reference)
+                    lane["evidence_ids"].append(reference)
+                observed = {
+                    scenario: str((lane["scenario_evidence"].get(scenario) or {}).get("status") or "not_run")
+                    for scenario in required_scenarios
+                }
+                lane["status"] = (
+                    "failed" if "failed" in observed.values()
+                    else "externally_blocked" if "externally_blocked" in observed.values()
+                    else "passed" if observed and all(value == "passed" for value in observed.values())
+                    else "not_run"
+                )
+                lane["evidence_ids"] = sorted(set(lane["evidence_ids"]))
+                for scenario_lane in lane["scenario_evidence"].values():
+                    scenario_lane["evidence_ids"] = sorted(set(scenario_lane["evidence_ids"]))
+                edge[LEGACY_EVIDENCE_FIELDS[evidence_class]] = (
+                    lane["evidence_ids"][-1] if lane["evidence_ids"] else ""
+                )
+                continue
             valid_references: list[str] = []
             for reference in references:
                 artifact, _reason = load_valid_evidence_reference(
@@ -651,11 +698,41 @@ def ingest_evidence_artifacts(
 
     for edge, evidence_class, outcome, reference in validated:
         lane = edge["evidence"][evidence_class]
-        lane["status"] = outcome
         lane["evidence_ids"] = sorted(set([
             *(str(item) for item in lane.get("evidence_ids") or ()),
             reference,
         ]))
+        if evidence_class == "real_execution":
+            raw = json.loads(Path(reference).read_text(encoding="utf-8"))
+            scenario_id = str(raw.get("scenario_id") or "")
+            required_scenarios = set(lane.get("required_scenario_ids") or ())
+            if scenario_id not in required_scenarios:
+                raise ValueError(
+                    f"real execution scenario is not required for {edge.get('edge_key')}: "
+                    f"{scenario_id or '<empty>'}"
+                )
+            scenario_evidence = lane.setdefault("scenario_evidence", {})
+            scenario_lane = scenario_evidence.setdefault(
+                scenario_id,
+                {"status": "not_run", "evidence_ids": []},
+            )
+            scenario_lane["status"] = outcome
+            scenario_lane["evidence_ids"] = sorted(set([
+                *(str(item) for item in scenario_lane.get("evidence_ids") or ()),
+                reference,
+            ]))
+            observed = {
+                scenario: str((scenario_evidence.get(scenario) or {}).get("status") or "not_run")
+                for scenario in required_scenarios
+            }
+            lane["status"] = (
+                "failed" if "failed" in observed.values()
+                else "externally_blocked" if "externally_blocked" in observed.values()
+                else "passed" if observed and all(value == "passed" for value in observed.values())
+                else "not_run"
+            )
+        else:
+            lane["status"] = outcome
         edge[LEGACY_EVIDENCE_FIELDS[evidence_class]] = lane["evidence_ids"][-1]
     return refresh_ledger_status(candidate)
 
@@ -668,14 +745,36 @@ def _execution_closure(
         edge for edge in edges
         if bool((edge.get("evidence") or {}).get(evidence_class, {}).get("required"))
     ]
-    counts = {
-        status: sum(
-            str((edge.get("evidence") or {}).get(evidence_class, {}).get("status") or "not_run")
-            == status
+    if evidence_class == "real_execution":
+        statuses = [
+            str(
+                (
+                    ((edge.get("evidence") or {}).get(evidence_class, {}).get("scenario_evidence") or {})
+                    .get(scenario_id, {})
+                    .get("status")
+                    or "not_run"
+                )
+            )
             for edge in required
-        )
-        for status in ("passed", "failed", "not_run", "externally_blocked")
-    }
+            for scenario_id in (
+                (edge.get("evidence") or {}).get(evidence_class, {}).get("required_scenario_ids") or ()
+            )
+        ]
+        denominator = len(statuses)
+        counts = {
+            status: sum(value == status for value in statuses)
+            for status in ("passed", "failed", "not_run", "externally_blocked")
+        }
+    else:
+        denominator = len(required)
+        counts = {
+            status: sum(
+                str((edge.get("evidence") or {}).get(evidence_class, {}).get("status") or "not_run")
+                == status
+                for edge in required
+            )
+            for status in ("passed", "failed", "not_run", "externally_blocked")
+        }
     if counts["failed"]:
         status = "failed"
     elif counts["not_run"] or counts["externally_blocked"]:
@@ -683,7 +782,7 @@ def _execution_closure(
     else:
         status = "complete"
     return {
-        "required_denominator": len(required),
+        "required_denominator": denominator,
         "observed_pass": counts["passed"],
         "observed_fail": counts["failed"],
         "not_run": counts["not_run"],

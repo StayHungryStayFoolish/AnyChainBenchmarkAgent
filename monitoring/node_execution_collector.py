@@ -42,6 +42,7 @@ NODE_CPU_HEADER = [
 ]
 
 DIRECT_MGAS_METRICS = [
+    "chain_mgasps",
     "chain_insert_mgasps",
     "reth_consensus_engine_beacon_block_insert_mgasps",
     "nethermind_mgas_per_sec",
@@ -71,7 +72,9 @@ def _fmt(value: Optional[float], digits: int = 2) -> str:
 
 
 def _metric_value(metrics_text: str, metric_name: str) -> Optional[float]:
-    pattern = re.compile(rf"^{re.escape(metric_name)}(?:\{{[^}}]*\}})?\s+([-+0-9.eE]+)\s*$")
+    pattern = re.compile(
+        rf"^{re.escape(metric_name)}\s*(?:\{{[^}}]*\}})?\s+([-+0-9.eE]+)\s*$"
+    )
     for line in metrics_text.splitlines():
         if not line or line.startswith("#"):
             continue

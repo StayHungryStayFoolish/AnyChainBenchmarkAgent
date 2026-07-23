@@ -83,7 +83,10 @@ flowchart TD
 
 该路径需要确认 chain/sync-health 行为、资源元数据、节点进程身份和停止条件。
 `NODE_PROMETHEUS_METRICS_URL` 是可选项；如果客户端没有暴露 MGas/s 或 gas-used
-指标，报告会展示 `execution_metric_status`，并根据源指标将 MGas/s 标为不可用或 0。
+指标，报告会展示 `execution_metric_status=unavailable`。只有当
+`execution_metric_status=available` 且 `execution_metric_source` 明确指出客户端
+指标时，数值 0 才表示真实观测值；否则不得把 0 解释为真实吞吐。框架支持 Geth 的
+`chain_mgasps` summary。
 
 Sync-observe 不录制 fake-node fixtures。节点可能先下载 peer snapshot，然后从
 snapshot 高度继续追块；框架通过 endpoint/sync-health 真实性校验观察这个行为，

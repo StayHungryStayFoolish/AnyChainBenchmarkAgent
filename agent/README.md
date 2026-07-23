@@ -231,6 +231,11 @@ Docker/Linux. It proves runtime wiring and artifacts, not mainnet catch-up
 performance or meaningful MGas/s. Host-only runs and fake-node-only runs do not
 qualify as full workflow coverage.
 
+The execution application boundary resolves every side-effecting request
+through `runners/execution_scenarios.py`. RPC smoke, RPC final benchmark, and
+bounded sync-observe are distinct scenarios with strict workflow, command,
+artifact, and evidence contracts; they are not interchangeable aliases.
+
 ## CLI Tools For Automation
 
 `python3 -m agent.cli` exposes JSON commands for CI and enterprise Agent

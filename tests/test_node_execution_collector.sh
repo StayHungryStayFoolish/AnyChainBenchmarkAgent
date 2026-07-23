@@ -25,6 +25,15 @@ PROM
 execution_data="$(NODE_PROMETHEUS_METRICS_URL="file://$TMP_DIR/metrics.prom" python3 "$COLLECTOR" --execution-data)"
 [[ "$execution_data" == "12.50,12500000.00,chain_insert_mgasps,available" ]]
 
+cat > "$TMP_DIR/geth.prom" <<'EOF'
+# TYPE chain_mgasps summary
+chain_mgasps_count 42
+chain_mgasps {quantile="0.5"} 7.25
+chain_mgasps {quantile="0.95"} 9.50
+EOF
+execution_data="$(NODE_PROMETHEUS_METRICS_URL="file://$TMP_DIR/geth.prom" python3 "$COLLECTOR" --execution-data)"
+[[ "$execution_data" == "7.25,7250000.00,chain_mgasps,available" ]]
+
 cat > "$TMP_DIR/gas.prom" <<'PROM'
 reth_sync_execution_gas_per_second 42000000
 PROM

@@ -123,6 +123,10 @@ from acting like a keyword bot:
 - smoke tests are isolated from final benchmark job artifacts;
 - real-node benchmark jobs require preflight, isolated smoke success, and a
   separate final approval; repeated approvals are idempotent;
+- side-effecting execution is typed by the authoritative
+  `agent/runners/execution_scenarios.py` registry. An operation/workflow
+  mismatch fails closed; the runtime never rewrites a requested operation
+  based on plan contents;
 - analysis must cite generated evidence paths.
 
 ## Accuracy Boundaries
@@ -220,6 +224,13 @@ The workflow confirms:
 
 It must not ask for RPC mode, custom RPC workload, mixed weights, Vegeta, or
 QPS profile unless the user explicitly switches to an RPC benchmark.
+
+Product execution evidence is counted by scenario, not only by the visible
+approval action. The required real scenarios are isolated RPC real-node smoke,
+final RPC real-node benchmark, and bounded sync-observe. A bounded
+sync-observe proof must contain observed performance/sync CSV rows, both
+localized HTML reports, and the sync timeline chart; it must not contain
+Vegeta or proxy workload artifacts.
 
 ## Development Gates
 

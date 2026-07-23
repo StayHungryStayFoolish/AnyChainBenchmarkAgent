@@ -21,6 +21,7 @@ from tests.agent_live.generate_harness_coverage_ledger import (
     contract_variant_hash,
     derive_overall_status,
     execution_exit_code,
+    ingest_evidence_artifacts,
 )
 from tests.agent_live.chaos_scheduler import build_chaos_schedule
 from tests.agent_live.coverage_evidence import build_evidence_artifact, write_evidence_artifact
@@ -365,9 +366,121 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
             contract["producer"],
             "tests/agent_live/execute_real_execution_ledger.py",
         )
-        self.assertEqual(contract["artifact_schema"], "real_execution_evidence.v1")
+        self.assertEqual(contract["artifact_schema"], "real_execution_evidence.v3")
         self.assertEqual(contract["gap"], "")
         self.assertEqual(self.ledger["runner_contracts"]["real_execution"], contract)
+
+    def test_real_execution_closure_is_counted_by_scenario(self) -> None:
+        closure = self.ledger["summary"]["execution_closure"]["real_execution"]
+        self.assertEqual(closure["required_denominator"], 3)
+        self.assertEqual(closure["not_run"], 3)
+        lanes = {
+            edge["action_type"]: edge["evidence"]["real_execution"]
+            for edge in self.ledger["edges"]
+            if edge["evidence"]["real_execution"]["required"]
+        }
+        self.assertEqual(
+            lanes["approve_preflight_smoke"]["required_scenario_ids"],
+            ["rpc_real_node_smoke", "sync_observe_bounded"],
+        )
+        self.assertEqual(
+            lanes["approve_final_benchmark"]["required_scenario_ids"],
+            ["rpc_real_node_final"],
+        )
+
+    def test_partial_real_execution_scenario_does_not_complete_action_lane(self) -> None:
+        ledger = build_ledger(revision=self.revision)
+        edge = next(
+            item
+            for item in ledger["edges"]
+            if item["action_type"] == "approve_preflight_smoke"
+            and item["evidence"]["real_execution"]["required"]
+        )
+        with TemporaryDirectory() as tmpdir:
+            artifact_path = Path(tmpdir) / "rpc-smoke.json"
+            artifact = {
+                "edge_key": edge["edge_key"],
+                "evidence_class": "real_execution",
+                "scenario_id": "rpc_real_node_smoke",
+                "outcome": "passed",
+            }
+            artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+            with patch(
+                "tests.agent_live.generate_harness_coverage_ledger.load_valid_evidence_reference",
+                return_value=(artifact, ""),
+            ):
+                updated = ingest_evidence_artifacts(ledger, [artifact_path])
+
+        updated_edge = next(
+            item for item in updated["edges"]
+            if item["edge_key"] == edge["edge_key"]
+        )
+        lane = updated_edge["evidence"]["real_execution"]
+        self.assertEqual(lane["status"], "not_run")
+        self.assertEqual(
+            lane["scenario_evidence"]["rpc_real_node_smoke"]["status"],
+            "passed",
+        )
+        self.assertNotIn("sync_observe_bounded", lane["scenario_evidence"])
+        closure = updated["summary"]["execution_closure"]["real_execution"]
+        self.assertEqual(closure["observed_pass"], 1)
+        self.assertEqual(closure["not_run"], 2)
+
+    def test_rebuild_preserves_each_valid_real_execution_scenario(self) -> None:
+        ledger = build_ledger(revision=self.revision)
+        edge = next(
+            item
+            for item in ledger["edges"]
+            if item["action_type"] == "approve_preflight_smoke"
+            and item["evidence"]["real_execution"]["required"]
+        )
+        references = {
+            "rpc_real_node_smoke": "/tmp/rpc-real-node-smoke.json",
+            "sync_observe_bounded": "/tmp/sync-observe-bounded.json",
+        }
+        old_edge = deepcopy(edge)
+        old_edge["evidence"]["real_execution"].update({
+            "status": "passed",
+            "evidence_ids": list(references.values()),
+        })
+
+        def load_reference(reference: str, **_kwargs: object) -> tuple[dict[str, str], str]:
+            scenario_id = next(
+                scenario
+                for scenario, expected_reference in references.items()
+                if reference == expected_reference
+            )
+            return {
+                "evidence_class": "real_execution",
+                "scenario_id": scenario_id,
+                "outcome": "passed",
+            }, ""
+
+        with patch(
+            "tests.agent_live.generate_harness_coverage_ledger.load_valid_evidence_reference",
+            side_effect=load_reference,
+        ):
+            rebuilt = build_ledger(
+                {"schema_version": LEDGER_SCHEMA_VERSION, "edges": [old_edge]},
+                revision=self.revision,
+            )
+
+        restored = next(
+            item for item in rebuilt["edges"]
+            if item["edge_key"] == edge["edge_key"]
+        )
+        lane = restored["evidence"]["real_execution"]
+        self.assertEqual(lane["status"], "passed")
+        self.assertEqual(
+            {
+                scenario: evidence["status"]
+                for scenario, evidence in lane["scenario_evidence"].items()
+            },
+            {
+                "rpc_real_node_smoke": "passed",
+                "sync_observe_bounded": "passed",
+            },
+        )
 
     def test_semantic_coordinator_actions_have_only_matching_runtime_seeds(self) -> None:
         expected = {

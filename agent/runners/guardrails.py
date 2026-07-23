@@ -8,6 +8,8 @@ import shutil
 import subprocess
 from typing import Any
 
+from agent.runners.execution_scenarios import scenario_by_id, workflow_type_from_plan
+
 
 ALLOWED_BENCHMARK_COMMANDS = {
     "./blockchain_node_benchmark.sh",
@@ -69,6 +71,26 @@ def validate_execution_plan(plan: dict[str, Any], approved: bool = False) -> lis
 
     if "dependency_install" in plan.get("approval_checkpoints", []) and not approved:
         errors.append("dependency_install approval is required")
+
+    provenance = plan.get("execution_provenance")
+    if isinstance(provenance, dict) and provenance.get("operation"):
+        try:
+            scenario = scenario_by_id(str(provenance.get("scenario_id") or ""))
+        except ValueError as exc:
+            errors.append(str(exc))
+        else:
+            operation = str(provenance.get("operation") or "")
+            workflow = workflow_type_from_plan(plan)
+            if operation != scenario.operation:
+                errors.append("execution provenance operation does not match its scenario")
+            if workflow != scenario.workflow_type:
+                errors.append("execution workflow does not match its scenario")
+            for token in scenario.required_command_tokens:
+                if token not in command:
+                    errors.append(f"execution command is missing required token: {token}")
+            for token in scenario.forbidden_command_tokens:
+                if token in command:
+                    errors.append(f"execution command contains forbidden token: {token}")
 
     return errors
 

@@ -23,6 +23,7 @@ from agent.runners.benchmark_pipeline import (
     submit_benchmark_job,
 )
 from agent.runners.job_manager import DEFAULT_JOBS_DIR, submit_job
+from agent.runners.execution_scenarios import scenario_for_operation
 
 
 class ExecutionOperation(str, Enum):
@@ -174,7 +175,7 @@ class BenchmarkExecutionService:
 
             approved_plan_file = self._require_plan_file(request)
             plan = self._load_approved_submission_plan(request, approved_plan_file)
-            operation = self._effective_submission_operation(operation, plan)
+            scenario = scenario_for_operation(operation.value, plan)
             spec = EXECUTION_OPERATION_SPECS[operation]
             idempotency_key = self._idempotency_key(
                 approved_plan_file,
@@ -186,6 +187,7 @@ class BenchmarkExecutionService:
                 approved_plan_file,
                 plan,
                 operation=operation,
+                scenario_id=scenario.scenario_id,
                 idempotency_key=idempotency_key,
                 runtime_override_sources=request.runtime_override_sources,
             )
@@ -284,16 +286,6 @@ class BenchmarkExecutionService:
         return path
 
     @staticmethod
-    def _effective_submission_operation(
-        operation: ExecutionOperation,
-        plan: Mapping[str, Any],
-    ) -> ExecutionOperation:
-        if operation is not ExecutionOperation.FINAL_BENCHMARK:
-            return operation
-        workflow = str(plan.get("workflow_type") or (plan.get("request") or {}).get("workflow_type") or "")
-        return ExecutionOperation.SYNC_OBSERVE if workflow == "sync_observe" else operation
-
-    @staticmethod
     def _idempotency_key(
         plan_file: Path,
         plan: Mapping[str, Any],
@@ -315,6 +307,7 @@ class BenchmarkExecutionService:
         plan: Mapping[str, Any],
         *,
         operation: ExecutionOperation,
+        scenario_id: str,
         idempotency_key: str,
         runtime_override_sources: tuple[str, ...],
     ) -> dict[str, Any]:
@@ -343,6 +336,7 @@ class BenchmarkExecutionService:
             "approved_plan_file": source_file,
             "approved_plan_sha256": source_sha256,
             "operation": operation.value,
+            "scenario_id": scenario_id,
             "runtime_overrides": overrides,
         }
         return execution_plan

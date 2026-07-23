@@ -282,6 +282,61 @@ class BenchmarkPipelineTest(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertTrue(result["passed"])
 
+    def test_sync_observe_result_requires_observed_metrics_without_rpc_artifacts(self) -> None:
+        from agent.runners.result_status import classify_benchmark_result
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            performance = root / "performance.csv"
+            performance.write_text(
+                "timestamp,cpu_usage,mem_usage,net_total_mbps,local_block_height,"
+                "sync_status,execution_mgas_per_sec,execution_metric_source,"
+                "execution_metric_status,current_qps,qps_data_available,"
+                "data_vda_total_iops,data_vda_avg_await\n"
+                "1,10,20,1,100,syncing,0,chain_mgasps,available,0,false,3,0.5\n"
+                "2,11,21,2,101,syncing,0,chain_mgasps,available,0,false,4,0.6\n",
+                encoding="utf-8",
+            )
+            report = root / "report.html"
+            report_en = root / "report_en.html"
+            report_zh = root / "report_zh.html"
+            chart = root / "sync_execution_timeline.png"
+            summary = root / "test_summary.json"
+            health = root / "block_height.csv"
+            report.write_text("<html>sync observe</html>", encoding="utf-8")
+            report_en.write_text("<html>sync observe</html>", encoding="utf-8")
+            report_zh.write_text("<html>sync observe</html>", encoding="utf-8")
+            chart.write_bytes(b"png")
+            summary.write_text("{}", encoding="utf-8")
+            health.write_text("timestamp,local_block_height\n1,100\n", encoding="utf-8")
+            artifacts = {
+                "summary_json": str(summary),
+                "performance_csv": str(performance),
+                "html_report": str(report),
+                "html_report_en": str(report_en),
+                "html_report_zh": str(report_zh),
+                "sync_timeline_chart": str(chart),
+                "sync_health_csv": str(health),
+            }
+            complete = classify_benchmark_result(
+                {"workflow_type": "sync_observe"},
+                0,
+                artifacts,
+            )
+            vegeta = root / "vegeta.json"
+            vegeta.write_text("{}", encoding="utf-8")
+            contaminated = classify_benchmark_result(
+                {"workflow_type": "sync_observe"},
+                0,
+                {**artifacts, "vegeta_json": str(vegeta)},
+            )
+
+        self.assertEqual(complete["status"], "completed")
+        self.assertEqual(contaminated["status"], "partial")
+        self.assertTrue(
+            any("forbidden artifact" in item for item in contaminated["artifact_failures"])
+        )
+
     def test_execution_approval_survives_preflight_result_merge(self) -> None:
         from unittest.mock import patch
 

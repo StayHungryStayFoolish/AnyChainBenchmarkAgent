@@ -119,6 +119,9 @@ flowchart LR
 - smoke 测试与最终 benchmark job 产物相互隔离；
 - real-node 最终 benchmark 必须经过 preflight、隔离 smoke 成功和独立最终审批；
   重复审批必须幂等；
+- 有副作用的执行由唯一的 `agent/runners/execution_scenarios.py` registry 定义。
+  operation 与 workflow 不匹配时必须 fail closed；runtime 不得根据 plan 内容静默
+  改写调用方请求的 operation；
 - 分析结论必须引用生成的证据路径。
 
 ## 准确性边界
@@ -208,6 +211,12 @@ sync-observe workflow。
 
 除非用户明确切换回 RPC benchmark，否则该 workflow 不应询问 RPC mode、自定义 RPC
 workload、mixed weights、Vegeta 或 QPS profile。
+
+产品执行证据按 execution scenario 计数，不能只按用户可见的审批 action 计数。
+必需的真实场景包括隔离 RPC real-node smoke、最终 RPC real-node benchmark 和
+bounded sync-observe。bounded sync-observe 证据必须包含真实观测的 performance/sync
+CSV、中英文 HTML 报告和 sync timeline 图，且不得包含 Vegeta 或 proxy workload
+产物。
 
 ## 开发门禁
 

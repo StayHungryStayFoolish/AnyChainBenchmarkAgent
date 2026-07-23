@@ -20,6 +20,14 @@ out="$(get_qps_runtime_fields "$status_file" "$vegeta_dir")"
     exit 1
 }
 
+QPS_STATUS_MODE=sync_observe
+out="$(get_qps_runtime_fields "$status_file" "$vegeta_dir")"
+unset QPS_STATUS_MODE
+[[ "$out" == "0,0.0,false" ]] || {
+    echo "sync-observe output mismatch: $out"
+    exit 1
+}
+
 echo "running qps:42" > "$status_file"
 out="$(get_qps_runtime_fields "$status_file" "$vegeta_dir")"
 [[ "$out" == "42,0.0,true" ]] || {

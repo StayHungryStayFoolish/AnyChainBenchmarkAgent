@@ -135,7 +135,7 @@ class BenchmarkExecutionServiceTests(unittest.TestCase):
             self.assertEqual(len(list((root / "jobs").glob("job_*/plan.json"))), 1)
             self.assertFalse((root / "jobs" / "execution_copies").exists())
 
-    def test_final_request_for_sync_plan_is_typed_as_sync_observe(self) -> None:
+    def test_final_request_for_sync_plan_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             plan_file = Path(tmpdir) / "sync.json"
             plan_file.write_text(
@@ -158,8 +158,48 @@ class BenchmarkExecutionServiceTests(unittest.TestCase):
                     )
                 )
 
-        self.assertEqual(result.operation, ExecutionOperation.SYNC_OBSERVE)
-        self.assertTrue(result.idempotency_key.startswith("sync_observe:"))
+        self.assertEqual(result.operation, ExecutionOperation.FINAL_BENCHMARK)
+        self.assertFalse(result.succeeded)
+        self.assertEqual(result.failure.code, ExecutionFailureCode.INVALID_REQUEST)
+        self.assertIn("does not own workflow sync_observe", result.failure.message)
+
+    def test_sync_request_for_rpc_plan_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plan_file = Path(tmpdir) / "rpc.json"
+            plan_file.write_text(
+                json.dumps({"plan_id": "rpc", "workflow_type": "rpc_benchmark", "execution": {}}),
+                encoding="utf-8",
+            )
+            result = self.service.execute(
+                ExecutionRequest(
+                    operation=ExecutionOperation.SYNC_OBSERVE,
+                    plan_file=plan_file,
+                    approved=True,
+                )
+            )
+
+        self.assertFalse(result.succeeded)
+        self.assertEqual(result.failure.code, ExecutionFailureCode.INVALID_REQUEST)
+        self.assertIn("does not own workflow rpc_benchmark", result.failure.message)
+
+    def test_real_node_smoke_rejects_sync_observe_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            plan_file = Path(tmpdir) / "sync.json"
+            plan_file.write_text(
+                json.dumps({"plan_id": "sync", "workflow_type": "sync_observe", "execution": {}}),
+                encoding="utf-8",
+            )
+            result = self.service.execute(
+                ExecutionRequest(
+                    operation=ExecutionOperation.REAL_NODE_SMOKE,
+                    plan_file=plan_file,
+                    approved=True,
+                )
+            )
+
+        self.assertFalse(result.succeeded)
+        self.assertEqual(result.failure.code, ExecutionFailureCode.INVALID_REQUEST)
+        self.assertIn("does not own workflow sync_observe", result.failure.message)
 
     def test_backend_exception_is_returned_as_typed_failure(self) -> None:
         with patch("agent.runners.application_service.prepare_benchmark_run", side_effect=RuntimeError("boom")):

@@ -23,6 +23,7 @@ from ..planners.strategy_planner import write_json
 from .job_manager import submit_job as _submit_job
 from .runbook import render_runbook as _render_runbook
 from .tool_result import tool_result as _tool_result
+from .execution_scenarios import RPC_BENCHMARK_WORKFLOW, workflow_type_from_plan
 
 
 def prepare_benchmark_run(
@@ -784,6 +785,8 @@ def _real_node_smoke_plan(
     import json
 
     plan = dict(plan) if plan is not None else dict(json.loads(plan_file.read_text(encoding="utf-8")))
+    if workflow_type_from_plan(plan) != RPC_BENCHMARK_WORKFLOW:
+        raise ValueError("real-node smoke only accepts an rpc_benchmark plan")
     if not smoke_root.is_absolute():
         smoke_root = Path(__file__).resolve().parents[2] / smoke_root
     smoke_output_root = (smoke_root / "benchmark-data").resolve()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+import csv
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -12,12 +13,13 @@ from typing import Any, Iterable, Mapping
 
 from agent.harness.coverage_events import state_diff_between
 from agent.harness.runtime_identity import repository_revision
+from agent.runners.execution_scenarios import scenario_by_id, workflow_type_from_plan
 from agent.utils.redaction import redact
 
 
 ARTIFACT_SCHEMA_VERSION = 4
 CLI_ARTIFACT_SCHEMA_VERSION = 6
-REAL_EXECUTION_ARTIFACT_SCHEMA_VERSION = 2
+REAL_EXECUTION_ARTIFACT_SCHEMA_VERSION = 3
 TURN_OBSERVATION_SCHEMA_VERSION = 2
 PTY_DIAGNOSTIC_SCHEMA_VERSION = 1
 PTY_DIAGNOSTIC_STATUSES = {
@@ -33,10 +35,6 @@ COMPILED_GRAPH_RUNNER = "tests.agent_live.graph_turn.invoke_product_graph_turn"
 PTY_REAL_CLI_RUNNER = "tests.agent_live.pty.real_cli"
 PTY_DYNAMIC_DUAL_AI_RUNNER = "tests.agent_live.pty.dynamic_dual_ai"
 REAL_EXECUTION_RUNNER = "tests.agent_live.real_execution.integration"
-REAL_EXECUTION_OPERATION_BY_ACTION = {
-    "approve_preflight_smoke": "preflight_smoke",
-    "approve_final_benchmark": "final_benchmark",
-}
 
 
 @dataclass(frozen=True)
@@ -2079,6 +2077,7 @@ def build_real_execution_evidence_artifact(
     *,
     edge: Mapping[str, Any],
     revision: Mapping[str, str],
+    scenario_id: str,
     operation_kind: str,
     request: Mapping[str, Any],
     result: Mapping[str, Any],
@@ -2099,10 +2098,14 @@ def build_real_execution_evidence_artifact(
     _require_lane(edge, "real_execution")
     if operation_kind not in {"preflight_smoke", "final_benchmark", "sync_observe"}:
         raise ValueError(f"unsupported real execution operation: {operation_kind}")
-    expected_operation = REAL_EXECUTION_OPERATION_BY_ACTION.get(str(edge.get("action_type") or ""))
-    if expected_operation and operation_kind != expected_operation:
+    scenario = scenario_by_id(scenario_id)
+    if scenario.action_type != str(edge.get("action_type") or ""):
         raise ValueError(
-            f"real execution operation disagrees with {edge.get('action_type')}: {operation_kind}"
+            f"real execution scenario disagrees with {edge.get('action_type')}: {scenario_id}"
+        )
+    if scenario.operation_kind != operation_kind:
+        raise ValueError(
+            f"real execution operation disagrees with {scenario_id}: {operation_kind}"
         )
     required_identity = {
         "edge_key": edge.get("edge_key"),
@@ -2137,6 +2140,7 @@ def build_real_execution_evidence_artifact(
         "evidence_class": "real_execution",
         "runner_type": REAL_EXECUTION_RUNNER,
         "revision": dict(revision),
+        "scenario_id": scenario_id,
         "operation_kind": operation_kind,
         "request": safe_request,
         "request_hash": content_hash(safe_request),
@@ -2199,9 +2203,14 @@ def validate_real_execution_evidence_artifact(
         return False, "repository revision mismatch"
     if artifact.get("operation_kind") not in {"preflight_smoke", "final_benchmark", "sync_observe"}:
         return False, "real execution operation is invalid"
-    expected_operation = REAL_EXECUTION_OPERATION_BY_ACTION.get(str(edge.get("action_type") or ""))
-    if expected_operation and artifact.get("operation_kind") != expected_operation:
-        return False, "real execution operation disagrees with action"
+    try:
+        scenario = scenario_by_id(str(artifact.get("scenario_id") or ""))
+    except ValueError as exc:
+        return False, str(exc)
+    if scenario.action_type != str(edge.get("action_type") or ""):
+        return False, "real execution scenario disagrees with action"
+    if artifact.get("operation_kind") != scenario.operation_kind:
+        return False, "real execution operation disagrees with scenario"
     if not str(artifact.get("job_id") or "").strip():
         return False, "real execution job id is missing"
     if artifact.get("outcome") != "passed" or artifact.get("exit_status") != 0 or artifact.get("error"):
@@ -2233,6 +2242,9 @@ def validate_real_execution_evidence_artifact(
             return False, str(exc)
         if content_hash(items) != artifact.get(hash_field):
             return False, f"{field} hash mismatch"
+    scenario_error = _real_execution_scenario_error(artifact, scenario)
+    if scenario_error:
+        return False, scenario_error
     unsigned = dict(artifact)
     artifact_hash = str(unsigned.pop("artifact_hash", ""))
     if content_hash(unsigned) != artifact_hash:
@@ -2242,6 +2254,118 @@ def validate_real_execution_evidence_artifact(
     if content_hash(evidence_payload) != evidence_id:
         return False, "evidence id mismatch"
     return True, ""
+
+
+def _real_execution_scenario_error(
+    artifact: Mapping[str, Any],
+    scenario: Any,
+) -> str:
+    request = dict(artifact.get("request") or {})
+    if str(request.get("scenario_id") or "") != scenario.scenario_id:
+        return "real execution request scenario mismatch"
+    if str(request.get("service_operation") or "") != scenario.operation:
+        return "real execution request operation mismatch"
+    result = dict(artifact.get("result") or {})
+    observed_job = dict(result.get("observed_job") or {})
+    artifacts = dict(observed_job.get("artifacts") or {})
+    plan_paths = [
+        Path(str(item.get("path") or ""))
+        for item in artifact.get("job_artifacts") or ()
+        if Path(str(item.get("path") or "")).name == "plan.json"
+    ]
+    if len(plan_paths) != 1:
+        return "real execution evidence must bind one job plan"
+    try:
+        plan = json.loads(plan_paths[0].read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"real execution job plan is invalid: {exc}"
+    if workflow_type_from_plan(plan) != scenario.workflow_type:
+        return "real execution workflow mismatch"
+    provenance = dict(plan.get("execution_provenance") or {})
+    if str(provenance.get("scenario_id") or "") != scenario.scenario_id:
+        return "real execution provenance scenario mismatch"
+    command = [str(item) for item in (plan.get("execution") or {}).get("command") or ()]
+    for token in scenario.required_command_tokens:
+        if token not in command:
+            return f"real execution command is missing required token: {token}"
+    for token in scenario.forbidden_command_tokens:
+        if token in command:
+            return f"real execution command contains forbidden token: {token}"
+    if scenario.operation_kind == "sync_observe":
+        try:
+            duration_index = command.index("--duration")
+            duration_seconds = int(command[duration_index + 1])
+        except (ValueError, IndexError):
+            return "bounded sync-observe command has no valid duration"
+        if duration_seconds <= 0:
+            return "bounded sync-observe duration must be positive"
+        execution_env = dict((plan.get("execution") or {}).get("environment") or {})
+        if str(plan.get("rpc_mode") or "") != "sync_observe":
+            return "sync-observe plan has an RPC workload mode"
+        if plan.get("use_fake_node") is not False:
+            return "sync-observe plan is not bound to a real-node source"
+        if str(execution_env.get("LOCAL_RPC_URL") or ""):
+            return "sync-observe plan contains an RPC benchmark endpoint"
+        if not str(execution_env.get("SYNC_OBSERVE_RPC_URL") or ""):
+            return "sync-observe plan has no observation endpoint"
+        if any(
+            str(execution_env.get(name) or "")
+            for name in (
+                "SYNC_OBSERVE_INITIAL_QPS",
+                "SYNC_OBSERVE_MAX_QPS",
+                "SYNC_OBSERVE_QPS_STEP",
+            )
+        ):
+            return "sync-observe plan contains a QPS profile"
+    for name in scenario.required_artifacts:
+        raw = str(artifacts.get(name) or "")
+        if not raw or not Path(raw).is_file():
+            return f"real execution required artifact is missing: {name}"
+    for name in scenario.forbidden_artifacts:
+        if str(artifacts.get(name) or ""):
+            return f"real execution contains forbidden artifact: {name}"
+    if scenario.operation_kind != "sync_observe":
+        return ""
+    csv_path = Path(str(artifacts.get("performance_csv") or ""))
+    try:
+        with csv_path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+    except (OSError, csv.Error) as exc:
+        return f"sync-observe performance CSV is invalid: {exc}"
+    if not rows:
+        return "sync-observe performance CSV has no observed rows"
+    required_columns = {
+        "timestamp",
+        "cpu_usage",
+        "mem_usage",
+        "net_total_mbps",
+        "local_block_height",
+        "sync_status",
+        "execution_mgas_per_sec",
+        "execution_metric_source",
+        "execution_metric_status",
+        "current_qps",
+        "qps_data_available",
+    }
+    columns = set(rows[0])
+    if missing := sorted(required_columns - columns):
+        return "sync-observe performance CSV is missing columns: " + ", ".join(missing)
+    if not any(column.endswith("_total_iops") for column in columns):
+        return "sync-observe performance CSV has no disk IOPS column"
+    if not any(column.endswith("_avg_await") for column in columns):
+        return "sync-observe performance CSV has no disk latency column"
+    for row in rows:
+        if str(row.get("current_qps") or "").strip() not in {"0", "0.0", "0.00"}:
+            return "sync-observe reported a non-zero QPS workload"
+        if str(row.get("qps_data_available") or "").strip().lower() not in {"false", "0"}:
+            return "sync-observe incorrectly reports QPS data as available"
+        status = str(row.get("execution_metric_status") or "").strip().lower()
+        source = str(row.get("execution_metric_source") or "").strip()
+        if status not in {"available", "unavailable"} or not source:
+            return "sync-observe MGas provenance is ambiguous"
+        if status == "available" and not str(row.get("execution_mgas_per_sec") or "").strip():
+            return "sync-observe available MGas row has no value"
+    return ""
 
 
 def _validate_hashed_artifact_identity(

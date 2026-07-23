@@ -28,7 +28,8 @@ class RealExecutionLedgerRunnerTest(unittest.TestCase):
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("--plan", result.stdout)
+        self.assertIn("--rpc-plan", result.stdout)
+        self.assertIn("--sync-plan", result.stdout)
 
     def test_edge_lookup_requires_one_applicable_execution_edge(self) -> None:
         edge = {

@@ -90,8 +90,10 @@ flowchart TD
 Required inputs for this path are chain/sync-health behavior, resource
 metadata, node process identity, and a stop condition. `NODE_PROMETHEUS_METRICS_URL`
 is optional; if the client does not expose MGas/s or gas-used metrics, the
-report shows `execution_metric_status` and leaves MGas/s as unavailable or zero
-according to the source metric.
+report shows `execution_metric_status=unavailable`. A numeric zero is treated
+as observed throughput only when `execution_metric_status=available` and
+`execution_metric_source` identifies the client metric. Geth's
+`chain_mgasps` summary is supported.
 
 Sync-observe does not record fake-node fixtures. A node may first download a
 peer snapshot and then catch up from that snapshot height; the framework
