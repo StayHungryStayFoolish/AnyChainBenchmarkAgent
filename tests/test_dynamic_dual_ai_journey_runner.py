@@ -262,6 +262,13 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
                 artifact, schedule=schedule, verifier_registry=registry, revision=REVISION
             )
             self.assertNotIn("target_coverage_ids", artifact["turns"][0]["decision"])
+            provenance = artifact["turns"][0]["decision_provenance"]
+            self.assertRegex(provenance["previous_response_hash"], r"^[0-9a-f]{64}$")
+            self.assertRegex(provenance["user_message_hash"], r"^[0-9a-f]{64}$")
+            self.assertEqual(
+                provenance["submitted_at_ns"],
+                artifact["turns"][0]["turn_identity"]["user_message_submitted_at_ns"],
+            )
 
     def test_journey_transcript_is_redacted_at_the_persistence_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -21,7 +21,7 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
@@ -261,6 +261,21 @@ class JourneyObservedEdge:
 
 
 @dataclass(frozen=True)
+class JourneyDecisionProvenance:
+    """One simulator decision bound to the complete response it followed."""
+
+    turn_index: int
+    previous_response_hash: str
+    selected_at_ns: int
+    submitted_at_ns: int
+    user_message_hash: str
+    persona: str
+    mission: str
+    rationale: str
+    risk_factor_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class JourneyVerifierContext:
     """Immutable facts available to an injected journey postcondition verifier."""
 
@@ -271,6 +286,9 @@ class JourneyVerifierContext:
     transcript: tuple[tuple[str, str], ...]
     observed_edge_keys: tuple[str, ...]
     latest_turn: PtyCliTurnRecord | None
+    completed_events: tuple[RuntimeTurnEvent, ...] = ()
+    completed_decisions: tuple[JourneyDecisionProvenance, ...] = ()
+    evaluating_postcondition_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -1605,6 +1623,8 @@ class DynamicDualAiJourneyRunner:
         transcript: list[tuple[str, str]] = []
         transcript_lines: list[str] = []
         turns: list[PtyCliTurnRecord] = []
+        events: list[RuntimeTurnEvent] = []
+        decisions: list[JourneyDecisionProvenance] = []
         observed_edge_keys: list[str] = []
         turn_results: list[dict[str, Any]] = []
         terminal_classification = JourneyTerminalClassification.INFRASTRUCTURE_INTERRUPTED
@@ -1636,6 +1656,8 @@ class DynamicDualAiJourneyRunner:
                 initial_event=initial_event,
                 current_event=baseline_event,
                 turns=turns,
+                events=events,
+                decisions=decisions,
                 transcript=transcript,
                 observed_edge_keys=observed_edge_keys,
                 latest_turn=None,
@@ -1717,6 +1739,18 @@ class DynamicDualAiJourneyRunner:
                     agent_response_received_at_ns=response_received_ns,
                 )
                 turns.append(turn)
+                events.append(committed_event)
+                decisions.append(JourneyDecisionProvenance(
+                    turn_index=committed_event.turn_index,
+                    previous_response_hash=content_hash(previous_response),
+                    selected_at_ns=selected_at_ns,
+                    submitted_at_ns=submitted_at_ns,
+                    user_message_hash=content_hash(decision.user_message),
+                    persona=decision.persona,
+                    mission=decision.mission,
+                    rationale=decision.rationale,
+                    risk_factor_ids=tuple(decision.risk_factor_ids),
+                ))
                 transcript.append((decision.user_message, response))
                 transcript_lines.extend((f"User> {decision.user_message}", response))
 
@@ -1728,6 +1762,8 @@ class DynamicDualAiJourneyRunner:
                     initial_event=initial_event,
                     current_event=committed_event,
                     turns=turns,
+                    events=events,
+                    decisions=decisions,
                     transcript=transcript,
                     observed_edge_keys=observed_edge_keys,
                     latest_turn=turn,
@@ -1761,6 +1797,12 @@ class DynamicDualAiJourneyRunner:
                         "rationale": decision.rationale,
                         "risk_factor_ids": list(decision.risk_factor_ids),
                     }),
+                    "decision_provenance": {
+                        "previous_response_hash": decisions[-1].previous_response_hash,
+                        "user_message_hash": decisions[-1].user_message_hash,
+                        "selected_at_ns": decisions[-1].selected_at_ns,
+                        "submitted_at_ns": decisions[-1].submitted_at_ns,
+                    },
                     "observed_edges": [
                         {
                             "edge_key": item.edge_key,
@@ -1923,7 +1965,10 @@ class DynamicDualAiJourneyRunner:
         bindings: list[JourneyVerifierBinding] = []
         for postcondition_id in outcome.required_postcondition_ids:
             definition = self.postcondition_verifier_registry.definitions[postcondition_id]
-            result = definition.verifier(context)
+            result = definition.verifier(replace(
+                context,
+                evaluating_postcondition_id=postcondition_id,
+            ))
             if not isinstance(result, JourneyPostconditionResult):
                 raise TypeError(
                     "journey postcondition verifier must return JourneyPostconditionResult: "
@@ -1993,6 +2038,8 @@ class DynamicDualAiJourneyRunner:
         initial_event: RuntimeTurnEvent,
         current_event: RuntimeTurnEvent,
         turns: Sequence[PtyCliTurnRecord],
+        events: Sequence[RuntimeTurnEvent],
+        decisions: Sequence[JourneyDecisionProvenance],
         transcript: Sequence[tuple[str, str]],
         observed_edge_keys: Sequence[str],
         latest_turn: PtyCliTurnRecord | None,
@@ -2005,6 +2052,8 @@ class DynamicDualAiJourneyRunner:
             transcript=tuple(transcript),
             observed_edge_keys=tuple(observed_edge_keys),
             latest_turn=latest_turn,
+            completed_events=tuple(events),
+            completed_decisions=tuple(decisions),
         )
 
     def _validate_event_revision(self, event: RuntimeTurnEvent) -> None:
@@ -2155,6 +2204,29 @@ def validate_journey_evidence_artifact(
     }
     if observed_postconditions != expected_postconditions:
         raise ValueError("Journey terminal postcondition evidence is incomplete")
+    for turn in payload.get("turns") or ():
+        if not isinstance(turn, Mapping):
+            raise ValueError("Journey turn evidence is invalid")
+        provenance = turn.get("decision_provenance")
+        identity = turn.get("turn_identity")
+        if not isinstance(provenance, Mapping) or not isinstance(identity, Mapping):
+            raise ValueError("Journey turn lacks response-bound decision provenance")
+        for field in ("previous_response_hash", "user_message_hash"):
+            if re.fullmatch(r"[0-9a-f]{64}", str(provenance.get(field) or "")) is None:
+                raise ValueError("Journey decision provenance hash is invalid")
+        selected_at_ns = provenance.get("selected_at_ns")
+        submitted_at_ns = provenance.get("submitted_at_ns")
+        if (
+            isinstance(selected_at_ns, bool)
+            or not isinstance(selected_at_ns, int)
+            or isinstance(submitted_at_ns, bool)
+            or not isinstance(submitted_at_ns, int)
+            or selected_at_ns <= 0
+            or submitted_at_ns < selected_at_ns
+            or submitted_at_ns != identity.get("user_message_submitted_at_ns")
+            or selected_at_ns != turn.get("selected_at_ns")
+        ):
+            raise ValueError("Journey decision provenance timing is invalid")
 
 
 

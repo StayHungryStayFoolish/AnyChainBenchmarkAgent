@@ -64,6 +64,24 @@ contains four independent executions: fake-node smoke, Geth real-node smoke,
 Geth real-node final, and bounded sync-observe. Catalog generation is never
 execution evidence.
 
+The Phase 8 execution adapters are:
+
+- `retained_regression_runner.py` for G3 exact real-CLI contracts and open
+  response-driven Journey contracts;
+- `product_chaos_journey_provider.py` for converting each frozen G4 obligation
+  into a runtime-compatible Journey definition and converting completed
+  Journey artifacts into atomic obligation evidence;
+- `product_obligation_evidence.py` for revision-, contract-, verifier-, and
+  artifact-bound G3/G4 admission.
+
+An adapter is not a pass. G3 remains blocked while any retained semantic
+postcondition lacks a reviewed machine evaluator. Its current executable
+registry fails those postconditions closed; caller-authored verifier results
+cannot be supplied to the evidence adapter. G4 evidence must contain complete
+response-bound decision provenance for every turn, including hashes for the
+preceding Agent response and submitted user message plus monotonic selection
+and submission timestamps.
+
 ### Baseline Persona Transcript That Must Pass
 
 Every broad Agent workflow or Harness change must include a dual-AI chaos
