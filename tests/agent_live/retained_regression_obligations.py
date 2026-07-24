@@ -15,10 +15,17 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from tests.agent_live.coverage_evidence import content_hash
+from tests.agent_live.retained_regression_attestations import (
+    RELATION_BY_VARIANT,
+    build_source_contract,
+    build_variant_contract,
+    validate_source_contract,
+    validate_variant_contract,
+)
 from tests.agent_live.runtime_checkpoint import reviewed_scenario
 
 
-RETAINED_REGRESSION_SCHEMA_VERSION = 1
+RETAINED_REGRESSION_SCHEMA_VERSION = 2
 RETAINED_REGRESSION_CASE_COUNT = 15
 RETAINED_REGRESSION_OBLIGATION_COUNT = 60
 RETAINED_REGRESSION_VARIANTS = (
@@ -29,6 +36,9 @@ RETAINED_REGRESSION_VARIANTS = (
 )
 RETAINED_REGRESSION_FIXTURE = Path(
     "tests/agent_live/fixtures/real_user_regressions/cases.json"
+)
+RETAINED_REGRESSION_VARIANT_CONTRACTS = Path(
+    "tests/agent_live/fixtures/real_user_regressions/variant_contracts.json"
 )
 RETAINED_REGRESSION_MANIFEST = Path(
     "tests/agent_live/fixtures/real_user_regressions/manifest.json"
@@ -71,7 +81,7 @@ _CASE_CONTRACTS: Mapping[str, _CaseContract] = {
         ("unknown_chain_silently_configured",),
     ),
     "RR-005": _CaseContract(
-        "provider_zone",
+        "provider_region_with_chain",
         "S1",
         ("chain_mode_change_confirmed", "incompatible_state_invalidated", "fallback_resumed"),
         ("environment_text_consumed_as_region",),
@@ -103,8 +113,14 @@ _CASE_CONTRACTS: Mapping[str, _CaseContract] = {
     "RR-010": _CaseContract(
         "new_chain_continue",
         "S1",
-        ("custom_method_collection_exited", "effective_runtime_method_set_materialized"),
-        ("removed_default_method_materialized", "custom_method_collection_looped"),
+        (
+            "custom_method_collection_exited",
+            "effective_workload_commit_replaces_defaults",
+        ),
+        (
+            "removed_default_method_committed",
+            "custom_method_collection_looped",
+        ),
     ),
     "RR-011": _CaseContract(
         "custom_needs_schema_evidence",
@@ -170,16 +186,29 @@ def build_retained_regression_obligations(
     root = Path(repo_root).resolve()
     active_revision = _validated_revision(revision)
     cases_path = root / RETAINED_REGRESSION_FIXTURE
+    variant_contracts_path = root / RETAINED_REGRESSION_VARIANT_CONTRACTS
     manifest_path = root / RETAINED_REGRESSION_MANIFEST
     cases_bytes = cases_path.read_bytes()
+    variant_contracts_bytes = variant_contracts_path.read_bytes()
     manifest_bytes = manifest_path.read_bytes()
     cases_payload = json.loads(cases_bytes)
+    variant_contracts_payload = json.loads(variant_contracts_bytes)
     manifest_payload = json.loads(manifest_bytes)
     source_binding = _validate_fixture_source(
         cases_payload=cases_payload,
         cases_bytes=cases_bytes,
+        variant_contracts_payload=variant_contracts_payload,
+        variant_contracts_bytes=variant_contracts_bytes,
         manifest_payload=manifest_payload,
         manifest_bytes=manifest_bytes,
+    )
+    variant_cases = {
+        str(item.get("case_id") or ""): dict(item)
+        for item in variant_contracts_payload.get("cases") or ()
+        if isinstance(item, Mapping)
+    }
+    variant_declarations = dict(
+        variant_contracts_payload.get("variant_contracts") or {}
     )
 
     cases = tuple(
@@ -212,6 +241,8 @@ def build_retained_regression_obligations(
                 state_fingerprint=state_fingerprint,
                 revision=active_revision,
                 source_binding=source_binding,
+                immutable_case_contract=variant_cases[case_id],
+                variant_declaration=dict(variant_declarations[variant]),
             )
             obligations.append(obligation)
 
@@ -334,15 +365,30 @@ def _build_obligation(
     state_fingerprint: str,
     revision: Mapping[str, str],
     source_binding: Mapping[str, Any],
+    immutable_case_contract: Mapping[str, Any],
+    variant_declaration: Mapping[str, Any],
 ) -> dict[str, Any]:
     case_id = str(case["id"])
     source_turns = tuple(str(turn) for turn in case.get("turns") or ())
     expected_text = str(case.get("expected") or "")
     precondition = str(case.get("precondition") or "")
     required = list(contract.required_postcondition_ids)
+    source_contract = build_source_contract(immutable_case_contract)
+    variant_contract = build_variant_contract(
+        variant=variant,
+        source_contract=source_contract,
+        declaration=variant_declaration,
+    )
+    common_stimulus = {
+        "source_contract": source_contract,
+        "source_contract_hash": content_hash(source_contract),
+        "variant_contract": variant_contract,
+        "variant_contract_hash": content_hash(variant_contract),
+    }
     if variant == "exact":
         required.insert(0, "exact_fixture_turns_observed")
         stimulus = {
+            **common_stimulus,
             "mode": "exact_fixture_replay",
             "turns": list(source_turns),
             "turns_hash": content_hash(source_turns),
@@ -353,6 +399,7 @@ def _build_obligation(
             "isomorphic_meaning_attested",
         ]
         stimulus = {
+            **common_stimulus,
             "mode": "response_driven_isomorphic",
             "source_turns_hash": content_hash(source_turns),
             "constraints": {
@@ -368,6 +415,7 @@ def _build_obligation(
             "adjacent_non_trigger_attested",
         ]
         stimulus = {
+            **common_stimulus,
             "mode": "response_driven_negative",
             "source_turns_hash": content_hash(source_turns),
             "constraints": {
@@ -382,6 +430,7 @@ def _build_obligation(
             "neighboring_transition_attested",
         ]
         stimulus = {
+            **common_stimulus,
             "mode": "response_driven_neighboring",
             "source_turns_hash": content_hash(source_turns),
             "constraints": {
@@ -460,6 +509,25 @@ def _validate_stimulus_contract(
     obligation_id: str,
 ) -> None:
     stimulus = dict(row.get("stimulus_contract") or {})
+    source_contract = validate_source_contract(
+        dict(stimulus.get("source_contract") or {})
+    )
+    variant_contract = validate_variant_contract(
+        dict(stimulus.get("variant_contract") or {}),
+        source_contract=source_contract,
+    )
+    if (
+        source_contract.get("case_id") != row.get("case_id")
+        or source_contract.get("source_turns_hash")
+        != stimulus.get("source_turns_hash", stimulus.get("turns_hash"))
+        or stimulus.get("source_contract_hash") != content_hash(source_contract)
+        or stimulus.get("variant_contract_hash") != content_hash(variant_contract)
+        or variant_contract.get("variant") != variant
+        or variant_contract.get("relation") != RELATION_BY_VARIANT[variant]
+    ):
+        raise ValueError(
+            f"retained regression immutable stimulus binding is stale: {obligation_id}"
+        )
     expected_modes = {
         "exact": "exact_fixture_replay",
         "isomorphic": "response_driven_isomorphic",
@@ -479,6 +547,10 @@ def _validate_stimulus_contract(
             raise ValueError(f"exact retained regression has no executable turns: {obligation_id}")
         if stimulus.get("turns_hash") != content_hash(tuple(turns)):
             raise ValueError(f"exact retained regression turns are stale: {obligation_id}")
+        if source_contract["source_turns_hash"] != stimulus["turns_hash"]:
+            raise ValueError(
+                f"exact retained regression source contract is stale: {obligation_id}"
+            )
         return
     if "turns" in stimulus or "messages" in stimulus:
         raise ValueError(
@@ -534,6 +606,8 @@ def _validate_fixture_source(
     *,
     cases_payload: Mapping[str, Any],
     cases_bytes: bytes,
+    variant_contracts_payload: Mapping[str, Any],
+    variant_contracts_bytes: bytes,
     manifest_payload: Mapping[str, Any],
     manifest_bytes: bytes,
 ) -> dict[str, Any]:
@@ -551,20 +625,84 @@ def _validate_fixture_source(
     if set(case_ids) != set(_CASE_CONTRACTS):
         raise ValueError("retained regression fixture case set is not reviewed")
 
+    if variant_contracts_payload.get("schema_version") != 1:
+        raise ValueError("unsupported retained regression variant contract schema")
+    raw_variant_cases = variant_contracts_payload.get("cases")
+    if (
+        not isinstance(raw_variant_cases, list)
+        or len(raw_variant_cases) != RETAINED_REGRESSION_CASE_COUNT
+    ):
+        raise ValueError(
+            "retained regression variant contracts must cover every case"
+        )
+    variant_cases: dict[str, Mapping[str, Any]] = {}
+    case_turn_hashes = {
+        str(case["id"]): content_hash(tuple(case.get("turns") or ()))
+        for case in cases
+    }
+    for raw in raw_variant_cases:
+        if not isinstance(raw, Mapping):
+            raise ValueError("retained regression variant case is invalid")
+        case_contract = build_source_contract(raw)
+        case_id = str(case_contract["case_id"])
+        if (
+            case_id in variant_cases
+            or case_turn_hashes.get(case_id)
+            != case_contract["source_turns_hash"]
+        ):
+            raise ValueError(
+                "retained regression variant source binding is stale"
+            )
+        variant_cases[case_id] = case_contract
+    if set(variant_cases) != set(case_ids):
+        raise ValueError("retained regression variant case set is incomplete")
+    declarations = variant_contracts_payload.get("variant_contracts")
+    if (
+        not isinstance(declarations, Mapping)
+        or set(declarations) != set(RETAINED_REGRESSION_VARIANTS)
+    ):
+        raise ValueError("retained regression variant declarations are incomplete")
+    exemplar = next(iter(variant_cases.values()))
+    for variant, declaration in declarations.items():
+        if not isinstance(declaration, Mapping):
+            raise ValueError("retained regression variant declaration is invalid")
+        build_variant_contract(
+            variant=str(variant),
+            source_contract=exemplar,
+            declaration=declaration,
+        )
+
     if manifest_payload.get("schema_version") != 1:
         raise ValueError("unsupported retained regression manifest schema")
     files = manifest_payload.get("files")
-    if not isinstance(files, list) or len(files) != 1:
-        raise ValueError("retained regression manifest must declare one fixture")
-    file_contract = dict(files[0])
-    if file_contract.get("path") != RETAINED_REGRESSION_FIXTURE.as_posix():
-        raise ValueError("retained regression manifest path is not authoritative")
-    if file_contract.get("sanitized") is not True:
-        raise ValueError("retained regression fixture must be declared sanitized")
-    if file_contract.get("case_count") != RETAINED_REGRESSION_CASE_COUNT:
-        raise ValueError("retained regression manifest case count is stale")
+    if not isinstance(files, list) or len(files) != 2:
+        raise ValueError("retained regression manifest must declare two fixtures")
+    file_index = {
+        str(item.get("path") or ""): dict(item)
+        for item in files
+        if isinstance(item, Mapping)
+    }
+    if set(file_index) != {
+        RETAINED_REGRESSION_FIXTURE.as_posix(),
+        RETAINED_REGRESSION_VARIANT_CONTRACTS.as_posix(),
+    }:
+        raise ValueError("retained regression manifest paths are not authoritative")
+    if any(
+        item.get("sanitized") is not True
+        or item.get("case_count") != RETAINED_REGRESSION_CASE_COUNT
+        for item in file_index.values()
+    ):
+        raise ValueError("retained regression manifest contract is stale")
     cases_sha256 = hashlib.sha256(cases_bytes).hexdigest()
-    if file_contract.get("sha256") != cases_sha256:
+    variants_sha256 = hashlib.sha256(variant_contracts_bytes).hexdigest()
+    if (
+        file_index[RETAINED_REGRESSION_FIXTURE.as_posix()].get("sha256")
+        != cases_sha256
+        or file_index[RETAINED_REGRESSION_VARIANT_CONTRACTS.as_posix()].get(
+            "sha256"
+        )
+        != variants_sha256
+    ):
         raise ValueError("retained regression fixture hash does not match manifest")
     source_revision = str(manifest_payload.get("source_revision") or "").strip()
     if not source_revision:
@@ -572,6 +710,10 @@ def _validate_fixture_source(
     return {
         "fixture_path": RETAINED_REGRESSION_FIXTURE.as_posix(),
         "fixture_sha256": cases_sha256,
+        "variant_contract_path": (
+            RETAINED_REGRESSION_VARIANT_CONTRACTS.as_posix()
+        ),
+        "variant_contract_sha256": variants_sha256,
         "manifest_path": RETAINED_REGRESSION_MANIFEST.as_posix(),
         "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
         "source_revision": source_revision,
@@ -586,6 +728,8 @@ def _validate_source_binding_shape(value: Any, *, obligation_id: str) -> None:
     expected_fields = {
         "fixture_path",
         "fixture_sha256",
+        "variant_contract_path",
+        "variant_contract_sha256",
         "manifest_path",
         "manifest_sha256",
         "source_revision",
@@ -596,8 +740,11 @@ def _validate_source_binding_shape(value: Any, *, obligation_id: str) -> None:
         raise ValueError(f"retained regression source binding is incomplete: {obligation_id}")
     if (
         value.get("fixture_path") != RETAINED_REGRESSION_FIXTURE.as_posix()
+        or value.get("variant_contract_path")
+        != RETAINED_REGRESSION_VARIANT_CONTRACTS.as_posix()
         or value.get("manifest_path") != RETAINED_REGRESSION_MANIFEST.as_posix()
         or len(str(value.get("fixture_sha256") or "")) != 64
+        or len(str(value.get("variant_contract_sha256") or "")) != 64
         or len(str(value.get("manifest_sha256") or "")) != 64
         or not str(value.get("source_revision") or "").strip()
         or value.get("case_count") != RETAINED_REGRESSION_CASE_COUNT

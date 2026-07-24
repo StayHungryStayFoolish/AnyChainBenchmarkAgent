@@ -26,6 +26,10 @@ from tests.agent_live.batch_orchestrator import (
     load_frozen_manifest,
     run_batch,
 )
+from tests.agent_live.codex_simulator_bridge import (
+    build_simulator_attestation,
+    simulator_context_hash,
+)
 
 
 BROKER_SCHEMA_VERSION = 2
@@ -157,6 +161,11 @@ def submit_decision(
     user_message: str,
     rationale: str,
     risk_factor_ids: Sequence[str] = (),
+    actor_kind: str = "",
+    actor_task_id: str = "",
+    actor_model: str = "",
+    source_step_id: str = "",
+    semantic_role: str = "",
 ) -> Path:
     broker_root = Path(root).resolve()
     request = _load_json(broker_root / "requests" / f"{request_id}.json")
@@ -175,24 +184,68 @@ def submit_decision(
             raise ValueError("Journey broker request has no immutable schedule identity")
         decision = {
             "previous_response_hash": response_hash,
+            "broker_request_id": request_id,
             "user_message": message,
             "persona": str(schedule.get("persona") or ""),
             "mission": str(schedule.get("mission") or ""),
             "rationale": reason,
             "risk_factor_ids": [str(item) for item in risk_factor_ids],
         }
+        verifier_input = schedule.get("verifier_input_contract") or {}
+        binding = {
+            "source_step_id": str(source_step_id).strip(),
+            "semantic_role": str(semantic_role).strip(),
+        }
+        if verifier_input:
+            if not all(binding.values()):
+                raise ValueError(
+                    "retained regression decision requires source step and semantic role"
+                )
+            decision["variant_binding"] = binding
+        elif any(binding.values()):
+            raise ValueError(
+                "generic Journey decision cannot declare a retained variant binding"
+            )
     else:
         target = control_identity.get("scheduled_target")
         if not isinstance(target, Mapping):
             raise ValueError("edge broker request has no scheduled target")
         decision = {
             "previous_response_hash": response_hash,
+            "broker_request_id": request_id,
             "user_message": message,
             "persona": str(target.get("persona") or ""),
             "goal": str(target.get("goal") or ""),
             "rationale": reason,
             "target_coverage_ids": [str(target.get("edge_key") or "")],
         }
+    actor_declaration = {
+        "actor_kind": str(actor_kind).strip(),
+        "task_id": str(actor_task_id).strip(),
+        "model": str(actor_model).strip(),
+    }
+    if any(actor_declaration.values()) and not all(actor_declaration.values()):
+        raise ValueError("simulator actor declaration requires kind, task id, and model")
+    if actor_declaration["actor_kind"]:
+        attestation = build_simulator_attestation(
+            actor_kind=actor_declaration["actor_kind"],
+            task_id=actor_declaration["task_id"],
+            model=actor_declaration["model"],
+            request_id=request_id,
+            previous_response_hash=response_hash,
+            context_hash=simulator_context_hash(
+                request.get("context") or {}
+            ),
+            decision_hash=_content_hash(decision),
+            user_message_hash=_content_hash(message),
+            turn_index=int((request.get("context") or {}).get("turn_index") or 0),
+            declared_at_ns=time.time_ns(),
+        )
+        decision["simulator_attestation"] = attestation
+        _write_immutable_json(
+            broker_root / "attestations" / f"{request_id}.json",
+            attestation,
+        )
     execution_payload_hash = _content_hash(decision)
     audit_decision = {
         **decision,
@@ -357,6 +410,11 @@ def _parser() -> argparse.ArgumentParser:
     submit.add_argument("--message", required=True)
     submit.add_argument("--rationale", required=True)
     submit.add_argument("--risk-factor", action="append", default=[])
+    submit.add_argument("--actor-kind", choices=("codex", "script"), default="")
+    submit.add_argument("--actor-task-id", default="")
+    submit.add_argument("--actor-model", default="")
+    submit.add_argument("--source-step-id", default="")
+    submit.add_argument("--semantic-role", default="")
     return parser
 
 
@@ -372,6 +430,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             user_message=args.message,
             rationale=args.rationale,
             risk_factor_ids=args.risk_factor,
+            actor_kind=args.actor_kind,
+            actor_task_id=args.actor_task_id,
+            actor_model=args.actor_model,
+            source_step_id=args.source_step_id,
+            semantic_role=args.semantic_role,
         ))
         return 0
     manifest = load_frozen_manifest(args.manifest)

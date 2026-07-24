@@ -124,8 +124,13 @@ generate_test_summary() {
     local archive_path="${ARCHIVES_DIR}/${run_id}"
     local summary_file="${archive_path}/test_summary.json"
 
-    if [[ "$benchmark_mode" == "sync_observe" && ( -z "$start_time" || -z "$end_time" ) ]]; then
+    if [[ -z "$start_time" || -z "$end_time" ]]; then
         local performance_csv="${archive_path}/logs/performance_latest.csv"
+        if [[ ! -f "$performance_csv" ]]; then
+            performance_csv=$(find "${archive_path}/logs" -maxdepth 1 -type f \
+                -name 'performance_*.csv' ! -name 'performance_latest.csv' \
+                -print 2>/dev/null | sort | tail -1)
+        fi
         if [[ -f "$performance_csv" ]]; then
             local inferred_times
             inferred_times=$(awk -F',' '

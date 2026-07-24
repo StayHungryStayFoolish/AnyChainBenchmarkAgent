@@ -10,8 +10,19 @@ from types import SimpleNamespace
 from typing import Mapping
 from unittest.mock import patch
 
-from tests.agent_live.chaos_scheduler import build_journey_schedule
-from tests.agent_live.coverage_evidence import RuntimeTurnEvent, VerifiedPostcondition
+from tests.agent_live.chaos_scheduler import (
+    build_journey_schedule,
+    journey_schedule_payload,
+)
+from tests.agent_live.coverage_evidence import (
+    RuntimeTurnEvent,
+    VerifiedPostcondition,
+    content_hash,
+)
+from tests.agent_live.codex_simulator_bridge import (
+    build_simulator_attestation,
+    simulator_context_hash,
+)
 from tests.agent_live.dynamic_dual_ai_chaos import (
     ChaosRunConfig,
     DynamicDualAiJourneyRunner,
@@ -28,6 +39,10 @@ from tests.agent_live.dynamic_dual_ai_chaos import (
     validate_journey_evidence_artifact,
 )
 from tests.agent_live.generate_harness_coverage_ledger import contract_variant_hash
+from tests.agent_live.retained_regression_attestations import (
+    build_source_contract,
+    build_variant_contract,
+)
 
 
 REVISION = {"commit": "journey-test", "worktree_hash": "a" * 64}
@@ -48,6 +63,14 @@ def ready_at_turn_three(context):
     return JourneyPostconditionResult(
         "ready_state",
         context.current_event.turn_index >= 3,
+        {"turn_index": context.current_event.turn_index},
+    )
+
+
+def ready_at_turn_two(context):
+    return JourneyPostconditionResult(
+        "ready_state",
+        context.current_event.turn_index >= 2,
         {"turn_index": context.current_event.turn_index},
     )
 
@@ -153,7 +176,7 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
             next_result={"kind": "question", "question_id": "opening_next_action"},
         )
 
-    def _schedule(self, *, max_turns: int = 3):
+    def _schedule(self, *, max_turns: int = 3, verifier_input_contract=None):
         return build_journey_schedule(
             revision=REVISION,
             seed=271,
@@ -172,8 +195,42 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
                     "outcome_id": "lost_state",
                     "required_postcondition_ids": ["state_lost"],
                 }],
+                "verifier_input_contract": verifier_input_contract or {},
             },
         )
+
+    def _retained_verifier_input(self):
+        source = build_source_contract({
+            "case_id": "journey-runner-retained",
+            "source_turns_hash": content_hash(("first", "second")),
+            "source_steps": [
+                {
+                    "step_id": "source-1",
+                    "turn_index": 1,
+                    "semantic_role": "request_capabilities",
+                },
+                {
+                    "step_id": "source-2",
+                    "turn_index": 2,
+                    "semantic_role": "select_mode",
+                },
+            ],
+        })
+        variant = build_variant_contract(
+            variant="isomorphic",
+            source_contract=source,
+            declaration={
+                "relation": "isomorphic_meaning",
+                "minimum_attestations": 2,
+            },
+        )
+        return {
+            "mode": "response_driven_isomorphic",
+            "source_contract": source,
+            "source_contract_hash": content_hash(source),
+            "variant_contract": variant,
+            "variant_contract_hash": content_hash(variant),
+        }
 
     def _decision(self, context: JourneySimulatorContext) -> JourneySimulatorDecision:
         return JourneySimulatorDecision(
@@ -226,7 +283,9 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
             details={"errors": []},
         )
 
-    def test_response_driven_turns_record_edges_and_qualifying_evidence(self) -> None:
+    def test_response_driven_test_transport_cannot_emit_qualifying_evidence(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             transport = FakeTransport([
                 "Agent> Model config: provider=deepseek, model=deepseek-chat, auth=api_key\nFirst.",
@@ -257,10 +316,18 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
             self.assertEqual(result.observed_edge_keys, (EDGE_KEY,))
             artifact = json.loads(result.evidence_path.read_text())
             self.assertEqual(result.evidence_path.name, f"journey-{result.evidence_id}.json")
-            self.assertTrue(artifact["qualifying_evidence"])
-            validate_journey_evidence_artifact(
-                artifact, schedule=schedule, verifier_registry=registry, revision=REVISION
+            self.assertFalse(artifact["qualifying_evidence"])
+            self.assertEqual(
+                artifact["qualification_reason"],
+                "untrusted_test_transport",
             )
+            with self.assertRaisesRegex(ValueError, "not marked as qualifying"):
+                validate_journey_evidence_artifact(
+                    artifact,
+                    schedule=schedule,
+                    verifier_registry=registry,
+                    revision=REVISION,
+                )
             self.assertNotIn("target_coverage_ids", artifact["turns"][0]["decision"])
             provenance = artifact["turns"][0]["decision_provenance"]
             self.assertRegex(provenance["previous_response_hash"], r"^[0-9a-f]{64}$")
@@ -268,6 +335,101 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
             self.assertEqual(
                 provenance["submitted_at_ns"],
                 artifact["turns"][0]["turn_identity"]["user_message_submitted_at_ns"],
+            )
+
+    def test_retained_journey_binds_live_codex_decisions_to_semantic_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            verifier_input = self._retained_verifier_input()
+            schedule = self._schedule(verifier_input_contract=verifier_input)
+
+            def simulator(context):
+                step_index = context.turn_index - 1
+                binding = {
+                    "source_step_id": f"source-{step_index}",
+                    "semantic_role": (
+                        "request_capabilities"
+                        if step_index == 1
+                        else "select_mode"
+                    ),
+                }
+                message = f"response-driven retained turn {step_index}"
+                broker_request_id = f"request-{step_index}"
+                unsigned = {
+                    "previous_response_hash": content_hash(
+                        context.previous_agent_response
+                    ),
+                    "broker_request_id": broker_request_id,
+                    "user_message": message,
+                    "persona": context.schedule.persona,
+                    "mission": context.schedule.mission,
+                    "rationale": "Selected from the complete response.",
+                    "risk_factor_ids": [],
+                    "variant_binding": binding,
+                }
+                attestation = build_simulator_attestation(
+                    actor_kind="codex",
+                    task_id="task-retained",
+                    model="gpt-test",
+                    request_id=broker_request_id,
+                    previous_response_hash=unsigned["previous_response_hash"],
+                    context_hash=simulator_context_hash({
+                        "session_id": context.session_id,
+                        "turn_index": context.turn_index,
+                        "previous_response_hash": unsigned[
+                            "previous_response_hash"
+                        ],
+                        "previous_response_received_at_ns": (
+                            context.previous_response_received_at_ns
+                        ),
+                        "schedule": journey_schedule_payload(
+                            context.schedule
+                        ),
+                        "observed_edge_keys": list(
+                            context.observed_edge_keys
+                        ),
+                    }),
+                    decision_hash=content_hash(unsigned),
+                    user_message_hash=content_hash(message),
+                    turn_index=context.turn_index,
+                    declared_at_ns=115 if step_index == 1 else 145,
+                )
+                return JourneySimulatorDecision(
+                    user_message=message,
+                    persona=context.schedule.persona,
+                    mission=context.schedule.mission,
+                    rationale="Selected from the complete response.",
+                    broker_request_id=broker_request_id,
+                    simulator_attestation=attestation,
+                    variant_binding=binding,
+                )
+
+            runner = self._runner(
+                Path(tmpdir),
+                schedule=schedule,
+                simulator=simulator,
+                transport=FakeTransport([
+                    "Agent> Model config: provider=deepseek, model=deepseek-chat, auth=api_key\nFirst.",
+                    "Agent> Second.",
+                    "Agent> Terminal.",
+                ]),
+                events=[self._event(1), self._event(2), self._event(3)],
+            )
+            with patch(
+                "tests.agent_live.dynamic_dual_ai_chaos.verify_runtime_postcondition",
+                return_value=self._verified_edge(),
+            ):
+                result = self._run(runner)
+            artifact = json.loads(result.evidence_path.read_text())
+            attestations = [
+                row["decision_provenance"]["variant_attestation"]
+                for row in artifact["turns"]
+            ]
+            self.assertEqual(
+                [item["source_step_id"] for item in attestations],
+                ["source-1", "source-2"],
+            )
+            self.assertTrue(
+                all(item["actor"]["actor_kind"] == "codex" for item in attestations)
             )
 
     def test_journey_transcript_is_redacted_at_the_persistence_boundary(self) -> None:
@@ -292,7 +454,8 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
                 schedule=self._schedule(max_turns=1),
                 simulator=simulator,
                 transport=transport,
-                events=[self._event(1), self._event(3)],
+                events=[self._event(1), self._event(2)],
+                registry=self._registry(ready=ready_at_turn_two),
             )
             result = self._run(runner)
 

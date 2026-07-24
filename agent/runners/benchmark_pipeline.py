@@ -196,7 +196,11 @@ def run_fake_node_smoke_benchmark(
         )
 
     repo = Path(__file__).resolve().parents[2]
-    smoke_root = Path(jobs_dir) / "fake_node_smoke" / f"{plan_path.stem}_{plan_path.stat().st_mtime_ns}"
+    smoke_root = _smoke_execution_root(
+        plan_path,
+        Path(jobs_dir),
+        kind="fake_node_smoke",
+    )
     if not smoke_root.is_absolute():
         smoke_root = repo / smoke_root
     smoke_root.mkdir(parents=True, exist_ok=True)
@@ -250,7 +254,11 @@ def run_real_node_smoke_benchmark(
         )
 
     repo = Path(__file__).resolve().parents[2]
-    smoke_root = Path(jobs_dir) / "real_node_smoke" / f"{plan_path.stem}_{plan_path.stat().st_mtime_ns}"
+    smoke_root = _smoke_execution_root(
+        plan_path,
+        Path(jobs_dir),
+        kind="real_node_smoke",
+    )
     if not smoke_root.is_absolute():
         smoke_root = repo / smoke_root
     smoke_root.mkdir(parents=True, exist_ok=True)
@@ -771,6 +779,18 @@ def _fake_node_smoke_plan(
     })
     plan["artifacts"] = artifacts
     return plan
+
+
+def _smoke_execution_root(
+    plan_path: Path,
+    jobs_dir: Path,
+    *,
+    kind: str,
+) -> Path:
+    if kind not in {"fake_node_smoke", "real_node_smoke"}:
+        raise ValueError(f"unsupported smoke execution kind: {kind}")
+    digest = hashlib.sha256(plan_path.read_bytes()).hexdigest()[:16]
+    return jobs_dir / kind / f"{plan_path.stem}_{digest}"
 
 
 def _real_node_smoke_plan(

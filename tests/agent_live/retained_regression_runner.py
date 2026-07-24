@@ -9,17 +9,35 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import replace
+import os
+import time
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from tests.agent_live.coverage_evidence import content_hash, pty_transcript_hash
-from tests.agent_live.chaos_scheduler import build_journey_schedule
+from tests.agent_live.coverage_evidence import (
+    PtyCliTurnRecord,
+    RuntimeTurnEvent,
+    content_hash,
+    pty_transcript_hash,
+    validate_runtime_turn_event,
+)
+from tests.agent_live.chaos_scheduler import (
+    build_journey_schedule,
+    journey_schedule_payload,
+)
+from tests.agent_live.codex_simulator_bridge import validate_simulator_attestation
 from tests.agent_live.dynamic_dual_ai_chaos import (
+    ChaosRunConfig,
+    JsonlRuntimeEventStream,
+    JourneyDecisionProvenance,
     JourneyPostconditionResult,
     JourneyPostconditionVerifierDefinition,
     JourneyVerifierContext,
+    _runtime_event_from_mapping,
+    _provider_model_from_startup,
     build_journey_outcome_verifier_registry,
+    transport_for_config,
 )
 from tests.agent_live.product_obligation_evidence import (
     PRODUCT_OBLIGATION_EVIDENCE_SCHEMA_VERSION,
@@ -29,6 +47,13 @@ from tests.agent_live.retained_regression_obligations import (
     POSTCONDITION_REGISTRY_ID,
     RETAINED_REGRESSION_OBLIGATION_COUNT,
     validate_retained_regression_obligations,
+)
+from tests.agent_live.retained_regression_predicates import (
+    POSTCONDITION_EVALUATORS,
+)
+from tests.agent_live.retained_regression_attestations import (
+    validate_variant_attestation,
+    validate_verifier_input_contract,
 )
 
 
@@ -43,6 +68,10 @@ RETAINED_REGRESSION_REGISTRY_IMPORT = (
 )
 RETAINED_REGRESSION_SEED = 20260724
 REQUIRED_ARTIFACT_ROLES = ("transcript", "runtime_events", "checkpoint_diff")
+LIVE_EXECUTION_BLOCKERS = (
+    "external_codex_actor_authentication_unavailable",
+    "independent_variant_semantic_verification_not_implemented",
+)
 
 _RULE_CLASSES: Mapping[str, tuple[str, ...]] = {
     "response_visible": (
@@ -88,7 +117,7 @@ _RULE_CLASSES: Mapping[str, tuple[str, ...]] = {
         "compatible_environment_retained",
         "mode_specific_state_invalidated",
         "rpc_groups_rerequired",
-        "effective_runtime_method_set_materialized",
+        "effective_workload_commit_replaces_defaults",
         "copied_scalar_normalized",
         "rpc_schema_evidence_extracted",
         "example_endpoint_scope_preserved",
@@ -111,7 +140,7 @@ _RULE_CLASSES: Mapping[str, tuple[str, ...]] = {
         "typed_confirmation_rejected_by_side_channel",
         "backtrack_lost_configuration_state",
         "stale_preflight_executed",
-        "removed_default_method_materialized",
+        "removed_default_method_committed",
         "custom_method_collection_looped",
         "example_endpoint_replaced_runtime_endpoint",
         "schema_intake_looped",
@@ -296,8 +325,10 @@ def _validate_journey_lineage(
     failures: list[str] = []
     previous_event = context.initial_event
     for index, (turn, event) in enumerate(zip(turns, events)):
-        if event.schema_version != 3:
-            failures.append(f"turn-{index}:schema")
+        try:
+            validate_runtime_turn_event(event)
+        except ValueError as exc:
+            failures.append(f"turn-{index}:event:{exc}")
         if event.before_fingerprint != previous_event.after_fingerprint:
             failures.append(f"turn-{index}:fingerprint-chain")
         if (
@@ -342,74 +373,7 @@ def _validate_journey_lineage(
     }
 
 
-def _response_driven_selection_observed(
-    context: JourneyVerifierContext,
-) -> tuple[bool, dict[str, Any]]:
-    decision_count = len(context.completed_decisions)
-    return decision_count == len(context.completed_turns), {
-        "response_bound_decision_count": decision_count,
-    }
-
-
-def _duplicate_job_submission(
-    context: JourneyVerifierContext,
-) -> tuple[bool, dict[str, Any]]:
-    submissions: dict[str, set[tuple[str, str]]] = {}
-    for event in context.completed_events:
-        receipt = dict(event.execution_receipt_summary or {})
-        key = str(
-            receipt.get("receipt_idempotency_key")
-            or receipt.get("intent_idempotency_key")
-            or ""
-        )
-        receipt_id = str(receipt.get("receipt_id") or "")
-        job_id = str(receipt.get("job_id") or "")
-        if key and (receipt_id or job_id):
-            submissions.setdefault(key, set()).add((receipt_id, job_id))
-    duplicates = {
-        key: len(identities)
-        for key, identities in submissions.items()
-        if len(identities) > 1
-    }
-    return bool(duplicates), {
-        "submission_key_count": len(submissions),
-        "duplicate_submission_counts": duplicates,
-    }
-
-
-def _typed_confirmation_rejected_by_side_channel(
-    context: JourneyVerifierContext,
-) -> tuple[bool, dict[str, Any]]:
-    rejected_after_acceptance: list[str] = []
-    accepted_pending_resolution_count = 0
-    for event in context.completed_events:
-        accepted_in_turn = any(
-            receipt.get("receipt_type") == "pending_resolution"
-            and receipt.get("verdict") == "accepted"
-            for receipt in event.control_receipts
-        )
-        if not accepted_in_turn:
-            continue
-        accepted_pending_resolution_count += 1
-        rejected_after_acceptance.extend(
-            str(receipt.get("receipt_id") or "")
-            for receipt in event.control_receipts
-            if receipt.get("receipt_type") == "domain_commit"
-            and receipt.get("completion") == "rejected"
-        )
-    return bool(rejected_after_acceptance), {
-        "accepted_pending_resolution_count": accepted_pending_resolution_count,
-        "rejected_domain_receipt_ids": rejected_after_acceptance,
-    }
-
-
-_IMPLEMENTED_POSTCONDITION_EVALUATORS = {
-    "response_driven_selection_observed": _response_driven_selection_observed,
-    "duplicate_job_submission": _duplicate_job_submission,
-    "typed_confirmation_rejected_by_side_channel": (
-        _typed_confirmation_rejected_by_side_channel
-    ),
-}
+_IMPLEMENTED_POSTCONDITION_EVALUATORS = dict(POSTCONDITION_EVALUATORS)
 
 
 RETAINED_REGRESSION_JOURNEY_VERIFIER_REGISTRY = (
@@ -465,7 +429,10 @@ def build_retained_regression_runner_provider(
                 RETAINED_REGRESSION_JOURNEY_VERIFIER_REGISTRY.registry_id
             ),
             "source_contract_registry_id": POSTCONDITION_REGISTRY_ID,
-            "execution_readiness": "blocked",
+            "execution_readiness": (
+                "ready" if not LIVE_EXECUTION_BLOCKERS else "blocked"
+            ),
+            "execution_blockers": list(LIVE_EXECUTION_BLOCKERS),
             "unsupported_postcondition_ids": sorted(
                 set(KNOWN_POSTCONDITION_IDS)
                 - set(_IMPLEMENTED_POSTCONDITION_EVALUATORS)
@@ -550,7 +517,10 @@ def validate_retained_regression_runner_provider(
         or registry.get("journey_registry_id")
         != RETAINED_REGRESSION_JOURNEY_VERIFIER_REGISTRY.registry_id
         or registry.get("source_contract_registry_id") != POSTCONDITION_REGISTRY_ID
-        or registry.get("execution_readiness") != "blocked"
+        or registry.get("execution_readiness")
+        != ("ready" if not LIVE_EXECUTION_BLOCKERS else "blocked")
+        or registry.get("execution_blockers")
+        != list(LIVE_EXECUTION_BLOCKERS)
         or set(registry.get("unsupported_postcondition_ids") or ())
         != (
             set(KNOWN_POSTCONDITION_IDS)
@@ -597,7 +567,6 @@ def build_product_obligation_evidence_artifact(
     revision: Mapping[str, str],
     execution: Mapping[str, Any],
     artifact_paths: Mapping[str, str | Path],
-    verifier_context: JourneyVerifierContext,
 ) -> dict[str, Any]:
     """Run the authoritative evaluator and adapt its results to admission."""
 
@@ -612,7 +581,13 @@ def build_product_obligation_evidence_artifact(
         execution,
         variant=str(obligation.get("variant") or ""),
     )
-    artifacts = _artifact_references(artifact_paths)
+    artifacts, bound_context = _reconstruct_verifier_context(
+        artifact_paths,
+        obligation=obligation,
+        target=target,
+        revision=active_revision,
+        execution=execution_payload,
+    )
     artifact_hashes = [item["sha256"] for item in artifacts]
     expected_ids = _expected_verifier_ids(obligation)
     normalized_results = []
@@ -627,7 +602,7 @@ def build_product_obligation_evidence_artifact(
             verifier_id
         ]
         result = definition.verifier(replace(
-            verifier_context,
+            bound_context,
             evaluating_postcondition_id=verifier_id,
         ))
         if (
@@ -688,6 +663,280 @@ def build_product_obligation_evidence_artifact(
     return {**unsigned, "evidence_hash": content_hash(unsigned)}
 
 
+def execute_exact_retained_regression(
+    *,
+    repo_root: str | Path,
+    obligation: Mapping[str, Any],
+    target: Mapping[str, Any],
+    revision: Mapping[str, str],
+    output_root: str | Path,
+    timeout_seconds: float = 180.0,
+) -> Path:
+    """Replay one immutable exact fixture through the real Linux CLI/PTY."""
+
+    root = Path(repo_root).resolve()
+    active_revision = _validated_revision(revision)
+    if (
+        str(obligation.get("variant") or "") != "exact"
+        or str(target.get("variant") or "") != "exact"
+    ):
+        raise ValueError("exact retained-regression executor requires an exact target")
+    if target.get("obligation_id") != obligation.get("obligation_id"):
+        raise ValueError("exact retained-regression target identity is stale")
+    turns_to_submit = tuple(
+        str(item)
+        for item in dict(obligation.get("stimulus_contract") or {}).get(
+            "turns", ()
+        )
+    )
+    if not turns_to_submit:
+        raise ValueError("exact retained-regression fixture has no turns")
+
+    obligation_id = str(obligation["obligation_id"])
+    execution_id = (
+        f"g3-exact-{content_hash({'obligation_id': obligation_id, 'revision': active_revision})[:20]}"
+    )
+    runtime_root = Path(output_root).resolve() / execution_id
+    if runtime_root.exists():
+        raise FileExistsError(
+            f"exact retained-regression runtime is immutable: {runtime_root}"
+        )
+    runtime_root.mkdir(parents=True)
+    session_id = execution_id
+    checkpoint_path = runtime_root / "checkpoints.sqlite"
+    event_path = runtime_root / "turn-events.jsonl"
+    try:
+        container_runtime = (
+            Path("/workspace") / runtime_root.relative_to(root)
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "exact retained-regression output must be inside the repository"
+        ) from exc
+    config = ChaosRunConfig.docker(
+        root,
+        session_id=session_id,
+        execution_id=execution_id,
+        session_purpose="retained-regression-exact",
+        runtime_root=runtime_root,
+        runtime_root_in_process=container_runtime,
+        response_timeout_seconds=timeout_seconds,
+    )
+    from tests.agent_live.runtime_checkpoint import (
+        reviewed_scenario,
+        seed_runtime_checkpoint,
+    )
+
+    scenario = reviewed_scenario(
+        str(dict(obligation["seed_contract"])["scenario_id"])
+    )
+    seed_runtime_checkpoint(
+        scenario.seed_state,
+        checkpoint_path=checkpoint_path,
+        session_id=session_id,
+        session_purpose="retained-regression-exact",
+        scenario_id=scenario.scenario_id,
+        scenario_state_fingerprint=scenario.state_fingerprint,
+    )
+    env = os.environ.copy()
+    env.update({
+        "ANYCHAIN_AGENT_CHECKPOINT_PATH": str(
+            container_runtime / "checkpoints.sqlite"
+        ),
+        "ANYCHAIN_AGENT_SESSION_ID": session_id,
+        "ANYCHAIN_AGENT_SESSION_PURPOSE": "retained-regression-exact",
+        "ANYCHAIN_AGENT_JOBS_DIR": str(container_runtime / "jobs"),
+        "ANYCHAIN_AGENT_TURN_EVENT_FILE": str(
+            container_runtime / "turn-events.jsonl"
+        ),
+    })
+    transport = transport_for_config(config)
+    event_stream = JsonlRuntimeEventStream(event_path)
+    observed_turns: list[PtyCliTurnRecord] = []
+    observed_events: list[RuntimeTurnEvent] = []
+    transcript_lines: list[str] = []
+    started_at = str(time.time_ns())
+    transport.start(env=env)
+    try:
+        previous_response = transport.read_complete_agent_response(
+            timeout_seconds=timeout_seconds
+        )
+        previous_received_at_ns = time.time_ns()
+        provider, model = _provider_model_from_startup(previous_response)
+        initial_event = event_stream.baseline()
+        validate_runtime_turn_event(initial_event)
+        if dict(initial_event.revision) != active_revision:
+            raise RuntimeError(
+                "exact retained-regression startup revision is stale"
+            )
+        transcript_lines.append(previous_response)
+        if initial_event.pending_question_id == "resume_harness_session":
+            transport.submit_bracketed_paste("1")
+            previous_response = transport.read_complete_agent_response(
+                timeout_seconds=timeout_seconds
+            )
+            initial_event = event_stream.next_event(
+                timeout_seconds=timeout_seconds
+            )
+            validate_runtime_turn_event(initial_event)
+            previous_received_at_ns = time.time_ns()
+            transcript_lines.extend(("User> 1", previous_response))
+
+        baseline = initial_event
+        for user_message in turns_to_submit:
+            submitted_at_ns = time.time_ns()
+            transport.submit_bracketed_paste(user_message)
+            committed = event_stream.next_event(
+                timeout_seconds=timeout_seconds
+            )
+            response = transport.read_complete_agent_response(
+                timeout_seconds=timeout_seconds
+            )
+            response_received_at_ns = time.time_ns()
+            validate_runtime_turn_event(committed)
+            if (
+                dict(committed.revision) != active_revision
+                or committed.before_fingerprint
+                != baseline.after_fingerprint
+                or committed.turn_index != baseline.turn_index + 1
+            ):
+                raise RuntimeError(
+                    "exact retained-regression runtime lineage is stale"
+                )
+            turn = PtyCliTurnRecord(
+                session_id=session_id,
+                turn_index=committed.turn_index,
+                previous_agent_response=previous_response,
+                user_message=user_message,
+                agent_response=response,
+                provider=provider,
+                model=model,
+                before_fingerprint=committed.before_fingerprint,
+                after_fingerprint=committed.after_fingerprint,
+                transcript_hash=pty_transcript_hash(
+                    session_id=session_id,
+                    turn_index=committed.turn_index,
+                    previous_agent_response=previous_response,
+                    user_message=user_message,
+                    agent_response=response,
+                ),
+                previous_response_received_at_ns=previous_received_at_ns,
+                user_message_submitted_at_ns=submitted_at_ns,
+                agent_response_received_at_ns=response_received_at_ns,
+            )
+            observed_turns.append(turn)
+            observed_events.append(committed)
+            transcript_lines.extend((f"User> {user_message}", response))
+            previous_response = response
+            previous_received_at_ns = response_received_at_ns
+            baseline = committed
+    finally:
+        transport.close()
+
+    artifact_paths = _write_exact_retained_artifacts(
+        runtime_root=runtime_root,
+        obligation=obligation,
+        target=target,
+        revision=active_revision,
+        execution_id=execution_id,
+        initial_event=initial_event,
+        events=observed_events,
+        turns=observed_turns,
+    )
+    execution = {
+        "execution_id": execution_id,
+        "runner": "retained-regression-real-cli-v1",
+        "transport": "real_pty",
+        "provider": provider,
+        "model": model,
+        "started_at": started_at,
+        "finished_at": str(time.time_ns()),
+    }
+    evidence = build_product_obligation_evidence_artifact(
+        obligation=obligation,
+        target=target,
+        revision=active_revision,
+        execution=execution,
+        artifact_paths=artifact_paths,
+    )
+    evidence_path = runtime_root / "product-obligation-evidence.json"
+    evidence_path.write_text(
+        json.dumps(evidence, ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+    (runtime_root / "transcript.txt").write_text(
+        "\n".join(transcript_lines).rstrip() + "\n",
+        encoding="utf-8",
+    )
+    return evidence_path
+
+
+def _write_exact_retained_artifacts(
+    *,
+    runtime_root: Path,
+    obligation: Mapping[str, Any],
+    target: Mapping[str, Any],
+    revision: Mapping[str, str],
+    execution_id: str,
+    initial_event: RuntimeTurnEvent,
+    events: Sequence[RuntimeTurnEvent],
+    turns: Sequence[PtyCliTurnRecord],
+) -> dict[str, Path]:
+    if not turns or len(events) != len(turns):
+        raise ValueError("exact retained-regression runtime lineage is incomplete")
+    schedule = _schedule_for_evidence(
+        obligation=obligation,
+        target=target,
+        revision=revision,
+    )
+    identity = {
+        "obligation_id": str(obligation["obligation_id"]),
+        "execution_id": execution_id,
+        "revision": dict(revision),
+        "schedule_id": schedule.schedule_id,
+        "verifier_input_contract_hash": content_hash(
+            _verifier_input_contract(obligation)
+        ),
+    }
+    payloads = {
+        "transcript": {
+            "turns": [{"turn": asdict(turn)} for turn in turns],
+        },
+        "runtime_events": {
+            "initial_event": asdict(initial_event),
+            "events": [asdict(event) for event in events],
+        },
+        "checkpoint_diff": {
+            "before_fingerprint": initial_event.after_fingerprint,
+            "after_fingerprint": events[-1].after_fingerprint,
+            "material_state_diff_hashes": [
+                dict(event.material_state_diff_hashes)
+                for event in events
+            ],
+        },
+    }
+    paths: dict[str, Path] = {}
+    artifact_root = runtime_root / "retained-artifacts"
+    artifact_root.mkdir()
+    for role, payload in payloads.items():
+        unsigned = {
+            "schema_version": 1,
+            "artifact_type": f"retained_regression_{role}",
+            "identity": identity,
+            **payload,
+        }
+        artifact = {**unsigned, "artifact_hash": content_hash(unsigned)}
+        path = artifact_root / f"{role}.json"
+        path.write_text(
+            json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+        paths[role] = path
+    return paths
+
+
 def _build_target(
     obligation: Mapping[str, Any],
     *,
@@ -738,40 +987,65 @@ def _build_target(
         "read_complete_agent_response_before_each_turn": True,
         "prewritten_future_turns_forbidden": True,
     }
+    journey = {
+        "journey_id": str(obligation["obligation_id"]),
+        "start_scenario": obligation["seed_contract"]["scenario_id"],
+        "persona": _persona_for_variant(variant),
+        "mission": (
+            "Exercise the frozen retained-regression contract "
+            f"{obligation['case_id']}/{variant}; choose each user turn only "
+            "after observing the complete preceding Agent response. "
+            "The source-turn hash is "
+            f"{obligation['stimulus_contract']['source_turns_hash']}."
+        ),
+        "allowed_risk_factors": [f"retained_regression_{variant}"],
+        "max_turns": 12,
+        "terminal_outcome": {
+            "outcome_id": f"{obligation['obligation_id']}-complete",
+            "required_postcondition_ids": list(
+                verifier["required_postcondition_ids"]
+            ),
+        },
+        "forbidden_outcomes": [
+            {
+                "outcome_id": (
+                    f"{obligation['obligation_id']}-forbidden-{index}"
+                ),
+                "required_postcondition_ids": [postcondition_id],
+            }
+            for index, postcondition_id in enumerate(
+                verifier["forbidden_postcondition_ids"],
+                start=1,
+            )
+        ],
+        "verifier_input_contract": _verifier_input_contract(obligation),
+    }
+    revision = dict(obligation["revision_binding"]["revision"])
+    schedule = build_journey_schedule(
+        revision=revision,
+        seed=RETAINED_REGRESSION_SEED,
+        journey=journey,
+    )
     base["journey_definition"] = {
         "lane": "journey",
         "verifier_registry": RETAINED_REGRESSION_REGISTRY_IMPORT,
-        "journey": {
-            "journey_id": str(obligation["obligation_id"]),
-            "start_scenario": obligation["seed_contract"]["scenario_id"],
-            "persona": _persona_for_variant(variant),
-            "mission": (
-                "Exercise the frozen retained-regression contract "
-                f"{obligation['case_id']}/{variant}; choose each user turn only "
-                "after observing the complete preceding Agent response. "
-                "The source-turn hash is "
-                f"{obligation['stimulus_contract']['source_turns_hash']}."
+        "verifier_input_contract": _verifier_input_contract(obligation),
+        "journey": journey,
+        "frozen_execution": {
+            "obligation_id": str(obligation["obligation_id"]),
+            "seed": RETAINED_REGRESSION_SEED,
+            "schedule_id": schedule.schedule_id,
+            "schedule_hash": content_hash(
+                journey_schedule_payload(schedule)
             ),
-            "allowed_risk_factors": [f"retained_regression_{variant}"],
-            "max_turns": 12,
-            "terminal_outcome": {
-                "outcome_id": f"{obligation['obligation_id']}-complete",
-                "required_postcondition_ids": list(
-                    verifier["required_postcondition_ids"]
-                ),
-            },
-            "forbidden_outcomes": [
-                {
-                    "outcome_id": (
-                        f"{obligation['obligation_id']}-forbidden-{index}"
-                    ),
-                    "required_postcondition_ids": [postcondition_id],
-                }
-                for index, postcondition_id in enumerate(
-                    verifier["forbidden_postcondition_ids"],
-                    start=1,
-                )
-            ],
+            "subject_group": schedule.subject_group,
+            "revision_binding": revision,
+        },
+        "simulator_attestation_contract": {
+            "required": True,
+            "identity_strength": "auditable_declaration_only",
+            "scripted_actor_qualifies": False,
+            "cryptographic_identity_claimed": False,
         },
     }
     return base
@@ -869,11 +1143,21 @@ def _validate_target(
         raise ValueError("response-driven retained regression contract is incomplete")
     journey_definition = dict(target.get("journey_definition") or {})
     journey = dict(journey_definition.get("journey") or {})
+    frozen_execution = dict(
+        journey_definition.get("frozen_execution") or {}
+    )
+    simulator_attestation_contract = dict(
+        journey_definition.get("simulator_attestation_contract") or {}
+    )
     serialized = repr(journey_definition)
     if (
         journey_definition.get("lane") != "journey"
         or journey_definition.get("verifier_registry")
         != RETAINED_REGRESSION_REGISTRY_IMPORT
+        or journey_definition.get("verifier_input_contract")
+        != _verifier_input_contract(obligation)
+        or journey.get("verifier_input_contract")
+        != _verifier_input_contract(obligation)
     ):
         raise ValueError("retained regression Journey lane is invalid")
     if any(
@@ -883,13 +1167,49 @@ def _validate_target(
         raise ValueError("response-driven retained regression contains prewritten turns")
     if str(obligation["stimulus_contract"]["source_turns_hash"]) not in serialized:
         raise ValueError("retained regression Journey definition is incomplete")
-    build_journey_schedule(
-        revision=dict(
-            obligation["revision_binding"]["revision"]
-        ),
+    revision = dict(obligation["revision_binding"]["revision"])
+    schedule = build_journey_schedule(
+        revision=revision,
         seed=RETAINED_REGRESSION_SEED,
         journey=journey,
     )
+    if frozen_execution != {
+        "obligation_id": str(obligation["obligation_id"]),
+        "seed": RETAINED_REGRESSION_SEED,
+        "schedule_id": schedule.schedule_id,
+        "schedule_hash": content_hash(journey_schedule_payload(schedule)),
+        "subject_group": schedule.subject_group,
+        "revision_binding": revision,
+    }:
+        raise ValueError(
+            "retained regression frozen Journey execution is stale"
+        )
+    if simulator_attestation_contract != {
+        "required": True,
+        "identity_strength": "auditable_declaration_only",
+        "scripted_actor_qualifies": False,
+        "cryptographic_identity_claimed": False,
+    }:
+        raise ValueError(
+            "retained regression simulator attestation policy is invalid"
+        )
+
+
+def _verifier_input_contract(
+    obligation: Mapping[str, Any],
+) -> dict[str, Any]:
+    stimulus = dict(obligation.get("stimulus_contract") or {})
+    return {
+        "mode": str(stimulus.get("mode") or ""),
+        "source_contract": dict(stimulus.get("source_contract") or {}),
+        "source_contract_hash": str(
+            stimulus.get("source_contract_hash") or ""
+        ),
+        "variant_contract": dict(stimulus.get("variant_contract") or {}),
+        "variant_contract_hash": str(
+            stimulus.get("variant_contract_hash") or ""
+        ),
+    }
 
 
 def _build_verifier_rules() -> dict[str, dict[str, Any]]:
@@ -988,22 +1308,324 @@ def _validate_verifier_rules(
     return index
 
 
-def _artifact_references(
+def _reconstruct_verifier_context(
     artifact_paths: Mapping[str, str | Path],
-) -> list[dict[str, str]]:
+    *,
+    obligation: Mapping[str, Any],
+    target: Mapping[str, Any],
+    revision: Mapping[str, str],
+    execution: Mapping[str, str],
+) -> tuple[list[dict[str, str]], JourneyVerifierContext]:
     if set(artifact_paths) != set(REQUIRED_ARTIFACT_ROLES):
         raise ValueError("retained regression evidence requires exactly three artifacts")
-    references = []
+    variant = str(target.get("variant") or "")
+    expected_schedule = _schedule_for_evidence(
+        obligation=obligation,
+        target=target,
+        revision=revision,
+    )
+    expected_identity = {
+        "obligation_id": str(obligation.get("obligation_id") or ""),
+        "execution_id": str(execution.get("execution_id") or ""),
+        "revision": dict(revision),
+        "schedule_id": expected_schedule.schedule_id,
+        "verifier_input_contract_hash": content_hash(
+            _verifier_input_contract(obligation)
+        ),
+    }
+    references: list[dict[str, str]] = []
+    payloads: dict[str, Mapping[str, Any]] = {}
     for role in REQUIRED_ARTIFACT_ROLES:
         path = Path(artifact_paths[role]).expanduser().resolve()
         if not path.is_file() or path.stat().st_size <= 0:
             raise ValueError(f"retained regression evidence artifact is missing: {path}")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"retained regression {role} artifact is not JSON"
+            ) from exc
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"retained regression {role} artifact is invalid")
+        unsigned = {
+            key: value for key, value in payload.items()
+            if key != "artifact_hash"
+        }
+        if (
+            payload.get("schema_version") != 1
+            or payload.get("artifact_type")
+            != f"retained_regression_{role}"
+            or payload.get("identity") != expected_identity
+            or payload.get("artifact_hash") != content_hash(unsigned)
+        ):
+            raise ValueError(
+                f"retained regression {role} artifact binding is stale"
+            )
+        payloads[role] = payload
         references.append({
             "role": role,
             "path": str(path),
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         })
-    return references
+    transcript_rows = payloads["transcript"].get("turns")
+    runtime_rows = payloads["runtime_events"].get("events")
+    initial_raw = payloads["runtime_events"].get("initial_event")
+    if (
+        not isinstance(transcript_rows, list)
+        or not transcript_rows
+        or not isinstance(runtime_rows, list)
+        or len(runtime_rows) != len(transcript_rows)
+        or not isinstance(initial_raw, Mapping)
+    ):
+        raise ValueError("retained regression artifact turn lineage is incomplete")
+    initial_event = _runtime_event_from_mapping(initial_raw)
+    validate_runtime_turn_event(initial_event)
+    events = tuple(
+        _runtime_event_from_mapping(item)
+        for item in runtime_rows
+        if isinstance(item, Mapping)
+    )
+    if len(events) != len(runtime_rows):
+        raise ValueError("retained regression runtime event is invalid")
+    turns: list[PtyCliTurnRecord] = []
+    decisions: list[JourneyDecisionProvenance] = []
+    transcript: list[tuple[str, str]] = []
+    seen_broker_request_ids: set[str] = set()
+    verifier_input = validate_verifier_input_contract(
+        _verifier_input_contract(obligation)
+    )
+    for index, row in enumerate(transcript_rows):
+        expected_row_fields = (
+            {"turn"} if variant == "exact" else {"turn", "decision"}
+        )
+        if not isinstance(row, Mapping) or set(row) != expected_row_fields:
+            raise ValueError("retained regression transcript row is invalid")
+        turn_raw = row.get("turn")
+        decision_raw = row.get("decision")
+        if not isinstance(turn_raw, Mapping) or (
+            variant != "exact"
+            and not isinstance(decision_raw, Mapping)
+        ):
+            raise ValueError("retained regression transcript lineage is invalid")
+        try:
+            turn = PtyCliTurnRecord(**dict(turn_raw))
+            decision = (
+                JourneyDecisionProvenance(**dict(decision_raw))
+                if variant != "exact"
+                else None
+            )
+        except TypeError as exc:
+            raise ValueError(
+                "retained regression transcript schema is invalid"
+            ) from exc
+        event = events[index]
+        validate_runtime_turn_event(event)
+        expected_before = (
+            initial_event.after_fingerprint
+            if index == 0
+            else events[index - 1].after_fingerprint
+        )
+        expected_turn_index = (
+            initial_event.turn_index + 1
+            if index == 0
+            else events[index - 1].turn_index + 1
+        )
+        expected_context_binding = {
+            "session_id": turn.session_id,
+            "turn_index": turn.turn_index,
+            "previous_response_hash": content_hash(
+                turn.previous_agent_response
+            ),
+            "previous_response_received_at_ns": (
+                turn.previous_response_received_at_ns
+            ),
+            "control_identity": {
+                "lane": "journey",
+                "schedule_id": expected_schedule.schedule_id,
+            },
+            "observed_edge_keys": list(
+                (decision.simulator_context_binding if decision else {}).get(
+                    "observed_edge_keys", ()
+                )
+            ),
+        }
+        if (
+            turn.session_id != initial_event.thread_id
+            or event.thread_id != initial_event.thread_id
+            or event.turn_index != expected_turn_index
+            or turn.turn_index != event.turn_index
+            or (
+                decision is not None
+                and decision.turn_index != event.turn_index
+            )
+            or event.before_fingerprint != expected_before
+            or turn.before_fingerprint != event.before_fingerprint
+            or turn.after_fingerprint != event.after_fingerprint
+            or turn.transcript_hash
+            != pty_transcript_hash(
+                session_id=turn.session_id,
+                turn_index=turn.turn_index,
+                previous_agent_response=turn.previous_agent_response,
+                user_message=turn.user_message,
+                agent_response=turn.agent_response,
+            )
+            or (
+                decision is not None
+                and (
+                    decision.previous_response_hash
+                    != content_hash(turn.previous_agent_response)
+                    or decision.user_message_hash
+                    != content_hash(turn.user_message)
+                    or decision.submitted_at_ns
+                    != turn.user_message_submitted_at_ns
+                    or dict(decision.simulator_context_binding)
+                    != expected_context_binding
+                )
+            )
+            or turn.provider != execution["provider"]
+            or turn.model != execution["model"]
+            or turn.previous_response_received_at_ns
+            < int(execution["started_at"])
+            or turn.agent_response_received_at_ns
+            > int(execution["finished_at"])
+        ):
+            raise ValueError(
+                "retained regression transcript/runtime binding is stale"
+            )
+        if decision is not None:
+            request_id = str(decision.broker_request_id or "")
+            if not request_id or request_id in seen_broker_request_ids:
+                raise ValueError(
+                    "retained regression broker request identity is missing or replayed"
+                )
+            seen_broker_request_ids.add(request_id)
+            unsigned_decision = {
+                "previous_response_hash": decision.previous_response_hash,
+                "broker_request_id": request_id,
+                "user_message": turn.user_message,
+                "persona": decision.persona,
+                "mission": decision.mission,
+                "rationale": decision.rationale,
+                "risk_factor_ids": list(decision.risk_factor_ids),
+                "variant_binding": {
+                    "source_step_id": str(
+                        decision.variant_attestation.get(
+                            "source_step_id", ""
+                        )
+                    ),
+                    "semantic_role": str(
+                        decision.variant_attestation.get(
+                            "semantic_role", ""
+                        )
+                    ),
+                },
+            }
+            validate_simulator_attestation(
+                decision.simulator_attestation,
+                previous_response_hash=decision.previous_response_hash,
+                decision_hash=content_hash(unsigned_decision),
+                request_id=request_id,
+                context_hash=content_hash(
+                    decision.simulator_context_binding
+                ),
+                user_message_hash=decision.user_message_hash,
+                turn_index=turn.turn_index,
+                submitted_at_ns=turn.user_message_submitted_at_ns,
+            )
+            validate_variant_attestation(
+                decision.variant_attestation,
+                verifier_input_contract=verifier_input,
+                turn=turn,
+                decision=decision,
+            )
+        turns.append(turn)
+        if decision is not None:
+            decisions.append(decision)
+        transcript.append((turn.user_message, turn.agent_response))
+    checkpoint = payloads["checkpoint_diff"]
+    if (
+        checkpoint.get("before_fingerprint") != initial_event.after_fingerprint
+        or checkpoint.get("after_fingerprint") != events[-1].after_fingerprint
+        or checkpoint.get("material_state_diff_hashes")
+        != [dict(event.material_state_diff_hashes) for event in events]
+    ):
+        raise ValueError("retained regression checkpoint diff is stale")
+    if dict(initial_event.revision) != dict(revision) or any(
+        dict(event.revision) != dict(revision) for event in events
+    ):
+        raise ValueError("retained regression runtime revision is stale")
+    context = JourneyVerifierContext(
+        schedule=expected_schedule,
+        initial_event=initial_event,
+        current_event=events[-1],
+        completed_turns=tuple(turns),
+        transcript=tuple(transcript),
+        observed_edge_keys=(),
+        latest_turn=turns[-1],
+        completed_events=events,
+        completed_decisions=tuple(decisions),
+        verifier_input_contract=verifier_input,
+    )
+    return references, context
+
+
+def _schedule_for_evidence(
+    *,
+    obligation: Mapping[str, Any],
+    target: Mapping[str, Any],
+    revision: Mapping[str, str],
+) -> Any:
+    if str(target.get("variant") or "") != "exact":
+        journey_definition = dict(target.get("journey_definition") or {})
+        journey = dict(journey_definition.get("journey") or {})
+    else:
+        verifier = dict(obligation.get("verifier_contract") or {})
+        journey = {
+            "journey_id": str(obligation.get("obligation_id") or ""),
+            "start_scenario": str(
+                dict(obligation.get("seed_contract") or {}).get(
+                    "scenario_id", ""
+                )
+            ),
+            "persona": "exact retained regression fixture replay",
+            "mission": "Replay the immutable retained regression turns.",
+            "allowed_risk_factors": [],
+            "max_turns": max(
+                1,
+                len(
+                    dict(obligation.get("stimulus_contract") or {}).get(
+                        "turns", ()
+                    )
+                ),
+            ),
+            "terminal_outcome": {
+                "outcome_id": (
+                    f"{obligation.get('obligation_id')}-exact-complete"
+                ),
+                "required_postcondition_ids": list(
+                    verifier.get("required_postcondition_ids") or ()
+                ),
+            },
+            "forbidden_outcomes": [
+                {
+                    "outcome_id": (
+                        f"{obligation.get('obligation_id')}-exact-forbidden-"
+                        f"{index}"
+                    ),
+                    "required_postcondition_ids": [postcondition_id],
+                }
+                for index, postcondition_id in enumerate(
+                    verifier.get("forbidden_postcondition_ids") or (),
+                    start=1,
+                )
+            ],
+            "verifier_input_contract": _verifier_input_contract(obligation),
+        }
+    return build_journey_schedule(
+        revision=revision,
+        seed=RETAINED_REGRESSION_SEED,
+        journey=journey,
+    )
 
 
 def _validated_execution_identity(
@@ -1034,6 +1656,17 @@ def _validated_execution_identity(
         raise ValueError("retained regression evidence class does not match its variant")
     if payload["started_at"] == payload["finished_at"]:
         raise ValueError("retained regression execution interval is empty")
+    try:
+        started_at_ns = int(payload["started_at"])
+        finished_at_ns = int(payload["finished_at"])
+    except ValueError as exc:
+        raise ValueError(
+            "retained regression execution interval is invalid"
+        ) from exc
+    if started_at_ns <= 0 or finished_at_ns <= started_at_ns:
+        raise ValueError(
+            "retained regression execution interval is invalid"
+        )
     return payload
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import asdict
 from dataclasses import replace
 import hashlib
 import json
@@ -9,10 +10,14 @@ import time
 import unittest
 from pathlib import Path
 
-from tests.agent_live.product_obligation_evidence import (
-    admit_product_obligation_evidence,
+from tests.agent_live.chaos_scheduler import (
+    build_journey_schedule,
+    journey_schedule_payload,
 )
-from tests.agent_live.chaos_scheduler import build_journey_schedule
+from tests.agent_live.codex_simulator_bridge import (
+    build_simulator_attestation,
+    simulator_context_binding,
+)
 from tests.agent_live.coverage_evidence import (
     PtyCliTurnRecord,
     RuntimeTurnEvent,
@@ -28,11 +33,15 @@ from tests.agent_live.retained_regression_obligations import (
     KNOWN_POSTCONDITION_IDS,
     build_retained_regression_obligations,
 )
+from tests.agent_live.retained_regression_attestations import (
+    build_variant_attestation,
+)
 from tests.agent_live.retained_regression_runner import (
     build_product_obligation_evidence_artifact,
     build_retained_regression_runner_provider,
     RETAINED_REGRESSION_JOURNEY_VERIFIER_REGISTRY,
     RETAINED_REGRESSION_REGISTRY_IMPORT,
+    _write_exact_retained_artifacts,
     retained_regression_journey_definitions,
     validate_retained_regression_runner_provider,
 )
@@ -87,6 +96,9 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
         for definition in journeys:
             serialized = json.dumps(definition)
             journey = definition["journey"]
+            verifier_input = definition["verifier_input_contract"]
+            self.assertTrue(verifier_input["source_contract_hash"])
+            self.assertTrue(verifier_input["variant_contract_hash"])
             self.assertEqual(
                 definition["verifier_registry"],
                 RETAINED_REGRESSION_REGISTRY_IMPORT,
@@ -97,8 +109,36 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
                 journey=journey,
             )
             self.assertEqual(schedule.journey_id, journey["journey_id"])
+            self.assertEqual(
+                definition["frozen_execution"],
+                {
+                    "obligation_id": schedule.journey_id,
+                    "seed": schedule.seed,
+                    "schedule_id": schedule.schedule_id,
+                    "schedule_hash": content_hash(
+                        journey_schedule_payload(schedule)
+                    ),
+                    "subject_group": schedule.subject_group,
+                    "revision_binding": REVISION,
+                },
+            )
+            self.assertTrue(
+                definition["simulator_attestation_contract"]["required"]
+            )
             for forbidden in ("turns", "messages", "future_user_turns", "dialogue"):
                 self.assertNotIn(f'"{forbidden}"', serialized)
+
+    def test_provider_remains_blocked_at_unresolved_trust_boundaries(self) -> None:
+        registry = self.provider["verifier_registry"]
+        self.assertEqual(registry["execution_readiness"], "blocked")
+        self.assertEqual(
+            registry["execution_blockers"],
+            [
+                "external_codex_actor_authentication_unavailable",
+                "independent_variant_semantic_verification_not_implemented",
+            ],
+        )
+        self.assertEqual(registry["unsupported_postcondition_ids"], [])
 
     def test_registry_is_importable_and_fail_closed(self) -> None:
         registry = load_verifier_registry(RETAINED_REGRESSION_REGISTRY_IMPORT)
@@ -179,9 +219,11 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
                 revision=REVISION,
             )
 
-    def test_adapter_evaluates_and_cannot_admit_unimplemented_semantics(self) -> None:
+    def test_exact_adapter_reconstructs_immutable_fixture_from_artifacts(self) -> None:
         obligation = next(
-            row for row in self.obligations if row["variant"] == "exact"
+            row for row in self.obligations
+            if row["variant"] == "exact"
+            and len(row["stimulus_contract"]["turns"]) == 1
         )
         target = next(
             row
@@ -190,37 +232,42 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            artifacts = {}
-            for role in ("transcript", "runtime_events", "checkpoint_diff"):
-                path = root / f"{role}.json"
-                path.write_text(json.dumps({"role": role}), encoding="utf-8")
-                artifacts[role] = path
+            context = self._exact_one_turn_context(
+                target,
+                obligation["stimulus_contract"]["turns"][0],
+            )
+            execution_id = "real-cli-execution"
+            artifacts = _write_exact_retained_artifacts(
+                runtime_root=root,
+                obligation=obligation,
+                target=target,
+                revision=REVISION,
+                execution_id=execution_id,
+                initial_event=context.initial_event,
+                events=context.completed_events,
+                turns=context.completed_turns,
+            )
             evidence = build_product_obligation_evidence_artifact(
                 obligation=obligation,
                 target=target,
                 revision=REVISION,
                 execution={
-                    "execution_id": "real-cli-execution",
+                    "execution_id": execution_id,
                     "runner": "retained-regression-real-cli-v1",
                     "transport": "real_pty",
                     "provider": "deepseek",
                     "model": "deepseek-chat",
-                    "started_at": "2026-07-24T00:00:00Z",
-                    "finished_at": "2026-07-24T00:01:00Z",
+                    "started_at": "1",
+                    "finished_at": "9999999999999999999",
                 },
                 artifact_paths=artifacts,
-                verifier_context=self._empty_context(target),
             )
-            evidence_path = root / "evidence.json"
-            evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
-            summary = admit_product_obligation_evidence(
-                obligations=self.obligations,
-                evidence_paths=[evidence_path],
-                revision=REVISION,
+            result = next(
+                item
+                for item in evidence["verifier_results"]
+                if item["verifier_id"] == "exact_fixture_turns_observed"
             )
-            self.assertEqual(summary["failed"], 1)
-            self.assertEqual(summary["not_run"], 59)
-            self.assertFalse(summary["complete"])
+            self.assertEqual(result["status"], "passed")
 
             with self.assertRaises(TypeError):
                 build_product_obligation_evidence_artifact(
@@ -259,11 +306,84 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
                         "transport": "real_pty",
                         "provider": "deepseek",
                         "model": "deepseek-chat",
-                        "started_at": "start",
-                        "finished_at": "finish",
+                        "started_at": "1",
+                        "finished_at": "9999999999999999999",
                     },
                     artifact_paths=artifacts,
-                    verifier_context=self._empty_context(target),
+                )
+
+    def test_adapter_reconstructs_context_only_from_bound_disk_artifacts(self) -> None:
+        obligation = next(
+            row for row in self.obligations
+            if row["variant"] != "exact"
+        )
+        target = next(
+            row for row in self.provider["targets"]
+            if row["obligation_id"] == obligation["obligation_id"]
+        )
+        context = self._one_turn_context(target)
+        execution_id = "response-driven-run"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifacts = self._write_bound_artifacts(
+                root,
+                obligation=obligation,
+                target=target,
+                context=context,
+                execution_id=execution_id,
+            )
+            evidence = build_product_obligation_evidence_artifact(
+                obligation=obligation,
+                target=target,
+                revision=REVISION,
+                execution={
+                    "execution_id": execution_id,
+                    "runner": "retained-regression-response-driven-journey-v1",
+                    "transport": "real_pty",
+                    "provider": "deepseek",
+                    "model": "deepseek-chat",
+                    "started_at": "1",
+                    "finished_at": "9999999999999999999",
+                },
+                artifact_paths=artifacts,
+            )
+            self.assertEqual(len(evidence["artifacts"]), 3)
+            self.assertEqual(
+                {item["role"] for item in evidence["artifacts"]},
+                {"transcript", "runtime_events", "checkpoint_diff"},
+            )
+            self.assertTrue(evidence["verifier_results"])
+
+            transcript_path = Path(artifacts["transcript"])
+            payload = json.loads(transcript_path.read_text(encoding="utf-8"))
+            payload["identity"]["obligation_id"] = "different-obligation"
+            unsigned = {
+                key: value
+                for key, value in payload.items()
+                if key != "artifact_hash"
+            }
+            payload["artifact_hash"] = content_hash(unsigned)
+            transcript_path.write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "artifact binding is stale"):
+                build_product_obligation_evidence_artifact(
+                    obligation=obligation,
+                    target=target,
+                    revision=REVISION,
+                    execution={
+                        "execution_id": execution_id,
+                        "runner": (
+                            "retained-regression-response-driven-journey-v1"
+                        ),
+                        "transport": "real_pty",
+                        "provider": "deepseek",
+                        "model": "deepseek-chat",
+                        "started_at": "1",
+                        "finished_at": "9999999999999999999",
+                    },
+                    artifact_paths=artifacts,
                 )
 
     def test_response_bound_lineage_and_forbidden_absence_semantics(self) -> None:
@@ -393,14 +513,34 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
 
         accepted = {
             "receipt_type": "pending_resolution",
+            "turn_index": 1,
+            "pending_id": "network_interface",
+            "pending_group": "network",
+            "pending_contract_hash": "1" * 64,
+            "resolution_path": "exact_contract",
+            "selected_option_id": "confirm_detected",
+            "selected_value_hash": "2" * 64,
+            "resolved_action_id": "action-1",
+            "input_hash": "3" * 64,
+            "normalizer": "typed_pending_contract",
             "verdict": "accepted",
-            "receipt_id": "a" * 64,
         }
+        accepted["receipt_id"] = content_hash(accepted)
         rejected = {
             "receipt_type": "domain_commit",
+            "turn_index": 1,
+            "owner": "environment",
             "completion": "rejected",
-            "receipt_id": "b" * 64,
+            "group_registry_contract_hash": "4" * 64,
+            "pending_before_hash": "5" * 64,
+            "pending_after_hash": "5" * 64,
+            "consumed_action_ids": [],
+            "invalidated_groups": [],
+            "invalidated_fields": [],
+            "response_fragment_hashes": [],
+            "blocker_hash": "6" * 64,
         }
+        rejected["receipt_id"] = content_hash(rejected)
         rejection_event = replace(
             context.current_event,
             control_receipts=(accepted, rejected),
@@ -417,7 +557,10 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
             "typed_confirmation_rejected_by_side_channel"
         ].verifier(rejection_context)
         self.assertTrue(rejection.satisfied)
-        self.assertEqual(rejection.details["rejected_domain_receipt_ids"], ["b" * 64])
+        self.assertEqual(
+            rejection.details["receipt_ids"],
+            [rejected["receipt_id"]],
+        )
 
     def _one_turn_context(self, target: dict) -> JourneyVerifierContext:
         base = self._empty_context(target)
@@ -450,7 +593,7 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
         )
         initial_event = replace(
             base.initial_event,
-            schema_version=3,
+            schema_version=2,
             event_type="startup_snapshot",
             thread_id="test",
             before_fingerprint=before,
@@ -474,16 +617,89 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
                     user_message.encode("utf-8")
                 ).hexdigest(),
             },
+            pending_transition={
+                "before_hash": "1" * 64,
+                "after_hash": "1" * 64,
+            },
+            render_manifest={"fragment_hashes": []},
+        )
+        verifier_input = target["journey_definition"][
+            "verifier_input_contract"
+        ]
+        source_step = verifier_input["source_contract"]["source_steps"][0]
+        broker_request_id = "request-1"
+        context_binding = simulator_context_binding({
+            "session_id": turn.session_id,
+            "turn_index": turn.turn_index,
+            "previous_response_hash": content_hash(previous_response),
+            "previous_response_received_at_ns": (
+                turn.previous_response_received_at_ns
+            ),
+            "schedule": journey_schedule_payload(base.schedule),
+            "observed_edge_keys": [],
+        })
+        variant_binding = {
+            "source_step_id": source_step["step_id"],
+            "semantic_role": source_step["semantic_role"],
+        }
+        unsigned_decision = {
+            "previous_response_hash": content_hash(previous_response),
+            "broker_request_id": broker_request_id,
+            "user_message": user_message,
+            "persona": "operator",
+            "mission": "continue",
+            "rationale": "response-bound",
+            "risk_factor_ids": [],
+            "variant_binding": variant_binding,
+        }
+        simulator_attestation = build_simulator_attestation(
+            actor_kind="codex",
+            task_id="task-1",
+            model="gpt-test",
+            request_id=broker_request_id,
+            previous_response_hash=content_hash(previous_response),
+            context_hash=content_hash(context_binding),
+            decision_hash=content_hash(unsigned_decision),
+            user_message_hash=content_hash(user_message),
+            turn_index=turn.turn_index,
+            declared_at_ns=now + 1,
+        )
+        variant_attestation = build_variant_attestation(
+            actor=simulator_attestation["actor"],
+            verifier_input_contract=verifier_input,
+            execution_binding={
+                "execution_id": "response-driven-run",
+                "session_id": turn.session_id,
+                "schedule_id": base.schedule.schedule_id,
+                "obligation_id": base.schedule.journey_id,
+                "broker_request_id": broker_request_id,
+                "simulator_attestation_id": simulator_attestation[
+                    "attestation_id"
+                ],
+            },
+            source_step_id=source_step["step_id"],
+            semantic_role=source_step["semantic_role"],
+            turn_index=turn.turn_index,
+            previous_response_hash=content_hash(previous_response),
+            user_message_hash=content_hash(user_message),
+            selected_at_ns=now + 1,
+            declared_at_ns=now + 1,
         )
         decision = JourneyDecisionProvenance(
             turn_index=1,
             previous_response_hash=content_hash(previous_response),
             selected_at_ns=now + 1,
-            submitted_at_ns=now + 1,
+            submitted_at_ns=now + 2,
             user_message_hash=content_hash(user_message),
             persona="operator",
             mission="continue",
             rationale="response-bound",
+            execution_id="response-driven-run",
+            obligation_id=base.schedule.journey_id,
+            broker_request_id=broker_request_id,
+            simulator_context_binding=context_binding,
+            simulator_attestation=simulator_attestation,
+            variant_attestation=variant_attestation,
         )
         return replace(
             base,
@@ -495,6 +711,152 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
             latest_turn=turn,
             transcript=((user_message, agent_response),),
         )
+
+    def _exact_one_turn_context(
+        self,
+        target: dict,
+        user_message: str,
+    ) -> JourneyVerifierContext:
+        base = self._empty_context(target)
+        before = "a" * 64
+        after = "b" * 64
+        previous_response = "Choose the next action."
+        agent_response = "The exact fixture was processed."
+        now = time.monotonic_ns()
+        initial_event = replace(
+            base.initial_event,
+            schema_version=2,
+            event_type="startup_snapshot",
+            thread_id="test",
+            before_fingerprint=before,
+            after_fingerprint=before,
+        )
+        event = RuntimeTurnEvent(
+            schema_version=3,
+            event_type="turn_committed",
+            thread_id="test",
+            session_purpose="test",
+            before_fingerprint=before,
+            after_fingerprint=after,
+            turn_index=1,
+            active_group="opening",
+            pending_question_id="",
+            action_queue_types=(),
+            revision=REVISION,
+            turn_receipt_summary={
+                "turn_id": "turn-1",
+                "input_hash": hashlib.sha256(
+                    user_message.encode("utf-8")
+                ).hexdigest(),
+            },
+            pending_transition={
+                "before_hash": "1" * 64,
+                "after_hash": "1" * 64,
+            },
+            render_manifest={"fragment_hashes": []},
+        )
+        turn = PtyCliTurnRecord(
+            session_id="test",
+            turn_index=1,
+            previous_agent_response=previous_response,
+            user_message=user_message,
+            agent_response=agent_response,
+            provider="deepseek",
+            model="deepseek-chat",
+            before_fingerprint=before,
+            after_fingerprint=after,
+            transcript_hash=pty_transcript_hash(
+                session_id="test",
+                turn_index=1,
+                previous_agent_response=previous_response,
+                user_message=user_message,
+                agent_response=agent_response,
+            ),
+            previous_response_received_at_ns=now,
+            user_message_submitted_at_ns=now + 1,
+            agent_response_received_at_ns=now + 2,
+        )
+        return replace(
+            base,
+            initial_event=initial_event,
+            current_event=event,
+            completed_turns=(turn,),
+            completed_events=(event,),
+            completed_decisions=(),
+            latest_turn=turn,
+            transcript=((user_message, agent_response),),
+        )
+
+    def _write_bound_artifacts(
+        self,
+        root: Path,
+        *,
+        obligation: dict,
+        target: dict,
+        context: JourneyVerifierContext,
+        execution_id: str,
+    ) -> dict[str, Path]:
+        identity = {
+            "obligation_id": obligation["obligation_id"],
+            "execution_id": execution_id,
+            "revision": REVISION,
+            "schedule_id": context.schedule.schedule_id,
+            "verifier_input_contract_hash": content_hash(
+                target["journey_definition"]["verifier_input_contract"]
+            ),
+        }
+        payloads = {
+            "transcript": {
+                "turns": [
+                    {
+                        "turn": asdict(turn),
+                        "decision": asdict(decision),
+                    }
+                    for turn, decision in zip(
+                        context.completed_turns,
+                        context.completed_decisions,
+                    )
+                ],
+            },
+            "runtime_events": {
+                "initial_event": asdict(context.initial_event),
+                "events": [
+                    asdict(event)
+                    for event in context.completed_events
+                ],
+            },
+            "checkpoint_diff": {
+                "before_fingerprint": (
+                    context.initial_event.after_fingerprint
+                ),
+                "after_fingerprint": (
+                    context.completed_events[-1].after_fingerprint
+                ),
+                "material_state_diff_hashes": [
+                    dict(event.material_state_diff_hashes)
+                    for event in context.completed_events
+                ],
+            },
+        }
+        paths: dict[str, Path] = {}
+        for role, role_payload in payloads.items():
+            unsigned = {
+                "schema_version": 1,
+                "artifact_type": f"retained_regression_{role}",
+                "identity": identity,
+                **role_payload,
+            }
+            artifact = {
+                **unsigned,
+                "artifact_hash": content_hash(unsigned),
+            }
+            path = root / f"{role}.json"
+            path.write_text(
+                json.dumps(artifact, sort_keys=True),
+                encoding="utf-8",
+            )
+            paths[role] = path
+        return paths
 
     def _empty_context(self, target: dict) -> JourneyVerifierContext:
         definition = target.get("journey_definition")

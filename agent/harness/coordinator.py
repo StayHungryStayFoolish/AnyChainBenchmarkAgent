@@ -109,6 +109,7 @@ from agent.workflows.group_registry import (
     GROUP_ORDER,
     GROUP_SPEC_BY_NAME,
     group_for_field,
+    group_registry_contract_hash,
     invalidation_targets,
     is_user_navigable_group,
     reconfiguration_question_for_field,
@@ -751,6 +752,11 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
             ),
             {},
         )
+        action = assign_action_ids(
+            f"{state.get('thread_id') or 'default'}:{int(state.get('turn_index') or 0)}",
+            text,
+            [action],
+        )[0]
         _append_control_receipt(
             state,
             "pending_resolution",
@@ -767,6 +773,7 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
                     or ""
                 ),
                 "selected_value_hash": _receipt_hash(action["selected_value"]),
+                "resolved_action_id": str(action.get("action_id") or ""),
                 "input_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
                 "normalizer": str(
                     (
@@ -779,11 +786,6 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
                 "verdict": "accepted",
             },
         )
-        action = assign_action_ids(
-            f"{state.get('thread_id') or 'default'}:{int(state.get('turn_index') or 0)}",
-            text,
-            [action],
-        )[0]
         source_clauses = [
             dict(clause)
             for clause in (state.get("turn_receipt") or {}).get("clauses") or []
@@ -2491,6 +2493,7 @@ def _apply_handler_result(
             {
                 "owner": owner,
                 "completion": "rejected",
+                "group_registry_contract_hash": group_registry_contract_hash(),
                 "blocker_hash": hashlib.sha256(
                     str(result.blocker).encode("utf-8")
                 ).hexdigest(),
@@ -2696,12 +2699,29 @@ def _apply_handler_result(
         }
         for path in result.delta.deletes
     )
+    before_group_states = dict(state.get("group_states") or {})
+    after_group_states = dict(candidate.get("group_states") or {})
+    group_state_transitions = []
+    for group in sorted(set(before_group_states) | set(after_group_states)):
+        before_status = str(
+            (before_group_states.get(group) or {}).get("status") or ""
+        )
+        after_status = str(
+            (after_group_states.get(group) or {}).get("status") or ""
+        )
+        if before_status != after_status:
+            group_state_transitions.append({
+                "group": group,
+                "before": before_status,
+                "after": after_status,
+            })
     _append_control_receipt(
         candidate,
         "domain_commit",
         {
             "owner": owner,
             "completion": str(result.completion or ""),
+            "group_registry_contract_hash": group_registry_contract_hash(),
             "consumed_action_ids": [
                 str(item) for item in result.consumed_action_ids if str(item)
             ],
@@ -2714,9 +2734,13 @@ def _apply_handler_result(
             "reconfigured_groups": [
                 str(item) for item in result.reconfigured_groups if str(item)
             ],
+            "group_state_transitions": group_state_transitions,
             "material_delta": delta_paths,
             "navigation_operation": str(
                 navigation_command.operation if navigation_command else ""
+            ),
+            "navigation_origin_group": str(
+                navigation_command.origin_group if navigation_command else ""
             ),
             "navigation_target_group": str(
                 navigation_command.target_group if navigation_command else ""

@@ -8,12 +8,15 @@ response-driven real PTY session.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 from typing import Any, Mapping, Sequence
 
 from tests.agent_live.coverage_evidence import content_hash
 from tests.agent_live.formal_journey_catalog import (
     FORMAL_JOURNEY_VERIFIER_REGISTRY,
     REGISTRY_IMPORT,
+    factor_observation_postcondition_id,
+    reviewed_seed_factor_proof,
 )
 from tests.agent_live.product_chaos_factors import (
     ProductCoveringArrayResult,
@@ -24,7 +27,7 @@ from tests.agent_live.product_chaos_factors import (
 from tests.agent_live.runtime_checkpoint import reviewed_scenario
 
 
-PRODUCT_CHAOS_OBLIGATION_SCHEMA_VERSION = 1
+PRODUCT_CHAOS_OBLIGATION_SCHEMA_VERSION = 3
 PRODUCT_CHAOS_SEED = 20260724
 PRODUCT_CHAOS_STATUS = "not_run"
 
@@ -105,7 +108,7 @@ def product_chaos_obligation_report(
         by_model[model_id] = by_model.get(model_id, 0) + 1
     return {
         "schema_version": PRODUCT_CHAOS_OBLIGATION_SCHEMA_VERSION,
-        "seed": PRODUCT_CHAOS_SEED,
+        "catalog_seed": PRODUCT_CHAOS_SEED,
         "required_denominator": len(rows),
         "generated_count": len(rows),
         "observed_pass_count": 0,
@@ -134,6 +137,7 @@ def validate_product_chaos_obligations(
 
     seen_ids: set[str] = set()
     seen_sources: set[tuple[str, str]] = set()
+    seen_execution_tuples: set[tuple[str, str, int, str]] = set()
     for row in rows:
         obligation_id = _required_text(row, "obligation_id")
         if obligation_id in seen_ids:
@@ -156,11 +160,32 @@ def validate_product_chaos_obligations(
             raise ValueError(f"unknown product Chaos source row: {source_key}")
         if model != expected_row["model"] or dict(row.get("factors") or {}) != expected_row["factors"]:
             raise ValueError(f"product Chaos source row drifted: {obligation_id}")
-        if row.get("seed") != PRODUCT_CHAOS_SEED:
+        row_seed = _row_seed(PRODUCT_CHAOS_SEED, model_id, source_row_id)
+        if row.get("seed") != row_seed:
             raise ValueError(f"product Chaos seed drifted: {obligation_id}")
+        subject_group = _required_text(
+            dict(row.get("factors") or {}),
+            "subject_group",
+        )
+        execution_tuple = (
+            obligation_id,
+            source_row_id,
+            row_seed,
+            subject_group,
+        )
+        if execution_tuple in seen_execution_tuples:
+            raise ValueError(
+                f"duplicate product Chaos execution tuple: {execution_tuple}"
+            )
+        seen_execution_tuples.add(execution_tuple)
         if row.get("revision_binding") != active_revision:
             raise ValueError(f"stale product Chaos revision: {obligation_id}")
-        if obligation_id != _obligation_id(model, source_row_id, row["factors"]):
+        if obligation_id != _obligation_id(
+            model,
+            source_row_id,
+            row["factors"],
+            row_seed,
+        ):
             raise ValueError(f"unstable product Chaos obligation id: {obligation_id}")
 
         _validate_start_contract(row)
@@ -177,6 +202,7 @@ def validate_product_chaos_obligations(
         raise ValueError(f"product Chaos catalog is missing source rows: {missing[:5]}")
 
 
+@lru_cache(maxsize=1)
 def _generated_models(
 ) -> tuple[tuple[_ModelContract, ProductCoveringArrayResult], ...]:
     models = (
@@ -196,6 +222,7 @@ def _generated_models(
     )
 
 
+@lru_cache(maxsize=1)
 def _expected_source_rows() -> dict[tuple[str, str], dict[str, Any]]:
     expected: dict[tuple[str, str], dict[str, Any]] = {}
     for contract, result in _generated_models():
@@ -209,7 +236,15 @@ def _expected_source_rows() -> dict[tuple[str, str], dict[str, Any]]:
             key = (result.model_id, row_id)
             if key in expected:
                 raise ValueError(f"covering generator produced duplicate source row: {key}")
-            expected[key] = {"model": model, "factors": dict(factors)}
+            expected[key] = {
+                "model": model,
+                "factors": dict(factors),
+                "seed": _row_seed(
+                    PRODUCT_CHAOS_SEED,
+                    result.model_id,
+                    row_id,
+                ),
+            }
     return expected
 
 
@@ -233,7 +268,17 @@ def _build_obligation(
         "model_version": result.model_version,
         "strength": result.strength,
     }
-    required = _required_postconditions(factor_values)
+    row_seed = _row_seed(PRODUCT_CHAOS_SEED, result.model_id, source_row_id)
+    subject_group = _required_text(factor_values, "subject_group")
+    behavioral_required = _required_postconditions(factor_values)
+    factor_observations = _factor_observation_contracts(
+        factor_values,
+        scenario_id=scenario_id,
+    )
+    required = (
+        *behavioral_required,
+        *(item["postcondition_id"] for item in factor_observations),
+    )
     definitions = FORMAL_JOURNEY_VERIFIER_REGISTRY.definitions
     bindings = [asdict(definitions[item]) for item in required]
     for binding in bindings:
@@ -241,15 +286,26 @@ def _build_obligation(
 
     unsigned: dict[str, Any] = {
         "schema_version": PRODUCT_CHAOS_OBLIGATION_SCHEMA_VERSION,
-        "obligation_id": _obligation_id(model, source_row_id, factor_values),
+        "obligation_id": _obligation_id(
+            model,
+            source_row_id,
+            factor_values,
+            row_seed,
+        ),
         "source_row_id": source_row_id,
         "model": model,
-        "seed": PRODUCT_CHAOS_SEED,
+        "seed": row_seed,
         "factors": factor_values,
         "start_contract": {
             "provider": "tests.agent_live.runtime_checkpoint:reviewed_scenario",
             "scenario_id": scenario_id,
             "scenario_state_fingerprint": state_fingerprint,
+            "subject_group": subject_group,
+            "typed_seed_factor_proofs": {
+                name: dict(reviewed_seed_factor_proof(scenario_id, name))
+                for name in ("session_state", "pending_state")
+                if name in factor_values
+            },
         },
         "simulator_contract": {
             "selection_mode": "response_driven",
@@ -259,12 +315,21 @@ def _build_obligation(
             "max_turns": _max_turns_for(factor_values),
             "prewritten_future_turns_forbidden": True,
             "read_complete_agent_response_before_each_turn": True,
+            "attestation": {
+                "required": True,
+                "identity_strength": "auditable_declaration_only",
+                "required_actor_fields": ["actor_kind", "task_id", "model"],
+                "scripted_actor_qualifies": False,
+                "cryptographic_identity_claimed": False,
+            },
         },
         "verifier_contract": {
             "registry_import": REGISTRY_IMPORT,
             "registry_id": FORMAL_JOURNEY_VERIFIER_REGISTRY.registry_id,
             "required_postcondition_ids": list(required),
             "required_bindings": bindings,
+            "behavioral_postcondition_ids": list(behavioral_required),
+            "factor_observation_contracts": factor_observations,
             "forbidden_postcondition_ids": [
                 "mechanical_response_loop",
                 "state_regressed",
@@ -284,84 +349,25 @@ def _build_obligation(
 
 
 def _start_scenario_for(factors: Mapping[str, str]) -> str:
-    session_state = str(factors.get("session_state") or "unspecified")
+    session_state = str(factors.get("session_state") or "partial")
     pending_state = str(factors.get("pending_state") or "")
-    workflow_mode = str(factors.get("workflow_mode") or "")
-    recovery = str(factors.get("recovery") or "")
-    chain_case = str(factors.get("chain_case") or "")
-    workload = str(factors.get("workload") or "")
-    evidence_shape = str(factors.get("evidence_shape") or "")
-    interruption_depth = str(factors.get("interruption_depth") or "")
-
-    if session_state == "quarantine":
-        if pending_state != "none" or recovery != "reset":
-            raise ValueError("quarantine row has no reliable reviewed start mapping")
-        return "resume_quarantine"
-
-    if pending_state == "none":
-        if recovery == "back" or interruption_depth in {"1", "2+"}:
-            return "action_go_back"
-        return {
-            "fresh": "action_queue_workflow_goal",
-            "partial": "action_change_group",
-            "complete": "action_activate_next_workflow_goal",
-            "unspecified": "action_change_group",
-        }.get(session_state) or _mapping_gap(factors, "session_state without pending")
-
-    if pending_state == "manual":
-        if workflow_mode == "sync":
-            return (
-                "endpoint_sync_observe_rpc_url"
-                if evidence_shape in {"request", "response", "split", "docs"}
-                else "sync_duration"
-            )
-        if workflow_mode == "real":
-            return "endpoint_local_rpc_url"
-        if chain_case == "case3":
-            return "case3_evidence"
-        if chain_case == "case2":
-            return (
-                "new_chain_existing_family_needs_schema_evidence"
-                if evidence_shape != "none"
-                else "new_chain_existing_family_needs_method"
-            )
-        if chain_case == "case1" or workload in {"custom_single", "custom_mixed"}:
-            return (
-                "custom_needs_schema_evidence"
-                if evidence_shape != "none"
-                else "custom_needs_method"
-            )
-        return {
-            "fresh": "chain_manual",
-            "partial": "provider_zone",
-            "complete": "advanced_adjust_value",
-            "unspecified": "provider_zone",
-        }.get(session_state) or _mapping_gap(factors, "manual pending")
-
-    if pending_state == "choice":
-        if session_state == "fresh":
-            return "opening"
-        if recovery in {"correct", "retry"}:
-            return "failure_recovery"
-        if session_state == "complete":
-            return {
-                "fake": "execution",
-                "real": "runtime_real_node_final",
-                "sync": "sync_after_setup",
-            }.get(workflow_mode) or _mapping_gap(factors, "complete choice workflow")
-        if workflow_mode == "sync":
-            return "sync_stop"
-        if workflow_mode == "real":
-            return "runtime_real_node_smoke"
-        if chain_case == "case3":
-            return "case3_next"
-        if chain_case == "case2":
-            return "new_chain_continue"
-        if chain_case == "case1":
-            return "custom_continue"
-        return "workload_mixed" if workload == "default_mixed" else "qps_mode"
-
-    return _mapping_gap(factors, "pending_state")
+    reviewed_starts = {
+        ("fresh", "manual"): "chain_manual",
+        ("fresh", "choice"): "opening",
+        ("partial", "none"): "action_change_group",
+        ("partial", "manual"): "provider_zone",
+        ("partial", "choice"): "qps_mode",
+        ("complete", "manual"): "sync_duration",
+        ("complete", "choice"): "execution",
+        ("quarantine", "choice"): "resume_quarantine",
+    }
+    scenario_id = reviewed_starts.get((session_state, pending_state))
+    if not scenario_id:
+        return _mapping_gap(
+            factors,
+            f"session_state={session_state}, pending_state={pending_state}",
+        )
+    return scenario_id
 
 
 def _required_postconditions(factors: Mapping[str, str]) -> tuple[str, ...]:
@@ -379,6 +385,45 @@ def _required_postconditions(factors: Mapping[str, str]) -> tuple[str, ...]:
     ):
         required.append("rpc_action_admitted")
     return tuple(dict.fromkeys(required))
+
+
+def _factor_observation_contracts(
+    factors: Mapping[str, str],
+    *,
+    scenario_id: str,
+) -> list[dict[str, Any]]:
+    contracts: list[dict[str, Any]] = []
+    for name, value in sorted(factors.items()):
+        evidence_class = (
+            "seed_fact"
+            if name in {"session_state", "pending_state"}
+            else "stimulus_property"
+            if name in {"input_shape", "evidence_shape"}
+            else "runtime_fact"
+        )
+        contract: dict[str, Any] = {
+            "factor_name": str(name),
+            "factor_value": str(value),
+            "risk_factor_id": f"{name}:{value}",
+            "postcondition_id": factor_observation_postcondition_id(
+                str(name), str(value)
+            ),
+            "claim_source": "response_bound_simulator_decision",
+            "evidence_class": evidence_class,
+            "observation_source": {
+                "seed_fact": "reviewed_seed_fingerprint_and_typed_classification",
+                "runtime_fact": "validated_owner_receipt_and_material_commit",
+                "stimulus_property": (
+                    "deterministic_syntax_or_attestation_plus_runtime_consequence"
+                ),
+            }[evidence_class],
+        }
+        if evidence_class == "seed_fact":
+            contract["typed_seed_proof"] = dict(
+                reviewed_seed_factor_proof(scenario_id, str(name))
+            )
+        contracts.append(contract)
+    return contracts
 
 
 def _persona_for(factors: Mapping[str, str]) -> str:
@@ -426,14 +471,28 @@ def _validate_start_contract(row: Mapping[str, Any]) -> None:
         raise ValueError(f"unknown product Chaos start provider: {obligation_id}")
     if start.get("scenario_state_fingerprint") != scenario.state_fingerprint:
         raise ValueError(f"stale product Chaos start fingerprint: {obligation_id}")
+    if start.get("subject_group") != factors.get("subject_group"):
+        raise ValueError(
+            f"product Chaos start subject group drifted: {obligation_id}"
+        )
+    expected_seed_proofs = {
+        name: dict(reviewed_seed_factor_proof(scenario_id, name))
+        for name in ("session_state", "pending_state")
+        if name in factors
+    }
+    if start.get("typed_seed_factor_proofs") != expected_seed_proofs:
+        raise ValueError(f"product Chaos typed seed proof drifted: {obligation_id}")
+    for name, proof in expected_seed_proofs.items():
+        if proof.get("classified_value") != factors.get(name):
+            raise ValueError(
+                "product Chaos seed factor does not match its reviewed start: "
+                f"{obligation_id}: {name}"
+            )
 
     question = dict((scenario.seed_state or {}).get("pending_question") or {})
     pending_state = str(factors.get("pending_state") or "")
     if pending_state == "none":
-        if scenario_id == "resume_quarantine":
-            if factors.get("session_state") != "quarantine":
-                raise ValueError(f"invalid quarantine control overlay: {obligation_id}")
-        elif scenario_id not in _NO_PENDING_SCENARIOS or question:
+        if scenario_id not in _NO_PENDING_SCENARIOS or question:
             raise ValueError(f"pending-none row has a pending start: {obligation_id}")
     elif pending_state == "manual":
         if str(question.get("kind") or "") not in _MANUAL_KINDS:
@@ -457,6 +516,15 @@ def _validate_simulator_contract(row: Mapping[str, Any]) -> None:
         or simulator.get("read_complete_agent_response_before_each_turn") is not True
     ):
         raise ValueError(f"product Chaos simulator contract is not dynamic: {obligation_id}")
+    attestation = simulator.get("attestation")
+    if not isinstance(attestation, Mapping) or attestation != {
+        "required": True,
+        "identity_strength": "auditable_declaration_only",
+        "required_actor_fields": ["actor_kind", "task_id", "model"],
+        "scripted_actor_qualifies": False,
+        "cryptographic_identity_claimed": False,
+    }:
+        raise ValueError(f"product Chaos simulator attestation drifted: {obligation_id}")
     if not _required_text(simulator, "persona") or not _required_text(simulator, "mission"):
         raise ValueError(f"product Chaos simulator identity is incomplete: {obligation_id}")
     max_turns = simulator.get("max_turns")
@@ -481,9 +549,26 @@ def _validate_verifier_contract(row: Mapping[str, Any]) -> None:
     unknown = (set(required) | set(forbidden)) - set(registry.definitions)
     if unknown:
         raise ValueError(f"unknown product Chaos verifiers: {sorted(unknown)}")
-    expected_required = _required_postconditions(dict(row.get("factors") or {}))
+    factors = dict(row.get("factors") or {})
+    scenario_id = _required_text(
+        dict(row.get("start_contract") or {}),
+        "scenario_id",
+    )
+    behavioral_required = _required_postconditions(factors)
+    factor_contracts = _factor_observation_contracts(
+        factors,
+        scenario_id=scenario_id,
+    )
+    expected_required = (
+        *behavioral_required,
+        *(item["postcondition_id"] for item in factor_contracts),
+    )
     if required != expected_required:
         raise ValueError(f"product Chaos verifier mapping drifted: {obligation_id}")
+    if verifier.get("behavioral_postcondition_ids") != list(behavioral_required):
+        raise ValueError(f"product Chaos behavioral verifier mapping drifted: {obligation_id}")
+    if verifier.get("factor_observation_contracts") != factor_contracts:
+        raise ValueError(f"product Chaos factor verifier mapping drifted: {obligation_id}")
     expected_bindings = []
     for postcondition_id in required:
         binding = asdict(registry.definitions[postcondition_id])
@@ -499,15 +584,25 @@ def _obligation_id(
     model: Mapping[str, Any],
     source_row_id: str,
     factors: Mapping[str, str],
+    row_seed: int,
 ) -> str:
     identity = {
         "schema_version": PRODUCT_CHAOS_OBLIGATION_SCHEMA_VERSION,
         "model": dict(model),
-        "seed": PRODUCT_CHAOS_SEED,
+        "seed": row_seed,
         "source_row_id": source_row_id,
         "factors": dict(factors),
     }
     return "g4-chaos-" + content_hash(identity)[:24]
+
+
+def _row_seed(catalog_seed: int, model_id: str, source_row_id: str) -> int:
+    identity = {
+        "catalog_seed": int(catalog_seed),
+        "model_id": str(model_id),
+        "source_row_id": str(source_row_id),
+    }
+    return int(content_hash(identity)[:16], 16)
 
 
 def _required_text(values: Mapping[str, Any], field: str) -> str:

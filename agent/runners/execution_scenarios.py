@@ -19,6 +19,7 @@ class ExecutionScenarioSpec:
     workflow_type: str
     target_modes: frozenset[str]
     required_artifacts: tuple[str, ...]
+    required_artifact_owner: str = "benchmark_data"
     real_evidence_required: bool = True
     forbidden_artifacts: tuple[str, ...] = ()
     required_command_tokens: tuple[str, ...] = ()

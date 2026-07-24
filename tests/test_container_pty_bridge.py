@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import signal
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +15,7 @@ from unittest import mock
 
 from tests.agent_live import container_pty_bridge
 from tests.agent_live.container_process_guard import CleanupReceiptArtifact
+from tests.agent_live.dynamic_dual_ai_chaos import ContainerPtyBridgeTransport
 
 
 class _FakeProcess:
@@ -198,6 +201,64 @@ class ContainerPtyBridgeLifecycleTest(unittest.TestCase):
         self.assertEqual(response["error_type"], "ContainerCleanupError")
         self.assertFalse(response["cleanup_receipt"]["cleaned"])
         self.assertEqual(guard.cleanup_calls, 1)
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux procfs")
+class ContainerPtyBridgeExecutionProofIntegrationTest(unittest.TestCase):
+    def test_real_bridge_produces_a_validated_process_cleanup_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            receipt_dir = Path(temporary) / "receipts"
+            execution_id = "container-pty-integration"
+            repl = (
+                "import sys\n"
+                "print('Agent> ready\\nUser> ', end='', flush=True)\n"
+                "for _line in sys.stdin:\n"
+                "    print('Agent> received\\nUser> ', end='', flush=True)\n"
+            )
+            transport = ContainerPtyBridgeTransport(
+                (
+                    sys.executable,
+                    "-m",
+                    "tests.agent_live.container_pty_bridge",
+                    "--cwd",
+                    str(Path.cwd()),
+                    "--",
+                    sys.executable,
+                    "-u",
+                    "-c",
+                    repl,
+                ),
+                cwd=Path.cwd(),
+                execution_id=execution_id,
+                cleanup_receipt_dir=receipt_dir,
+            )
+
+            transport.start(env=os.environ)
+            self.assertEqual(
+                transport.read_complete_agent_response(timeout_seconds=5),
+                "Agent> ready",
+            )
+            transport.submit_bracketed_paste("hello")
+            self.assertEqual(
+                transport.read_complete_agent_response(timeout_seconds=5),
+                "Agent> received",
+            )
+            transport.close()
+
+            proof = transport.validated_execution_proof()
+            self.assertEqual(proof["execution_id"], execution_id)
+            self.assertEqual(proof["proof_type"], "container_pty_process_guard")
+            self.assertEqual(proof["transport_kind"], "container_pty_bridge")
+            self.assertTrue(proof["cleaned"])
+            roles = {
+                role
+                for row in proof["registered_processes"]
+                for role in row["roles"]
+            }
+            self.assertTrue(
+                {"container_bridge", "agent_process_group_leader"}.issubset(roles)
+            )
+            self.assertEqual(len(proof["zero_survivor_scans"]), 2)
 
 
 if __name__ == "__main__":

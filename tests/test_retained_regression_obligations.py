@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from tests.agent_live.coverage_evidence import content_hash
 from tests.agent_live.retained_regression_obligations import (
     RETAINED_REGRESSION_OBLIGATION_COUNT,
     RETAINED_REGRESSION_VARIANTS,
@@ -50,6 +51,11 @@ class RetainedRegressionObligationCatalogTest(unittest.TestCase):
             with self.subTest(obligation_id=row["obligation_id"]):
                 self.assertEqual(row["revision_binding"]["revision"], REVISION)
                 self.assertTrue(row["revision_binding"]["source_fixture"]["sanitized"])
+                self.assertTrue(
+                    row["revision_binding"]["source_fixture"][
+                        "variant_contract_sha256"
+                    ]
+                )
                 self.assertTrue(row["seed_contract"]["scenario_state_fingerprint"])
                 self.assertTrue(row["verifier_contract"]["required_postcondition_ids"])
                 self.assertFalse(
@@ -58,6 +64,15 @@ class RetainedRegressionObligationCatalogTest(unittest.TestCase):
                 self.assertNotIn("expected", row["verifier_contract"])
                 self.assertNotIn("expected_text", row["verifier_contract"])
                 self.assertEqual(row["execution_status"], "not_run")
+                stimulus = row["stimulus_contract"]
+                self.assertEqual(
+                    stimulus["source_contract_hash"],
+                    content_hash(stimulus["source_contract"]),
+                )
+                self.assertEqual(
+                    stimulus["variant_contract"]["variant"],
+                    row["variant"],
+                )
                 if row["variant"] == "exact":
                     self.assertTrue(row["stimulus_contract"]["turns"])
                 else:
@@ -67,6 +82,22 @@ class RetainedRegressionObligationCatalogTest(unittest.TestCase):
                             "read_each_complete_agent_response"
                         ]
                     )
+
+    def test_validation_rejects_stale_immutable_variant_contract(self) -> None:
+        rows = list(deepcopy(self.obligations))
+        rows[0]["stimulus_contract"]["source_contract"][
+            "source_turns_hash"
+        ] = "0" * 64
+        with self.assertRaisesRegex(ValueError, "contract semantics|immutable stimulus"):
+            validate_retained_regression_obligations(rows, revision=REVISION)
+
+        rows = list(deepcopy(self.obligations))
+        open_row = next(row for row in rows if row["variant"] == "negative")
+        open_row["stimulus_contract"]["variant_contract"][
+            "relation"
+        ] = "isomorphic_meaning"
+        with self.assertRaisesRegex(ValueError, "variant contract semantics"):
+            validate_retained_regression_obligations(rows, revision=REVISION)
 
     def test_reviewed_seeds_satisfy_network_and_backtrack_preconditions(self) -> None:
         network = reviewed_scenario("network_interface")

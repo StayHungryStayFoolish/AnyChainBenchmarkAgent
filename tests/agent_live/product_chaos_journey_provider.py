@@ -12,7 +12,10 @@ import argparse
 import hashlib
 import json
 import os
+import tempfile
+from dataclasses import replace
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -21,17 +24,40 @@ from tests.agent_live.chaos_scheduler import (
     journey_schedule_payload,
     validate_journey_schedule,
 )
+from tests.agent_live.batch_orchestrator import (
+    TimeoutPolicy,
+    freeze_batch_manifest,
+)
 from tests.agent_live.coverage_evidence import content_hash
-from tests.agent_live.dynamic_dual_ai_chaos import JOURNEY_EVIDENCE_SCHEMA_VERSION
+from tests.agent_live.coverage_evidence import PtyCliTurnRecord, RuntimeTurnEvent
+from tests.agent_live.codex_simulator_bridge import validate_simulator_attestation
+from tests.agent_live.container_process_guard import (
+    validate_cleanup_receipt_artifact,
+)
+from tests.agent_live.dynamic_dual_ai_chaos import (
+    JOURNEY_EVIDENCE_SCHEMA_VERSION,
+    JourneyDecisionProvenance,
+    JourneyVerifierContext,
+    journey_outcome_verifier_registry_payload,
+)
+from tests.agent_live.formal_journey_catalog import (
+    FORMAL_JOURNEY_VERIFIER_REGISTRY,
+)
 from tests.agent_live.product_chaos_obligations import (
+    build_product_chaos_obligations,
     validate_product_chaos_obligations,
 )
 from tests.agent_live.product_obligation_evidence import (
     PRODUCT_OBLIGATION_EVIDENCE_SCHEMA_VERSION,
 )
+from tests.agent_live.runtime_checkpoint import (
+    reviewed_scenario,
+    seed_runtime_checkpoint,
+)
 
 
 PRODUCT_CHAOS_JOURNEY_MANIFEST_SCHEMA_VERSION = 1
+PRODUCT_CHAOS_TARGET_SET_SCHEMA_VERSION = 1
 CHECKPOINT_DIFF_SCHEMA_VERSION = 1
 DEFINITION_MANIFEST_TYPE = "product_chaos_journey_definition_manifest"
 CHECKPOINT_DIFF_TYPE = "product_chaos_checkpoint_diffs"
@@ -93,6 +119,7 @@ def build_product_chaos_journey_definition(
         "start_scenario": dict(row["start_contract"])["scenario_id"],
         "persona": simulator["persona"],
         "mission": simulator["mission"],
+        "subject_group": factors["subject_group"],
         "allowed_risk_factors": [
             f"{name}:{value}" for name, value in sorted(factors.items())
         ],
@@ -188,6 +215,385 @@ def write_product_chaos_journey_manifest(
     return _write_json_once(Path(path).resolve(), dict(manifest))
 
 
+def build_product_chaos_target_payloads(
+    definition_manifest: Mapping[str, Any],
+) -> tuple[dict[str, Any], ...]:
+    """Translate frozen definitions without changing obligation schedules."""
+
+    definitions = definition_manifest.get("definitions")
+    revision = definition_manifest.get("revision_binding")
+    if (
+        definition_manifest.get("artifact_type") != DEFINITION_MANIFEST_TYPE
+        or not isinstance(definitions, Sequence)
+        or isinstance(definitions, (str, bytes))
+        or not definitions
+        or not isinstance(revision, Mapping)
+    ):
+        raise ValueError("G4 definition manifest is incomplete")
+    unsigned = {
+        key: value for key, value in definition_manifest.items()
+        if key != "manifest_hash"
+    }
+    if definition_manifest.get("manifest_hash") != content_hash(unsigned):
+        raise ValueError("G4 definition manifest identity is stale")
+    payloads: list[dict[str, Any]] = []
+    for row in definitions:
+        if not isinstance(row, Mapping):
+            raise ValueError("G4 definition row is invalid")
+        definition = row.get("definition")
+        schedule = row.get("schedule")
+        if not isinstance(definition, Mapping) or not isinstance(schedule, Mapping):
+            raise ValueError("G4 definition row lacks definition or schedule")
+        if row.get("definition_hash") != content_hash(definition):
+            raise ValueError("G4 definition hash is stale")
+        if row.get("schedule_hash") != content_hash(schedule):
+            raise ValueError("G4 schedule hash is stale")
+        payload = {
+            **dict(definition),
+            "frozen_execution": {
+                "obligation_id": str(row.get("obligation_id") or ""),
+                "seed": int(schedule["seed"]),
+                "schedule_id": str(schedule["schedule_id"]),
+                "schedule_hash": str(row["schedule_hash"]),
+                "subject_group": str(schedule["subject_group"]),
+                "revision_binding": dict(revision),
+            },
+            "simulator_attestation_contract": {
+                "required": True,
+                "identity_strength": "auditable_declaration_only",
+                "scripted_actor_qualifies": False,
+                "cryptographic_identity_claimed": False,
+            },
+        }
+        _reject_future_turns(payload)
+        payloads.append(payload)
+    return tuple(payloads)
+
+
+def write_product_chaos_target_set(
+    definition_manifest: Mapping[str, Any],
+    output_dir: str | Path,
+) -> Path:
+    """Write immutable batch targets and their own revision-bound manifest."""
+
+    destination = Path(output_dir).resolve()
+    if destination.exists():
+        raise FileExistsError(f"G4 target directory is immutable: {destination}")
+    payloads = build_product_chaos_target_payloads(definition_manifest)
+    revision = dict(definition_manifest["revision_binding"])
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f".{destination.name}-staging-",
+        dir=destination.parent,
+    ) as temporary:
+        staging = Path(temporary)
+        preflight_dir = staging / "preflight"
+        preflight_dir.mkdir()
+        scenario_preflights: dict[str, dict[str, Any]] = {}
+        scenario_ids = sorted({
+            str(payload["journey"]["start_scenario"])
+            for payload in payloads
+        })
+        for index, scenario_id in enumerate(scenario_ids, start=1):
+            scenario = reviewed_scenario(scenario_id)
+            relative_checkpoint = (
+                Path("preflight")
+                / f"{index:02d}-{content_hash(scenario_id)[:16]}.sqlite"
+            )
+            receipt = seed_runtime_checkpoint(
+                scenario.seed_state,
+                checkpoint_path=staging / relative_checkpoint,
+                session_id=f"g4-preflight-{content_hash(scenario_id)[:16]}",
+                session_purpose="product-chaos-reachability-preflight",
+                scenario_id=scenario_id,
+                scenario_state_fingerprint=scenario.state_fingerprint,
+            )
+            normalized_receipt = {
+                **receipt.payload,
+                "checkpoint_path": str(relative_checkpoint),
+            }
+            scenario_preflights[scenario_id] = {
+                "scenario_id": scenario_id,
+                "scenario_state_fingerprint": scenario.state_fingerprint,
+                "checkpoint_path": str(relative_checkpoint),
+                "checkpoint_sha256": receipt.checkpoint_sha256,
+                "seed_receipt": normalized_receipt,
+                "seed_receipt_hash": content_hash(normalized_receipt),
+            }
+        targets: list[dict[str, Any]] = []
+        for index, payload in enumerate(payloads, start=1):
+            name = f"{index:02d}.json"
+            encoded = _json_bytes(payload)
+            (staging / name).write_bytes(encoded)
+            frozen = payload["frozen_execution"]
+            scenario_id = str(payload["journey"]["start_scenario"])
+            scenario_preflight = scenario_preflights[scenario_id]
+            preflight_id = content_hash({
+                "obligation_id": frozen["obligation_id"],
+                "schedule_id": frozen["schedule_id"],
+                "subject_group": frozen["subject_group"],
+                "scenario_id": scenario_id,
+                "seed_receipt_hash": scenario_preflight["seed_receipt_hash"],
+            })
+            targets.append({
+                "index": index,
+                "obligation_id": frozen["obligation_id"],
+                "seed": frozen["seed"],
+                "schedule_id": frozen["schedule_id"],
+                "subject_group": frozen["subject_group"],
+                "scenario_id": scenario_id,
+                "preflight_id": preflight_id,
+                "path": name,
+                "sha256": hashlib.sha256(encoded).hexdigest(),
+            })
+        obligation_set = [
+            {
+                "obligation_id": row["obligation_id"],
+                "schedule_id": row["schedule_id"],
+                "seed": row["seed"],
+                "subject_group": row["subject_group"],
+            }
+            for row in sorted(
+                targets,
+                key=lambda item: (
+                    item["obligation_id"],
+                    item["schedule_id"],
+                ),
+            )
+        ]
+        unsigned = {
+            "schema_version": PRODUCT_CHAOS_TARGET_SET_SCHEMA_VERSION,
+            "artifact_type": "product_chaos_target_set",
+            "revision_binding": revision,
+            "definition_manifest_hash": definition_manifest["manifest_hash"],
+            "definition_selection": definition_manifest["selection"],
+            "expected_obligation_set_hash": content_hash(
+                obligation_set
+            ),
+            "coverage_denominators": {
+                "generated": len(targets),
+                "executable": len(targets),
+                "qualifying": 0,
+            },
+            "reachability_preflight_complete": True,
+            "scenario_preflight_count": len(scenario_preflights),
+            "scenario_preflights": [
+                scenario_preflights[key]
+                for key in sorted(scenario_preflights)
+            ],
+            "target_count": len(targets),
+            "targets": targets,
+        }
+        manifest = {**unsigned, "manifest_hash": content_hash(unsigned)}
+        (staging / "manifest.json").write_bytes(_json_bytes(manifest))
+        os.replace(staging, destination)
+    return destination / "manifest.json"
+
+
+def freeze_product_chaos_batch(
+    *,
+    repo_root: str | Path,
+    targets_dir: str | Path,
+    manifest_path: str | Path,
+    runtime_base: str | Path,
+    worker_runtime: str = "linux",
+    timeout_policy: TimeoutPolicy = TimeoutPolicy(),
+) -> Any:
+    """Freeze one G4 batch while preserving every target's own schedule seed."""
+
+    target_root = Path(targets_dir).resolve()
+    target_manifest = _load_mapping(
+        target_root / "manifest.json",
+        "G4 target-set manifest",
+    )
+    if target_manifest.get("artifact_type") != "product_chaos_target_set":
+        raise ValueError("target directory is not a G4 product target set")
+    if target_manifest.get("definition_selection") != "all":
+        raise ValueError(
+            "G4 batch requires the complete obligation target set"
+        )
+    unsigned = {
+        key: value for key, value in target_manifest.items()
+        if key != "manifest_hash"
+    }
+    if target_manifest.get("manifest_hash") != content_hash(unsigned):
+        raise ValueError("G4 target-set manifest identity is stale")
+    targets = target_manifest.get("targets")
+    if not isinstance(targets, Sequence) or isinstance(targets, (str, bytes)):
+        raise ValueError("G4 target-set manifest has no targets")
+    if target_manifest.get("target_count") != len(targets):
+        raise ValueError("G4 target-set manifest count is stale")
+    preflight_rows = target_manifest.get("scenario_preflights")
+    if (
+        target_manifest.get("reachability_preflight_complete") is not True
+        or not isinstance(preflight_rows, list)
+        or target_manifest.get("scenario_preflight_count")
+        != len(preflight_rows)
+    ):
+        raise ValueError("G4 target-set reachability preflight is incomplete")
+    scenario_preflights: dict[str, dict[str, Any]] = {}
+    for row in preflight_rows:
+        if not isinstance(row, Mapping):
+            raise ValueError("G4 scenario preflight row is invalid")
+        scenario_id = str(row.get("scenario_id") or "")
+        receipt = row.get("seed_receipt")
+        checkpoint = target_root / str(row.get("checkpoint_path") or "")
+        if (
+            not scenario_id
+            or scenario_id in scenario_preflights
+            or not isinstance(receipt, Mapping)
+            or content_hash(receipt) != row.get("seed_receipt_hash")
+            or receipt.get("scenario_id") != scenario_id
+            or receipt.get("checkpoint_path") != row.get("checkpoint_path")
+            or receipt.get("checkpoint_sha256") != row.get("checkpoint_sha256")
+            or _sha256_file(checkpoint) != row.get("checkpoint_sha256")
+        ):
+            raise ValueError("G4 scenario reachability receipt is invalid")
+        scenario = reviewed_scenario(scenario_id)
+        if (
+            row.get("scenario_state_fingerprint")
+            != scenario.state_fingerprint
+            or receipt.get("scenario_state_fingerprint")
+            != scenario.state_fingerprint
+        ):
+            raise ValueError("G4 scenario reachability fingerprint is stale")
+        scenario_preflights[scenario_id] = dict(row)
+    for row in targets:
+        if not isinstance(row, Mapping):
+            raise ValueError("G4 target-set row is invalid")
+        path = target_root / str(row.get("path") or "")
+        if _sha256_file(path) != str(row.get("sha256") or ""):
+            raise ValueError("G4 target file hash is stale")
+        payload = _load_mapping(path, "G4 target")
+        frozen = dict(payload.get("frozen_execution") or {})
+        scenario_id = str((payload.get("journey") or {}).get("start_scenario") or "")
+        preflight = scenario_preflights.get(scenario_id)
+        if {
+            "obligation_id": frozen.get("obligation_id"),
+            "schedule_id": frozen.get("schedule_id"),
+            "seed": frozen.get("seed"),
+            "subject_group": frozen.get("subject_group"),
+        } != {
+            "obligation_id": row.get("obligation_id"),
+            "schedule_id": row.get("schedule_id"),
+            "seed": row.get("seed"),
+            "subject_group": row.get("subject_group"),
+        }:
+            raise ValueError("G4 target row differs from its frozen execution")
+        expected_preflight_id = content_hash({
+            "obligation_id": frozen.get("obligation_id"),
+            "schedule_id": frozen.get("schedule_id"),
+            "subject_group": frozen.get("subject_group"),
+            "scenario_id": scenario_id,
+            "seed_receipt_hash": (
+                preflight.get("seed_receipt_hash") if preflight else ""
+            ),
+        })
+        if (
+            preflight is None
+            or row.get("scenario_id") != scenario_id
+            or row.get("preflight_id") != expected_preflight_id
+        ):
+            raise ValueError("G4 target has no matching reachability preflight")
+    obligation_set = [
+        {
+            "obligation_id": str(row.get("obligation_id") or ""),
+            "schedule_id": str(row.get("schedule_id") or ""),
+            "seed": int(row.get("seed") or 0),
+            "subject_group": str(row.get("subject_group") or ""),
+        }
+        for row in sorted(
+            targets,
+            key=lambda item: (
+                str(item.get("obligation_id") or ""),
+                str(item.get("schedule_id") or ""),
+            ),
+        )
+    ]
+    expected_set_hash = str(
+        target_manifest.get("expected_obligation_set_hash") or ""
+    )
+    if (
+        not expected_set_hash
+        or content_hash(obligation_set) != expected_set_hash
+        or len({
+            (
+                row["obligation_id"],
+                row["schedule_id"],
+                row["seed"],
+                row["subject_group"],
+            )
+            for row in obligation_set
+        })
+        != len(obligation_set)
+    ):
+        raise ValueError("G4 target obligation set is incomplete or duplicated")
+    revision = dict(target_manifest["revision_binding"])
+    authoritative_manifest = build_product_chaos_journey_manifest(
+        build_product_chaos_obligations(revision=revision),
+        revision=revision,
+    )
+    authoritative_payloads = {
+        payload["frozen_execution"]["obligation_id"]: payload
+        for payload in build_product_chaos_target_payloads(
+            authoritative_manifest
+        )
+    }
+    authoritative_set = [
+        {
+            "obligation_id": row["obligation_id"],
+            "schedule_id": row["schedule"]["schedule_id"],
+            "seed": row["schedule"]["seed"],
+            "subject_group": row["schedule"]["subject_group"],
+        }
+        for row in sorted(
+            authoritative_manifest["definitions"],
+            key=lambda item: (
+                item["obligation_id"],
+                item["schedule"]["schedule_id"],
+            ),
+        )
+    ]
+    if (
+        target_manifest.get("definition_manifest_hash")
+        != authoritative_manifest["manifest_hash"]
+        or obligation_set != authoritative_set
+        or expected_set_hash != content_hash(authoritative_set)
+    ):
+        raise ValueError(
+            "G4 target obligation set differs from the authoritative catalog"
+        )
+    for row in targets:
+        payload = _load_mapping(
+            target_root / str(row["path"]),
+            "G4 target",
+        )
+        expected_payload = authoritative_payloads.get(
+            str(row["obligation_id"])
+        )
+        if expected_payload is None or payload != expected_payload:
+            raise ValueError(
+                "G4 target payload differs from the authoritative catalog"
+            )
+    if target_manifest.get("coverage_denominators") != {
+        "generated": len(authoritative_set),
+        "executable": len(authoritative_set),
+        "qualifying": 0,
+    }:
+        raise ValueError("G4 target coverage denominators are inconsistent")
+    return freeze_batch_manifest(
+        repo_root=repo_root,
+        targets_dir=target_root,
+        manifest_path=manifest_path,
+        runtime_base=runtime_base,
+        shard_count=len(targets),
+        expected_revision=revision,
+        timeout_policy=timeout_policy,
+        worker_runtime=worker_runtime,
+        expected_obligation_set_hash=expected_set_hash,
+    )
+
+
 def convert_completed_journey_to_product_evidence(
     obligation: Mapping[str, Any],
     *,
@@ -211,8 +617,16 @@ def convert_completed_journey_to_product_evidence(
     output = Path(evidence_path).resolve()
     diff_output = Path(
         checkpoint_diff_path
-        or output.with_name(f"{output.stem}-checkpoint-diffs.json")
+        or (
+            output.parent.parent
+            / f"{output.parent.name}-checkpoint-diffs"
+            / f"{output.stem}-checkpoint-diffs.json"
+        )
     ).resolve()
+    if output.parent == diff_output.parent:
+        raise ValueError(
+            "product evidence and checkpoint-diff artifacts require separate directories"
+        )
     source_paths = {
         "journey_result": root / "journey-result.json",
         "journey_schedule": root / "journey-schedule.json",
@@ -234,7 +648,6 @@ def convert_completed_journey_to_product_evidence(
         source_paths["journey_schedule"],
         "Journey schedule",
     )
-
     definition = build_product_chaos_journey_definition(row, revision=revision)
     expected_schedule = build_journey_schedule(
         revision=revision,
@@ -244,7 +657,7 @@ def convert_completed_journey_to_product_evidence(
     expected_schedule_payload = journey_schedule_payload(expected_schedule)
     if source_schedule != expected_schedule_payload:
         raise ValueError("completed Journey schedule does not match the G4 obligation")
-    _validate_source_journey(
+    execution_proof = _validate_source_journey(
         result=result,
         source_evidence=source_evidence,
         schedule_payload=expected_schedule_payload,
@@ -252,9 +665,22 @@ def convert_completed_journey_to_product_evidence(
         revision=revision,
         provider=provider,
         model=model,
+        runtime_root=root,
+    )
+    actor_declarations = _validate_response_bound_attestations(
+        source_evidence=source_evidence,
+        obligation=row,
+        schedule_payload=expected_schedule_payload,
     )
 
     events = _load_runtime_events(source_paths["runtime_events"])
+    rerun_observations = _rerun_journey_verifiers(
+        obligation=row,
+        source_evidence=source_evidence,
+        schedule=expected_schedule,
+        events=events,
+        transcript_path=source_paths["transcript"],
+    )
     checkpoint_diff = _build_checkpoint_diff_artifact(
         obligation=row,
         revision=revision,
@@ -267,6 +693,10 @@ def convert_completed_journey_to_product_evidence(
         **source_paths,
         "journey_evidence": source_evidence_path,
     }
+    if execution_proof:
+        artifact_sources["process_guard_receipt"] = Path(
+            str(execution_proof["path"])
+        )
     artifact_descriptors = [
         _artifact_descriptor(role, path)
         for role, path in artifact_sources.items()
@@ -286,6 +716,8 @@ def convert_completed_journey_to_product_evidence(
     verifier_results = _product_verifier_results(
         obligation=row,
         source_evidence=source_evidence,
+        rerun_observations=rerun_observations,
+        actor_declarations=actor_declarations,
         classification=classification,
         outcome=outcome,
         artifact_hashes=artifact_hashes,
@@ -295,11 +727,7 @@ def convert_completed_journey_to_product_evidence(
         tuple(artifact_sources.values()),
     )
     execution = {
-        "execution_id": content_hash({
-            "journey_evidence_id": source_evidence["evidence_id"],
-            "session_id": source_evidence["session_id"],
-            "obligation_id": row["obligation_id"],
-        }),
+        "execution_id": source_evidence["execution_id"],
         "runner": JOURNEY_RUNNER,
         "transport": REAL_PTY_TRANSPORT,
         "provider": provider,
@@ -358,6 +786,12 @@ def _validated_obligation(
     ):
         if field not in row:
             raise ValueError(f"G4 obligation is missing {field}")
+    canonical = _canonical_obligation_index(
+        str(revision.get("commit") or ""),
+        str(revision.get("worktree_hash") or ""),
+    ).get(str(row["obligation_id"]))
+    if canonical is None or row != canonical:
+        raise ValueError("G4 obligation differs from the authoritative catalog")
     simulator = dict(row["simulator_contract"])
     if (
         simulator.get("selection_mode") != "response_driven"
@@ -378,7 +812,8 @@ def _validate_source_journey(
     revision: Mapping[str, str],
     provider: str,
     model: str,
-) -> None:
+    runtime_root: Path,
+) -> dict[str, Any]:
     evidence_unsigned = dict(source_evidence)
     artifact_hash = str(evidence_unsigned.pop("artifact_hash", "") or "")
     if not artifact_hash or artifact_hash != content_hash(evidence_unsigned):
@@ -404,7 +839,13 @@ def _validate_source_journey(
         raise ValueError("source Journey schedule hash is stale")
     verifier = dict(obligation["verifier_contract"])
     registry = dict(source_evidence.get("verifier_registry") or {})
-    if registry.get("registry_id") != verifier["registry_id"]:
+    expected_registry = journey_outcome_verifier_registry_payload(
+        FORMAL_JOURNEY_VERIFIER_REGISTRY
+    )
+    if (
+        registry.get("registry_id") != verifier["registry_id"]
+        or registry != expected_registry
+    ):
         raise ValueError("source Journey verifier registry is stale")
     if source_evidence.get("provider") != provider or source_evidence.get("model") != model:
         raise ValueError("source Journey provider/model does not match DeepSeek")
@@ -441,6 +882,66 @@ def _validate_source_journey(
         raise ValueError("Journey qualifying-evidence flag contradicts its classification")
     if result.get("qualifying_evidence") is not qualifies:
         raise ValueError("Journey result qualifying-evidence flag is inconsistent")
+    if qualifies:
+        return _validate_source_execution_proof(
+            source_evidence,
+            runtime_root=runtime_root,
+        )
+    return {}
+
+
+def _validate_source_execution_proof(
+    source_evidence: Mapping[str, Any],
+    *,
+    runtime_root: Path,
+) -> dict[str, Any]:
+    execution_id = str(source_evidence.get("execution_id") or "")
+    proof = source_evidence.get("execution_proof")
+    if (
+        not execution_id
+        or source_evidence.get("qualification_reason")
+        != "trusted_container_pty_execution"
+        or not isinstance(proof, Mapping)
+        or proof.get("proof_type") != "container_pty_process_guard"
+        or proof.get("transport_kind") != "container_pty_bridge"
+        or proof.get("execution_id") != execution_id
+    ):
+        raise ValueError("source Journey lacks a trusted execution-bound PTY proof")
+    proof_path = Path(str(proof.get("path") or ""))
+    expected_receipt_root = (
+        runtime_root.resolve() / "container-cleanup-receipts"
+    )
+    if proof_path.parent.resolve() != expected_receipt_root:
+        raise ValueError("source Journey PTY proof is outside its runtime root")
+    validated = validate_cleanup_receipt_artifact(
+        proof_path,
+        execution_id=execution_id,
+        required_roles=(
+            "container_bridge",
+            "agent_process_group_leader",
+        ),
+        allowed_roots=(expected_receipt_root,),
+    )
+    expected = {
+        "proof_type": "container_pty_process_guard",
+        "transport_kind": "container_pty_bridge",
+        **validated,
+    }
+    if dict(proof) != expected:
+        raise ValueError("source Journey PTY proof differs from its receipt")
+    return expected
+
+
+@lru_cache(maxsize=None)
+def _canonical_obligation_index(
+    commit: str,
+    worktree_hash: str,
+) -> dict[str, dict[str, Any]]:
+    revision = {"commit": commit, "worktree_hash": worktree_hash}
+    return {
+        str(row["obligation_id"]): dict(row)
+        for row in build_product_chaos_obligations(revision=revision)
+    }
 
 
 def _validate_response_bound_turns(turns: Sequence[Any]) -> None:
@@ -470,6 +971,270 @@ def _validate_response_bound_turns(turns: Sequence[Any]) -> None:
             or submitted_at_ns != identity.get("user_message_submitted_at_ns")
         ):
             raise ValueError("Journey decision provenance timing is invalid")
+
+
+def _validate_response_bound_attestations(
+    *,
+    source_evidence: Mapping[str, Any],
+    obligation: Mapping[str, Any],
+    schedule_payload: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    turns = tuple(source_evidence.get("turns") or ())
+    actors: dict[tuple[str, str, str], dict[str, str]] = {}
+    seen_request_ids: set[str] = set()
+    execution_id = str(source_evidence.get("execution_id") or "")
+    session_id = str(source_evidence.get("session_id") or "")
+    if not execution_id or not session_id:
+        raise ValueError("Journey evidence has no execution/session identity")
+    for turn in turns:
+        turn_index = int(turn.get("turn_index") or 0)
+        provenance = dict(turn.get("decision_provenance") or {})
+        decision = dict(turn.get("decision") or {})
+        attestation = provenance.get("simulator_attestation")
+        context_binding = provenance.get("simulator_context_binding")
+        request_id = str(provenance.get("broker_request_id") or "")
+        if not isinstance(attestation, Mapping):
+            raise ValueError(
+                "Journey decision provenance has no simulator attestation"
+            )
+        if not isinstance(context_binding, Mapping):
+            raise ValueError(
+                "Journey decision provenance has no simulator context binding"
+            )
+        if not request_id or request_id in seen_request_ids:
+            raise ValueError(
+                "Journey decision provenance has a missing or replayed request id"
+            )
+        seen_request_ids.add(request_id)
+        control_identity = dict(
+            context_binding.get("control_identity") or {}
+        )
+        if (
+            provenance.get("execution_id") != execution_id
+            or provenance.get("obligation_id") != obligation["obligation_id"]
+            or context_binding.get("session_id") != session_id
+            or control_identity.get("lane") != "journey"
+            or control_identity.get("schedule_id")
+            != schedule_payload["schedule_id"]
+        ):
+            raise ValueError(
+                "Journey decision provenance control identity is stale"
+            )
+        reconstructed = {
+            "previous_response_hash": str(
+                provenance.get("previous_response_hash") or ""
+            ),
+            "user_message": str(decision.get("user_message") or ""),
+            "persona": str(decision.get("persona") or ""),
+            "mission": str(decision.get("mission") or ""),
+            "rationale": str(decision.get("rationale") or ""),
+            "risk_factor_ids": list(decision.get("risk_factor_ids") or ()),
+            "broker_request_id": request_id,
+        }
+        validate_simulator_attestation(
+            attestation,
+            previous_response_hash=reconstructed["previous_response_hash"],
+            decision_hash=content_hash(reconstructed),
+            request_id=request_id,
+            context_hash=content_hash(context_binding),
+            user_message_hash=str(
+                provenance.get("user_message_hash") or ""
+            ),
+            turn_index=turn_index,
+            submitted_at_ns=int(provenance.get("submitted_at_ns") or 0),
+        )
+        if str(attestation.get("user_message_hash") or "") != str(
+            provenance.get("user_message_hash") or ""
+        ):
+            raise ValueError("simulator attestation user-message binding is stale")
+        if _sha256_text(reconstructed["user_message"]) != str(
+            provenance.get("user_message_hash") or ""
+        ):
+            raise ValueError("Journey decision text does not match its provenance hash")
+        actor = dict(attestation["actor"])
+        key = (
+            str(actor["actor_kind"]),
+            str(actor["task_id"]),
+            str(actor["model"]),
+        )
+        actors[key] = {
+            "actor_kind": key[0],
+            "task_id": key[1],
+            "model": key[2],
+        }
+    return [actors[key] for key in sorted(actors)]
+
+
+def _sha256_text(value: str) -> str:
+    return content_hash(value)
+
+
+def _runtime_event(payload: Mapping[str, Any]) -> RuntimeTurnEvent:
+    return RuntimeTurnEvent(
+        schema_version=int(payload["schema_version"]),
+        event_type=str(payload["event_type"]),
+        thread_id=str(payload["thread_id"]),
+        session_purpose=str(payload.get("session_purpose") or ""),
+        before_fingerprint=str(payload["before_fingerprint"]),
+        after_fingerprint=str(payload["after_fingerprint"]),
+        turn_index=int(payload["turn_index"]),
+        active_group=str(payload.get("active_group") or ""),
+        pending_question_id=str(payload.get("pending_question_id") or ""),
+        action_queue_types=tuple(payload.get("action_queue_types") or ()),
+        pending_contract=dict(payload.get("pending_contract") or {}),
+        revision=dict(payload.get("revision") or {}),
+        admitted_action_types=tuple(payload.get("admitted_action_types") or ()),
+        admitted_action_targets=tuple(
+            dict(item) for item in payload.get("admitted_action_targets") or ()
+        ),
+        admitted_action_provenance=tuple(
+            dict(item) for item in payload.get("admitted_action_provenance") or ()
+        ),
+        turn_receipt_summary=dict(payload.get("turn_receipt_summary") or {}),
+        pending_transition=dict(payload.get("pending_transition") or {}),
+        render_manifest=dict(payload.get("render_manifest") or {}),
+        execution_receipt_summary=dict(
+            payload.get("execution_receipt_summary") or {}
+        ),
+        control_receipts=tuple(
+            dict(item) for item in payload.get("control_receipts") or ()
+        ),
+        state_diff_hashes=dict(payload.get("state_diff_hashes") or {}),
+        material_state_diff_hashes=dict(
+            payload.get("material_state_diff_hashes") or {}
+        ),
+        after_value_hashes=dict(payload.get("after_value_hashes") or {}),
+        next_result=dict(payload.get("next_result") or {}),
+    )
+
+
+def _transcript_responses(
+    transcript_path: Path,
+    decisions: Sequence[Mapping[str, Any]],
+) -> tuple[str, tuple[str, ...]]:
+    text = transcript_path.read_text(encoding="utf-8")
+    cursor = 0
+    previous_response = ""
+    responses: list[str] = []
+    for index, decision in enumerate(decisions):
+        marker = "User> " + str(decision.get("user_message") or "")
+        position = text.find(marker, cursor)
+        if position < 0:
+            raise ValueError("transcript is not bound to the recorded Journey decisions")
+        if index == 0:
+            previous_response = text[:position].rstrip()
+        response_start = position + len(marker)
+        next_marker = (
+            "User> " + str(decisions[index + 1].get("user_message") or "")
+            if index + 1 < len(decisions)
+            else ""
+        )
+        if next_marker:
+            response_end = text.find(next_marker, response_start)
+            if response_end < 0:
+                raise ValueError("transcript Journey turn order is incomplete")
+        else:
+            response_end = len(text)
+        responses.append(text[response_start:response_end].strip())
+        cursor = response_end
+    return previous_response, tuple(responses)
+
+
+def _rerun_journey_verifiers(
+    *,
+    obligation: Mapping[str, Any],
+    source_evidence: Mapping[str, Any],
+    schedule: Any,
+    events: Sequence[Mapping[str, Any]],
+    transcript_path: Path,
+) -> dict[str, dict[str, Any]]:
+    runtime_events = tuple(_runtime_event(event) for event in events)
+    if len(runtime_events) < 2:
+        raise ValueError("independent verifier rerun requires baseline and committed events")
+    initial = runtime_events[0]
+    committed = runtime_events[1:]
+    source_turns = tuple(source_evidence.get("turns") or ())
+    if len(committed) != len(source_turns):
+        raise ValueError("runtime events and Journey turns have different cardinality")
+    decisions = tuple(dict(turn.get("decision") or {}) for turn in source_turns)
+    previous_response, responses = _transcript_responses(
+        transcript_path, decisions
+    )
+    pty_turns: list[PtyCliTurnRecord] = []
+    provenance_rows: list[JourneyDecisionProvenance] = []
+    transcript: list[tuple[str, str]] = []
+    for index, (source_turn, event, decision, response) in enumerate(
+        zip(source_turns, committed, decisions, responses, strict=True)
+    ):
+        identity = dict(source_turn.get("turn_identity") or {})
+        provenance = dict(source_turn.get("decision_provenance") or {})
+        user_message = str(decision.get("user_message") or "")
+        turn = PtyCliTurnRecord(
+            session_id=str(source_evidence["session_id"]),
+            turn_index=int(source_turn["turn_index"]),
+            previous_agent_response=previous_response,
+            user_message=user_message,
+            agent_response=response,
+            provider=str(source_evidence["provider"]),
+            model=str(source_evidence["model"]),
+            before_fingerprint=str(identity["before_fingerprint"]),
+            after_fingerprint=str(identity["after_fingerprint"]),
+            transcript_hash=str(identity["transcript_hash"]),
+            previous_response_received_at_ns=int(
+                identity["previous_response_received_at_ns"]
+            ),
+            user_message_submitted_at_ns=int(
+                identity["user_message_submitted_at_ns"]
+            ),
+            agent_response_received_at_ns=int(
+                identity["agent_response_received_at_ns"]
+            ),
+        )
+        pty_turns.append(turn)
+        provenance_rows.append(JourneyDecisionProvenance(
+            turn_index=turn.turn_index,
+            previous_response_hash=str(provenance["previous_response_hash"]),
+            selected_at_ns=int(provenance["selected_at_ns"]),
+            submitted_at_ns=int(provenance["submitted_at_ns"]),
+            user_message_hash=str(provenance["user_message_hash"]),
+            persona=str(decision["persona"]),
+            mission=str(decision["mission"]),
+            rationale=str(decision["rationale"]),
+            risk_factor_ids=tuple(decision.get("risk_factor_ids") or ()),
+        ))
+        transcript.append((user_message, response))
+        previous_response = response
+    context = JourneyVerifierContext(
+        schedule=schedule,
+        initial_event=initial,
+        current_event=committed[-1],
+        completed_turns=tuple(pty_turns),
+        transcript=tuple(transcript),
+        observed_edge_keys=tuple(source_evidence.get("observed_edge_keys") or ()),
+        latest_turn=pty_turns[-1],
+        completed_events=committed,
+        completed_decisions=tuple(provenance_rows),
+    )
+    verifier = dict(obligation["verifier_contract"])
+    observations: dict[str, dict[str, Any]] = {}
+    for postcondition_id in (
+        *verifier["required_postcondition_ids"],
+        *verifier["forbidden_postcondition_ids"],
+    ):
+        definition = FORMAL_JOURNEY_VERIFIER_REGISTRY.definitions[postcondition_id]
+        result = definition.verifier(
+            replace(context, evaluating_postcondition_id=postcondition_id)
+        )
+        observations[postcondition_id] = {
+            "satisfied": result.satisfied,
+            "details": dict(result.details),
+            "verifier": {
+                "verifier_id": definition.verifier_id,
+                "verifier_version": definition.verifier_version,
+                "implementation_hash": definition.implementation_hash,
+            },
+        }
+    return observations
 
 
 def _build_checkpoint_diff_artifact(
@@ -551,6 +1316,8 @@ def _product_verifier_results(
     *,
     obligation: Mapping[str, Any],
     source_evidence: Mapping[str, Any],
+    rerun_observations: Mapping[str, Mapping[str, Any]],
+    actor_declarations: Sequence[Mapping[str, str]],
     classification: str,
     outcome: str,
     artifact_hashes: Sequence[str],
@@ -558,10 +1325,27 @@ def _product_verifier_results(
     verifier = dict(obligation["verifier_contract"])
     required = tuple(verifier["required_postcondition_ids"])
     forbidden = tuple(verifier["forbidden_postcondition_ids"])
-    observations = _latest_postcondition_observations(source_evidence)
+    recorded_observations = _latest_postcondition_observations(source_evidence)
     results: list[dict[str, Any]] = []
     for postcondition_id in (*required, *forbidden):
-        observed = observations.get(postcondition_id)
+        observed = rerun_observations.get(postcondition_id)
+        recorded = recorded_observations.get(postcondition_id)
+        if (
+            classification == "passed"
+            and observed is not None
+            and recorded is not None
+            and observed.get("satisfied") is not recorded.get("satisfied")
+        ):
+            missing = list(
+                dict(observed.get("details") or {}).get(
+                    "missing_product_receipts"
+                ) or ()
+            )
+            raise ValueError(
+                "independent verifier rerun contradicts recorded Journey verification: "
+                + postcondition_id
+                + (f"; missing product receipts: {missing}" if missing else "")
+            )
         if outcome == "externally_blocked":
             status = "externally_blocked"
         elif observed is None:
@@ -574,6 +1358,9 @@ def _product_verifier_results(
             "source_classification": classification,
             "postcondition_id": postcondition_id,
             "observation": observed,
+            "recorded_observation": recorded,
+            "verification_mode": "independent_rerun",
+            "simulator_actor_declarations": list(actor_declarations),
         }, ensure_ascii=False, sort_keys=True)
         results.append({
             "verifier_id": postcondition_id,
@@ -774,6 +1561,23 @@ def _parser() -> argparse.ArgumentParser:
     definitions.add_argument("--output", required=True, type=Path)
     definitions.add_argument("--obligation-id")
 
+    targets = subparsers.add_parser(
+        "targets",
+        help="Translate a frozen definition manifest into immutable batch targets.",
+    )
+    targets.add_argument("--definitions", required=True, type=Path)
+    targets.add_argument("--output-dir", required=True, type=Path)
+
+    batch = subparsers.add_parser(
+        "batch",
+        help="Freeze a G4 batch from immutable targets without changing row seeds.",
+    )
+    batch.add_argument("--repo-root", required=True, type=Path)
+    batch.add_argument("--targets-dir", required=True, type=Path)
+    batch.add_argument("--output", required=True, type=Path)
+    batch.add_argument("--runtime-base", required=True, type=Path)
+    batch.add_argument("--worker-runtime", choices=("linux", "docker"), default="linux")
+
     evidence = subparsers.add_parser(
         "evidence",
         help="Convert an already completed Journey runtime into G4 evidence.",
@@ -790,6 +1594,23 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "targets":
+        definition_manifest = _load_mapping(
+            args.definitions.resolve(),
+            "G4 definition manifest",
+        )
+        write_product_chaos_target_set(definition_manifest, args.output_dir)
+        return 0
+    if args.command == "batch":
+        freeze_product_chaos_batch(
+            repo_root=args.repo_root,
+            targets_dir=args.targets_dir,
+            manifest_path=args.output,
+            runtime_base=args.runtime_base,
+            worker_runtime=args.worker_runtime,
+        )
+        return 0
+
     rows, revision = load_frozen_product_chaos_catalog(args.catalog)
     if args.command == "definitions":
         manifest = build_product_chaos_journey_manifest(

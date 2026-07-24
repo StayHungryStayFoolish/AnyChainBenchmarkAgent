@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from ..llm.providers import provider_from_config
-from ..llm.types import LLMTurnTimeoutError
+from ..llm.types import LLMProviderError, LLMTurnTimeoutError
 from .action_registry import (
     ACTION_BY_TYPE,
     ACTION_SPECS,
@@ -119,42 +119,96 @@ def resolve_product_action_queue(
     admission_calls = 0
     try:
         provider = provider_from_config()
-        stage_a_prompt = _stage_a_prompt()
+        pending = dict(state.get("pending_question") or {})
+        focused_types = _active_pending_action_types(pending)
+        if focused_types:
+            (
+                focused_result,
+                _focused_errors,
+                focused_sizes,
+                focused_compiler_calls,
+                focused_admission_calls,
+                focused_seed,
+            ) = adjudicate_active_pending_contract(
+                provider,
+                state,
+                text,
+                clauses,
+                invalid_candidate=json.dumps(
+                    {"actions": [], "semantic_units": []},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                validation_errors=(
+                    "Resolve the complete active typed-question transaction. "
+                    "Fail closed when the turn contains an independently owned "
+                    "sibling demand outside the supplied action schema.",
+                ),
+                allowed_action_types=focused_types,
+            )
+            request_sizes.extend(focused_sizes)
+            stage_b_calls += focused_compiler_calls
+            admission_calls += focused_admission_calls
+            if focused_result is not None:
+                return _with_metrics(
+                    focused_result,
+                    started,
+                    request_sizes=request_sizes,
+                    stage_a_calls=stage_a_calls,
+                    stage_b_calls=stage_b_calls,
+                    admission_calls=admission_calls,
+                    owner_count=1,
+                    unit_count=len(clauses),
+                )
         stage_a_payload = _stage_a_payload(state, text, clauses)
         partition: list[dict[str, Any]] = []
-        partition_errors: tuple[str, ...] = ()
-        previous_output = ""
-        for attempt in range(2):
-            request_payload = dict(stage_a_payload)
-            request_prompt = stage_a_prompt
-            if attempt:
-                request_payload["contract_repair"] = {
-                    "prior_invalid_output": previous_output,
-                    "validation_errors": list(partition_errors),
-                    "instruction": (
-                        "Return a complete replacement document. Correct every "
-                        "validation error without dropping or paraphrasing source text."
-                    ),
-                }
-                request_prompt = (
-                    f"{stage_a_prompt} This is a contract-repair attempt. The prior "
-                    f"document was rejected for: {'; '.join(partition_errors)}. "
-                    "Return a new full document that satisfies those errors exactly."
+        owner_documents: dict[str, dict[str, Any]] = {}
+        if focused_types and focused_seed:
+            partition, coordinator_document, _seed_errors = (
+                _focused_global_seed(
+                    focused_seed,
+                    state,
+                    clauses,
+                    allowed_action_types=focused_types,
                 )
-            request_sizes.append(_wire_size(request_prompt, request_payload))
-            stage_a_calls += 1
-            previous_output = request_semantic_compilation(
-                provider,
-                system_prompt=request_prompt,
-                request_payload=request_payload,
-                max_tokens=2600,
             )
-            partition, partition_errors = _validate_partition_document(
-                previous_output,
-                clauses,
-            )
-            if not partition_errors:
-                break
+            if partition and coordinator_document:
+                owner_documents["coordinator"] = coordinator_document
+        partition_errors: tuple[str, ...] = ()
+        if not partition:
+            stage_a_prompt = _stage_a_prompt()
+            previous_output = ""
+            for attempt in range(2):
+                request_payload = dict(stage_a_payload)
+                request_prompt = stage_a_prompt
+                if attempt:
+                    request_payload["contract_repair"] = {
+                        "prior_invalid_output": previous_output,
+                        "validation_errors": list(partition_errors),
+                        "instruction": (
+                            "Return a complete replacement document. Correct every "
+                            "validation error without dropping or paraphrasing source text."
+                        ),
+                    }
+                    request_prompt = (
+                        f"{stage_a_prompt} This is a contract-repair attempt. The prior "
+                        f"document was rejected for: {'; '.join(partition_errors)}. "
+                        "Return a new full document that satisfies those errors exactly."
+                    )
+                request_sizes.append(_wire_size(request_prompt, request_payload))
+                stage_a_calls += 1
+                previous_output = request_semantic_compilation(
+                    provider,
+                    system_prompt=request_prompt,
+                    request_payload=request_payload,
+                    max_tokens=2600,
+                )
+                partition, partition_errors = _validate_partition_document(
+                    previous_output,
+                    clauses,
+                )
+                if not partition_errors:
+                    break
         if partition_errors:
             return _with_metrics(
                 _unresolved_action_queue(clauses, partition_errors),
@@ -178,6 +232,7 @@ def resolve_product_action_queue(
                 focused_sizes,
                 focused_compiler_calls,
                 focused_admission_calls,
+                _focused_seed,
             ) = adjudicate_active_pending_contract(
                 provider,
                 state,
@@ -221,34 +276,10 @@ def resolve_product_action_queue(
                 owner_count=1,
                 unit_count=len(partition),
             )
-        (
-            partition_admission_errors,
-            admission_request_sizes,
-            redundant_unit_ids,
-        ) = (
-            _review_stage_a_partition(
-                provider,
-                stage_a_payload,
-                partition,
-            )
-        )
-        request_sizes.extend(admission_request_sizes)
-        stage_a_calls += len(admission_request_sizes)
-        if partition_admission_errors:
-            return _with_metrics(
-                _unresolved_action_queue(clauses, partition_admission_errors),
-                started,
-                request_sizes=request_sizes,
-                stage_a_calls=stage_a_calls,
-                stage_b_calls=stage_b_calls,
-                admission_calls=admission_calls,
-                owner_count=0,
-                unit_count=len(partition),
-            )
         source_partition, compilation_partition = (
             _partition_after_stage_a_admission(
                 partition,
-                redundant_unit_ids,
+                frozenset(),
             )
         )
         source_partition, compilation_partition = (
@@ -289,7 +320,32 @@ def resolve_product_action_queue(
                 if route["owner"] == owner and route["group"]
             )
             owner_inputs.append((owner, unit_ids, owner_groups))
-        owner_documents: dict[str, dict[str, Any]] = {}
+        for owner, unit_ids in requests.items():
+            if owner not in owner_documents:
+                continue
+            bound_ids = tuple(
+                str(binding.get("unit_id") or "")
+                for binding in owner_documents[owner].get("bindings") or ()
+            )
+            if bound_ids != unit_ids:
+                owner_documents = {}
+                partition = []
+                return _with_metrics(
+                    _unresolved_action_queue(
+                        clauses,
+                        ("focused seed owner bindings differ from routed partition",),
+                    ),
+                    started,
+                    request_sizes=request_sizes,
+                    stage_a_calls=stage_a_calls,
+                    stage_b_calls=stage_b_calls,
+                    admission_calls=admission_calls,
+                    owner_count=len(requests),
+                    unit_count=len(compilation_partition),
+                )
+        owner_inputs = [
+            item for item in owner_inputs if item[0] not in owner_documents
+        ]
         with ThreadPoolExecutor(max_workers=max(1, len(owner_inputs))) as executor:
             futures = [
                 executor.submit(
@@ -374,53 +430,10 @@ def resolve_product_action_queue(
                 )
                 + len(plan.request_json.encode("utf-8"))
             )
-        needs_focused_pending_adjudication = bool(
-            admission is not None
-            and admission.valid
-            and plan is not None
-            and _admitted_plan_requires_pending_contract_adjudication(
-                plan,
-                admission,
-                state,
-                focused_adjudication=False,
-            )
-        )
-        if needs_focused_pending_adjudication:
-            (
-                focused_result,
-                focused_errors,
-                focused_sizes,
-                focused_compiler_calls,
-                focused_admission_calls,
-            ) = adjudicate_active_pending_contract(
-                provider,
-                state,
-                text,
-                clauses,
-                invalid_candidate=candidate_text,
-                validation_errors=admission_errors,
-                allowed_action_types=allowed_types,
-            )
-            request_sizes.extend(focused_sizes)
-            stage_b_calls += focused_compiler_calls
-            admission_calls += focused_admission_calls
-            if focused_result is not None:
-                return _with_metrics(
-                    focused_result,
-                    started,
-                    request_sizes=request_sizes,
-                    stage_a_calls=stage_a_calls,
-                    stage_b_calls=stage_b_calls,
-                    admission_calls=admission_calls,
-                    owner_count=len(requests),
-                    unit_count=len(partition),
-                )
-            admission_errors = focused_errors
         if (
             admission is None
             or not admission.valid
             or plan is None
-            or needs_focused_pending_adjudication
         ):
             return _with_metrics(
                 _unresolved_action_queue(clauses, admission_errors),
@@ -443,7 +456,7 @@ def resolve_product_action_queue(
             owner_count=len(requests),
             unit_count=len(partition),
         )
-    except LLMTurnTimeoutError:
+    except (LLMTurnTimeoutError, LLMProviderError):
         raise
     except Exception as exc:
         return _with_metrics(
@@ -577,6 +590,265 @@ def _stage_a_payload(
             for row in group_schema()
         ],
     }
+
+
+def _focused_global_seed(
+    candidate: str,
+    state: AgentGraphState,
+    clauses: Sequence[TurnClause],
+    *,
+    allowed_action_types: frozenset[str],
+) -> tuple[list[dict[str, Any]], dict[str, Any], tuple[str, ...]]:
+    """Promote one focused result into the global partition when fully routed.
+
+    The focused compiler may identify both the active pending answer and
+    independent sibling units. This boundary reuses only source-exact units,
+    one registry-valid pending action, and explicit registry routes. Any
+    ambiguity falls back to normal Stage A planning.
+    """
+
+    try:
+        payload = json.loads(candidate)
+    except json.JSONDecodeError:
+        return [], {}, ("focused global seed is not strict JSON",)
+    if not isinstance(payload, Mapping):
+        return [], {}, ("focused global seed is not an object",)
+    actions = payload.get("actions")
+    units = payload.get("semantic_units")
+    if not isinstance(actions, list) or len(actions) != 1:
+        return [], {}, ("focused global seed requires exactly one action",)
+    if not isinstance(units, list) or not units:
+        return [], {}, ("focused global seed requires semantic units",)
+    try:
+        pending_action = validate_action_contract(actions[0])
+    except (TypeError, ValueError) as exc:
+        return [], {}, (f"focused global seed pending action is invalid: {exc}",)
+    action_type = str(pending_action.get("type") or "")
+    if action_type not in allowed_action_types:
+        return [], {}, ("focused global seed action is outside pending contract",)
+    action_spec = ACTION_BY_TYPE.get(action_type)
+    if action_spec is None or action_spec.owner != "coordinator":
+        return [], {}, ("focused global seed action is not coordinator-owned",)
+
+    pending_group = str(
+        dict(state.get("pending_question") or {}).get("group") or ""
+    )
+    if pending_group not in GROUP_SPEC_BY_NAME:
+        return [], {}, ("focused global seed has no registered pending group",)
+
+    normalized_units, normalization_errors = _normalize_focused_seed_units(
+        units,
+        clauses,
+        pending_action,
+    )
+    if normalization_errors:
+        return [], {}, normalization_errors
+
+    partition_rows: list[dict[str, Any]] = []
+    pending_unit_ids: list[str] = []
+    for index, raw in enumerate(normalized_units, start=1):
+        if not isinstance(raw, Mapping):
+            return [], {}, ("focused global seed contains a non-object unit",)
+        disposition = str(raw.get("disposition") or "")
+        indexes = raw.get("action_indexes")
+        indexes = list(indexes) if isinstance(indexes, list) else []
+        unit_id = f"focused-unit-{index}"
+        row = {
+            "unit_id": unit_id,
+            "clause_id": str(raw.get("clause_id") or ""),
+            "source_text": str(raw.get("source_text") or ""),
+            "reason": str(raw.get("reason") or "focused global seed"),
+        }
+        if disposition == "action":
+            if indexes != [0] or raw.get("owner_routes"):
+                return [], {}, (
+                    "focused global seed pending unit has invalid ownership",
+                )
+            row["operation"] = "pending_answer"
+            row["owner_routes"] = [{
+                "owner": "coordinator",
+                "group": pending_group,
+            }]
+            pending_unit_ids.append(unit_id)
+        elif disposition == "context":
+            if indexes or raw.get("owner_routes"):
+                return [], {}, (
+                    "focused global seed context unit has invalid ownership",
+                )
+            row["operation"] = "context"
+            row["owner_routes"] = []
+        elif disposition == "unresolved":
+            if indexes:
+                return [], {}, (
+                    "focused global seed unresolved unit has action indexes",
+                )
+            operation = str(raw.get("operation") or "")
+            routes = raw.get("owner_routes")
+            if operation not in _UNIVERSAL_OPERATIONS or operation in {
+                "pending_answer",
+                "context",
+                "unresolved",
+            }:
+                return [], {}, (
+                    "focused global seed unresolved unit has no valid operation",
+                )
+            if not isinstance(routes, list) or not routes:
+                return [], {}, (
+                    "focused global seed unresolved unit has no exact route",
+                )
+            normalized_routes: list[dict[str, str]] = []
+            for route in routes:
+                if not isinstance(route, Mapping):
+                    return [], {}, (
+                        "focused global seed route is not an object",
+                    )
+                owner = str(route.get("owner") or "")
+                group = str(route.get("group") or "")
+                group_spec = GROUP_SPEC_BY_NAME.get(group)
+                if (
+                    owner == "coordinator"
+                    or owner not in _OWNERS
+                    or group_spec is None
+                    or (
+                        owner not in {"orientation", "analysis"}
+                        and group_spec.owner != owner
+                    )
+                    or (
+                        operation in _UNIVERSAL_OPERATION_OWNER
+                        and _UNIVERSAL_OPERATION_OWNER[operation] != owner
+                    )
+                ):
+                    return [], {}, (
+                        "focused global seed route is outside the registry",
+                    )
+                normalized_routes.append({"owner": owner, "group": group})
+            row["operation"] = operation
+            row["owner_routes"] = normalized_routes
+        else:
+            return [], {}, ("focused global seed unit disposition is invalid",)
+        partition_rows.append(row)
+    if not pending_unit_ids:
+        return [], {}, ("focused global seed does not bind the pending action",)
+
+    partition, errors = _validate_partition_document(
+        json.dumps(
+            {"semantic_units": partition_rows},
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        clauses,
+    )
+    if errors:
+        return [], {}, errors
+    coordinator_document = {
+        "actions": [pending_action],
+        "bindings": [
+            {
+                "unit_id": unit_id,
+                "action_indexes": [0],
+                "disposition": "action",
+                "reason": "focused pending action retained by Harness",
+            }
+            for unit_id in pending_unit_ids
+        ],
+    }
+    return partition, coordinator_document, ()
+
+
+def _normalize_focused_seed_units(
+    units: Sequence[Any],
+    clauses: Sequence[TurnClause],
+    pending_action: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], tuple[str, ...]]:
+    """Resolve only source overlap proven by the pending action's evidence."""
+
+    if not all(isinstance(unit, Mapping) for unit in units):
+        return [], ("focused global seed contains a non-object unit",)
+    rows = [dict(unit) for unit in units]
+    clause_by_id = {clause.clause_id: clause for clause in clauses}
+    evidence = str(pending_action.get("source_evidence") or "")
+    for row in rows:
+        if (
+            str(row.get("disposition") or "") != "action"
+            or list(row.get("action_indexes") or []) != [0]
+        ):
+            continue
+        clause = clause_by_id.get(str(row.get("clause_id") or ""))
+        if clause is None or not evidence or evidence not in clause.text:
+            return [], (
+                "focused global seed pending evidence has no exact clause anchor",
+            )
+        row["source_text"] = evidence
+
+    for clause_id, clause in clause_by_id.items():
+        clause_rows = [
+            row for row in rows
+            if str(row.get("clause_id") or "") == clause_id
+        ]
+        unresolved = [
+            row for row in clause_rows
+            if str(row.get("disposition") or "") == "unresolved"
+        ]
+        if (
+            len(unresolved) != 1
+            or str(unresolved[0].get("source_text") or "") != clause.text
+        ):
+            continue
+        anchors = [
+            str(row.get("source_text") or "")
+            for row in clause_rows
+            if row is not unresolved[0]
+        ]
+        if not anchors:
+            continue
+        placements: list[tuple[int, int]] = []
+        cursor = 0
+        for anchor in anchors:
+            start = clause.text.find(anchor, cursor)
+            if start < 0:
+                return [], (
+                    "focused global seed source anchors are ambiguous",
+                )
+            placements.append((start, start + len(anchor)))
+            cursor = start + len(anchor)
+        gaps: list[tuple[int, int]] = []
+        cursor = 0
+        for start, end in placements:
+            if cursor < start and not _separator_text(clause.text[cursor:start]):
+                gaps.append((cursor, start))
+            cursor = max(cursor, end)
+        if cursor < len(clause.text) and not _separator_text(clause.text[cursor:]):
+            gaps.append((cursor, len(clause.text)))
+        if len(gaps) != 1:
+            return [], (
+                "focused global seed cannot derive one unique sibling source span",
+            )
+        start, end = gaps[0]
+        unresolved[0]["source_text"] = clause.text[start:end]
+
+    clause_order = {
+        clause.clause_id: index for index, clause in enumerate(clauses)
+    }
+    try:
+        rows.sort(
+            key=lambda row: (
+                clause_order[str(row.get("clause_id") or "")],
+                clause_by_id[str(row.get("clause_id") or "")].text.index(
+                    str(row.get("source_text") or "")
+                ),
+            )
+        )
+    except (KeyError, ValueError):
+        return [], ("focused global seed source anchors are invalid",)
+    return rows, ()
+
+
+def _separator_text(value: str) -> bool:
+    return all(
+        character.isspace()
+        or not character.isalnum()
+        for character in str(value or "")
+    )
 
 
 def _validate_partition_document(
@@ -1498,6 +1770,23 @@ def _focused_action_types_for_partition(
         if universal_operations.intersection(spec.semantic_operations)
     )
     return partition_types | universal_types
+
+
+def _active_pending_action_types(
+    pending: Mapping[str, Any],
+) -> frozenset[str]:
+    """Return only action types explicitly declared by the active question."""
+
+    if not pending:
+        return frozenset()
+    accepted = {
+        str(value)
+        for value in pending.get("accepted_action_types") or ()
+        if str(value) in ACTION_BY_TYPE
+    }
+    if "answer_pending" in ACTION_BY_TYPE:
+        accepted.add("answer_pending")
+    return frozenset(accepted)
 
 
 def _stage_b_payload(

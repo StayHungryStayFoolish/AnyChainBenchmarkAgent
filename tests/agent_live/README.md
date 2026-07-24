@@ -58,7 +58,7 @@ are raw evidence, not product acceptance.
 
 Phase 8 uses finite, frozen denominators. G3 contains 60 retained-regression
 obligations: exact, isomorphic, negative, and neighboring variants for each of
-15 sanitized real-user cases. G4 contains 135 response-driven obligations:
+15 sanitized real-user cases. G4 contains 130 response-driven obligations:
 63 constrained pairwise rows plus 72 high-risk state-control triples. G5
 contains four independent executions: fake-node smoke, Geth real-node smoke,
 Geth real-node final, and bounded sync-observe. Catalog generation is never

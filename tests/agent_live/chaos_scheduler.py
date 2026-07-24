@@ -7,7 +7,7 @@ turns, execute the CLI, or claim that a scheduled row was observed.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
@@ -16,7 +16,7 @@ from tests.agent_live.coverage_evidence import content_hash
 
 
 CHAOS_SCHEDULE_SCHEMA_VERSION = 4
-JOURNEY_SCHEDULE_SCHEMA_VERSION = 1
+JOURNEY_SCHEDULE_SCHEMA_VERSION = 3
 DEFAULT_DEFERRED_CONTINUATION_TURN_BUDGET = 12
 
 
@@ -61,6 +61,8 @@ class JourneySchedule:
     max_turns: int
     terminal_outcome: JourneyOutcomeContract
     forbidden_outcomes: tuple[JourneyOutcomeContract, ...]
+    subject_group: str = ""
+    verifier_input_contract: Mapping[str, Any] = field(default_factory=dict)
     schema_version: int = JOURNEY_SCHEDULE_SCHEMA_VERSION
 
 
@@ -213,6 +215,8 @@ def build_journey_schedule(
         "max_turns",
         "terminal_outcome",
         "forbidden_outcomes",
+        "subject_group",
+        "verifier_input_contract",
     }
     unknown_fields = sorted(set(journey) - allowed_fields)
     if unknown_fields:
@@ -248,8 +252,14 @@ def build_journey_schedule(
         raise ValueError("journey schedule forbidden outcome ids must be unique")
     if terminal_outcome.outcome_id in forbidden_ids:
         raise ValueError("journey terminal outcome cannot also be forbidden")
+    verifier_input_contract = journey.get("verifier_input_contract") or {}
+    if not isinstance(verifier_input_contract, Mapping):
+        raise ValueError("journey verifier_input_contract must be an object")
+    verifier_input_contract = dict(verifier_input_contract)
+    subject_group = str(journey.get("subject_group") or "").strip()
 
     identity = {
+        "schema_version": JOURNEY_SCHEDULE_SCHEMA_VERSION,
         "journey_id": journey_id,
         "seed": int(seed),
         "revision": dict(revision),
@@ -262,6 +272,8 @@ def build_journey_schedule(
         "forbidden_outcomes": [
             _journey_outcome_payload(item) for item in forbidden_outcomes
         ],
+        "subject_group": subject_group,
+        "verifier_input_contract": verifier_input_contract,
     }
     return JourneySchedule(
         schedule_id=content_hash(identity),
@@ -275,6 +287,8 @@ def build_journey_schedule(
         max_turns=max_turns,
         terminal_outcome=terminal_outcome,
         forbidden_outcomes=forbidden_outcomes,
+        subject_group=subject_group,
+        verifier_input_contract=MappingProxyType(verifier_input_contract),
     )
 
 
@@ -294,6 +308,8 @@ def journey_schedule_payload(schedule: JourneySchedule) -> dict[str, Any]:
         "forbidden_outcomes": [
             _journey_outcome_payload(item) for item in schedule.forbidden_outcomes
         ],
+        "subject_group": schedule.subject_group,
+        "verifier_input_contract": dict(schedule.verifier_input_contract),
     }
 
 
@@ -318,6 +334,8 @@ def validate_journey_schedule(
             "max_turns": schedule.max_turns,
             "terminal_outcome": schedule.terminal_outcome,
             "forbidden_outcomes": schedule.forbidden_outcomes,
+            "subject_group": schedule.subject_group,
+            "verifier_input_contract": dict(schedule.verifier_input_contract),
         },
     )
     if schedule.schedule_id != rebuilt.schedule_id:

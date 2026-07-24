@@ -2,27 +2,49 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
+import os
+import re
+import struct
 import time
-import csv
+import urllib.parse
+import zlib
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from tests.agent_live.coverage_events import state_diff_between
 from agent.harness.runtime_identity import repository_revision
+from agent.runners.artifact_ownership import (
+    ARTIFACT_MANIFEST_SCHEMA_VERSION,
+    derive_artifact_owner_roots,
+    required_artifact_owner,
+    validate_owned_artifact_path,
+)
 from agent.harness.control_receipts import (
     validate_persisted_domain_control_receipt,
 )
-from agent.runners.execution_scenarios import scenario_by_id, workflow_type_from_plan
+from agent.runners.execution_scenarios import (
+    EXECUTION_SCENARIOS,
+    scenario_by_id,
+    workflow_type_from_plan,
+)
+from agent.runners.plan_projection import validate_execution_plan_projection
+from agent.runners.runtime_env_projection import validate_runtime_env_projection
 from agent.utils.redaction import redact
+from tests.agent_live.real_execution_host_attestation import (
+    validate_host_attestation_file,
+)
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
 ARTIFACT_SCHEMA_VERSION = 4
 CLI_ARTIFACT_SCHEMA_VERSION = 6
-REAL_EXECUTION_ARTIFACT_SCHEMA_VERSION = 3
+REAL_EXECUTION_ARTIFACT_SCHEMA_VERSION = 4
 TURN_OBSERVATION_SCHEMA_VERSION = 2
 PTY_DIAGNOSTIC_SCHEMA_VERSION = 1
 PTY_DIAGNOSTIC_STATUSES = {
@@ -31,6 +53,67 @@ PTY_DIAGNOSTIC_STATUSES = {
     }),
     "interruption": frozenset({"interrupted"}),
 }
+
+
+@dataclass(frozen=True)
+class G5RuntimeContract:
+    schema_version: int
+    contract_id: str
+    chain_id: str
+    image_digest: str
+    image_reference: str
+    rpc_url: str
+    metrics_url: str
+    compose_service: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+G5_RUNTIME_CONTRACT = G5RuntimeContract(
+    schema_version=1,
+    contract_id="phase-e-g5-local-geth-v1",
+    chain_id="0x539",
+    image_digest="sha256:746d19134a870e0c83760eee5897696678b0e57c1f73e3392254fcd8426e5782",
+    image_reference="ethereum/client-go@sha256:746d19134a870e0c83760eee5897696678b0e57c1f73e3392254fcd8426e5782",
+    rpc_url="http://geth-dev:8545",
+    metrics_url="http://geth-dev:6060/debug/metrics/prometheus",
+    compose_service="geth-dev",
+)
+
+
+@dataclass(frozen=True)
+class G5ScenarioAdmission:
+    sequence_index: int
+    predecessor_scenario_id: str = ""
+    endpoint_env_var: str = ""
+
+
+G5_SCENARIO_ADMISSION = {
+    "rpc_fake_node_smoke": G5ScenarioAdmission(sequence_index=1),
+    "rpc_real_node_smoke": G5ScenarioAdmission(
+        sequence_index=2,
+        predecessor_scenario_id="rpc_fake_node_smoke",
+        endpoint_env_var="LOCAL_RPC_URL",
+    ),
+    "rpc_real_node_final": G5ScenarioAdmission(
+        sequence_index=3,
+        predecessor_scenario_id="rpc_real_node_smoke",
+        endpoint_env_var="LOCAL_RPC_URL",
+    ),
+    "sync_observe_bounded": G5ScenarioAdmission(
+        sequence_index=4,
+        predecessor_scenario_id="rpc_real_node_final",
+        endpoint_env_var="SYNC_OBSERVE_RPC_URL",
+    ),
+}
+
+
+def g5_scenario_admission(scenario_id: str) -> G5ScenarioAdmission:
+    try:
+        return G5_SCENARIO_ADMISSION[scenario_id]
+    except KeyError as exc:
+        raise ValueError(f"scenario has no G5 admission contract: {scenario_id}") from exc
 EXECUTION_EVIDENCE_CLASSES = frozenset(
     {"deterministic", "real_cli", "dynamic_dual_ai", "real_execution"}
 )
@@ -1475,6 +1558,12 @@ def _validate_runtime_event(event: RuntimeTurnEvent) -> None:
         raise ValueError("runtime event pending contract identity is inconsistent")
 
 
+def validate_runtime_turn_event(event: RuntimeTurnEvent) -> None:
+    """Validate one complete runtime event at an external evidence boundary."""
+
+    _validate_runtime_event(event)
+
+
 def verify_runtime_postcondition(
     edge: Mapping[str, Any],
     baseline: RuntimeTurnEvent,
@@ -2177,6 +2266,9 @@ def build_real_execution_evidence_artifact(
     job_id: str,
     job_artifacts: Iterable[Mapping[str, Any]],
     log_artifacts: Iterable[Mapping[str, Any]],
+    outcome: str = "passed",
+    exit_status: int = 0,
+    error: str = "",
     started_at: str | None = None,
     finished_at: str | None = None,
 ) -> dict[str, Any]:
@@ -2212,14 +2304,30 @@ def build_real_execution_evidence_artifact(
         raise ValueError(f"invalid real execution identity: {', '.join(missing) or 'worktree hash'}")
     if not str(job_id or "").strip():
         raise ValueError("real execution evidence requires a job id")
+    if outcome not in {"passed", "observed-fail"}:
+        raise ValueError(f"invalid real execution outcome: {outcome}")
+    if outcome == "passed" and (int(exit_status) != 0 or str(error or "").strip()):
+        raise ValueError("passed real execution evidence cannot contain a failure")
+    if outcome == "observed-fail" and int(exit_status) == 0:
+        raise ValueError("observed-fail real execution evidence requires non-zero exit status")
+    if outcome == "observed-fail" and not str(error or "").strip():
+        raise ValueError("observed-fail real execution evidence requires an error")
     if not request or not result:
         raise ValueError("real execution evidence requires request and result objects")
     raw_artifacts = [dict(item) for item in job_artifacts]
     raw_logs = [dict(item) for item in log_artifacts]
     if not raw_artifacts or not raw_logs:
         raise ValueError("real execution evidence requires hashed job and log artifacts")
+    observed_job = dict(result.get("observed_job") or {})
+    run_dir = Path(str(observed_job.get("run_dir") or ""))
+    if not run_dir.is_dir() or run_dir.is_symlink() or run_dir.name != str(job_id):
+        raise ValueError("real execution evidence requires one fresh non-symlink run_dir")
     for item in (*raw_artifacts, *raw_logs):
-        _validate_hashed_artifact_identity(item, expected_job_id=str(job_id))
+        _validate_hashed_artifact_identity(
+            item,
+            expected_job_id=str(job_id),
+            expected_run_dir=run_dir,
+        )
     safe_request = redact(deepcopy(dict(request)))
     safe_result = redact(deepcopy(dict(result)))
     artifacts = redact(raw_artifacts)
@@ -2246,9 +2354,9 @@ def build_real_execution_evidence_artifact(
         "job_artifacts_hash": content_hash(artifacts),
         "log_artifacts": logs,
         "log_artifacts_hash": content_hash(logs),
-        "outcome": "passed",
-        "exit_status": 0,
-        "error": "",
+        "outcome": outcome,
+        "exit_status": int(exit_status),
+        "error": str(redact(str(error or ""))),
         "content_redacted": True,
         "started_at": started_at or _utc_timestamp(),
         "finished_at": finished_at or _utc_timestamp(),
@@ -2263,6 +2371,7 @@ def validate_real_execution_evidence_artifact(
     *,
     edge: Mapping[str, Any],
     revision: Mapping[str, str],
+    allow_observed_failure: bool = False,
 ) -> tuple[bool, str]:
     lane_error = _lane_error(edge, "real_execution")
     if lane_error:
@@ -2306,8 +2415,34 @@ def validate_real_execution_evidence_artifact(
         return False, "real execution operation disagrees with scenario"
     if not str(artifact.get("job_id") or "").strip():
         return False, "real execution job id is missing"
-    if artifact.get("outcome") != "passed" or artifact.get("exit_status") != 0 or artifact.get("error"):
-        return False, "qualifying real execution evidence must be an observed pass"
+    outcome = str(artifact.get("outcome") or "")
+    exit_status = artifact.get("exit_status")
+    error = str(artifact.get("error") or "")
+    if outcome == "passed":
+        if exit_status != 0 or error:
+            return False, "passed real execution evidence contains a failure"
+    elif outcome == "observed-fail":
+        if not allow_observed_failure:
+            return False, "observed-fail evidence does not qualify as a passing execution edge"
+        if not isinstance(exit_status, int) or exit_status == 0 or not error:
+            return False, "observed-fail evidence has no observed failure"
+    else:
+        return False, "real execution outcome is invalid"
+    try:
+        started_at = datetime.fromisoformat(
+            str(artifact.get("started_at") or "").replace("Z", "+00:00")
+        )
+        finished_at = datetime.fromisoformat(
+            str(artifact.get("finished_at") or "").replace("Z", "+00:00")
+        )
+    except ValueError:
+        return False, "real execution observation timestamp is invalid"
+    if (
+        started_at.tzinfo is None
+        or finished_at.tzinfo is None
+        or finished_at < started_at
+    ):
+        return False, "real execution observation time range is invalid"
     request = artifact.get("request")
     result = artifact.get("result")
     if not isinstance(request, Mapping) or not request:
@@ -2318,6 +2453,30 @@ def validate_real_execution_evidence_artifact(
         return False, "real execution request hash mismatch"
     if content_hash(result) != artifact.get("result_hash"):
         return False, "real execution result hash mismatch"
+    observed_job = dict(result.get("observed_job") or {})
+    run_dir = Path(str(observed_job.get("run_dir") or ""))
+    if not run_dir.is_dir() or run_dir.is_symlink():
+        return False, "real execution run_dir is missing or symlinked"
+    observed_status = str(observed_job.get("status") or "")
+    observed_exit_status = observed_job.get("exit_code")
+    observed_error = str(observed_job.get("error") or "")
+    expected_outcome = (
+        "passed"
+        if observed_status == "completed" and observed_exit_status == 0
+        else "observed-fail"
+    )
+    expected_error = "" if expected_outcome == "passed" else observed_error
+    if (
+        not isinstance(observed_exit_status, int)
+        or artifact.get("outcome") != expected_outcome
+        or artifact.get("exit_status") != observed_exit_status
+        or str(artifact.get("error") or "") != expected_error
+    ):
+        return False, "real execution outcome is not derived from persisted job state"
+    if expected_outcome == "observed-fail" and (
+        observed_exit_status == 0 or not observed_error
+    ):
+        return False, "persisted observed failure is incomplete"
     for field, hash_field in (
         ("job_artifacts", "job_artifacts_hash"),
         ("log_artifacts", "log_artifacts_hash"),
@@ -2330,6 +2489,7 @@ def validate_real_execution_evidence_artifact(
                 _validate_hashed_artifact_identity(
                     item,
                     expected_job_id=str(artifact.get("job_id") or ""),
+                    expected_run_dir=run_dir,
                 )
         except ValueError as exc:
             return False, str(exc)
@@ -2358,6 +2518,36 @@ def _real_execution_scenario_error(
         return "real execution request scenario mismatch"
     if str(request.get("service_operation") or "") != scenario.operation:
         return "real execution request operation mismatch"
+    approved_plan_file = Path(str(request.get("approved_plan_file") or ""))
+    try:
+        approved_plan_sha256 = hashlib.sha256(approved_plan_file.read_bytes()).hexdigest()
+    except OSError as exc:
+        return f"approved plan cannot be rehashed: {exc}"
+    if approved_plan_sha256 != str(request.get("approved_plan_sha256") or ""):
+        return "approved plan hash mismatch"
+    if dict(request.get("approved_plan_revision") or {}) != dict(artifact.get("revision") or {}):
+        return "approved plan revision binding mismatch"
+    try:
+        approved_plan = json.loads(approved_plan_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"approved plan is invalid: {exc}"
+    envelope_file = Path(str(request.get("admission_envelope_file") or ""))
+    try:
+        envelope_sha256 = hashlib.sha256(envelope_file.read_bytes()).hexdigest()
+        envelope = json.loads(envelope_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"G5 admission envelope is invalid: {exc}"
+    if envelope_sha256 != str(request.get("admission_envelope_sha256") or ""):
+        return "G5 admission envelope hash mismatch"
+    envelope_error = _g5_admission_envelope_error(
+        envelope=envelope,
+        request=request,
+        scenario=scenario,
+        artifact=artifact,
+        approved_plan=approved_plan,
+    )
+    if envelope_error:
+        return envelope_error
     result = dict(artifact.get("result") or {})
     observed_job = dict(result.get("observed_job") or {})
     artifacts = dict(observed_job.get("artifacts") or {})
@@ -2368,15 +2558,108 @@ def _real_execution_scenario_error(
     ]
     if len(plan_paths) != 1:
         return "real execution evidence must bind one job plan"
+    job_paths = [
+        Path(str(item.get("path") or ""))
+        for item in artifact.get("job_artifacts") or ()
+        if Path(str(item.get("path") or "")).name == "job.json"
+    ]
+    if len(job_paths) != 1:
+        return "real execution evidence must bind one persisted job"
     try:
         plan = json.loads(plan_paths[0].read_text(encoding="utf-8"))
+        persisted_job = redact(
+            json.loads(job_paths[0].read_text(encoding="utf-8"))
+        )
     except (OSError, json.JSONDecodeError) as exc:
-        return f"real execution job plan is invalid: {exc}"
+        return f"real execution job plan or persisted job is invalid: {exc}"
     if workflow_type_from_plan(plan) != scenario.workflow_type:
         return "real execution workflow mismatch"
     provenance = dict(plan.get("execution_provenance") or {})
     if str(provenance.get("scenario_id") or "") != scenario.scenario_id:
         return "real execution provenance scenario mismatch"
+    if str(provenance.get("operation") or "") != scenario.operation:
+        return "real execution provenance operation mismatch"
+    if str(provenance.get("approved_plan_file") or "") != str(approved_plan_file.resolve()):
+        return "job plan approved-plan path mismatch"
+    if str(provenance.get("approved_plan_sha256") or "") != approved_plan_sha256:
+        return "job plan approved-plan hash mismatch"
+    if str(provenance.get("job_id") or "") != str(artifact.get("job_id") or ""):
+        return "job plan provenance job mismatch"
+    if str(provenance.get("job_plan_file") or "") != str(plan_paths[0].resolve()):
+        return "job plan provenance path mismatch"
+    if "g5_admission_provenance" in plan:
+        return "G5 admission metadata leaked into the product job plan"
+    try:
+        validate_execution_plan_projection(
+            approved_plan,
+            plan,
+            approved_plan_file=approved_plan_file,
+            operation=scenario.operation,
+            scenario_id=scenario.scenario_id,
+            job_id=str(artifact.get("job_id") or ""),
+            job_plan_file=plan_paths[0],
+        )
+    except (OSError, ValueError) as exc:
+        return f"job plan projection is invalid: {exc}"
+    observed_job = dict(result.get("observed_job") or {})
+    if str(observed_job.get("job_id") or "") != str(artifact.get("job_id") or ""):
+        return "observed job identity mismatch"
+    for field in ("job_id", "status", "exit_code", "error", "created_at"):
+        observed_value = observed_job.get(field)
+        persisted_value = persisted_job.get(field)
+        if field == "error":
+            observed_value = str(observed_value or "")
+            persisted_value = str(persisted_value or "")
+        if observed_value != persisted_value:
+            return f"observed job disagrees with persisted job: {field}"
+    jobs_dir = Path(str(request.get("jobs_dir") or "")).resolve()
+    run_dir = Path(str(observed_job.get("run_dir") or "")).resolve()
+    if run_dir.parent != jobs_dir or run_dir.name != str(artifact.get("job_id") or ""):
+        return "observed job is outside the admitted jobs root"
+    try:
+        owner_roots = derive_artifact_owner_roots(observed_job)
+    except (OSError, ValueError) as exc:
+        return f"real execution artifact owner roots are invalid: {exc}"
+    try:
+        runtime_projection = validate_runtime_env_projection(observed_job)
+    except (OSError, ValueError) as exc:
+        return f"real execution runtime.env projection is invalid: {exc}"
+    if request.get("runtime_env_projection") != runtime_projection:
+        return "real execution runtime.env projection receipt mismatch"
+    try:
+        admitted_at = datetime.fromisoformat(
+            str(request.get("jobs_root_admitted_at") or "").replace("Z", "+00:00")
+        )
+        created_at = datetime.fromisoformat(
+            str(observed_job.get("created_at") or "").replace("Z", "+00:00")
+        )
+        submitted_at = datetime.fromisoformat(
+            str(artifact.get("started_at") or "").replace("Z", "+00:00")
+        )
+    except ValueError:
+        return "real execution freshness timestamp is invalid"
+    if admitted_at.tzinfo is None or created_at.tzinfo is None or created_at < admitted_at:
+        return "observed job predates the admitted jobs root"
+    if submitted_at.tzinfo is None or created_at < submitted_at:
+        return "observed job predates its execution submission"
+    endpoint_error = _real_execution_endpoint_error(
+        request=request,
+        plan=approved_plan,
+        scenario=scenario,
+        artifact=artifact,
+        envelope=envelope,
+    )
+    if endpoint_error:
+        return endpoint_error
+    runtime_error = _real_execution_runtime_attestation_error(
+        request=request,
+        plan=approved_plan,
+        scenario=scenario,
+        artifact=artifact,
+        envelope=envelope,
+    )
+    if runtime_error:
+        return runtime_error
     command = [str(item) for item in (plan.get("execution") or {}).get("command") or ()]
     for token in scenario.required_command_tokens:
         if token not in command:
@@ -2410,6 +2693,16 @@ def _real_execution_scenario_error(
             )
         ):
             return "sync-observe plan contains a QPS profile"
+    if str(artifact.get("outcome") or "") == "observed-fail":
+        return ""
+    manifest_error = _required_artifact_manifest_error(
+        artifact=artifact,
+        request=request,
+        observed_artifacts=artifacts,
+        scenario=scenario,
+    )
+    if manifest_error:
+        return manifest_error
     for name in scenario.required_artifacts:
         raw = str(artifacts.get(name) or "")
         if not raw or not Path(raw).is_file():
@@ -2417,8 +2710,256 @@ def _real_execution_scenario_error(
     for name in scenario.forbidden_artifacts:
         if str(artifacts.get(name) or ""):
             return f"real execution contains forbidden artifact: {name}"
-    if scenario.operation_kind != "sync_observe":
-        return ""
+    content_error = _real_execution_content_error(
+        artifacts=artifacts,
+        plan=plan,
+        scenario=scenario,
+    )
+    if content_error:
+        return content_error
+    return ""
+
+
+def _real_execution_content_error(
+    *,
+    artifacts: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    scenario: Any,
+) -> str:
+    summary_error = _summary_artifact_error(
+        Path(str(artifacts.get("summary_json") or "")),
+        plan=plan,
+        sync_observe=scenario.operation_kind == "sync_observe",
+    )
+    if summary_error:
+        return summary_error
+    report_names = (
+        ("html_report_en", "html_report_zh")
+        if scenario.operation_kind == "sync_observe"
+        else ("html_report",)
+    )
+    for name in report_names:
+        report_error = _html_report_error(
+            Path(str(artifacts.get(name) or "")),
+            label=name,
+        )
+        if report_error:
+            return report_error
+    if scenario.operation_kind == "sync_observe":
+        return _sync_observe_content_error(artifacts)
+    return _rpc_benchmark_content_error(artifacts, plan=plan)
+
+
+def _summary_artifact_error(
+    path: Path,
+    *,
+    plan: Mapping[str, Any],
+    sync_observe: bool,
+) -> str:
+    try:
+        summary = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"real execution summary JSON is invalid: {exc}"
+    if not isinstance(summary, Mapping) or not str(summary.get("run_id") or ""):
+        return "real execution summary has no run identity"
+    expected_mode = (
+        "sync_observe"
+        if sync_observe
+        else str(plan.get("benchmark_mode") or "").strip().lower()
+    )
+    if str(summary.get("benchmark_mode") or "").strip().lower() != expected_mode:
+        return "real execution summary benchmark mode mismatch"
+    try:
+        start_epoch = _observation_epoch(summary.get("start_time"))
+        end_epoch = _observation_epoch(summary.get("end_time"))
+    except ValueError as exc:
+        return f"real execution summary time range is invalid: {exc}"
+    if end_epoch < start_epoch:
+        return "real execution summary time range is reversed"
+    parameters = dict(summary.get("test_parameters") or {})
+    parameter_names = {
+        "initial_qps",
+        "max_qps",
+        "qps_step",
+        "duration_per_level",
+    }
+    if set(parameters) != parameter_names or any(
+        not isinstance(parameters.get(name), int) for name in parameter_names
+    ):
+        return "real execution summary test parameters are invalid"
+    max_successful_qps = summary.get("max_successful_qps")
+    if not isinstance(max_successful_qps, int):
+        return "real execution summary successful QPS is invalid"
+    if sync_observe:
+        if max_successful_qps != 0 or any(parameters.values()):
+            return "sync-observe summary contains an RPC workload"
+    elif (
+        max_successful_qps <= 0
+        or parameters["initial_qps"] <= 0
+        or parameters["max_qps"] < parameters["initial_qps"]
+        or parameters["qps_step"] <= 0
+        or parameters["duration_per_level"] <= 0
+    ):
+        return "RPC benchmark summary has no successful workload"
+    return ""
+
+
+def _html_report_error(path: Path, *, label: str) -> str:
+    try:
+        raw = path.read_bytes()
+        document = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return f"{label} is not a valid UTF-8 HTML report: {exc}"
+    lowered = document.lower()
+    if (
+        len(raw) < 256
+        or "<html" not in lowered
+        or "</html>" not in lowered
+        or "<title" not in lowered
+        or "report" not in lowered
+    ):
+        return f"{label} has no complete report document"
+    return ""
+
+
+def _rpc_benchmark_content_error(
+    artifacts: Mapping[str, Any],
+    *,
+    plan: Mapping[str, Any],
+) -> str:
+    summary_path = Path(str(artifacts.get("summary_json") or ""))
+    performance_path = Path(str(artifacts.get("performance_csv") or ""))
+    try:
+        with performance_path.open(newline="", encoding="utf-8") as handle:
+            performance_rows = list(csv.DictReader(handle))
+    except (OSError, csv.Error) as exc:
+        return f"RPC performance CSV is invalid: {exc}"
+    required_performance_columns = {
+        "timestamp",
+        "current_qps",
+        "rpc_latency_ms",
+        "qps_data_available",
+        "cpu_usage",
+        "mem_usage",
+    }
+    if not performance_rows:
+        return "RPC performance CSV has no observed rows"
+    if missing := sorted(required_performance_columns - set(performance_rows[0])):
+        return "RPC performance CSV is missing columns: " + ", ".join(missing)
+    has_workload_observation = False
+    for row in performance_rows:
+        try:
+            current_qps = float(str(row.get("current_qps") or "0"))
+            latency = float(str(row.get("rpc_latency_ms") or "0"))
+        except ValueError:
+            return "RPC performance CSV contains a non-numeric workload observation"
+        if current_qps < 0 or latency < 0:
+            return "RPC performance CSV contains a negative workload observation"
+        if (
+            current_qps > 0
+            and str(row.get("qps_data_available") or "").strip().lower()
+            in {"true", "1"}
+        ):
+            has_workload_observation = True
+    if not has_workload_observation:
+        return "RPC performance CSV has no available positive-QPS observation"
+    range_error = _observation_range_error(
+        summary_path,
+        performance_rows,
+        label="RPC performance CSV",
+    )
+    if range_error:
+        return range_error
+
+    proxy_path = Path(str(artifacts.get("proxy_method_csv") or ""))
+    try:
+        with proxy_path.open(newline="", encoding="utf-8") as handle:
+            proxy_rows = list(csv.DictReader(handle))
+    except (OSError, csv.Error) as exc:
+        return f"RPC proxy method CSV is invalid: {exc}"
+    proxy_columns = {"timestamp_ns", "method_name", "status_code", "latency_ms"}
+    if not proxy_rows or not proxy_columns.issubset(proxy_rows[0]):
+        return "RPC proxy method CSV has no typed method observations"
+    for row in proxy_rows:
+        try:
+            status_code = int(str(row.get("status_code") or ""))
+            latency = float(str(row.get("latency_ms") or ""))
+            timestamp_ns = int(str(row.get("timestamp_ns") or ""))
+        except ValueError:
+            return "RPC proxy method CSV contains an invalid observation"
+        if (
+            not str(row.get("method_name") or "").strip()
+            or not 100 <= status_code <= 599
+            or latency < 0
+            or timestamp_ns <= 0
+        ):
+            return "RPC proxy method CSV contains an invalid observation"
+
+    vegeta_path = Path(str(artifacts.get("vegeta_json") or ""))
+    try:
+        vegeta = json.loads(vegeta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"Vegeta result JSON is invalid: {exc}"
+    if not isinstance(vegeta, Mapping):
+        return "Vegeta result is not a JSON object"
+    requests = vegeta.get("requests")
+    success = vegeta.get("success")
+    status_codes = dict(vegeta.get("status_codes") or {})
+    if (
+        not isinstance(requests, int)
+        or requests <= 0
+        or not isinstance(success, (int, float))
+        or not 0 <= float(success) <= 1
+        or not isinstance(vegeta.get("throughput"), (int, float))
+        or float(vegeta["throughput"]) <= 0
+    ):
+        return "Vegeta result has no valid request statistics"
+    try:
+        observed_status_total = sum(int(value) for value in status_codes.values())
+    except (TypeError, ValueError):
+        return "Vegeta result status counts are invalid"
+    if observed_status_total != requests or not any(
+        str(code).startswith("2") and int(count) > 0
+        for code, count in status_codes.items()
+    ):
+        return "Vegeta result status counts do not prove successful requests"
+    expected_methods, workload_error = _approved_rpc_methods(plan)
+    if workload_error:
+        return workload_error
+    workload_rows = [
+        row
+        for row in proxy_rows
+        if str(row.get("method_name") or "").strip() in expected_methods
+    ]
+    if len(workload_rows) != requests:
+        return "RPC proxy workload count does not match Vegeta requests"
+    observed_method_names = {
+        str(row.get("method_name") or "").strip() for row in workload_rows
+    }
+    if observed_method_names != expected_methods:
+        return "RPC proxy workload methods do not match the approved plan"
+    proxy_status_counts: dict[str, int] = {}
+    for row in workload_rows:
+        status = str(int(str(row.get("status_code") or "")))
+        proxy_status_counts[status] = proxy_status_counts.get(status, 0) + 1
+    normalized_vegeta_status = {
+        str(int(str(code))): int(count) for code, count in status_codes.items()
+    }
+    if proxy_status_counts != normalized_vegeta_status:
+        return "RPC proxy workload status counts do not match Vegeta results"
+    try:
+        summary_start, summary_end = _summary_time_range(summary_path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return f"RPC summary time range cannot be loaded: {exc}"
+    for row in workload_rows:
+        observed = int(str(row.get("timestamp_ns") or "")) / 1_000_000_000
+        if not summary_start <= observed <= summary_end:
+            return "RPC proxy workload observation is outside the summary time range"
+    return ""
+
+
+def _sync_observe_content_error(artifacts: Mapping[str, Any]) -> str:
+    summary_path = Path(str(artifacts.get("summary_json") or ""))
     csv_path = Path(str(artifacts.get("performance_csv") or ""))
     try:
         with csv_path.open(newline="", encoding="utf-8") as handle:
@@ -2447,6 +2988,7 @@ def _real_execution_scenario_error(
         return "sync-observe performance CSV has no disk IOPS column"
     if not any(column.endswith("_avg_await") for column in columns):
         return "sync-observe performance CSV has no disk latency column"
+    has_healthy_node_observation = False
     for row in rows:
         if str(row.get("current_qps") or "").strip() not in {"0", "0.0", "0.00"}:
             return "sync-observe reported a non-zero QPS workload"
@@ -2456,15 +2998,849 @@ def _real_execution_scenario_error(
         source = str(row.get("execution_metric_source") or "").strip()
         if status not in {"available", "unavailable"} or not source:
             return "sync-observe MGas provenance is ambiguous"
-        if status == "available" and not str(row.get("execution_mgas_per_sec") or "").strip():
-            return "sync-observe available MGas row has no value"
+        if status == "available":
+            try:
+                mgas = float(str(row.get("execution_mgas_per_sec") or ""))
+                gas = float(str(row.get("execution_gas_per_sec") or ""))
+            except ValueError:
+                return "sync-observe available MGas row has no numeric value"
+            if mgas < 0 or gas < 0 or abs(gas - (mgas * 1_000_000)) > 0.5:
+                return "sync-observe MGas and gas/s observations disagree"
+        local_height = str(row.get("local_block_height") or "").strip().lower()
+        local_health = str(row.get("local_health") or "").strip().lower()
+        sync_status = str(row.get("sync_status") or "").strip().lower()
+        probe_error = str(row.get("probe_error") or "").strip().lower()
+        if (
+            local_height not in {"", "null", "n/a"}
+            and local_health in {"1", "true"}
+            and sync_status not in {"", "unknown", "unhealthy"}
+            and probe_error in {"", "null", "none"}
+        ):
+            try:
+                has_healthy_node_observation = float(local_height) >= 0
+            except ValueError:
+                return "sync-observe local height observation is invalid"
+    if not has_healthy_node_observation:
+        return "sync-observe has no healthy observed node sample"
+    range_error = _observation_range_error(
+        summary_path,
+        rows,
+        label="sync-observe performance CSV",
+    )
+    if range_error:
+        return range_error
+    health_path = Path(str(artifacts.get("sync_health_csv") or ""))
+    try:
+        with health_path.open(newline="", encoding="utf-8") as handle:
+            health_rows = list(csv.DictReader(handle))
+    except (OSError, csv.Error) as exc:
+        return f"sync-observe health CSV is invalid: {exc}"
+    health_columns = {
+        "timestamp",
+        "local_block_height",
+        "sync_status",
+        "probe_error",
+    }
+    if not health_rows or not health_columns.issubset(health_rows[0]):
+        return "sync-observe health CSV has no typed observations"
+    if not any(
+        str(row.get("local_block_height") or "").strip().lower()
+        not in {"", "null", "n/a"}
+        and str(row.get("sync_status") or "").strip().lower()
+        not in {"", "unknown", "unhealthy"}
+        and str(row.get("probe_error") or "").strip().lower()
+        in {"", "null", "none"}
+        for row in health_rows
+    ):
+        return "sync-observe health CSV has no successful node probe"
+    range_error = _observation_range_error(
+        summary_path,
+        health_rows,
+        label="sync-observe health CSV",
+        require_all_within=False,
+    )
+    if range_error:
+        return range_error
+    chart_path = Path(str(artifacts.get("sync_timeline_chart") or ""))
+    try:
+        chart = chart_path.read_bytes()
+    except OSError as exc:
+        return f"sync-observe timeline chart is unreadable: {exc}"
+    return _png_error(chart)
+
+
+def _approved_rpc_methods(plan: Mapping[str, Any]) -> tuple[set[str], str]:
+    mode = str(plan.get("rpc_mode") or "").strip().lower()
+    requirements = dict(plan.get("chain_template_requirements") or {})
+    if mode == "single":
+        method = str(requirements.get("single_method") or "").strip()
+        return ({method}, "") if method else (set(), "approved single RPC method is missing")
+    if mode == "mixed":
+        weighted = requirements.get("mixed_weighted")
+        if not isinstance(weighted, list):
+            return set(), "approved mixed RPC workload is missing"
+        methods = {
+            str(item.get("method") or "").strip()
+            for item in weighted
+            if isinstance(item, Mapping)
+            and isinstance(item.get("weight"), int)
+            and item["weight"] > 0
+        }
+        if not methods:
+            return set(), "approved mixed RPC workload has no positive-weight methods"
+        return methods, ""
+    return set(), "approved RPC mode is invalid"
+
+
+def _observation_epoch(value: Any) -> float:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("timestamp is missing")
+    parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _summary_time_range(path: Path) -> tuple[float, float]:
+    summary = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(summary, Mapping):
+        raise ValueError("summary is not a JSON object")
+    start = _observation_epoch(summary.get("start_time"))
+    end = _observation_epoch(summary.get("end_time"))
+    if end < start:
+        raise ValueError("summary time range is reversed")
+    return start, end
+
+
+def _observation_range_error(
+    summary_path: Path,
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    label: str,
+    require_all_within: bool = True,
+) -> str:
+    try:
+        start, end = _summary_time_range(summary_path)
+        observations = [_observation_epoch(row.get("timestamp")) for row in rows]
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return f"{label} time range is invalid: {exc}"
+    if not observations:
+        return f"{label} has no timestamped observations"
+    if require_all_within:
+        if min(observations) < start or max(observations) > end:
+            return f"{label} observations are outside the summary time range"
+    elif max(observations) < start or min(observations) > end:
+        return f"{label} does not overlap the summary time range"
     return ""
+
+
+def _png_error(data: bytes) -> str:
+    if len(data) < 45 or data[:8] != b"\x89PNG\r\n\x1a\n":
+        return "sync-observe timeline chart is not a valid PNG"
+    offset = 8
+    seen_ihdr = False
+    seen_iend = False
+    width = height = bit_depth = color_type = interlace = 0
+    decompressor = zlib.decompressobj()
+    decoded_bytes = 0
+    try:
+        while offset < len(data):
+            if offset + 12 > len(data):
+                raise ValueError("truncated PNG chunk")
+            length = struct.unpack(">I", data[offset : offset + 4])[0]
+            chunk_type = data[offset + 4 : offset + 8]
+            end = offset + 12 + length
+            if end > len(data):
+                raise ValueError("truncated PNG chunk payload")
+            payload = data[offset + 8 : offset + 8 + length]
+            expected_crc = struct.unpack(">I", data[offset + 8 + length : end])[0]
+            if zlib.crc32(chunk_type + payload) & 0xFFFFFFFF != expected_crc:
+                raise ValueError("PNG chunk CRC mismatch")
+            if chunk_type == b"IHDR":
+                if seen_ihdr or offset != 8 or length != 13:
+                    raise ValueError("invalid PNG IHDR")
+                width, height, bit_depth, color_type, compression, filtering, interlace = struct.unpack(
+                    ">IIBBBBB", payload
+                )
+                if (
+                    width <= 0
+                    or height <= 0
+                    or bit_depth != 8
+                    or color_type != 6
+                    or compression != 0
+                    or filtering != 0
+                    or interlace != 0
+                ):
+                    raise ValueError("unsupported PNG image format")
+                seen_ihdr = True
+            elif chunk_type == b"IDAT":
+                if not seen_ihdr or seen_iend:
+                    raise ValueError("invalid PNG IDAT ordering")
+                decoded_bytes += len(decompressor.decompress(payload))
+            elif chunk_type == b"IEND":
+                if length != 0 or not seen_ihdr or seen_iend:
+                    raise ValueError("invalid PNG IEND")
+                decoded_bytes += len(decompressor.flush())
+                seen_iend = True
+                if end != len(data):
+                    raise ValueError("data follows PNG IEND")
+            offset = end
+    except (struct.error, zlib.error, ValueError) as exc:
+        return f"sync-observe timeline chart is invalid: {exc}"
+    expected_decoded = height * (1 + width * 4)
+    if not seen_ihdr or not seen_iend or decoded_bytes != expected_decoded:
+        return "sync-observe timeline chart has incomplete image data"
+    return ""
+
+
+def _g5_admission_envelope_error(
+    *,
+    envelope: Mapping[str, Any],
+    request: Mapping[str, Any],
+    scenario: Any,
+    artifact: Mapping[str, Any],
+    approved_plan: Mapping[str, Any],
+) -> str:
+    admission = g5_scenario_admission(scenario.scenario_id)
+    if envelope.get("schema_version") != 1:
+        return "G5 admission envelope schema is invalid"
+    if dict(envelope.get("repository_revision") or {}) != dict(
+        artifact.get("revision") or {}
+    ):
+        return "G5 admission envelope revision mismatch"
+    if (
+        str(envelope.get("scenario_id") or "") != scenario.scenario_id
+        or envelope.get("sequence_index") != admission.sequence_index
+    ):
+        return "G5 admission envelope scenario mismatch"
+    approved_path = Path(str(request.get("approved_plan_file") or "")).resolve()
+    if (
+        str(envelope.get("approved_plan_file") or "") != str(approved_path)
+        or str(envelope.get("approved_plan_sha256") or "")
+        != str(request.get("approved_plan_sha256") or "")
+    ):
+        return "G5 admission envelope approved-plan binding mismatch"
+    endpoint_contract = dict(envelope.get("endpoint_identity_contract") or {})
+    container_requirements = dict(envelope.get("container_metrics_requirements") or {})
+    runtime_contract = dict(envelope.get("g5_runtime_contract") or {})
+    runtime_contract_sha256 = str(envelope.get("g5_runtime_contract_sha256") or "")
+    if not admission.endpoint_env_var:
+        if (
+            endpoint_contract
+            or container_requirements
+            or runtime_contract
+            or runtime_contract_sha256
+        ):
+            return "fake-node G5 envelope contains real-node requirements"
+        return ""
+    expected_runtime_contract = G5_RUNTIME_CONTRACT.to_dict()
+    if (
+        runtime_contract != expected_runtime_contract
+        or runtime_contract_sha256 != content_hash(runtime_contract)
+    ):
+        return "G5 runtime contract binding mismatch"
+    execution_env = dict((approved_plan.get("execution") or {}).get("environment") or {})
+    endpoint = str(execution_env.get(admission.endpoint_env_var) or "")
+    metrics_url = str(execution_env.get("NODE_PROMETHEUS_METRICS_URL") or "")
+    expected_endpoint = {
+        "chain": str(approved_plan.get("chain") or ""),
+        "env_var": admission.endpoint_env_var,
+        "endpoint_sha256": hashlib.sha256(endpoint.encode("utf-8")).hexdigest(),
+        "probe_method": "eth_chainId",
+        "params_sha256": content_hash([]),
+        "expected_identity": G5_RUNTIME_CONTRACT.chain_id,
+    }
+    if (
+        endpoint != G5_RUNTIME_CONTRACT.rpc_url
+        or metrics_url != G5_RUNTIME_CONTRACT.metrics_url
+        or endpoint_contract != expected_endpoint
+    ):
+        return "G5 admission endpoint identity contract mismatch"
+    expected_container = {
+        "compose_service": G5_RUNTIME_CONTRACT.compose_service,
+        "image_digest": G5_RUNTIME_CONTRACT.image_digest,
+        "image_reference": G5_RUNTIME_CONTRACT.image_reference,
+        "rpc_url_sha256": hashlib.sha256(
+            G5_RUNTIME_CONTRACT.rpc_url.encode("utf-8")
+        ).hexdigest(),
+        "metrics_env_var": "NODE_PROMETHEUS_METRICS_URL",
+        "metrics_url_sha256": hashlib.sha256(metrics_url.encode("utf-8")).hexdigest(),
+        "metrics_required": True,
+    }
+    if container_requirements != expected_container:
+        return "G5 admission container/metrics requirements mismatch"
+    try:
+        created_at = datetime.fromisoformat(
+            str(envelope.get("created_at") or "").replace("Z", "+00:00")
+        )
+        admitted_at = datetime.fromisoformat(
+            str(request.get("jobs_root_admitted_at") or "").replace("Z", "+00:00")
+        )
+        started_at = datetime.fromisoformat(
+            str(artifact.get("started_at") or "").replace("Z", "+00:00")
+        )
+    except ValueError:
+        return "G5 admission envelope timestamp is invalid"
+    if (
+        any(value.tzinfo is None for value in (created_at, admitted_at, started_at))
+        or not admitted_at <= created_at <= started_at
+    ):
+        return "G5 admission envelope timestamp is out of bounds"
+    return ""
+
+
+def _real_execution_endpoint_error(
+    *,
+    request: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    scenario: Any,
+    artifact: Mapping[str, Any],
+    envelope: Mapping[str, Any],
+) -> str:
+    admission = g5_scenario_admission(scenario.scenario_id)
+    probe = dict(request.get("endpoint_probe") or {})
+    if not admission.endpoint_env_var:
+        return "fake-node scenario unexpectedly contains endpoint probe evidence" if probe else ""
+    identity = dict(envelope.get("endpoint_identity_contract") or {})
+    execution_env = dict((plan.get("execution") or {}).get("environment") or {})
+    endpoint = str(execution_env.get(admission.endpoint_env_var) or "").strip()
+    expected = str(identity.get("expected_identity") or "").strip()
+    method = str(identity.get("probe_method") or "").strip()
+    required = {
+        "chain": str(plan.get("chain") or ""),
+        "endpoint_sha256": hashlib.sha256(endpoint.encode("utf-8")).hexdigest() if endpoint else "",
+        "endpoint_env_var": admission.endpoint_env_var,
+        "probe_method": method,
+        "expected_identity": expected,
+        "verified": True,
+    }
+    for name, value in required.items():
+        if probe.get(name) != value:
+            return f"real execution endpoint probe mismatch: {name}"
+    if not isinstance(probe.get("http_status"), int) or not 200 <= probe["http_status"] < 300:
+        return "real execution endpoint probe HTTP status is invalid"
+    request_contract = dict(probe.get("request_contract") or {})
+    response_contract = dict(probe.get("response_contract") or {})
+    expected_request_contract = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params_sha256": str(identity.get("params_sha256") or ""),
+    }
+    if request_contract != expected_request_contract:
+        return "real execution endpoint request extraction contract mismatch"
+    if content_hash(request_contract) != str(probe.get("request_contract_sha256") or ""):
+        return "real execution endpoint request contract hash mismatch"
+    if (
+        response_contract.get("jsonrpc") != "2.0"
+        or response_contract.get("id") != request_contract.get("id")
+        or response_contract.get("result_path") != "$.result"
+        or response_contract.get("result_type") != "hex_quantity"
+        or not isinstance(response_contract.get("result"), str)
+        or re.fullmatch(r"0x[0-9a-fA-F]+", response_contract["result"]) is None
+        or set(response_contract)
+        != {"jsonrpc", "id", "result_path", "result_type", "result"}
+    ):
+        return "real execution endpoint response extraction contract is invalid"
+    if content_hash(response_contract) != str(probe.get("response_contract_sha256") or ""):
+        return "real execution endpoint response contract hash mismatch"
+    observed = str(response_contract.get("result") or "").strip()
+    if str(probe.get("observed_identity") or "") != observed:
+        return "real execution endpoint observed identity is not probe-derived"
+    if observed.lower() != expected.lower():
+        return "real execution endpoint observed identity does not match approved identity"
+    if content_hash(response_contract) != str(probe.get("response_sha256") or ""):
+        return "real execution endpoint typed response hash mismatch"
+    try:
+        probed_at = datetime.fromisoformat(str(probe.get("probed_at") or "").replace("Z", "+00:00"))
+    except ValueError:
+        return "real execution endpoint probe timestamp is invalid"
+    if probed_at.tzinfo is None:
+        return "real execution endpoint probe timestamp has no timezone"
+    try:
+        admitted_at = datetime.fromisoformat(
+            str(request.get("jobs_root_admitted_at") or "").replace("Z", "+00:00")
+        )
+    except ValueError:
+        return "real execution endpoint admission timestamp is invalid"
+    if probed_at < admitted_at:
+        return "real execution endpoint probe predates jobs-root admission"
+    try:
+        started_at = datetime.fromisoformat(
+            str(artifact.get("started_at") or "").replace("Z", "+00:00")
+        )
+    except ValueError:
+        return "real execution endpoint execution timestamp is invalid"
+    if probed_at > started_at:
+        return "real execution endpoint probe occurred after submission"
+    return ""
+
+
+def _real_execution_runtime_attestation_error(
+    *,
+    request: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    scenario: Any,
+    artifact: Mapping[str, Any],
+    envelope: Mapping[str, Any],
+) -> str:
+    admission = g5_scenario_admission(scenario.scenario_id)
+    attestation = dict(request.get("runtime_attestation") or {})
+    if not admission.endpoint_env_var:
+        return (
+            "fake-node scenario unexpectedly contains runtime attestation"
+            if attestation
+            else ""
+        )
+    if attestation.get("schema_version") != 1:
+        return "geth-dev runtime attestation schema is invalid"
+    if dict(attestation.get("repository_revision") or {}) != dict(
+        artifact.get("revision") or {}
+    ):
+        return "geth-dev runtime attestation revision mismatch"
+    unsigned = dict(attestation)
+    attestation_hash = str(unsigned.pop("attestation_sha256", ""))
+    if content_hash(unsigned) != attestation_hash:
+        return "geth-dev runtime attestation hash mismatch"
+    host_attestation_file = str(attestation.get("host_attestation_file") or "")
+    host_attestation_hash = str(attestation.get("host_attestation_sha256") or "")
+    try:
+        host_attestation = validate_host_attestation_file(
+            host_attestation_file,
+            repo_root=REPO_ROOT,
+            revision=dict(artifact.get("revision") or {}),
+        )
+    except (OSError, ValueError) as exc:
+        return f"G5 host attestation is invalid: {exc}"
+    if host_attestation.get("attestation_file_sha256") != host_attestation_hash:
+        return "G5 host attestation hash binding mismatch"
+    container = dict(attestation.get("container") or {})
+    container_id = str(container.get("container_id") or "")
+    image_digest = str(container.get("image_digest") or "")
+    requirements = dict(envelope.get("container_metrics_requirements") or {})
+    if (
+        len(container_id) < 12
+        or any(character not in "0123456789abcdef" for character in container_id.lower())
+        or image_digest != G5_RUNTIME_CONTRACT.image_digest
+        or container.get("image_reference") != G5_RUNTIME_CONTRACT.image_reference
+        or container.get("compose_service") != G5_RUNTIME_CONTRACT.compose_service
+        or image_digest != requirements.get("image_digest")
+        or container.get("image_reference") != requirements.get("image_reference")
+        or G5_RUNTIME_CONTRACT.compose_service
+        not in (container.get("network_aliases") or ())
+        or not container.get("network_addresses")
+    ):
+        return "geth-dev container identity is invalid"
+    if content_hash(container) != str(attestation.get("container_contract_sha256") or ""):
+        return "geth-dev container contract hash mismatch"
+    target_container = dict(host_attestation.get("target_container") or {})
+    target_networks = dict(target_container.get("networks") or {})
+    target_addresses = sorted({
+        str(details.get("ip_address") or "")
+        for details in target_networks.values()
+        if str(details.get("ip_address") or "")
+    })
+    target_aliases = sorted({
+        str(alias)
+        for details in target_networks.values()
+        for alias in (details.get("aliases") or ())
+        if str(alias)
+    })
+    expected_container = {
+        "container_id": str(target_container.get("container_id") or ""),
+        "image_digest": str(target_container.get("image_digest") or ""),
+        "image_reference": str(target_container.get("image_reference") or ""),
+        "compose_service": str(target_container.get("compose_service") or ""),
+        "compose_project": str(target_container.get("compose_project") or ""),
+        "network_addresses": target_addresses,
+        "network_aliases": target_aliases,
+    }
+    inspect_hash = str(attestation.get("docker_inspect_sha256") or "")
+    if container != expected_container:
+        return "geth-dev runtime container disagrees with host attestation"
+    if (
+        not _is_sha256(inspect_hash)
+        or inspect_hash
+        != str(
+            (host_attestation.get("docker_inspect_sha256") or {}).get(
+                G5_RUNTIME_CONTRACT.compose_service
+            )
+            or ""
+        )
+    ):
+        return "geth-dev docker inspect hash is invalid"
+    endpoint_probe = dict(request.get("endpoint_probe") or {})
+    if (
+        attestation.get("rpc_endpoint_sha256") != endpoint_probe.get("endpoint_sha256")
+        or attestation.get("rpc_chain_id") != endpoint_probe.get("observed_identity")
+        or attestation.get("rpc_response_sha256") != endpoint_probe.get("response_sha256")
+    ):
+        return "geth-dev RPC attestation is not bound to the endpoint probe"
+    rpc_route = dict(attestation.get("rpc_route") or {})
+    metrics_route = dict(attestation.get("metrics_route") or {})
+    container_addresses = set(container.get("network_addresses") or ())
+    for label, route, expected_url in (
+        ("RPC", rpc_route, G5_RUNTIME_CONTRACT.rpc_url),
+        ("metrics", metrics_route, G5_RUNTIME_CONTRACT.metrics_url),
+    ):
+        parsed = urllib.parse.urlsplit(expected_url)
+        if (
+            route.get("scheme") != parsed.scheme
+            or route.get("hostname") != G5_RUNTIME_CONTRACT.compose_service
+            or route.get("port") != parsed.port
+            or route.get("path") != (parsed.path or "/")
+            or not set(route.get("resolved_addresses") or ()) & container_addresses
+        ):
+            return f"geth-dev {label} route is not bound to the inspected container"
+    execution_env = dict((plan.get("execution") or {}).get("environment") or {})
+    metrics_env_var = str(requirements.get("metrics_env_var") or "")
+    metrics_url = str(execution_env.get(metrics_env_var) or "").strip()
+    metrics = dict(attestation.get("metrics_probe") or {})
+    if not metrics_url:
+        return "geth-dev metrics endpoint is absent from the approved plan"
+    if metrics.get("metrics_url_sha256") != hashlib.sha256(
+        metrics_url.encode("utf-8")
+    ).hexdigest():
+        return "geth-dev metrics URL hash mismatch"
+    if metrics.get("metrics_url_sha256") != requirements.get("metrics_url_sha256"):
+        return "geth-dev metrics probe does not satisfy the G5 envelope"
+    if (
+        not isinstance(metrics.get("http_status"), int)
+        or not 200 <= metrics["http_status"] < 300
+        or not _is_sha256(str(metrics.get("body_sha256") or ""))
+        or not isinstance(metrics.get("body_size_bytes"), int)
+        or metrics["body_size_bytes"] <= 0
+        or not isinstance(metrics.get("non_comment_sample_count"), int)
+        or metrics["non_comment_sample_count"] <= 0
+        or not isinstance(metrics.get("metric_family_count"), int)
+        or metrics["metric_family_count"] <= 0
+        or metrics.get("parser") != "prometheus_text_v0.0.4"
+    ):
+        return "geth-dev metrics probe contract is invalid"
+    try:
+        admitted_at = datetime.fromisoformat(
+            str(request.get("jobs_root_admitted_at") or "").replace("Z", "+00:00")
+        )
+        metrics_at = datetime.fromisoformat(
+            str(metrics.get("probed_at") or "").replace("Z", "+00:00")
+        )
+        attested_at = datetime.fromisoformat(
+            str(attestation.get("attested_at") or "").replace("Z", "+00:00")
+        )
+        started_at = datetime.fromisoformat(
+            str(artifact.get("started_at") or "").replace("Z", "+00:00")
+        )
+    except ValueError:
+        return "geth-dev runtime attestation timestamp is invalid"
+    if (
+        any(
+            value.tzinfo is None
+            for value in (admitted_at, metrics_at, attested_at, started_at)
+        )
+        or not admitted_at <= metrics_at <= attested_at <= started_at
+    ):
+        return "geth-dev runtime attestation timestamps are out of bounds"
+    try:
+        host_attested_at = datetime.fromisoformat(
+            str(host_attestation.get("attested_at") or "").replace("Z", "+00:00")
+        )
+    except ValueError:
+        return "G5 host attestation timestamp is invalid"
+    if host_attested_at.tzinfo is None or host_attested_at > admitted_at:
+        return "G5 host attestation postdates jobs-root admission"
+    return ""
+
+
+def _required_artifact_manifest_error(
+    *,
+    artifact: Mapping[str, Any],
+    request: Mapping[str, Any],
+    observed_artifacts: Mapping[str, Any],
+    scenario: Any,
+) -> str:
+    manifests = [
+        item for item in artifact.get("job_artifacts") or ()
+        if Path(str(item.get("path") or "")).name == "required-artifacts.sha256.json"
+    ]
+    if len(manifests) != 1:
+        return "real execution evidence must bind one required-artifact manifest"
+    manifest_record = manifests[0]
+    observed_job = dict(
+        ((artifact.get("result") or {}).get("observed_job") or {})
+    )
+    try:
+        owner_roots = derive_artifact_owner_roots(observed_job)
+    except (OSError, ValueError) as exc:
+        return f"required-artifact owner roots are invalid: {exc}"
+    try:
+        _validate_hashed_artifact_identity(
+            manifest_record,
+            expected_job_id=str(artifact.get("job_id") or ""),
+            expected_run_dir=Path(
+                str(((artifact.get("result") or {}).get("observed_job") or {}).get("run_dir") or "")
+            ),
+        )
+        manifest = json.loads(Path(str(manifest_record["path"])).read_text(encoding="utf-8"))
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        return f"required-artifact manifest is invalid: {exc}"
+    if manifest.get("schema_version") != ARTIFACT_MANIFEST_SCHEMA_VERSION:
+        return "required-artifact manifest schema mismatch"
+    if str(manifest.get("job_id") or "") != str(artifact.get("job_id") or ""):
+        return "required-artifact manifest job mismatch"
+    if str(manifest.get("scenario_id") or "") != scenario.scenario_id:
+        return "required-artifact manifest scenario mismatch"
+    expected_roots = {
+        name: str(path)
+        for name, path in sorted(owner_roots.items())
+    }
+    if manifest.get("owner_roots") != expected_roots:
+        return "required-artifact manifest owner roots mismatch"
+    expected_roots_hash = hashlib.sha256(
+        json.dumps(
+            expected_roots,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if manifest.get("owner_roots_sha256") != expected_roots_hash:
+        return "required-artifact manifest owner roots hash mismatch"
+    job_plan_file = Path(str(observed_job.get("plan_file") or ""))
+    try:
+        expected_job_plan_hash = hashlib.sha256(job_plan_file.read_bytes()).hexdigest()
+    except OSError as exc:
+        return f"required-artifact job plan cannot be read: {exc}"
+    if manifest.get("job_plan_sha256") != expected_job_plan_hash:
+        return "required-artifact manifest job plan hash mismatch"
+    records = list(manifest.get("artifacts") or ())
+    names = [str(item.get("name") or "") for item in records]
+    if len(names) != len(set(names)) or set(names) != set(scenario.required_artifacts):
+        return "required-artifact manifest names mismatch"
+    if records != list(request.get("required_artifact_hashes") or ()):
+        return "required-artifact request binding mismatch"
+    for record in records:
+        name = str(record.get("name") or "")
+        path = Path(str(record.get("path") or ""))
+        if str(observed_artifacts.get(name) or "") != str(path):
+            return f"required-artifact observed path mismatch: {name}"
+        expected_owner = required_artifact_owner(scenario, name)
+        expected_root = owner_roots[expected_owner].resolve()
+        if (
+            record.get("owner") != expected_owner
+            or record.get("owner_root") != str(expected_root)
+        ):
+            return f"required-artifact owner mismatch: {name}"
+        try:
+            admitted_path = validate_owned_artifact_path(
+                path,
+                expected_owner=expected_owner,
+                owner_roots=owner_roots,
+            )
+            if record.get("relative_path") != str(
+                path.relative_to(expected_root)
+            ):
+                return f"required-artifact relative path mismatch: {name}"
+            if record.get("resolved_path") != str(admitted_path):
+                return f"required-artifact resolved path mismatch: {name}"
+            observed_link_target = os.readlink(path) if path.is_symlink() else ""
+            if record.get("link_target") != observed_link_target:
+                return f"required-artifact link target mismatch: {name}"
+            if hashlib.sha256(admitted_path.read_bytes()).hexdigest() != str(record.get("sha256") or ""):
+                return f"required-artifact hash mismatch: {name}"
+            if admitted_path.stat().st_size != int(record.get("size_bytes", -1)):
+                return f"required-artifact size mismatch: {name}"
+        except (OSError, TypeError, ValueError) as exc:
+            return f"required-artifact cannot be admitted: {name}: {exc}"
+    return ""
+
+
+def validate_real_execution_ledger_artifacts(
+    artifacts: Iterable[Mapping[str, Any]],
+    *,
+    revision: Mapping[str, str],
+) -> tuple[bool, str]:
+    observed = list(artifacts)
+    expected = sorted(
+        (scenario for scenario in EXECUTION_SCENARIOS if scenario.real_evidence_required),
+        key=lambda scenario: g5_scenario_admission(scenario.scenario_id).sequence_index,
+    )
+    if [item.get("scenario_id") for item in observed] != [
+        scenario.scenario_id for scenario in expected
+    ]:
+        return False, "real execution ledger scenario sequence mismatch"
+    job_ids = [str(item.get("job_id") or "") for item in observed]
+    if not all(job_ids) or len(set(job_ids)) != len(job_ids):
+        return False, "real execution ledger job identities are not unique"
+    if any(item.get("outcome") != "passed" for item in observed):
+        return False, "real execution ledger requires four passing scenarios"
+    for artifact, scenario in zip(observed, expected):
+        admission = g5_scenario_admission(scenario.scenario_id)
+        if dict(artifact.get("revision") or {}) != dict(revision):
+            return False, "real execution ledger revision mismatch"
+        request = dict(artifact.get("request") or {})
+        if request.get("ledger_sequence") != admission.sequence_index:
+            return False, "real execution ledger sequence binding mismatch"
+        if (
+            str(request.get("predecessor_scenario_id") or "")
+            != admission.predecessor_scenario_id
+        ):
+            return False, "real execution ledger predecessor binding mismatch"
+    for predecessor, current in zip(observed, observed[1:]):
+        try:
+            predecessor_finished = datetime.fromisoformat(
+                str(predecessor.get("finished_at") or "").replace("Z", "+00:00")
+            )
+            current_started = datetime.fromisoformat(
+                str(current.get("started_at") or "").replace("Z", "+00:00")
+            )
+        except ValueError:
+            return False, "real execution ledger ordering timestamp is invalid"
+        if (
+            predecessor.get("outcome") != "passed"
+            or predecessor_finished.tzinfo is None
+            or current_started.tzinfo is None
+            or predecessor_finished > current_started
+        ):
+            return False, "real execution ledger is not a fully serial passing sequence"
+    smoke = observed[1]
+    final = observed[2]
+    smoke_probe = dict((smoke.get("request") or {}).get("endpoint_probe") or {})
+    final_probe = dict((final.get("request") or {}).get("endpoint_probe") or {})
+    if smoke_probe.get("endpoint_sha256") != final_probe.get("endpoint_sha256"):
+        return False, "real-node smoke and final target different endpoints"
+    smoke_profile = dict(
+        ((smoke.get("request") or {}).get("runtime_env_projection") or {}).get(
+            "execution_profile"
+        )
+        or {}
+    )
+    final_profile = dict(
+        ((final.get("request") or {}).get("runtime_env_projection") or {}).get(
+            "execution_profile"
+        )
+        or {}
+    )
+    smoke_units = smoke_profile.get("minimum_request_seconds")
+    final_units = final_profile.get("minimum_request_seconds")
+    if (
+        not isinstance(smoke_units, int)
+        or not isinstance(final_units, int)
+        or smoke_units <= 0
+        or final_units <= smoke_units
+        or smoke_profile.get("output_root_sha256")
+        == final_profile.get("output_root_sha256")
+    ):
+        return False, "real-node final profile is not materially stronger than smoke"
+    runtime_artifacts = (observed[1], observed[2], observed[3])
+    runtime_identities = {
+        (
+            str(
+                ((item.get("request") or {}).get("runtime_attestation") or {})
+                .get("container", {})
+                .get("container_id")
+                or ""
+            ),
+            str(
+                ((item.get("request") or {}).get("runtime_attestation") or {})
+                .get("container", {})
+                .get("image_digest")
+                or ""
+            ),
+        )
+        for item in runtime_artifacts
+    }
+    if len(runtime_identities) != 1 or not all(next(iter(runtime_identities), ())):
+        return False, "real/sync execution did not attest one geth-dev container image"
+    host_identities = {
+        (
+            str(
+                ((item.get("request") or {}).get("runtime_attestation") or {})
+                .get("host_attestation_file")
+                or ""
+            ),
+            str(
+                ((item.get("request") or {}).get("runtime_attestation") or {})
+                .get("host_attestation_sha256")
+                or ""
+            ),
+            str(
+                ((item.get("request") or {}).get("runtime_attestation") or {})
+                .get("docker_inspect_sha256")
+                or ""
+            ),
+        )
+        for item in runtime_artifacts
+    }
+    if len(host_identities) != 1 or not all(next(iter(host_identities), ())):
+        return False, "real/sync execution did not share one host attestation"
+    return True, ""
+
+
+def validate_real_execution_predecessor(
+    artifacts: Iterable[Mapping[str, Any]],
+    *,
+    scenario: Any,
+    started_at: str,
+    endpoint_probe: Mapping[str, Any],
+    runtime_attestation: Mapping[str, Any],
+) -> tuple[bool, str]:
+    predecessor_id = g5_scenario_admission(
+        scenario.scenario_id
+    ).predecessor_scenario_id
+    if not predecessor_id:
+        return True, ""
+    matches = [
+        artifact
+        for artifact in artifacts
+        if str(artifact.get("scenario_id") or "") == predecessor_id
+    ]
+    if len(matches) != 1:
+        return False, f"required predecessor evidence is missing: {predecessor_id}"
+    predecessor = matches[0]
+    if predecessor.get("outcome") != "passed":
+        return False, f"required predecessor did not pass: {predecessor_id}"
+    try:
+        predecessor_finished = datetime.fromisoformat(
+            str(predecessor.get("finished_at") or "").replace("Z", "+00:00")
+        )
+        current_started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False, "predecessor ordering timestamp is invalid"
+    if (
+        predecessor_finished.tzinfo is None
+        or current_started.tzinfo is None
+        or predecessor_finished > current_started
+    ):
+        return False, f"required predecessor is not serial: {predecessor_id}"
+    predecessor_probe = dict(
+        (predecessor.get("request") or {}).get("endpoint_probe") or {}
+    )
+    if (
+        predecessor_probe
+        and endpoint_probe
+        and predecessor_probe.get("endpoint_sha256")
+        != endpoint_probe.get("endpoint_sha256")
+    ):
+        return False, f"required predecessor targeted a different endpoint: {predecessor_id}"
+    predecessor_runtime = dict(
+        (predecessor.get("request") or {}).get("runtime_attestation") or {}
+    )
+    predecessor_container = dict(predecessor_runtime.get("container") or {})
+    current_container = dict(runtime_attestation.get("container") or {})
+    if predecessor_container and current_container and (
+        predecessor_container.get("container_id") != current_container.get("container_id")
+        or predecessor_container.get("image_digest") != current_container.get("image_digest")
+    ):
+        return False, f"required predecessor used a different runtime: {predecessor_id}"
+    return True, ""
 
 
 def _validate_hashed_artifact_identity(
     item: Mapping[str, Any],
     *,
     expected_job_id: str = "",
+    expected_run_dir: Path | None = None,
 ) -> None:
     if not isinstance(item, Mapping):
         raise ValueError("hashed artifact identity is not an object")
@@ -2475,11 +3851,34 @@ def _validate_hashed_artifact_identity(
     path = Path(raw_path)
     if not path.is_file():
         raise ValueError(f"hashed artifact does not exist: {path}")
-    if expected_job_id and expected_job_id not in path.parts:
+    if expected_run_dir is not None:
+        _validate_exact_descendant(path, expected_run_dir=expected_run_dir)
+    elif expected_job_id and expected_job_id not in path.parts:
         raise ValueError(f"hashed artifact is not owned by job {expected_job_id}: {path}")
     observed_hash = hashlib.sha256(path.read_bytes()).hexdigest()
     if observed_hash != expected_hash:
         raise ValueError(f"hashed artifact content mismatch: {path}")
+
+
+def _validate_exact_descendant(path: Path, *, expected_run_dir: Path) -> None:
+    if expected_run_dir.is_symlink() or not expected_run_dir.is_dir():
+        raise ValueError("fresh run_dir is missing or symlinked")
+    root = expected_run_dir.resolve(strict=True)
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"artifact escapes fresh run_dir: {path}") from exc
+    current = path if path.is_absolute() else Path.cwd() / path
+    while current != root:
+        if current.is_symlink():
+            raise ValueError(f"artifact path contains a symlink: {current}")
+        parent = current.parent
+        if parent == current:
+            raise ValueError(f"artifact is not rooted in fresh run_dir: {path}")
+        current = parent
+    if resolved == root:
+        raise ValueError("artifact cannot be the run_dir itself")
 
 
 def _lane_error(edge: Mapping[str, Any], evidence_class: str) -> str:

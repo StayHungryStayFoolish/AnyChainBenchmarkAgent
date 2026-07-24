@@ -145,9 +145,21 @@ check_dependencies() {
 }
 
 # Get local node block height
+get_observed_rpc_url() {
+    if [[ "${RPC_MODE:-}" == "sync_observe" || "${SYNC_OBSERVE_MODE:-false}" == "true" ]]; then
+        [[ -n "${SYNC_OBSERVE_RPC_URL:-}" ]] || return 1
+        printf '%s\n' "$SYNC_OBSERVE_RPC_URL"
+        return 0
+    fi
+    [[ -n "${LOCAL_RPC_URL:-}" ]] || return 1
+    printf '%s\n' "$LOCAL_RPC_URL"
+}
+
 get_local_block_height() {
     # Use function from shared function library to get block height
-    source "$(dirname "${BASH_SOURCE[0]}")/../core/common_functions.sh" && get_block_height "$LOCAL_RPC_URL"
+    local observed_rpc_url
+    observed_rpc_url=$(get_observed_rpc_url) || return 1
+    source "$(dirname "${BASH_SOURCE[0]}")/../core/common_functions.sh" && get_block_height "$observed_rpc_url"
 }
 
 # Get mainnet block height
@@ -166,9 +178,14 @@ check_node_health() {
 # Monitor block height difference
 monitor_block_height_diff() {
     local timestamp=$(get_unified_timestamp)
+    local observed_rpc_url
+    observed_rpc_url=$(get_observed_rpc_url) || {
+        echo "❌ No RPC endpoint is configured for the active workflow" >&2
+        return 1
+    }
     
     # Use function from shared function library to get block height data
-    local block_height_data=$(source "$(dirname "${BASH_SOURCE[0]}")/../core/common_functions.sh" && get_cached_block_height_data "$BLOCK_HEIGHT_CACHE_FILE" 3 "$LOCAL_RPC_URL" "$MAINNET_RPC_URL")
+    local block_height_data=$(source "$(dirname "${BASH_SOURCE[0]}")/../core/common_functions.sh" && get_cached_block_height_data "$BLOCK_HEIGHT_CACHE_FILE" 3 "$observed_rpc_url" "$MAINNET_RPC_URL")
     
     # Parse data
     local local_block_height=$(echo "$block_height_data" | jq -r '.local_block_height')
@@ -311,7 +328,12 @@ show_status() {
     echo "===================="
     
     # Get latest block height data
-    local block_height_data=$(source "$(dirname "${BASH_SOURCE[0]}")/../core/common_functions.sh" && get_cached_block_height_data "$BLOCK_HEIGHT_CACHE_FILE" "$CACHE_MAX_AGE" "$LOCAL_RPC_URL" "$MAINNET_RPC_URL")
+    local observed_rpc_url
+    observed_rpc_url=$(get_observed_rpc_url) || {
+        echo "No RPC endpoint is configured for the active workflow"
+        return 1
+    }
+    local block_height_data=$(source "$(dirname "${BASH_SOURCE[0]}")/../core/common_functions.sh" && get_cached_block_height_data "$BLOCK_HEIGHT_CACHE_FILE" "$CACHE_MAX_AGE" "$observed_rpc_url" "$MAINNET_RPC_URL")
     
     # Parse data
     local timestamp=$(echo "$block_height_data" | jq -r '.timestamp')

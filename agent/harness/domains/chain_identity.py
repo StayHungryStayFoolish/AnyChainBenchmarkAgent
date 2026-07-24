@@ -25,6 +25,7 @@ from agent.llm.search_grounding import run_google_search_grounding
 from agent.onboarding.families import SUPPORTED_FAMILIES
 from .chain_rpc_questions import _adapter_family_question, _answer_option, _choice
 from .chain_rpc_questions import _endpoint_validation_question
+from .chain_identity_receipts import emit_chain_identity_resolution_receipt
 
 SUPPORTED_ADAPTER_FAMILIES = frozenset(SUPPORTED_FAMILIES)
 
@@ -188,6 +189,13 @@ def _apply_chain_candidate(state: AgentGraphState, raw: str, resolution: dict[st
         ]
         return
     resolved = research_chain_identity(state, raw, resolution)
+    emit_chain_identity_resolution_receipt(
+        state,
+        candidate=raw,
+        resolution=resolved,
+        resolver_source="planner_proposal" if resolution is not None else "llm",
+        confirmation_required=True,
+    )
     adapter_family = normalize_scalar(resolved.get("adapter_family") or "unknown")
     canonical_name = normalize_scalar(resolved.get("canonical_chain_name") or raw)
     possible_known = _known_chain_proposal(resolved, known)
@@ -256,6 +264,16 @@ def _request_chain_change(
         _preserve_same_chain(state, previous)
         return
     resolved = None if canonical else research_chain_identity(state, raw, resolution)
+    if resolved is not None:
+        emit_chain_identity_resolution_receipt(
+            state,
+            candidate=raw,
+            resolution=resolved,
+            resolver_source=(
+                "planner_proposal" if resolution is not None else "llm"
+            ),
+            confirmation_required=True,
+        )
     candidate_label = canonical or raw
     prompt = localized(
         state.get("language", "en"),

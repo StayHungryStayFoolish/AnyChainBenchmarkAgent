@@ -355,19 +355,21 @@ def _read_json(path: str | Path) -> dict[str, Any]:
 
 
 def _write_json(path: str | Path, payload: dict[str, Any]) -> None:
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-
-
-def _atomic_write_json(path: str | Path, payload: dict[str, Any]) -> None:
     target = Path(path)
     temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
     try:
-        _write_json(temporary, payload)
+        with temporary.open("x", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _atomic_write_json(path: str | Path, payload: dict[str, Any]) -> None:
+    _write_json(path, payload)
 
 
 def _now() -> str:

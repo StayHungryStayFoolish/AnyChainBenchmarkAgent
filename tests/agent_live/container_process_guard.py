@@ -30,6 +30,199 @@ class _ProcessGone(ProcessLookupError):
     pass
 
 
+def validate_cleanup_receipt_artifact(
+    path: str | Path,
+    *,
+    execution_id: str,
+    required_roles: tuple[str, ...],
+    allowed_roots: tuple[str | Path, ...],
+) -> dict[str, Any]:
+    """Validate one content-addressed process-guard receipt from disk."""
+
+    receipt_path = Path(path).resolve()
+    roots = tuple(Path(root).resolve() for root in allowed_roots)
+    if not roots or not any(
+        receipt_path == root or root in receipt_path.parents for root in roots
+    ):
+        raise ValueError("process guard receipt is outside its allowed roots")
+    try:
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot load process guard receipt: {exc}") from exc
+    required = {
+        "receipt_id", "schema_version", "execution_id", "container_id",
+        "pid_namespace_inode", "bridge_identity", "registered_processes",
+        "term_decisions", "kill_decisions", "reap_results", "survivor_scans",
+        "zero_survivor_scans", "errors", "cleaned", "started_at_ns",
+        "finished_at_ns",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != required:
+        raise ValueError(
+            "process guard receipt fields do not match the authoritative schema"
+        )
+    if payload["schema_version"] != RECEIPT_SCHEMA_VERSION:
+        raise ValueError("unsupported process guard receipt schema")
+    if payload["execution_id"] != execution_id:
+        raise ValueError("process guard receipt execution id mismatch")
+    unsigned = {key: value for key, value in payload.items() if key != "receipt_id"}
+    receipt_id = hashlib.sha256(_canonical_json(unsigned)).hexdigest()
+    if payload["receipt_id"] != receipt_id:
+        raise ValueError("process guard receipt content hash is stale")
+    if receipt_path.name != f"container-cleanup-receipt-{receipt_id}.json":
+        raise ValueError("process guard receipt filename is not content-addressed")
+    if not str(payload["container_id"]):
+        raise ValueError("process guard receipt has no container/host identity")
+    if int(payload["pid_namespace_inode"]) <= 0:
+        raise ValueError("process guard receipt has no PID namespace identity")
+
+    registered_rows = payload["registered_processes"]
+    if not isinstance(registered_rows, list) or not registered_rows:
+        raise ValueError("process guard receipt has no registered processes")
+    registered: set[tuple[int, int, int, int]] = set()
+    roles: set[str] = set()
+    for row in registered_rows:
+        identity = _receipt_identity(row)
+        if identity in registered:
+            raise ValueError("process guard receipt repeats a registered identity")
+        registered.add(identity)
+        row_roles = row.get("roles") if isinstance(row, Mapping) else None
+        if not isinstance(row_roles, list) or not all(
+            isinstance(role, str) and role for role in row_roles
+        ):
+            raise ValueError("registered process roles are invalid")
+        roles.update(row_roles)
+    if not set(required_roles).issubset(roles):
+        raise ValueError("process guard receipt is missing required registered roles")
+    if _receipt_identity(payload["bridge_identity"]) not in registered:
+        raise ValueError("process guard bridge/observer identity was not registered")
+
+    term_identities = _validate_receipt_signal_decisions(
+        payload["term_decisions"],
+        registered,
+        expected_signal="SIGTERM",
+    )
+    kill_identities = _validate_receipt_signal_decisions(
+        payload["kill_decisions"],
+        registered,
+        expected_signal="SIGKILL",
+    )
+    if not kill_identities.issubset(term_identities):
+        raise ValueError("process guard issued KILL without a TERM decision")
+
+    zero_scans = payload["zero_survivor_scans"]
+    if not isinstance(zero_scans, list) or len(zero_scans) != 2:
+        raise ValueError("process guard receipt lacks two stable zero-survivor scans")
+    for scan in zero_scans:
+        if not isinstance(scan, Mapping) or set(scan) != {
+            "scan_index", "purpose", "scanned_at_ns", "survivors", "scan_errors"
+        }:
+            raise ValueError("process guard zero-survivor scan is malformed")
+        if (
+            scan["purpose"] != "zero_survivor_verification"
+            or scan["survivors"]
+            or scan["scan_errors"]
+        ):
+            raise ValueError("process guard zero-survivor scans are not clean")
+    if (
+        int(zero_scans[1]["scan_index"]) <= int(zero_scans[0]["scan_index"])
+        or int(zero_scans[1]["scanned_at_ns"])
+        <= int(zero_scans[0]["scanned_at_ns"])
+    ):
+        raise ValueError(
+            "process guard zero-survivor scans are not stable and ordered"
+        )
+    survivor_scans = payload["survivor_scans"]
+    if not isinstance(survivor_scans, list) or survivor_scans[-2:] != zero_scans:
+        raise ValueError(
+            "process guard final scans differ from its zero-survivor proof"
+        )
+
+    reap_results = payload["reap_results"]
+    if not isinstance(reap_results, list) or not all(
+        isinstance(row, Mapping)
+        and set(row) == {"pid", "reaped", "return_code", "error"}
+        and int(row.get("pid") or 0) > 0
+        and isinstance(row.get("reaped"), bool)
+        for row in reap_results
+    ):
+        raise ValueError("process guard reap results are malformed")
+    if payload["cleaned"]:
+        if payload["errors"]:
+            raise ValueError("clean process guard receipt contains errors")
+        if any(not bool(row.get("reaped")) for row in reap_results):
+            raise ValueError(
+                "clean process guard receipt contains an unreaped process"
+            )
+    if payload["cleaned"] is not True:
+        raise ValueError("process guard receipt does not prove cleanup")
+
+    return {
+        "receipt_id": receipt_id,
+        "path": str(receipt_path),
+        "sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+        "execution_id": execution_id,
+        "container_id": str(payload["container_id"]),
+        "pid_namespace_inode": int(payload["pid_namespace_inode"]),
+        "registered_processes": registered_rows,
+        "term_decisions": payload["term_decisions"],
+        "kill_decisions": payload["kill_decisions"],
+        "reap_results": payload["reap_results"],
+        "zero_survivor_scans": zero_scans,
+        "errors": payload["errors"],
+        "cleaned": True,
+    }
+
+
+def _validate_receipt_signal_decisions(
+    rows: Any,
+    registered: set[tuple[int, int, int, int]],
+    *,
+    expected_signal: str,
+) -> set[tuple[int, int, int, int]]:
+    if not isinstance(rows, list):
+        raise ValueError("process guard signal decisions are not a list")
+    identities: set[tuple[int, int, int, int]] = set()
+    for row in rows:
+        if (
+            not isinstance(row, Mapping)
+            or set(row)
+            != {"identity", "signal", "sent", "outcome", "decided_at_ns"}
+            or row.get("signal") != expected_signal
+        ):
+            raise ValueError("process guard signal decision is malformed")
+        if (
+            not isinstance(row.get("sent"), bool)
+            or int(row.get("decided_at_ns") or 0) <= 0
+        ):
+            raise ValueError("process guard signal decision metadata is malformed")
+        if row["sent"] != (row.get("outcome") == "sent"):
+            raise ValueError(
+                "process guard signal outcome contradicts its sent flag"
+            )
+        identity = _receipt_identity(row.get("identity"))
+        if identity not in registered:
+            raise ValueError("process guard signaled an unregistered identity")
+        identities.add(identity)
+    return identities
+
+
+def _receipt_identity(value: Any) -> tuple[int, int, int, int]:
+    if not isinstance(value, Mapping):
+        raise ValueError("process identity is not an object")
+    try:
+        identity = (
+            int(value["pid"]),
+            int(value["pgid"]),
+            int(value["start_ticks"]),
+            int(value["pid_namespace_inode"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("process identity fields are invalid") from exc
+    if any(item <= 0 for item in identity):
+        raise ValueError("process identity fields must be positive")
+    return identity
+
+
 @dataclass(frozen=True, order=True)
 class ProcessIdentity:
     pid: int

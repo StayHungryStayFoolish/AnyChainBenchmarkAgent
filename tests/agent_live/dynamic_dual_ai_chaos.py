@@ -10,6 +10,7 @@ existing tamper-evident PTY evidence contract.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import os
@@ -21,7 +22,7 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
@@ -137,8 +138,16 @@ class ChaosRunConfig:
         root = Path(repo_root).resolve()
         session_id = str(changes.pop("session_id", f"dynamic-chaos-{uuid.uuid4().hex}"))
         execution_id = str(changes.pop("execution_id", f"chaos-{uuid.uuid4().hex}"))
-        host_runtime = root / ".agent" / "dynamic-chaos" / session_id
-        container_runtime = Path("/workspace/.agent/dynamic-chaos") / session_id
+        changes.setdefault("provider", os.environ.get("LLM_PROVIDER", cls.provider))
+        changes.setdefault("model", os.environ.get("LLM_MODEL", cls.model))
+        host_runtime = Path(changes.pop(
+            "runtime_root",
+            root / ".agent" / "dynamic-chaos" / session_id,
+        )).resolve()
+        container_runtime = Path(changes.pop(
+            "runtime_root_in_process",
+            Path("/workspace/.agent/dynamic-chaos") / session_id,
+        ))
         container_env = {
             "ANYCHAIN_CHAOS_EXECUTION_ID": execution_id,
             "ANYCHAIN_CHAOS_INNER_CLEANUP_RECEIPT_DIR": str(
@@ -190,6 +199,8 @@ class ChaosRunConfig:
 
         root = Path(repo_root).resolve()
         session_id = str(changes.pop("session_id", f"dynamic-chaos-{uuid.uuid4().hex}"))
+        changes.setdefault("provider", os.environ.get("LLM_PROVIDER", cls.provider))
+        changes.setdefault("model", os.environ.get("LLM_MODEL", cls.model))
         runtime = root / ".agent" / "dynamic-chaos" / session_id
         return cls(
             repo_root=root,
@@ -248,6 +259,9 @@ class JourneySimulatorDecision:
     mission: str
     rationale: str
     risk_factor_ids: tuple[str, ...] = ()
+    broker_request_id: str = ""
+    simulator_attestation: Mapping[str, Any] = field(default_factory=dict)
+    variant_binding: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -273,6 +287,12 @@ class JourneyDecisionProvenance:
     mission: str
     rationale: str
     risk_factor_ids: tuple[str, ...] = ()
+    execution_id: str = ""
+    obligation_id: str = ""
+    broker_request_id: str = ""
+    simulator_context_binding: Mapping[str, Any] = field(default_factory=dict)
+    simulator_attestation: Mapping[str, Any] = field(default_factory=dict)
+    variant_attestation: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -289,6 +309,7 @@ class JourneyVerifierContext:
     completed_events: tuple[RuntimeTurnEvent, ...] = ()
     completed_decisions: tuple[JourneyDecisionProvenance, ...] = ()
     evaluating_postcondition_id: str = ""
+    verifier_input_contract: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -301,7 +322,7 @@ class JourneyPostconditionResult:
 
 
 JOURNEY_VERIFIER_REGISTRY_SCHEMA_VERSION = 1
-JOURNEY_EVIDENCE_SCHEMA_VERSION = 2
+JOURNEY_EVIDENCE_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -755,6 +776,53 @@ class ContainerPtyBridgeTransport:
         if temporary is not None:
             temporary.cleanup()
 
+    def validated_execution_proof(self) -> Mapping[str, Any]:
+        """Return the authoritative container PTY/process cleanup proof."""
+
+        if self.cleanup_receipt_dir is None or self.cleanup_receipt is None:
+            raise RuntimeError(
+                "container PTY execution has no persistent cleanup receipt"
+            )
+        from tests.agent_live.container_process_guard import (
+            validate_cleanup_receipt_artifact,
+        )
+
+        paths = tuple(
+            self.cleanup_receipt_dir.glob(
+                "container-cleanup-receipt-*.json"
+            )
+        )
+        if len(paths) != 1:
+            raise RuntimeError(
+                "container PTY execution must produce exactly one cleanup receipt"
+            )
+        proof = validate_cleanup_receipt_artifact(
+            paths[0],
+            execution_id=self.execution_id,
+            required_roles=(
+                "container_bridge",
+                "agent_process_group_leader",
+            ),
+            allowed_roots=(self.cleanup_receipt_dir,),
+        )
+        comparable = {
+            key: proof[key]
+            for key in ("receipt_id", "sha256", "cleaned")
+        }
+        observed = {
+            key: self.cleanup_receipt[key]
+            for key in ("receipt_id", "sha256", "cleaned")
+        }
+        if comparable != observed:
+            raise RuntimeError(
+                "container PTY cleanup summary differs from its receipt"
+            )
+        return {
+            "proof_type": "container_pty_process_guard",
+            "transport_kind": "container_pty_bridge",
+            **proof,
+        }
+
     def _request(self, payload: Mapping[str, Any], *, timeout_seconds: float) -> dict[str, Any]:
         if self._process is None:
             raise RuntimeError("container PTY bridge transport is not running")
@@ -1078,7 +1146,7 @@ class DynamicDualAiChaosRunner:
                     coverage_contract=dict(edge),
                 )
                 decision = self.simulator(context)
-                selected_at_ns = self.clock_ns()
+                selection_observed_at_ns = self.clock_ns()
                 if decision is None:
                     target_results.append({
                         "target_id": scheduled_target.target_id,
@@ -1094,6 +1162,15 @@ class DynamicDualAiChaosRunner:
                     timeout_seconds=self.config.response_timeout_seconds
                 )
                 self._validate_event_revision(committed_event)
+                if (
+                    committed_event.before_fingerprint
+                    != baseline_event.after_fingerprint
+                    or committed_event.turn_index
+                    != baseline_event.turn_index + 1
+                ):
+                    raise JourneyInfrastructureInterruptedError(
+                        "Journey runtime event lineage skipped or diverged"
+                    )
                 response = self.transport.read_complete_agent_response(
                     timeout_seconds=self.config.response_timeout_seconds
                 )
@@ -1123,7 +1200,7 @@ class DynamicDualAiChaosRunner:
                     selected_message=decision.user_message,
                     rationale=decision.rationale,
                     target_coverage_ids=tuple(decision.target_coverage_ids),
-                    selected_at_ns=selected_at_ns,
+                    selected_at_ns=selection_observed_at_ns,
                 )
                 turns.append(turn)
                 transcript.append((decision.user_message, response))
@@ -1634,6 +1711,8 @@ class DynamicDualAiJourneyRunner:
         initial_verification: dict[str, Any] = {}
         observed_provider = ""
         observed_model = ""
+        execution_proof: Mapping[str, Any] = {}
+        qualification_reason = "execution_not_completed"
 
         try:
             self.transport.start(env=env)
@@ -1699,7 +1778,7 @@ class DynamicDualAiJourneyRunner:
                     observed_edge_keys=tuple(observed_edge_keys),
                 )
                 decision = self.simulator(context)
-                selected_at_ns = self.clock_ns()
+                selection_observed_at_ns = self.clock_ns()
                 if decision is None:
                     raise JourneyExternallyBlockedError(
                         "external Codex simulator did not provide a journey decision"
@@ -1710,6 +1789,17 @@ class DynamicDualAiJourneyRunner:
                     raise JourneySimulatorInvalidError(str(exc)) from exc
 
                 submitted_at_ns = self.clock_ns()
+                (
+                    simulator_attestation,
+                    variant_attestation,
+                    selected_at_ns,
+                ) = self._validated_decision_attestations(
+                    context=context,
+                    decision=decision,
+                    selection_observed_at_ns=selection_observed_at_ns,
+                    submitted_at_ns=submitted_at_ns,
+                    prior_decisions=decisions,
+                )
                 self.transport.submit_bracketed_paste(decision.user_message)
                 committed_event = self.event_stream.next_event(
                     timeout_seconds=self.config.response_timeout_seconds
@@ -1740,6 +1830,10 @@ class DynamicDualAiJourneyRunner:
                 )
                 turns.append(turn)
                 events.append(committed_event)
+                from tests.agent_live.codex_simulator_bridge import (
+                    simulator_context_binding,
+                )
+
                 decisions.append(JourneyDecisionProvenance(
                     turn_index=committed_event.turn_index,
                     previous_response_hash=content_hash(previous_response),
@@ -1750,6 +1844,27 @@ class DynamicDualAiJourneyRunner:
                     mission=decision.mission,
                     rationale=decision.rationale,
                     risk_factor_ids=tuple(decision.risk_factor_ids),
+                    execution_id=self.config.execution_id,
+                    obligation_id=self.schedule.journey_id,
+                    broker_request_id=decision.broker_request_id,
+                    simulator_context_binding=simulator_context_binding({
+                        "session_id": context.session_id,
+                        "turn_index": context.turn_index,
+                        "previous_response_hash": content_hash(
+                            context.previous_agent_response
+                        ),
+                        "previous_response_received_at_ns": (
+                            context.previous_response_received_at_ns
+                        ),
+                        "schedule": journey_schedule_payload(
+                            context.schedule
+                        ),
+                        "observed_edge_keys": list(
+                            context.observed_edge_keys
+                        ),
+                    }),
+                    simulator_attestation=simulator_attestation,
+                    variant_attestation=variant_attestation,
                 ))
                 transcript.append((decision.user_message, response))
                 transcript_lines.extend((f"User> {decision.user_message}", response))
@@ -1798,10 +1913,22 @@ class DynamicDualAiJourneyRunner:
                         "risk_factor_ids": list(decision.risk_factor_ids),
                     }),
                     "decision_provenance": {
+                        "execution_id": decisions[-1].execution_id,
+                        "obligation_id": decisions[-1].obligation_id,
+                        "broker_request_id": decisions[-1].broker_request_id,
                         "previous_response_hash": decisions[-1].previous_response_hash,
                         "user_message_hash": decisions[-1].user_message_hash,
                         "selected_at_ns": decisions[-1].selected_at_ns,
                         "submitted_at_ns": decisions[-1].submitted_at_ns,
+                        "simulator_context_binding": redact(
+                            dict(decisions[-1].simulator_context_binding)
+                        ),
+                        "simulator_attestation": redact(
+                            dict(decisions[-1].simulator_attestation)
+                        ),
+                        "variant_attestation": redact(
+                            dict(decisions[-1].variant_attestation)
+                        ),
                     },
                     "observed_edges": [
                         {
@@ -1857,8 +1984,30 @@ class DynamicDualAiJourneyRunner:
                         JourneyTerminalClassification.INFRASTRUCTURE_INTERRUPTED
                     )
                     failure_reason = f"{type(close_error).__name__}: {close_error}"
+            if isinstance(self.transport, ContainerPtyBridgeTransport):
+                try:
+                    execution_proof = (
+                        self.transport.validated_execution_proof()
+                    )
+                    qualification_reason = "trusted_container_pty_execution"
+                except Exception as proof_error:
+                    terminal_classification = (
+                        JourneyTerminalClassification.INFRASTRUCTURE_INTERRUPTED
+                    )
+                    terminal_outcome_id = ""
+                    failure_reason = (
+                        f"{type(proof_error).__name__}: {proof_error}"
+                    )
+                    qualification_reason = "container_pty_proof_invalid"
+            else:
+                qualification_reason = "untrusted_test_transport"
             _write_redacted_transcript(transcript_path, transcript_lines)
             safe_transcript_lines = redact(list(transcript_lines))
+            qualifying_evidence = bool(
+                terminal_classification
+                == JourneyTerminalClassification.PASSED
+                and execution_proof
+            )
             journey_payload = {
                 "schema_version": JOURNEY_EVIDENCE_SCHEMA_VERSION,
                 "artifact_type": "dynamic_dual_ai_journey_evidence",
@@ -1871,12 +2020,13 @@ class DynamicDualAiJourneyRunner:
                     self.postcondition_verifier_registry
                 ),
                 "session_id": self.config.session_id,
+                "execution_id": self.config.execution_id,
                 "provider": observed_provider or self.config.provider,
                 "model": observed_model or self.config.model,
                 "terminal_classification": terminal_classification.value,
-                "qualifying_evidence": (
-                    terminal_classification == JourneyTerminalClassification.PASSED
-                ),
+                "qualifying_evidence": qualifying_evidence,
+                "qualification_reason": qualification_reason,
+                "execution_proof": dict(execution_proof),
                 "terminal_outcome_id": terminal_outcome_id,
                 "max_turns": self.schedule.max_turns,
                 "completed_turn_count": len(turns),
@@ -1888,6 +2038,23 @@ class DynamicDualAiJourneyRunner:
                 "initial_verification": initial_verification,
                 "turns": turn_results,
             }
+            if (
+                self.schedule.verifier_input_contract
+                and terminal_classification
+                == JourneyTerminalClassification.PASSED
+            ):
+                journey_payload["retained_artifacts"] = (
+                    _write_retained_journey_artifacts(
+                        runtime_root=runtime_root,
+                        schedule=self.schedule,
+                        revision=self.revision,
+                        execution_id=self.config.execution_id,
+                        initial_event=initial_event,
+                        events=events,
+                        turns=turns,
+                        decisions=decisions,
+                    )
+                )
             evidence_id = content_hash(journey_payload)
             evidence_artifact = {**journey_payload, "evidence_id": evidence_id}
             evidence_artifact["artifact_hash"] = content_hash(evidence_artifact)
@@ -2054,7 +2221,137 @@ class DynamicDualAiJourneyRunner:
             latest_turn=latest_turn,
             completed_events=tuple(events),
             completed_decisions=tuple(decisions),
+            verifier_input_contract=dict(self.schedule.verifier_input_contract),
         )
+
+    def _validated_decision_attestations(
+        self,
+        *,
+        context: JourneySimulatorContext,
+        decision: JourneySimulatorDecision,
+        selection_observed_at_ns: int,
+        submitted_at_ns: int,
+        prior_decisions: Sequence[JourneyDecisionProvenance],
+    ) -> tuple[Mapping[str, Any], Mapping[str, Any], int]:
+        verifier_input = dict(self.schedule.verifier_input_contract)
+        from tests.agent_live.codex_simulator_bridge import (
+            simulator_context_hash,
+            validate_simulator_attestation,
+        )
+        if not decision.simulator_attestation:
+            if verifier_input:
+                raise JourneySimulatorInvalidError(
+                    "retained regression decision has no simulator attestation"
+                )
+            return {}, {}, selection_observed_at_ns
+        unsigned_decision = _journey_unsigned_decision(
+            context=context,
+            decision=decision,
+        )
+        request_id = str(decision.broker_request_id or "")
+        if not request_id:
+            raise JourneySimulatorInvalidError(
+                "attested Journey decision has no broker request identity"
+            )
+        if any(
+            request_id
+            == str(
+                item.simulator_attestation.get("request_id") or ""
+            )
+            for item in prior_decisions
+        ):
+            raise JourneySimulatorInvalidError(
+                "Journey simulator broker request was replayed"
+            )
+        context_payload = {
+            "session_id": context.session_id,
+            "turn_index": context.turn_index,
+            "previous_response_hash": content_hash(
+                context.previous_agent_response
+            ),
+            "previous_response_received_at_ns": (
+                context.previous_response_received_at_ns
+            ),
+            "schedule": journey_schedule_payload(context.schedule),
+            "observed_edge_keys": list(context.observed_edge_keys),
+        }
+        try:
+            simulator_attestation = validate_simulator_attestation(
+                decision.simulator_attestation,
+                previous_response_hash=content_hash(
+                    context.previous_agent_response
+                ),
+                decision_hash=content_hash(unsigned_decision),
+                request_id=request_id,
+                context_hash=simulator_context_hash(context_payload),
+                user_message_hash=content_hash(decision.user_message),
+                turn_index=context.turn_index,
+                submitted_at_ns=submitted_at_ns,
+            )
+        except ValueError as exc:
+            raise JourneySimulatorInvalidError(str(exc)) from exc
+        declared_at_ns = int(simulator_attestation["declared_at_ns"])
+        if (
+            declared_at_ns < context.previous_response_received_at_ns
+            or declared_at_ns > selection_observed_at_ns
+        ):
+            raise JourneySimulatorInvalidError(
+                "simulator declaration time is outside the response-selection interval"
+            )
+        if not verifier_input:
+            return simulator_attestation, {}, declared_at_ns
+        from tests.agent_live.retained_regression_attestations import (
+            build_variant_attestation,
+            validate_verifier_input_contract,
+        )
+
+        contract = validate_verifier_input_contract(verifier_input)
+        binding = dict(decision.variant_binding)
+        if set(binding) != {"source_step_id", "semantic_role"}:
+            raise JourneySimulatorInvalidError(
+                "retained regression decision requires an exact variant binding"
+            )
+        source_step = next(
+            (
+                dict(step)
+                for step in contract["source_contract"]["source_steps"]
+                if step.get("step_id") == binding["source_step_id"]
+            ),
+            None,
+        )
+        if (
+            source_step is None
+            or binding["source_step_id"]
+            not in contract["variant_contract"]["allowed_source_step_ids"]
+            or binding["semantic_role"] != source_step["semantic_role"]
+        ):
+            raise JourneySimulatorInvalidError(
+                "retained regression variant binding is outside the frozen contract"
+            )
+        variant_attestation = build_variant_attestation(
+            actor=simulator_attestation["actor"],
+            verifier_input_contract=contract,
+            execution_binding={
+                "execution_id": self.config.execution_id,
+                "session_id": context.session_id,
+                "schedule_id": context.schedule.schedule_id,
+                "obligation_id": context.schedule.journey_id,
+                "broker_request_id": request_id,
+                "simulator_attestation_id": simulator_attestation[
+                    "attestation_id"
+                ],
+            },
+            source_step_id=binding["source_step_id"],
+            semantic_role=binding["semantic_role"],
+            turn_index=context.turn_index,
+            previous_response_hash=content_hash(
+                context.previous_agent_response
+            ),
+            user_message_hash=content_hash(decision.user_message),
+            selected_at_ns=declared_at_ns,
+            declared_at_ns=declared_at_ns,
+        )
+        return simulator_attestation, variant_attestation, declared_at_ns
 
     def _validate_event_revision(self, event: RuntimeTurnEvent) -> None:
         if dict(event.revision) != self.revision:
@@ -2099,6 +2396,124 @@ def _validate_journey_decision(
         raise ValueError(
             "journey simulator selected undeclared risk factors: " + ", ".join(unexpected)
         )
+    if schedule.verifier_input_contract:
+        if not decision.simulator_attestation:
+            raise ValueError(
+                "retained regression Journey decision lacks simulator attestation"
+            )
+        if not decision.variant_binding:
+            raise ValueError(
+                "retained regression Journey decision lacks variant binding"
+            )
+    elif decision.variant_binding:
+        raise ValueError(
+            "generic Journey decision cannot declare a retained variant binding"
+        )
+
+
+def _journey_unsigned_decision(
+    *,
+    context: JourneySimulatorContext,
+    decision: JourneySimulatorDecision,
+) -> dict[str, Any]:
+    unsigned = {
+        "previous_response_hash": content_hash(
+            context.previous_agent_response
+        ),
+        "user_message": decision.user_message,
+        "persona": decision.persona,
+        "mission": decision.mission,
+        "rationale": decision.rationale,
+        "risk_factor_ids": list(decision.risk_factor_ids),
+    }
+    if decision.variant_binding:
+        unsigned["variant_binding"] = dict(decision.variant_binding)
+    if decision.broker_request_id:
+        unsigned["broker_request_id"] = decision.broker_request_id
+    return unsigned
+
+
+def _write_retained_journey_artifacts(
+    *,
+    runtime_root: Path,
+    schedule: JourneySchedule,
+    revision: Mapping[str, str],
+    execution_id: str,
+    initial_event: RuntimeTurnEvent | None,
+    events: Sequence[RuntimeTurnEvent],
+    turns: Sequence[PtyCliTurnRecord],
+    decisions: Sequence[JourneyDecisionProvenance],
+) -> dict[str, Any]:
+    if initial_event is None or len(events) != len(turns) or len(turns) != len(
+        decisions
+    ):
+        raise JourneyInfrastructureInterruptedError(
+            "retained Journey artifacts have incomplete runtime lineage"
+        )
+    identity = {
+        "obligation_id": schedule.journey_id,
+        "execution_id": str(execution_id),
+        "revision": dict(revision),
+        "schedule_id": schedule.schedule_id,
+        "verifier_input_contract_hash": content_hash(
+            dict(schedule.verifier_input_contract)
+        ),
+    }
+    payloads = {
+        "transcript": {
+            "turns": [
+                {
+                    "turn": redact(asdict(turn)),
+                    "decision": redact(asdict(decision)),
+                }
+                for turn, decision in zip(turns, decisions)
+            ],
+        },
+        "runtime_events": {
+            "initial_event": asdict(initial_event),
+            "events": [asdict(event) for event in events],
+        },
+        "checkpoint_diff": {
+            "before_fingerprint": initial_event.after_fingerprint,
+            "after_fingerprint": (
+                events[-1].after_fingerprint
+                if events
+                else initial_event.after_fingerprint
+            ),
+            "material_state_diff_hashes": [
+                dict(event.material_state_diff_hashes)
+                for event in events
+            ],
+        },
+    }
+    references: dict[str, Any] = {}
+    artifact_root = runtime_root / "retained-artifacts"
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    for role, role_payload in payloads.items():
+        unsigned = {
+            "schema_version": 1,
+            "artifact_type": f"retained_regression_{role}",
+            "identity": identity,
+            **role_payload,
+        }
+        artifact = {**unsigned, "artifact_hash": content_hash(unsigned)}
+        path = artifact_root / f"{role}.json"
+        path.write_text(
+            json.dumps(
+                artifact,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        references[role] = {
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "artifact_hash": artifact["artifact_hash"],
+        }
+    return references
 
 
 def _journey_outcome_verification_payload(
@@ -2178,6 +2593,39 @@ def validate_journey_evidence_artifact(
         raise ValueError("non-passing Journey artifact cannot qualify as evidence")
     if payload.get("qualifying_evidence") is not True:
         raise ValueError("passing Journey artifact is not marked as qualifying evidence")
+    if payload.get("qualification_reason") != "trusted_container_pty_execution":
+        raise ValueError("Journey evidence has no trusted PTY qualification")
+    execution_id = str(payload.get("execution_id") or "")
+    execution_proof = payload.get("execution_proof")
+    if not execution_id or not isinstance(execution_proof, Mapping):
+        raise ValueError("Journey evidence lacks an execution-bound PTY proof")
+    if (
+        execution_proof.get("proof_type") != "container_pty_process_guard"
+        or execution_proof.get("transport_kind") != "container_pty_bridge"
+        or execution_proof.get("execution_id") != execution_id
+    ):
+        raise ValueError("Journey PTY proof identity is invalid")
+    from tests.agent_live.container_process_guard import (
+        validate_cleanup_receipt_artifact,
+    )
+
+    proof_path = Path(str(execution_proof.get("path") or ""))
+    validated_proof = validate_cleanup_receipt_artifact(
+        proof_path,
+        execution_id=execution_id,
+        required_roles=(
+            "container_bridge",
+            "agent_process_group_leader",
+        ),
+        allowed_roots=(proof_path.parent,),
+    )
+    expected_proof = {
+        "proof_type": "container_pty_process_guard",
+        "transport_kind": "container_pty_bridge",
+        **validated_proof,
+    }
+    if dict(execution_proof) != expected_proof:
+        raise ValueError("Journey PTY proof differs from its receipt")
     if payload.get("terminal_outcome_id") != schedule.terminal_outcome.outcome_id:
         raise ValueError("Journey evidence terminal outcome does not match")
     verifications = [payload.get("initial_verification") or {}]
@@ -2211,6 +2659,17 @@ def validate_journey_evidence_artifact(
         identity = turn.get("turn_identity")
         if not isinstance(provenance, Mapping) or not isinstance(identity, Mapping):
             raise ValueError("Journey turn lacks response-bound decision provenance")
+        if (
+            provenance.get("execution_id") != execution_id
+            or provenance.get("obligation_id") != schedule.journey_id
+            or not str(provenance.get("broker_request_id") or "")
+            or not isinstance(
+                provenance.get("simulator_context_binding"), Mapping
+            )
+        ):
+            raise ValueError(
+                "Journey decision provenance execution binding is invalid"
+            )
         for field in ("previous_response_hash", "user_message_hash"):
             if re.fullmatch(r"[0-9a-f]{64}", str(provenance.get(field) or "")) is None:
                 raise ValueError("Journey decision provenance hash is invalid")

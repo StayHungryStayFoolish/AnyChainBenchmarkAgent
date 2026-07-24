@@ -34,6 +34,8 @@ from tests.agent_live.codex_simulator_bridge import (
     CONTEXT_FRAME,
     DECISION_FRAME,
     RESULT_FRAME,
+    simulator_context_hash,
+    validate_simulator_attestation,
 )
 from tests.agent_live.journey_simulator_bridge import (
     CONTEXT_FRAME as JOURNEY_CONTEXT_FRAME,
@@ -65,7 +67,7 @@ from tests.agent_live.coverage_evidence import (
 from tests.agent_live.generate_harness_coverage_ledger import build_ledger
 
 
-BATCH_MANIFEST_SCHEMA_VERSION = 3
+BATCH_MANIFEST_SCHEMA_VERSION = 4
 BATCH_RESULT_SCHEMA_VERSION = 2
 CLEANUP_RECEIPT_SCHEMA_VERSION = 2
 BATCH_SURVIVOR_PROOF_SCHEMA_VERSION = 1
@@ -119,6 +121,9 @@ class FrozenShardSpec:
     lane: str = "edge"
     verifier_registry_import: str = ""
     verifier_registry_id: str = ""
+    obligation_id: str = ""
+    subject_group: str = ""
+    simulator_attestation_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -135,6 +140,7 @@ class FrozenBatchManifest:
     required_env_names: tuple[str, ...]
     timeout_policy: TimeoutPolicy
     stderr_cap_bytes: int
+    expected_obligation_set_hash: str = ""
     worker_runtime: str = "docker"
     formal_profile: bool = False
     scheduler_schema_version: int = CHAOS_SCHEDULE_SCHEMA_VERSION
@@ -236,6 +242,7 @@ def freeze_batch_manifest(
     discovery_ledger_path: str | Path | None = None,
     formal_profile: bool = False,
     worker_runtime: str = "docker",
+    expected_obligation_set_hash: str = "",
 ) -> FrozenBatchManifest:
     """Validate every target and atomically freeze the complete spawn manifest."""
 
@@ -288,6 +295,17 @@ def freeze_batch_manifest(
             ) from exc
         payload = _load_json(target_path)
         lane = _target_lane(payload)
+        target_seed = seed_base + index
+        frozen_execution: Mapping[str, Any] = {}
+        simulator_attestation_required = False
+        obligation_id = ""
+        subject_group = ""
+        if lane == "journey":
+            frozen_execution = _frozen_journey_execution(payload)
+            if frozen_execution:
+                target_seed = int(frozen_execution["seed"])
+                obligation_id = str(frozen_execution["obligation_id"])
+            simulator_attestation_required = _simulator_attestation_required(payload)
         shard_id = f"{batch_nonce}-{index:02d}"
         session_id = f"batch-{shard_id}"
         shard_runtime = runtime / shard_id
@@ -305,7 +323,7 @@ def freeze_batch_manifest(
             schedule = build_chaos_schedule(
                 ledger,
                 revision=revision,
-                seed=seed_base + index,
+                seed=target_seed,
                 targets=targets,
             )
             validate_chaos_schedule(schedule, ledger=ledger, revision=revision)
@@ -328,10 +346,29 @@ def freeze_batch_manifest(
             journey, verifier_registry_import = _journey_target(payload)
             schedule = build_journey_schedule(
                 revision=revision,
-                seed=seed_base + index,
+                seed=target_seed,
                 journey=journey,
             )
             validate_journey_schedule(schedule, revision=revision)
+            subject_group = schedule.subject_group
+            if frozen_execution:
+                if dict(frozen_execution["revision_binding"]) != revision:
+                    raise ValueError("frozen Journey execution revision is stale")
+                if str(frozen_execution["schedule_id"]) != schedule.schedule_id:
+                    raise ValueError("frozen Journey schedule identity drifted")
+                if str(frozen_execution["schedule_hash"]) != _content_hash(
+                    journey_schedule_payload(schedule)
+                ):
+                    raise ValueError("frozen Journey schedule hash drifted")
+                if obligation_id != schedule.journey_id:
+                    raise ValueError("frozen Journey obligation identity drifted")
+                if (
+                    str(frozen_execution["subject_group"])
+                    != schedule.subject_group
+                ):
+                    raise ValueError(
+                        "frozen Journey subject group drifted"
+                    )
             registry = load_verifier_registry(verifier_registry_import)
             verifier_registry_id = registry.registry_id
             target_ids = (schedule.journey_id,)
@@ -344,7 +381,7 @@ def freeze_batch_manifest(
                 f"journey:{schedule.journey_id}",
             )
         command = tuple(str(item) for item in factory(
-            index, target_path, shard_runtime, session_id, seed_base + index,
+            index, target_path, shard_runtime, session_id, target_seed,
             schedule.schedule_id,
         ))
         command = _bind_docker_execution_environment(
@@ -359,7 +396,7 @@ def freeze_batch_manifest(
         shards.append(FrozenShardSpec(
             shard_id=shard_id,
             index=index,
-            seed=seed_base + index,
+            seed=target_seed,
             session_id=session_id,
             target_path=str(target_path),
             target_hash=target_hash,
@@ -378,6 +415,9 @@ def freeze_batch_manifest(
             lane=lane,
             verifier_registry_import=verifier_registry_import,
             verifier_registry_id=verifier_registry_id,
+            obligation_id=obligation_id,
+            subject_group=subject_group,
+            simulator_attestation_required=simulator_attestation_required,
         ))
 
     lane_counts = {lane: sum(item.lane == lane for item in shards) for lane in SHARD_LANES}
@@ -387,6 +427,43 @@ def freeze_batch_manifest(
     }:
         raise ValueError(
             "formal batch requires exactly 24 edge shards and 8 journey shards"
+        )
+    journey_shards = tuple(
+        shard for shard in shards if shard.lane == "journey"
+    )
+    obligation_ids = [
+        shard.obligation_id for shard in journey_shards if shard.obligation_id
+    ]
+    schedule_ids = [shard.schedule_id for shard in journey_shards]
+    if (
+        len(obligation_ids) != len(set(obligation_ids))
+        or len(schedule_ids) != len(set(schedule_ids))
+    ):
+        raise ValueError(
+            "batch has duplicate Journey obligation or schedule identity"
+        )
+    observed_obligation_set_hash = _content_hash([
+        {
+            "obligation_id": shard.obligation_id,
+            "schedule_id": shard.schedule_id,
+            "seed": shard.seed,
+            "subject_group": shard.subject_group,
+        }
+        for shard in sorted(
+            journey_shards,
+            key=lambda item: (
+                item.obligation_id,
+                item.schedule_id,
+            ),
+        )
+    ])
+    if (
+        expected_obligation_set_hash
+        and observed_obligation_set_hash
+        != expected_obligation_set_hash
+    ):
+        raise ValueError(
+            "batch Journey obligation set differs from the expected set"
         )
 
     unsigned = {
@@ -400,6 +477,7 @@ def freeze_batch_manifest(
         "required_env_names": sorted({str(item) for item in required_env_names}),
         "timeout_policy": asdict(timeout_policy),
         "stderr_cap_bytes": stderr_cap_bytes,
+        "expected_obligation_set_hash": expected_obligation_set_hash,
         "worker_runtime": worker_runtime,
         "formal_profile": formal_profile,
         "scheduler_schema_version": CHAOS_SCHEDULE_SCHEMA_VERSION,
@@ -421,6 +499,7 @@ def freeze_batch_manifest(
         required_env_names=tuple(unsigned["required_env_names"]),
         timeout_policy=timeout_policy,
         stderr_cap_bytes=stderr_cap_bytes,
+        expected_obligation_set_hash=expected_obligation_set_hash,
         worker_runtime=worker_runtime,
         formal_profile=formal_profile,
     )
@@ -453,6 +532,9 @@ def load_frozen_manifest(path: str | Path) -> FrozenBatchManifest:
         required_env_names=tuple(payload["required_env_names"]),
         timeout_policy=TimeoutPolicy(**payload["timeout_policy"]),
         stderr_cap_bytes=int(payload["stderr_cap_bytes"]),
+        expected_obligation_set_hash=str(
+            payload.get("expected_obligation_set_hash") or ""
+        ),
         worker_runtime=str(payload.get("worker_runtime") or "docker"),
         formal_profile=bool(payload.get("formal_profile", False)),
         scheduler_schema_version=int(payload["scheduler_schema_version"]),
@@ -502,6 +584,43 @@ def validate_frozen_manifest(
         values = [getattr(item, attribute) for item in manifest.shards]
         if len(values) != len(set(values)):
             raise ValueError(f"manifest has duplicate {attribute}")
+    journey_shards = tuple(
+        shard for shard in manifest.shards if shard.lane == "journey"
+    )
+    obligation_ids = [
+        shard.obligation_id for shard in journey_shards if shard.obligation_id
+    ]
+    schedule_ids = [shard.schedule_id for shard in journey_shards]
+    if (
+        len(obligation_ids) != len(set(obligation_ids))
+        or len(schedule_ids) != len(set(schedule_ids))
+    ):
+        raise ValueError(
+            "manifest has duplicate Journey obligation or schedule identity"
+        )
+    observed_obligation_set_hash = _content_hash([
+        {
+            "obligation_id": shard.obligation_id,
+            "schedule_id": shard.schedule_id,
+            "seed": shard.seed,
+            "subject_group": shard.subject_group,
+        }
+        for shard in sorted(
+            journey_shards,
+            key=lambda item: (
+                item.obligation_id,
+                item.schedule_id,
+            ),
+        )
+    ])
+    if (
+        manifest.expected_obligation_set_hash
+        and observed_obligation_set_hash
+        != manifest.expected_obligation_set_hash
+    ):
+        raise ValueError(
+            "manifest Journey obligation set differs from the expected set"
+        )
     for shard in manifest.shards:
         target = Path(shard.target_path)
         if _sha256_file(target) != shard.target_hash:
@@ -535,12 +654,38 @@ def validate_frozen_manifest(
                 raise ValueError("edge shard cannot bind a Journey verifier registry")
         else:
             journey, registry_import = _journey_target(target_payload)
+            frozen_execution = _frozen_journey_execution(target_payload)
             schedule = build_journey_schedule(
                 revision=manifest.revision,
                 seed=shard.seed,
                 journey=journey,
             )
             validate_journey_schedule(schedule, revision=manifest.revision)
+            if schedule.subject_group != shard.subject_group:
+                raise ValueError("frozen Journey subject group changed")
+            if frozen_execution:
+                if int(frozen_execution["seed"]) != shard.seed:
+                    raise ValueError("frozen Journey seed changed")
+                if str(frozen_execution["obligation_id"]) != shard.obligation_id:
+                    raise ValueError("frozen Journey obligation changed")
+                if str(frozen_execution["schedule_id"]) != shard.schedule_id:
+                    raise ValueError("frozen Journey schedule binding changed")
+                if str(frozen_execution["schedule_hash"]) != _content_hash(
+                    journey_schedule_payload(schedule)
+                ):
+                    raise ValueError("frozen Journey schedule hash changed")
+                if str(
+                    frozen_execution["subject_group"]
+                ) != shard.subject_group:
+                    raise ValueError(
+                        "frozen Journey subject group changed"
+                    )
+            elif shard.obligation_id:
+                raise ValueError("Journey shard retained an unbound obligation id")
+            if _simulator_attestation_required(
+                target_payload
+            ) != shard.simulator_attestation_required:
+                raise ValueError("Journey simulator attestation policy changed")
             if registry_import != shard.verifier_registry_import:
                 raise ValueError("frozen Journey verifier import changed")
             if load_verifier_registry(registry_import).registry_id != shard.verifier_registry_id:
@@ -926,7 +1071,12 @@ async def _exchange_frames(
                 raise ExternalDecisionBlocked("simulator decision timed out") from exc
             if decision is None:
                 raise ExternalDecisionBlocked("simulator returned no decision")
-            normalized = _validate_decision(context, decision, lane=shard.lane)
+            normalized = _validate_decision(
+                context,
+                decision,
+                lane=shard.lane,
+                simulator_attestation_required=shard.simulator_attestation_required,
+            )
             state.decision_hashes.append(_content_hash(normalized))
             process.stdin.write(
                 (decision_frame + _canonical_json(normalized) + "\n").encode("utf-8")
@@ -970,7 +1120,11 @@ class _SimulatorInvalid(RuntimeError):
 
 
 def _validate_decision(
-    context: Mapping[str, Any], decision: Mapping[str, Any], *, lane: str = "edge"
+    context: Mapping[str, Any],
+    decision: Mapping[str, Any],
+    *,
+    lane: str = "edge",
+    simulator_attestation_required: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(decision, Mapping):
         raise _SimulatorInvalid("simulator decision is not an object")
@@ -1001,6 +1155,46 @@ def _validate_decision(
             schedule.get("allowed_risk_factors") or ()
         ):
             raise _SimulatorInvalid("simulator selected invalid Journey risk factors")
+        verifier_input = schedule.get("verifier_input_contract") or {}
+        binding = decision.get("variant_binding") or {}
+        if verifier_input:
+            try:
+                from tests.agent_live.retained_regression_attestations import (
+                    validate_verifier_input_contract,
+                )
+
+                contract = validate_verifier_input_contract(verifier_input)
+            except ValueError as exc:
+                raise _SimulatorInvalid(str(exc)) from exc
+            if (
+                not isinstance(binding, Mapping)
+                or set(binding) != {"source_step_id", "semantic_role"}
+            ):
+                raise _SimulatorInvalid(
+                    "retained regression decision has no exact variant binding"
+                )
+            source_step = next(
+                (
+                    item
+                    for item in contract["source_contract"]["source_steps"]
+                    if item.get("step_id") == binding.get("source_step_id")
+                ),
+                None,
+            )
+            if (
+                source_step is None
+                or binding.get("source_step_id")
+                not in contract["variant_contract"]["allowed_source_step_ids"]
+                or binding.get("semantic_role")
+                != source_step.get("semantic_role")
+            ):
+                raise _SimulatorInvalid(
+                    "retained regression variant binding is outside the frozen contract"
+                )
+        elif binding:
+            raise _SimulatorInvalid(
+                "generic Journey decision declared a retained variant binding"
+            )
     else:
         target = context.get("scheduled_target") or {}
         if str(decision.get("persona") or "") != str(target.get("persona") or ""):
@@ -1012,7 +1206,41 @@ def _validate_decision(
             raise _SimulatorInvalid("simulator dropped the scheduled coverage edge")
     if not str(decision.get("user_message") or ""):
         raise _SimulatorInvalid("simulator decision has an empty user message")
+    if simulator_attestation_required:
+        _validate_simulator_attestation(context, decision)
     return dict(decision)
+
+
+def _validate_simulator_attestation(
+    context: Mapping[str, Any],
+    decision: Mapping[str, Any],
+) -> None:
+    attestation = decision.get("simulator_attestation")
+    if not isinstance(attestation, Mapping):
+        raise _SimulatorInvalid("product Journey decision has no simulator attestation")
+    unsigned_decision = {
+        key: value for key, value in decision.items()
+        if key != "simulator_attestation"
+    }
+    try:
+        request_id = str(decision.get("broker_request_id") or "")
+        if not request_id:
+            raise ValueError(
+                "attested simulator decision has no broker request identity"
+            )
+        validate_simulator_attestation(
+            attestation,
+            previous_response_hash=str(context.get("previous_response_hash") or ""),
+            decision_hash=_content_hash(unsigned_decision),
+            request_id=request_id,
+            context_hash=simulator_context_hash(context),
+            user_message_hash=_content_hash(
+                str(decision.get("user_message") or "")
+            ),
+            turn_index=int(context.get("turn_index") or 0),
+        )
+    except ValueError as exc:
+        raise _SimulatorInvalid(str(exc)) from exc
 
 
 def _validate_context_frame(
@@ -1691,6 +1919,9 @@ def _manifest_unsigned_payload(manifest: FrozenBatchManifest) -> dict[str, Any]:
         "required_env_names": list(manifest.required_env_names),
         "timeout_policy": asdict(manifest.timeout_policy),
         "stderr_cap_bytes": manifest.stderr_cap_bytes,
+        "expected_obligation_set_hash": (
+            manifest.expected_obligation_set_hash
+        ),
         "worker_runtime": manifest.worker_runtime,
         "formal_profile": manifest.formal_profile,
         "scheduler_schema_version": manifest.scheduler_schema_version,
@@ -2255,7 +2486,13 @@ def _target_lane(payload: Any) -> str:
 def _journey_target(payload: Any) -> tuple[Mapping[str, Any], str]:
     if not isinstance(payload, Mapping) or _target_lane(payload) != "journey":
         raise ValueError("Journey target must be an object with lane=journey")
-    allowed = {"lane", "journey", "verifier_registry"}
+    allowed = {
+        "lane",
+        "journey",
+        "verifier_registry",
+        "frozen_execution",
+        "simulator_attestation_contract",
+    }
     unknown = sorted(set(payload) - allowed)
     if unknown:
         raise ValueError(
@@ -2269,6 +2506,59 @@ def _journey_target(payload: Any) -> tuple[Mapping[str, Any], str]:
     if not registry_import:
         raise ValueError("Journey target requires verifier_registry")
     return journey, registry_import
+
+
+def _frozen_journey_execution(payload: Any) -> Mapping[str, Any]:
+    if not isinstance(payload, Mapping):
+        return {}
+    raw = payload.get("frozen_execution")
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise ValueError("frozen Journey execution contract must be an object")
+    required = {
+        "obligation_id",
+        "seed",
+        "schedule_id",
+        "schedule_hash",
+        "subject_group",
+        "revision_binding",
+    }
+    if set(raw) != required:
+        raise ValueError("frozen Journey execution contract fields mismatch")
+    if not str(raw.get("obligation_id") or "").strip():
+        raise ValueError("frozen Journey execution has no obligation id")
+    seed = raw.get("seed")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError("frozen Journey execution seed is invalid")
+    for field in ("schedule_id", "schedule_hash"):
+        value = str(raw.get(field) or "")
+        if len(value) != 64:
+            raise ValueError(f"frozen Journey execution {field} is invalid")
+    revision = raw.get("revision_binding")
+    if not isinstance(revision, Mapping) or not all(
+        str(revision.get(field) or "").strip()
+        for field in ("commit", "worktree_hash")
+    ):
+        raise ValueError("frozen Journey execution revision is incomplete")
+    return dict(raw)
+
+
+def _simulator_attestation_required(payload: Any) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    raw = payload.get("simulator_attestation_contract")
+    if raw is None:
+        return False
+    expected = {
+        "required": True,
+        "identity_strength": "auditable_declaration_only",
+        "scripted_actor_qualifies": False,
+        "cryptographic_identity_claimed": False,
+    }
+    if raw != expected:
+        raise ValueError("Journey simulator attestation contract is invalid")
+    return True
 
 
 def _reject_secret_bearing_command(command: Sequence[str]) -> None:

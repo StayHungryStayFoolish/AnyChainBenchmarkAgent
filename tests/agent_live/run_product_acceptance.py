@@ -36,6 +36,16 @@ from tests.agent_live.retained_regression_obligations import (
 SCHEMA_VERSION = 1
 IMPLEMENTED_THROUGH_PHASE = 8
 EMPTY_WORKTREE_HASH = hashlib.sha256(b"").hexdigest()
+FULL_PYTHON_SUITE_COMMAND = (
+    sys.executable,
+    "-m",
+    "unittest",
+    "discover",
+    "-s",
+    "tests",
+    "-p",
+    "test_*.py",
+)
 
 
 def _run(command: Sequence[str]) -> dict[str, Any]:
@@ -304,7 +314,7 @@ def _phase6_source(inventory: dict[str, Any]) -> dict[str, Any]:
     }
     regressions = _retained_regression_inventory()
     checks = [
-        _run((sys.executable, "-m", "pytest", "-q")),
+        _run(FULL_PYTHON_SUITE_COMMAND),
         _run((sys.executable, "tools/check_agent_boundaries.py", "--root", ".")),
     ]
     complete = _phase6_complete(

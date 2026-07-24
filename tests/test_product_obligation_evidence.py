@@ -269,6 +269,27 @@ class ProductObligationEvidenceTest(unittest.TestCase):
                 revision=REVISION,
             )
 
+    def test_g4_pass_cannot_bypass_journey_and_process_provenance(self) -> None:
+        obligation = _obligation("g4-strict")
+        unsigned = {
+            key: value
+            for key, value in obligation.items()
+            if key != "contract_hash"
+        }
+        unsigned.update({
+            "model": {"model_id": "product-chaos"},
+            "factors": {"subject_group": "chain_identity"},
+            "start_contract": {"scenario_id": "opening"},
+        })
+        obligation = {**unsigned, "contract_hash": content_hash(unsigned)}
+        path, _payload = self._evidence(obligation, suffix="g4-strict")
+        with self.assertRaisesRegex(ValueError, "G4 runtime provenance"):
+            admit_product_obligation_evidence(
+                obligations=[obligation],
+                evidence_paths=[path],
+                revision=REVISION,
+            )
+
     def test_missing_required_artifact_or_hash_mismatch_fails_closed(self) -> None:
         path, payload = self._evidence(self.obligations[0])
         payload["artifacts"].pop()

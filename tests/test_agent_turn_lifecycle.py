@@ -163,6 +163,50 @@ class TurnBudgetContractTest(unittest.TestCase):
                 with self.assertRaises(LLMTurnTimeoutError):
                     DeepSeekProvider(config).complete(LLMRequest(messages=[LLMMessage(role="user", content="hello")]))
 
+    def test_deepseek_provider_configuration_failure_is_typed(self) -> None:
+        from agent.llm.config import LLMConfig
+        from agent.llm.providers import DeepSeekProvider
+        from agent.llm.types import (
+            LLMMessage,
+            LLMProviderError,
+            LLMRequest,
+            llm_turn_scope,
+        )
+
+        class BadRequestError(Exception):
+            __module__ = "openai"
+            status_code = 400
+
+        class OpenAI:
+            def __init__(self, **_kwargs):
+                self.chat = types.SimpleNamespace(
+                    completions=types.SimpleNamespace(
+                        create=lambda **_call: (_ for _ in ()).throw(
+                            BadRequestError("unsupported model")
+                        )
+                    )
+                )
+
+        module = types.ModuleType("openai")
+        module.OpenAI = OpenAI
+        httpx_module = types.ModuleType("httpx")
+        httpx_module.Timeout = lambda **values: types.SimpleNamespace(**values)
+        config = LLMConfig(
+            provider="deepseek",
+            model="invalid-model",
+            deepseek_api_key="secret",
+            deepseek_api_key_present=True,
+        )
+        with patch.dict(sys.modules, {"openai": module, "httpx": httpx_module}):
+            with llm_turn_scope(2):
+                with self.assertRaises(LLMProviderError) as raised:
+                    DeepSeekProvider(config).complete(
+                        LLMRequest(messages=[LLMMessage(role="user", content="hello")])
+                    )
+
+        self.assertEqual(raised.exception.category, "configuration")
+        self.assertEqual(raised.exception.status_code, 400)
+
 
 class TurnCheckpointContractTest(unittest.TestCase):
     def test_turn_receipt_binds_every_semantic_unit_to_its_admitted_action(self) -> None:
@@ -335,6 +379,10 @@ class TurnCheckpointContractTest(unittest.TestCase):
         self.assertEqual(len(pending_receipts), 1)
         self.assertEqual(pending_receipts[0]["pending_id"], "CLOUD_REGION")
         self.assertEqual(pending_receipts[0]["verdict"], "accepted")
+        self.assertIn(
+            pending_receipts[0]["resolved_action_id"],
+            event["turn_receipt_summary"]["execution_order"],
+        )
         semantic_unit = event["turn_receipt_summary"]["semantic_units"][0]
         self.assertEqual(
             (semantic_unit["start"], semantic_unit["end"]),
@@ -349,6 +397,27 @@ class TurnCheckpointContractTest(unittest.TestCase):
         self.assertEqual(
             len(response_receipts[0]["fragments"]),
             len(result["visible_response"]),
+        )
+        domain_receipts = [
+            item
+            for item in event["control_receipts"]
+            if item["receipt_type"] == "domain_commit"
+        ]
+        self.assertEqual(len(domain_receipts), 1)
+        self.assertEqual(
+            domain_receipts[0]["group_state_transitions"],
+            [
+                {
+                    "group": "job_monitoring",
+                    "before": "",
+                    "after": "invalidated",
+                },
+                {
+                    "group": "preflight_smoke_execution",
+                    "before": "",
+                    "after": "invalidated",
+                },
+            ],
         )
 
     def test_cancelled_turn_does_not_commit_partial_checkpoint(self) -> None:
@@ -399,6 +468,41 @@ class TurnCheckpointContractTest(unittest.TestCase):
             with (
                 patch.object(runtime.graph, "invoke", side_effect=TimedOutGraph().invoke),
                 self.assertRaises(LLMTurnTimeoutError),
+            ):
+                runtime.invoke("change everything", language="en")
+            after = runtime.snapshot()
+            runtime.close()
+
+        self.assertEqual(after, before)
+
+    def test_provider_failure_does_not_commit_partial_checkpoint(self) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+        from agent.llm.types import LLMProviderError
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = AnyChainGraphRuntime(
+                thread_id="rollback-provider",
+                checkpoint_path=Path(tmpdir) / "checkpoint.sqlite",
+            )
+            runtime._persist_state({
+                "target_mode": "fake-node",
+                "active_group": "target_mode",
+            })
+            before = runtime.snapshot()
+
+            class FailedGraph:
+                def invoke(self, state, **_kwargs):
+                    state["target_mode"] = "real-node"
+                    raise LLMProviderError(
+                        "provider unavailable",
+                        provider="deepseek",
+                        model="invalid-model",
+                        category="configuration",
+                    )
+
+            with (
+                patch.object(runtime.graph, "invoke", side_effect=FailedGraph().invoke),
+                self.assertRaises(LLMProviderError),
             ):
                 runtime.invoke("change everything", language="en")
             after = runtime.snapshot()

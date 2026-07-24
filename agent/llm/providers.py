@@ -12,7 +12,17 @@ from urllib import request as urlrequest
 
 from .config import LLMConfig, load_llm_config
 from .google_auth import get_google_access_token
-from .types import LLMTurnTimeoutError, LLMMessage, LLMProvider, LLMRequest, LLMResponse, ensure_turn_active, remaining_turn_seconds
+from .types import (
+    LLMMessage,
+    LLMProvider,
+    LLMProviderError,
+    LLMRequest,
+    LLMResponse,
+    LLMTurnTimeoutError,
+    ensure_turn_active,
+    llm_turn_scope,
+    remaining_turn_seconds,
+)
 
 
 class OpenAIProvider:
@@ -262,7 +272,7 @@ def _openai_request(config: LLMConfig, call: Any) -> Any:
                 model=config.model,
                 stage="provider_request",
             ) from exc
-        raise
+        raise _provider_error(config, exc) from exc
     ensure_turn_active()
     return response
 
@@ -298,6 +308,8 @@ def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str], confi
             model=config.model,
             stage="provider_request",
         ) from exc
+    except urlerror.HTTPError as exc:
+        raise _provider_error(config, exc) from exc
     except urlerror.URLError as exc:
         if _is_transport_timeout(exc.reason if isinstance(exc.reason, BaseException) else exc):
             raise LLMTurnTimeoutError(
@@ -306,7 +318,7 @@ def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str], confi
                 model=config.model,
                 stage="provider_request",
             ) from exc
-        raise
+        raise _provider_error(config, exc) from exc
     ensure_turn_active()
     return payload
 
@@ -349,6 +361,112 @@ def provider_runtime_errors(config: LLMConfig | None = None) -> list[str]:
         if not google_auth_available:
             errors.append("google-auth package is required for Vertex authentication")
     return errors
+
+
+def probe_provider_readiness(
+    config: LLMConfig | None = None,
+    *,
+    timeout_seconds: float = 20.0,
+) -> LLMProviderError | None:
+    """Verify that the configured provider and model can execute a minimal call."""
+
+    config = config or load_llm_config()
+    runtime_errors = provider_runtime_errors(config)
+    if runtime_errors:
+        return LLMProviderError(
+            "; ".join(runtime_errors),
+            provider=config.provider,
+            model=config.model,
+            category="configuration",
+            stage="provider_readiness",
+        )
+    try:
+        with llm_turn_scope(min(config.turn_timeout_seconds, timeout_seconds)):
+            response = provider_from_config(config).complete(LLMRequest(
+                messages=[
+                    LLMMessage(
+                        role="system",
+                        content=(
+                            "Return exactly one JSON object with the single field "
+                            '`"ready": true`. Do not use Markdown.'
+                        ),
+                    ),
+                    LLMMessage(role="user", content='{"probe":"provider_readiness"}'),
+                ],
+                temperature=0.0,
+                max_tokens=256,
+            ))
+    except LLMTurnTimeoutError as exc:
+        return LLMProviderError(
+            "provider readiness probe timed out",
+            provider=config.provider,
+            model=config.model,
+            category="timeout",
+            stage="provider_readiness",
+            retriable=True,
+        )
+    except LLMProviderError as exc:
+        return LLMProviderError(
+            str(exc),
+            provider=exc.provider or config.provider,
+            model=exc.model or config.model,
+            category=exc.category,
+            stage="provider_readiness",
+            status_code=exc.status_code,
+            retriable=exc.retriable,
+        )
+    except Exception as exc:
+        return LLMProviderError(
+            f"provider readiness failed: {type(exc).__name__}",
+            provider=config.provider,
+            model=config.model,
+            category="provider",
+            stage="provider_readiness",
+        )
+    try:
+        readiness = json.loads(str(response.text or "").strip())
+    except json.JSONDecodeError:
+        readiness = None
+    if readiness != {"ready": True}:
+        return LLMProviderError(
+            "provider readiness did not satisfy the strict response contract",
+            provider=config.provider,
+            model=config.model,
+            category="response",
+            stage="provider_readiness",
+        )
+    return None
+
+
+def _provider_error(config: LLMConfig, exc: BaseException) -> LLMProviderError:
+    status_code = int(
+        getattr(exc, "status_code", 0)
+        or getattr(exc, "code", 0)
+        or 0
+    )
+    if status_code in {401, 403}:
+        category = "authentication"
+    elif status_code == 402:
+        category = "quota"
+    elif status_code == 429:
+        category = "rate_limit"
+    elif status_code == 400:
+        category = "configuration"
+    elif status_code >= 500:
+        category = "service"
+    elif isinstance(exc, (ConnectionError, urlerror.URLError)):
+        category = "transport"
+    else:
+        category = "provider"
+    return LLMProviderError(
+        f"{config.provider}/{config.model} provider request failed"
+        + (f" with HTTP {status_code}" if status_code else ""),
+        provider=config.provider,
+        model=config.model,
+        category=category,
+        status_code=status_code,
+        retriable=category in {"rate_limit", "service", "transport"},
+    )
 
 
 def _openai_completion_options(model: str, request: LLMRequest) -> dict[str, Any]:

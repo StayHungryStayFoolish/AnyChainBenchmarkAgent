@@ -18,7 +18,8 @@
 #   G2 — concurrent dd processes ≤ 4
 #   G3 — destination filesystem free space ≥ 5 GiB
 #   G4 — never write to /dev/* directly; always to file under WORKDIR
-#   G5 — every dd uses oflag=direct so we bypass page cache (real disk I/O)
+#   G5 — prefer direct I/O; use GNU dd nocache semantics when the filesystem
+#        rejects direct I/O (for example Docker overlayfs read paths)
 #
 # OUTPUT:
 #   stdout — JSON-line per phase: {"phase": "...", "bytes": N, "duration_s": f, "mbps": f}
@@ -35,6 +36,8 @@ MIN_FREE_GIB="${MIN_FREE_GIB:-5}"                      # G3
 BLOCK_SIZE="${BLOCK_SIZE:-1M}"
 DURATION_SEC="${DURATION_SEC:-60}"
 PHASES="${PHASES:-write,read,mixed}"   # comma-separated
+WRITE_IO_FLAG="direct"
+READ_IO_FLAG="direct"
 
 # -------- Helpers ----------------------------------------------------
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -43,6 +46,19 @@ emit_json() {
   # $1 phase, $2 bytes, $3 duration_s, $4 mbps
   printf '{"phase":"%s","bytes":%s,"duration_s":%s,"mbps":%s,"ts":"%s"}\n' \
     "$1" "$2" "$3" "$4" "$(date -u +%FT%TZ)"
+}
+
+calculate_timing() {
+  local start="$1"
+  local end="$2"
+  local bytes="$3"
+  awk -v start="$start" -v end="$end" -v bytes="$bytes" 'BEGIN {
+    duration = end - start
+    if (duration <= 0) {
+      duration = 0.000001
+    }
+    printf "%.4f,%.2f\n", duration, (bytes / 1048576) / duration
+  }'
 }
 
 guardrail_check() {
@@ -68,21 +84,50 @@ cleanup() {
 }
 trap cleanup EXIT
 
+run_write_io() {
+  local destination="$1"
+  local count="$2"
+  dd if=/dev/zero of="$destination" \
+    bs="$BLOCK_SIZE" count="$count" \
+    conv=fsync "oflag=${WRITE_IO_FLAG}" status=none
+}
+
+run_read_io() {
+  local source="$1"
+  dd if="$source" of=/dev/null \
+    bs="$BLOCK_SIZE" "iflag=${READ_IO_FLAG}" status=none
+}
+
+negotiate_io_mode() {
+  local probe="${WORKDIR}/.direct_io_probe"
+  rm -f "$probe"
+
+  if ! dd if=/dev/zero of="$probe" bs="$BLOCK_SIZE" count=1 \
+      conv=fsync oflag=direct status=none 2>/dev/null; then
+    WRITE_IO_FLAG="nocache"
+  fi
+
+  if [[ -f "$probe" ]] && ! dd if="$probe" of=/dev/null bs="$BLOCK_SIZE" \
+      count=1 iflag=direct status=none 2>/dev/null; then
+    READ_IO_FLAG="nocache"
+  fi
+
+  rm -f "$probe"
+  echo "# I/O mode: write=${WRITE_IO_FLAG} read=${READ_IO_FLAG}" >&2
+}
+
 # -------- Phases -----------------------------------------------------
 phase_write() {
   local count=$((TOTAL_WRITE_CAP_MIB))   # block_size=1M → count=MiB
   local start end dur bytes mbps
   start=$(date +%s.%N)
-  # G4: write to file, not device. G5: oflag=direct (real I/O)
-  if ! dd if=/dev/zero of="${WORKDIR}/bench_data" \
-        bs="$BLOCK_SIZE" count="$count" \
-        conv=fsync oflag=direct status=none 2>&1; then
+  # G4: write to a scratch file, never the device itself.
+  if ! run_write_io "${WORKDIR}/bench_data" "$count"; then
     die "dd write failed"
   fi
   end=$(date +%s.%N)
-  dur=$(awk "BEGIN{printf \"%.2f\", $end - $start}")
   bytes=$((count * 1024 * 1024))
-  mbps=$(awk "BEGIN{printf \"%.2f\", ($bytes / 1048576) / $dur}")
+  IFS=',' read -r dur mbps < <(calculate_timing "$start" "$end" "$bytes")
   emit_json "write" "$bytes" "$dur" "$mbps"
 }
 
@@ -90,15 +135,12 @@ phase_read() {
   [[ -f "${WORKDIR}/bench_data" ]] || die "phase_read: bench_data missing"
   local start end dur bytes mbps
   start=$(date +%s.%N)
-  # iflag=direct: bypass cache → real disk read
-  if ! dd if="${WORKDIR}/bench_data" of=/dev/null \
-        bs="$BLOCK_SIZE" iflag=direct status=none 2>&1; then
+  if ! run_read_io "${WORKDIR}/bench_data"; then
     die "dd read failed"
   fi
   end=$(date +%s.%N)
-  dur=$(awk "BEGIN{printf \"%.2f\", $end - $start}")
   bytes=$(stat -c%s "${WORKDIR}/bench_data")
-  mbps=$(awk "BEGIN{printf \"%.2f\", ($bytes / 1048576) / $dur}")
+  IFS=',' read -r dur mbps < <(calculate_timing "$start" "$end" "$bytes")
   emit_json "read" "$bytes" "$dur" "$mbps"
 }
 
@@ -113,12 +155,9 @@ phase_mixed() {
   local pids=()
   local i
   for ((i=0; i<procs; i++)); do
-    dd if=/dev/zero of="${WORKDIR}/bench_mix_w_${i}" \
-       bs="$BLOCK_SIZE" count=$((half / procs)) \
-       conv=fsync oflag=direct status=none 2>&1 &
+    run_write_io "${WORKDIR}/bench_mix_w_${i}" "$((half / procs))" &
     pids+=($!)
-    dd if="${WORKDIR}/bench_data" of=/dev/null \
-       bs="$BLOCK_SIZE" iflag=direct status=none 2>&1 &
+    run_read_io "${WORKDIR}/bench_data" &
     pids+=($!)
   done
   local pid rc=0
@@ -126,13 +165,12 @@ phase_mixed() {
     wait "$pid" || rc=1
   done
   end=$(date +%s.%N)
-  dur=$(awk "BEGIN{printf \"%.2f\", $end - $start}")
   rm -f "${WORKDIR}"/bench_mix_w_*
   [[ "$rc" -eq 0 ]] || die "dd mixed phase had failures"
   # Approx bytes = write_half_MiB (read amount varies with cache)
   local bytes=$((half * 1024 * 1024))
   local mbps
-  mbps=$(awk "BEGIN{printf \"%.2f\", ($bytes / 1048576) / $dur}")
+  IFS=',' read -r dur mbps < <(calculate_timing "$start" "$end" "$bytes")
   emit_json "mixed" "$bytes" "$dur" "$mbps"
 }
 
@@ -143,6 +181,7 @@ main() {
   echo "# LEDGER_DEVICE=${LEDGER_DEVICE:-sda} ACCOUNTS_DEVICE=${ACCOUNTS_DEVICE:-<none>}" >&2
 
   guardrail_check
+  negotiate_io_mode
 
   IFS=',' read -ra phase_arr <<< "$PHASES"
   for p in "${phase_arr[@]}"; do

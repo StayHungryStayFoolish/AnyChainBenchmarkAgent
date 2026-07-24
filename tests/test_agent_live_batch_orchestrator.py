@@ -24,6 +24,7 @@ from tests.agent_live.chaos_scheduler import (
     journey_schedule_payload,
     schedule_payload,
 )
+from tests.agent_live.coverage_evidence import content_hash
 from tests.agent_live.generate_harness_coverage_ledger import build_ledger
 
 from tests.agent_live.batch_orchestrator import (
@@ -509,6 +510,104 @@ class BatchOrchestratorTests(unittest.TestCase):
         )
         self.assertEqual(row["stable_coverage_ids"], [])
         self.assertEqual(row["journey_ids"], [shard.target_ids[0]])
+
+    def test_product_journey_preserves_frozen_seed_and_schedule_identity(self) -> None:
+        target = self.targets / "01.json"
+        payload = formal_journey_definitions()[0]
+        journey = dict(payload["journey"])
+        journey["journey_id"] = "g4-obligation-1"
+        seed = 20260724
+        schedule = build_journey_schedule(
+            revision=self.revision,
+            seed=seed,
+            journey=journey,
+        )
+        schedule_payload_value = journey_schedule_payload(schedule)
+        payload = {
+            **payload,
+            "journey": journey,
+            "frozen_execution": {
+                "obligation_id": journey["journey_id"],
+                "seed": seed,
+                "schedule_id": schedule.schedule_id,
+                "schedule_hash": content_hash(schedule_payload_value),
+                "subject_group": schedule.subject_group,
+                "revision_binding": self.revision,
+            },
+            "simulator_attestation_contract": {
+                "required": True,
+                "identity_strength": "auditable_declaration_only",
+                "scripted_actor_qualifies": False,
+                "cryptographic_identity_claimed": False,
+            },
+        }
+        target.write_text(json.dumps(payload), encoding="utf-8")
+        observed = {}
+
+        def factory(index, target_path, runtime, session, observed_seed, schedule_id):
+            del index, target_path, runtime, session
+            observed.update(seed=observed_seed, schedule_id=schedule_id)
+            return (sys.executable, "-c", "pass")
+
+        manifest = freeze_batch_manifest(
+            repo_root=self.root,
+            targets_dir=self.targets,
+            manifest_path=self.root / ".agent" / "product-manifest.json",
+            runtime_base=self.root / ".agent" / "product-runtime",
+            shard_count=1,
+            required_env_names=(),
+            command_factory=factory,
+        )
+        shard = manifest.shards[0]
+        self.assertEqual(shard.seed, seed)
+        self.assertEqual(shard.schedule_id, schedule.schedule_id)
+        self.assertEqual(shard.obligation_id, journey["journey_id"])
+        self.assertTrue(shard.simulator_attestation_required)
+        self.assertEqual(observed, {
+            "seed": seed,
+            "schedule_id": schedule.schedule_id,
+        })
+
+    def test_product_journey_rejects_frozen_schedule_hash_drift(self) -> None:
+        target = self.targets / "01.json"
+        payload = formal_journey_definitions()[0]
+        journey = dict(payload["journey"])
+        journey["journey_id"] = "g4-obligation-stale-schedule"
+        seed = 20260724
+        schedule = build_journey_schedule(
+            revision=self.revision,
+            seed=seed,
+            journey=journey,
+        )
+        target.write_text(json.dumps({
+            **payload,
+            "journey": journey,
+            "frozen_execution": {
+                "obligation_id": journey["journey_id"],
+                "seed": seed,
+                "schedule_id": schedule.schedule_id,
+                "schedule_hash": "0" * 64,
+                "subject_group": schedule.subject_group,
+                "revision_binding": self.revision,
+            },
+            "simulator_attestation_contract": {
+                "required": True,
+                "identity_strength": "auditable_declaration_only",
+                "scripted_actor_qualifies": False,
+                "cryptographic_identity_claimed": False,
+            },
+        }), encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "schedule hash drifted"):
+            freeze_batch_manifest(
+                repo_root=self.root,
+                targets_dir=self.targets,
+                manifest_path=self.root / ".agent" / "product-manifest.json",
+                runtime_base=self.root / ".agent" / "product-runtime",
+                shard_count=1,
+                required_env_names=(),
+                command_factory=lambda *_args: (sys.executable, "-c", "pass"),
+            )
 
     def test_all_shards_finish_once_with_five_terminal_classifications(self) -> None:
         modes = ["pass-slow", "product", "pass", "pass", "infrastructure"]

@@ -235,7 +235,7 @@ def request_semantic_compilation(
     request_payload: Mapping[str, Any],
     max_tokens: int = 3600,
 ) -> str:
-    """Run exactly one semantic compiler provider call."""
+    """Run one call and leave malformed output to the caller's bounded repair."""
 
     ensure_turn_active()
     response = provider.complete(LLMRequest(
@@ -249,7 +249,11 @@ def request_semantic_compilation(
         temperature=0.0,
         max_tokens=max_tokens,
     ))
-    return _canonical_json(_strict_json_object(str(response.text or "")))
+    raw = str(response.text or "")
+    try:
+        return _canonical_json(_strict_json_object(raw))
+    except ValueError:
+        return raw
 
 
 def freeze_semantic_plan(

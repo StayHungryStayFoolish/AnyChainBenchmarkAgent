@@ -165,6 +165,22 @@ class AgentContractProjectionTest(unittest.TestCase):
         arguments["closure"]["open_required"] = 1
         self.assertFalse(_phase6_complete(**arguments))
 
+    def test_product_acceptance_uses_declared_unittest_runtime(self) -> None:
+        from tests.agent_live.run_product_acceptance import FULL_PYTHON_SUITE_COMMAND
+
+        self.assertEqual(
+            FULL_PYTHON_SUITE_COMMAND[1:],
+            (
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "tests",
+                "-p",
+                "test_*.py",
+            ),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -23,6 +23,7 @@ from agent.runners.benchmark_pipeline import (
     submit_benchmark_job,
 )
 from agent.runners.job_manager import DEFAULT_JOBS_DIR, submit_job
+from agent.runners.plan_projection import validate_execution_plan_projection
 from agent.runners.execution_scenarios import scenario_for_operation
 
 
@@ -192,6 +193,13 @@ class BenchmarkExecutionService:
                 scenario_id=scenario.scenario_id,
                 idempotency_key=idempotency_key,
                 runtime_override_sources=request.runtime_override_sources,
+            )
+            validate_execution_plan_projection(
+                plan,
+                execution_plan,
+                approved_plan_file=approved_plan_file,
+                operation=operation.value,
+                scenario_id=scenario.scenario_id,
             )
             jobs_dir = str(request.jobs_dir)
             if spec.runner_kind == "fake_node_smoke":

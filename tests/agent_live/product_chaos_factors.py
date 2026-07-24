@@ -11,6 +11,7 @@ import random
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
+from agent.workflows.group_registry import GROUP_ORDER
 from tests.agent_live.covering_arrays import (
     FACTOR_MODEL_SCHEMA_VERSION,
     Factor,
@@ -25,6 +26,7 @@ PRODUCT_CHAOS_MODEL_VERSION = FACTOR_MODEL_SCHEMA_VERSION
 
 STATE_CONTROL_FACTOR_NAMES = (
     "workflow_mode",
+    "subject_group",
     "language",
     "pending_state",
     "group_state",
@@ -49,6 +51,7 @@ def build_product_factor_model() -> FactorModel:
 
     factors = (
         Factor("workflow_mode", ("fake", "real", "sync")),
+        Factor("subject_group", GROUP_ORDER),
         Factor("language", ("en", "zh")),
         Factor("session_state", ("fresh", "partial", "complete", "quarantine")),
         Factor("pending_state", ("none", "manual", "choice")),
@@ -84,6 +87,22 @@ def build_product_factor_model() -> FactorModel:
         "default_single", "default_mixed", "custom_single", "custom_mixed"
     ):
         forbid(f"sync-no-{workload}", workflow_mode="sync", workload=workload)
+    for subject_group in (
+        "workload_rpc",
+        "target_samples_fixtures",
+        "qps_profile",
+    ):
+        forbid(
+            f"sync-no-{subject_group}-group",
+            workflow_mode="sync",
+            subject_group=subject_group,
+        )
+    for workflow_mode in ("fake", "real"):
+        forbid(
+            f"{workflow_mode}-no-sync-observe-group",
+            workflow_mode=workflow_mode,
+            subject_group="sync_observe",
+        )
     for workflow_mode in ("fake", "real"):
         for chain_case in ("known", "case1", "case2"):
             forbid(
@@ -107,15 +126,28 @@ def build_product_factor_model() -> FactorModel:
     ):
         forbid(f"case3-no-{workload}", chain_case="case3", workload=workload)
 
-    # Back requires a real interruption frame. A quarantined state can only be
-    # reset; it cannot expose a stale pending question or appear completed.
+    # Back requires a real interruption frame. A quarantined checkpoint is
+    # presented through the resume selector, so it has a choice contract and
+    # can only be reset. Fresh and complete checkpoints also enter through a
+    # concrete question; a no-pending baseline is only a valid partial-session
+    # control state.
     forbid("back-requires-interruption", interruption_depth="0", recovery="back")
-    for pending_state in ("manual", "choice"):
+    for pending_state in ("none", "manual"):
         forbid(
             f"quarantine-no-{pending_state}-question",
             session_state="quarantine",
             pending_state=pending_state,
         )
+    forbid(
+        "fresh-session-requires-question",
+        session_state="fresh",
+        pending_state="none",
+    )
+    forbid(
+        "complete-session-requires-question",
+        session_state="complete",
+        pending_state="none",
+    )
     for group_state in ("partial", "completed"):
         forbid(
             f"quarantine-no-{group_state}-group",

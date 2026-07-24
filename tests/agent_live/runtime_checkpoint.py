@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import asdict, dataclass
 from copy import deepcopy
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -34,6 +35,7 @@ def reviewed_scenario_state(scenario_id: str) -> Mapping[str, Any]:
     return deepcopy(dict(scenario.seed_state))
 
 
+@lru_cache(maxsize=None)
 def reviewed_scenario(scenario_id: str) -> Any:
     """Return one authoritative executable scenario for evidence setup."""
 

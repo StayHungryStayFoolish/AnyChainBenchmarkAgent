@@ -1837,6 +1837,45 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             "en",
         ))
 
+    def test_runtime_identity_follows_explicit_process_configuration(self) -> None:
+        root = Path("/tmp/anychain-chaos-contract")
+        with patch.dict(
+            os.environ,
+            {
+                "LLM_PROVIDER": "deepseek",
+                "LLM_MODEL": "configured-runtime-model",
+            },
+        ):
+            linux = ChaosRunConfig.linux(root, session_id="configured-linux")
+            docker = ChaosRunConfig.docker(root, session_id="configured-docker")
+
+        self.assertEqual(
+            (linux.provider, linux.model),
+            ("deepseek", "configured-runtime-model"),
+        )
+        self.assertEqual(
+            (docker.provider, docker.model),
+            ("deepseek", "configured-runtime-model"),
+        )
+
+    def test_explicit_runtime_identity_overrides_process_configuration(self) -> None:
+        root = Path("/tmp/anychain-chaos-contract")
+        with patch.dict(
+            os.environ,
+            {
+                "LLM_PROVIDER": "deepseek",
+                "LLM_MODEL": "configured-runtime-model",
+            },
+        ):
+            config = ChaosRunConfig.linux(
+                root,
+                session_id="explicit-runtime",
+                provider="openai",
+                model="explicit-model",
+            )
+
+        self.assertEqual((config.provider, config.model), ("openai", "explicit-model"))
+
     def test_bracketed_paste_preserves_multiline_unicode_as_one_submission(self) -> None:
         message = "请分析：\n```json\n{\"method\":\"eth_call\",\"params\":[]}\n```"
         encoded = encode_bracketed_paste(message)

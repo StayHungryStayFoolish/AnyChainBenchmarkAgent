@@ -12,6 +12,29 @@ from typing import Any, Iterator, Literal, Protocol
 MessageRole = Literal["system", "user", "assistant", "tool"]
 
 
+class LLMProviderError(Exception):
+    """A typed provider failure that must not be treated as user ambiguity."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider: str = "",
+        model: str = "",
+        category: str = "provider",
+        stage: str = "provider_request",
+        status_code: int = 0,
+        retriable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.provider = provider
+        self.model = model
+        self.category = category
+        self.stage = stage
+        self.status_code = status_code
+        self.retriable = retriable
+
+
 class LLMTurnTimeoutError(BaseException):
     """The shared turn deadline expired and must bypass transport retries."""
 

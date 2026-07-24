@@ -36,6 +36,7 @@ CONTEXT_FRAME = "CODEX_SIMULATOR_CONTEXT "
 DECISION_FRAME = "CODEX_SIMULATOR_DECISION "
 RESULT_FRAME = "CODEX_SIMULATOR_RESULT "
 DEFAULT_DECISION_TIMEOUT_SECONDS = 300.0
+SIMULATOR_ATTESTATION_SCHEMA_VERSION = 1
 
 
 class CodexSimulatorBridgeError(RuntimeError):
@@ -68,6 +69,215 @@ class CodexSimulatorInvalidJson(CodexSimulatorProtocolError):
 
 class CodexSimulatorStaleResponse(CodexSimulatorProtocolError):
     """The decision was bound to a different Agent response."""
+
+
+def simulator_context_binding(context: Mapping[str, Any]) -> dict[str, Any]:
+    """Project the immutable response-bound identity shared by every lane."""
+
+    schedule = context.get("schedule")
+    target = context.get("scheduled_target")
+    if isinstance(schedule, Mapping):
+        control_identity = {
+            "lane": "journey",
+            "schedule_id": str(schedule.get("schedule_id") or ""),
+        }
+    elif isinstance(target, Mapping):
+        control_identity = {
+            "lane": "edge",
+            "target_id": str(target.get("target_id") or ""),
+            "edge_key": str(target.get("edge_key") or ""),
+        }
+    else:
+        raise ValueError("simulator context has no immutable control identity")
+    binding = {
+        "session_id": str(context.get("session_id") or ""),
+        "turn_index": int(context.get("turn_index") or 0),
+        "previous_response_hash": str(
+            context.get("previous_response_hash") or ""
+        ),
+        "previous_response_received_at_ns": int(
+            context.get("previous_response_received_at_ns") or 0
+        ),
+        "control_identity": control_identity,
+        "observed_edge_keys": [
+            str(item) for item in context.get("observed_edge_keys") or ()
+        ],
+    }
+    if (
+        not binding["session_id"]
+        or binding["turn_index"] <= 0
+        or len(binding["previous_response_hash"]) != 64
+        or binding["previous_response_received_at_ns"] <= 0
+        or (
+            control_identity["lane"] == "journey"
+            and not control_identity["schedule_id"]
+        )
+        or (
+            control_identity["lane"] == "edge"
+            and not control_identity["edge_key"]
+        )
+    ):
+        raise ValueError("simulator context binding is incomplete")
+    return binding
+
+
+def simulator_context_hash(context: Mapping[str, Any]) -> str:
+    return content_hash(simulator_context_binding(context))
+
+
+def build_simulator_attestation(
+    *,
+    actor_kind: str,
+    task_id: str,
+    model: str,
+    request_id: str,
+    previous_response_hash: str,
+    context_hash: str,
+    decision_hash: str,
+    user_message_hash: str,
+    turn_index: int,
+    declared_at_ns: int,
+) -> dict[str, Any]:
+    """Build an auditable declaration, never a cryptographic identity proof."""
+
+    actor = {
+        "actor_kind": str(actor_kind).strip(),
+        "task_id": str(task_id).strip(),
+        "model": str(model).strip(),
+    }
+    if not all(actor.values()):
+        raise ValueError("simulator actor declaration requires kind, task id, and model")
+    unsigned = {
+        "schema_version": SIMULATOR_ATTESTATION_SCHEMA_VERSION,
+        "identity_strength": "auditable_declaration_only",
+        "cryptographic_identity_claimed": False,
+        "selection_mode": "response_driven",
+        "prewritten_future_turns": False,
+        "actor": actor,
+        "request_id": str(request_id).strip(),
+        "previous_response_hash": str(previous_response_hash).strip(),
+        "context_hash": str(context_hash).strip(),
+        "decision_hash": str(decision_hash).strip(),
+        "user_message_hash": str(user_message_hash).strip(),
+        "turn_index": int(turn_index),
+        "declared_at_ns": int(declared_at_ns),
+    }
+    for field in (
+        "request_id",
+        "previous_response_hash",
+        "context_hash",
+        "decision_hash",
+        "user_message_hash",
+    ):
+        if not str(unsigned[field]):
+            raise ValueError(f"simulator attestation requires {field}")
+    return {**unsigned, "attestation_id": content_hash(unsigned)}
+
+
+def validate_simulator_attestation(
+    attestation: Mapping[str, Any],
+    *,
+    previous_response_hash: str,
+    decision_hash: str,
+    request_id: str = "",
+    context_hash: str = "",
+    user_message_hash: str = "",
+    turn_index: int = 0,
+    submitted_at_ns: int = 0,
+) -> dict[str, Any]:
+    required_fields = {
+        "schema_version",
+        "identity_strength",
+        "cryptographic_identity_claimed",
+        "selection_mode",
+        "prewritten_future_turns",
+        "actor",
+        "request_id",
+        "previous_response_hash",
+        "context_hash",
+        "decision_hash",
+        "user_message_hash",
+        "turn_index",
+        "declared_at_ns",
+        "attestation_id",
+    }
+    if set(attestation) != required_fields:
+        raise ValueError("simulator attestation schema fields are invalid")
+    if attestation.get("schema_version") != SIMULATOR_ATTESTATION_SCHEMA_VERSION:
+        raise ValueError("simulator attestation schema is unsupported")
+    actor = attestation.get("actor")
+    if (
+        not isinstance(actor, Mapping)
+        or set(actor) != {"actor_kind", "task_id", "model"}
+        or not all(
+        str(actor.get(field) or "").strip()
+        for field in ("actor_kind", "task_id", "model")
+        )
+    ):
+        raise ValueError("simulator attestation actor declaration is incomplete")
+    if str(actor.get("actor_kind") or "") != "codex":
+        raise ValueError("scripted or undeclared simulator actors do not qualify")
+    expected = {
+        "identity_strength": "auditable_declaration_only",
+        "cryptographic_identity_claimed": False,
+        "selection_mode": "response_driven",
+        "prewritten_future_turns": False,
+    }
+    if any(attestation.get(key) != value for key, value in expected.items()):
+        raise ValueError("simulator attestation policy is invalid")
+    if (
+        isinstance(attestation.get("turn_index"), bool)
+        or not isinstance(attestation.get("turn_index"), int)
+        or int(attestation["turn_index"]) <= 0
+    ):
+        raise ValueError("simulator attestation turn index is invalid")
+    if not str(attestation.get("request_id") or "").strip():
+        raise ValueError("simulator attestation request identity is invalid")
+    for field in (
+        "previous_response_hash",
+        "context_hash",
+        "decision_hash",
+        "user_message_hash",
+    ):
+        value = str(attestation.get(field) or "")
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError(f"simulator attestation {field} is invalid")
+    if (
+        isinstance(attestation.get("declared_at_ns"), bool)
+        or not isinstance(attestation.get("declared_at_ns"), int)
+        or int(attestation["declared_at_ns"]) <= 0
+    ):
+        raise ValueError("simulator attestation declaration time is invalid")
+    if str(attestation.get("previous_response_hash") or "") != str(
+        previous_response_hash
+    ):
+        raise ValueError("simulator attestation is bound to a stale response")
+    if str(attestation.get("decision_hash") or "") != str(decision_hash):
+        raise ValueError("simulator attestation decision hash is stale")
+    expected_optional = {
+        "request_id": request_id,
+        "context_hash": context_hash,
+        "user_message_hash": user_message_hash,
+    }
+    for field, expected_value in expected_optional.items():
+        if expected_value and str(attestation.get(field) or "") != str(
+            expected_value
+        ):
+            raise ValueError(f"simulator attestation {field} is stale")
+    if turn_index and attestation.get("turn_index") != turn_index:
+        raise ValueError("simulator attestation turn index is stale")
+    if (
+        submitted_at_ns
+        and int(attestation.get("declared_at_ns") or 0) > submitted_at_ns
+    ):
+        raise ValueError("simulator attestation was declared after submission")
+    unsigned = {
+        key: value for key, value in attestation.items()
+        if key != "attestation_id"
+    }
+    if str(attestation.get("attestation_id") or "") != content_hash(unsigned):
+        raise ValueError("simulator attestation identity is stale")
+    return dict(attestation)
 
 
 def _input_generation_rule(contract: Mapping[str, Any]) -> str:

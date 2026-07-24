@@ -15,6 +15,7 @@ from typing import Any, Mapping, Sequence
 
 from agent.utils.redaction import redact
 from tests.agent_live.chaos_scheduler import (
+    JOURNEY_SCHEDULE_SCHEMA_VERSION,
     JourneySchedule,
     build_journey_schedule,
     journey_schedule_payload,
@@ -104,6 +105,11 @@ class StdioCodexJourneySimulator:
             "rationale": "<why this turn follows from the observed response>",
             "risk_factor_ids": [],
         }
+        if context.schedule.verifier_input_contract:
+            decision_template["variant_binding"] = {
+                "source_step_id": "<one allowed source step id>",
+                "semantic_role": "<the exact semantic role for that source step>",
+            }
         payload = {
             "schema_version": 1,
             "session_id": context.session_id,
@@ -129,6 +135,9 @@ class StdioCodexJourneySimulator:
                 "immutable_persona": context.schedule.persona,
                 "immutable_mission": context.schedule.mission,
                 "allowed_risk_factors": list(context.schedule.allowed_risk_factors),
+                "verifier_input_contract": dict(
+                    context.schedule.verifier_input_contract
+                ),
                 "output_rule": (
                     "Write exactly one decision frame followed by one JSON object."
                 ),
@@ -168,6 +177,20 @@ class StdioCodexJourneySimulator:
             mission=_required_text(decision, "mission"),
             rationale=_required_text(decision, "rationale"),
             risk_factor_ids=tuple(str(item) for item in risk_factor_ids),
+            broker_request_id=_required_text(
+                decision, "broker_request_id"
+            )
+            if decision.get("simulator_attestation")
+            else "",
+            simulator_attestation=dict(
+                decision.get("simulator_attestation") or {}
+            ),
+            variant_binding={
+                str(key): str(value)
+                for key, value in dict(
+                    decision.get("variant_binding") or {}
+                ).items()
+            },
         )
 
     def _read_decision_line(self) -> str:
@@ -250,6 +273,8 @@ def load_journey_schedule(path: Path, *, revision: Mapping[str, str]) -> Journey
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, Mapping):
         raise ValueError("Journey schedule file must contain a JSON object")
+    if payload.get("schema_version") != JOURNEY_SCHEDULE_SCHEMA_VERSION:
+        raise ValueError("Journey schedule file schema is unsupported")
     if dict(payload.get("revision") or {}) != dict(revision):
         raise ValueError("Journey schedule file revision does not match the active revision")
     schedule = build_journey_schedule(
@@ -264,6 +289,9 @@ def load_journey_schedule(path: Path, *, revision: Mapping[str, str]) -> Journey
             "max_turns": payload.get("max_turns"),
             "terminal_outcome": payload.get("terminal_outcome"),
             "forbidden_outcomes": payload.get("forbidden_outcomes") or (),
+            "verifier_input_contract": (
+                payload.get("verifier_input_contract") or {}
+            ),
         },
     )
     if payload.get("schedule_id") != schedule.schedule_id:

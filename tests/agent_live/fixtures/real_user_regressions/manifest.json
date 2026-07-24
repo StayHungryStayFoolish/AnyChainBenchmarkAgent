@@ -7,6 +7,12 @@
       "sha256": "e71dd432312eae9baab9bf7a15f1c8f0241128f74f29113aaf338caadb1827a6",
       "case_count": 15,
       "sanitized": true
+    },
+    {
+      "path": "tests/agent_live/fixtures/real_user_regressions/variant_contracts.json",
+      "sha256": "4ff3fa50288137ce0697d5c947d0813b39c3f75145a60b8b71e9b8577e046b69",
+      "case_count": 15,
+      "sanitized": true
     }
   ]
 }

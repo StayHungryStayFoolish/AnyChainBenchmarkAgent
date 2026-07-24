@@ -8,13 +8,20 @@ import re
 from typing import Any, Mapping, Sequence
 
 from ..llm.providers import provider_from_config
-from ..llm.types import LLMTurnTimeoutError, LLMMessage, LLMRequest, ensure_turn_active
+from ..llm.types import (
+    LLMMessage,
+    LLMProviderError,
+    LLMRequest,
+    LLMTurnTimeoutError,
+    ensure_turn_active,
+)
 from ..onboarding.families import SUPPORTED_FAMILIES
 from .action_registry import (
     ACTION_BY_TYPE,
     ACTION_SPECS,
     CONSULTATION_TOPIC_PURPOSES,
     CONSULTATION_TOPICS,
+    SEMANTIC_OPERATIONS,
     SEMANTIC_SUPPORT_RELATIONS,
     TRUSTED_ACTION_METADATA_FIELDS,
     answer_pending_representation_conflict,
@@ -236,7 +243,7 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
             clauses,
             (*repaired_validation.errors, *final_errors),
         )
-    except LLMTurnTimeoutError:
+    except (LLMTurnTimeoutError, LLMProviderError):
         raise
     except Exception as exc:
         return {
@@ -260,20 +267,17 @@ def adjudicate_active_pending_contract(
     tuple[int, ...],
     int,
     int,
+    str,
 ]:
     """Resolve one ambiguous active-question plan through the focused authority."""
 
     prompt = _pending_contract_adjudication_prompt()
-    original_request = _action_queue_payload(state, text)
-    focused_action_schema = [
-        row
-        for row in original_request["action_schema"]
-        if str(row.get("type") or "") in allowed_action_types
-    ]
-    original_request = {
-        **original_request,
-        "action_schema": focused_action_schema,
-    }
+    original_request = _focused_pending_request_payload(
+        state,
+        text,
+        allowed_action_types=allowed_action_types,
+    )
+    focused_action_schema = list(original_request["action_schema"])
     payload = {
         "invalid_output": _parse_json_object(invalid_candidate),
         "validation_errors": list(dict.fromkeys(str(value) for value in validation_errors)),
@@ -320,6 +324,23 @@ def adjudicate_active_pending_contract(
         )
         if focused_validation.valid:
             break
+        if _candidate_requires_global_semantic_scope(focused_candidate):
+            return (
+                None,
+                tuple(
+                    dict.fromkeys(
+                        (
+                            *focused_validation.errors,
+                            "focused pending candidate retained an independent "
+                            "unresolved semantic unit; global planning is required",
+                        )
+                    )
+                ),
+                tuple(request_sizes),
+                compiler_calls,
+                0,
+                focused_candidate,
+            )
         prior_output = _parse_json_object(focused_candidate)
         prior_errors = list(focused_validation.errors)
     if not focused_validation.valid:
@@ -329,6 +350,7 @@ def adjudicate_active_pending_contract(
             tuple(request_sizes),
             compiler_calls,
             0,
+            "",
         )
     plan, admission, admission_errors = _review_bounded_semantic_candidate(
         provider,
@@ -338,6 +360,7 @@ def adjudicate_active_pending_contract(
         clauses,
         allowed_action_types=allowed_action_types,
         whole_plan_contract_repair=True,
+        compact_pending_review=True,
     )
     admission_calls = 0
     if admission is not None:
@@ -360,6 +383,7 @@ def adjudicate_active_pending_contract(
             tuple(request_sizes),
             compiler_calls,
             admission_calls,
+            "",
         )
     try:
         result = _admitted_action_queue(plan, admission, state)
@@ -370,8 +394,70 @@ def adjudicate_active_pending_contract(
             tuple(request_sizes),
             compiler_calls,
             admission_calls,
+            "",
         )
-    return result, (), tuple(request_sizes), compiler_calls, admission_calls
+    return result, (), tuple(request_sizes), compiler_calls, admission_calls, ""
+
+
+def _candidate_requires_global_semantic_scope(candidate: str) -> bool:
+    """Return whether a scoped pending candidate preserved independent work."""
+
+    document = _parse_json_object(candidate)
+    actions = document.get("actions")
+    semantic_units = document.get("semantic_units")
+    if not isinstance(actions, list) or not actions:
+        return False
+    if not isinstance(semantic_units, list):
+        return False
+    return any(
+        isinstance(unit, Mapping)
+        and str(unit.get("disposition") or "") == "unresolved"
+        and bool(str(unit.get("source_text") or "").strip())
+        for unit in semantic_units
+    )
+
+
+def _focused_pending_request_payload(
+    state: AgentGraphState,
+    text: str,
+    *,
+    allowed_action_types: frozenset[str],
+) -> dict[str, Any]:
+    """Project only the immutable state needed to adjudicate one active question."""
+
+    payload = _action_queue_payload(state, text)
+    pending = dict(state.get("pending_question") or {})
+    pending_group = str(pending.get("group") or "")
+    return {
+        **payload,
+        "action_schema": [
+            row for row in payload["action_schema"]
+            if str(row.get("type") or "") in allowed_action_types
+        ],
+        "group_schema": [
+            row for row in payload["group_schema"]
+            if str(row.get("name") or "") == pending_group
+        ],
+        "routing_groups": [
+            {
+                "name": str(row.get("name") or ""),
+                "owner": str(row.get("owner") or ""),
+                "fields": [
+                    str(value) for value in row.get("fields") or ()
+                ],
+                "category": str(row.get("category") or ""),
+            }
+            for row in payload["group_schema"]
+        ],
+        "universal_operations": sorted(SEMANTIC_OPERATIONS),
+        "workflow_state": {
+            "active_group": str(state.get("active_group") or ""),
+            "language": str(state.get("language") or ""),
+            "target_mode": str(state.get("target_mode") or ""),
+            "workflow_mode": str(state.get("workflow_mode") or ""),
+            "pending_question": pending,
+        },
+    }
 
 
 def _compile_semantic_candidate(
@@ -1154,6 +1240,7 @@ def _review_bounded_semantic_candidate(
     *,
     allowed_action_types: frozenset[str] | None = None,
     whole_plan_contract_repair: bool = False,
+    compact_pending_review: bool = False,
 ) -> tuple[ImmutableSemanticPlan | None, WholePlanAdmission | None, tuple[str, ...]]:
     if not validation.valid:
         return None, None, tuple(validation.errors)
@@ -1163,6 +1250,7 @@ def _review_bounded_semantic_candidate(
             state,
             clauses,
             allowed_action_types=allowed_action_types,
+            compact_pending_review=compact_pending_review,
         )
     except ValueError as exc:
         return None, None, (str(exc),)
@@ -1287,6 +1375,7 @@ def _freeze_bounded_semantic_plan(
     clauses: tuple[TurnClause, ...],
     *,
     allowed_action_types: frozenset[str] | None = None,
+    compact_pending_review: bool = False,
 ) -> ImmutableSemanticPlan:
     payload = _parse_json_object(text)
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
@@ -1422,6 +1511,21 @@ def _freeze_bounded_semantic_plan(
         for index, unit in enumerate(units)
         if isinstance(unit, dict)
     ]
+    review_workflow_state = workflow_snapshot(state)
+    review_group_schema = group_schema()
+    if compact_pending_review:
+        pending_group = str(pending.get("group") or "")
+        review_workflow_state = {
+            "active_group": str(state.get("active_group") or ""),
+            "language": str(state.get("language") or ""),
+            "target_mode": str(state.get("target_mode") or ""),
+            "workflow_mode": str(state.get("workflow_mode") or ""),
+            "pending_question": pending,
+        }
+        review_group_schema = [
+            row for row in group_schema()
+            if str(row.get("name") or "") == pending_group
+        ]
     return freeze_semantic_plan(
         payload,
         action_records=action_records,
@@ -1433,9 +1537,9 @@ def _freeze_bounded_semantic_plan(
             },
             "pending_question": state.get("pending_question") or {},
             "turn_pending_value_candidates": turn_pending_value_candidates,
-            "workflow_state": workflow_snapshot(state),
+            "workflow_state": review_workflow_state,
             "action_schema": action_schema(action_types=allowed_action_types),
-            "group_schema": group_schema(),
+            "group_schema": review_group_schema,
             "semantic_scope_schema": semantic_scope_schema(),
         },
     )
@@ -2986,7 +3090,8 @@ def _pending_contract_adjudication_prompt() -> str:
         "action_schema row. Never place action arguments inside an arguments object or another "
         "nested action envelope. This is the only focused adjudication. "
         "Read original_request.user_text, clauses, workflow_state.pending_question, "
-        "pending_typed_candidates, action_schema, invalid_output, and validation_errors. "
+        "pending_typed_candidates, action_schema, routing_groups, invalid_output, and "
+        "validation_errors. "
         "Decide only whether the source semantically answers the active typed question, while preserving "
         "every independent consultation, mutation, navigation, or evidence demand already present. "
         "For a declared option, emit answer_pending with selected_value exactly equal to that option's "
@@ -3007,6 +3112,13 @@ def _pending_contract_adjudication_prompt() -> str:
         "contains an independent consultation. "
         "A question, contradiction, different selection, concrete sibling value, navigation request, or "
         "other operation is not a reason and must retain its own typed owner. "
+        "When an independent unit is outside the supplied focused action_schema, keep disposition "
+        "'unresolved', set operation to one supplied universal_operations value, and add owner_routes "
+        "using only exact {owner,group} pairs from routing_groups. "
+        "Routes classify the independent unit for the global Harness; they do not authorize or invent "
+        "an action. If no exact route is justified, omit owner_routes so the Harness fails closed and "
+        "runs full global partitioning. Units mapped to the pending action and context units must not "
+        "declare owner_routes. "
         + PENDING_CANDIDATE_SEMANTIC_POLICY
         + "pending_typed_candidates are deterministic syntax candidates, not intent decisions. When exactly "
         "one candidate exists and the user's clauses present that candidate as the answer to the active manual "
@@ -3043,7 +3155,9 @@ def _pending_contract_adjudication_prompt() -> str:
         "invalid_output. "
         "Return semantic_units covering every clause. Each row must be "
         "{unit_id, clause_id, source_text, disposition:'action'|'context'|'unresolved', "
-        "action_indexes:[zero-based indexes], reason}. Copy clause_id and exact source_text from the "
+        "action_indexes:[zero-based indexes], reason, optional operation, optional "
+        "owner_routes:[{owner,group}]}. "
+        "Copy clause_id and exact source_text from the "
         "authoritative clauses; never omit either field. Structured clauses remain atomic. Each action "
         "source_evidence must be an exact excerpt of one mapped source unit. "
         "Use only declared action types and arguments. If the source does not answer the pending contract, "
@@ -3142,7 +3256,7 @@ def resolve_unknown_chain_identity(state: AgentGraphState, chain_text: str) -> d
             )
         )
         payload = _parse_json_object(response.text)
-    except LLMTurnTimeoutError:
+    except (LLMTurnTimeoutError, LLMProviderError):
         raise
     except Exception as exc:
         payload = {"chain_exists": None, "reason": f"chain identity resolver failed: {type(exc).__name__}", "confidence": "low"}
@@ -3156,7 +3270,7 @@ def extract_chain_mention(state: AgentGraphState, text: str) -> dict[str, Any]:
     try:
         provider = provider_from_config()
         payload = _extract_chain_mention_with_provider(provider, state, text)
-    except LLMTurnTimeoutError:
+    except (LLMTurnTimeoutError, LLMProviderError):
         raise
     except Exception as exc:
         payload = {"found": False, "reason": f"chain mention extraction failed: {type(exc).__name__}", "confidence": "low"}
@@ -3216,7 +3330,7 @@ def extract_rpc_schema_from_evidence(state: AgentGraphState, evidence: str, *, m
             )
         )
         payload = _parse_json_object(response.text)
-    except LLMTurnTimeoutError:
+    except (LLMTurnTimeoutError, LLMProviderError):
         raise
     except Exception as exc:
         payload = {"status": "failed", "reason": f"schema extraction failed: {type(exc).__name__}", "confidence": "low"}
@@ -3281,7 +3395,7 @@ def analyze_evidence_with_model(state: AgentGraphState, evidence: str, user_ques
         answer = str(response.text or "").strip()
         if answer:
             return answer
-    except LLMTurnTimeoutError:
+    except (LLMTurnTimeoutError, LLMProviderError):
         raise
     except Exception as exc:
         error_type = type(exc).__name__

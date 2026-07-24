@@ -43,13 +43,18 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
         import types
 
         from agent.terminal import repl as repl_mod
-        from agent.terminal.io import OutputOnlyIO
         from agent.terminal.repl import AnyChainTerminal, TerminalSession
+
+        messages: list[str] = []
+
+        class RecordingIO:
+            def agent(self, _language: str, message: str) -> None:
+                messages.append(message)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             app = AnyChainTerminal(
                 state=TerminalSession(language="en"),
-                io=OutputOnlyIO(),
+                io=RecordingIO(),
                 session_id="dep-thread",
                 checkpoint_path=Path(tmpdir) / "cp.sqlite",
                 session_purpose="chaos",
@@ -62,7 +67,15 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
 
             with patch.object(
                 repl_mod, "adk_status", return_value=types.SimpleNamespace(as_dict=lambda: {"available": True, "reason": "t"})
-            ), patch.object(repl_mod, "provider_runtime_errors", return_value=[]):
+            ), patch.object(
+                repl_mod,
+                "provider_runtime_errors",
+                return_value=[],
+            ), patch.object(
+                repl_mod,
+                "probe_provider_readiness",
+                return_value=None,
+            ):
                 app.startup()
                 # The offer must survive startup, not be clobbered.
                 self.assertEqual(app.state.current_question_id, "install_dependencies")
@@ -88,6 +101,60 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
 
         with patch.object(providers.importlib.util, "find_spec", side_effect=find_spec):
             self.assertEqual(providers.provider_runtime_errors(config), [])
+
+    def test_startup_blocks_natural_language_when_provider_probe_fails(self) -> None:
+        import types
+
+        from agent.llm.types import LLMProviderError
+        from agent.terminal import repl as repl_mod
+        from agent.terminal.repl import AnyChainTerminal, TerminalSession
+
+        messages: list[str] = []
+
+        class RecordingIO:
+            def agent(self, _language: str, message: str) -> None:
+                messages.append(message)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = AnyChainTerminal(
+                state=TerminalSession(language="en"),
+                io=RecordingIO(),
+                session_id="provider-failure",
+                checkpoint_path=Path(tmpdir) / "cp.sqlite",
+                session_purpose="chaos",
+            )
+            app._load_framework_context = lambda: None  # type: ignore[method-assign]
+            app._startup_doctor = lambda: None  # type: ignore[method-assign]
+            with patch.object(
+                repl_mod,
+                "adk_status",
+                return_value=types.SimpleNamespace(
+                    as_dict=lambda: {"available": True, "reason": "ready"}
+                ),
+            ), patch.object(
+                repl_mod,
+                "provider_runtime_errors",
+                return_value=[],
+            ), patch.object(
+                repl_mod,
+                "probe_provider_readiness",
+                return_value=LLMProviderError(
+                    "unsupported model",
+                    provider="deepseek",
+                    model="invalid-model",
+                    category="configuration",
+                    status_code=400,
+                ),
+            ):
+                app.startup()
+
+            self.assertFalse(app._llm_runtime_available)
+            app.handle_user_text("start a benchmark")
+
+        output = "\n".join(messages)
+        self.assertIn("deepseek/invalid-model", output)
+        self.assertIn("HTTP 400", output)
+        self.assertNotEqual(app.state.current_question_id, "install_agent_runtime")
 
     def test_logs_command_reports_clean_error_for_missing_job(self) -> None:
         """`logs <bad-id>` must emit a clean "job not found" message, not a raw

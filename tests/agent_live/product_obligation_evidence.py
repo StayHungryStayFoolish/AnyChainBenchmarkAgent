@@ -14,6 +14,9 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from tests.agent_live.coverage_evidence import content_hash
+from tests.agent_live.container_process_guard import (
+    validate_cleanup_receipt_artifact,
+)
 
 
 PRODUCT_OBLIGATION_EVIDENCE_SCHEMA_VERSION = 1
@@ -199,11 +202,20 @@ def _validate_evidence_document(
     if outcome not in EVIDENCE_OUTCOMES:
         raise ValueError(f"invalid evidence outcome: {obligation_id}")
     _validate_execution(document.get("execution"), obligation_id)
-    artifact_hashes = _validate_artifacts(
+    artifacts = _validate_artifacts(
         document.get("artifacts"),
         evidence_path=evidence_path,
         obligation_id=obligation_id,
     )
+    artifact_hashes = {
+        str(item["sha256"]) for item in artifacts.values()
+    }
+    if document.get("outcome") == "passed" and _is_g4_obligation(obligation):
+        _validate_g4_runtime_provenance(
+            document=document,
+            obligation=obligation,
+            artifacts=artifacts,
+        )
     _validate_verifier_results(
         document.get("verifier_results"),
         obligation=obligation,
@@ -246,7 +258,7 @@ def _validate_artifacts(
     *,
     evidence_path: Path,
     obligation_id: str,
-) -> set[str]:
+) -> dict[str, dict[str, Any]]:
     if (
         not isinstance(value, Sequence)
         or isinstance(value, (str, bytes))
@@ -256,6 +268,7 @@ def _validate_artifacts(
     roles: set[str] = set()
     paths: set[Path] = set()
     hashes: set[str] = set()
+    records: dict[str, dict[str, Any]] = {}
     for raw in value:
         if not isinstance(raw, Mapping) or set(raw) != _ARTIFACT_FIELDS:
             raise ValueError(f"runtime artifact contract is invalid: {obligation_id}")
@@ -279,13 +292,102 @@ def _validate_artifacts(
         if _sha256_file(path) != recorded_hash:
             raise ValueError(f"runtime artifact hash mismatch: {path}")
         hashes.add(recorded_hash)
+        records[role] = {
+            "path": path,
+            "sha256": recorded_hash,
+        }
     missing_roles = REQUIRED_ARTIFACT_ROLES - roles
     if missing_roles:
         raise ValueError(
             f"required runtime artifacts are missing for {obligation_id}: "
             + ", ".join(sorted(missing_roles))
         )
-    return hashes
+    return records
+
+
+def _is_g4_obligation(obligation: Mapping[str, Any]) -> bool:
+    return (
+        isinstance(obligation.get("model"), Mapping)
+        and isinstance(obligation.get("factors"), Mapping)
+        and isinstance(obligation.get("start_contract"), Mapping)
+    )
+
+
+def _validate_g4_runtime_provenance(
+    *,
+    document: Mapping[str, Any],
+    obligation: Mapping[str, Any],
+    artifacts: Mapping[str, Mapping[str, Any]],
+) -> None:
+    obligation_id = str(obligation["obligation_id"])
+    required_roles = {
+        "journey_evidence",
+        "journey_result",
+        "journey_schedule",
+        "process_guard_receipt",
+    }
+    missing = required_roles - set(artifacts)
+    if missing:
+        raise ValueError(
+            f"required G4 runtime provenance is missing for {obligation_id}: "
+            + ", ".join(sorted(missing))
+        )
+    journey_path = Path(artifacts["journey_evidence"]["path"])
+    try:
+        journey = json.loads(journey_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"G4 Journey evidence is invalid: {obligation_id}"
+        ) from exc
+    execution = dict(document["execution"])
+    proof = journey.get("execution_proof") if isinstance(journey, Mapping) else None
+    if (
+        not isinstance(journey, Mapping)
+        or journey.get("artifact_type") != "dynamic_dual_ai_journey_evidence"
+        or journey.get("journey_id") != obligation_id
+        or journey.get("revision") != document.get("revision_binding")
+        or journey.get("terminal_classification") != "passed"
+        or journey.get("qualifying_evidence") is not True
+        or journey.get("qualification_reason")
+        != "trusted_container_pty_execution"
+        or journey.get("execution_id") != execution.get("execution_id")
+        or journey.get("provider") != execution.get("provider")
+        or journey.get("model") != execution.get("model")
+        or not isinstance(proof, Mapping)
+    ):
+        raise ValueError(
+            f"G4 Journey provenance does not match product evidence: {obligation_id}"
+        )
+    receipt_path = Path(artifacts["process_guard_receipt"]["path"]).resolve()
+    transcript_root = Path(artifacts["transcript"]["path"]).resolve().parent
+    expected_receipt_root = transcript_root / "container-cleanup-receipts"
+    if (
+        receipt_path.parent != expected_receipt_root
+        or Path(str(proof.get("path") or "")).resolve() != receipt_path
+        or proof.get("sha256")
+        != artifacts["process_guard_receipt"]["sha256"]
+    ):
+        raise ValueError(
+            f"G4 process proof is outside its runtime or artifact binding: {obligation_id}"
+        )
+    validated = validate_cleanup_receipt_artifact(
+        receipt_path,
+        execution_id=str(execution["execution_id"]),
+        required_roles=(
+            "container_bridge",
+            "agent_process_group_leader",
+        ),
+        allowed_roots=(expected_receipt_root,),
+    )
+    expected_proof = {
+        "proof_type": "container_pty_process_guard",
+        "transport_kind": "container_pty_bridge",
+        **validated,
+    }
+    if dict(proof) != expected_proof:
+        raise ValueError(
+            f"G4 process proof differs from its receipt: {obligation_id}"
+        )
 
 
 def _validate_verifier_results(

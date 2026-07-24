@@ -1,0 +1,938 @@
+"""Unit tests for shared retained-regression semantic predicates."""
+
+from __future__ import annotations
+
+from dataclasses import replace
+import hashlib
+import json
+from types import SimpleNamespace
+import unittest
+
+from agent.harness.domains.rpc_receipts import evidence_hash
+from agent.harness.domains.analysis_receipts import analysis_hash
+from tests.agent_live.coverage_evidence import RuntimeTurnEvent, content_hash
+from tests.agent_live.retained_regression_attestations import (
+    build_source_contract,
+    build_variant_attestation,
+    build_variant_contract,
+)
+from tests.agent_live.retained_regression_obligations import (
+    KNOWN_POSTCONDITION_IDS,
+)
+from tests.agent_live.retained_regression_predicates import (
+    POSTCONDITION_EVALUATORS,
+    UNSUPPORTED_WITHOUT_IMMUTABLE_VARIANT_CONTRACT,
+)
+
+
+HASH = "a" * 64
+
+
+def _hashed(body: dict) -> dict:
+    return {**body, "receipt_id": content_hash(body)}
+
+
+def _event(
+    *receipts: dict,
+    turn_index: int = 1,
+    pending_transition: dict | None = None,
+    turn_receipt: dict | None = None,
+    material_diffs: dict | None = None,
+    execution: dict | None = None,
+) -> RuntimeTurnEvent:
+    transition = pending_transition or {
+        "transition": "absent",
+        "before_id": "",
+        "before_group": "",
+        "before_hash": "1" * 64,
+        "after_id": "",
+        "after_group": "",
+        "after_hash": "2" * 64,
+        "consumer_action_ids": [],
+    }
+    return RuntimeTurnEvent(
+        schema_version=3,
+        event_type="turn_committed",
+        thread_id="predicate-test",
+        session_purpose="test",
+        before_fingerprint="3" * 64,
+        after_fingerprint="4" * 64,
+        turn_index=turn_index,
+        active_group="test_group",
+        pending_question_id=str(transition.get("after_id") or ""),
+        action_queue_types=(),
+        revision={"commit": "test", "worktree_hash": "5" * 64},
+        turn_receipt_summary=turn_receipt or {},
+        pending_transition=transition,
+        control_receipts=tuple(receipts),
+        material_state_diff_hashes=material_diffs or {},
+        execution_receipt_summary=execution or {},
+    )
+
+
+def _context(*events: RuntimeTurnEvent, **values) -> SimpleNamespace:
+    return SimpleNamespace(
+        completed_events=events,
+        completed_turns=tuple(values.get("turns") or ()),
+        completed_decisions=tuple(values.get("decisions") or ()),
+        verifier_input_contract=values.get("verifier_input_contract") or {},
+    )
+
+
+def _verifier_input(
+    variant: str,
+    messages: tuple[str, ...],
+    *,
+    semantic_roles: tuple[str, ...] | None = None,
+) -> dict:
+    roles = semantic_roles or tuple("source_intent" for _ in messages)
+    source = build_source_contract({
+        "case_id": "contract-test",
+        "source_turns_hash": content_hash(messages),
+        "source_steps": [
+            {
+                "step_id": f"source-{index}",
+                "turn_index": index,
+                "semantic_role": role,
+            }
+            for index, role in enumerate(roles, start=1)
+        ],
+    })
+    declarations = {
+        "exact": ("exact_fixture", 0),
+        "isomorphic": ("isomorphic_meaning", 1),
+        "negative": ("adjacent_non_trigger", 1),
+        "neighboring": ("neighboring_transition", 1),
+    }
+    relation, minimum = declarations[variant]
+    variant_contract = build_variant_contract(
+        variant=variant,
+        source_contract=source,
+        declaration={
+            "relation": relation,
+            "minimum_attestations": minimum,
+        },
+    )
+    modes = {
+        "exact": "exact_fixture_replay",
+        "isomorphic": "response_driven_isomorphic",
+        "negative": "response_driven_negative",
+        "neighboring": "response_driven_neighboring",
+    }
+    return {
+        "mode": modes[variant],
+        "source_contract": source,
+        "source_contract_hash": content_hash(source),
+        "variant_contract": variant_contract,
+        "variant_contract_hash": content_hash(variant_contract),
+    }
+
+
+def _turn_and_decision(
+    message: str,
+    *,
+    turn_index: int = 1,
+) -> tuple[SimpleNamespace, SimpleNamespace]:
+    previous = "complete response"
+    turn = SimpleNamespace(
+        turn_index=turn_index,
+        previous_agent_response=previous,
+        user_message=message,
+    )
+    decision = SimpleNamespace(
+        turn_index=turn_index,
+        previous_response_hash=content_hash(previous),
+        user_message_hash=content_hash(message),
+        selected_at_ns=10,
+        submitted_at_ns=20,
+        execution_id="execution-1",
+        obligation_id="obligation-1",
+        broker_request_id=f"request-{turn_index}",
+        simulator_context_binding={
+            "session_id": "session-1",
+            "control_identity": {
+                "lane": "journey",
+                "schedule_id": "schedule-1",
+            },
+        },
+        simulator_attestation={
+            "attestation_id": f"simulator-{turn_index}",
+            "actor": {
+                "actor_kind": "codex",
+                "task_id": "task-1",
+                "model": "gpt-5",
+            },
+        },
+        variant_attestation={},
+    )
+    return turn, decision
+
+
+def _execution_binding(decision: SimpleNamespace) -> dict[str, str]:
+    return {
+        "execution_id": decision.execution_id,
+        "session_id": decision.simulator_context_binding["session_id"],
+        "schedule_id": decision.simulator_context_binding[
+            "control_identity"
+        ]["schedule_id"],
+        "obligation_id": decision.obligation_id,
+        "broker_request_id": decision.broker_request_id,
+        "simulator_attestation_id": decision.simulator_attestation[
+            "attestation_id"
+        ],
+    }
+
+
+def _with_attestation(
+    decision: SimpleNamespace,
+    attestation: dict,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        **{
+            **vars(decision),
+            "variant_attestation": attestation,
+        }
+    )
+
+
+def _pending_receipt(**updates) -> dict:
+    body = {
+        "receipt_type": "pending_resolution",
+        "turn_index": 1,
+        "pending_id": "NETWORK_INTERFACE",
+        "pending_group": "network",
+        "pending_contract_hash": "1" * 64,
+        "resolution_path": "exact_contract",
+        "selected_option_id": "use-detected",
+        "selected_value_hash": "2" * 64,
+        "resolved_action_id": "action-1",
+        "input_hash": "3" * 64,
+        "normalizer": "exact_contract",
+        "verdict": "accepted",
+    }
+    body.update(updates)
+    return _hashed(body)
+
+
+def _workload_receipt(**updates) -> dict:
+    methods = ["eth_accounts"]
+    body = {
+        "receipt_type": "rpc_workload_commit",
+        "receipt_version": 1,
+        "turn_index": 1,
+        "owner": "rpc_workload",
+        "case": "custom_rpc",
+        "rpc_mode": "single",
+        "choice": "custom",
+        "methods": methods,
+        "method_hashes": [evidence_hash(method) for method in methods],
+        "mixed_weight_entries": [],
+        "replace_defaults": True,
+        "job_local_override": True,
+        "catalog_revision": 1,
+        "fixture_required": True,
+        "fixture_status": "recorded",
+    }
+    body.update(updates)
+    return {**body, "receipt_id": evidence_hash(body)}
+
+
+class RetainedRegressionPredicatesTest(unittest.TestCase):
+    def test_mapping_covers_known_ids_and_implements_variant_claims(
+        self,
+    ) -> None:
+        self.assertGreaterEqual(len(POSTCONDITION_EVALUATORS), 50)
+        self.assertLessEqual(
+            set(POSTCONDITION_EVALUATORS),
+            set(KNOWN_POSTCONDITION_IDS),
+        )
+        self.assertEqual(
+            UNSUPPORTED_WITHOUT_IMMUTABLE_VARIANT_CONTRACT,
+            frozenset(),
+        )
+        self.assertTrue(
+            {
+                "exact_fixture_turns_observed",
+                "isomorphic_meaning_attested",
+                "adjacent_non_trigger_attested",
+                "neighboring_transition_attested",
+                "environment_text_consumed_as_region",
+            }.issubset(POSTCONDITION_EVALUATORS)
+        )
+
+    def test_exact_fixture_hash_rejects_reordered_or_duplicate_turns(self) -> None:
+        messages = ("first", "second")
+        contract = _verifier_input("exact", messages)
+        turns = tuple(_turn_and_decision(message, turn_index=index)[0]
+                      for index, message in enumerate(messages, start=1))
+        satisfied, details = POSTCONDITION_EVALUATORS[
+            "exact_fixture_turns_observed"
+        ](_context(turns=turns, verifier_input_contract=contract))
+        self.assertTrue(satisfied, details)
+
+        reordered = tuple(reversed(turns))
+        satisfied, _ = POSTCONDITION_EVALUATORS[
+            "exact_fixture_turns_observed"
+        ](_context(turns=reordered, verifier_input_contract=contract))
+        self.assertFalse(satisfied)
+        satisfied, _ = POSTCONDITION_EVALUATORS[
+            "exact_fixture_turns_observed"
+        ](_context(
+            turns=(*turns, turns[-1]),
+            verifier_input_contract=contract,
+        ))
+        self.assertFalse(satisfied)
+
+    def test_open_variant_attestations_are_contract_and_response_bound(
+        self,
+    ) -> None:
+        predicate_by_variant = {
+            "isomorphic": "isomorphic_meaning_attested",
+            "negative": "adjacent_non_trigger_attested",
+            "neighboring": "neighboring_transition_attested",
+        }
+        for variant, predicate_id in predicate_by_variant.items():
+            with self.subTest(variant=variant):
+                contract = _verifier_input(variant, ("source",))
+                turn, decision = _turn_and_decision("selected")
+                attestation = build_variant_attestation(
+                    actor={
+                        "actor_kind": "codex",
+                        "task_id": "task-1",
+                        "model": "gpt-5",
+                    },
+                    verifier_input_contract=contract,
+                    execution_binding=_execution_binding(decision),
+                    source_step_id="source-1",
+                    semantic_role="source_intent",
+                    turn_index=1,
+                    previous_response_hash=decision.previous_response_hash,
+                    user_message_hash=decision.user_message_hash,
+                    selected_at_ns=10,
+                    declared_at_ns=15,
+                )
+                context = _context(
+                    turns=(turn,),
+                    decisions=(_with_attestation(decision, attestation),),
+                    verifier_input_contract=contract,
+                )
+                satisfied, details = POSTCONDITION_EVALUATORS[
+                    predicate_id
+                ](context)
+                self.assertTrue(satisfied, details)
+
+                stale = dict(attestation)
+                stale["user_message_hash"] = "0" * 64
+                stale["attestation_id"] = content_hash({
+                    key: value for key, value in stale.items()
+                    if key != "attestation_id"
+                })
+                satisfied, details = POSTCONDITION_EVALUATORS[
+                    predicate_id
+                ](_context(
+                    turns=(turn,),
+                    decisions=(_with_attestation(decision, stale),),
+                    verifier_input_contract=contract,
+                ))
+                self.assertFalse(satisfied)
+                self.assertTrue(details["invalid_attestations"])
+
+                cross_execution = dict(attestation)
+                cross_execution["execution_binding"] = {
+                    **cross_execution["execution_binding"],
+                    "execution_id": "other-execution",
+                }
+                cross_execution["attestation_id"] = content_hash({
+                    key: value
+                    for key, value in cross_execution.items()
+                    if key != "attestation_id"
+                })
+                satisfied, details = POSTCONDITION_EVALUATORS[
+                    predicate_id
+                ](_context(
+                    turns=(turn,),
+                    decisions=(
+                        _with_attestation(
+                            decision,
+                            cross_execution,
+                        ),
+                    ),
+                    verifier_input_contract=contract,
+                ))
+                self.assertFalse(satisfied)
+                self.assertTrue(details["invalid_attestations"])
+
+    def test_neighboring_attestation_rejects_missing_duplicate_and_role_drift(
+        self,
+    ) -> None:
+        contract = _verifier_input(
+            "neighboring",
+            ("source-a", "source-b"),
+            semantic_roles=("source_intent", "chain_change_request"),
+        )
+        first_turn, first_decision = _turn_and_decision("selected-a")
+        second_turn, second_decision = _turn_and_decision(
+            "selected-b",
+            turn_index=2,
+        )
+
+        def attestation(
+            *,
+            step_id: str,
+            role: str,
+            turn: SimpleNamespace,
+            decision: SimpleNamespace,
+        ) -> dict:
+            return build_variant_attestation(
+                actor={
+                    "actor_kind": "codex",
+                    "task_id": "task-1",
+                    "model": "gpt-5",
+                },
+                verifier_input_contract=contract,
+                execution_binding=_execution_binding(decision),
+                source_step_id=step_id,
+                semantic_role=role,
+                turn_index=turn.turn_index,
+                previous_response_hash=decision.previous_response_hash,
+                user_message_hash=decision.user_message_hash,
+                selected_at_ns=10,
+                declared_at_ns=15,
+            )
+
+        first = attestation(
+            step_id="source-1",
+            role="source_intent",
+            turn=first_turn,
+            decision=first_decision,
+        )
+        second = attestation(
+            step_id="source-2",
+            role="chain_change_request",
+            turn=second_turn,
+            decision=second_decision,
+        )
+        predicate = POSTCONDITION_EVALUATORS[
+            "neighboring_transition_attested"
+        ]
+        satisfied, details = predicate(_context(
+            turns=(first_turn, second_turn),
+            decisions=(
+                _with_attestation(first_decision, first),
+                _with_attestation(second_decision, second),
+            ),
+            verifier_input_contract=contract,
+        ))
+        self.assertTrue(satisfied, details)
+
+        satisfied, details = predicate(_context(
+            turns=(first_turn, second_turn),
+            decisions=(
+                _with_attestation(first_decision, first),
+                second_decision,
+            ),
+            verifier_input_contract=contract,
+        ))
+        self.assertFalse(satisfied)
+        self.assertEqual(details["missing_source_step_ids"], ["source-2"])
+
+        duplicate = attestation(
+            step_id="source-1",
+            role="source_intent",
+            turn=second_turn,
+            decision=second_decision,
+        )
+        satisfied, details = predicate(_context(
+            turns=(first_turn, second_turn),
+            decisions=(
+                _with_attestation(first_decision, first),
+                _with_attestation(second_decision, duplicate),
+            ),
+            verifier_input_contract=contract,
+        ))
+        self.assertFalse(satisfied)
+        self.assertEqual(details["duplicate_source_step_ids"], ["source-1"])
+
+        wrong_role = dict(second)
+        wrong_role["semantic_role"] = "source_intent"
+        wrong_role["attestation_id"] = content_hash({
+            key: value for key, value in wrong_role.items()
+            if key != "attestation_id"
+        })
+        satisfied, details = predicate(_context(
+            turns=(first_turn, second_turn),
+            decisions=(
+                _with_attestation(first_decision, first),
+                _with_attestation(second_decision, wrong_role),
+            ),
+            verifier_input_contract=contract,
+        ))
+        self.assertFalse(satisfied)
+        self.assertTrue(details["invalid_attestations"])
+
+        wrong_relation = dict(second)
+        wrong_relation["relation"] = "adjacent_non_trigger"
+        wrong_relation["attestation_id"] = content_hash({
+            key: value for key, value in wrong_relation.items()
+            if key != "attestation_id"
+        })
+        satisfied, details = predicate(_context(
+            turns=(first_turn, second_turn),
+            decisions=(
+                _with_attestation(first_decision, first),
+                _with_attestation(second_decision, wrong_relation),
+            ),
+            verifier_input_contract=contract,
+        ))
+        self.assertFalse(satisfied)
+        self.assertTrue(details["invalid_attestations"])
+
+        wrong_actor = dict(second)
+        wrong_actor["actor"] = {
+            **second["actor"],
+            "actor_kind": "script",
+        }
+        wrong_actor["attestation_id"] = content_hash({
+            key: value for key, value in wrong_actor.items()
+            if key != "attestation_id"
+        })
+        stale_hash = dict(second)
+        stale_hash["variant_contract_hash"] = "0" * 64
+        stale_hash["attestation_id"] = content_hash({
+            key: value for key, value in stale_hash.items()
+            if key != "attestation_id"
+        })
+        for invalid_attestation in (wrong_actor, stale_hash):
+            satisfied, details = predicate(_context(
+                turns=(first_turn, second_turn),
+                decisions=(
+                    _with_attestation(first_decision, first),
+                    _with_attestation(second_decision, invalid_attestation),
+                ),
+                verifier_input_contract=contract,
+            ))
+            self.assertFalse(satisfied)
+            self.assertTrue(details["invalid_attestations"])
+
+    def test_environment_region_violation_requires_independent_semantic_binding(
+        self,
+    ) -> None:
+        message = "selected chain-change intent"
+        contract = _verifier_input(
+            "isomorphic",
+            ("source",),
+            semantic_roles=("chain_change_request",),
+        )
+        turn, decision = _turn_and_decision(message)
+        attestation = build_variant_attestation(
+            actor={
+                "actor_kind": "codex",
+                "task_id": "task-1",
+                "model": "gpt-5",
+            },
+            verifier_input_contract=contract,
+            execution_binding=_execution_binding(decision),
+            source_step_id="source-1",
+            semantic_role="chain_change_request",
+            turn_index=1,
+            previous_response_hash=decision.previous_response_hash,
+            user_message_hash=decision.user_message_hash,
+            selected_at_ns=10,
+            declared_at_ns=15,
+        )
+        action_id = "action-1"
+        receipt = _pending_receipt(
+            pending_id="CLOUD_REGION",
+            pending_group="provider_deployment",
+            resolution_path="typed_manual_value",
+            selected_option_id="",
+            selected_value_hash="2" * 64,
+            resolved_action_id=action_id,
+            input_hash=hashlib.sha256(message.encode("utf-8")).hexdigest(),
+            normalizer="declared_value_type",
+        )
+        transition = {
+            "transition": "consumed",
+            "before_id": "CLOUD_REGION",
+            "before_group": "provider_deployment",
+            "before_hash": "1" * 64,
+            "after_id": "",
+            "after_group": "",
+            "after_hash": "2" * 64,
+            "consumer_action_ids": [action_id],
+        }
+        event = _event(
+            receipt,
+            pending_transition=transition,
+            turn_receipt={"admitted_action_ids": [action_id]},
+        )
+        context = _context(
+            event,
+            turns=(turn,),
+            decisions=(_with_attestation(decision, attestation),),
+            verifier_input_contract=contract,
+        )
+        observed, details = POSTCONDITION_EVALUATORS[
+            "environment_text_consumed_as_region"
+        ](context)
+        self.assertTrue(observed, details)
+
+        unrelated_contract = _verifier_input("isomorphic", ("source",))
+        observed, _ = POSTCONDITION_EVALUATORS[
+            "environment_text_consumed_as_region"
+        ](_context(
+            event,
+            turns=(turn,),
+            decisions=(decision,),
+            verifier_input_contract=unrelated_contract,
+        ))
+        self.assertFalse(observed)
+
+    def test_pending_evaluator_accepts_valid_receipt_and_rejects_rehashed_bad_semantics(
+        self,
+    ) -> None:
+        valid = _pending_receipt()
+        transition = {
+            "transition": "consumed",
+            "before_id": "NETWORK_INTERFACE",
+            "before_group": "network",
+            "before_hash": "1" * 64,
+            "after_id": "",
+            "after_group": "",
+            "after_hash": "2" * 64,
+            "consumer_action_ids": ["action-1"],
+        }
+        event = _event(
+            valid,
+            pending_transition=transition,
+            turn_receipt={
+                "admitted_action_ids": ["action-1"],
+                "execution_order": ["action-1"],
+            },
+        )
+        satisfied, details = POSTCONDITION_EVALUATORS[
+            "current_menu_binding_preserved"
+        ](_context(event))
+        self.assertTrue(satisfied)
+        self.assertEqual(details["invalid_receipts"], [])
+
+        invalid = _pending_receipt(resolution_path="guessed_from_text")
+        invalid_event = replace(event, control_receipts=(invalid,))
+        satisfied, details = POSTCONDITION_EVALUATORS[
+            "current_menu_binding_preserved"
+        ](_context(invalid_event))
+        self.assertFalse(satisfied)
+        self.assertIn("semantics", details["invalid_receipts"][0]["reason"])
+
+        wrong_action = _pending_receipt(resolved_action_id="action-2")
+        wrong_action_event = replace(event, control_receipts=(wrong_action,))
+        satisfied, details = POSTCONDITION_EVALUATORS[
+            "current_menu_binding_preserved"
+        ](_context(wrong_action_event))
+        self.assertFalse(satisfied)
+        self.assertEqual(details["matched_receipt_count"], 0)
+
+    def test_workload_predicate_requires_semantically_valid_replacement_receipt(
+        self,
+    ) -> None:
+        satisfied, details = POSTCONDITION_EVALUATORS[
+            "effective_workload_commit_replaces_defaults"
+        ](_context(_event(_workload_receipt())))
+        self.assertTrue(satisfied)
+        self.assertEqual(details["matched_receipt_count"], 1)
+
+        invalid = _workload_receipt(
+            rpc_mode="mixed",
+            mixed_weight_entries=[
+                {"method_hash": evidence_hash("eth_accounts"), "weight": 40}
+            ],
+        )
+        satisfied, details = POSTCONDITION_EVALUATORS[
+            "effective_workload_commit_replaces_defaults"
+        ](_context(_event(invalid)))
+        self.assertFalse(satisfied)
+        self.assertIn("weight", details["invalid_receipts"][0]["reason"])
+
+    def test_sync_observe_rpc_load_violation_requires_same_event_mode_and_operation(
+        self,
+    ) -> None:
+        sync_event = _event(
+            execution={
+                "intent_action_type": "final_benchmark",
+                "manager_submission_receipt_id": "7" * 64,
+                "manager_read_receipt_id": "8" * 64,
+                "manager_observed_status": "completed",
+                "job_status": "completed",
+            },
+        )
+        sync_event = replace(
+            sync_event,
+            after_value_hashes={"workflow_mode": content_hash("sync_observe")},
+        )
+        observed, details = POSTCONDITION_EVALUATORS[
+            "sync_observe_ran_rpc_load"
+        ](_context(sync_event))
+        self.assertTrue(observed)
+        self.assertEqual(
+            details["violations"][0]["operation"],
+            "final_benchmark",
+        )
+
+        proper_sync = replace(
+            sync_event,
+            execution_receipt_summary={"intent_action_type": "sync_observe"},
+        )
+        observed, _ = POSTCONDITION_EVALUATORS[
+            "sync_observe_ran_rpc_load"
+        ](_context(proper_sync))
+        self.assertFalse(observed)
+
+        rpc_mode = replace(
+            sync_event,
+            after_value_hashes={"workflow_mode": content_hash("rpc_benchmark")},
+        )
+        observed, _ = POSTCONDITION_EVALUATORS[
+            "sync_observe_ran_rpc_load"
+        ](_context(rpc_mode))
+        self.assertFalse(observed)
+
+        planned_only = replace(
+            sync_event,
+            execution_receipt_summary={
+                "intent_action_type": "final_benchmark",
+            },
+        )
+        observed, _ = POSTCONDITION_EVALUATORS[
+            "sync_observe_ran_rpc_load"
+        ](_context(planned_only))
+        self.assertFalse(observed)
+
+    def test_semantic_unit_predicates_cover_order_preservation_and_drop(
+        self,
+    ) -> None:
+        planner = _hashed({
+            "receipt_type": "semantic_planner",
+            "turn_index": 1,
+            "input_hash": "1" * 64,
+            "pending_contract_hash": "2" * 64,
+            "resolver_invoked": True,
+            "result_reason_hash": "3" * 64,
+            "planned_action_types": ["set_value"],
+            "semantic_units": [
+                {"unit_id": "unit-1", "disposition": "action"},
+                {"unit_id": "unit-2", "disposition": "unresolved"},
+            ],
+            "planner_metrics": {"unit_count": 2},
+        })
+        summary = {
+            "semantic_units": [
+                {"unit_id": "unit-1", "start": 0, "end": 4},
+                {"unit_id": "unit-2", "start": 5, "end": 9},
+            ],
+            "semantic_order": ["unit-1", "unit-2"],
+            "unit_action_bindings": {"unit-1": ["action-1"]},
+            "unresolved_unit_ids": ["unit-2"],
+        }
+        context = _context(_event(planner, turn_receipt=summary))
+        satisfied, _ = POSTCONDITION_EVALUATORS[
+            "semantic_units_partitioned_in_order"
+        ](context)
+        self.assertTrue(satisfied)
+        preserved, _ = POSTCONDITION_EVALUATORS[
+            "unresolved_units_preserved"
+        ](context)
+        self.assertTrue(preserved)
+        dropped, details = POSTCONDITION_EVALUATORS[
+            "semantic_unit_dropped"
+        ](context)
+        self.assertFalse(dropped, details)
+
+        dropped_context = _context(
+            _event(
+                planner,
+                turn_receipt={
+                    **summary,
+                    "unresolved_unit_ids": [],
+                },
+            )
+        )
+        dropped, details = POSTCONDITION_EVALUATORS[
+            "semantic_unit_dropped"
+        ](dropped_context)
+        self.assertTrue(dropped)
+        self.assertEqual(details["dropped_units_by_turn"], {1: ["unit-2"]})
+
+    def test_execution_predicates_distinguish_single_submission_and_duplicate(
+        self,
+    ) -> None:
+        first = _event(
+            execution={
+                "intent_idempotency_key": "execution-key",
+                "manager_submission_receipt_id": "1" * 64,
+                "manager_submission_disposition": "created",
+                "manager_matching_job_count": 1,
+                "job_id": "job-1",
+            }
+        )
+        satisfied, _ = POSTCONDITION_EVALUATORS[
+            "approved_execution_submitted_once"
+        ](_context(first))
+        self.assertTrue(satisfied)
+        duplicated = replace(
+            first,
+            turn_index=2,
+            execution_receipt_summary={
+                **first.execution_receipt_summary,
+                "manager_submission_receipt_id": "2" * 64,
+                "job_id": "job-2",
+            },
+        )
+        duplicate, details = POSTCONDITION_EVALUATORS[
+            "duplicate_job_submission"
+        ](_context(first, duplicated))
+        self.assertTrue(duplicate)
+        self.assertEqual(
+            details["duplicate_submission_counts"],
+            {"execution-key": 2},
+        )
+
+    def test_read_only_consultation_positive_and_material_mutation_negative_side(
+        self,
+    ) -> None:
+        body = {
+            "receipt_type": "orientation_response",
+            "schema_version": 1,
+            "owner": "orientation",
+            "turn_index": 1,
+            "topic": "capabilities",
+            "action_type": "answer_opening_question",
+            "action_id": "action-1",
+            "pending_contract_hash": "1" * 64,
+            "response_hash": "2" * 64,
+            "projection_fields": ["chain", "pending_id"],
+            "state_projection_hash": "3" * 64,
+            "read_only": True,
+        }
+        receipt = _hashed(body)
+        transition = {
+            "transition": "preserved",
+            "before_id": "CLOUD_REGION",
+            "before_group": "provider_deployment",
+            "before_hash": "4" * 64,
+            "after_id": "CLOUD_REGION",
+            "after_group": "provider_deployment",
+            "after_hash": "4" * 64,
+            "consumer_action_ids": ["action-1"],
+        }
+        clean = _context(_event(receipt, pending_transition=transition))
+        satisfied, _ = POSTCONDITION_EVALUATORS[
+            "consultation_answered_read_only"
+        ](clean)
+        self.assertTrue(satisfied)
+        preserved, _ = POSTCONDITION_EVALUATORS[
+            "consultation_preserved_pending_work"
+        ](clean)
+        self.assertTrue(preserved)
+        mutated, _ = POSTCONDITION_EVALUATORS[
+            "workflow_state_mutated_by_consultation"
+        ](clean)
+        self.assertFalse(mutated)
+
+        changed = _context(
+            _event(
+                receipt,
+                pending_transition=transition,
+                material_diffs={
+                    "confirmed_config.CLOUD_REGION": {
+                        "before": "5" * 64,
+                        "after": "6" * 64,
+                    }
+                },
+            )
+        )
+        mutated, details = POSTCONDITION_EVALUATORS[
+            "workflow_state_mutated_by_consultation"
+        ](changed)
+        self.assertTrue(mutated, details)
+
+    def test_every_registered_predicate_fails_closed_without_evidence(
+        self,
+    ) -> None:
+        empty = _context()
+        unexpectedly_satisfied = {
+            postcondition_id: details
+            for postcondition_id, evaluator in POSTCONDITION_EVALUATORS.items()
+            for satisfied, details in (evaluator(empty),)
+            if satisfied
+        }
+        self.assertEqual(unexpectedly_satisfied, {})
+
+    def test_resume_contract_and_evidence_classification_use_structured_evidence(
+        self,
+    ) -> None:
+        resume_event = replace(
+            _event(),
+            pending_question_id="resume_harness_session",
+            pending_contract={
+                "id": "resume_harness_session",
+                "options": [
+                    {"id": "1", "expected_patch": {"resume_context": {}}},
+                    {"id": "2", "expected_patch": {"resume_context": {}}},
+                ],
+            },
+        )
+        exposed, _ = POSTCONDITION_EVALUATORS[
+            "resume_action_contract_exposed"
+        ](_context(resume_event))
+        self.assertTrue(exposed)
+
+        orientation_body = {
+            "receipt_type": "orientation_response",
+            "schema_version": 1,
+            "owner": "orientation",
+            "turn_index": 1,
+            "topic": "capabilities",
+            "action_type": "answer_opening_question",
+            "action_id": "action-1",
+            "pending_contract_hash": "1" * 64,
+            "response_hash": "2" * 64,
+            "projection_fields": ["chain"],
+            "state_projection_hash": "3" * 64,
+            "read_only": True,
+        }
+        evidence_body = {
+            "receipt_type": "analysis_evidence_block",
+            "receipt_version": 1,
+            "turn_index": 1,
+            "owner": "analysis",
+            "operation": "start",
+            "block_id": "4" * 64,
+            "question_id_hash": "5" * 64,
+            "question_kind_hash": "6" * 64,
+            "line_count": 1,
+            "block_content_hash": "7" * 64,
+            "input_disposition": "accepted",
+            "input_non_empty_line_count": 1,
+            "input_hash": "8" * 64,
+            "status": "active",
+            "visible_result_hash": "9" * 64,
+        }
+        evidence_receipt = {
+            **evidence_body,
+            "receipt_id": analysis_hash(evidence_body),
+        }
+        counted, details = POSTCONDITION_EVALUATORS[
+            "ordinary_question_counted_as_evidence"
+        ](
+            _context(
+                _event(
+                    _hashed(orientation_body),
+                    evidence_receipt,
+                )
+            )
+        )
+        self.assertTrue(counted, details)
+
+
+if __name__ == "__main__":
+    unittest.main()

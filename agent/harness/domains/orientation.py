@@ -21,6 +21,7 @@ from ..oracle import format_current_context, format_current_state, format_startu
 from ..questions import choice_question
 from ..state import AgentGraphState
 from .chain_identity import research_chain_identity
+from .orientation_receipts import build_orientation_response_receipt
 
 
 def has_resumable_configuration(state: AgentGraphState) -> bool:
@@ -193,11 +194,20 @@ def apply_orientation_action(state: AgentGraphState, action: ActionProposal) -> 
         question = None
         if not state.get("pending_question") and not has_resumable_configuration(state):
             question = opening_question(state)
+        response = localized(
+            language,
+            "你好，我是 AnyChain Benchmark Agent。你可以直接说明测试目标、询问当前状态，或粘贴配置、日志和报告。",
+            "Hi, I am AnyChain Benchmark Agent. State a test goal, ask about current state, or paste configuration, logs, or reports.",
+        )
         return HandlerResult(
-            visible_result=localized(
-                language,
-                "你好，我是 AnyChain Benchmark Agent。你可以直接说明测试目标、询问当前状态，或粘贴配置、日志和报告。",
-                "Hi, I am AnyChain Benchmark Agent. State a test goal, ask about current state, or paste configuration, logs, or reports.",
+            visible_result=response,
+            control_receipts=(
+                build_orientation_response_receipt(
+                    state,
+                    action,
+                    topic="identity",
+                    response=response,
+                ),
             ),
             pending_question=question,
             next_group="opening" if question else "",
@@ -243,8 +253,17 @@ def apply_orientation_action(state: AgentGraphState, action: ActionProposal) -> 
         pending = dict(state.get("pending_question") or {})
         if topic == "recommendation" and not pending and not state.get("target_mode"):
             pending = recommendation_question(state)
+        response = answer_consultation(state, raw)
         return HandlerResult(
-            visible_result=answer_consultation(state, raw),
+            visible_result=response,
+            control_receipts=(
+                build_orientation_response_receipt(
+                    state,
+                    action,
+                    topic=topic or "capabilities",
+                    response=response,
+                ),
+            ),
             pending_question=pending or None,
             consumed_action_ids=(action.action_id,),
             stop_after_response=True,

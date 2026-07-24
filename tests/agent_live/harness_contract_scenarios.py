@@ -398,6 +398,31 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
     zone_state["confirmed_config"] = {"CLOUD_REGION": "test-region"}
     add("provider_zone", zone_state, question_for_environment(zone_state, "provider_deployment"))
 
+    region_with_chain_state = new_state(
+        "coverage-provider-region-with-chain",
+        language=language,
+        session_purpose="coverage",
+    )
+    region_with_chain_state["target_mode"] = "fake-node"
+    region_with_chain_state["workflow_mode"] = "rpc_benchmark"
+    region_with_chain_state["chain_identity"] = {
+        "raw": "solana",
+        "canonical": "solana",
+        "status": "confirmed",
+        "case": "known",
+    }
+    region_with_chain_state["confirmed_config"] = {
+        "BLOCKCHAIN_NODE": "solana",
+    }
+    add(
+        "provider_region_with_chain",
+        region_with_chain_state,
+        question_for_environment(
+            region_with_chain_state,
+            "provider_deployment",
+        ),
+    )
+
     provider_state = new_state("coverage-provider-machine", language=language, session_purpose="coverage")
     provider_state["confirmed_config"] = {
         "CLOUD_REGION": "test-region",

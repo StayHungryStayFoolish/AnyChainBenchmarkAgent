@@ -32,9 +32,14 @@ from ..harness.invariants import StateInvariantError
 from ..knowledge.framework_capabilities import load_framework_capabilities
 from ..knowledge.framework_context import load_framework_context
 from ..llm.config import load_llm_config
-from ..llm.providers import provider_runtime_errors
+from ..llm.providers import probe_provider_readiness, provider_runtime_errors
 from ..llm.search_grounding import web_research_status
-from ..llm.types import LLMTurnCancelledError, LLMTurnTimeoutError, llm_turn_scope
+from ..llm.types import (
+    LLMProviderError,
+    LLMTurnCancelledError,
+    LLMTurnTimeoutError,
+    llm_turn_scope,
+)
 from ..runners.job_manager import list_jobs
 from ..utils.redaction import redact
 from .io import OutputOnlyIO, TerminalIO
@@ -154,6 +159,7 @@ class AnyChainTerminal:
         self._llm_config = load_llm_config()
         self._web_research_status: dict[str, Any] = {}
         self._llm_runtime_available = False
+        self._llm_unavailable_reason = ""
         self._job_commands = JobCommandHandler(self.state, self.io)
         self._turn_active = False
 
@@ -247,11 +253,28 @@ class AnyChainTerminal:
             if not deps_offer_pending:
                 self.state.current_question_id = ""
                 self.state.pending_missing_dependencies = []
-            self._ensure_harness()
-            if self.fresh_session:
-                self._ensure_harness().reset(language=self.state.language)
-            elif not deps_offer_pending:
-                self._offer_harness_resume_if_needed()
+            readiness_error = probe_provider_readiness(self._llm_config)
+            self._llm_runtime_available = readiness_error is None
+            self._llm_unavailable_reason = (
+                _provider_error_summary(readiness_error)
+                if readiness_error is not None
+                else ""
+            )
+            if readiness_error is not None:
+                self.io.agent(
+                    self.state.language,
+                    t(
+                        self.state.language,
+                        "llm_provider_unavailable",
+                        reason=self._llm_unavailable_reason,
+                    ),
+                )
+            else:
+                self._ensure_harness()
+                if self.fresh_session:
+                    self._ensure_harness().reset(language=self.state.language)
+                elif not deps_offer_pending:
+                    self._offer_harness_resume_if_needed()
         self.io.agent(self.state.language, t(self.state.language, "help"))
 
     def handle_user_text(self, text: str) -> None:
@@ -276,11 +299,14 @@ class AnyChainTerminal:
         if self._handle_pending_confirmation(lowered):
             return
         if not self._llm_runtime_available:
-            self.state.current_question_id = "install_agent_runtime"
-            runtime_errors = provider_runtime_errors(self._llm_config)
             self.io.agent(
                 self.state.language,
-                t(self.state.language, "agent_runtime_offer", missing="; ".join(runtime_errors)),
+                t(
+                    self.state.language,
+                    "llm_provider_unavailable",
+                    reason=self._llm_unavailable_reason
+                    or "provider readiness has not been established",
+                ),
             )
             return
 
@@ -619,6 +645,12 @@ def _adk_error_message(language: str, exc: Exception) -> str:
         and type(exc).__module__.endswith("harness.invariants")
     ):
         return t(language, "harness_runtime_error")
+    if isinstance(exc, LLMProviderError):
+        return t(
+            language,
+            "llm_provider_unavailable",
+            reason=_provider_error_summary(exc),
+        )
     message = str(exc).lower()
     if "insufficient balance" in message or "insufficient quota" in message:
         return t(language, "llm_billing_error")
@@ -645,6 +677,16 @@ def _adk_error_message(language: str, exc: Exception) -> str:
     ):
         return t(language, "adk_runtime_error")
     return t(language, "harness_runtime_error")
+
+
+def _provider_error_summary(exc: LLMProviderError | None) -> str:
+    if exc is None:
+        return ""
+    identity = "/".join(
+        item for item in (exc.provider, exc.model) if str(item).strip()
+    )
+    status = f", HTTP {exc.status_code}" if exc.status_code else ""
+    return f"{identity or 'model provider'}: {exc.category or 'provider'}{status}"
 
 
 @contextmanager
