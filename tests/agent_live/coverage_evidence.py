@@ -74,7 +74,16 @@ class RuntimeTurnEvent:
     revision: Mapping[str, str] = field(default_factory=dict)
     admitted_action_types: tuple[str, ...] = ()
     admitted_action_targets: tuple[Mapping[str, str], ...] = ()
+    admitted_action_provenance: tuple[Mapping[str, Any], ...] = ()
+    turn_receipt_summary: Mapping[str, Any] = field(default_factory=dict)
+    pending_transition: Mapping[str, Any] = field(default_factory=dict)
+    render_manifest: Mapping[str, Any] = field(default_factory=dict)
+    execution_receipt_summary: Mapping[str, Any] = field(default_factory=dict)
+    control_receipts: tuple[Mapping[str, Any], ...] = ()
     state_diff_hashes: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    material_state_diff_hashes: Mapping[str, Mapping[str, str]] = field(
+        default_factory=dict
+    )
     after_value_hashes: Mapping[str, str] = field(default_factory=dict)
     next_result: Mapping[str, Any] = field(default_factory=dict)
 
@@ -519,6 +528,14 @@ def validate_pty_diagnostic_artifact(artifact: Mapping[str, Any]) -> tuple[bool,
         runtime_event_values["admitted_action_targets"] = tuple(
             dict(item) for item in runtime_event_values.get("admitted_action_targets") or ()
         )
+        runtime_event_values["admitted_action_provenance"] = tuple(
+            dict(item)
+            for item in runtime_event_values.get("admitted_action_provenance") or ()
+        )
+        runtime_event_values["control_receipts"] = tuple(
+            dict(item)
+            for item in runtime_event_values.get("control_receipts") or ()
+        )
         runtime_event = RuntimeTurnEvent(**runtime_event_values)
         _validate_runtime_event(runtime_event)
     except (TypeError, ValueError) as exc:
@@ -599,6 +616,12 @@ def _runtime_event_payload(event: RuntimeTurnEvent) -> dict[str, Any]:
     payload["action_queue_types"] = list(event.action_queue_types)
     payload["admitted_action_types"] = list(event.admitted_action_types)
     payload["admitted_action_targets"] = [dict(item) for item in event.admitted_action_targets]
+    payload["admitted_action_provenance"] = [
+        dict(item) for item in event.admitted_action_provenance
+    ]
+    payload["control_receipts"] = [
+        dict(item) for item in event.control_receipts
+    ]
     return payload
 
 
@@ -1353,7 +1376,7 @@ def _validate_turn_observation(
 
 
 def _validate_runtime_event(event: RuntimeTurnEvent) -> None:
-    if event.schema_version != 2:
+    if event.schema_version not in {2, 3}:
         raise ValueError("unsupported runtime turn event schema")
     if event.event_type not in {"startup_snapshot", "turn_committed", "turn_recovered"}:
         raise ValueError("runtime event type is not observable")
@@ -1368,6 +1391,75 @@ def _validate_runtime_event(event: RuntimeTurnEvent) -> None:
         str(event.revision.get("worktree_hash") or "")
     ):
         raise ValueError("runtime event revision is invalid")
+    if event.schema_version == 3:
+        turn_receipt = dict(event.turn_receipt_summary or {})
+        if turn_receipt:
+            if (
+                not str(turn_receipt.get("turn_id") or "")
+                or not _is_sha256(str(turn_receipt.get("input_hash") or ""))
+            ):
+                raise ValueError("runtime turn receipt identity is invalid")
+            admitted_ids = [
+                str(item)
+                for item in turn_receipt.get("admitted_action_ids") or ()
+                if str(item)
+            ]
+            provenance_ids = [
+                str(item.get("action_id") or "")
+                for item in event.admitted_action_provenance
+                if str(item.get("action_id") or "")
+            ]
+            if provenance_ids != admitted_ids:
+                raise ValueError(
+                    "runtime action provenance differs from turn admission order"
+                )
+            execution_order = [
+                str(item)
+                for item in turn_receipt.get("execution_order") or ()
+                if str(item)
+            ]
+            if any(item not in admitted_ids for item in execution_order):
+                raise ValueError("runtime turn receipt executed an unadmitted action")
+        for action in event.admitted_action_provenance:
+            if not isinstance(action, Mapping) or not str(action.get("type") or ""):
+                raise ValueError("runtime action provenance is invalid")
+            for field_name in ("arguments_hash", "source_hash"):
+                if not _is_sha256(str(action.get(field_name) or "")):
+                    raise ValueError("runtime action provenance hash is invalid")
+        transition = dict(event.pending_transition or {})
+        for field_name in ("before_hash", "after_hash"):
+            if not _is_sha256(str(transition.get(field_name) or "")):
+                raise ValueError("runtime pending transition hash is invalid")
+        manifest = dict(event.render_manifest or {})
+        if any(
+            not _is_sha256(str(item))
+            for item in manifest.get("fragment_hashes") or ()
+        ):
+            raise ValueError("runtime render manifest hash is invalid")
+        for receipt in event.control_receipts:
+            if (
+                not isinstance(receipt, Mapping)
+                or not str(receipt.get("receipt_type") or "")
+                or not _is_sha256(str(receipt.get("receipt_id") or ""))
+            ):
+                raise ValueError("runtime control receipt is invalid")
+            unsigned = dict(receipt)
+            receipt_id = str(unsigned.pop("receipt_id"))
+            if content_hash(unsigned) != receipt_id:
+                raise ValueError("runtime control receipt hash is stale")
+        for path, hashes in event.material_state_diff_hashes.items():
+            if (
+                not str(path)
+                or not isinstance(hashes, Mapping)
+                or any(
+                    value and not _is_sha256(str(value))
+                    for value in (
+                        hashes.get("before"),
+                        hashes.get("after"),
+                    )
+                )
+            ):
+                raise ValueError("runtime material state diff is invalid")
     if str(event.pending_contract.get("id") or "") != event.pending_question_id:
         raise ValueError("runtime event pending contract identity is inconsistent")
 

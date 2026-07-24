@@ -2482,6 +2482,21 @@ def _runtime_event_from_mapping(payload: Mapping[str, Any]) -> RuntimeTurnEvent:
     missing = sorted(required - set(payload))
     if missing:
         raise RuntimeError(f"runtime turn event is missing: {', '.join(missing)}")
+    if int(payload["schema_version"]) == 3:
+        required_v3 = {
+            "admitted_action_provenance",
+            "turn_receipt_summary",
+            "pending_transition",
+            "render_manifest",
+            "execution_receipt_summary",
+            "control_receipts",
+            "material_state_diff_hashes",
+        }
+        missing_v3 = sorted(required_v3 - set(payload))
+        if missing_v3:
+            raise RuntimeError(
+                "runtime turn event v3 is missing: " + ", ".join(missing_v3)
+            )
     return RuntimeTurnEvent(
         schema_version=int(payload["schema_version"]),
         event_type=str(payload["event_type"]),
@@ -2504,9 +2519,34 @@ def _runtime_event_from_mapping(payload: Mapping[str, Any]) -> RuntimeTurnEvent:
             for item in payload["admitted_action_targets"]
             if isinstance(item, Mapping)
         ),
+        admitted_action_provenance=tuple(
+            dict(item)
+            for item in payload.get("admitted_action_provenance") or ()
+            if isinstance(item, Mapping)
+        ),
+        turn_receipt_summary=dict(payload.get("turn_receipt_summary") or {}),
+        pending_transition=dict(payload.get("pending_transition") or {}),
+        render_manifest=dict(payload.get("render_manifest") or {}),
+        execution_receipt_summary=dict(
+            payload.get("execution_receipt_summary") or {}
+        ),
+        control_receipts=tuple(
+            dict(item)
+            for item in payload.get("control_receipts") or ()
+            if isinstance(item, Mapping)
+        ),
         state_diff_hashes={
             str(path): {str(key): str(value) for key, value in dict(hashes).items()}
             for path, hashes in dict(payload["state_diff_hashes"] or {}).items()
+        },
+        material_state_diff_hashes={
+            str(path): {
+                str(key): str(value)
+                for key, value in dict(hashes).items()
+            }
+            for path, hashes in dict(
+                payload.get("material_state_diff_hashes") or {}
+            ).items()
         },
         after_value_hashes={
             str(path): str(value)

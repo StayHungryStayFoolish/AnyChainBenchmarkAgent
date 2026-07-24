@@ -13,7 +13,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from tests.agent_live.coverage_evidence import content_hash
+from tests.agent_live.coverage_evidence import content_hash, pty_transcript_hash
 from tests.agent_live.chaos_scheduler import build_journey_schedule
 from tests.agent_live.dynamic_dual_ai_chaos import (
     JourneyPostconditionResult,
@@ -242,33 +242,174 @@ _DECLARATIVE_ASSERTIONS: Mapping[str, tuple[Mapping[str, Any], ...]] = {
 def retained_regression_postcondition(
     context: JourneyVerifierContext,
 ) -> JourneyPostconditionResult:
-    """Fail closed until each retained semantic has an independent evaluator.
-
-    The registry is executable and consumes the complete Journey context, but
-    no retained semantic is allowed to pass merely because a fixture or caller
-    names it.  Later implementations must replace this result with reviewed
-    machine predicates over the event/decision/checkpoint lineage.
-    """
+    """Evaluate only reviewed machine predicates over response-bound lineage."""
 
     postcondition_id = str(context.evaluating_postcondition_id or "")
-    complete_lineage = bool(
-        context.completed_turns
-        and len(context.completed_turns) == len(context.completed_events)
-        and len(context.completed_turns) == len(context.completed_decisions)
-        and context.latest_turn == context.completed_turns[-1]
-    )
+    lineage_valid, lineage = _validate_journey_lineage(context)
+    if not lineage_valid:
+        return JourneyPostconditionResult(
+            postcondition_id=postcondition_id,
+            satisfied=False,
+            details={
+                **lineage,
+                "reason": "journey lineage is incomplete or inconsistent",
+                "fail_closed": True,
+            },
+        )
+    evaluator = _IMPLEMENTED_POSTCONDITION_EVALUATORS.get(postcondition_id)
+    if evaluator is None:
+        return JourneyPostconditionResult(
+            postcondition_id=postcondition_id,
+            satisfied=False,
+            details={
+                **lineage,
+                "reason": "retained semantic verifier is not implemented",
+                "fail_closed": True,
+            },
+        )
+    satisfied, details = evaluator(context)
     return JourneyPostconditionResult(
         postcondition_id=postcondition_id,
-        satisfied=False,
+        satisfied=satisfied,
         details={
-            "reason": "retained semantic verifier is not implemented",
-            "fail_closed": True,
-            "complete_runtime_lineage_observed": complete_lineage,
-            "completed_turn_count": len(context.completed_turns),
-            "completed_event_count": len(context.completed_events),
-            "completed_decision_count": len(context.completed_decisions),
+            **lineage,
+            **details,
+            "fail_closed": False,
         },
     )
+
+
+def _validate_journey_lineage(
+    context: JourneyVerifierContext,
+) -> tuple[bool, dict[str, Any]]:
+    turns = tuple(context.completed_turns)
+    events = tuple(context.completed_events)
+    decisions = tuple(context.completed_decisions)
+    response_driven = bool(decisions)
+    valid = bool(
+        turns
+        and len(turns) == len(events)
+        and (not response_driven or len(turns) == len(decisions))
+        and context.latest_turn == turns[-1]
+        and context.current_event == events[-1]
+    )
+    failures: list[str] = []
+    previous_event = context.initial_event
+    for index, (turn, event) in enumerate(zip(turns, events)):
+        if event.schema_version != 3:
+            failures.append(f"turn-{index}:schema")
+        if event.before_fingerprint != previous_event.after_fingerprint:
+            failures.append(f"turn-{index}:fingerprint-chain")
+        if (
+            turn.before_fingerprint != event.before_fingerprint
+            or turn.after_fingerprint != event.after_fingerprint
+            or turn.turn_index != event.turn_index
+        ):
+            failures.append(f"turn-{index}:turn-event-binding")
+        receipt = dict(event.turn_receipt_summary or {})
+        if receipt.get("input_hash") != hashlib.sha256(
+            turn.user_message.encode("utf-8")
+        ).hexdigest():
+            failures.append(f"turn-{index}:input-hash")
+        if turn.transcript_hash != pty_transcript_hash(
+            session_id=event.thread_id,
+            turn_index=turn.turn_index,
+            previous_agent_response=turn.previous_agent_response,
+            user_message=turn.user_message,
+            agent_response=turn.agent_response,
+        ):
+            failures.append(f"turn-{index}:transcript-hash")
+        if response_driven:
+            decision = decisions[index]
+            if (
+                decision.turn_index != turn.turn_index
+                or decision.previous_response_hash
+                != content_hash(turn.previous_agent_response)
+                or decision.user_message_hash != content_hash(turn.user_message)
+                or decision.selected_at_ns < turn.previous_response_received_at_ns
+                or decision.submitted_at_ns < decision.selected_at_ns
+                or turn.user_message_submitted_at_ns < decision.submitted_at_ns
+            ):
+                failures.append(f"turn-{index}:decision-binding")
+        previous_event = event
+    valid = valid and not failures
+    return valid, {
+        "complete_runtime_lineage_observed": valid,
+        "completed_turn_count": len(turns),
+        "completed_event_count": len(events),
+        "completed_decision_count": len(decisions),
+        "lineage_failures": failures,
+    }
+
+
+def _response_driven_selection_observed(
+    context: JourneyVerifierContext,
+) -> tuple[bool, dict[str, Any]]:
+    decision_count = len(context.completed_decisions)
+    return decision_count == len(context.completed_turns), {
+        "response_bound_decision_count": decision_count,
+    }
+
+
+def _duplicate_job_submission_absent(
+    context: JourneyVerifierContext,
+) -> tuple[bool, dict[str, Any]]:
+    submissions: dict[str, set[tuple[str, str]]] = {}
+    for event in context.completed_events:
+        receipt = dict(event.execution_receipt_summary or {})
+        key = str(
+            receipt.get("receipt_idempotency_key")
+            or receipt.get("intent_idempotency_key")
+            or ""
+        )
+        receipt_id = str(receipt.get("receipt_id") or "")
+        job_id = str(receipt.get("job_id") or "")
+        if key and (receipt_id or job_id):
+            submissions.setdefault(key, set()).add((receipt_id, job_id))
+    duplicates = {
+        key: len(identities)
+        for key, identities in submissions.items()
+        if len(identities) > 1
+    }
+    return not duplicates, {
+        "submission_key_count": len(submissions),
+        "duplicate_submission_counts": duplicates,
+    }
+
+
+def _typed_confirmation_rejected_by_side_channel_absent(
+    context: JourneyVerifierContext,
+) -> tuple[bool, dict[str, Any]]:
+    rejected_after_acceptance: list[str] = []
+    accepted_pending_resolution_count = 0
+    for event in context.completed_events:
+        accepted_in_turn = any(
+            receipt.get("receipt_type") == "pending_resolution"
+            and receipt.get("verdict") == "accepted"
+            for receipt in event.control_receipts
+        )
+        if not accepted_in_turn:
+            continue
+        accepted_pending_resolution_count += 1
+        rejected_after_acceptance.extend(
+            str(receipt.get("receipt_id") or "")
+            for receipt in event.control_receipts
+            if receipt.get("receipt_type") == "domain_commit"
+            and receipt.get("completion") == "rejected"
+        )
+    return not rejected_after_acceptance, {
+        "accepted_pending_resolution_count": accepted_pending_resolution_count,
+        "rejected_domain_receipt_ids": rejected_after_acceptance,
+    }
+
+
+_IMPLEMENTED_POSTCONDITION_EVALUATORS = {
+    "response_driven_selection_observed": _response_driven_selection_observed,
+    "duplicate_job_submission": _duplicate_job_submission_absent,
+    "typed_confirmation_rejected_by_side_channel": (
+        _typed_confirmation_rejected_by_side_channel_absent
+    ),
+}
 
 
 RETAINED_REGRESSION_JOURNEY_VERIFIER_REGISTRY = (
@@ -278,9 +419,12 @@ RETAINED_REGRESSION_JOURNEY_VERIFIER_REGISTRY = (
             verifier_id=f"retained-regression-{postcondition_id}",
             verifier_version=1,
             description=(
-                "Fail-closed placeholder for a retained-regression semantic; "
-                "it cannot qualify product evidence until replaced by a "
-                "reviewed machine evaluator."
+                "Reviewed machine evaluator over response-bound runtime "
+                "lineage."
+                if postcondition_id in _IMPLEMENTED_POSTCONDITION_EVALUATORS
+                else
+                "Fail-closed retained-regression semantic awaiting a reviewed "
+                "machine evaluator."
             ),
             verifier=retained_regression_postcondition,
         )
@@ -322,7 +466,10 @@ def build_retained_regression_runner_provider(
             ),
             "source_contract_registry_id": POSTCONDITION_REGISTRY_ID,
             "execution_readiness": "blocked",
-            "unsupported_postcondition_ids": sorted(KNOWN_POSTCONDITION_IDS),
+            "unsupported_postcondition_ids": sorted(
+                set(KNOWN_POSTCONDITION_IDS)
+                - set(_IMPLEMENTED_POSTCONDITION_EVALUATORS)
+            ),
             "rules": [
                 verifier_rules[key] for key in sorted(verifier_rules)
             ],
@@ -405,7 +552,10 @@ def validate_retained_regression_runner_provider(
         or registry.get("source_contract_registry_id") != POSTCONDITION_REGISTRY_ID
         or registry.get("execution_readiness") != "blocked"
         or set(registry.get("unsupported_postcondition_ids") or ())
-        != set(KNOWN_POSTCONDITION_IDS)
+        != (
+            set(KNOWN_POSTCONDITION_IDS)
+            - set(_IMPLEMENTED_POSTCONDITION_EVALUATORS)
+        )
         or not isinstance(rules, Sequence)
         or isinstance(rules, (str, bytes))
     ):

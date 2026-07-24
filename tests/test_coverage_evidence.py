@@ -17,11 +17,14 @@ from agent.harness.domains.environment import question_for_environment
 from agent.harness.state import new_state
 from tests.agent_live.coverage_evidence import (
     COMPILED_GRAPH_RUNNER,
+    RuntimeTurnEvent,
     TurnObservation,
     VerifiedPostcondition,
+    _validate_runtime_event,
     _redacted_turn_observation,
     build_evidence_artifact,
     build_real_execution_evidence_artifact,
+    content_hash,
     validate_evidence_artifact,
     validate_real_execution_evidence_artifact,
 )
@@ -29,6 +32,71 @@ from tests.agent_live.graph_turn import invoke_product_graph_turn
 
 
 class CoverageEvidenceTest(unittest.TestCase):
+    def test_runtime_event_rejects_tampered_control_receipts_and_material_hashes(
+        self,
+    ) -> None:
+        receipt = {
+            "receipt_type": "semantic_planner",
+            "turn_index": 1,
+            "resolver_invoked": True,
+        }
+        receipt["receipt_id"] = content_hash(receipt)
+        event = RuntimeTurnEvent(
+            schema_version=3,
+            event_type="turn_committed",
+            thread_id="runtime-test",
+            session_purpose="chaos",
+            before_fingerprint="a" * 64,
+            after_fingerprint="b" * 64,
+            turn_index=1,
+            active_group="opening",
+            pending_question_id="",
+            action_queue_types=(),
+            revision={"commit": "commit", "worktree_hash": "c" * 64},
+            turn_receipt_summary={
+                "turn_id": "turn-1",
+                "input_hash": "d" * 64,
+                "admitted_action_ids": [],
+                "execution_order": [],
+            },
+            pending_transition={
+                "before_hash": "e" * 64,
+                "after_hash": "f" * 64,
+            },
+            control_receipts=(receipt,),
+            material_state_diff_hashes={
+                "active_group": {"before": "1" * 64, "after": "2" * 64}
+            },
+        )
+        _validate_runtime_event(event)
+
+        tampered_receipt = dict(receipt)
+        tampered_receipt["resolver_invoked"] = False
+        with self.assertRaisesRegex(ValueError, "receipt hash is stale"):
+            _validate_runtime_event(
+                event.__class__(
+                    **{
+                        **event.__dict__,
+                        "control_receipts": (tampered_receipt,),
+                    }
+                )
+            )
+
+        with self.assertRaisesRegex(ValueError, "material state diff"):
+            _validate_runtime_event(
+                event.__class__(
+                    **{
+                        **event.__dict__,
+                        "material_state_diff_hashes": {
+                            "active_group": {
+                                "before": "not-a-hash",
+                                "after": "2" * 64,
+                            }
+                        },
+                    }
+                )
+            )
+
     def test_redaction_preserves_coverage_identity_that_names_secret_fields(self) -> None:
         edge_key = "chain_auxiliary_endpoints::RPC_API_KEY::contract-hash"
         secret = "runtime-secret-4821"

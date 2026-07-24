@@ -11,6 +11,7 @@ from tests.agent_live.retained_regression_obligations import (
     build_retained_regression_obligations,
     validate_retained_regression_obligations,
 )
+from tests.agent_live.runtime_checkpoint import reviewed_scenario
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -66,6 +67,47 @@ class RetainedRegressionObligationCatalogTest(unittest.TestCase):
                             "read_each_complete_agent_response"
                         ]
                     )
+
+    def test_reviewed_seeds_satisfy_network_and_backtrack_preconditions(self) -> None:
+        network = reviewed_scenario("network_interface")
+        self.assertEqual(network.question["id"], "network_interface")
+        self.assertEqual(
+            [option["value"] for option in network.question["options"]],
+            ["eth0"],
+        )
+        self.assertEqual(
+            network.seed_state["discovery"]["network"]["default_interface"],
+            "eth0",
+        )
+
+        qps = reviewed_scenario("qps_mode")
+        self.assertEqual(qps.question["id"], "benchmark_mode")
+        self.assertEqual(qps.seed_state["group_history"], ["workload_rpc"])
+        self.assertEqual(qps.seed_state["chain_identity"]["canonical"], "bsc")
+        self.assertEqual(qps.seed_state["rpc_mode"], "single")
+        self.assertTrue(qps.seed_state["workload"]["confirmed"])
+        self.assertEqual(
+            qps.seed_state["confirmed_config"]["NETWORK_INTERFACE"],
+            "eth0",
+        )
+
+        rpc_schema = reviewed_scenario("custom_needs_schema_evidence")
+        self.assertEqual(
+            rpc_schema.seed_state["custom_rpc"]["endpoint"],
+            "http://geth-dev:8545",
+        )
+        self.assertEqual(
+            rpc_schema.seed_state["custom_rpc"]["catalog"]["draft"][
+                "validation_endpoint"
+            ],
+            "http://geth-dev:8545",
+        )
+
+        multi_intent = reviewed_scenario("action_change_group")
+        self.assertEqual(
+            multi_intent.seed_state["chain_identity"]["canonical"],
+            "ethereum",
+        )
 
     def test_validation_fails_closed_for_missing_and_duplicate_obligations(self) -> None:
         missing = list(deepcopy(self.obligations[:-1]))

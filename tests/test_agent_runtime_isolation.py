@@ -60,7 +60,7 @@ class AgentRuntimeIsolationTests(unittest.TestCase):
 
             event = json.loads(event_file.read_text(encoding="utf-8").splitlines()[-1])
             self.assertEqual(event["event_type"], "turn_committed")
-            self.assertEqual(event["schema_version"], 2)
+            self.assertEqual(event["schema_version"], 3)
             self.assertEqual(event["thread_id"], "event-runtime")
             self.assertEqual(event["turn_index"], result["turn_index"])
             self.assertEqual(len(event["before_fingerprint"]), 64)
@@ -70,7 +70,39 @@ class AgentRuntimeIsolationTests(unittest.TestCase):
             self.assertIn("admitted_action_types", event)
             self.assertTrue(event["state_diff_hashes"])
             self.assertTrue(event["next_result"])
+            self.assertEqual(
+                [item["type"] for item in event["admitted_action_provenance"]],
+                ["greeting"],
+            )
+            action_receipt = event["admitted_action_provenance"][0]
+            self.assertEqual(len(action_receipt["arguments_hash"]), 64)
+            self.assertEqual(len(action_receipt["source_hash"]), 64)
+            self.assertIn(
+                event["turn_receipt_summary"]["status"],
+                {"blocked", "committed"},
+            )
+            self.assertEqual(
+                event["pending_transition"]["after_id"],
+                result["pending_question"]["id"],
+            )
+            self.assertEqual(
+                event["render_manifest"]["fragment_count"],
+                len(result["visible_response"]),
+            )
+            self.assertIn("execution_receipt_summary", event)
+            self.assertTrue(event["control_receipts"])
+            self.assertTrue(
+                all(
+                    len(item["receipt_id"]) == 64
+                    for item in event["control_receipts"]
+                )
+            )
+            self.assertIn("material_state_diff_hashes", event)
             self.assertNotIn("confirmed_config", event)
+            self.assertNotIn(
+                "hello",
+                json.dumps(event, ensure_ascii=False),
+            )
 
     def test_invariant_recovery_emits_one_committed_turn_observation(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime

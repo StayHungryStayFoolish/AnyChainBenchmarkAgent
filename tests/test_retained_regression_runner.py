@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
+import hashlib
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -10,8 +13,16 @@ from tests.agent_live.product_obligation_evidence import (
     admit_product_obligation_evidence,
 )
 from tests.agent_live.chaos_scheduler import build_journey_schedule
-from tests.agent_live.coverage_evidence import RuntimeTurnEvent
-from tests.agent_live.dynamic_dual_ai_chaos import JourneyVerifierContext
+from tests.agent_live.coverage_evidence import (
+    PtyCliTurnRecord,
+    RuntimeTurnEvent,
+    content_hash,
+    pty_transcript_hash,
+)
+from tests.agent_live.dynamic_dual_ai_chaos import (
+    JourneyDecisionProvenance,
+    JourneyVerifierContext,
+)
 from tests.agent_live.journey_simulator_bridge import load_verifier_registry
 from tests.agent_live.retained_regression_obligations import (
     KNOWN_POSTCONDITION_IDS,
@@ -254,6 +265,236 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
                     artifact_paths=artifacts,
                     verifier_context=self._empty_context(target),
                 )
+
+    def test_response_bound_lineage_and_forbidden_absence_semantics(self) -> None:
+        target = next(
+            row for row in self.provider["targets"] if row["variant"] != "exact"
+        )
+        context = self._one_turn_context(target)
+        registry = RETAINED_REGRESSION_JOURNEY_VERIFIER_REGISTRY
+
+        response_bound = registry.definitions[
+            "response_driven_selection_observed"
+        ].verifier(replace(
+            context,
+            evaluating_postcondition_id="response_driven_selection_observed",
+        ))
+        self.assertTrue(response_bound.satisfied)
+        self.assertTrue(response_bound.details["complete_runtime_lineage_observed"])
+
+        no_duplicate = registry.definitions["duplicate_job_submission"].verifier(
+            replace(
+                context,
+                evaluating_postcondition_id="duplicate_job_submission",
+            )
+        )
+        self.assertTrue(no_duplicate.satisfied)
+
+        no_side_channel_rejection = registry.definitions[
+            "typed_confirmation_rejected_by_side_channel"
+        ].verifier(replace(
+            context,
+            evaluating_postcondition_id=(
+                "typed_confirmation_rejected_by_side_channel"
+            ),
+        ))
+        self.assertTrue(no_side_channel_rejection.satisfied)
+
+    def test_forbidden_predicates_fail_when_violation_is_observed(self) -> None:
+        target = next(
+            row for row in self.provider["targets"] if row["variant"] != "exact"
+        )
+        context = self._one_turn_context(target)
+        duplicate_event = replace(
+            context.current_event,
+            execution_receipt_summary={
+                "receipt_idempotency_key": "same-key",
+                "receipt_id": "receipt-b",
+                "job_id": "job-b",
+            },
+        )
+        first_event = replace(
+            context.current_event,
+            after_fingerprint="c" * 64,
+            execution_receipt_summary={
+                "receipt_idempotency_key": "same-key",
+                "receipt_id": "receipt-a",
+                "job_id": "job-a",
+            },
+        )
+        second_turn = replace(
+            context.latest_turn,
+            turn_index=2,
+            before_fingerprint="c" * 64,
+            after_fingerprint=duplicate_event.after_fingerprint,
+            previous_response_received_at_ns=(
+                context.latest_turn.previous_response_received_at_ns + 20
+            ),
+            user_message_submitted_at_ns=(
+                context.latest_turn.user_message_submitted_at_ns + 20
+            ),
+            agent_response_received_at_ns=(
+                context.latest_turn.agent_response_received_at_ns + 20
+            ),
+        )
+        second_turn = replace(
+            second_turn,
+            transcript_hash=pty_transcript_hash(
+                session_id=second_turn.session_id,
+                turn_index=second_turn.turn_index,
+                previous_agent_response=second_turn.previous_agent_response,
+                user_message=second_turn.user_message,
+                agent_response=second_turn.agent_response,
+            ),
+        )
+        duplicate_event = replace(
+            duplicate_event,
+            before_fingerprint="c" * 64,
+            turn_index=2,
+        )
+        first_turn = replace(
+            context.latest_turn,
+            after_fingerprint="c" * 64,
+        )
+        first_turn = replace(
+            first_turn,
+            transcript_hash=pty_transcript_hash(
+                session_id=first_turn.session_id,
+                turn_index=first_turn.turn_index,
+                previous_agent_response=first_turn.previous_agent_response,
+                user_message=first_turn.user_message,
+                agent_response=first_turn.agent_response,
+            ),
+        )
+        first_decision = context.completed_decisions[0]
+        second_decision = replace(
+            first_decision,
+            turn_index=2,
+            selected_at_ns=first_decision.selected_at_ns + 20,
+            submitted_at_ns=first_decision.submitted_at_ns + 20,
+        )
+        duplicate_context = replace(
+            context,
+            current_event=duplicate_event,
+            completed_turns=(first_turn, second_turn),
+            completed_events=(first_event, duplicate_event),
+            completed_decisions=(first_decision, second_decision),
+            latest_turn=second_turn,
+            evaluating_postcondition_id="duplicate_job_submission",
+        )
+        duplicate = RETAINED_REGRESSION_JOURNEY_VERIFIER_REGISTRY.definitions[
+            "duplicate_job_submission"
+        ].verifier(duplicate_context)
+        self.assertFalse(duplicate.satisfied)
+        self.assertEqual(
+            duplicate.details["duplicate_submission_counts"],
+            {"same-key": 2},
+        )
+
+        accepted = {
+            "receipt_type": "pending_resolution",
+            "verdict": "accepted",
+            "receipt_id": "a" * 64,
+        }
+        rejected = {
+            "receipt_type": "domain_commit",
+            "completion": "rejected",
+            "receipt_id": "b" * 64,
+        }
+        rejection_event = replace(
+            context.current_event,
+            control_receipts=(accepted, rejected),
+        )
+        rejection_context = replace(
+            context,
+            current_event=rejection_event,
+            completed_events=(rejection_event,),
+            evaluating_postcondition_id=(
+                "typed_confirmation_rejected_by_side_channel"
+            ),
+        )
+        rejection = RETAINED_REGRESSION_JOURNEY_VERIFIER_REGISTRY.definitions[
+            "typed_confirmation_rejected_by_side_channel"
+        ].verifier(rejection_context)
+        self.assertFalse(rejection.satisfied)
+        self.assertEqual(rejection.details["rejected_domain_receipt_ids"], ["b" * 64])
+
+    def _one_turn_context(self, target: dict) -> JourneyVerifierContext:
+        base = self._empty_context(target)
+        before = "a" * 64
+        after = "b" * 64
+        user_message = "continue"
+        previous_response = "Choose the next action."
+        agent_response = "The next action is ready."
+        now = time.monotonic_ns()
+        turn = PtyCliTurnRecord(
+            session_id="test",
+            turn_index=1,
+            previous_agent_response=previous_response,
+            user_message=user_message,
+            agent_response=agent_response,
+            provider="deepseek",
+            model="deepseek-chat",
+            before_fingerprint=before,
+            after_fingerprint=after,
+            transcript_hash=pty_transcript_hash(
+                session_id="test",
+                turn_index=1,
+                previous_agent_response=previous_response,
+                user_message=user_message,
+                agent_response=agent_response,
+            ),
+            previous_response_received_at_ns=now,
+            user_message_submitted_at_ns=now + 2,
+            agent_response_received_at_ns=now + 3,
+        )
+        initial_event = replace(
+            base.initial_event,
+            schema_version=3,
+            event_type="startup_snapshot",
+            thread_id="test",
+            before_fingerprint=before,
+            after_fingerprint=before,
+        )
+        event = RuntimeTurnEvent(
+            schema_version=3,
+            event_type="turn_committed",
+            thread_id="test",
+            session_purpose="test",
+            before_fingerprint=before,
+            after_fingerprint=after,
+            turn_index=1,
+            active_group="opening",
+            pending_question_id="",
+            action_queue_types=(),
+            revision=REVISION,
+            turn_receipt_summary={
+                "turn_id": "turn-1",
+                "input_hash": hashlib.sha256(
+                    user_message.encode("utf-8")
+                ).hexdigest(),
+            },
+        )
+        decision = JourneyDecisionProvenance(
+            turn_index=1,
+            previous_response_hash=content_hash(previous_response),
+            selected_at_ns=now + 1,
+            submitted_at_ns=now + 1,
+            user_message_hash=content_hash(user_message),
+            persona="operator",
+            mission="continue",
+            rationale="response-bound",
+        )
+        return replace(
+            base,
+            initial_event=initial_event,
+            current_event=event,
+            completed_turns=(turn,),
+            completed_events=(event,),
+            completed_decisions=(decision,),
+            latest_turn=turn,
+            transcript=((user_message, agent_response),),
+        )
 
     def _empty_context(self, target: dict) -> JourneyVerifierContext:
         definition = target.get("journey_definition")

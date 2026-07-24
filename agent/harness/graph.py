@@ -295,8 +295,9 @@ class AnyChainGraphRuntime:
             action_type = str((item or {}).get("type") or "")
             if action_type and action_type not in admitted_action_types:
                 admitted_action_types.append(action_type)
+        admitted_action_provenance = _admitted_action_provenance(after)
         payload = {
-            "schema_version": 2,
+            "schema_version": 3,
             "event_type": event_type,
             "thread_id": self.thread_id,
             "session_purpose": self.session_purpose,
@@ -321,12 +322,233 @@ class AnyChainGraphRuntime:
                 if str((item or {}).get("type") or "") == "change_group"
                 and str((item or {}).get("group") or "")
             ],
+            "admitted_action_provenance": admitted_action_provenance,
+            "turn_receipt_summary": _turn_receipt_summary(after),
+            "pending_transition": _pending_transition_summary(
+                before,
+                after,
+                admitted_action_provenance,
+            ),
+            "render_manifest": _render_manifest(after),
+            "execution_receipt_summary": _execution_receipt_summary(after),
+            "control_receipts": _control_receipts(after),
             "state_diff_hashes": _state_diff_hashes(before, after),
+            "material_state_diff_hashes": _material_state_diff_hashes(
+                before,
+                after,
+            ),
             "after_value_hashes": _leaf_value_hashes(after),
             "next_result": _next_result(after),
         }
         with path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _admitted_action_provenance(state: Mapping[str, Any]) -> list[dict[str, Any]]:
+    allowed = {
+        "type",
+        "action_id",
+        "source",
+        "owner",
+        "effect",
+        "group",
+        "argument_names",
+        "arguments_hash",
+        "source_unit_ids",
+        "source_hash",
+        "admission_receipt_id",
+    }
+    rows: list[dict[str, Any]] = []
+    for raw in (state.get("turn_context") or {}).get("admitted_actions") or ():
+        if not isinstance(raw, Mapping):
+            continue
+        row = {
+            str(key): deepcopy(value)
+            for key, value in raw.items()
+            if str(key) in allowed
+        }
+        if str(row.get("type") or ""):
+            rows.append(row)
+    return rows
+
+
+def _turn_receipt_summary(state: Mapping[str, Any]) -> dict[str, Any]:
+    receipt = dict(state.get("turn_receipt") or {})
+    if not receipt:
+        return {}
+    semantic_units = []
+    for raw in receipt.get("semantic_units") or ():
+        if not isinstance(raw, Mapping):
+            continue
+        source_text = str(raw.get("source_text") or "")
+        semantic_units.append({
+            "unit_id": str(raw.get("unit_id") or ""),
+            "clause_id": str(raw.get("clause_id") or ""),
+            "disposition": str(raw.get("disposition") or ""),
+            "action_indexes": [
+                int(index)
+                for index in raw.get("action_indexes") or ()
+                if isinstance(index, int) and not isinstance(index, bool)
+            ],
+            "source_hash": hashlib.sha256(source_text.encode("utf-8")).hexdigest(),
+        })
+    pending_verdicts = []
+    for raw in receipt.get("pending_candidate_verdicts") or ():
+        if not isinstance(raw, Mapping):
+            continue
+        pending_verdicts.append({
+            "action_index": raw.get("action_index"),
+            "admission_action_id": str(raw.get("admission_action_id") or ""),
+            "candidate_value_hash": _canonical_hash(raw.get("candidate_value")),
+            "semantic_unit_ids": [
+                str(item) for item in raw.get("semantic_unit_ids") or () if str(item)
+            ],
+            "verdict": str(raw.get("verdict") or ""),
+        })
+    omission_checks = [
+        {
+            "unit_id": str(raw.get("unit_id") or ""),
+            "disposition": str(raw.get("disposition") or ""),
+            "action_indexes": [
+                int(index)
+                for index in raw.get("action_indexes") or ()
+                if isinstance(index, int) and not isinstance(index, bool)
+            ],
+            "verdict": str(raw.get("verdict") or ""),
+        }
+        for raw in receipt.get("sibling_omission_checks") or ()
+        if isinstance(raw, Mapping)
+    ]
+    return {
+        "turn_id": str(receipt.get("turn_id") or ""),
+        "input_hash": str(receipt.get("input_hash") or ""),
+        "language": str(receipt.get("language") or ""),
+        "input_shape": str(receipt.get("input_shape") or ""),
+        "status": str(receipt.get("status") or ""),
+        "semantic_units": semantic_units,
+        "admitted_action_ids": [
+            str(item) for item in receipt.get("admitted_action_ids") or () if str(item)
+        ],
+        "semantic_order": [
+            str(item) for item in receipt.get("semantic_order") or () if str(item)
+        ],
+        "execution_order": [
+            str(item) for item in receipt.get("execution_order") or () if str(item)
+        ],
+        "owner_bindings": {
+            str(key): str(value)
+            for key, value in dict(receipt.get("owner_bindings") or {}).items()
+        },
+        "action_unit_bindings": {
+            str(key): [str(item) for item in value if str(item)]
+            for key, value in dict(receipt.get("action_unit_bindings") or {}).items()
+            if isinstance(value, (list, tuple))
+        },
+        "unit_action_bindings": {
+            str(key): [str(item) for item in value if str(item)]
+            for key, value in dict(receipt.get("unit_action_bindings") or {}).items()
+            if isinstance(value, (list, tuple))
+        },
+        "pending_candidate_verdicts": pending_verdicts,
+        "sibling_omission_checks": omission_checks,
+        "unresolved_unit_ids": [
+            str(item) for item in receipt.get("unresolved_units") or () if str(item)
+        ],
+        "pending_before_hash": _canonical_hash(receipt.get("pending_before") or {}),
+        "pending_after_hash": _canonical_hash(receipt.get("pending_after") or {}),
+        "response_count": int(receipt.get("response_count") or 0),
+    }
+
+
+def _pending_transition_summary(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    actions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    pending_before = dict(before.get("pending_question") or {})
+    pending_after = dict(after.get("pending_question") or {})
+    before_hash = _canonical_hash(pending_before)
+    after_hash = _canonical_hash(pending_after)
+    if before_hash == after_hash:
+        transition = "preserved"
+    elif pending_before and pending_after:
+        transition = "replaced"
+    elif pending_before:
+        transition = "consumed"
+    elif pending_after:
+        transition = "created"
+    else:
+        transition = "absent"
+    return {
+        "transition": transition,
+        "before_id": str(pending_before.get("id") or ""),
+        "before_group": str(pending_before.get("group") or ""),
+        "before_hash": before_hash,
+        "after_id": str(pending_after.get("id") or ""),
+        "after_group": str(pending_after.get("group") or ""),
+        "after_hash": after_hash,
+        "consumer_action_ids": [
+            str(item.get("action_id") or "")
+            for item in actions
+            if str(item.get("action_id") or "")
+        ],
+    }
+
+
+def _render_manifest(state: Mapping[str, Any]) -> dict[str, Any]:
+    fragments = [str(item) for item in state.get("visible_response") or ()]
+    return {
+        "language": str(state.get("language") or ""),
+        "fragment_count": len(fragments),
+        "fragment_hashes": [
+            hashlib.sha256(item.encode("utf-8")).hexdigest() for item in fragments
+        ],
+        "pending_contract_hash": _canonical_hash(
+            state.get("pending_question") or {}
+        ),
+        "result": _next_result(state),
+    }
+
+
+def _execution_receipt_summary(state: Mapping[str, Any]) -> dict[str, Any]:
+    intent = dict(state.get("side_effect_intent") or {})
+    receipt = dict(state.get("side_effect_receipt") or {})
+    job = dict(state.get("job") or {})
+    return {
+        "intent_id": str(intent.get("intent_id") or ""),
+        "intent_action_type": str(intent.get("operation") or ""),
+        "intent_idempotency_key": str(intent.get("idempotency_key") or ""),
+        "receipt_id": str(receipt.get("receipt_id") or ""),
+        "receipt_status": str(receipt.get("status") or ""),
+        "receipt_idempotency_key": str(receipt.get("idempotency_key") or ""),
+        "job_id": str(job.get("job_id") or ""),
+        "job_status": str(job.get("status") or ""),
+    }
+
+
+def _control_receipts(state: Mapping[str, Any]) -> list[dict[str, Any]]:
+    receipts = []
+    for raw in (state.get("turn_context") or {}).get("control_receipts") or ():
+        if not isinstance(raw, Mapping):
+            continue
+        receipt = deepcopy(dict(raw))
+        if (
+            str(receipt.get("receipt_type") or "")
+            and len(str(receipt.get("receipt_id") or "")) == 64
+        ):
+            receipts.append(receipt)
+    return receipts
+
+
+def _canonical_hash(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _state_fingerprint(state: AgentGraphState) -> str:
@@ -353,6 +575,49 @@ def _state_diff_hashes(
         }
         for path in sorted(set(before_hashes) | set(after_hashes))
         if before_hashes.get(path) != after_hashes.get(path)
+    }
+
+
+_MATERIAL_STATE_ROOTS = frozenset({
+    "active_group",
+    "active_subgroup",
+    "confirmed_config",
+    "inferred_config",
+    "group_states",
+    "group_history",
+    "invalidated_groups",
+    "interruption_stack",
+    "chain_identity",
+    "target_mode",
+    "workflow_mode",
+    "rpc_mode",
+    "workload",
+    "custom_rpc",
+    "qps_profile",
+    "endpoint_evidence",
+    "fixture_evidence",
+    "sync_observe",
+    "observability",
+    "advanced_tuning",
+    "preflight",
+    "smoke",
+    "final_benchmark",
+    "job",
+    "failure_recovery",
+    "evidence_collection",
+    "evidence_buffer",
+    "report_analysis",
+})
+
+
+def _material_state_diff_hashes(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+) -> dict[str, dict[str, str]]:
+    return {
+        path: hashes
+        for path, hashes in _state_diff_hashes(before, after).items()
+        if path.split(".", 1)[0] in _MATERIAL_STATE_ROOTS
     }
 
 

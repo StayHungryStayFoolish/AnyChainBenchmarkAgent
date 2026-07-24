@@ -20,13 +20,14 @@ from .oracle import (
 )
 from .routing import (
     chain_identity_confirmed,
+    group_readiness,
     navigation_prerequisite as _navigation_prerequisite,
     next_group_and_reason,
     option_return_policy as _option_return_policy,
 )
 from .turns import adjudicate_turn
 from .plan_coverage import segment_user_turn
-from .action_registry import ACTION_BY_TYPE, action_crosses_pending_barrier, action_execution_phase, action_is_turn_local, action_merge_key, action_preserves_pending, assign_action_ids, lifecycle_rejected_action_indexes, merge_semantic_actions, normalize_action_relations, validate_action_contract, validate_action_transaction_contract, validate_field_intake_admission_receipt, validate_proposal_field_receipts
+from .action_registry import ACTION_BY_TYPE, ACTION_METADATA_FIELDS, TRUSTED_ACTION_METADATA_FIELDS, action_crosses_pending_barrier, action_execution_phase, action_is_turn_local, action_merge_key, action_preserves_pending, assign_action_ids, lifecycle_rejected_action_indexes, merge_semantic_actions, normalize_action_relations, validate_action_contract, validate_action_transaction_contract, validate_field_intake_admission_receipt, validate_proposal_field_receipts
 from .contracts import (
     ActionEnvelope,
     ActionProposal,
@@ -314,6 +315,45 @@ def _record_admitted_action(
         "action_id": action_id,
         "source": source,
     }
+    spec = ACTION_BY_TYPE.get(action_type)
+    if spec is not None:
+        admitted_action["owner"] = spec.owner
+        admitted_action["effect"] = spec.effect
+    argument_payload = {
+        str(key): value
+        for key, value in action.items()
+        if key not in ACTION_METADATA_FIELDS
+        and key not in TRUSTED_ACTION_METADATA_FIELDS
+        and not str(key).startswith("_")
+    }
+    admitted_action["argument_names"] = sorted(argument_payload)
+    admitted_action["arguments_hash"] = hashlib.sha256(
+        json.dumps(
+            argument_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    admitted_action["source_unit_ids"] = [
+        str(item)
+        for item in (
+            action.get("source_unit_ids")
+            or action.get("_source_unit_ids")
+            or ()
+        )
+        if str(item)
+    ]
+    source_evidence = str(action.get("source_evidence") or "")
+    admitted_action["source_hash"] = hashlib.sha256(
+        source_evidence.encode("utf-8")
+    ).hexdigest()
+    admission_receipt = action.get("_semantic_admission_receipt")
+    if isinstance(admission_receipt, Mapping):
+        admitted_action["admission_receipt_id"] = str(
+            admission_receipt.get("receipt_id") or ""
+        )
     if action_type == "change_group":
         target_group = str(
             action.get("group")
@@ -340,7 +380,6 @@ def _record_admitted_action(
     if action_id and action_id not in admitted_ids:
         admitted_ids.append(action_id)
         semantic_order.append(action_id)
-    spec = ACTION_BY_TYPE.get(action_type)
     if action_id and spec is not None:
         owners[action_id] = (
             GROUP_OWNER.get(
@@ -372,6 +411,43 @@ def _record_admitted_action(
     receipt["unit_action_bindings"] = unit_actions
     receipt["status"] = "planned"
     state["turn_receipt"] = receipt
+
+
+def _receipt_hash(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _append_control_receipt(
+    state: AgentGraphState,
+    receipt_type: str,
+    payload: Mapping[str, Any],
+) -> None:
+    """Append one secret-free observation emitted by the current owner."""
+
+    body = {
+        "receipt_type": str(receipt_type),
+        "turn_index": int(state.get("turn_index") or 0),
+        **deepcopy(dict(payload)),
+    }
+    body["receipt_id"] = _receipt_hash(body)
+    turn_context = dict(state.get("turn_context") or {})
+    receipts = [
+        dict(item)
+        for item in turn_context.get("control_receipts") or ()
+        if isinstance(item, Mapping)
+    ]
+    if not any(item.get("receipt_id") == body["receipt_id"] for item in receipts):
+        receipts.append(body)
+    turn_context["control_receipts"] = receipts
+    state["turn_context"] = turn_context
 
 
 def _record_semantic_plan_receipt(
@@ -628,6 +704,43 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
             action["selected_value"] = selected_value
         else:
             action["selected_value"] = _coerce_answer(text, pending)
+        selected_option = next(
+            (
+                option
+                for option in pending.get("options") or ()
+                if isinstance(option, Mapping)
+                and option.get("value") == action["selected_value"]
+            ),
+            {},
+        )
+        _append_control_receipt(
+            state,
+            "pending_resolution",
+            {
+                "pending_id": pending_question_id,
+                "pending_group": str(pending.get("group") or ""),
+                "pending_contract_hash": _receipt_hash(pending),
+                "resolution_path": (
+                    "exact_contract" if matched else "typed_manual_value"
+                ),
+                "selected_option_id": str(
+                    selected_option.get("id")
+                    or selected_option.get("value")
+                    or ""
+                ),
+                "selected_value_hash": _receipt_hash(action["selected_value"]),
+                "input_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "normalizer": str(
+                    (
+                        (pending.get("validation") or {}).get("normalization")
+                        or "exact_contract"
+                    )
+                    if matched
+                    else "declared_value_type"
+                ),
+                "verdict": "accepted",
+            },
+        )
         action = assign_action_ids(
             f"{state.get('thread_id') or 'default'}:{int(state.get('turn_index') or 0)}",
             text,
@@ -776,6 +889,38 @@ def plan_turn_step(state: AgentGraphState) -> AgentGraphState:
 
     text = str((state.get("turn_context") or {}).get("text") or "")
     queue = resolve_action_queue(state, text)
+    _append_control_receipt(
+        state,
+        "semantic_planner",
+        {
+            "input_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "pending_contract_hash": _receipt_hash(
+                state.get("pending_question") or {}
+            ),
+            "resolver_invoked": True,
+            "result_reason_hash": hashlib.sha256(
+                str(queue.get("reason") or "").encode("utf-8")
+            ).hexdigest(),
+            "planned_action_types": [
+                str(item.get("type") or "")
+                for item in queue.get("actions") or ()
+                if isinstance(item, Mapping) and str(item.get("type") or "")
+            ],
+            "semantic_units": [
+                {
+                    "unit_id": str(item.get("unit_id") or ""),
+                    "disposition": str(item.get("disposition") or ""),
+                }
+                for item in queue.get("semantic_units") or ()
+                if isinstance(item, Mapping) and str(item.get("unit_id") or "")
+            ],
+            "planner_metrics": {
+                str(key): value
+                for key, value in dict(queue.get("planner_metrics") or {}).items()
+                if isinstance(value, (int, float, bool))
+            },
+        },
+    )
     if str(queue.get("reason") or "") == "resolver failed":
         record = model_provider_failure_record("resolver_failed")
         state["failure_recovery"] = {"status": "pending", "record": record}
@@ -1862,7 +2007,32 @@ def _prepared_state_hash(state: Mapping[str, Any]) -> str:
 
 
 def fallback_turn_step(state: AgentGraphState) -> AgentGraphState:
+    selected_group, reason = next_group_and_reason(state)
+    readiness = {}
+    for group in GROUP_ORDER:
+        fact = group_readiness(state, group)
+        readiness[group] = {
+            "ready": bool(fact.ready),
+            "continuation": bool(fact.continuation),
+            "reason_hash": hashlib.sha256(
+                str(fact.reason or "").encode("utf-8")
+            ).hexdigest(),
+        }
     state = _ask_next_blocking_question(state)
+    _append_control_receipt(
+        state,
+        "fallback_selection",
+        {
+            "selected_group": selected_group,
+            "reason_hash": hashlib.sha256(
+                str(reason or "").encode("utf-8")
+            ).hexdigest(),
+            "group_readiness": readiness,
+            "pending_after_id": str(
+                (state.get("pending_question") or {}).get("id") or ""
+            ),
+        },
+    )
     return _set_turn_phase(state, "compose", "fallback_resolved")
 
 
@@ -2189,6 +2359,7 @@ def _apply_handler_result(
     """
 
     previous_pending = dict(state.get("pending_question") or {})
+    navigation_command = result.navigation_command
     if result.blocker:
         candidate: AgentGraphState = deepcopy(state)
         current_action = dict(candidate.get("current_action") or {})
@@ -2223,6 +2394,28 @@ def _apply_handler_result(
         responses = list(candidate.get("visible_response") or [])
         responses.append(blocker_response)
         candidate["visible_response"] = responses
+        _append_control_receipt(
+            candidate,
+            "domain_commit",
+            {
+                "owner": owner,
+                "completion": "rejected",
+                "blocker_hash": hashlib.sha256(
+                    str(result.blocker).encode("utf-8")
+                ).hexdigest(),
+                "pending_before_hash": _receipt_hash(previous_pending),
+                "pending_after_hash": _receipt_hash(
+                    candidate.get("pending_question") or {}
+                ),
+                "consumed_action_ids": [],
+                "invalidated_groups": [],
+                "invalidated_fields": [],
+                "response_fragment_hashes": [
+                    hashlib.sha256(str(item).encode("utf-8")).hexdigest()
+                    for item in candidate.get("visible_response") or ()
+                ],
+            },
+        )
         validate_state(candidate)
         return candidate
 
@@ -2391,6 +2584,43 @@ def _apply_handler_result(
         candidate["pending_question"].pop("resume_action_queue", None)
 
     candidate = _activate_ready_deferred_group(candidate)
+    _append_control_receipt(
+        candidate,
+        "domain_commit",
+        {
+            "owner": owner,
+            "completion": str(result.completion or ""),
+            "consumed_action_ids": [
+                str(item) for item in result.consumed_action_ids if str(item)
+            ],
+            "invalidated_groups": [
+                str(item) for item in result.invalidated_groups if str(item)
+            ],
+            "invalidated_fields": [
+                str(item) for item in result.invalidated_fields if str(item)
+            ],
+            "reconfigured_groups": [
+                str(item) for item in result.reconfigured_groups if str(item)
+            ],
+            "navigation_operation": str(
+                navigation_command.operation if navigation_command else ""
+            ),
+            "navigation_target_group": str(
+                navigation_command.target_group if navigation_command else ""
+            ),
+            "pending_before_hash": _receipt_hash(previous_pending),
+            "pending_after_hash": _receipt_hash(
+                candidate.get("pending_question") or {}
+            ),
+            "pending_after_id": str(
+                (candidate.get("pending_question") or {}).get("id") or ""
+            ),
+            "response_fragment_hashes": [
+                hashlib.sha256(str(item).encode("utf-8")).hexdigest()
+                for item in candidate.get("visible_response") or ()
+            ],
+        },
+    )
 
     validate_state(candidate)
     return candidate

@@ -110,6 +110,11 @@ def action_transition_scenarios(language: str = "en") -> list[ActionTransitionSc
         return state
 
     change_group = base("change-group")
+    change_group["chain_identity"] = {
+        "raw": "ethereum",
+        "canonical": "ethereum",
+        "status": "confirmed",
+    }
 
     go_back = base("go-back")
     go_back["active_group"] = "qps_profile"
@@ -462,11 +467,39 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
     for scenario_id, group, confirmed in environment_seeds:
         state = new_state(f"coverage-{scenario_id}", language=language, session_purpose="coverage")
         state["confirmed_config"] = dict(confirmed)
+        if scenario_id == "network_interface":
+            state["discovery"] = {
+                "network": {
+                    "default_interface": "eth0",
+                    "interfaces": ["eth0"],
+                }
+            }
         add(scenario_id, state, question_for_environment(state, group))
 
     qps_state = new_state("coverage-qps-mode", language=language, session_purpose="coverage")
     qps_state["target_mode"] = "fake-node"
     qps_state["workflow_mode"] = "rpc_benchmark"
+    qps_state["chain_identity"] = {
+        "raw": "bsc",
+        "canonical": "bsc",
+        "status": "confirmed",
+    }
+    qps_state["rpc_mode"] = "single"
+    qps_state["workload"] = {"confirmed": True}
+    qps_state["group_history"] = ["workload_rpc"]
+    qps_state["confirmed_config"] = {
+        "CLOUD_REGION": "test-region",
+        "CLOUD_ZONE": "test-zone",
+        "MACHINE_TYPE": "test-machine",
+        "LEDGER_DEVICE": "vda",
+        "DATA_VOL_TYPE": "test-disk",
+        "DATA_VOL_SIZE": "100",
+        "DATA_VOL_MAX_IOPS": "3000",
+        "DATA_VOL_MAX_THROUGHPUT": "1000",
+        "has_accounts_device": False,
+        "NETWORK_INTERFACE": "eth0",
+        "NETWORK_MAX_BANDWIDTH_GBPS": "10",
+    }
     qps = question_for_performance(qps_state, "qps_profile")
     if qps:
         add("qps_mode", qps_state, qps)
@@ -1226,6 +1259,15 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
             },
             **deepcopy(runtime_extra),
         }
+        if scenario_id == "custom_needs_schema_evidence":
+            state["custom_rpc"]["endpoint"] = "http://geth-dev:8545"
+            state["custom_rpc"]["endpoint_probe"] = {
+                "ready": True,
+                "probe_id": "reviewed-custom-rpc-probe",
+            }
+            state["custom_rpc"]["catalog"]["draft"][
+                "validation_endpoint"
+            ] = "http://geth-dev:8545"
         manual_path = ""
         next_ids: tuple[str, ...] = ()
         if scenario_id == "custom_needs_method":

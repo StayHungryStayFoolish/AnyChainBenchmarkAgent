@@ -503,7 +503,22 @@ def _build_checkpoint_diff_artifact(
             "active_group": str(event.get("active_group") or ""),
             "pending_question_id": str(event.get("pending_question_id") or ""),
             "admitted_action_types": list(event.get("admitted_action_types") or ()),
+            "admitted_action_provenance": list(
+                event.get("admitted_action_provenance") or ()
+            ),
+            "turn_receipt_summary": dict(
+                event.get("turn_receipt_summary") or {}
+            ),
+            "pending_transition": dict(event.get("pending_transition") or {}),
+            "render_manifest": dict(event.get("render_manifest") or {}),
+            "execution_receipt_summary": dict(
+                event.get("execution_receipt_summary") or {}
+            ),
+            "control_receipts": list(event.get("control_receipts") or ()),
             "state_diff_hashes": dict(event.get("state_diff_hashes") or {}),
+            "material_state_diff_hashes": dict(
+                event.get("material_state_diff_hashes") or {}
+            ),
             "after_value_hashes": dict(event.get("after_value_hashes") or {}),
         })
     for turn in result.get("turns") or ():
