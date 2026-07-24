@@ -5062,7 +5062,33 @@ network:
         state["custom_rpc"] = {"status": "needs_method", "endpoint": "https://bsc-rpc.publicnode.com", "endpoint_ready": True}
         q = {"id": "custom_rpc_method", "group": "endpoint_process", "kind": "manual_value", "field": "custom_rpc_method", "manual_input_allowed": True}
         blob = 'curl https://some-other-node.example.com -X POST --data \'{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["latest",false],"id":1}\''
-        with patch("agent.harness.domains.rpc_endpoint.validate_rpc_endpoint", side_effect=_probe_ok):
+        with (
+            patch(
+                "agent.harness.domains.rpc_endpoint.validate_rpc_endpoint",
+                side_effect=_probe_ok,
+            ),
+            patch(
+                "agent.harness.domains.rpc_endpoint.extract_rpc_schema_from_evidence",
+                return_value={
+                    "method": "eth_getBlockByNumber",
+                    "params": ["latest", False],
+                    "param_schema": [
+                        {
+                            "position": 0,
+                            "wire_type": "string",
+                            "meaning": "block selector",
+                        },
+                        {
+                            "position": 1,
+                            "wire_type": "boolean",
+                            "meaning": "include full transactions",
+                        },
+                    ],
+                    "response_schema": {"type": "object"},
+                    "confidence": "high",
+                },
+            ),
+        ):
             outcome = apply_chain_rpc_answer(state, q, blob, blob)
             result = _commit_result(state, outcome, owner="chain_rpc")
         self.assertEqual(_catalog_draft(result).get("method"), "eth_getBlockByNumber")
@@ -6543,9 +6569,19 @@ network:
             "adapter_family": "jsonrpc",
             "confidence": "high",
         }
-        with patch(
-            "agent.harness.domains.chain_identity.resolve_unknown_chain_identity",
-            return_value=resolution,
+        with (
+            patch(
+                "agent.harness.domains.chain_rpc.extract_chain_mention",
+                return_value={
+                    "found": True,
+                    "chain_text": "LocalEvmDemo",
+                    "confidence": "high",
+                },
+            ),
+            patch(
+                "agent.harness.domains.chain_identity.resolve_unknown_chain_identity",
+                return_value=resolution,
+            ),
         ):
             result = process_turn(state)
 
@@ -6722,6 +6758,14 @@ network:
         with (
             patch("agent.harness.domains.chain_identity.resolve_unknown_chain_identity", return_value=dict(resolution)),
             patch(
+                "agent.harness.domains.chain_rpc.extract_chain_mention",
+                return_value={
+                    "found": True,
+                    "chain_text": "newlychain",
+                    "confidence": "high",
+                },
+            ),
+            patch(
                 "agent.harness.domains.chain_identity.run_google_search_grounding",
                 return_value=SearchGroundingResult(available=True, query="q", text_summary="NewlyChain is a real L1, jsonrpc-compatible."),
             ) as grounding,
@@ -6736,6 +6780,14 @@ network:
         # confirmation prompt still renders normally without a search line.
         with (
             patch("agent.harness.domains.chain_identity.resolve_unknown_chain_identity", return_value=dict(resolution)),
+            patch(
+                "agent.harness.domains.chain_rpc.extract_chain_mention",
+                return_value={
+                    "found": True,
+                    "chain_text": "newlychain",
+                    "confidence": "high",
+                },
+            ),
             patch("agent.harness.domains.chain_identity.run_google_search_grounding") as grounding2,
         ):
             state2 = _mk()
@@ -7504,7 +7556,17 @@ network:
         }
         state["last_user_input"] = "ethereum"
 
-        with patch("agent.harness.coordinator.resolve_action_queue") as resolver:
+        with (
+            patch("agent.harness.coordinator.resolve_action_queue") as resolver,
+            patch(
+                "agent.harness.domains.chain_rpc.extract_chain_mention",
+                return_value={
+                    "found": True,
+                    "chain_text": "ethereum",
+                    "confidence": "high",
+                },
+            ),
+        ):
             resolver.return_value = {"actions": [{"type": "choose_chain", "chain_text": "ethereum", "source_evidence": "ethereum", "confidence": "high"}]}
             result = process_turn(state)
 
@@ -13145,7 +13207,7 @@ response:
             first = process_turn(state)
 
         self.assertEqual(first["pending_question"]["id"], "inferred_config_review")
-        self.assertNotIn("resume_action_queue", first["pending_question"])
+        self.assertTrue(first["pending_question"].get("resume_action_queue"))
         self.assertEqual(
             [item.get("action_type") or item.get("type") for item in first["action_queue"]],
             ["request_target_mode_selection", "set_qps_mode"],

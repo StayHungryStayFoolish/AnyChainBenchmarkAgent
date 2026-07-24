@@ -67,11 +67,12 @@ from tests.agent_live.coverage_evidence import (
 from tests.agent_live.generate_harness_coverage_ledger import build_ledger
 
 
-BATCH_MANIFEST_SCHEMA_VERSION = 4
+BATCH_MANIFEST_SCHEMA_VERSION = 5
 BATCH_RESULT_SCHEMA_VERSION = 2
 CLEANUP_RECEIPT_SCHEMA_VERSION = 2
 BATCH_SURVIVOR_PROOF_SCHEMA_VERSION = 1
 DEFAULT_SHARD_COUNT = 32
+DEFAULT_MAX_CONCURRENCY = 4
 FORMAL_EDGE_SHARD_COUNT = 24
 FORMAL_JOURNEY_SHARD_COUNT = 8
 SHARD_LANES = frozenset({"edge", "journey"})
@@ -136,6 +137,7 @@ class FrozenBatchManifest:
     repo_root: str
     revision: Mapping[str, str]
     shard_count: int
+    max_concurrency: int
     shards: tuple[FrozenShardSpec, ...]
     required_env_names: tuple[str, ...]
     timeout_policy: TimeoutPolicy
@@ -233,6 +235,7 @@ def freeze_batch_manifest(
     manifest_path: str | Path,
     runtime_base: str | Path,
     shard_count: int = DEFAULT_SHARD_COUNT,
+    max_concurrency: int | None = None,
     seed_base: int = 10_000,
     command_factory: CommandFactory | None = None,
     expected_revision: Mapping[str, str] | None = None,
@@ -256,6 +259,19 @@ def freeze_batch_manifest(
     ).resolve()
     if shard_count < 1:
         raise ValueError("shard_count must be positive")
+    resolved_max_concurrency = (
+        min(DEFAULT_MAX_CONCURRENCY, shard_count)
+        if max_concurrency is None
+        else max_concurrency
+    )
+    if (
+        not isinstance(resolved_max_concurrency, int)
+        or isinstance(resolved_max_concurrency, bool)
+        or resolved_max_concurrency < 1
+    ):
+        raise ValueError("max_concurrency must be a positive integer")
+    if resolved_max_concurrency > shard_count:
+        raise ValueError("max_concurrency cannot exceed shard_count")
     if stderr_cap_bytes < 1:
         raise ValueError("stderr_cap_bytes must be positive")
     if worker_runtime not in {"docker", "linux"}:
@@ -473,6 +489,7 @@ def freeze_batch_manifest(
         "repo_root": str(root),
         "revision": revision,
         "shard_count": shard_count,
+        "max_concurrency": resolved_max_concurrency,
         "shards": [_shard_payload(item) for item in shards],
         "required_env_names": sorted({str(item) for item in required_env_names}),
         "timeout_policy": asdict(timeout_policy),
@@ -495,6 +512,7 @@ def freeze_batch_manifest(
         repo_root=str(root),
         revision=revision,
         shard_count=shard_count,
+        max_concurrency=resolved_max_concurrency,
         shards=tuple(shards),
         required_env_names=tuple(unsigned["required_env_names"]),
         timeout_policy=timeout_policy,
@@ -519,6 +537,7 @@ def load_frozen_manifest(path: str | Path) -> FrozenBatchManifest:
         repo_root=str(payload["repo_root"]),
         revision=dict(payload["revision"]),
         shard_count=int(payload["shard_count"]),
+        max_concurrency=int(payload["max_concurrency"]),
         shards=tuple(FrozenShardSpec(
             **{**row, "command": tuple(row["command"]),
                "target_ids": tuple(row["target_ids"]),
@@ -559,6 +578,14 @@ def validate_frozen_manifest(
         raise ValueError("discovery schema changed after manifest creation")
     if manifest.shard_count != len(manifest.shards):
         raise ValueError("manifest shard_count does not match its shard records")
+    if (
+        not isinstance(manifest.max_concurrency, int)
+        or isinstance(manifest.max_concurrency, bool)
+        or manifest.max_concurrency < 1
+    ):
+        raise ValueError("manifest max_concurrency must be a positive integer")
+    if manifest.max_concurrency > manifest.shard_count:
+        raise ValueError("manifest max_concurrency exceeds shard_count")
     if manifest.worker_runtime not in {"docker", "linux"}:
         raise ValueError("manifest worker runtime is invalid")
     if manifest.formal_profile and manifest.worker_runtime != "linux":
@@ -725,7 +752,19 @@ async def run_batch(
     if index_path.exists():
         raise FileExistsError(f"batch result index is immutable: {index_path}")
 
-    tasks = [asyncio.create_task(_run_shard(frozen, shard, broker)) for shard in frozen.shards]
+    semaphore = asyncio.Semaphore(frozen.max_concurrency)
+
+    async def run_bounded(shard: FrozenShardSpec) -> ShardResult:
+        try:
+            async with semaphore:
+                return await _run_shard(frozen, shard, broker)
+        except asyncio.CancelledError as exc:
+            return _not_started_interruption_result(frozen, shard, exc)
+
+    tasks = [
+        asyncio.create_task(run_bounded(shard))
+        for shard in frozen.shards
+    ]
     batch_interrupted = False
     try:
         gather = asyncio.gather(*tasks, return_exceptions=True)
@@ -1836,6 +1875,69 @@ def _synthetic_interruption_result(
     )
 
 
+def _not_started_interruption_result(
+    manifest: FrozenBatchManifest, shard: FrozenShardSpec, exc: BaseException
+) -> ShardResult:
+    now = time.time_ns()
+    runtime = Path(shard.runtime_root)
+    runtime.mkdir(parents=True, exist_ok=True)
+    stderr_path = runtime / "worker.stderr.redacted.txt"
+    receipt_path = runtime / "not-started-cleanup-receipt.json"
+    _atomic_write(stderr_path, b"", mode=0o600)
+    receipt = {
+        "receipt_id": "",
+        "schema_version": CLEANUP_RECEIPT_SCHEMA_VERSION,
+        "shard_id": shard.shard_id,
+        "execution_id": shard.execution_id,
+        "host_proof": {
+            "registered_processes": [],
+            "survivor_scans": [],
+            "errors": [],
+            "cleaned": True,
+        },
+        "container_proof": {
+            "registered_processes": [],
+            "zero_survivor_scans": [],
+            "errors": [],
+            "cleaned": True,
+        },
+        "worker_identity": {},
+        "exit_code": None,
+        "actions": ["worker_not_started"],
+        "errors": [],
+        "cleaned": True,
+        "started_at_ns": now,
+        "finished_at_ns": now,
+    }
+    receipt["receipt_id"] = _content_hash(
+        {key: value for key, value in receipt.items() if key != "receipt_id"}
+    )
+    _write_immutable_json(receipt_path, receipt)
+    return ShardResult(
+        shard_id=shard.shard_id,
+        classification="infrastructure_interrupted",
+        attempt_count=1,
+        started_at_ns=now,
+        finished_at_ns=now,
+        exit_code=None,
+        target_hash=shard.target_hash,
+        response_hashes=(),
+        decision_hashes=(),
+        transcript_hash="",
+        schedule_result_hash="",
+        evidence_hashes=(),
+        diagnostic_hashes=(),
+        evidence_ids=(),
+        diagnostic_ids=(str(receipt["receipt_id"]),),
+        stderr_hash=_sha256_file(stderr_path),
+        stderr_path=str(stderr_path),
+        stderr_truncated=False,
+        cleanup_receipt_path=str(receipt_path),
+        cleanup_receipt_hash=_sha256_file(receipt_path),
+        reason=str(redact(f"{type(exc).__name__}: worker not started"))[:1000],
+    )
+
+
 def _append_discovery_results(
     manifest: FrozenBatchManifest,
     results: Sequence[ShardResult],
@@ -1915,6 +2017,7 @@ def _manifest_unsigned_payload(manifest: FrozenBatchManifest) -> dict[str, Any]:
         "repo_root": manifest.repo_root,
         "revision": dict(manifest.revision),
         "shard_count": manifest.shard_count,
+        "max_concurrency": manifest.max_concurrency,
         "shards": [_shard_payload(item) for item in manifest.shards],
         "required_env_names": list(manifest.required_env_names),
         "timeout_policy": asdict(manifest.timeout_policy),
@@ -2267,6 +2370,27 @@ def _validate_composite_cleanup_receipt(
         )
     if payload["errors"]:
         raise ValueError("clean composite cleanup receipt contains errors")
+    if payload["actions"] == ["worker_not_started"]:
+        expected_host_proof = {
+            "registered_processes": [],
+            "survivor_scans": [],
+            "errors": [],
+            "cleaned": True,
+        }
+        expected_container_proof = {
+            "registered_processes": [],
+            "zero_survivor_scans": [],
+            "errors": [],
+            "cleaned": True,
+        }
+        if (
+            payload["worker_identity"] != {}
+            or payload["exit_code"] is not None
+            or payload["host_proof"] != expected_host_proof
+            or payload["container_proof"] != expected_container_proof
+        ):
+            raise ValueError("not-started cleanup receipt contains process state")
+        return
     proof_contracts = {
         "host_proof": (
             ("host_worker", "docker_exec")

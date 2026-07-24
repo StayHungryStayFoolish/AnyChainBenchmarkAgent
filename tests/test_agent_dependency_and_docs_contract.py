@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 REQUIREMENTS = ROOT / "requirements-adk.txt"
 INSTALLER = ROOT / "scripts" / "install_agent_deps.sh"
-HANDOFF = ROOT / ".agent" / "task-docs" / "2026-07-10-agent-handoff-for-external-ai.md"
+HANDOFF = ROOT / "docs" / "en" / "agent-handoff-product-verification.md"
 
 LONG_LIVED_DOCS = (
     ROOT / "README.md",

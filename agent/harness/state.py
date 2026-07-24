@@ -128,7 +128,16 @@ RESET_PRESERVED_KEYS = (
 
 DEFAULT_GROUP_ORDER = list(GROUP_ORDER)
 
-STATE_SCHEMA_VERSION = 13
+STATE_SCHEMA_VERSION = 14
+
+
+_V13_IMPLICIT_QUEUE_RESUME_QUESTION_IDS = frozenset({
+    "inferred_config_review",
+    "target_mode_change_confirm",
+    "chain_change_confirm",
+    "chain_ambiguity_confirm",
+    "unknown_chain_identity_confirm",
+})
 
 
 class UnsupportedStateVersion(RuntimeError):
@@ -202,9 +211,12 @@ def migrate_state(
         control.pop("selected_owner", None)
         control.pop("phase", None)
         fresh["control"] = control
+    if raw_version <= 13:
+        _migrate_v13_pending_queue_ownership(fresh)
+    if raw_version < STATE_SCHEMA_VERSION:
         fresh.setdefault("audit_events", []).append({
             "event": "checkpoint_schema_migrated",
-            "from_schema_version": 12,
+            "from_schema_version": raw_version,
             "to_schema_version": STATE_SCHEMA_VERSION,
             "in_flight_transition_retained": False,
         })
@@ -419,6 +431,33 @@ def _migrate_v12_action_queue_contract(state: AgentGraphState) -> None:
         "before": len(queue),
         "after": len(enveloped),
         "rejected_untrusted": rejected,
+    })
+
+
+def _migrate_v13_pending_queue_ownership(state: AgentGraphState) -> None:
+    """Materialize v13's implicit queue policy into the typed question contract.
+
+    Schema v13 let a coordinator-side question-ID allowlist retain deferred
+    actions even when the persisted question omitted ``resume_action_queue``.
+    Schema v14 retires that runtime authority. This migration preserves the
+    old checkpoint's effective behavior once, at the checkpoint boundary.
+    """
+
+    pending = state.get("pending_question")
+    queue = state.get("action_queue") or []
+    if (
+        not isinstance(pending, dict)
+        or not pending
+        or not queue
+        or str(pending.get("id") or "") not in _V13_IMPLICIT_QUEUE_RESUME_QUESTION_IDS
+    ):
+        return
+    pending["resume_action_queue"] = True
+    state.setdefault("audit_events", []).append({
+        "event": "checkpoint_v13_queue_ownership_migrated",
+        "question_id": str(pending.get("id") or ""),
+        "retained_action_count": len(queue),
+        "ownership": "pending_question.resume_action_queue",
     })
 
 

@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent.harness.runtime_identity import repository_revision
-from tests.agent_live.batch_orchestrator import validate_frozen_manifest
+from tests.agent_live.batch_orchestrator import TimeoutPolicy, validate_frozen_manifest
 from tests.agent_live.chaos_scheduler import (
     build_journey_schedule,
     journey_schedule_payload,
@@ -44,6 +44,7 @@ from tests.agent_live.formal_journey_catalog import (
 )
 from tests.agent_live.product_chaos_obligations import (
     build_product_chaos_obligations,
+    product_chaos_obligation_report,
 )
 from tests.agent_live.product_obligation_evidence import (
     admit_product_obligation_evidence,
@@ -630,12 +631,21 @@ class ProductChaosJourneyProviderTest(unittest.TestCase):
                 targets_dir=target_dir,
                 manifest_path=self.root / "batch.json",
                 runtime_base=self.root / "runtime",
+                environment={"DEEPSEEK_API_KEY": "unit-test-secret"},
             )
         self.assertEqual(
             freeze.call_args.kwargs["shard_count"],
             len(self.obligations),
         )
         self.assertEqual(freeze.call_args.kwargs["expected_revision"], REVISION)
+        self.assertEqual(
+            freeze.call_args.kwargs["required_env_names"],
+            ("DEEPSEEK_API_KEY",),
+        )
+        self.assertNotIn(
+            "unit-test-secret",
+            repr(freeze.call_args.kwargs),
+        )
 
         definitions_path = self.root / "definitions.json"
         definitions_path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -645,9 +655,12 @@ class ProductChaosJourneyProviderTest(unittest.TestCase):
             "--definitions", str(definitions_path),
             "--output-dir", str(cli_target_dir),
         ]), 0)
-        with patch(
-            "tests.agent_live.product_chaos_journey_provider.freeze_batch_manifest"
-        ) as freeze:
+        with (
+            patch.dict(os.environ, {"DEEPSEEK_API_KEY": "cli-test-secret"}),
+            patch(
+                "tests.agent_live.product_chaos_journey_provider.freeze_batch_manifest"
+            ) as freeze,
+        ):
             freeze.return_value = object()
             self.assertEqual(main([
                 "batch",
@@ -656,12 +669,63 @@ class ProductChaosJourneyProviderTest(unittest.TestCase):
                 "--output", str(self.root / "cli-batch.json"),
                 "--runtime-base", str(self.root / "cli-runtime"),
                 "--worker-runtime", "docker",
+                "--max-concurrency", "7",
+                "--shard-timeout-seconds", "901",
+                "--decision-timeout-seconds", "241",
+                "--cleanup-timeout-seconds", "6",
             ]), 0)
         self.assertEqual(
             freeze.call_args.kwargs["shard_count"],
             len(self.obligations),
         )
         self.assertEqual(freeze.call_args.kwargs["worker_runtime"], "docker")
+        self.assertEqual(freeze.call_args.kwargs["max_concurrency"], 7)
+        self.assertEqual(
+            freeze.call_args.kwargs["timeout_policy"],
+            TimeoutPolicy(
+                shard_seconds=901.0,
+                decision_seconds=241.0,
+                cleanup_seconds=6.0,
+            ),
+        )
+        self.assertNotIn("cli-test-secret", repr(freeze.call_args.kwargs))
+
+    def test_batch_fails_fast_when_required_provider_environment_is_missing(self) -> None:
+        manifest = build_product_chaos_journey_manifest(
+            self.obligations,
+            revision=REVISION,
+        )
+        target_dir = self.root / "missing-env-targets"
+        write_product_chaos_target_set(manifest, target_dir)
+
+        with (
+            patch(
+                "tests.agent_live.product_chaos_journey_provider.freeze_batch_manifest"
+            ) as freeze,
+            self.assertRaisesRegex(RuntimeError, "DEEPSEEK_API_KEY"),
+        ):
+            freeze_product_chaos_batch(
+                repo_root=self.root,
+                targets_dir=target_dir,
+                manifest_path=self.root / "missing-env-batch.json",
+                runtime_base=self.root / "missing-env-runtime",
+                environment={"DEEPSEEK_API_KEY": "   "},
+            )
+        freeze.assert_not_called()
+
+    def test_catalog_report_is_the_authority_for_g4_denominator(self) -> None:
+        report = product_chaos_obligation_report(
+            self.obligations,
+            revision=REVISION,
+        )
+        self.assertEqual(report["required_denominator"], 625)
+        self.assertEqual(
+            report["by_model"],
+            {
+                "anychain-agent-product-chaos": 176,
+                "anychain-agent-product-chaos-state-control": 449,
+            },
+        )
 
     def test_full_authoritative_catalog_freezes_and_reloads_without_mocking(self) -> None:
         repo_root = Path.cwd().resolve()
@@ -679,8 +743,13 @@ class ProductChaosJourneyProviderTest(unittest.TestCase):
             manifest_path=self.root / "full-batch.json",
             runtime_base=self.root / "full-runtime",
             worker_runtime="linux",
+            environment={"DEEPSEEK_API_KEY": "unit-test-secret"},
         )
         validate_frozen_manifest(frozen)
+        self.assertNotIn(
+            "unit-test-secret",
+            Path(frozen.manifest_path).read_text(encoding="utf-8"),
+        )
         self.assertEqual(len(frozen.shards), len(obligations))
         self.assertEqual(
             len({row.obligation_id for row in frozen.shards}),
@@ -739,6 +808,7 @@ class ProductChaosJourneyProviderTest(unittest.TestCase):
                 targets_dir=incomplete_dir,
                 manifest_path=self.root / "incomplete-batch.json",
                 runtime_base=self.root / "incomplete-runtime",
+                environment={"DEEPSEEK_API_KEY": "unit-test-secret"},
             )
 
         cross_bound_dir = self.root / "cross-bound-targets"
@@ -766,6 +836,7 @@ class ProductChaosJourneyProviderTest(unittest.TestCase):
                 targets_dir=cross_bound_dir,
                 manifest_path=self.root / "cross-bound-batch.json",
                 runtime_base=self.root / "cross-bound-runtime",
+                environment={"DEEPSEEK_API_KEY": "unit-test-secret"},
             )
 
         stale_preflight_dir = self.root / "stale-preflight-targets"
@@ -787,6 +858,7 @@ class ProductChaosJourneyProviderTest(unittest.TestCase):
                 targets_dir=stale_preflight_dir,
                 manifest_path=self.root / "stale-preflight-batch.json",
                 runtime_base=self.root / "stale-preflight-runtime",
+                environment={"DEEPSEEK_API_KEY": "unit-test-secret"},
             )
 
         drifted_payload_dir = self.root / "drifted-payload-targets"
@@ -827,6 +899,7 @@ class ProductChaosJourneyProviderTest(unittest.TestCase):
                 targets_dir=drifted_payload_dir,
                 manifest_path=self.root / "drifted-payload-batch.json",
                 runtime_base=self.root / "drifted-payload-runtime",
+                environment={"DEEPSEEK_API_KEY": "unit-test-secret"},
             )
 
     def test_catalog_rejects_tampering_and_stale_revision(self) -> None:

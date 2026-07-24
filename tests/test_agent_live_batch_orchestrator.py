@@ -28,6 +28,7 @@ from tests.agent_live.coverage_evidence import content_hash
 from tests.agent_live.generate_harness_coverage_ledger import build_ledger
 
 from tests.agent_live.batch_orchestrator import (
+    DEFAULT_MAX_CONCURRENCY,
     DEFAULT_SHARD_COUNT,
     ExternalDecisionBlocked,
     ShardResult,
@@ -71,6 +72,8 @@ parser.add_argument("--target", required=True)
 parser.add_argument("--schedule", required=True)
 parser.add_argument("--session", required=True)
 args = parser.parse_args()
+if args.mode in {"stubborn", "stubborn-after-result"}:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 runtime = Path(args.runtime)
 runtime.mkdir(parents=True, exist_ok=True)
 Path(args.marker).write_text("started\n", encoding="utf-8")
@@ -168,7 +171,6 @@ if not line.startswith(decision_prefix):
     sys.exit(10)
 json.loads(line[len(decision_prefix):])
 if args.mode == "stubborn":
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
     while True:
         time.sleep(1)
 if args.mode == "pass-slow":
@@ -281,7 +283,6 @@ if args.mode == "fragmented":
 else:
     print(result_frame, end="", flush=True)
 if args.mode == "stubborn-after-result":
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
     while True:
         time.sleep(1)
 sys.exit(exit_code)
@@ -453,6 +454,8 @@ class BatchOrchestratorTests(unittest.TestCase):
             command_factory=self._factory(["pass"] * DEFAULT_SHARD_COUNT, self.root / ".agent" / "markers"),
         )
         self.assertEqual(manifest.shard_count, 32)
+        self.assertEqual(manifest.max_concurrency, DEFAULT_MAX_CONCURRENCY)
+        self.assertLess(manifest.max_concurrency, manifest.shard_count)
         self.assertFalse(manifest_path.stat().st_mode & stat.S_IWUSR)
         self.assertNotIn("super-secret", manifest_path.read_text(encoding="utf-8"))
         loaded = load_frozen_manifest(manifest_path)
@@ -461,6 +464,147 @@ class BatchOrchestratorTests(unittest.TestCase):
         (self.targets / "01.json").write_text('{"targets": []}', encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "frozen target changed"):
             validate_frozen_manifest(manifest)
+
+    def test_max_concurrency_is_frozen_validated_and_tamper_evident(self) -> None:
+        self._write_targets(4)
+        common = {
+            "repo_root": self.root,
+            "targets_dir": self.targets,
+            "runtime_base": self.root / ".agent" / "bounded-runtime",
+            "shard_count": 4,
+            "command_factory": self._factory(
+                ["pass"] * 4, self.root / ".agent" / "bounded-markers"
+            ),
+        }
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            freeze_batch_manifest(
+                **common,
+                manifest_path=self.root / ".agent" / "zero-concurrency.json",
+                max_concurrency=0,
+            )
+        with self.assertRaisesRegex(ValueError, "cannot exceed shard_count"):
+            freeze_batch_manifest(
+                **common,
+                manifest_path=self.root / ".agent" / "excess-concurrency.json",
+                max_concurrency=5,
+            )
+
+        manifest_path = self.root / ".agent" / "bounded-manifest.json"
+        manifest = freeze_batch_manifest(
+            **common,
+            manifest_path=manifest_path,
+            max_concurrency=2,
+        )
+        self.assertEqual(manifest.max_concurrency, 2)
+        self.assertEqual(
+            json.loads(manifest_path.read_text())["max_concurrency"],
+            2,
+        )
+
+        os.chmod(manifest_path, 0o644)
+        payload = json.loads(manifest_path.read_text())
+        payload["max_concurrency"] = 3
+        manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+        os.chmod(manifest_path, 0o444)
+        with self.assertRaisesRegex(ValueError, "content hash is stale"):
+            load_frozen_manifest(manifest_path)
+
+    def test_run_batch_never_exceeds_frozen_max_concurrency(self) -> None:
+        shard_count = 12
+        max_concurrency = 3
+        self._write_targets(shard_count)
+        manifest = freeze_batch_manifest(
+            repo_root=self.root,
+            targets_dir=self.targets,
+            manifest_path=self.root / ".agent" / "concurrency-manifest.json",
+            runtime_base=self.root / ".agent" / "concurrency-runtime",
+            shard_count=shard_count,
+            max_concurrency=max_concurrency,
+            required_env_names=(),
+            command_factory=self._factory(
+                ["pass"] * shard_count,
+                self.root / ".agent" / "concurrency-markers",
+            ),
+        )
+        active = 0
+        peak = 0
+        first_wave_ready = asyncio.Event()
+        release_first_wave = asyncio.Event()
+
+        async def controlled_run(_manifest, shard, _broker):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            if active == max_concurrency:
+                first_wave_ready.set()
+            await release_first_wave.wait()
+            active -= 1
+            runtime = Path(shard.runtime_root)
+            runtime.mkdir(parents=True, exist_ok=True)
+            stderr_path = runtime / "worker.stderr.redacted.txt"
+            stderr_path.write_bytes(b"")
+            receipt_path = runtime / "cleanup-receipt.json"
+            receipt_path.write_text('{"cleaned": true}\n', encoding="utf-8")
+            empty_hash = hashlib.sha256(b"").hexdigest()
+            return ShardResult(
+                shard_id=shard.shard_id,
+                classification="passed",
+                attempt_count=1,
+                started_at_ns=1,
+                finished_at_ns=2,
+                exit_code=0,
+                target_hash=shard.target_hash,
+                response_hashes=(),
+                decision_hashes=(),
+                transcript_hash=empty_hash,
+                schedule_result_hash=empty_hash,
+                evidence_hashes=(),
+                diagnostic_hashes=(),
+                evidence_ids=(),
+                diagnostic_ids=(),
+                stderr_hash=empty_hash,
+                stderr_path=str(stderr_path),
+                stderr_truncated=False,
+                cleanup_receipt_path=str(receipt_path),
+                cleanup_receipt_hash=hashlib.sha256(
+                    receipt_path.read_bytes()
+                ).hexdigest(),
+                reason="",
+            )
+
+        async def clean_batch(_manifest):
+            return {"cleaned": True, "scans": [], "errors": []}
+
+        async def scenario():
+            task = asyncio.create_task(run_batch(
+                manifest,
+                broker=lambda _shard_id, _context: {},
+                result_index_path=self.root / ".agent" / "concurrency-index.json",
+            ))
+            await asyncio.wait_for(first_wave_ready.wait(), timeout=1)
+            await asyncio.sleep(0)
+            self.assertEqual(active, max_concurrency)
+            self.assertEqual(peak, max_concurrency)
+            release_first_wave.set()
+            return await task
+
+        with patch(
+            "tests.agent_live.batch_orchestrator._run_shard",
+            side_effect=controlled_run,
+        ), patch(
+            "tests.agent_live.batch_orchestrator._validate_composite_cleanup_receipt"
+        ), patch(
+            "tests.agent_live.batch_orchestrator._final_batch_survivor_proof",
+            side_effect=clean_batch,
+        ), patch(
+            "tests.agent_live.batch_orchestrator._append_discovery_results",
+            return_value=(),
+        ):
+            index = asyncio.run(scenario())
+
+        self.assertEqual(peak, max_concurrency)
+        self.assertEqual(active, 0)
+        self.assertEqual(index.completed, shard_count)
 
     def test_journey_discovery_attempt_uses_journey_identity(self) -> None:
         target = self.targets / "01.json"
@@ -694,6 +838,7 @@ class BatchOrchestratorTests(unittest.TestCase):
             manifest_path=self.root / ".agent" / "stress-manifest.json",
             runtime_base=self.root / ".agent" / "stress-runtime",
             shard_count=DEFAULT_SHARD_COUNT,
+            max_concurrency=DEFAULT_MAX_CONCURRENCY,
             required_env_names=(),
             command_factory=self._mixed_factory(
                 modes, self.root / ".agent" / "stress-markers"
@@ -869,7 +1014,7 @@ class BatchOrchestratorTests(unittest.TestCase):
             shard_count=1,
             command_factory=self._factory(["pass"], markers),
             timeout_policy=TimeoutPolicy(
-                shard_seconds=5, decision_seconds=5, cleanup_seconds=1
+                shard_seconds=5, decision_seconds=5, cleanup_seconds=2
             ),
         )
         result_path = self.root / ".agent" / "interrupt-index.json"
@@ -904,6 +1049,63 @@ class BatchOrchestratorTests(unittest.TestCase):
         self.assertTrue(result_path.is_file())
         receipt = json.loads(Path(index.shards[0].cleanup_receipt_path).read_text())
         self.assertTrue(receipt["cleaned"])
+
+    def test_bounded_interruption_cleans_active_and_not_started_shards(self) -> None:
+        self._write_targets(3)
+        markers = self.root / ".agent" / "bounded-interrupt-markers"
+        manifest = freeze_batch_manifest(
+            repo_root=self.root,
+            targets_dir=self.targets,
+            manifest_path=self.root / ".agent" / "bounded-interrupt-manifest.json",
+            runtime_base=self.root / ".agent" / "bounded-interrupt-runtime",
+            shard_count=3,
+            max_concurrency=1,
+            command_factory=self._factory(["pass"] * 3, markers),
+            timeout_policy=TimeoutPolicy(
+                shard_seconds=5, decision_seconds=5, cleanup_seconds=1
+            ),
+        )
+
+        async def blocked_broker(_shard_id, _context):
+            await asyncio.sleep(60)
+            raise AssertionError("interrupted broker resumed")
+
+        async def scenario():
+            interruption_event = asyncio.Event()
+            task = asyncio.create_task(run_batch(
+                manifest,
+                broker=blocked_broker,
+                result_index_path=(
+                    self.root / ".agent" / "bounded-interrupt-index.json"
+                ),
+                interruption_event=interruption_event,
+            ))
+            deadline = asyncio.get_running_loop().time() + 2
+            while not (markers / "01").exists():
+                if asyncio.get_running_loop().time() >= deadline:
+                    self.fail("bounded worker did not start before interruption")
+                await asyncio.sleep(0.01)
+            self.assertFalse((markers / "02").exists())
+            self.assertFalse((markers / "03").exists())
+            interruption_event.set()
+            return await task
+
+        index = asyncio.run(scenario())
+
+        self.assertEqual(index.execution_status, "infrastructure_interrupted")
+        self.assertEqual(
+            index.classification_counts["infrastructure_interrupted"], 3
+        )
+        receipts = [
+            json.loads(Path(row.cleanup_receipt_path).read_text())
+            for row in index.shards
+        ]
+        self.assertTrue(all(receipt["cleaned"] for receipt in receipts))
+        self.assertEqual(
+            sum(receipt["actions"] == ["worker_not_started"] for receipt in receipts),
+            2,
+        )
+        self.assertTrue(index.batch_survivor_proof["cleaned"])
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "formal control plane is Linux-only")
     def test_filesystem_broker_process_sigterm_persists_truthful_cleanup(self) -> None:
@@ -948,14 +1150,19 @@ class BatchOrchestratorTests(unittest.TestCase):
             text=True,
         )
         try:
-            deadline = time.monotonic() + 3
+            deadline = time.monotonic() + 8
             request_dir = broker_root / "requests"
             while not tuple(request_dir.glob("*.json")):
                 if process.poll() is not None:
                     stdout, stderr = process.communicate()
                     self.fail(f"broker exited before signal: {stdout}\n{stderr}")
                 if time.monotonic() >= deadline:
-                    self.fail("broker did not publish a response-bound request")
+                    process.kill()
+                    stdout, stderr = process.communicate(timeout=5)
+                    self.fail(
+                        "broker did not publish a response-bound request: "
+                        f"{stdout}\n{stderr}"
+                    )
                 time.sleep(0.01)
             process.send_signal(signal.SIGTERM)
             stdout, stderr = process.communicate(timeout=5)

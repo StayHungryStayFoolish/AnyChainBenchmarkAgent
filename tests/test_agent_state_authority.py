@@ -86,7 +86,7 @@ class InvocationContextAuthorityTest(unittest.TestCase):
         legacy_adapter.assert_not_called()
         self.assertEqual(migrated["schema_version"], current["schema_version"])
 
-    def test_v12_checkpoint_is_persisted_as_v13_once(self) -> None:
+    def test_v12_checkpoint_is_persisted_at_current_schema_once(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
         from agent.harness.state import STATE_SCHEMA_VERSION, new_state
 
@@ -111,6 +111,71 @@ class InvocationContextAuthorityTest(unittest.TestCase):
             if event.get("event") == "checkpoint_schema_migrated"
         ]
         self.assertEqual(len(migration_events), 1)
+
+    def test_v13_checkpoint_materializes_implicit_queue_resume_contract(self) -> None:
+        from agent.harness.state import STATE_SCHEMA_VERSION, migrate_state, new_state
+
+        old = new_state("v13-queue-owner", language="en")
+        old["schema_version"] = 13
+        old["pending_question"] = {
+            "contract_version": 2,
+            "id": "chain_change_confirm",
+            "group": "chain_identity",
+            "kind": "yes_no",
+            "manual_input_allowed": False,
+            "accepted_action_types": ["answer_pending"],
+            "options": [],
+            "validation": {},
+        }
+        old["action_queue"] = [{"action_type": "set_qps_mode"}]
+
+        migrated = migrate_state(
+            old,
+            thread_id="v13-queue-owner",
+            language="en",
+            session_purpose="user",
+        )
+
+        self.assertEqual(migrated["schema_version"], STATE_SCHEMA_VERSION)
+        self.assertTrue(migrated["pending_question"]["resume_action_queue"])
+        self.assertEqual(
+            [
+                event.get("event")
+                for event in migrated.get("audit_events") or []
+                if event.get("event") == "checkpoint_v13_queue_ownership_migrated"
+            ],
+            ["checkpoint_v13_queue_ownership_migrated"],
+        )
+
+    def test_current_pending_question_id_cannot_retain_queue_without_typed_contract(self) -> None:
+        from agent.harness.coordinator import adjudicate_turn_step
+        from agent.harness.state import new_state
+
+        state = new_state("typed-queue-owner", language="en")
+        state["pending_question"] = {
+            "contract_version": 2,
+            "id": "chain_change_confirm",
+            "group": "chain_identity",
+            "kind": "yes_no",
+            "manual_input_allowed": False,
+            "accepted_action_types": ["answer_pending"],
+            "options": [],
+            "validation": {},
+        }
+        state["action_queue"] = [{"action_type": "set_qps_mode"}]
+        state["last_user_input"] = "Y"
+        state["turn_context"] = {
+            "kind": "free_text",
+            "input_shape": "prose",
+            "text": "Y",
+        }
+
+        admitted = adjudicate_turn_step(state)
+
+        self.assertEqual(
+            [item.get("action_type") for item in admitted["action_queue"]],
+            ["answer_pending"],
+        )
 
     def test_invariant_recovery_projects_external_context_before_raw_checkpoint_write(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime

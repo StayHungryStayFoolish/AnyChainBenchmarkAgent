@@ -156,6 +156,66 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
         self.assertIn("HTTP 400", output)
         self.assertNotEqual(app.state.current_question_id, "install_agent_runtime")
 
+    def test_runtime_install_reuses_live_provider_readiness_and_preserves_error(self) -> None:
+        from agent.llm.types import LLMProviderError
+        from agent.terminal import repl as repl_mod
+        from agent.terminal.repl import AnyChainTerminal, TerminalSession
+
+        messages: list[str] = []
+
+        class RecordingIO:
+            def agent(self, _language: str, message: str) -> None:
+                messages.append(message)
+
+        failure = LLMProviderError(
+            "quota exhausted",
+            provider="deepseek",
+            model="deepseek-chat",
+            category="quota",
+            stage="provider_readiness",
+            status_code=402,
+            retriable=False,
+        )
+        app = AnyChainTerminal(
+            state=TerminalSession(
+                language="en",
+                current_question_id="install_agent_runtime",
+            ),
+            io=RecordingIO(),
+            session_id="install-readiness",
+            session_purpose="chaos",
+        )
+        app._startup_doctor = lambda: None  # type: ignore[method-assign]
+        with patch.object(
+            repl_mod,
+            "load_llm_config",
+            return_value=app._llm_config,
+        ), patch.object(
+            repl_mod.subprocess,
+            "run",
+            return_value=type("Completed", (), {"returncode": 0})(),
+        ), patch.object(
+            repl_mod,
+            "provider_runtime_errors",
+            return_value=[],
+        ), patch.object(
+            repl_mod,
+            "probe_provider_readiness",
+            return_value=failure,
+        ) as readiness, patch.object(
+            app,
+            "_ensure_harness",
+        ) as ensure_harness:
+            app._install_agent_runtime()
+
+        readiness.assert_called_once_with(app._llm_config)
+        ensure_harness.assert_not_called()
+        self.assertFalse(app._llm_runtime_available)
+        self.assertIs(app._llm_readiness_error, failure)
+        self.assertIn("deepseek/deepseek-chat", app._llm_unavailable_reason)
+        self.assertIn("HTTP 402", app._llm_unavailable_reason)
+        self.assertIn("HTTP 402", "\n".join(messages))
+
     def test_logs_command_reports_clean_error_for_missing_job(self) -> None:
         """`logs <bad-id>` must emit a clean "job not found" message, not a raw
 

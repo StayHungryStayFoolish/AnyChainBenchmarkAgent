@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import contextvars
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Literal, Protocol
+from typing import Any, Callable, Iterator, Literal, ParamSpec, Protocol, TypeVar
 
 
 MessageRole = Literal["system", "user", "assistant", "tool"]
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
 
 class LLMProviderError(Exception):
@@ -57,8 +60,15 @@ class LLMTurnCancelledError(KeyboardInterrupt):
 class LLMTurnContext:
     deadline: float
     timeout_seconds: float
+    cancelled: threading.Event = field(
+        default_factory=threading.Event,
+        compare=False,
+        repr=False,
+    )
 
     def remaining_seconds(self) -> float:
+        if self.cancelled.is_set():
+            raise LLMTurnCancelledError("active Agent turn was cancelled")
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             raise LLMTurnTimeoutError(f"Agent turn exceeded its {self.timeout_seconds:g}s deadline")
@@ -109,6 +119,31 @@ def ensure_turn_active() -> None:
     context = _TURN_CONTEXT.get()
     if context is not None:
         context.remaining_seconds()
+
+
+def copy_llm_turn_context() -> contextvars.Context:
+    """Capture the current turn context for one independently run worker."""
+
+    return contextvars.copy_context()
+
+
+def run_in_llm_turn_context(
+    context: contextvars.Context,
+    callback: Callable[_P, _R],
+    *args: _P.args,
+    **kwargs: _P.kwargs,
+) -> _R:
+    """Run one worker with the captured absolute deadline and cancellation."""
+
+    return context.run(callback, *args, **kwargs)
+
+
+def cancel_active_llm_turn() -> None:
+    """Cooperatively stop sibling work that shares the active turn context."""
+
+    context = _TURN_CONTEXT.get()
+    if context is not None:
+        context.cancelled.set()
 
 
 @dataclass(frozen=True)

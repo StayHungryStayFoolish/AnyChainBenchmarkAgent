@@ -16,7 +16,13 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from ..llm.providers import provider_from_config
-from ..llm.types import LLMProviderError, LLMTurnTimeoutError
+from ..llm.types import (
+    LLMProviderError,
+    LLMTurnTimeoutError,
+    cancel_active_llm_turn,
+    copy_llm_turn_context,
+    run_in_llm_turn_context,
+)
 from .action_registry import (
     ACTION_BY_TYPE,
     ACTION_SPECS,
@@ -346,9 +352,13 @@ def resolve_product_action_queue(
         owner_inputs = [
             item for item in owner_inputs if item[0] not in owner_documents
         ]
-        with ThreadPoolExecutor(max_workers=max(1, len(owner_inputs))) as executor:
+        executor = ThreadPoolExecutor(max_workers=max(1, len(owner_inputs)))
+        futures = []
+        try:
             futures = [
                 executor.submit(
+                    run_in_llm_turn_context,
+                    copy_llm_turn_context(),
                     _compile_owner_document,
                     state,
                     owner,
@@ -362,6 +372,14 @@ def resolve_product_action_queue(
                 (owner, unit_ids, future.result())
                 for (owner, unit_ids, _groups), future in zip(owner_inputs, futures)
             ]
+        except BaseException:
+            cancel_active_llm_turn()
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
         for owner, _unit_ids, (document, errors, owner_request_sizes) in owner_results:
             stage_b_calls += len(owner_request_sizes)
             request_sizes.extend(owner_request_sizes)

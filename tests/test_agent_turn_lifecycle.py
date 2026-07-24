@@ -11,9 +11,11 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,6 +24,42 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class TurnBudgetContractTest(unittest.TestCase):
+    def test_copied_worker_context_shares_deadline_and_cancellation(self) -> None:
+        from agent.llm.types import (
+            LLMTurnCancelledError,
+            cancel_active_llm_turn,
+            copy_llm_turn_context,
+            ensure_turn_active,
+            llm_turn_scope,
+            remaining_turn_seconds,
+            run_in_llm_turn_context,
+        )
+
+        entered = threading.Event()
+        proceed = threading.Event()
+
+        def worker() -> float:
+            remaining = remaining_turn_seconds()
+            entered.set()
+            self.assertTrue(proceed.wait(timeout=1))
+            ensure_turn_active()
+            return remaining
+
+        with llm_turn_scope(1):
+            time.sleep(0.03)
+            context = copy_llm_turn_context()
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    run_in_llm_turn_context,
+                    context,
+                    worker,
+                )
+                self.assertTrue(entered.wait(timeout=1))
+                cancel_active_llm_turn()
+                proceed.set()
+                with self.assertRaises(LLMTurnCancelledError):
+                    future.result(timeout=1)
+
     def test_bounded_recovery_and_repair_use_remaining_whole_turn_budget(self) -> None:
         from agent.harness.intent import resolve_action_queue
         from agent.llm.types import LLMResponse, llm_turn_scope, remaining_turn_seconds
@@ -206,6 +244,111 @@ class TurnBudgetContractTest(unittest.TestCase):
 
         self.assertEqual(raised.exception.category, "configuration")
         self.assertEqual(raised.exception.status_code, 400)
+
+    def test_malformed_openai_success_response_is_typed_at_provider_boundary(
+        self,
+    ) -> None:
+        from agent.llm.config import LLMConfig
+        from agent.llm.providers import DeepSeekProvider
+        from agent.llm.types import (
+            LLMMessage,
+            LLMProviderError,
+            LLMRequest,
+            llm_turn_scope,
+        )
+
+        malformed_responses = (
+            types.SimpleNamespace(choices=[]),
+            types.SimpleNamespace(
+                choices=[types.SimpleNamespace(message=types.SimpleNamespace())]
+            ),
+            types.SimpleNamespace(
+                choices=[
+                    types.SimpleNamespace(
+                        message=types.SimpleNamespace(content="")
+                    )
+                ]
+            ),
+        )
+        config = LLMConfig(
+            provider="deepseek",
+            model="deepseek-chat",
+            deepseek_api_key="secret",
+            deepseek_api_key_present=True,
+        )
+        httpx_module = types.ModuleType("httpx")
+        httpx_module.Timeout = lambda **values: types.SimpleNamespace(**values)
+
+        for response in malformed_responses:
+            with self.subTest(response=response):
+                class OpenAI:
+                    def __init__(self, **_kwargs):
+                        self.chat = types.SimpleNamespace(
+                            completions=types.SimpleNamespace(
+                                create=lambda **_call: response
+                            )
+                        )
+
+                module = types.ModuleType("openai")
+                module.OpenAI = OpenAI
+                with patch.dict(
+                    sys.modules,
+                    {"openai": module, "httpx": httpx_module},
+                ):
+                    with llm_turn_scope(2):
+                        with self.assertRaises(LLMProviderError) as raised:
+                            DeepSeekProvider(config).complete(
+                                LLMRequest(
+                                    messages=[
+                                        LLMMessage(role="user", content="hello")
+                                    ]
+                                )
+                            )
+
+                self.assertEqual(raised.exception.category, "response")
+                self.assertEqual(
+                    raised.exception.stage,
+                    "provider_response",
+                )
+
+    def test_malformed_native_success_responses_are_typed_at_provider_boundary(
+        self,
+    ) -> None:
+        from agent.llm.config import LLMConfig
+        from agent.llm.providers import _anthropic_text, _gemini_text
+        from agent.llm.types import LLMProviderError
+
+        cases = (
+            (
+                _gemini_text,
+                LLMConfig(
+                    provider="gemini",
+                    model="gemini-test",
+                    gemini_api_key="secret",
+                    gemini_api_key_present=True,
+                ),
+                {"candidates": []},
+            ),
+            (
+                _anthropic_text,
+                LLMConfig(
+                    provider="claude",
+                    model="claude-test",
+                    anthropic_api_key="secret",
+                    anthropic_api_key_present=True,
+                ),
+                {"content": [{"type": "text"}]},
+            ),
+        )
+        for extractor, config, response in cases:
+            with self.subTest(provider=config.provider):
+                with self.assertRaises(LLMProviderError) as raised:
+                    extractor(config, response)
+                self.assertEqual(raised.exception.category, "response")
+                self.assertEqual(
+                    raised.exception.stage,
+                    "provider_response",
+                )
 
 
 class TurnCheckpointContractTest(unittest.TestCase):

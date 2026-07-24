@@ -114,14 +114,6 @@ from agent.workflows.group_registry import (
     is_user_navigable_group,
     reconfiguration_question_for_field,
 )
-QUEUE_RESUME_PENDING_IDS = {
-    "inferred_config_review",
-    "target_mode_change_confirm",
-    "chain_change_confirm",
-    "chain_ambiguity_confirm",
-    "unknown_chain_identity_confirm",
-}
-
 _ADMISSION_METADATA_KEYS = (
     "_semantic_admission_receipt",
     "_proposal_field_receipts",
@@ -727,10 +719,7 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
         return _set_turn_phase(state, "compose", "pending_literal_rejected")
     if pending_fits:
         pending_question_id = str(pending.get("id") or "")
-        resume_queue = bool(
-            pending.get("resume_action_queue")
-            or pending_question_id in QUEUE_RESUME_PENDING_IDS
-        )
+        resume_queue = pending.get("resume_action_queue") is True
         matched, selected_value = contract_exact_answer(text, pending)
         action = {
             "type": "answer_pending",
@@ -1121,14 +1110,22 @@ def admit_turn_step(state: AgentGraphState) -> AgentGraphState:
         default_origin_group=origin_group,
         default_plan_scope=scope,
     )
-    if (
-        str(pending.get("id") or "") == "inferred_config_review"
-        and not any(str(item.get("type") or "") == "answer_pending" for item in durable_actions)
-        and not extends_active_config_review
+    queue_deferred_by_pending_contract = bool(
+        pending
+        and ordered_queue
         and not any(
             _action_can_run_while_pending(state, dict(item))
             for item in ordered_actions
         )
+    )
+    if queue_deferred_by_pending_contract:
+        pending["resume_action_queue"] = True
+        state["pending_question"] = pending
+    if (
+        str(pending.get("id") or "") == "inferred_config_review"
+        and not any(str(item.get("type") or "") == "answer_pending" for item in durable_actions)
+        and not extends_active_config_review
+        and queue_deferred_by_pending_contract
     ):
         state["action_queue"] = ordered_queue
         return _set_turn_phase(state, "compose", "config_review_barrier")

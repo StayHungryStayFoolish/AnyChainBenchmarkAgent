@@ -9,6 +9,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tests.agent_live.chaos_scheduler import (
     build_journey_schedule,
@@ -37,13 +38,18 @@ from tests.agent_live.retained_regression_attestations import (
     build_variant_attestation,
 )
 from tests.agent_live.retained_regression_runner import (
+    build_retained_regression_definition_manifest,
     build_product_obligation_evidence_artifact,
     build_retained_regression_runner_provider,
+    convert_completed_retained_journey_to_product_evidence,
+    execute_exact_retained_regressions,
+    freeze_retained_regression_open_batch,
     RETAINED_REGRESSION_JOURNEY_VERIFIER_REGISTRY,
     RETAINED_REGRESSION_REGISTRY_IMPORT,
     _write_exact_retained_artifacts,
     retained_regression_journey_definitions,
     validate_retained_regression_runner_provider,
+    write_retained_regression_target_set,
 )
 
 
@@ -128,17 +134,46 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
             for forbidden in ("turns", "messages", "future_user_turns", "dialogue"):
                 self.assertNotIn(f'"{forbidden}"', serialized)
 
-    def test_provider_remains_blocked_at_unresolved_trust_boundaries(self) -> None:
+    def test_provider_is_ready_with_auditable_non_cryptographic_attestation(self) -> None:
         registry = self.provider["verifier_registry"]
+        self.assertEqual(registry["execution_readiness"], "ready")
+        self.assertEqual(registry["execution_blockers"], [])
+        self.assertEqual(registry["unsupported_postcondition_ids"], [])
+        self.assertEqual(
+            registry["simulator_attestation_policy"],
+            {
+                "required": True,
+                "identity_strength": "auditable_declaration_only",
+                "cryptographic_identity_claimed": False,
+                "selection_mode": "response_driven",
+                "prewritten_future_turns": False,
+            },
+        )
+
+    def test_missing_postcondition_evaluator_blocks_execution(self) -> None:
+        evaluator_path = (
+            "tests.agent_live.retained_regression_runner."
+            "_IMPLEMENTED_POSTCONDITION_EVALUATORS"
+        )
+        incomplete = {
+            key: value
+            for key, value in RETAINED_REGRESSION_JOURNEY_VERIFIER_REGISTRY.definitions.items()
+            if key != "current_turn_language_preserved"
+        }
+        with patch(evaluator_path, incomplete):
+            provider = build_retained_regression_runner_provider(
+                obligations=self.obligations,
+                revision=REVISION,
+            )
+        registry = provider["verifier_registry"]
         self.assertEqual(registry["execution_readiness"], "blocked")
         self.assertEqual(
             registry["execution_blockers"],
             [
-                "external_codex_actor_authentication_unavailable",
-                "independent_variant_semantic_verification_not_implemented",
+                "missing_postcondition_evaluator:"
+                "current_turn_language_preserved"
             ],
         )
-        self.assertEqual(registry["unsupported_postcondition_ids"], [])
 
     def test_registry_is_importable_and_fail_closed(self) -> None:
         registry = load_verifier_registry(RETAINED_REGRESSION_REGISTRY_IMPORT)
@@ -561,6 +596,202 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
             rejection.details["receipt_ids"],
             [rejected["receipt_id"]],
         )
+
+    def test_open_definition_target_and_bounded_batch_pipeline(self) -> None:
+        manifest = build_retained_regression_definition_manifest(self.provider)
+        self.assertEqual(manifest["definition_count"], 45)
+        self.assertFalse(manifest["prewritten_future_turns"])
+        serialized = json.dumps(manifest)
+        for forbidden in ('"turns"', '"messages"', '"future_user_turns"'):
+            self.assertNotIn(forbidden, serialized)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            targets_dir = root / "targets"
+            target_manifest_path = write_retained_regression_target_set(
+                provider=self.provider,
+                definition_manifest=manifest,
+                output_dir=targets_dir,
+            )
+            target_manifest = json.loads(
+                target_manifest_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(target_manifest["target_count"], 45)
+            self.assertEqual(
+                len(tuple(targets_dir.glob("[0-9][0-9].json"))),
+                45,
+            )
+
+            sentinel = object()
+            with patch(
+                "tests.agent_live.retained_regression_runner."
+                "freeze_batch_manifest",
+                return_value=sentinel,
+            ) as freeze:
+                result = freeze_retained_regression_open_batch(
+                    repo_root=REPO_ROOT,
+                    provider=self.provider,
+                    targets_dir=targets_dir,
+                    manifest_path=root / "batch.json",
+                    runtime_base=root / "runtime",
+                    max_concurrency=4,
+                )
+            self.assertIs(result, sentinel)
+            kwargs = freeze.call_args.kwargs
+            self.assertEqual(kwargs["shard_count"], 45)
+            self.assertEqual(kwargs["max_concurrency"], 4)
+            self.assertFalse(kwargs["formal_profile"])
+            self.assertEqual(
+                kwargs["expected_obligation_set_hash"],
+                target_manifest["expected_obligation_set_hash"],
+            )
+
+            target = targets_dir / "01.json"
+            target.write_text("{}\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "differs"):
+                freeze_retained_regression_open_batch(
+                    repo_root=REPO_ROOT,
+                    provider=self.provider,
+                    targets_dir=targets_dir,
+                    manifest_path=root / "tampered-batch.json",
+                    runtime_base=root / "runtime-2",
+                )
+
+    def test_exact_suite_executes_all_15_authoritative_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "exact"
+
+            def fake_execute(**kwargs):
+                target = kwargs["target"]
+                runtime = (
+                    kwargs["output_root"]
+                    / f"fake-{target['obligation_id']}"
+                )
+                runtime.mkdir()
+                evidence = runtime / "evidence.json"
+                evidence.write_text(
+                    json.dumps({"obligation_id": target["obligation_id"]}),
+                    encoding="utf-8",
+                )
+                return evidence
+
+            with patch(
+                "tests.agent_live.retained_regression_runner."
+                "execute_exact_retained_regression",
+                side_effect=fake_execute,
+            ) as execute:
+                paths = execute_exact_retained_regressions(
+                    repo_root=REPO_ROOT,
+                    provider=self.provider,
+                    obligations=self.obligations,
+                    output_root=output,
+                )
+            self.assertEqual(len(paths), 15)
+            self.assertEqual(execute.call_count, 15)
+            index = json.loads(
+                (output / "execution-index.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(index["scheduled"], 15)
+            self.assertEqual(index["completed"], 15)
+
+    def test_completed_journey_converts_retained_runtime_artifacts(self) -> None:
+        obligation = next(
+            row for row in self.obligations
+            if row["variant"] != "exact"
+        )
+        target = next(
+            row for row in self.provider["targets"]
+            if row["obligation_id"] == obligation["obligation_id"]
+        )
+        context = self._one_turn_context(target)
+        execution_id = "response-driven-run"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifacts = self._write_bound_artifacts(
+                root,
+                obligation=obligation,
+                target=target,
+                context=context,
+                execution_id=execution_id,
+            )
+            retained = {
+                role: {
+                    "path": str(path),
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+                for role, path in artifacts.items()
+            }
+            schedule = build_journey_schedule(
+                revision=REVISION,
+                seed=20260724,
+                journey=target["journey_definition"]["journey"],
+            )
+            (root / "journey-schedule.json").write_text(
+                json.dumps(journey_schedule_payload(schedule)),
+                encoding="utf-8",
+            )
+            source_turn = {
+                "turn_identity": {
+                    "previous_response_received_at_ns": (
+                        context.latest_turn.previous_response_received_at_ns
+                    ),
+                    "agent_response_received_at_ns": (
+                        context.latest_turn.agent_response_received_at_ns
+                    ),
+                }
+            }
+            source_evidence = {
+                "evidence_id": "journey-evidence",
+                "execution_id": execution_id,
+                "provider": "deepseek",
+                "model": "deepseek-chat",
+                "turns": [source_turn],
+                "retained_artifacts": retained,
+            }
+            evidence_dir = root / "evidence"
+            evidence_dir.mkdir()
+            source_path = evidence_dir / "journey.json"
+            source_path.write_text(
+                json.dumps(source_evidence),
+                encoding="utf-8",
+            )
+            result = {
+                "schema_version": 1,
+                "journey_id": obligation["obligation_id"],
+                "schedule_id": schedule.schedule_id,
+                "revision": REVISION,
+                "terminal_classification": "passed",
+                "execution_status": "passed",
+                "qualifying_evidence": True,
+                "evidence_id": "journey-evidence",
+                "evidence_path": str(source_path),
+                "turns": [source_turn],
+            }
+            (root / "journey-result.json").write_text(
+                json.dumps(result),
+                encoding="utf-8",
+            )
+            output = root / "product-evidence.json"
+            with patch(
+                "tests.agent_live.retained_regression_runner."
+                "validate_journey_evidence_artifact"
+            ):
+                converted = (
+                    convert_completed_retained_journey_to_product_evidence(
+                        obligation=obligation,
+                        target=target,
+                        revision=REVISION,
+                        runtime_root=root,
+                        evidence_path=output,
+                    )
+                )
+            self.assertEqual(converted, output)
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(payload["obligation_id"], obligation["obligation_id"])
+            self.assertEqual(
+                payload["execution"]["runner"],
+                "retained-regression-response-driven-journey-v1",
+            )
 
     def _one_turn_context(self, target: dict) -> JourneyVerifierContext:
         base = self._empty_context(target)

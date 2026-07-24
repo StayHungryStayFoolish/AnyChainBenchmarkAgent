@@ -65,6 +65,7 @@ JOURNEY_RUNNER = "dynamic_dual_ai_journey"
 REAL_PTY_TRANSPORT = "real_pty"
 DEFAULT_PROVIDER = "deepseek"
 DEFAULT_MODEL = "deepseek-chat"
+DEFAULT_REQUIRED_ENV_NAMES = ("DEEPSEEK_API_KEY",)
 
 _SOURCE_CLASSIFICATION_TO_OUTCOME = {
     "passed": "passed",
@@ -397,10 +398,17 @@ def freeze_product_chaos_batch(
     manifest_path: str | Path,
     runtime_base: str | Path,
     worker_runtime: str = "linux",
+    max_concurrency: int | None = None,
+    required_env_names: Sequence[str] = DEFAULT_REQUIRED_ENV_NAMES,
     timeout_policy: TimeoutPolicy = TimeoutPolicy(),
+    environment: Mapping[str, str] | None = None,
 ) -> Any:
     """Freeze one G4 batch while preserving every target's own schedule seed."""
 
+    normalized_required_env_names = _require_execution_environment(
+        required_env_names,
+        environment=environment,
+    )
     target_root = Path(targets_dir).resolve()
     target_manifest = _load_mapping(
         target_root / "manifest.json",
@@ -587,11 +595,41 @@ def freeze_product_chaos_batch(
         manifest_path=manifest_path,
         runtime_base=runtime_base,
         shard_count=len(targets),
+        max_concurrency=max_concurrency,
         expected_revision=revision,
+        required_env_names=normalized_required_env_names,
         timeout_policy=timeout_policy,
         worker_runtime=worker_runtime,
         expected_obligation_set_hash=expected_set_hash,
     )
+
+
+def _require_execution_environment(
+    required_env_names: Sequence[str],
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> tuple[str, ...]:
+    """Fail before freezing when a required provider credential is unavailable."""
+
+    names = tuple(sorted({
+        str(name).strip()
+        for name in required_env_names
+        if str(name).strip()
+    }))
+    if not names:
+        raise ValueError("G4 batch requires at least one required environment name")
+    active_environment = os.environ if environment is None else environment
+    missing = tuple(
+        name
+        for name in names
+        if not str(active_environment.get(name) or "").strip()
+    )
+    if missing:
+        raise RuntimeError(
+            "G4 batch required environment is missing or empty: "
+            + ", ".join(missing)
+        )
+    return names
 
 
 def convert_completed_journey_to_product_evidence(
@@ -1577,6 +1615,22 @@ def _parser() -> argparse.ArgumentParser:
     batch.add_argument("--output", required=True, type=Path)
     batch.add_argument("--runtime-base", required=True, type=Path)
     batch.add_argument("--worker-runtime", choices=("linux", "docker"), default="linux")
+    batch.add_argument("--max-concurrency", type=_positive_int)
+    batch.add_argument(
+        "--shard-timeout-seconds",
+        type=_positive_float,
+        default=TimeoutPolicy().shard_seconds,
+    )
+    batch.add_argument(
+        "--decision-timeout-seconds",
+        type=_positive_float,
+        default=TimeoutPolicy().decision_seconds,
+    )
+    batch.add_argument(
+        "--cleanup-timeout-seconds",
+        type=_positive_float,
+        default=TimeoutPolicy().cleanup_seconds,
+    )
 
     evidence = subparsers.add_parser(
         "evidence",
@@ -1590,6 +1644,20 @@ def _parser() -> argparse.ArgumentParser:
     evidence.add_argument("--provider", default=DEFAULT_PROVIDER)
     evidence.add_argument("--model", default=DEFAULT_MODEL)
     return parser
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be greater than zero")
+    return parsed
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1608,6 +1676,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             manifest_path=args.output,
             runtime_base=args.runtime_base,
             worker_runtime=args.worker_runtime,
+            max_concurrency=args.max_concurrency,
+            timeout_policy=TimeoutPolicy(
+                shard_seconds=args.shard_timeout_seconds,
+                decision_seconds=args.decision_timeout_seconds,
+                cleanup_seconds=args.cleanup_timeout_seconds,
+            ),
         )
         return 0
 

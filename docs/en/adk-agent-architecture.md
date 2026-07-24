@@ -198,12 +198,13 @@ edit it manually. If a user changes an earlier answer, the Harness must update
 or invalidate the affected group state and regenerate downstream runtime
 artifacts through deterministic tools.
 
-Checkpoint state uses schema version 13. Current-version turns never invoke a
-legacy action compiler. Version 12 checkpoints cross one explicit migration
-adapter and are immediately persisted as version 13. Older checkpoints are
-quarantined: only an allowlisted set of environment facts is exposed for
-reconfirmation, and old pending actions or guessed plan files are never
-resumed as executable work.
+Checkpoint state uses schema version 14. Current-version turns never invoke a
+legacy action compiler. Version 12 checkpoints cross the explicit migration
+boundary; version 13 checkpoints additionally migrate deferred-queue retention
+into the typed pending-question contract before being persisted as version 14.
+Older checkpoints are quarantined: only an allowlisted set of environment
+facts is exposed for reconfirmation, and old pending actions or guessed plan
+files are never resumed as executable work.
 
 ## Google Search Boundary
 

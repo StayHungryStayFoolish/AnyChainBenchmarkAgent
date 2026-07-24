@@ -7,14 +7,21 @@ not execute the CLI, choose future response-driven turns, or claim outcomes.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
+import tempfile
 import time
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from agent.harness.runtime_identity import repository_revision
+from tests.agent_live.batch_orchestrator import (
+    TimeoutPolicy,
+    freeze_batch_manifest,
+)
 from tests.agent_live.coverage_evidence import (
     PtyCliTurnRecord,
     RuntimeTurnEvent,
@@ -37,6 +44,7 @@ from tests.agent_live.dynamic_dual_ai_chaos import (
     _runtime_event_from_mapping,
     _provider_model_from_startup,
     build_journey_outcome_verifier_registry,
+    validate_journey_evidence_artifact,
     transport_for_config,
 )
 from tests.agent_live.product_obligation_evidence import (
@@ -46,6 +54,7 @@ from tests.agent_live.retained_regression_obligations import (
     KNOWN_POSTCONDITION_IDS,
     POSTCONDITION_REGISTRY_ID,
     RETAINED_REGRESSION_OBLIGATION_COUNT,
+    build_retained_regression_obligations,
     validate_retained_regression_obligations,
 )
 from tests.agent_live.retained_regression_predicates import (
@@ -68,10 +77,20 @@ RETAINED_REGRESSION_REGISTRY_IMPORT = (
 )
 RETAINED_REGRESSION_SEED = 20260724
 REQUIRED_ARTIFACT_ROLES = ("transcript", "runtime_events", "checkpoint_diff")
-LIVE_EXECUTION_BLOCKERS = (
-    "external_codex_actor_authentication_unavailable",
-    "independent_variant_semantic_verification_not_implemented",
-)
+RETAINED_REGRESSION_DEFINITION_MANIFEST_SCHEMA_VERSION = 1
+RETAINED_REGRESSION_TARGET_SET_SCHEMA_VERSION = 1
+RETAINED_REGRESSION_EXACT_COUNT = 15
+RETAINED_REGRESSION_OPEN_COUNT = 45
+DEFAULT_PROVIDER = "deepseek"
+DEFAULT_MODEL = "deepseek-chat"
+
+_AUDITABLE_ACTOR_ATTESTATION_POLICY = {
+    "required": True,
+    "identity_strength": "auditable_declaration_only",
+    "cryptographic_identity_claimed": False,
+    "selection_mode": "response_driven",
+    "prewritten_future_turns": False,
+}
 
 _RULE_CLASSES: Mapping[str, tuple[str, ...]] = {
     "response_visible": (
@@ -410,6 +429,14 @@ def build_retained_regression_runner_provider(
         revision=active_revision,
     )
     verifier_rules = _build_verifier_rules()
+    unsupported = sorted(
+        set(KNOWN_POSTCONDITION_IDS)
+        - set(_IMPLEMENTED_POSTCONDITION_EVALUATORS)
+    )
+    execution_blockers = [
+        f"missing_postcondition_evaluator:{postcondition_id}"
+        for postcondition_id in unsupported
+    ]
     targets = tuple(
         _build_target(dict(obligation), verifier_rules=verifier_rules)
         for obligation in obligations
@@ -429,13 +456,11 @@ def build_retained_regression_runner_provider(
                 RETAINED_REGRESSION_JOURNEY_VERIFIER_REGISTRY.registry_id
             ),
             "source_contract_registry_id": POSTCONDITION_REGISTRY_ID,
-            "execution_readiness": (
-                "ready" if not LIVE_EXECUTION_BLOCKERS else "blocked"
-            ),
-            "execution_blockers": list(LIVE_EXECUTION_BLOCKERS),
-            "unsupported_postcondition_ids": sorted(
-                set(KNOWN_POSTCONDITION_IDS)
-                - set(_IMPLEMENTED_POSTCONDITION_EVALUATORS)
+            "execution_readiness": "ready" if not execution_blockers else "blocked",
+            "execution_blockers": execution_blockers,
+            "unsupported_postcondition_ids": unsupported,
+            "simulator_attestation_policy": dict(
+                _AUDITABLE_ACTOR_ATTESTATION_POLICY
             ),
             "rules": [
                 verifier_rules[key] for key in sorted(verifier_rules)
@@ -461,6 +486,234 @@ def retained_regression_journey_definitions(
         dict(target["journey_definition"])
         for target in provider.get("targets") or ()
         if target.get("variant") != "exact"
+    )
+
+
+def write_retained_regression_provider(
+    *,
+    repo_root: str | Path,
+    output_path: str | Path,
+) -> Path:
+    """Build and immutably write the authoritative G3 provider."""
+
+    root = Path(repo_root).resolve()
+    revision = repository_revision(root)
+    obligations = build_retained_regression_obligations(
+        repo_root=root,
+        revision=revision,
+    )
+    provider = build_retained_regression_runner_provider(
+        obligations=obligations,
+        revision=revision,
+    )
+    return _write_json_once(Path(output_path).resolve(), provider)
+
+
+def load_retained_regression_provider(
+    *,
+    repo_root: str | Path,
+    provider_path: str | Path,
+    require_current_revision: bool = True,
+) -> tuple[dict[str, Any], tuple[dict[str, Any], ...], dict[str, str]]:
+    """Load a provider and recompile its complete authoritative catalog."""
+
+    root = Path(repo_root).resolve()
+    provider = _load_mapping(
+        Path(provider_path).resolve(),
+        "retained regression provider",
+    )
+    revision = _validated_revision(provider.get("revision_binding") or {})
+    if require_current_revision and repository_revision(root) != revision:
+        raise ValueError("retained regression provider revision is not current")
+    obligations = build_retained_regression_obligations(
+        repo_root=root,
+        revision=revision,
+    )
+    validate_retained_regression_runner_provider(
+        provider,
+        obligations=obligations,
+        revision=revision,
+    )
+    return provider, obligations, revision
+
+
+def build_retained_regression_definition_manifest(
+    provider: Mapping[str, Any],
+    *,
+    obligation_id: str | None = None,
+) -> dict[str, Any]:
+    """Freeze all or one of the 45 open G3 Journey definitions."""
+
+    if (
+        provider.get("execution_status") != "not_run"
+        or dict(provider.get("verifier_registry") or {}).get(
+            "execution_readiness"
+        )
+        != "ready"
+    ):
+        raise ValueError("retained regression provider is not execution ready")
+    selected = [
+        dict(target)
+        for target in provider.get("targets") or ()
+        if target.get("variant") != "exact"
+        and (
+            obligation_id is None
+            or target.get("obligation_id") == obligation_id
+        )
+    ]
+    if obligation_id is not None and len(selected) != 1:
+        raise ValueError(f"unknown open G3 obligation: {obligation_id}")
+    if obligation_id is None and len(selected) != RETAINED_REGRESSION_OPEN_COUNT:
+        raise ValueError("G3 provider does not contain all 45 open obligations")
+    definitions = []
+    for target in selected:
+        definition = dict(target["journey_definition"])
+        _reject_future_turns(definition)
+        definitions.append({
+            "obligation_id": target["obligation_id"],
+            "obligation_contract_hash": target["obligation_contract_hash"],
+            "variant": target["variant"],
+            "definition": definition,
+            "definition_hash": content_hash(definition),
+        })
+    unsigned = {
+        "schema_version": (
+            RETAINED_REGRESSION_DEFINITION_MANIFEST_SCHEMA_VERSION
+        ),
+        "artifact_type": "retained_regression_journey_definition_manifest",
+        "provider_hash": provider["provider_hash"],
+        "revision_binding": dict(provider["revision_binding"]),
+        "selection": "single" if obligation_id else "all",
+        "definition_count": len(definitions),
+        "generation_is_execution": False,
+        "prewritten_future_turns": False,
+        "actor_attestation_policy": dict(
+            _AUDITABLE_ACTOR_ATTESTATION_POLICY
+        ),
+        "definitions": definitions,
+    }
+    manifest = {**unsigned, "manifest_hash": content_hash(unsigned)}
+    _reject_future_turns(manifest)
+    return manifest
+
+
+def write_retained_regression_definition_manifest(
+    manifest: Mapping[str, Any],
+    output_path: str | Path,
+) -> Path:
+    """Write a G3 definition manifest without replacing an existing artifact."""
+
+    return _write_json_once(Path(output_path).resolve(), dict(manifest))
+
+
+def write_retained_regression_target_set(
+    *,
+    provider: Mapping[str, Any],
+    definition_manifest: Mapping[str, Any],
+    output_dir: str | Path,
+) -> Path:
+    """Materialize immutable numbered targets for the shared batch runtime."""
+
+    definitions = _validated_definition_manifest(
+        provider=provider,
+        manifest=definition_manifest,
+        require_all=True,
+    )
+    destination = Path(output_dir).resolve()
+    if destination.exists():
+        raise FileExistsError(f"G3 target directory is immutable: {destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f".{destination.name}-staging-",
+        dir=destination.parent,
+    ) as temporary:
+        staging = Path(temporary)
+        target_rows: list[dict[str, Any]] = []
+        for index, row in enumerate(definitions, start=1):
+            payload = _batch_target_payload(row["definition"])
+            name = f"{index:02d}.json"
+            encoded = _json_bytes(payload)
+            (staging / name).write_bytes(encoded)
+            frozen = dict(payload["frozen_execution"])
+            target_rows.append({
+                "index": index,
+                "obligation_id": row["obligation_id"],
+                "obligation_contract_hash": row[
+                    "obligation_contract_hash"
+                ],
+                "variant": row["variant"],
+                "seed": frozen["seed"],
+                "schedule_id": frozen["schedule_id"],
+                "subject_group": frozen["subject_group"],
+                "path": name,
+                "sha256": hashlib.sha256(encoded).hexdigest(),
+            })
+        obligation_set = [
+            {
+                "obligation_id": row["obligation_id"],
+                "schedule_id": row["schedule_id"],
+                "seed": row["seed"],
+                "subject_group": row["subject_group"],
+            }
+            for row in target_rows
+        ]
+        unsigned = {
+            "schema_version": RETAINED_REGRESSION_TARGET_SET_SCHEMA_VERSION,
+            "artifact_type": "retained_regression_target_set",
+            "provider_hash": provider["provider_hash"],
+            "definition_manifest_hash": definition_manifest["manifest_hash"],
+            "revision_binding": dict(provider["revision_binding"]),
+            "expected_obligation_set_hash": content_hash(obligation_set),
+            "target_count": len(target_rows),
+            "targets": target_rows,
+        }
+        target_manifest = {
+            **unsigned,
+            "manifest_hash": content_hash(unsigned),
+        }
+        (staging / "manifest.json").write_bytes(_json_bytes(target_manifest))
+        os.replace(staging, destination)
+    return destination / "manifest.json"
+
+
+def freeze_retained_regression_open_batch(
+    *,
+    repo_root: str | Path,
+    provider: Mapping[str, Any],
+    targets_dir: str | Path,
+    manifest_path: str | Path,
+    runtime_base: str | Path,
+    max_concurrency: int | None = None,
+    worker_runtime: str = "linux",
+    timeout_policy: TimeoutPolicy = TimeoutPolicy(),
+) -> Any:
+    """Validate all 45 open targets and freeze one bounded shared batch."""
+
+    target_root = Path(targets_dir).resolve()
+    target_manifest = _load_mapping(
+        target_root / "manifest.json",
+        "retained regression target manifest",
+    )
+    target_rows = _validated_target_set(
+        provider=provider,
+        target_manifest=target_manifest,
+        targets_dir=target_root,
+    )
+    return freeze_batch_manifest(
+        repo_root=repo_root,
+        targets_dir=target_root,
+        manifest_path=manifest_path,
+        runtime_base=runtime_base,
+        shard_count=len(target_rows),
+        max_concurrency=max_concurrency,
+        seed_base=RETAINED_REGRESSION_SEED,
+        expected_revision=dict(provider["revision_binding"]),
+        timeout_policy=timeout_policy,
+        worker_runtime=worker_runtime,
+        formal_profile=False,
+        expected_obligation_set_hash=str(
+            target_manifest["expected_obligation_set_hash"]
+        ),
     )
 
 
@@ -511,21 +764,40 @@ def validate_retained_regression_runner_provider(
 
     registry = dict(provider.get("verifier_registry") or {})
     rules = registry.get("rules")
+    unsupported = sorted(
+        set(KNOWN_POSTCONDITION_IDS)
+        - set(_IMPLEMENTED_POSTCONDITION_EVALUATORS)
+    )
+    execution_blockers = [
+        f"missing_postcondition_evaluator:{postcondition_id}"
+        for postcondition_id in unsupported
+    ]
     if (
-        registry.get("registry_id") != RETAINED_REGRESSION_VERIFIER_REGISTRY_ID
+        set(registry)
+        != {
+            "registry_id",
+            "registry_import",
+            "journey_registry_id",
+            "source_contract_registry_id",
+            "execution_readiness",
+            "execution_blockers",
+            "unsupported_postcondition_ids",
+            "simulator_attestation_policy",
+            "rules",
+        }
+        or registry.get("registry_id")
+        != RETAINED_REGRESSION_VERIFIER_REGISTRY_ID
         or registry.get("registry_import") != RETAINED_REGRESSION_REGISTRY_IMPORT
         or registry.get("journey_registry_id")
         != RETAINED_REGRESSION_JOURNEY_VERIFIER_REGISTRY.registry_id
         or registry.get("source_contract_registry_id") != POSTCONDITION_REGISTRY_ID
         or registry.get("execution_readiness")
-        != ("ready" if not LIVE_EXECUTION_BLOCKERS else "blocked")
-        or registry.get("execution_blockers")
-        != list(LIVE_EXECUTION_BLOCKERS)
+        != ("ready" if not execution_blockers else "blocked")
+        or registry.get("execution_blockers") != execution_blockers
         or set(registry.get("unsupported_postcondition_ids") or ())
-        != (
-            set(KNOWN_POSTCONDITION_IDS)
-            - set(_IMPLEMENTED_POSTCONDITION_EVALUATORS)
-        )
+        != set(unsupported)
+        or registry.get("simulator_attestation_policy")
+        != _AUDITABLE_ACTOR_ATTESTATION_POLICY
         or not isinstance(rules, Sequence)
         or isinstance(rules, (str, bytes))
     ):
@@ -671,6 +943,7 @@ def execute_exact_retained_regression(
     revision: Mapping[str, str],
     output_root: str | Path,
     timeout_seconds: float = 180.0,
+    worker_runtime: str = "docker",
 ) -> Path:
     """Replay one immutable exact fixture through the real Linux CLI/PTY."""
 
@@ -713,7 +986,13 @@ def execute_exact_retained_regression(
         raise ValueError(
             "exact retained-regression output must be inside the repository"
         ) from exc
-    config = ChaosRunConfig.docker(
+    config_factory = {
+        "docker": ChaosRunConfig.docker,
+        "linux": ChaosRunConfig.linux,
+    }.get(worker_runtime)
+    if config_factory is None:
+        raise ValueError(f"unsupported exact worker runtime: {worker_runtime}")
+    config = config_factory(
         root,
         session_id=session_id,
         execution_id=execution_id,
@@ -870,6 +1149,192 @@ def execute_exact_retained_regression(
         encoding="utf-8",
     )
     return evidence_path
+
+
+def execute_exact_retained_regressions(
+    *,
+    repo_root: str | Path,
+    provider: Mapping[str, Any],
+    obligations: Sequence[Mapping[str, Any]],
+    output_root: str | Path,
+    obligation_id: str | None = None,
+    timeout_seconds: float = 180.0,
+    worker_runtime: str = "docker",
+) -> tuple[Path, ...]:
+    """Execute all 15 exact targets, or one explicitly selected exact target."""
+
+    obligation_index = {
+        str(row["obligation_id"]): dict(row)
+        for row in obligations
+    }
+    selected = [
+        dict(target)
+        for target in provider.get("targets") or ()
+        if target.get("variant") == "exact"
+        and (
+            obligation_id is None
+            or target.get("obligation_id") == obligation_id
+        )
+    ]
+    if obligation_id is not None and len(selected) != 1:
+        raise ValueError(f"unknown exact G3 obligation: {obligation_id}")
+    if obligation_id is None and len(selected) != RETAINED_REGRESSION_EXACT_COUNT:
+        raise ValueError("G3 provider does not contain all 15 exact obligations")
+    output = Path(output_root).resolve()
+    if output.exists():
+        raise FileExistsError(f"G3 exact output is immutable: {output}")
+    output.mkdir(parents=True)
+    evidence_paths: list[Path] = []
+    for target in selected:
+        obligation = obligation_index.get(str(target["obligation_id"]))
+        if obligation is None:
+            raise ValueError("G3 exact target has no authoritative obligation")
+        evidence_paths.append(execute_exact_retained_regression(
+            repo_root=repo_root,
+            obligation=obligation,
+            target=target,
+            revision=dict(provider["revision_binding"]),
+            output_root=output,
+            timeout_seconds=timeout_seconds,
+            worker_runtime=worker_runtime,
+        ))
+    summary_unsigned = {
+        "schema_version": 1,
+        "artifact_type": "retained_regression_exact_execution_index",
+        "provider_hash": provider["provider_hash"],
+        "revision_binding": dict(provider["revision_binding"]),
+        "selection": "single" if obligation_id else "all",
+        "scheduled": len(selected),
+        "completed": len(evidence_paths),
+        "evidence": [
+            {
+                "obligation_id": target["obligation_id"],
+                "path": str(path),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+            for target, path in zip(selected, evidence_paths, strict=True)
+        ],
+    }
+    _write_json_once(
+        output / "execution-index.json",
+        {
+            **summary_unsigned,
+            "index_hash": content_hash(summary_unsigned),
+        },
+    )
+    return tuple(evidence_paths)
+
+
+def convert_completed_retained_journey_to_product_evidence(
+    *,
+    obligation: Mapping[str, Any],
+    target: Mapping[str, Any],
+    revision: Mapping[str, str],
+    runtime_root: str | Path,
+    evidence_path: str | Path,
+    provider: str = DEFAULT_PROVIDER,
+    model: str = DEFAULT_MODEL,
+) -> Path:
+    """Validate one completed open Journey and adapt its retained artifacts."""
+
+    if str(obligation.get("variant") or "") == "exact":
+        raise ValueError("Journey conversion requires an open G3 obligation")
+    if provider != DEFAULT_PROVIDER or not str(model).strip():
+        raise ValueError(
+            "G3 Journey evidence requires an explicit DeepSeek provider/model"
+        )
+    root = Path(runtime_root).resolve()
+    result = _load_mapping(root / "journey-result.json", "Journey result")
+    schedule_payload = _load_mapping(
+        root / "journey-schedule.json",
+        "Journey schedule",
+    )
+    expected_schedule = _schedule_for_evidence(
+        obligation=obligation,
+        target=target,
+        revision=revision,
+    )
+    if schedule_payload != journey_schedule_payload(expected_schedule):
+        raise ValueError("completed Journey schedule does not match G3")
+    evidence_source = _resolve_runtime_artifact(
+        root,
+        str(result.get("evidence_path") or ""),
+        label="Journey evidence",
+    )
+    source_evidence = _load_mapping(evidence_source, "Journey evidence")
+    validate_journey_evidence_artifact(
+        source_evidence,
+        schedule=expected_schedule,
+        verifier_registry=RETAINED_REGRESSION_JOURNEY_VERIFIER_REGISTRY,
+        revision=revision,
+    )
+    if (
+        result.get("schema_version") != 1
+        or result.get("journey_id") != obligation.get("obligation_id")
+        or result.get("schedule_id") != expected_schedule.schedule_id
+        or dict(result.get("revision") or {}) != dict(revision)
+        or result.get("terminal_classification") != "passed"
+        or result.get("execution_status") != "passed"
+        or result.get("qualifying_evidence") is not True
+        or result.get("evidence_id") != source_evidence.get("evidence_id")
+        or result.get("turns") != source_evidence.get("turns")
+        or source_evidence.get("provider") != provider
+        or source_evidence.get("model") != model
+    ):
+        raise ValueError("completed Journey result is not qualifying G3 evidence")
+    retained = source_evidence.get("retained_artifacts")
+    if not isinstance(retained, Mapping) or set(retained) != set(
+        REQUIRED_ARTIFACT_ROLES
+    ):
+        raise ValueError("completed Journey lacks retained G3 artifacts")
+    artifact_paths: dict[str, Path] = {}
+    for role in REQUIRED_ARTIFACT_ROLES:
+        reference = retained.get(role)
+        if not isinstance(reference, Mapping):
+            raise ValueError(f"retained G3 {role} reference is invalid")
+        path = _resolve_runtime_artifact(
+            root,
+            str(reference.get("path") or ""),
+            label=f"retained G3 {role}",
+        )
+        if hashlib.sha256(path.read_bytes()).hexdigest() != reference.get(
+            "sha256"
+        ):
+            raise ValueError(f"retained G3 {role} hash is stale")
+        artifact_paths[role] = path
+    turns = tuple(source_evidence.get("turns") or ())
+    if not turns:
+        raise ValueError("completed Journey has no response-bound turns")
+    started_at = min(
+        int(dict(turn.get("turn_identity") or {})[
+            "previous_response_received_at_ns"
+        ])
+        for turn in turns
+        if isinstance(turn, Mapping)
+    )
+    finished_at = max(
+        int(dict(turn.get("turn_identity") or {})[
+            "agent_response_received_at_ns"
+        ])
+        for turn in turns
+        if isinstance(turn, Mapping)
+    )
+    payload = build_product_obligation_evidence_artifact(
+        obligation=obligation,
+        target=target,
+        revision=revision,
+        execution={
+            "execution_id": source_evidence["execution_id"],
+            "runner": "retained-regression-response-driven-journey-v1",
+            "transport": "real_pty",
+            "provider": provider,
+            "model": model,
+            "started_at": str(started_at),
+            "finished_at": str(finished_at),
+        },
+        artifact_paths=artifact_paths,
+    )
+    return _write_json_once(Path(evidence_path).resolve(), payload)
 
 
 def _write_exact_retained_artifacts(
@@ -1686,6 +2151,259 @@ def _persona_for_variant(variant: str) -> str:
     }[variant]
 
 
+def _validated_definition_manifest(
+    *,
+    provider: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    require_all: bool,
+) -> tuple[dict[str, Any], ...]:
+    unsigned = {key: value for key, value in manifest.items() if key != "manifest_hash"}
+    definitions = manifest.get("definitions")
+    if (
+        manifest.get("schema_version")
+        != RETAINED_REGRESSION_DEFINITION_MANIFEST_SCHEMA_VERSION
+        or manifest.get("artifact_type")
+        != "retained_regression_journey_definition_manifest"
+        or manifest.get("provider_hash") != provider.get("provider_hash")
+        or manifest.get("revision_binding") != provider.get("revision_binding")
+        or manifest.get("generation_is_execution") is not False
+        or manifest.get("prewritten_future_turns") is not False
+        or manifest.get("actor_attestation_policy")
+        != _AUDITABLE_ACTOR_ATTESTATION_POLICY
+        or manifest.get("manifest_hash") != content_hash(unsigned)
+        or not isinstance(definitions, Sequence)
+        or isinstance(definitions, (str, bytes))
+        or manifest.get("definition_count") != len(definitions)
+    ):
+        raise ValueError("retained regression definition manifest is invalid")
+    authoritative = {
+        str(target["obligation_id"]): dict(target)
+        for target in provider.get("targets") or ()
+        if target.get("variant") != "exact"
+    }
+    if require_all and (
+        manifest.get("selection") != "all"
+        or len(definitions) != RETAINED_REGRESSION_OPEN_COUNT
+    ):
+        raise ValueError("G3 execution requires all 45 open definitions")
+    if not require_all and manifest.get("selection") not in {"all", "single"}:
+        raise ValueError("G3 definition selection is invalid")
+    validated: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in definitions:
+        if not isinstance(raw, Mapping):
+            raise ValueError("G3 definition row is invalid")
+        row = dict(raw)
+        obligation_id = str(row.get("obligation_id") or "")
+        target = authoritative.get(obligation_id)
+        definition = row.get("definition")
+        if (
+            set(row)
+            != {
+                "obligation_id",
+                "obligation_contract_hash",
+                "variant",
+                "definition",
+                "definition_hash",
+            }
+            or target is None
+            or obligation_id in seen
+            or row.get("obligation_contract_hash")
+            != target["obligation_contract_hash"]
+            or row.get("variant") != target["variant"]
+            or definition != target["journey_definition"]
+            or row.get("definition_hash") != content_hash(definition)
+        ):
+            raise ValueError("G3 definition differs from its provider")
+        _reject_future_turns(definition)
+        seen.add(obligation_id)
+        validated.append(row)
+    expected_ids = set(authoritative)
+    if require_all and seen != expected_ids:
+        raise ValueError("G3 definition manifest is incomplete")
+    return tuple(validated)
+
+
+def _validated_target_set(
+    *,
+    provider: Mapping[str, Any],
+    target_manifest: Mapping[str, Any],
+    targets_dir: Path,
+) -> tuple[dict[str, Any], ...]:
+    unsigned = {
+        key: value
+        for key, value in target_manifest.items()
+        if key != "manifest_hash"
+    }
+    rows = target_manifest.get("targets")
+    canonical_definitions = build_retained_regression_definition_manifest(
+        provider
+    )
+    if (
+        target_manifest.get("schema_version")
+        != RETAINED_REGRESSION_TARGET_SET_SCHEMA_VERSION
+        or target_manifest.get("artifact_type")
+        != "retained_regression_target_set"
+        or target_manifest.get("provider_hash") != provider.get("provider_hash")
+        or target_manifest.get("definition_manifest_hash")
+        != canonical_definitions["manifest_hash"]
+        or target_manifest.get("revision_binding")
+        != provider.get("revision_binding")
+        or target_manifest.get("manifest_hash") != content_hash(unsigned)
+        or not isinstance(rows, Sequence)
+        or isinstance(rows, (str, bytes))
+        or len(rows) != RETAINED_REGRESSION_OPEN_COUNT
+        or target_manifest.get("target_count") != len(rows)
+    ):
+        raise ValueError("retained regression target set is invalid")
+    definitions = _validated_definition_manifest(
+        provider=provider,
+        manifest=canonical_definitions,
+        require_all=True,
+    )
+    obligation_set: list[dict[str, Any]] = []
+    validated: list[dict[str, Any]] = []
+    for index, (raw, definition_row) in enumerate(
+        zip(rows, definitions, strict=True),
+        start=1,
+    ):
+        if not isinstance(raw, Mapping):
+            raise ValueError("G3 target row is invalid")
+        row = dict(raw)
+        expected_name = f"{index:02d}.json"
+        target_path = (targets_dir / expected_name).resolve()
+        try:
+            target_path.relative_to(targets_dir)
+        except ValueError as exc:
+            raise ValueError("G3 target escapes its immutable directory") from exc
+        if (
+            row.get("index") != index
+            or row.get("path") != expected_name
+            or row.get("obligation_id") != definition_row["obligation_id"]
+            or row.get("obligation_contract_hash")
+            != definition_row["obligation_contract_hash"]
+            or row.get("variant") != definition_row["variant"]
+            or not target_path.is_file()
+            or hashlib.sha256(target_path.read_bytes()).hexdigest()
+            != row.get("sha256")
+            or _load_mapping(target_path, "G3 target")
+            != _batch_target_payload(definition_row["definition"])
+        ):
+            raise ValueError("G3 target file differs from its definition")
+        frozen = dict(definition_row["definition"]["frozen_execution"])
+        if {
+            "seed": row.get("seed"),
+            "schedule_id": row.get("schedule_id"),
+            "subject_group": row.get("subject_group"),
+        } != {
+            "seed": frozen["seed"],
+            "schedule_id": frozen["schedule_id"],
+            "subject_group": frozen["subject_group"],
+        }:
+            raise ValueError("G3 target frozen execution is stale")
+        obligation_set.append({
+            "obligation_id": row["obligation_id"],
+            "schedule_id": row["schedule_id"],
+            "seed": row["seed"],
+            "subject_group": row["subject_group"],
+        })
+        validated.append(row)
+    if target_manifest.get("expected_obligation_set_hash") != content_hash(
+        obligation_set
+    ):
+        raise ValueError("G3 target obligation set hash is stale")
+    return tuple(validated)
+
+
+def _batch_target_payload(definition: Mapping[str, Any]) -> dict[str, Any]:
+    """Project provider metadata onto the shared Journey target schema."""
+
+    payload = {
+        key: value
+        for key, value in definition.items()
+        if key != "verifier_input_contract"
+    }
+    if set(payload) != {
+        "lane",
+        "verifier_registry",
+        "journey",
+        "frozen_execution",
+        "simulator_attestation_contract",
+    }:
+        raise ValueError("G3 Journey cannot be projected onto the batch schema")
+    return payload
+
+
+def _reject_future_turns(value: Any) -> None:
+    forbidden = {"turns", "messages", "future_user_turns", "dialogue"}
+    if isinstance(value, Mapping):
+        leaked = forbidden & set(value)
+        if leaked:
+            raise ValueError(
+                "response-driven G3 definition contains prewritten turns: "
+                + ", ".join(sorted(leaked))
+            )
+        for nested in value.values():
+            _reject_future_turns(nested)
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        for nested in value:
+            _reject_future_turns(nested)
+
+
+def _resolve_runtime_artifact(root: Path, raw_path: str, *, label: str) -> Path:
+    declared = Path(raw_path).expanduser()
+    candidates = (
+        declared,
+        root / "evidence" / declared.name,
+        root / "retained-artifacts" / declared.name,
+    )
+    matches = tuple(
+        path.resolve()
+        for path in candidates
+        if path.is_file()
+    )
+    unique = tuple(dict.fromkeys(matches))
+    if len(unique) != 1:
+        raise ValueError(f"{label} path cannot be resolved unambiguously")
+    try:
+        unique[0].relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{label} is outside its runtime root") from exc
+    return unique[0]
+
+
+def _load_mapping(path: Path, label: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} is not readable JSON: {path}") from exc
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{label} must be a JSON object")
+    return dict(payload)
+
+
+def _write_json_once(path: Path, payload: Mapping[str, Any]) -> Path:
+    if path.exists():
+        raise FileExistsError(f"immutable output already exists: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    descriptor = os.open(path, flags, 0o444)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(_json_bytes(payload))
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    return path
+
+
+def _json_bytes(payload: Mapping[str, Any]) -> bytes:
+    return (
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n"
+    ).encode("utf-8")
+
+
 def _validated_revision(revision: Mapping[str, str]) -> dict[str, str]:
     normalized = {
         "commit": str(revision.get("commit") or "").strip(),
@@ -1694,3 +2412,156 @@ def _validated_revision(revision: Mapping[str, str]) -> dict[str, str]:
     if not normalized["commit"] or not normalized["worktree_hash"]:
         raise ValueError("retained regression runner requires a revision binding")
     return normalized
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Execute and adapt the complete Phase 8 G3 catalog.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    provider = commands.add_parser("provider")
+    provider.add_argument("--repo-root", required=True, type=Path)
+    provider.add_argument("--output", required=True, type=Path)
+
+    validate = commands.add_parser("validate-provider")
+    validate.add_argument("--repo-root", required=True, type=Path)
+    validate.add_argument("--provider", required=True, type=Path)
+
+    exact = commands.add_parser("exact")
+    exact.add_argument("--repo-root", required=True, type=Path)
+    exact.add_argument("--provider", required=True, type=Path)
+    exact.add_argument("--output-root", required=True, type=Path)
+    exact.add_argument("--obligation-id")
+    exact.add_argument("--timeout-seconds", type=float, default=180.0)
+    exact.add_argument(
+        "--worker-runtime",
+        choices=("linux", "docker"),
+        default="docker",
+    )
+
+    definitions = commands.add_parser("definitions")
+    definitions.add_argument("--repo-root", required=True, type=Path)
+    definitions.add_argument("--provider", required=True, type=Path)
+    definitions.add_argument("--output", required=True, type=Path)
+    definitions.add_argument("--obligation-id")
+
+    targets = commands.add_parser("targets")
+    targets.add_argument("--repo-root", required=True, type=Path)
+    targets.add_argument("--provider", required=True, type=Path)
+    targets.add_argument("--definitions", required=True, type=Path)
+    targets.add_argument("--output-dir", required=True, type=Path)
+
+    batch = commands.add_parser("batch")
+    batch.add_argument("--repo-root", required=True, type=Path)
+    batch.add_argument("--provider", required=True, type=Path)
+    batch.add_argument("--targets-dir", required=True, type=Path)
+    batch.add_argument("--output", required=True, type=Path)
+    batch.add_argument("--runtime-base", required=True, type=Path)
+    batch.add_argument("--max-concurrency", type=int)
+    batch.add_argument(
+        "--worker-runtime",
+        choices=("linux", "docker"),
+        default="linux",
+    )
+
+    evidence = commands.add_parser("evidence")
+    evidence.add_argument("--repo-root", required=True, type=Path)
+    evidence.add_argument("--provider", required=True, type=Path)
+    evidence.add_argument("--obligation-id", required=True)
+    evidence.add_argument("--runtime-root", required=True, type=Path)
+    evidence.add_argument("--output", required=True, type=Path)
+    evidence.add_argument("--provider-name", default=DEFAULT_PROVIDER)
+    evidence.add_argument("--model", default=DEFAULT_MODEL)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    if args.command == "provider":
+        write_retained_regression_provider(
+            repo_root=args.repo_root,
+            output_path=args.output,
+        )
+        return 0
+
+    provider, obligations, revision = load_retained_regression_provider(
+        repo_root=args.repo_root,
+        provider_path=args.provider,
+    )
+    if args.command == "validate-provider":
+        return 0
+    if args.command == "exact":
+        execute_exact_retained_regressions(
+            repo_root=args.repo_root,
+            provider=provider,
+            obligations=obligations,
+            output_root=args.output_root,
+            obligation_id=args.obligation_id,
+            timeout_seconds=args.timeout_seconds,
+            worker_runtime=args.worker_runtime,
+        )
+        return 0
+    if args.command == "definitions":
+        manifest = build_retained_regression_definition_manifest(
+            provider,
+            obligation_id=args.obligation_id,
+        )
+        write_retained_regression_definition_manifest(
+            manifest,
+            args.output,
+        )
+        return 0
+    if args.command == "targets":
+        manifest = _load_mapping(
+            args.definitions.resolve(),
+            "retained regression definition manifest",
+        )
+        write_retained_regression_target_set(
+            provider=provider,
+            definition_manifest=manifest,
+            output_dir=args.output_dir,
+        )
+        return 0
+    if args.command == "batch":
+        freeze_retained_regression_open_batch(
+            repo_root=args.repo_root,
+            provider=provider,
+            targets_dir=args.targets_dir,
+            manifest_path=args.output,
+            runtime_base=args.runtime_base,
+            max_concurrency=args.max_concurrency,
+            worker_runtime=args.worker_runtime,
+        )
+        return 0
+
+    obligation_index = {
+        str(row["obligation_id"]): dict(row)
+        for row in obligations
+    }
+    target_index = {
+        str(row["obligation_id"]): dict(row)
+        for row in provider["targets"]
+    }
+    obligation = obligation_index.get(args.obligation_id)
+    target = target_index.get(args.obligation_id)
+    if (
+        obligation is None
+        or target is None
+        or obligation.get("variant") == "exact"
+    ):
+        raise ValueError(f"unknown open G3 obligation: {args.obligation_id}")
+    convert_completed_retained_journey_to_product_evidence(
+        obligation=obligation,
+        target=target,
+        revision=revision,
+        runtime_root=args.runtime_root,
+        evidence_path=args.output,
+        provider=args.provider_name,
+        model=args.model,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

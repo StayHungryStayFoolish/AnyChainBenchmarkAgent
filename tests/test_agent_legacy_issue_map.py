@@ -73,7 +73,7 @@ class AgentLegacyIssueMapTest(unittest.TestCase):
         from agent.workflows.group_registry import GROUP_OWNER
 
         documents = (
-            REPO_ROOT / ".agent" / "task-docs" / "2026-07-10-agent-handoff-for-external-ai.md",
+            REPO_ROOT / "docs" / "en" / "agent-handoff-product-verification.md",
             REPO_ROOT / "docs" / "en" / "adk-agent-architecture.md",
             REPO_ROOT / "docs" / "zh" / "adk-agent-architecture.md",
         )

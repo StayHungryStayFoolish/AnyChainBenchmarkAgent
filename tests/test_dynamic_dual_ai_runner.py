@@ -1837,6 +1837,28 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             "en",
         ))
 
+    def test_linux_runtime_accepts_an_explicit_evidence_root(self) -> None:
+        root = Path("/tmp/anychain-chaos-contract")
+        runtime = root / ".agent" / "evidence" / "phase8" / "g3" / "exact"
+        config = ChaosRunConfig.linux(
+            root,
+            session_id="retained-exact",
+            runtime_root=runtime,
+            runtime_root_in_process=runtime,
+        )
+
+        self.assertEqual(config.runtime_root, runtime)
+        self.assertEqual(config.runtime_root_in_process, runtime)
+        self.assertEqual(
+            config.command[-4:],
+            (
+                "--state-file",
+                str(runtime / "terminal-session.json"),
+                "--language",
+                "en",
+            ),
+        )
+
     def test_runtime_identity_follows_explicit_process_configuration(self) -> None:
         root = Path("/tmp/anychain-chaos-contract")
         with patch.dict(

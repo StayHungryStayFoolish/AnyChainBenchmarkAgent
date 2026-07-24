@@ -44,7 +44,7 @@ class OpenAIProvider:
                 **_openai_completion_options(self.config.model, request),
             ),
         )
-        text = response.choices[0].message.content or ""
+        text = _openai_response_text(self.config, response)
         return LLMResponse(
             text=text,
             model=self.config.model,
@@ -81,7 +81,7 @@ class DeepSeekProvider:
                 tools=request.tools or None,
             ),
         )
-        text = response.choices[0].message.content or ""
+        text = _openai_response_text(self.config, response)
         return LLMResponse(
             text=text,
             model=self.config.model,
@@ -115,7 +115,7 @@ class VertexGeminiProvider:
                 tools=request.tools or None,
             ),
         )
-        text = response.choices[0].message.content or ""
+        text = _openai_response_text(self.config, response)
         return LLMResponse(
             text=text,
             model=self.config.model,
@@ -176,7 +176,7 @@ class GeminiAPIKeyProvider:
             f"{urlparse.quote(self.config.model, safe='')}:generateContent?key={urlparse.quote(api_key, safe='')}"
         )
         response = _post_json(url, payload, headers={}, config=self.config)
-        text = _gemini_text(response)
+        text = _gemini_text(self.config, response)
         return LLMResponse(text=text, model=self.config.model, provider=self.config.provider, raw=response)
 
 
@@ -201,7 +201,7 @@ class VertexClaudeProvider:
         if request.tools:
             payload["tools"] = request.tools
         response = _post_json(url, payload, headers={"Authorization": f"Bearer {token}"}, config=self.config)
-        text = "".join(block.get("text", "") for block in response.get("content", []) if block.get("type") == "text")
+        text = _anthropic_text(self.config, response)
         return LLMResponse(
             text=text,
             model=self.config.model,
@@ -240,7 +240,7 @@ class AnthropicAPIKeyProvider:
             },
             config=self.config,
         )
-        text = "".join(block.get("text", "") for block in response.get("content", []) if block.get("type") == "text")
+        text = _anthropic_text(self.config, response)
         return LLMResponse(text=text, model=self.config.model, provider=self.config.provider, raw=response)
 
 
@@ -275,6 +275,29 @@ def _openai_request(config: LLMConfig, call: Any) -> Any:
         raise _provider_error(config, exc) from exc
     ensure_turn_active()
     return response
+
+
+def _response_error(config: LLMConfig, detail: str) -> LLMProviderError:
+    return LLMProviderError(
+        f"{config.provider}/{config.model} returned a malformed successful response: {detail}",
+        provider=config.provider,
+        model=config.model,
+        category="response",
+        stage="provider_response",
+    )
+
+
+def _openai_response_text(config: LLMConfig, response: Any) -> str:
+    choices = getattr(response, "choices", None)
+    if not isinstance(choices, (list, tuple)) or not choices:
+        raise _response_error(config, "choices is missing or empty")
+    message = getattr(choices[0], "message", None)
+    if message is None:
+        raise _response_error(config, "choices[0].message is missing")
+    content = getattr(message, "content", None)
+    if not isinstance(content, str) or not content.strip():
+        raise _response_error(config, "choices[0].message.content is missing or empty")
+    return content
 
 
 def _is_transport_timeout(exc: BaseException) -> bool:
@@ -319,6 +342,10 @@ def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str], confi
                 stage="provider_request",
             ) from exc
         raise _provider_error(config, exc) from exc
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise _response_error(config, "body is not valid UTF-8 JSON") from exc
+    if not isinstance(payload, dict):
+        raise _response_error(config, "body is not a JSON object")
     ensure_turn_active()
     return payload
 
@@ -510,9 +537,40 @@ def _gemini_contents(messages: list[LLMMessage]) -> tuple[str, list[dict[str, An
     return "\n\n".join(system_parts), contents
 
 
-def _gemini_text(response: dict[str, Any]) -> str:
-    candidates = response.get("candidates") or []
-    if not candidates:
-        return ""
-    parts = candidates[0].get("content", {}).get("parts", [])
-    return "".join(part.get("text", "") for part in parts)
+def _gemini_text(config: LLMConfig, response: dict[str, Any]) -> str:
+    candidates = response.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        raise _response_error(config, "candidates is missing or empty")
+    candidate = candidates[0]
+    if not isinstance(candidate, dict):
+        raise _response_error(config, "candidates[0] is not an object")
+    content = candidate.get("content")
+    if not isinstance(content, dict):
+        raise _response_error(config, "candidates[0].content is missing")
+    parts = content.get("parts")
+    if not isinstance(parts, list) or not parts:
+        raise _response_error(config, "candidates[0].content.parts is missing or empty")
+    text = "".join(
+        str(part.get("text"))
+        for part in parts
+        if isinstance(part, dict) and isinstance(part.get("text"), str)
+    )
+    if not text.strip():
+        raise _response_error(config, "candidates[0].content.parts has no text")
+    return text
+
+
+def _anthropic_text(config: LLMConfig, response: dict[str, Any]) -> str:
+    content = response.get("content")
+    if not isinstance(content, list) or not content:
+        raise _response_error(config, "content is missing or empty")
+    text = "".join(
+        str(block.get("text"))
+        for block in content
+        if isinstance(block, dict)
+        and block.get("type") == "text"
+        and isinstance(block.get("text"), str)
+    )
+    if not text.strip():
+        raise _response_error(config, "content has no text block")
+    return text

@@ -92,9 +92,10 @@ analysis.
 The product compiles one checkpointer-backed graph. Each transition admits,
 selects, routes, and commits at most one durable action. Side effects are
 persisted as an intent before invocation and as a receipt afterward. Checkpoint
-schema version 13 is the current contract; version 12 crosses one isolated
-migration adapter, while older state is quarantined for explicit
-reconfirmation.
+schema version 14 is the current contract. Version 12 crosses the isolated
+migration boundary, and version 13 additionally migrates deferred-queue
+retention into the typed pending-question contract. Older state is quarantined
+for explicit reconfirmation.
 
 ## Main Modules
 
@@ -248,7 +249,7 @@ deterministic G2 gate. Retained real-user regression replay, real CLI,
 response-driven dual-AI Chaos, and real execution belong to Phase 8 and close
 G3-G6 only after the controller admits their revision-bound evidence. Follow
 `tests/agent_live/README.md` and
-`.agent/task-docs/2026-07-10-agent-handoff-for-external-ai.md` for dynamic
+`docs/en/agent-handoff-product-verification.md` for dynamic
 dual-AI Chaos: DeepSeek runs the real CLI while Codex chooses each next user
 turn from the actual previous response. Ledger, matrix, PTY, simulator, and
 execution scripts are subordinate evidence providers; their direct exit codes

@@ -160,6 +160,7 @@ class AnyChainTerminal:
         self._web_research_status: dict[str, Any] = {}
         self._llm_runtime_available = False
         self._llm_unavailable_reason = ""
+        self._llm_readiness_error: LLMProviderError | None = None
         self._job_commands = JobCommandHandler(self.state, self.io)
         self._turn_active = False
 
@@ -238,6 +239,8 @@ class AnyChainTerminal:
         runtime_errors = provider_runtime_errors(self._llm_config)
         self._llm_runtime_available = not runtime_errors
         if runtime_errors:
+            self._llm_readiness_error = None
+            self._llm_unavailable_reason = "; ".join(runtime_errors)
             self.state.current_question_id = "install_agent_runtime"
             self.state.pending_missing_dependencies = list(runtime_errors)
             self.io.agent(
@@ -253,23 +256,7 @@ class AnyChainTerminal:
             if not deps_offer_pending:
                 self.state.current_question_id = ""
                 self.state.pending_missing_dependencies = []
-            readiness_error = probe_provider_readiness(self._llm_config)
-            self._llm_runtime_available = readiness_error is None
-            self._llm_unavailable_reason = (
-                _provider_error_summary(readiness_error)
-                if readiness_error is not None
-                else ""
-            )
-            if readiness_error is not None:
-                self.io.agent(
-                    self.state.language,
-                    t(
-                        self.state.language,
-                        "llm_provider_unavailable",
-                        reason=self._llm_unavailable_reason,
-                    ),
-                )
-            else:
+            if self._establish_provider_readiness():
                 self._ensure_harness()
                 if self.fresh_session:
                     self._ensure_harness().reset(language=self.state.language)
@@ -476,11 +463,33 @@ class AnyChainTerminal:
         self.state.current_question_id = ""
         self.io.agent(self.state.language, t(self.state.language, "agent_runtime_install_done", exit_code=completed.returncode))
         self._llm_config = load_llm_config()
-        self._llm_runtime_available = not provider_runtime_errors(self._llm_config)
-        if self._llm_runtime_available:
+        runtime_errors = provider_runtime_errors(self._llm_config)
+        if runtime_errors:
+            self._llm_runtime_available = False
+            self._llm_readiness_error = None
+            self._llm_unavailable_reason = "; ".join(runtime_errors)
+        elif self._establish_provider_readiness():
             self._harness = None
             self._ensure_harness()
         self._startup_doctor()
+
+    def _establish_provider_readiness(self) -> bool:
+        """Apply the one live-provider readiness transition used by the CLI."""
+
+        readiness_error = probe_provider_readiness(self._llm_config)
+        self._llm_readiness_error = readiness_error
+        self._llm_runtime_available = readiness_error is None
+        self._llm_unavailable_reason = _provider_error_summary(readiness_error)
+        if readiness_error is not None:
+            self.io.agent(
+                self.state.language,
+                t(
+                    self.state.language,
+                    "llm_provider_unavailable",
+                    reason=self._llm_unavailable_reason,
+                ),
+            )
+        return self._llm_runtime_available
 
     def _install_dependencies(self) -> None:
         self.io.agent(self.state.language, t(self.state.language, "dependency_install_start"))

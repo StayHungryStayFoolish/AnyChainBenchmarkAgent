@@ -201,7 +201,14 @@ class ChaosRunConfig:
         session_id = str(changes.pop("session_id", f"dynamic-chaos-{uuid.uuid4().hex}"))
         changes.setdefault("provider", os.environ.get("LLM_PROVIDER", cls.provider))
         changes.setdefault("model", os.environ.get("LLM_MODEL", cls.model))
-        runtime = root / ".agent" / "dynamic-chaos" / session_id
+        runtime = Path(changes.pop(
+            "runtime_root",
+            root / ".agent" / "dynamic-chaos" / session_id,
+        )).resolve()
+        runtime_in_process = Path(changes.pop(
+            "runtime_root_in_process",
+            runtime,
+        ))
         return cls(
             repo_root=root,
             command=(
@@ -219,7 +226,7 @@ class ChaosRunConfig:
             ),
             session_id=session_id,
             runtime_root=runtime,
-            runtime_root_in_process=runtime,
+            runtime_root_in_process=runtime_in_process,
             transport_kind="container_pty_bridge",
             **changes,
         )

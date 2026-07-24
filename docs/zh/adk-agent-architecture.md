@@ -187,11 +187,11 @@ flowchart TD
 先前答案，Harness 必须更新或失效受影响的 group state，并通过确定性工具重新
 生成下游 runtime 产物。
 
-checkpoint state 当前使用 schema version 13。当前版本的新 turn 绝不调用 legacy
-action compiler。version 12 checkpoint 只通过一个明确的 migration adapter，并立即
-持久化为 version 13。更老的 checkpoint 必须进入 quarantine：仅允许列入白名单的
-环境事实供用户重新确认，旧 pending action 或通过文件路径猜测出的 plan 绝不能恢复
-为可执行任务。
+checkpoint state 当前使用 schema version 14。当前版本的新 turn 绝不调用 legacy
+action compiler。version 12 checkpoint 只通过明确的 migration boundary；version 13
+还会把 deferred queue 保留语义迁移到 typed pending-question contract，然后持久化为
+version 14。更老的 checkpoint 必须进入 quarantine：仅允许列入白名单的环境事实供
+用户重新确认，旧 pending action 或通过文件路径猜测出的 plan 绝不能恢复为可执行任务。
 
 ## Google Search 边界
 

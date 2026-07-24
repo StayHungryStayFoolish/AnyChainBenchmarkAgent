@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -2912,6 +2914,126 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(result["planner_metrics"]["stage_b_calls"], 2)
         self.assertEqual(result["planner_metrics"]["admission_calls"], 1)
 
+    def test_parallel_owner_compilers_inherit_one_absolute_turn_deadline(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import resolve_product_action_queue
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.llm.types import llm_turn_scope, remaining_turn_seconds
+
+        text = "Switch to bsc. Use quick."
+        stage_a = {
+            "semantic_units": [
+                {
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "source_text": "Switch to bsc.",
+                    "operation": "domain_request",
+                    "owner_routes": [{
+                        "owner": "chain_rpc",
+                        "group": "chain_identity",
+                    }],
+                    "reason": "chain",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "clause_id": "clause-2",
+                    "source_text": "Use quick.",
+                    "operation": "domain_request",
+                    "owner_routes": [{
+                        "owner": "performance",
+                        "group": "qps_profile",
+                    }],
+                    "reason": "qps",
+                },
+            ]
+        }
+        documents = {
+            "chain_rpc": {
+                "actions": [{
+                    "type": "choose_chain",
+                    "chain_text": "bsc",
+                    "source_evidence": "bsc",
+                }],
+                "bindings": [{
+                    "unit_id": "unit-1",
+                    "action_indexes": [0],
+                    "disposition": "action",
+                    "reason": "compiled",
+                }],
+            },
+            "performance": {
+                "actions": [{
+                    "type": "set_qps_mode",
+                    "qps_mode": "quick",
+                    "mutation_explicit": True,
+                    "source_evidence": "quick",
+                }],
+                "bindings": [{
+                    "unit_id": "unit-2",
+                    "action_indexes": [0],
+                    "disposition": "action",
+                    "reason": "compiled",
+                }],
+            },
+        }
+        observed: list[float] = []
+        observed_lock = threading.Lock()
+
+        def compile_owner(
+            _state,
+            owner,
+            _groups,
+            _partition,
+            _unit_ids,
+        ):
+            remaining = remaining_turn_seconds()
+            with observed_lock:
+                observed.append(remaining)
+            return documents[owner], (), (100,)
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                return_value=json.dumps(stage_a),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner._compile_owner_document",
+                side_effect=compile_owner,
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.prepare_hierarchical_candidate",
+                side_effect=lambda candidate, *_args, **_kwargs: (
+                    candidate,
+                    PlanCoverageResult(True, (), ()),
+                ),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner._review_bounded_semantic_candidate",
+                return_value=(
+                    SimpleNamespace(request_json="{}"),
+                    SimpleNamespace(valid=True, errors=()),
+                    (),
+                ),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner._admitted_action_queue",
+                return_value={"actions": [{"type": "compiled"}]},
+            ),
+        ):
+            with llm_turn_scope(0.5):
+                time.sleep(0.04)
+                result = resolve_product_action_queue({}, text)
+
+        self.assertEqual(result["actions"], [{"type": "compiled"}])
+        self.assertEqual(len(observed), 2)
+        self.assertTrue(all(0 < remaining < 0.48 for remaining in observed))
+        self.assertLess(max(observed) - min(observed), 0.05)
+
     def test_provider_failure_is_not_converted_to_user_clarification(self) -> None:
         from agent.harness.hierarchical_planner import resolve_product_action_queue
         from agent.llm.types import LLMProviderError
@@ -2928,6 +3050,52 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             side_effect=provider_error,
         ), self.assertRaises(LLMProviderError) as raised:
             resolve_product_action_queue({}, "Use the first option because it is safer.")
+
+        self.assertIs(raised.exception, provider_error)
+
+    def test_parallel_owner_response_failure_is_not_converted_to_clarification(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import resolve_product_action_queue
+        from agent.llm.types import LLMProviderError, llm_turn_scope
+
+        stage_a = {
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": "Switch to bsc.",
+                "operation": "domain_request",
+                "owner_routes": [{
+                    "owner": "chain_rpc",
+                    "group": "chain_identity",
+                }],
+                "reason": "chain",
+            }]
+        }
+        provider_error = LLMProviderError(
+            "malformed successful response",
+            provider="deepseek",
+            model="deepseek-chat",
+            category="response",
+            stage="provider_response",
+        )
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                return_value=json.dumps(stage_a),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner._compile_owner_document",
+                side_effect=provider_error,
+            ),
+            llm_turn_scope(1),
+            self.assertRaises(LLMProviderError) as raised,
+        ):
+            resolve_product_action_queue({}, "Switch to bsc.")
 
         self.assertIs(raised.exception, provider_error)
 

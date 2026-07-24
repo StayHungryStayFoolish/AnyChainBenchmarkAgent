@@ -44,7 +44,7 @@ complete terminal turn
 -> persist/invoke/receipt when the action has an external side effect
 -> repeat selection through graph transitions while admitted work remains
 -> canonical fallback and one response with at most one blocking question
--> validate and checkpoint schema version 13
+-> validate and checkpoint schema version 14
 ```
 
 The single metadata authority is
@@ -103,7 +103,8 @@ Important implementation files:
 - `agent/harness/routing.py`: navigation and canonical fallback authority
 - `agent/harness/response.py`: single response-composition authority
 - `agent/harness/contracts.py`: durable action/result/effect/turn contracts
-- `agent/harness/checkpoint_migrations.py`: isolated version-12 migration only
+- `agent/harness/checkpoint_migrations.py`: isolated historical checkpoint
+  migration boundary only
 - `agent/harness/questions.py`: typed question/option contracts
 - `agent/harness/transitions.py`: invalidation and reconfiguration state
 - `agent/harness/invariants.py`: state and expected-patch enforcement
@@ -121,9 +122,11 @@ design contract.
 The runtime compiles one graph with its SQLite checkpointer. It must not create
 a second uncheckpointed turn graph or drain the complete durable queue inside
 one Python node. Current-version turns must not invoke checkpoint compatibility
-code. Version 12 crosses the isolated adapter once and is persisted as version
-13; older state is quarantined and only allowlisted environment facts may be
-offered for reconfirmation.
+code. Version 12 crosses the isolated adapter once and is persisted through the
+current schema; version 13 additionally migrates deferred-queue retention into
+the typed `pending_question.resume_action_queue` contract before persistence as
+version 14. Older state is quarantined and only allowlisted environment facts
+may be offered for reconfirmation.
 
 ## Migrated Historical Findings
 
