@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 REQUIREMENTS = ROOT / "requirements-adk.txt"
 INSTALLER = ROOT / "scripts" / "install_agent_deps.sh"
+HANDOFF = ROOT / ".agent" / "task-docs" / "2026-07-10-agent-handoff-for-external-ai.md"
 
 LONG_LIVED_DOCS = (
     ROOT / "README.md",
@@ -94,6 +95,24 @@ class AgentDocumentationContractTests(unittest.TestCase):
             self.assertIn(term, en)
             self.assertIn(term, zh)
 
+    def test_architecture_mirrors_provider_and_semantic_planner_boundaries(self) -> None:
+        for relative in (
+            "agent/README.md",
+            "docs/en/adk-agent-architecture.md",
+            "docs/zh/adk-agent-architecture.md",
+        ):
+            content = _text(ROOT / relative)
+            for term in (
+                "LLMProvider",
+                "generateContent",
+                "Anthropic Messages API",
+                "rawPredict",
+                "hierarchical_planner.py",
+                "Stage A",
+                "Stage B",
+            ):
+                self.assertIn(term, content, f"{relative} is missing {term}")
+
     def test_cli_guide_rejects_fake_node_only_workflow_coverage(self) -> None:
         guide = _text(ROOT / "docs/en/agent-cli-verification-guide.md")
         self.assertNotIn("Fake-node validation is enough for Agent CLI workflow coverage", guide)
@@ -145,6 +164,23 @@ class AgentDocumentationContractTests(unittest.TestCase):
             "hashed job artifacts",
         ):
             self.assertIn(term, content)
+
+    def test_live_docs_name_the_single_acceptance_authority_and_phase_boundary(self) -> None:
+        for path in (
+            ROOT / "agent" / "README.md",
+            ROOT / "tests" / "agent_live" / "README.md",
+            HANDOFF,
+        ):
+            content = _text(path)
+            for term in (
+                "run_product_acceptance.py",
+                "Phase 6",
+                "G2",
+                "Phase 8",
+                "G3-G6",
+                "subordinate evidence providers",
+            ):
+                self.assertIn(term, content, f"{path.relative_to(ROOT)} is missing {term}")
 
     def test_relative_markdown_links_exist(self) -> None:
         link_pattern = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")

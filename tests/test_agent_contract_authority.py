@@ -26,8 +26,13 @@ class ActionContractAuthorityTest(unittest.TestCase):
         from agent.harness.context import action_schema
 
         rendered = {item["type"]: item for item in action_schema()}
-        self.assertEqual(set(rendered), {spec.action_type for spec in ACTION_SPECS})
+        self.assertEqual(
+            set(rendered),
+            {spec.action_type for spec in ACTION_SPECS if not spec.internal_only},
+        )
         for spec in ACTION_SPECS:
+            if spec.internal_only:
+                continue
             self.assertEqual(rendered[spec.action_type]["allowed_arguments"], list(spec.allowed_arguments))
             self.assertEqual(rendered[spec.action_type]["required_arguments"], list(spec.required_arguments))
             self.assertEqual(rendered[spec.action_type]["constraints"], list(spec.constraints))
@@ -49,6 +54,33 @@ class ActionContractAuthorityTest(unittest.TestCase):
             validate_action_contract({
                 "type": "choose_chain",
                 "source_evidence": "BNB",
+            })
+
+    def test_pending_answer_uses_one_canonical_representation(self) -> None:
+        from agent.harness.action_registry import validate_action_contract
+
+        selected = validate_action_contract({
+            "type": "answer_pending",
+            "selected_value": "disabled",
+            "source_evidence": "Disable observability",
+        })
+        manual = validate_action_contract({
+            "type": "answer_pending",
+            "answer": "custom-value",
+            "source_evidence": "Use custom-value",
+        })
+
+        self.assertNotIn("answer", selected)
+        self.assertNotIn("selected_value", manual)
+        with self.assertRaisesRegex(
+            ValueError,
+            "conflicting answer and selected_value representations",
+        ):
+            validate_action_contract({
+                "type": "answer_pending",
+                "answer": "Disabled",
+                "selected_value": "disabled",
+                "source_evidence": "Disable observability",
             })
 
     def test_optional_empty_model_arguments_are_equivalent_to_omission(self) -> None:
@@ -149,24 +181,15 @@ class ActionContractAuthorityTest(unittest.TestCase):
                 "sync_observe_stop_condition": "duration",
             })
 
-    def test_legacy_nested_arguments_use_versioned_measured_entry(self) -> None:
-        from agent.harness.action_registry import (
-            LEGACY_ARGUMENTS_ENVELOPE_VERSION,
-            compatibility_usage,
-            normalize_action_envelope,
-            validate_action_contract,
-        )
+    def test_legacy_nested_arguments_exist_only_in_v12_checkpoint_adapter(self) -> None:
+        from agent.harness.action_registry import validate_action_contract
+        from agent.harness.checkpoint_migrations import normalize_v12_action_envelope
 
-        before = compatibility_usage().get(LEGACY_ARGUMENTS_ENVELOPE_VERSION, 0)
-        action = normalize_action_envelope({
+        action = normalize_v12_action_envelope({
             "type": "answer_opening_question",
             "arguments": {"topic": "current_config"},
         })
         self.assertEqual(action["topic"], "current_config")
-        self.assertEqual(
-            compatibility_usage()[LEGACY_ARGUMENTS_ENVELOPE_VERSION],
-            before + 1,
-        )
         with self.assertRaisesRegex(ValueError, "arguments.v1 is retired"):
             validate_action_contract({
                 "type": "answer_opening_question",
@@ -181,6 +204,48 @@ class ActionContractAuthorityTest(unittest.TestCase):
         self.assertNotIn("Always include source_evidence", prompt)
         self.assertNotIn("confidence:'low'|'medium'|'high'", prompt)
 
+    def test_whole_plan_admission_cannot_reassign_context_ownership(self) -> None:
+        from agent.harness.semantic_compiler import whole_plan_admission_prompt
+
+        prompt = whole_plan_admission_prompt("")
+
+        self.assertIn("immutable disposition=context", prompt)
+        self.assertIn("never reinterpret it as complete or support", prompt)
+        self.assertIn("never invent an owner", prompt)
+
+    def test_pending_semantic_policy_preserves_contrastive_option_selection(
+        self,
+    ) -> None:
+        from agent.harness.semantic_policy import PENDING_CANDIDATE_SEMANTIC_POLICY
+
+        self.assertIn(
+            "select only the affirmed option",
+            PENDING_CANDIDATE_SEMANTIC_POLICY,
+        )
+        self.assertIn(
+            "never an answer selecting a rejected option",
+            PENDING_CANDIDATE_SEMANTIC_POLICY,
+        )
+        self.assertIn(
+            "one pending selection",
+            PENDING_CANDIDATE_SEMANTIC_POLICY,
+        )
+
+    def test_focused_pending_prompt_owns_option_effect_navigation(self) -> None:
+        from agent.harness.intent import _pending_contract_adjudication_prompt
+
+        prompt = _pending_contract_adjudication_prompt()
+
+        self.assertIn("flow named by one declared option", prompt)
+        self.assertIn("Emit answer_pending for its exact value", prompt)
+        self.assertIn("never replace that selection with change_group", prompt)
+        self.assertIn(
+            "top-level keys are exactly actions and semantic_units",
+            prompt,
+        )
+        self.assertIn("never wrap it in action_plan", prompt)
+        self.assertIn("Never place action arguments inside an arguments object", prompt)
+
     def test_r36_turn_local_lifetime_contract_is_preserved(self) -> None:
         from agent.harness.action_registry import action_is_turn_local
 
@@ -191,17 +256,15 @@ class ActionContractAuthorityTest(unittest.TestCase):
             "analyze_report",
         ):
             self.assertTrue(action_is_turn_local({"type": action_type}), action_type)
-        self.assertFalse(action_is_turn_local({"type": "inspect_failure"}))
+        self.assertTrue(action_is_turn_local({"type": "inspect_failure"}))
         self.assertFalse(action_is_turn_local({"type": "choose_target_mode"}))
 
     def test_retired_custom_rpc_action_is_only_an_admission_compatibility_input(self) -> None:
-        from agent.harness.action_registry import (
-            ACTION_BY_TYPE,
-            compile_legacy_custom_rpc_action,
-        )
+        from agent.harness.action_registry import ACTION_BY_TYPE
+        from agent.harness.checkpoint_migrations import compile_v12_custom_rpc_action
 
         self.assertNotIn("start_custom_rpc", ACTION_BY_TYPE)
-        compiled = compile_legacy_custom_rpc_action({
+        compiled = compile_v12_custom_rpc_action({
             "type": "start_custom_rpc",
             "rpc_endpoint": "https://example.invalid/rpc",
             "rpc_method": "eth_chainId",

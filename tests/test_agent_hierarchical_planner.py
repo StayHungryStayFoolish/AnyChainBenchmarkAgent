@@ -7,6 +7,686 @@ from unittest.mock import patch
 
 
 class HierarchicalPlannerContractTest(unittest.TestCase):
+    def test_stage_b_pending_answer_contract_exposes_complete_typed_options(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _stage_b_payload,
+            _stage_b_prompt,
+        )
+        from agent.harness.state import new_state
+
+        state = new_state("stage-b-pending-options", language="en")
+        state["pending_question"] = {
+            "id": "generic_choice",
+            "group": "opening",
+            "kind": "numbered_choice",
+            "prompt": "Choose one.",
+            "field": "generic_choice",
+            "manual_input_allowed": False,
+            "options": [
+                {"id": "first", "label": "First", "value": "alpha"},
+                {"id": "other", "label": "None / unsure", "value": "unknown"},
+            ],
+            "accepted_action_types": ["answer_pending"],
+        }
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": "None of these fit and I am not sure.",
+            "operation": "pending_answer",
+            "owner_routes": [{"owner": "coordinator", "group": ""}],
+            "reason": "semantic option selection",
+        }]
+
+        payload = _stage_b_payload(
+            state,
+            "coordinator",
+            frozenset(),
+            partition,
+            ("unit-1",),
+        )
+        prompt = _stage_b_prompt("coordinator")
+
+        self.assertEqual(
+            payload["owner_state"]["pending_question"]["options"],
+            state["pending_question"]["options"],
+        )
+        self.assertIn(
+            "answer_pending",
+            {row["type"] for row in payload["owner_action_schema"]},
+        )
+        self.assertIn("owner_state.pending_question", prompt)
+        self.assertIn("exactly one option is semantically selected", prompt)
+        self.assertIn("zero or several options", prompt)
+        self.assertIn("emit the coordinator-owned answer_pending action", prompt)
+        self.assertIn(
+            "selected_value equal to that option's exact value, omit answer",
+            prompt,
+        )
+        self.assertIn(
+            "For valid manual input, emit answer and omit selected_value",
+            prompt,
+        )
+        self.assertIn(
+            "Never emit that specialized option.action directly",
+            prompt,
+        )
+
+    def test_stage_a_contract_keeps_pending_selection_rationale_atomic(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _stage_a_admission_prompt,
+            _stage_a_prompt,
+        )
+
+        partition_prompt = _stage_a_prompt()
+        admission_prompt = _stage_a_admission_prompt()
+
+        self.assertIn("form one pending_answer operation", partition_prompt)
+        self.assertIn(
+            "active pending_question.group as that route's group",
+            partition_prompt,
+        )
+        self.assertIn("referential application", partition_prompt)
+        self.assertIn("declared completion effect", partition_prompt)
+        self.assertIn(
+            "independently asks for research, explanation, navigation, or a mutation",
+            partition_prompt,
+        )
+        self.assertIn(
+            "do not approve a fictitious second demand",
+            admission_prompt,
+        )
+        self.assertIn(
+            "form one pending_answer for the affirmed option",
+            partition_prompt,
+        )
+        self.assertIn(
+            "rejection of one declared option as selecting that rejected option",
+            admission_prompt,
+        )
+        self.assertIn("one parser-proven manual value", partition_prompt)
+        self.assertIn("pending_typed_candidates proves one candidate", admission_prompt)
+
+    def test_stage_a_redundancy_preserves_source_coverage_but_not_execution(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _partition_after_stage_a_admission,
+        )
+
+        partition = [
+            {
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": "Disable observability for this run;",
+                "operation": "pending_answer",
+                "owner_routes": [{"owner": "coordinator", "group": ""}],
+                "reason": "selects the disabled option",
+            },
+            {
+                "unit_id": "unit-2",
+                "clause_id": "clause-2",
+                "source_text": "I don't want any monitoring enabled.",
+                "operation": "domain_request",
+                "owner_routes": [{
+                    "owner": "performance",
+                    "group": "observability",
+                }],
+                "reason": "restates the selected option",
+            },
+        ]
+
+        source, compilation = _partition_after_stage_a_admission(
+            partition,
+            frozenset({"unit-2"}),
+        )
+
+        self.assertEqual([row["unit_id"] for row in source], ["unit-1", "unit-2"])
+        self.assertEqual([row["unit_id"] for row in compilation], ["unit-1"])
+        self.assertEqual(source[1]["operation"], "context")
+        self.assertEqual(source[1]["owner_routes"], [])
+        self.assertIn("non-executable duplicate", source[1]["reason"])
+        self.assertEqual(partition[1]["operation"], "domain_request")
+
+    def test_focused_pending_adjudication_recompiles_once_before_admission(
+        self,
+    ) -> None:
+        from agent.harness.intent import adjudicate_active_pending_contract
+        from agent.harness.plan_coverage import PlanCoverageResult, TurnClause
+        from agent.harness.semantic_compiler import WholePlanAdmission
+        from agent.harness.state import new_state
+
+        state = new_state("focused-pending-repair", language="en")
+        state["pending_question"] = {
+            "id": "workload_confirm",
+            "group": "workload_rpc",
+            "kind": "numbered_choice",
+            "prompt": "Choose the next workload step.",
+            "field": "workload_confirm",
+            "manual_input_allowed": False,
+            "options": [{
+                "id": "change_target",
+                "label": "Change chain or target mode",
+                "value": "change_target",
+            }],
+            "accepted_action_types": ["answer_pending"],
+        }
+        clauses = (
+            TurnClause(
+                "clause-1",
+                "Take me to the chain or target-mode change flow.",
+            ),
+        )
+        invalid = PlanCoverageResult(
+            False,
+            ("answer_pending contains retired nested arguments",),
+            ("clause-1",),
+        )
+        valid = PlanCoverageResult(True, (), ())
+        compile_responses = [
+            ("first-invalid", ()),
+            ("second-valid", ()),
+        ]
+
+        with (
+            patch(
+                "agent.harness.intent._compile_semantic_candidate",
+                side_effect=compile_responses,
+            ) as compiler,
+            patch(
+                "agent.harness.intent._prepare_bounded_semantic_candidate",
+                side_effect=[("{}", invalid), ("{}", valid)],
+            ),
+            patch(
+                "agent.harness.intent._review_bounded_semantic_candidate",
+                return_value=(
+                    SimpleNamespace(request_json="{}"),
+                    WholePlanAdmission(
+                        valid=True,
+                        errors=(),
+                        request_count=1,
+                        request_sizes=(101,),
+                    ),
+                    (),
+                ),
+            ) as reviewer,
+            patch(
+                "agent.harness.intent._admitted_plan_requires_pending_contract_adjudication",
+                return_value=False,
+            ),
+            patch(
+                "agent.harness.intent._admitted_action_queue",
+                return_value={"actions": [{"type": "answer_pending"}]},
+            ),
+        ):
+            result, errors, sizes, compiler_calls, admission_calls = (
+                adjudicate_active_pending_contract(
+                    object(),
+                    state,
+                    clauses[0].text,
+                    clauses,
+                    invalid_candidate="{}",
+                    validation_errors=("broad plan is ambiguous",),
+                    allowed_action_types=frozenset({"answer_pending"}),
+                )
+            )
+
+        self.assertEqual(result["actions"], [{"type": "answer_pending"}])
+        self.assertEqual(errors, ())
+        self.assertEqual(compiler_calls, 2)
+        self.assertEqual(admission_calls, 1)
+        self.assertEqual(len(sizes), 3)
+        self.assertEqual(compiler.call_count, 2)
+        second_request = compiler.call_args_list[1].kwargs["request_payload"]
+        self.assertEqual(
+            second_request["validation_errors"],
+            ["answer_pending contains retired nested arguments"],
+        )
+        self.assertEqual(
+            [
+                row["type"]
+                for row in second_request["action_schema"]
+            ],
+            ["answer_pending"],
+        )
+        self.assertEqual(
+            [
+                row["type"]
+                for row in second_request["original_request"]["action_schema"]
+            ],
+            ["answer_pending"],
+        )
+        reviewer.assert_called_once()
+
+    def test_stage_a_routes_competing_pending_units_to_focused_authority(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _partition_requires_focused_pending_adjudication,
+        )
+        from agent.harness.state import new_state
+
+        state = new_state("focused-multi-unit", language="en")
+        state["pending_question"] = {
+            "id": "detected_value",
+            "group": "environment",
+        }
+        partition = [
+            {
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "operation": "pending_answer",
+            },
+            {
+                "unit_id": "unit-2",
+                "clause_id": "clause-2",
+                "operation": "pending_answer",
+            },
+        ]
+
+        self.assertTrue(
+            _partition_requires_focused_pending_adjudication(
+                state,
+                {"structured_candidates": []},
+                partition,
+            )
+        )
+        self.assertFalse(
+            _partition_requires_focused_pending_adjudication(
+                {**state, "pending_question": {}},
+                {"structured_candidates": []},
+                partition,
+            )
+        )
+
+    def test_stage_a_routes_typed_candidate_with_executable_sibling_to_focused_authority(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _partition_requires_focused_pending_adjudication,
+        )
+        from agent.harness.state import new_state
+
+        state = new_state("focused-manual-sibling", language="en")
+        state["pending_question"] = {
+            "id": "generic_manual_value",
+            "group": "endpoint_process",
+            "kind": "url",
+            "manual_input_allowed": True,
+            "options": [],
+        }
+        partition = [
+            {
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "operation": "domain_request",
+            },
+            {
+                "unit_id": "unit-2",
+                "clause_id": "clause-2",
+                "operation": "pending_answer",
+            },
+        ]
+
+        self.assertTrue(
+            _partition_requires_focused_pending_adjudication(
+                state,
+                {
+                    "pending_typed_candidates": [
+                        "https://example.invalid/rpc",
+                    ],
+                    "structured_candidates": [],
+                },
+                partition,
+            )
+        )
+        self.assertTrue(
+            _partition_requires_focused_pending_adjudication(
+                state,
+                {
+                    "pending_typed_candidates": [
+                        "https://example.invalid/rpc",
+                    ],
+                    "structured_candidates": [],
+                },
+                [{
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "operation": "domain_request",
+                }],
+            )
+        )
+        self.assertFalse(
+            _partition_requires_focused_pending_adjudication(
+                state,
+                {
+                    "pending_typed_candidates": [
+                        "https://one.invalid/rpc",
+                        "https://two.invalid/rpc",
+                    ],
+                    "structured_candidates": [],
+                },
+                partition,
+            )
+        )
+
+    def test_focused_partition_schema_can_correct_universal_labels_only(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _focused_action_types_for_partition,
+        )
+
+        allowed = _focused_action_types_for_partition([{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "chain_rpc",
+                "group": "endpoint_process",
+            }],
+        }])
+
+        self.assertIn("rpc_catalog_command", allowed)
+        self.assertIn("answer_pending", allowed)
+        self.assertIn("answer_opening_question", allowed)
+        self.assertIn("change_group", allowed)
+        self.assertNotIn("set_qps_mode", allowed)
+
+    def test_stage_a_routes_structured_pending_conflict_to_focused_authority(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _partition_requires_focused_pending_adjudication,
+        )
+        from agent.harness.state import new_state
+
+        state = new_state("focused-structured", language="en")
+        state["pending_question"] = {
+            "id": "throughput",
+            "group": "environment",
+        }
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-2",
+            "operation": "pending_answer",
+        }]
+
+        self.assertTrue(
+            _partition_requires_focused_pending_adjudication(
+                state,
+                {
+                    "structured_candidates": [{
+                        "clause_id": "clause-2",
+                        "config_values": {"THROUGHPUT": "1200"},
+                    }],
+                },
+                partition,
+            )
+        )
+        self.assertFalse(
+            _partition_requires_focused_pending_adjudication(
+                state,
+                {
+                    "structured_candidates": [{
+                        "clause_id": "clause-1",
+                        "config_values": {"THROUGHPUT": "1200"},
+                    }],
+                },
+                partition,
+            )
+        )
+
+    def test_stage_a_keeps_typed_evidence_contribution_atomic(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _canonicalize_atomic_evidence_partition,
+        )
+        from agent.harness.plan_coverage import TurnClause
+        from agent.harness.state import new_state
+
+        state = new_state("focused-evidence", language="en")
+        state["pending_question"] = {
+            "id": "schema_evidence",
+            "group": "endpoint_process",
+            "validation": {"value_type": "evidence_contribution"},
+        }
+        source, compilation = _canonicalize_atomic_evidence_partition(
+            state,
+            (
+                TurnClause(
+                    "clause-1",
+                    "request JSON\nresponse is not available yet",
+                    "structured",
+                ),
+            ),
+            [
+                {
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "operation": "pending_answer",
+                    "source_text": "request JSON",
+                    "owner_routes": [{
+                        "owner": "coordinator",
+                        "group": "endpoint_process",
+                    }],
+                },
+                {
+                    "unit_id": "unit-2",
+                    "clause_id": "clause-1",
+                    "operation": "context",
+                    "source_text": "response is not available yet",
+                    "owner_routes": [],
+                },
+            ],
+            [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "operation": "pending_answer",
+                "source_text": "request JSON",
+                "owner_routes": [{
+                    "owner": "coordinator",
+                    "group": "endpoint_process",
+                }],
+            }],
+        )
+
+        self.assertEqual(source, compilation)
+        self.assertEqual(len(source), 1)
+        self.assertEqual(
+            source[0]["source_text"],
+            "request JSON\nresponse is not available yet",
+        )
+        self.assertEqual(source[0]["operation"], "pending_answer")
+
+    def test_stage_a_routes_structured_config_to_environment_review(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _canonicalize_structured_config_partition,
+        )
+        from agent.harness.plan_coverage import TurnClause
+        from agent.harness.state import new_state
+
+        state = new_state("structured-review", language="en")
+        state["active_group"] = "accounts_disk"
+        state["pending_question"] = {
+            "id": "throughput",
+            "group": "accounts_disk",
+        }
+        unit = {
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": "THROUGHPUT=1200",
+            "operation": "pending_answer",
+            "owner_routes": [{
+                "owner": "coordinator",
+                "group": "accounts_disk",
+            }],
+            "reason": "candidate answer",
+        }
+        source, compilation = _canonicalize_structured_config_partition(
+            state,
+            (TurnClause("clause-1", "Use this:\nTHROUGHPUT=1200", "structured"),),
+            {
+                "structured_candidates": [{
+                    "clause_id": "clause-1",
+                    "config_values": {"THROUGHPUT": "1200"},
+                }],
+            },
+            [unit],
+            [unit],
+        )
+
+        self.assertEqual(source, compilation)
+        self.assertEqual(source[0]["operation"], "domain_request")
+        self.assertEqual(
+            source[0]["owner_routes"],
+            [{"owner": "environment", "group": "accounts_disk"}],
+        )
+        self.assertEqual(source[0]["source_text"], "Use this:\nTHROUGHPUT=1200")
+
+    def test_unique_manual_candidate_keeps_wrapper_as_source_context(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _canonicalize_unique_manual_pending_partition,
+        )
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.state import new_state
+
+        state = new_state("unique-manual-wrapper", language="en")
+        state["active_group"] = "endpoint_process"
+        state["pending_question"] = {
+            "id": "generic_endpoint",
+            "group": "endpoint_process",
+            "kind": "url",
+            "manual_input_allowed": True,
+            "options": [],
+            "manual_action": {
+                "type": "answer_pending",
+                "value_argument": "answer",
+            },
+            "validation": {},
+        }
+        clauses = segment_user_turn(
+            "Use only this validation value:\n"
+            "http://127.0.0.1:8545\n"
+            "Do not apply it to the final target."
+        )
+        partition = [
+            {
+                "unit_id": f"unit-{index}",
+                "clause_id": clause.clause_id,
+                "source_text": clause.text,
+                "operation": "pending_answer",
+                "owner_routes": [{
+                    "owner": "coordinator",
+                    "group": "endpoint_process",
+                }],
+                "reason": "one manual transaction",
+            }
+            for index, clause in enumerate(clauses, start=1)
+        ]
+
+        source, compilation = _canonicalize_unique_manual_pending_partition(
+            state,
+            clauses,
+            partition,
+            partition,
+        )
+
+        self.assertEqual(
+            [unit["operation"] for unit in source],
+            ["context", "pending_answer", "context"],
+        )
+        self.assertEqual(len(compilation), 1)
+        self.assertEqual(
+            compilation[0]["source_text"],
+            "http://127.0.0.1:8545",
+        )
+
+    def test_stage_a_retains_unclaimed_prose_for_independent_review(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _retain_unclaimed_prose_clauses,
+        )
+        from agent.harness.plan_coverage import TurnClause
+
+        clauses = (
+            TurnClause("clause-1", "Choose disabled;", "prose"),
+            TurnClause("clause-2", "I do not need metrics.", "prose"),
+        )
+        units = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": "Choose disabled;",
+            "operation": "pending_answer",
+            "owner_routes": [{
+                "owner": "coordinator",
+                "group": "observability",
+            }],
+            "reason": "selects one option",
+        }]
+
+        retained = _retain_unclaimed_prose_clauses(units, clauses)
+
+        self.assertEqual(len(retained), 2)
+        self.assertEqual(retained[1]["clause_id"], "clause-2")
+        self.assertEqual(retained[1]["source_text"], clauses[1].text)
+        self.assertEqual(retained[1]["operation"], "context")
+        self.assertEqual(retained[1]["owner_routes"], [])
+
+    def test_stage_a_does_not_synthesize_context_for_structured_clause(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _retain_unclaimed_prose_clauses,
+        )
+        from agent.harness.plan_coverage import TurnClause
+
+        clauses = (
+            TurnClause("clause-1", "Choose disabled.", "prose"),
+            TurnClause("clause-2", "MODE: local", "structured"),
+        )
+        units = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": "Choose disabled.",
+            "operation": "pending_answer",
+            "owner_routes": [{
+                "owner": "coordinator",
+                "group": "observability",
+            }],
+            "reason": "selects one option",
+        }]
+
+        retained = _retain_unclaimed_prose_clauses(units, clauses)
+
+        self.assertEqual(retained, units)
+
+    def test_whole_plan_contract_separates_options_from_manual_candidates(
+        self,
+    ) -> None:
+        from agent.harness.semantic_compiler import whole_plan_admission_prompt
+
+        prompt = whole_plan_admission_prompt("semantic policy")
+
+        self.assertIn(
+            "pending_answer_argument is an opaque manual-candidate id",
+            prompt,
+        )
+        self.assertIn(
+            "Declared options are reviewed through the immutable action and "
+            "pending_choice_contracts",
+            prompt,
+        )
+        self.assertIn(
+            "supplies an empty pending_value_candidates list, "
+            "pending_answer_argument must be exactly the empty string",
+            prompt,
+        )
+        self.assertNotIn("adapter_family_confirm", prompt)
+
     def test_product_resolver_end_to_end_contract_without_internal_boundary_mocks(
         self,
     ) -> None:
@@ -38,6 +718,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                         "unit_verdicts": [{
                             "unit_id": "unit-1",
                             "verdict": "complete",
+                            "supports_unit_id": "",
                             "reason": "all settings are routed",
                         }],
                         "clause_verdicts": [{
@@ -425,6 +1106,40 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
 
         self.assertTrue(any("arguments.v1 is retired" in error for error in errors))
 
+    def test_stage_b_rejects_selected_value_absent_from_pending_options(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _validate_owner_document
+
+        document = {
+            "actions": [{
+                "type": "answer_pending",
+                "selected_value": "[]",
+                "source_evidence": '"params":[]',
+            }],
+            "bindings": [{
+                "unit_id": "unit-1",
+                "action_indexes": [0],
+                "disposition": "action",
+                "reason": "mistook a wire literal for an option",
+            }],
+        }
+
+        _payload, errors = _validate_owner_document(
+            json.dumps(document),
+            "coordinator",
+            ("unit-1",),
+            pending_question={
+                "id": "schema_evidence",
+                "options": [],
+                "manual_input_allowed": True,
+            },
+        )
+
+        self.assertTrue(
+            any("absent from the active pending options" in error for error in errors)
+        )
+
     def test_stage_b_rejects_action_outside_the_unit_group(self) -> None:
         from agent.harness.hierarchical_planner import _validate_owner_document
 
@@ -527,6 +1242,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             "unit_verdicts": [{
                 "unit_id": "unit-1",
                 "verdict": "complete",
+                "supports_unit_id": "",
                 "reason": "chain is represented",
             }],
             "clause_verdicts": [{
@@ -545,13 +1261,753 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             "agent.harness.hierarchical_planner.request_semantic_compilation",
             return_value=json.dumps(response),
         ):
-            errors, _size = _review_stage_a_partition(
+            errors, _sizes, _redundant = _review_stage_a_partition(
                 object(),
                 payload,
                 partition,
             )
 
         self.assertTrue(any("omitted demand" in error for error in errors))
+
+    def test_stage_a_admission_repairs_only_malformed_contract_output(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_stage_a_partition,
+        )
+
+        payload = {
+            "user_text": "Keep monitoring disabled.",
+            "clauses": [{
+                "clause_id": "clause-1",
+                "text": "Keep monitoring disabled.",
+            }],
+            "groups": [{"name": "observability", "owner": "performance"}],
+            "universal_operations": ["pending_answer"],
+        }
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": "Keep monitoring disabled.",
+            "operation": "pending_answer",
+            "owner_routes": [{
+                "owner": "coordinator",
+                "group": "observability",
+            }],
+            "reason": "selects the disabled option",
+        }]
+        valid = {
+            "unit_verdicts": [{
+                "unit_id": "unit-1",
+                "verdict": "complete",
+                "supports_unit_id": "",
+                "reason": "the selection is represented",
+            }],
+            "clause_verdicts": [{
+                "clause_id": "clause-1",
+                "verdict": "complete",
+                "omitted_owner_routes": [],
+                "reason": "the complete demand is represented",
+            }],
+            "reason": "the partition is complete",
+        }
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=["{}", json.dumps(valid)],
+        ) as compiler:
+            errors, sizes, _redundant = _review_stage_a_partition(
+                object(),
+                payload,
+                partition,
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(len(sizes), 2)
+        self.assertEqual(compiler.call_count, 2)
+        repair_payload = compiler.call_args_list[1].kwargs["request_payload"]
+        self.assertIn("contract_repair", repair_payload)
+
+    def test_stage_a_admission_does_not_retry_valid_semantic_rejection(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_stage_a_partition,
+        )
+
+        payload = {
+            "user_text": "Use BSC and quick.",
+            "clauses": [{
+                "clause_id": "clause-1",
+                "text": "Use BSC and quick.",
+            }],
+            "groups": [
+                {"name": "chain_identity", "owner": "chain_rpc"},
+                {"name": "qps_profile", "owner": "performance"},
+            ],
+            "universal_operations": ["domain_request"],
+        }
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": "Use BSC and quick.",
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "chain_rpc",
+                "group": "chain_identity",
+            }],
+            "reason": "chain only",
+        }]
+        rejected = {
+            "unit_verdicts": [{
+                "unit_id": "unit-1",
+                "verdict": "complete",
+                "supports_unit_id": "",
+                "reason": "chain is represented",
+            }],
+            "clause_verdicts": [{
+                "clause_id": "clause-1",
+                "verdict": "omitted",
+                "omitted_owner_routes": [{
+                    "owner": "performance",
+                    "group": "qps_profile",
+                }],
+                "reason": "quick is missing",
+            }],
+            "reason": "one sibling demand is omitted",
+        }
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            return_value=json.dumps(rejected),
+        ) as compiler:
+            errors, sizes, _redundant = _review_stage_a_partition(
+                object(),
+                payload,
+                partition,
+            )
+
+        self.assertTrue(any("omitted demand" in error for error in errors))
+        self.assertEqual(len(sizes), 1)
+        self.assertEqual(compiler.call_count, 1)
+
+    def test_stage_a_context_unit_defers_omission_authority_to_clause(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_stage_a_partition,
+        )
+
+        payload = {
+            "user_text": "Proceed, using the settings already reviewed.",
+            "clauses": [{
+                "clause_id": "clause-1",
+                "text": "Proceed, using the settings already reviewed.",
+            }],
+            "groups": [{
+                "name": "preflight_smoke_execution",
+                "owner": "execution",
+            }],
+            "universal_operations": ["pending_answer", "context"],
+        }
+        partition = [
+            {
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": "Proceed",
+                "operation": "pending_answer",
+                "owner_routes": [{
+                    "owner": "coordinator",
+                    "group": "preflight_smoke_execution",
+                }],
+                "reason": "selects one option",
+            },
+            {
+                "unit_id": "unit-2",
+                "clause_id": "clause-1",
+                "source_text": "using the settings already reviewed.",
+                "operation": "context",
+                "owner_routes": [],
+                "reason": "restates the selected option scope",
+            },
+        ]
+        reviewed = {
+            "unit_verdicts": [
+                {
+                    "unit_id": "unit-1",
+                    "verdict": "complete",
+                    "supports_unit_id": "",
+                    "reason": "the selection is represented",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "verdict": "unresolved",
+                    "supports_unit_id": "",
+                    "reason": "the context has no action owner",
+                },
+            ],
+            "clause_verdicts": [{
+                "clause_id": "clause-1",
+                "verdict": "complete",
+                "omitted_owner_routes": [],
+                "reason": "the clause contains no omitted demand",
+            }],
+            "reason": "complete",
+        }
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            return_value=json.dumps(reviewed),
+        ) as compiler:
+            errors, sizes, _redundant = _review_stage_a_partition(
+                object(),
+                payload,
+                partition,
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(len(sizes), 1)
+        self.assertEqual(compiler.call_count, 1)
+
+    def test_stage_a_admission_identifies_redundant_sibling_unit(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_stage_a_partition,
+        )
+
+        payload = {
+            "user_text": "Proceed and perform the declared effect.",
+            "clauses": [{
+                "clause_id": "clause-1",
+                "text": "Proceed",
+            }, {
+                "clause_id": "clause-2",
+                "text": "perform the declared effect.",
+            }],
+            "groups": [{
+                "name": "preflight_smoke_execution",
+                "owner": "execution",
+            }],
+            "universal_operations": ["pending_answer", "domain_request"],
+            "pending_question": {
+                "id": "generic_specialized_choice",
+                "options": [{
+                    "value": True,
+                    "completion_effect": "Perform the declared effect.",
+                    "action": {"type": "approve_preflight_smoke"},
+                }],
+            },
+        }
+        partition = [
+            {
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": "Proceed",
+                "operation": "pending_answer",
+                "owner_routes": [{
+                    "owner": "coordinator",
+                    "group": "preflight_smoke_execution",
+                }],
+                "reason": "selects one option",
+            },
+            {
+                "unit_id": "unit-2",
+                "clause_id": "clause-2",
+                "source_text": "perform the declared effect.",
+                "operation": "domain_request",
+                "owner_routes": [{
+                    "owner": "execution",
+                    "group": "preflight_smoke_execution",
+                }],
+                "reason": "duplicates the selected option effect",
+            },
+        ]
+        reviewed = {
+            "unit_verdicts": [
+                {
+                    "unit_id": "unit-1",
+                    "verdict": "complete",
+                    "supports_unit_id": "",
+                    "reason": "the selection owns the demand",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "verdict": "redundant",
+                    "supports_unit_id": "unit-1",
+                    "reason": "this only restates the selected option effect",
+                },
+            ],
+            "clause_verdicts": [
+                {
+                    "clause_id": "clause-1",
+                    "verdict": "complete",
+                    "omitted_owner_routes": [],
+                    "reason": "the selection represents the complete demand",
+                },
+                {
+                    "clause_id": "clause-2",
+                    "verdict": "complete",
+                    "omitted_owner_routes": [],
+                    "reason": "the later clause only restates the effect",
+                },
+            ],
+            "reason": "one redundant unit",
+        }
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            return_value=json.dumps(reviewed),
+        ) as compiler:
+            errors, _sizes, redundant = _review_stage_a_partition(
+                object(),
+                payload,
+                partition,
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(redundant, frozenset({"unit-2"}))
+        self.assertEqual(
+            compiler.call_args.kwargs["request_payload"]["pending_question"],
+            payload["pending_question"],
+        )
+
+    def test_stage_a_admission_can_bind_manual_value_scope_to_candidate(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_stage_a_partition,
+        )
+
+        payload = {
+            "user_text": (
+                "Use only this value for validation:\n"
+                "https://example.invalid/rpc\n"
+                "Do not apply it to the final target."
+            ),
+            "clauses": [
+                {"clause_id": "clause-1", "text": "Use only this value for validation:"},
+                {"clause_id": "clause-2", "text": "https://example.invalid/rpc"},
+                {
+                    "clause_id": "clause-3",
+                    "text": "Do not apply it to the final target.",
+                },
+            ],
+            "groups": [{
+                "name": "endpoint_process",
+                "owner": "chain_rpc",
+            }],
+            "universal_operations": ["pending_answer", "domain_request"],
+            "pending_question": {
+                "id": "generic_manual_value",
+                "group": "endpoint_process",
+                "manual_input_allowed": True,
+                "options": [],
+            },
+            "pending_typed_candidates": ["https://example.invalid/rpc"],
+        }
+        partition = [
+            {
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": "Use only this value for validation:",
+                "operation": "domain_request",
+                "owner_routes": [{
+                    "owner": "chain_rpc",
+                    "group": "endpoint_process",
+                }],
+                "reason": "scope wrapper",
+            },
+            {
+                "unit_id": "unit-2",
+                "clause_id": "clause-2",
+                "source_text": "https://example.invalid/rpc",
+                "operation": "pending_answer",
+                "owner_routes": [{
+                    "owner": "coordinator",
+                    "group": "endpoint_process",
+                }],
+                "reason": "typed candidate",
+            },
+            {
+                "unit_id": "unit-3",
+                "clause_id": "clause-3",
+                "source_text": "Do not apply it to the final target.",
+                "operation": "domain_request",
+                "owner_routes": [{
+                    "owner": "chain_rpc",
+                    "group": "endpoint_process",
+                }],
+                "reason": "exclusion wrapper",
+            },
+        ]
+        reviewed = {
+            "unit_verdicts": [
+                {
+                    "unit_id": "unit-1",
+                    "verdict": "redundant",
+                    "supports_unit_id": "unit-2",
+                    "reason": "purpose scope for the manual candidate",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "verdict": "complete",
+                    "supports_unit_id": "",
+                    "reason": "the typed candidate owns the transaction",
+                },
+                {
+                    "unit_id": "unit-3",
+                    "verdict": "redundant",
+                    "supports_unit_id": "unit-2",
+                    "reason": "application exclusion for the candidate",
+                },
+            ],
+            "clause_verdicts": [
+                {
+                    "clause_id": f"clause-{index}",
+                    "verdict": "complete",
+                    "omitted_owner_routes": [],
+                    "reason": "fully represented by the one transaction",
+                }
+                for index in range(1, 4)
+            ],
+            "reason": "one manual-value transaction with scope context",
+        }
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            return_value=json.dumps(reviewed),
+        ) as compiler:
+            errors, _sizes, redundant = _review_stage_a_partition(
+                object(),
+                payload,
+                partition,
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(redundant, frozenset({"unit-1", "unit-3"}))
+        self.assertEqual(
+            compiler.call_args.kwargs["request_payload"][
+                "pending_typed_candidates"
+            ],
+            ["https://example.invalid/rpc"],
+        )
+
+    def test_stage_a_admission_allows_contrast_before_selected_unit(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_stage_a_partition,
+        )
+
+        payload = {
+            "user_text": "Do not keep defaults. Change the target instead.",
+            "clauses": [
+                {"clause_id": "clause-1", "text": "Do not keep defaults."},
+                {"clause_id": "clause-2", "text": "Change the target instead."},
+            ],
+            "groups": [{
+                "name": "workload_rpc",
+                "owner": "chain_rpc",
+            }],
+            "universal_operations": ["pending_answer", "context"],
+            "pending_question": {
+                "id": "generic_choice",
+                "options": [
+                    {"value": "default", "action": {"type": "use_default_workload"}},
+                    {"value": "change", "action": {"type": "request_target_change"}},
+                ],
+            },
+        }
+        partition = [
+            {
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": "Do not keep defaults.",
+                "operation": "context",
+                "owner_routes": [],
+                "reason": "contrast for the selected option",
+            },
+            {
+                "unit_id": "unit-2",
+                "clause_id": "clause-2",
+                "source_text": "Change the target instead.",
+                "operation": "pending_answer",
+                "owner_routes": [{
+                    "owner": "coordinator",
+                    "group": "workload_rpc",
+                }],
+                "reason": "selects one declared option",
+            },
+        ]
+        reviewed = {
+            "unit_verdicts": [
+                {
+                    "unit_id": "unit-1",
+                    "verdict": "redundant",
+                    "supports_unit_id": "unit-2",
+                    "reason": "contrastive evidence for the later selection",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "verdict": "complete",
+                    "supports_unit_id": "",
+                    "reason": "the selected option owns the demand",
+                },
+            ],
+            "clause_verdicts": [
+                {
+                    "clause_id": "clause-1",
+                    "verdict": "complete",
+                    "omitted_owner_routes": [],
+                    "reason": "contains contrast only",
+                },
+                {
+                    "clause_id": "clause-2",
+                    "verdict": "complete",
+                    "omitted_owner_routes": [],
+                    "reason": "contains the complete selection",
+                },
+            ],
+            "reason": "one contrastive redundant unit",
+        }
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            return_value=json.dumps(reviewed),
+        ):
+            errors, _sizes, redundant = _review_stage_a_partition(
+                object(),
+                payload,
+                partition,
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(redundant, frozenset({"unit-1"}))
+
+    def test_stage_b_repairs_specialized_option_schema_once(self) -> None:
+        from agent.harness.hierarchical_planner import _compile_owner_document
+        from agent.harness.state import new_state
+
+        state = new_state("stage-b-structural-repair", language="en")
+        state["pending_question"] = {
+            "id": "generic_specialized_choice",
+            "group": "preflight_smoke_execution",
+            "kind": "yes_no",
+            "prompt": "Proceed?",
+            "field": "generic_specialized_choice",
+            "manual_input_allowed": False,
+            "options": [{
+                "id": "proceed",
+                "label": "Proceed",
+                "value": "proceed",
+                "action": {"type": "approve_preflight_smoke"},
+            }],
+            "accepted_action_types": ["approve_preflight_smoke"],
+        }
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": "Proceed with it.",
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "execution",
+                "group": "preflight_smoke_execution",
+            }],
+            "reason": "selects the declared specialized action",
+        }]
+        malformed = {
+            "actions": [{
+                "type": "approve_preflight_smoke",
+                "source_evidence": "Proceed with it.",
+            }],
+            "bindings": [{
+                "unit_id": "unit-1",
+                "action_indexes": [0],
+                "disposition": "action",
+                "reason": "selected",
+            }],
+            "reason": "compiled",
+        }
+        repaired = {
+            "actions": [{"type": "approve_preflight_smoke"}],
+            "bindings": [{
+                "unit_id": "unit-1",
+                "action_indexes": [0],
+                "disposition": "action",
+                "reason": "selected",
+            }],
+            "reason": "repaired",
+        }
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                side_effect=[json.dumps(malformed), json.dumps(repaired)],
+            ) as compiler,
+        ):
+            document, errors, sizes = _compile_owner_document(
+                state,
+                "execution",
+                frozenset({"preflight_smoke_execution"}),
+                partition,
+                ("unit-1",),
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(
+            document["actions"],
+            [{"type": "approve_preflight_smoke"}],
+        )
+        self.assertEqual(len(sizes), 2)
+        self.assertEqual(compiler.call_count, 2)
+        repair_payload = compiler.call_args_list[1].kwargs["request_payload"]
+        self.assertIn("contract_repair", repair_payload)
+        self.assertIn(
+            "undeclared arguments",
+            " ".join(repair_payload["contract_repair"]["validator_errors"]),
+        )
+
+    def test_stage_b_repairs_conflicting_pending_answer_representation_once(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _compile_owner_document
+        from agent.harness.state import new_state
+
+        state = new_state("stage-b-pending-representation-repair", language="en")
+        state["pending_question"] = {
+            "id": "observability_mode",
+            "group": "observability",
+            "kind": "numbered_choice",
+            "prompt": "Choose observability.",
+            "field": "observability_mode",
+            "manual_input_allowed": False,
+            "options": [{
+                "id": "disabled",
+                "label": "Disabled",
+                "value": "disabled",
+                "action": {
+                    "type": "set_observability",
+                    "observability_mode": "disabled",
+                },
+            }],
+            "accepted_action_types": ["answer_pending"],
+        }
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": "Disable observability for this run.",
+            "operation": "pending_answer",
+            "owner_routes": [{"owner": "coordinator", "group": ""}],
+            "reason": "selects one declared option",
+        }]
+        conflicting = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": "Disabled",
+                "selected_value": "disabled",
+                "source_evidence": "Disable observability for this run.",
+            }],
+            "bindings": [{
+                "unit_id": "unit-1",
+                "action_indexes": [0],
+                "disposition": "action",
+                "reason": "selected",
+            }],
+            "reason": "compiled",
+        }
+        repaired = {
+            "actions": [{
+                "type": "answer_pending",
+                "selected_value": "disabled",
+                "source_evidence": "Disable observability for this run.",
+            }],
+            "bindings": [{
+                "unit_id": "unit-1",
+                "action_indexes": [0],
+                "disposition": "action",
+                "reason": "selected",
+            }],
+            "reason": "repaired",
+        }
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                side_effect=[json.dumps(conflicting), json.dumps(repaired)],
+            ) as compiler,
+        ):
+            document, errors, sizes = _compile_owner_document(
+                state,
+                "coordinator",
+                frozenset(),
+                partition,
+                ("unit-1",),
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(document["actions"], repaired["actions"])
+        self.assertEqual(len(sizes), 2)
+        self.assertEqual(compiler.call_count, 2)
+        repair = compiler.call_args_list[1].kwargs["request_payload"][
+            "contract_repair"
+        ]
+        self.assertIn(
+            "conflicting answer and selected_value representations",
+            " ".join(repair["validator_errors"]),
+        )
+
+    def test_stage_b_does_not_retry_valid_unresolved_binding(self) -> None:
+        from agent.harness.hierarchical_planner import _compile_owner_document
+        from agent.harness.state import new_state
+
+        state = new_state("stage-b-semantic-unresolved", language="en")
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": "The request is ambiguous.",
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "execution",
+                "group": "preflight_smoke_execution",
+            }],
+            "reason": "ambiguous selection",
+        }]
+        unresolved = {
+            "actions": [],
+            "bindings": [{
+                "unit_id": "unit-1",
+                "action_indexes": [],
+                "disposition": "unresolved",
+                "reason": "more information is required",
+            }],
+            "reason": "unresolved",
+        }
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                return_value=json.dumps(unresolved),
+            ) as compiler,
+        ):
+            document, errors, sizes = _compile_owner_document(
+                state,
+                "execution",
+                frozenset({"preflight_smoke_execution"}),
+                partition,
+                ("unit-1",),
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(document["actions"], [])
+        self.assertEqual(len(sizes), 1)
+        self.assertEqual(compiler.call_count, 1)
 
     def test_merge_preserves_semantic_order_across_owners(self) -> None:
         from agent.harness.hierarchical_planner import _merge_owner_documents
@@ -877,7 +2333,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             ) as compiler,
             patch(
                 "agent.harness.hierarchical_planner._review_stage_a_partition",
-                return_value=((), 100),
+                return_value=((), (100,), frozenset()),
             ),
             patch(
                 "agent.harness.hierarchical_planner.prepare_hierarchical_candidate",
@@ -904,9 +2360,19 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             [action["type"] for action in candidate["actions"]],
             ["choose_chain", "set_qps_mode"],
         )
-        from agent.harness.action_registry import ACTION_BY_TYPE
-
-        self.assertEqual(captured["allowed"], frozenset(ACTION_BY_TYPE))
+        self.assertEqual(
+            captured["allowed"],
+            frozenset({
+                "change_chain",
+                "choose_adapter_family",
+                "choose_chain",
+                "request_chain_selection",
+                "request_qps_customization",
+                "secondary_handoff_command",
+                "set_qps_mode",
+                "set_qps_override",
+            }),
+        )
         self.assertEqual(result["planner_metrics"]["stage_a_calls"], 2)
         self.assertEqual(result["planner_metrics"]["stage_b_calls"], 2)
         self.assertEqual(result["planner_metrics"]["admission_calls"], 1)

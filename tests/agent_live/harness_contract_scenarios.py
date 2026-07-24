@@ -274,7 +274,11 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
                 "kind": "prefix_equals_before_prefix",
                 "after_prefix": "pending_question",
                 "before_prefix": "resume_context.pending_question",
-                "ignored_suffixes": ["created_turn_index", "resume_action_queue"],
+                "ignored_suffixes": [
+                    "created_turn_index",
+                    "resume_action_queue",
+                    "same_turn_navigation_allowed",
+                ],
             },
             {
                 "kind": "path_equals_before_path",
@@ -1059,21 +1063,24 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
     catalog("target_mode_change", state, state.get("pending_question"))
 
     state = new_state("catalog-unknown-chain", language=language, session_purpose="coverage")
-    state["target_mode"] = "fake-node"
-    state["workflow_mode"] = "rpc_benchmark"
-    state = _compiled_action_state(
-        state,
-        {
-            "type": "choose_chain",
-            "chain_text": "sola",
-            "source_evidence": "sola",
-            "chain_exists": False,
-            "possible_known_chain": "solana",
-            "confidence": "high",
+    state.update({
+        "target_mode": "fake-node",
+        "workflow_mode": "rpc_benchmark",
+        "chain_identity": {
+            "raw": "sola",
+            "status": "needs_known_chain_confirmation",
+            "proposed_known_chain": "solana",
+            "llm_resolution": {
+                "chain_exists": False,
+                "possible_known_chain": "solana",
+            },
         },
-        user_text="test sola",
+    })
+    catalog(
+        "unknown_chain_identity",
+        state,
+        question_for_chain_rpc(state, "chain_identity"),
     )
-    catalog("unknown_chain_identity", state, state.get("pending_question"))
 
     state = new_state("catalog-chain-change", language=language, session_purpose="coverage")
     state.update({

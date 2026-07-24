@@ -14,6 +14,17 @@ from unittest.mock import patch
 LANGGRAPH_AVAILABLE = importlib.util.find_spec("langgraph") is not None
 
 
+def _upgrade_seeded_queue(state):
+    """Make deferred test proposals conform to the current durable contract."""
+
+    from tests.agent_live.graph_turn import admitted_action_queue
+
+    state["action_queue"] = admitted_action_queue(
+        state,
+        list(state.get("action_queue") or []),
+    )
+
+
 def _admitted_mock_plan(state, text, payload):
     """Mint the same immutable receipts as the production intent boundary."""
 
@@ -294,7 +305,7 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         self.assertEqual(result["chain_identity"]["canonical"], "bsc")
         self.assertEqual(result["pending_question"]["id"], "target_mode_select")
         self.assertEqual(
-            [item["type"] for item in result["action_queue"]],
+            [item.get("action_type") or item.get("type") for item in result["action_queue"]],
             ["set_rpc_mode", "set_qps_mode", "set_observability"],
         )
         self.assertIsNone(result.get("observability_mode"))
@@ -306,7 +317,7 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         self.assertEqual(result["rpc_mode"], "mixed")
         self.assertEqual(result["pending_question"]["id"], "workload_confirm")
         self.assertEqual(
-            [item["type"] for item in result["action_queue"]],
+            [item.get("action_type") or item.get("type") for item in result["action_queue"]],
             ["set_qps_mode", "set_observability"],
         )
 
@@ -341,7 +352,13 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
 
         self.assertEqual(result["pending_question"]["id"], "target_mode_select")
         self.assertEqual(
-            [(item["type"], item.get("qps_mode")) for item in result["action_queue"]],
+            [
+                (
+                    item.get("action_type") or item.get("type"),
+                    (item.get("arguments") or item).get("qps_mode"),
+                )
+                for item in result["action_queue"]
+            ],
             [("set_qps_mode", "quick")],
         )
         self.assertFalse(result.get("qps_profile"))
@@ -419,11 +436,12 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         """
 
         from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.state import new_state
 
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime = AnyChainGraphRuntime(thread_id="reset-thread", checkpoint_path=Path(tmpdir) / "checkpoints.sqlite")
-            runtime._persist_state(
-                {
+            checkpoint = new_state("reset-thread", language="en")
+            checkpoint.update({
                     "discovery": {"cloud": {"provider": "gcp"}},
                     "framework_summary": {"chain_count": 36},
                     "job": {"job_id": "job_demo", "status": "completed"},
@@ -431,8 +449,8 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
                     "confirmed_config": {"BLOCKCHAIN_NODE": "bsc", "CLOUD_REGION": "us-1"},
                     "target_mode": "fake-node",
                     "chain_identity": {"raw": "bsc", "canonical": "bsc", "status": "confirmed"},
-                }
-            )
+            })
+            runtime._persist_state(checkpoint)
             state = runtime.reset(language="en")
 
         self.assertEqual(state.get("discovery"), {})
@@ -1108,6 +1126,7 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
             },
         ]
         state["action_queue"] = deferred
+        _upgrade_seeded_queue(state)
         state["pending_question"] = resume_question(state)
         state["active_group"] = "opening"
         state["last_user_input"] = "Continue the saved configuration."
@@ -1126,7 +1145,19 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         self.assertEqual(result["active_group"], "qps_profile")
         self.assertEqual(result["pending_question"]["id"], "qps_profile_confirm")
         self.assertEqual(result.get("resume_context"), {})
-        self.assertEqual(result.get("action_queue"), deferred)
+        self.assertEqual(
+            [
+                (
+                    item.get("action_id"),
+                    item.get("action_type") or item.get("type"),
+                )
+                for item in result.get("action_queue") or []
+            ],
+            [
+                ("deferred-chain", "choose_chain"),
+                ("deferred-observability", "set_observability"),
+            ],
+        )
         admitted = (result.get("turn_context") or {}).get("admitted_actions") or []
         self.assertTrue(admitted)
         self.assertTrue(all(item.get("type") == "answer_pending" for item in admitted))
@@ -1231,7 +1262,7 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         self.assertEqual(result.get("pending_question"), {})
 
     def test_report_consultation_does_not_discard_same_turn_qps_change(self) -> None:
-        from agent.harness.coordinator import _process_action_queue
+        from tests.agent_live.graph_turn import invoke_actions
         from agent.harness.state import new_state
 
         state = new_state("report-and-change", language="en")
@@ -1262,14 +1293,14 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
             }),
             patch("agent.harness.domains.analysis.list_jobs", return_value=[]),
         ):
-            result = _process_action_queue(state, actions, "analyze latest and set quick")
+            result = invoke_actions(state, actions, "analyze latest and set quick")
 
         self.assertEqual((result.get("qps_profile") or {}).get("mode"), "quick")
         self.assertEqual((result.get("pending_question") or {}).get("id"), "qps_profile_confirm")
         self.assertIn("job_demo", "\n".join(result.get("visible_response") or []))
 
     def test_report_consultation_runs_before_custom_rpc_and_leaves_rpc_question_active(self) -> None:
-        from agent.harness.coordinator import _process_action_queue
+        from tests.agent_live.graph_turn import invoke_actions
         from agent.harness.state import new_state
 
         state = new_state("report-and-custom-rpc", language="en")
@@ -1284,8 +1315,8 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
             "active_group": "advanced_tuning",
         })
         actions = [
-            {"type": "rpc_catalog_command", "catalog_command": "enter", "source_evidence": "enter custom RPC setup", "confidence": "high"},
             {"type": "analyze_report", "confidence": "high", "subject": "latest"},
+            {"type": "rpc_catalog_command", "catalog_command": "enter", "source_evidence": "enter custom RPC setup", "confidence": "high"},
         ]
         with (
             patch("agent.harness.domains.analysis.resume_job", return_value={
@@ -1297,7 +1328,7 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
             }),
             patch("agent.harness.domains.analysis.list_jobs", return_value=[]),
         ):
-            result = _process_action_queue(state, actions, "analyze latest, then enter custom RPC setup")
+            result = invoke_actions(state, actions, "analyze latest, then enter custom RPC setup")
 
         self.assertEqual((result.get("custom_rpc") or {}).get("status"), "needs_endpoint")
         self.assertEqual((result.get("pending_question") or {}).get("id"), "custom_rpc_endpoint")
@@ -1306,7 +1337,7 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         self.assertIn("job_demo", "\n".join(result.get("visible_response") or []))
 
     def test_compound_rpc_custom_qps_and_observability_respects_domain_dependencies(self) -> None:
-        from agent.harness.coordinator import _process_action_queue
+        from tests.agent_live.graph_turn import invoke_actions
         from agent.harness.state import new_state
 
         state = new_state("compound-domain-order", language="en")
@@ -1324,19 +1355,19 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
             {"type": "rpc_catalog_command", "catalog_command": "enter", "source_evidence": "custom RPC", "confidence": "high"},
         ]
 
-        result = _process_action_queue(state, actions, "single, custom RPC, quick, observability disabled")
+        result = invoke_actions(state, actions, "single, custom RPC, quick, observability disabled")
 
         self.assertEqual((result.get("custom_rpc") or {}).get("status"), "needs_endpoint")
         self.assertEqual((result.get("pending_question") or {}).get("id"), "custom_rpc_endpoint")
         self.assertEqual(
-            [item.get("type") for item in result.get("action_queue") or []],
+            [item.get("action_type") or item.get("type") for item in result.get("action_queue") or []],
             ["set_qps_mode", "set_observability"],
         )
         prompt = str((result.get("pending_question") or {}).get("prompt") or "")
         self.assertEqual(sum(prompt in item for item in result.get("visible_response") or []), 1)
 
     def test_consultation_does_not_let_mutation_bypass_blocking_question(self) -> None:
-        from agent.harness.coordinator import _process_action_queue
+        from tests.agent_live.graph_turn import invoke_actions
         from agent.harness.domains.chain_rpc import question_for_chain_rpc
         from agent.harness.state import new_state
 
@@ -1362,17 +1393,20 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
             },
         ]
 
-        result = _process_action_queue(state, actions, "what will run, then use quick")
+        result = invoke_actions(state, actions, "what will run, then use quick")
 
         self.assertEqual((result.get("pending_question") or {}).get("id"), "workload_confirm")
-        self.assertEqual([item["type"] for item in result.get("action_queue") or []], ["set_qps_mode"])
+        self.assertEqual(
+            [item.get("action_type") or item.get("type") for item in result.get("action_queue") or []],
+            ["set_qps_mode"],
+        )
         self.assertFalse(result.get("qps_profile"))
         visible = "\n".join(result.get("visible_response") or [])
         self.assertIn("Use defaults", visible)
         self.assertIn("Add custom RPC method", visible)
 
     def test_new_turn_explicit_action_can_interrupt_older_blocking_question(self) -> None:
-        from agent.harness.coordinator import _process_action_queue
+        from tests.agent_live.graph_turn import invoke_actions
         from agent.harness.domains.performance import question_for_performance
         from agent.harness.state import new_state
 
@@ -1390,7 +1424,7 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         state["pending_question"] = question_for_performance(state, "qps_profile") or {}
         state["pending_question"]["created_turn_index"] = 3
 
-        result = _process_action_queue(
+        result = invoke_actions(
             state,
             [{"type": "rpc_catalog_command", "catalog_command": "enter", "source_evidence": "Take me to custom RPC", "confidence": "high"}],
             "Take me to custom RPC",
@@ -1635,7 +1669,7 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         self.assertEqual(result["custom_rpc"], {})
 
     def test_deferred_actions_survive_next_turn_and_resume_after_barrier_answer(self) -> None:
-        from agent.harness.coordinator import _process_action_queue
+        from tests.agent_live.graph_turn import invoke_actions
         from agent.harness.domains.chain_rpc import question_for_chain_rpc
         from agent.harness.state import new_state
 
@@ -1652,8 +1686,10 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
             ],
         })
         state["pending_question"] = question_for_chain_rpc(state, "workload_rpc") or {}
+        state["pending_question"]["resume_action_queue"] = True
+        _upgrade_seeded_queue(state)
 
-        result = _process_action_queue(
+        result = invoke_actions(
             state,
             [{"type": "use_default_workload", "confidence": "high"}],
             "Use defaults",
@@ -1663,7 +1699,7 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         self.assertEqual((result.get("qps_profile") or {}).get("mode"), "quick")
         self.assertEqual((result.get("pending_question") or {}).get("id"), "qps_profile_confirm")
         self.assertEqual(
-            [item["type"] for item in result.get("action_queue") or []],
+            [item.get("action_type") or item.get("type") for item in result.get("action_queue") or []],
             ["set_observability"],
         )
 
@@ -2118,9 +2154,26 @@ network:
         with patch("agent.harness.coordinator.resolve_action_queue") as resolver:
             resolver.return_value = {
                 "actions": [
-                    {"type": "set_qps_override", "qps_overrides": {"INITIAL_QPS": 5}, "confidence": "high"},
-                    {"type": "set_accounts_presence", "has_accounts_device": False, "confidence": "high"},
-                    {"type": "change_group", "group": "ledger_disk", "confidence": "high", "selection_contract_verified": True},
+                    {
+                        "type": "set_qps_override",
+                        "qps_overrides": {"INITIAL_QPS": 5},
+                        "source_evidence": "把 initial qps 设成 5",
+                        "confidence": "high",
+                    },
+                    {
+                        "type": "set_accounts_presence",
+                        "has_accounts_device": False,
+                        "source_evidence": "我没有 accounts 盘",
+                        "confidence": "high",
+                    },
+                    {
+                        "type": "change_group",
+                        "group": "ledger_disk",
+                        "navigation_explicit": True,
+                        "source_evidence": "回去继续磁盘",
+                        "confidence": "high",
+                        "selection_contract_verified": True,
+                    },
                 ]
             }
             result = process_turn(state)
@@ -2693,10 +2746,14 @@ network:
             result = process_turn(state)
 
         self.assertEqual(result["pending_question"]["id"], "inferred_config_review")
-        self.assertEqual(result["action_queue"][0]["type"], "rpc_catalog_command")
+        self.assertEqual(
+            result["action_queue"][0].get("action_type")
+            or result["action_queue"][0].get("type"),
+            "rpc_catalog_command",
+        )
         self.assertNotIn("endpoint_ready", result.get("custom_rpc", {}))
 
-    def test_custom_rpc_schema_answer_clears_stale_queue_control(self) -> None:
+    def test_custom_rpc_schema_answer_preserves_unrelated_durable_queue(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
         from agent.harness.state import new_state
 
@@ -2726,6 +2783,7 @@ network:
                 "use_complete_turn": True,
             },
             "queue_barrier": True,
+            "resume_action_queue": True,
         }
         state["action_queue"] = [
             {
@@ -2734,6 +2792,7 @@ network:
                 "confidence": "high",
             }
         ]
+        _upgrade_seeded_queue(state)
         state["last_user_input"] = "[]"
 
         ok_probe = {"ready": True, "status": "ok", "evidence_file": ".agent/evidence/probe.json"}
@@ -2754,7 +2813,13 @@ network:
 
         self.assertEqual(result["custom_rpc"]["status"], "method_validated_next")
         self.assertEqual(result["pending_question"]["id"], "custom_rpc_continue")
-        self.assertEqual(result.get("action_queue"), [])
+        self.assertEqual(
+            [
+                item.get("action_type") or item.get("type")
+                for item in result.get("action_queue") or []
+            ],
+            ["propose_config_values"],
+        )
         self.assertNotIn("CLOUD_REGION", result["confirmed_config"])
         prompt = str(result["pending_question"].get("prompt") or "")
         self.assertEqual(sum(prompt in item for item in result.get("visible_response") or []), 1)
@@ -3024,7 +3089,10 @@ network:
         self.assertEqual(result.get("target_mode"), "")
         self.assertEqual(result["pending_question"]["id"], "target_mode_select")
         self.assertEqual((result.get("chain_identity") or {}).get("canonical"), "bsc")
-        queued = {str(item.get("type") or "") for item in result.get("action_queue") or []}
+        queued = {
+            str(item.get("action_type") or item.get("type") or "")
+            for item in result.get("action_queue") or []
+        }
         self.assertTrue({"set_rpc_mode", "set_qps_mode", "set_observability"}.issubset(queued))
         self.assertIsNone((result.get("observability") or {}).get("mode"))
 
@@ -3642,10 +3710,10 @@ network:
 
         from agent.harness.coordinator import (
             _action_answers_pending_contract,
-            _dispatch_pending_action,
         )
         from agent.harness.domains.environment import question_for_environment
         from agent.harness.state import new_state
+        from tests.agent_live.graph_turn import invoke_action
 
         state = new_state("manual-choice", language="en")
         state.update({
@@ -3677,7 +3745,7 @@ network:
         }
 
         self.assertTrue(_action_answers_pending_contract(state, action))
-        result = _dispatch_pending_action(state, action)
+        result = invoke_action(state, action, state["last_user_input"])
 
         self.assertEqual((result.get("confirmed_config") or {}).get("DATA_VOL_SIZE"), "1000")
         self.assertFalse((result.get("inferred_config") or {}).get("DATA_VOL_SIZE_manual_required"))
@@ -3713,7 +3781,7 @@ network:
         state["last_user_input"] = "skip it, I don't have one"
         with patch(
             "agent.harness.coordinator.resolve_action_queue",
-            return_value={"actions": [{"type": "answer_pending", "answer": "skip", "selected_value": "none", "source_evidence": "skip it, I don't have one", "semantic_purpose_verified": True, "confidence": "high"}]},
+            return_value={"actions": [{"type": "answer_pending", "selected_value": "none", "source_evidence": "skip it, I don't have one", "semantic_purpose_verified": True, "confidence": "high"}]},
         ):
             result = process_turn(state)
 
@@ -4677,7 +4745,7 @@ network:
         )
 
     def test_pending_answer_removes_equivalent_duplicate_setter(self) -> None:
-        from agent.harness.coordinator import _validate_action_plan
+        from agent.harness.admission import _validate_action_plan
         from agent.harness.domains.chain_rpc import question_for_chain_rpc
         from agent.harness.state import new_state
 
@@ -6559,7 +6627,10 @@ network:
         self.assertFalse(result.get("rpc_mode"))
         self.assertEqual(result["pending_question"]["group"], "chain_identity")
         self.assertEqual(result["control"]["deferred_group"], "workload_rpc")
-        self.assertTrue(any(item.get("type") == "set_rpc_mode" for item in result.get("action_queue") or []))
+        self.assertTrue(any(
+            (item.get("action_type") or item.get("type")) == "set_rpc_mode"
+            for item in result.get("action_queue") or []
+        ))
 
     def test_unknown_chain_identity_grounds_with_google_search_unconditionally(self) -> None:
         """B.1 (known-issues.md): `needs_google_search` -- a flag the
@@ -7264,53 +7335,48 @@ network:
         self.assertNotIn("CLOUD_REGION", result.get("confirmed_config", {}))
         self.assertEqual(result["pending_question"]["id"], "CLOUD_REGION")
 
-    def test_declined_chain_change_preserves_unrelated_queued_actions(self) -> None:
-        from agent.harness.coordinator import _apply_pending_answer
+    def test_declined_chain_change_continues_unrelated_durable_action(self) -> None:
+        from tests.agent_live.graph_turn import answer_pending, invoke_actions
         from agent.harness.state import new_state
 
         state = new_state("unit-thread")
         state["active_group"] = "chain_identity"
         state["target_mode"] = "fake-node"
         state["workflow_mode"] = "rpc_benchmark"
-        state["chain_identity"] = {
-            "canonical": "bsc",
-            "status": "confirmed",
-            "change_candidate": {"raw": "ethereum", "interrupted_group": "qps_profile"},
-        }
-        state["action_queue"] = [{"action_id": "qps-1", "type": "set_qps_mode", "qps_mode": "quick"}]
-        question = {
-            "id": "chain_change_confirm",
-            "group": "chain_identity",
-            "kind": "yes_no",
-            "field": "chain_change_confirmed",
-            "options": [{"label": "Y", "value": True}, {"label": "N", "value": False}],
-            "interrupted_group": "qps_profile",
-        }
-
-        result = _apply_pending_answer(state, "n", question)
+        state["chain_identity"] = {"canonical": "bsc", "status": "confirmed"}
+        result = invoke_actions(
+            state,
+            [
+                {
+                    "type": "change_chain",
+                    "chain_text": "ethereum",
+                    "source_evidence": "switch to ethereum",
+                },
+                {
+                    "type": "set_qps_mode",
+                    "qps_mode": "quick",
+                    "mutation_explicit": True,
+                    "source_evidence": "use quick QPS",
+                },
+            ],
+            "switch to ethereum, then use quick QPS",
+        )
+        question = result["pending_question"]
+        self.assertEqual(question["id"], "chain_change_confirm")
+        result = answer_pending(result, "n", question)
 
         self.assertEqual(result["chain_identity"]["canonical"], "bsc")
-        self.assertEqual([item["action_id"] for item in result["action_queue"]], ["qps-1"])
-        self.assertEqual(result["active_group"], "qps_profile")
+        self.assertEqual(result["qps_profile"]["mode"], "quick")
 
     def test_keep_current_chain_does_not_invalidate_chain_dependent_state(self) -> None:
         from copy import deepcopy
-        from agent.harness.coordinator import _apply_pending_answer
         from agent.harness.state import new_state
 
         state = new_state("unit-thread")
         state["active_group"] = "chain_identity"
         state["target_mode"] = "real-node"
         state["workflow_mode"] = "rpc_benchmark"
-        state["chain_identity"] = {
-            "canonical": "solana",
-            "status": "confirmed",
-            "change_candidate": {
-                "raw": "sola",
-                "interrupted_group": "qps_profile",
-                "resolution": {"possible_known_chain": "solana"},
-            },
-        }
+        state["chain_identity"] = {"canonical": "solana", "status": "confirmed"}
         state["confirmed_config"] = {
             "BLOCKCHAIN_NODE": "solana",
             "LOCAL_RPC_URL": "http://node:8899",
@@ -7320,25 +7386,29 @@ network:
         state["workload"] = {"confirmed": True, "methods": ["getBalance"]}
         state["preflight"] = {"approved": True}
         preserved = deepcopy({key: state[key] for key in ("confirmed_config", "endpoint_evidence", "workload", "preflight")})
-        question = {
-            "id": "chain_change_confirm",
-            "group": "chain_identity",
-            "kind": "numbered_choice",
-            "field": "chain_change_confirmed",
-            "options": [{"label": "Keep solana", "value": "confirm_known_chain"}],
-        }
-
-        result = _apply_pending_answer(state, "1", question)
+        from tests.agent_live.graph_turn import invoke_action
+        state = invoke_action(
+            state,
+            {
+                "type": "change_chain",
+                "chain_text": "sola",
+                "canonical_chain_name": "sola",
+                "possible_known_chain": "solana",
+                "source_evidence": "change to sola",
+            },
+            "change to sola",
+        )
+        result = state
 
         self.assertEqual(result["chain_identity"]["canonical"], "solana")
         for key, value in preserved.items():
             self.assertEqual(result[key], value)
-        self.assertEqual(result["active_group"], "qps_profile")
 
     def test_workload_menu_options_are_executable_typed_transitions(self) -> None:
         from copy import deepcopy
-        from agent.harness.coordinator import _apply_pending_answer, _question_for_group
+        from agent.harness.domains.chain_rpc import question_for_chain_rpc
         from agent.harness.state import new_state
+        from tests.agent_live.graph_turn import answer_pending
 
         base = new_state("unit-thread")
         base["turn_index"] = 1
@@ -7348,34 +7418,38 @@ network:
         base["chain_identity"] = {"canonical": "solana", "status": "confirmed", "case": "known"}
         base["confirmed_config"] = {"BLOCKCHAIN_NODE": "solana"}
 
-        rpc_question = _question_for_group(base, "workload_rpc")
+        rpc_question = question_for_chain_rpc(base, "workload_rpc")
+        assert rpc_question is not None
         self.assertEqual(rpc_question["contract_version"], 2)
-        state = _apply_pending_answer(deepcopy(base), "1", rpc_question)
+        base["pending_question"] = rpc_question
+        state = answer_pending(deepcopy(base), "1", rpc_question)
         self.assertEqual(state["rpc_mode"], "single")
         self.assertEqual(state["pending_question"]["id"], "workload_confirm")
 
         default_question = state["pending_question"]
         state["turn_index"] = 2
-        default_result = _apply_pending_answer(deepcopy(state), "1", default_question)
+        default_result = answer_pending(deepcopy(state), "1", default_question)
         self.assertTrue(default_result["workload"]["confirmed"])
         self.assertEqual(default_result["workload"]["methods"], ["getAccountInfo"])
 
         state["turn_index"] = 3
-        custom_result = _apply_pending_answer(deepcopy(state), "2", default_question)
+        custom_result = answer_pending(deepcopy(state), "2", default_question)
         self.assertEqual(custom_result["custom_rpc"]["status"], "needs_endpoint")
         self.assertEqual(custom_result["active_group"], "endpoint_process")
 
         mixed = deepcopy(base)
         mixed["rpc_mode"] = "mixed"
-        mixed_question = _question_for_group(mixed, "workload_rpc")
+        mixed_question = question_for_chain_rpc(mixed, "workload_rpc")
+        assert mixed_question is not None
+        mixed["pending_question"] = mixed_question
         self.assertEqual([item["value"] for item in mixed_question["options"]], ["default", "custom_rpc", "weights", "change_target"])
         mixed["turn_index"] = 4
-        weights_result = _apply_pending_answer(mixed, "3", mixed_question)
+        weights_result = answer_pending(mixed, "3", mixed_question)
         self.assertEqual(weights_result["custom_rpc"]["status"], "needs_weights")
 
         change_state = deepcopy(state)
         change_state["turn_index"] = 5
-        change_result = _apply_pending_answer(change_state, "3", default_question)
+        change_result = answer_pending(change_state, "3", default_question)
         self.assertEqual(change_result["pending_question"]["id"], "target_change_scope")
         self.assertEqual(change_result["chain_identity"]["canonical"], "solana")
 
@@ -8487,7 +8561,7 @@ response:
         self.assertEqual(state["pending_question"]["id"], "new_chain_method_continue")
         self.assertIn("new_chain_method_probe", state["endpoint_evidence"])
 
-    def test_pending_answer_clears_stale_action_queue_before_new_endpoint_question(self) -> None:
+    def test_pending_answer_preserves_unrelated_queue_before_new_endpoint_question(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
         from agent.harness.state import new_state
 
@@ -8507,6 +8581,7 @@ response:
             "field": "adapter_family",
             "options": [{"label": "jsonrpc / EVM", "value": "jsonrpc"}],
             "manual_input_allowed": False,
+            "resume_action_queue": True,
         }
         state["action_queue"] = [
             {
@@ -8516,12 +8591,19 @@ response:
                 "confidence": "high",
             }
         ]
+        _upgrade_seeded_queue(state)
 
         state["last_user_input"] = "1"
         state = process_turn(state)
 
         self.assertEqual(state["pending_question"]["id"], "new_chain_endpoint")
-        self.assertEqual(state.get("action_queue"), [])
+        self.assertEqual(
+            [
+                item.get("action_type") or item.get("type")
+                for item in state.get("action_queue") or []
+            ],
+            ["propose_config_values"],
+        )
 
         ok_probe = {"ready": True, "status": "ok", "evidence_file": ".agent/evidence/probe.json"}
         with patch("agent.harness.domains.rpc_endpoint.validate_rpc_endpoint", return_value=ok_probe):
@@ -8899,13 +8981,18 @@ response:
             cancel_question=existing.cancel_question,
         )
         with patch.dict(coordinator.DOMAIN_RUNTIME, {"environment": runtime}):
-            result = coordinator._dispatch_pending_action(
+            from tests.agent_live.graph_turn import invoke_action
+            result = invoke_action(
                 state,
                 {"type": "answer_pending", "answer": 0, "selected_value": 0},
+                "zero",
             )
 
         self.assertEqual(result["confirmed_config"]["CLOUD_REGION"], 0)
-        self.assertEqual(result.get("pending_question"), {})
+        self.assertNotEqual(
+            (result.get("pending_question") or {}).get("id"),
+            "typed_zero_choice",
+        )
 
     def test_new_chain_semantic_response_rejection_satisfies_declared_postcondition(self) -> None:
         from agent.harness.domains.chain_rpc_questions import _response_confirmation_question
@@ -9558,7 +9645,14 @@ response:
                 "agent.harness.coordinator.resolve_action_queue",
                 return_value={"actions": [
                     {"type": "answer_pending", "answer": "够了", "selected_value": "finish", "source_evidence": "够了", "confidence": "high"},
-                    {"type": "rpc_workload_command", "workload_scope": "mixed_replace", "rpc_weights": {"eth_chainId": 100}, "finish_methods": True, "confidence": "high"},
+                    {
+                        "type": "rpc_workload_command",
+                        "workload_scope": "mixed_replace",
+                        "rpc_weights": {"eth_chainId": 100},
+                        "finish_methods": True,
+                        "source_evidence": "只用这个 method 做 mixed，权重 100",
+                        "confidence": "high",
+                    },
                 ]},
             ),
         ):
@@ -9587,6 +9681,7 @@ response:
             {"type": "set_qps_mode", "qps_mode": "quick", "mutation_explicit": True, "source_evidence": "quick", "confidence": "high", "_origin_text": "quick Grafana 不开"},
             {"type": "set_observability", "observability_mode": "disabled", "mutation_explicit": True, "source_evidence": "Grafana 不开", "confidence": "high", "_origin_text": "quick Grafana 不开"},
         ]
+        _upgrade_seeded_queue(state)
         state["pending_question"] = {
             "id": "custom_rpc_continue",
             "group": "endpoint_process",
@@ -9617,7 +9712,11 @@ response:
         self.assertEqual(result["workload"]["mixed_weights"], {"eth_chainId": 100})
         self.assertEqual(result["qps_profile"]["mode"], "quick")
         self.assertEqual(result["pending_question"]["id"], "qps_profile_confirm")
-        self.assertEqual(result["action_queue"][0]["type"], "set_observability")
+        self.assertEqual(
+            result["action_queue"][0].get("action_type")
+            or result["action_queue"][0].get("type"),
+            "set_observability",
+        )
 
         # A compound turn may propose multiple groups, but each blocking
         # group still completes its own confirmation protocol before the
@@ -9647,6 +9746,7 @@ response:
             {"type": "set_qps_mode", "qps_mode": "quick", "confidence": "high", "_origin_text": "quick Grafana 不开"},
             {"type": "set_observability", "observability_mode": "disabled", "confidence": "high", "_origin_text": "quick Grafana 不开"},
         ]
+        _upgrade_seeded_queue(state)
         state["last_user_input"] = ""
 
         result = process_turn(state)
@@ -9688,6 +9788,7 @@ response:
         state["action_queue"] = [
             {"type": "set_qps_mode", "qps_mode": "quick", "confidence": "high", "_origin_text": "quick"}
         ]
+        _upgrade_seeded_queue(state)
         state["last_user_input"] = "eth_chainId"
 
         result = process_turn(state)
@@ -9695,12 +9796,16 @@ response:
         self.assertEqual(result["custom_rpc"]["status"], "needs_schema_evidence")
         self.assertEqual(result["pending_question"]["id"], "custom_rpc_schema_evidence")
         self.assertTrue(result["pending_question"].get("resume_action_queue"))
-        self.assertEqual(result["action_queue"][0]["type"], "set_qps_mode")
+        self.assertEqual(
+            result["action_queue"][0].get("action_type")
+            or result["action_queue"][0].get("type"),
+            "set_qps_mode",
+        )
         self.assertEqual(result.get("qps_profile"), {})
         self.assertIn("Provide schema evidence", "\n".join(result.get("visible_response") or []))
 
     def test_custom_rpc_catalog_intake_precedes_unresolved_target_mode(self) -> None:
-        from agent.harness.coordinator import _process_action_queue
+        from tests.agent_live.graph_turn import invoke_actions
         from agent.harness.state import new_state
 
         state = new_state("custom-rpc-before-target-mode", language="en")
@@ -9728,7 +9833,7 @@ response:
             "validation": {"input_mode": "rpc_method_or_schema_evidence"},
         }
 
-        result = _process_action_queue(
+        result = invoke_actions(
             state,
             [
                 {
@@ -9755,12 +9860,12 @@ response:
         self.assertEqual((result.get("pending_question") or {}).get("id"), "custom_rpc_schema_evidence")
         self.assertFalse(result.get("target_mode"))
         self.assertEqual(
-            [row.get("type") for row in result.get("action_queue") or []],
+            [row.get("action_type") or row.get("type") for row in result.get("action_queue") or []],
             ["request_target_mode_selection"],
         )
 
     def test_new_chain_catalog_intake_precedes_unresolved_target_mode(self) -> None:
-        from agent.harness.coordinator import _process_action_queue
+        from tests.agent_live.graph_turn import invoke_actions
         from agent.harness.state import new_state
 
         state = new_state("new-chain-rpc-before-target-mode", language="en")
@@ -9786,7 +9891,7 @@ response:
             "validation": {"input_mode": "rpc_method_or_schema_evidence"},
         }
 
-        result = _process_action_queue(
+        result = invoke_actions(
             state,
             [
                 {
@@ -9814,13 +9919,13 @@ response:
         self.assertNotIn("change_group", [row.get("type") for row in result.get("completed_actions") or []])
         self.assertFalse(result.get("target_mode"))
         self.assertEqual(
-            [row.get("type") for row in result.get("action_queue") or []],
+            [row.get("action_type") or row.get("type") for row in result.get("action_queue") or []],
             ["request_target_mode_selection"],
         )
 
     def test_custom_rpc_workload_selection_still_waits_for_target_mode(self) -> None:
         from agent.harness.action_registry import ACTION_BY_TYPE
-        from agent.harness.coordinator import _process_action_queue
+        from tests.agent_live.graph_turn import invoke_actions
         from agent.harness.state import new_state
 
         state = new_state("custom-rpc-workload-before-target-mode", language="en")
@@ -9833,7 +9938,7 @@ response:
             "case": "known",
         }
 
-        result = _process_action_queue(
+        result = invoke_actions(
             state,
             [
                 {
@@ -9853,7 +9958,10 @@ response:
 
         self.assertIn("target_mode", ACTION_BY_TYPE["rpc_workload_command"].requires_capabilities)
         self.assertEqual((result.get("pending_question") or {}).get("id"), "target_mode_select")
-        self.assertEqual([row.get("type") for row in result.get("action_queue") or []], ["rpc_workload_command"])
+        self.assertEqual(
+            [row.get("action_type") or row.get("type") for row in result.get("action_queue") or []],
+            ["rpc_workload_command"],
+        )
         self.assertNotIn("rpc_workload_command", [row.get("type") for row in result.get("completed_actions") or []])
         self.assertFalse(result.get("target_mode"))
 
@@ -9930,7 +10038,11 @@ response:
 
         self.assertEqual(result["pending_question"]["id"], "chain")
         self.assertTrue(result["pending_question"]["queue_barrier"])
-        self.assertEqual(result["action_queue"][0]["type"], "rpc_catalog_command")
+        self.assertEqual(
+            result["action_queue"][0].get("action_type")
+            or result["action_queue"][0].get("type"),
+            "rpc_catalog_command",
+        )
         self.assertNotIn("endpoint_probe", result.get("custom_rpc") or {})
 
     def test_finishing_custom_rpc_method_displays_scope_question(self) -> None:
@@ -9960,6 +10072,7 @@ response:
         state["action_queue"] = [
             {"type": "set_observability", "observability_mode": "disabled", "mutation_explicit": True, "source_evidence": "disable observability", "confidence": "high"}
         ]
+        _upgrade_seeded_queue(state)
         state["last_user_input"] = "2"
 
         result = process_turn(state)
@@ -9967,7 +10080,11 @@ response:
         self.assertEqual(result["custom_rpc"]["status"], "needs_scope")
         self.assertEqual(result["pending_question"]["id"], "custom_rpc_scope")
         self.assertIn("Choose how to apply", "\n".join(result.get("visible_response") or []))
-        self.assertEqual(result["action_queue"][0]["type"], "set_observability")
+        self.assertEqual(
+            result["action_queue"][0].get("action_type")
+            or result["action_queue"][0].get("type"),
+            "set_observability",
+        )
 
     def test_completed_custom_rpc_scope_keeps_interrupted_qps_after_deferred_observability(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
@@ -10001,6 +10118,7 @@ response:
         state["action_queue"] = [
             {"type": "set_observability", "observability_mode": "disabled", "mutation_explicit": True, "source_evidence": "disable observability", "confidence": "high"}
         ]
+        _upgrade_seeded_queue(state)
         state["last_user_input"] = "1"
 
         result = process_turn(state)
@@ -10079,7 +10197,7 @@ response:
         self.assertEqual(next_result.get("question_id"), "opening_next_action")
 
     def test_specific_workload_consultation_absorbs_generic_config_responses(self) -> None:
-        from agent.harness.coordinator import _drop_conflicting_answer_actions
+        from agent.harness.admission import _drop_conflicting_answer_actions
         from agent.harness.state import new_state
 
         state = new_state("workload-consultation", language="en")
@@ -10099,7 +10217,7 @@ response:
         self.assertTrue(any(item.get("type") == "set_qps_mode" for item in pruned))
 
     def test_rpc_mutation_uses_its_actionable_workload_question_as_the_consultation_answer(self) -> None:
-        from agent.harness.coordinator import _drop_conflicting_answer_actions
+        from agent.harness.admission import _drop_conflicting_answer_actions
         from agent.harness.state import new_state
 
         state = new_state("workload-mutation-consultation", language="en")
@@ -10140,6 +10258,7 @@ response:
             "confidence": "high",
             "_origin_text": "quick",
         }]
+        _upgrade_seeded_queue(state)
         state["pending_question"] = {
             "id": "custom_rpc_schema_evidence",
             "group": "endpoint_process",
@@ -10363,9 +10482,8 @@ response:
         self.assertGreater(result["custom_rpc"]["catalog"]["revision"], 1)
         self.assertEqual(result["pending_question"]["id"], "custom_rpc_schema_confirm")
 
-    def test_legacy_custom_rpc_compiles_explicit_schema_evidence_action(self) -> None:
-        from agent.harness.coordinator import _apply_queue_action
-        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+    def test_legacy_custom_rpc_migration_respects_current_catalog_confirmation(self) -> None:
+        from tests.agent_live.graph_turn import answer_pending, invoke_action
         from agent.harness.state import new_state
 
         state = new_state("unit-thread", language="zh")
@@ -10391,12 +10509,27 @@ response:
         probe = {"ready": True, "status": "ok", "evidence_file": ".agent/evidence/probe.json"}
 
         with patch("agent.harness.domains.rpc_endpoint.extract_rpc_schema_from_evidence", return_value={"status": "draft", "method": "eth_chainId", "params": [], "params_json": [], "response_summary": "hex chain id", "confidence": "high"}), patch("agent.harness.domains.rpc_endpoint.validate_rpc_endpoint", return_value=probe):
-            from agent.harness.action_registry import compile_legacy_custom_rpc_action
+            from agent.harness.checkpoint_migrations import compile_v12_custom_rpc_action
             result = state
-            for compiled in compile_legacy_custom_rpc_action(action):
-                result = _apply_queue_action(result, compiled, state["last_user_input"])
+            for compiled in compile_v12_custom_rpc_action(action):
+                result = invoke_action(result, compiled, state["last_user_input"])
             self.assertEqual(result["custom_rpc"]["status"], "schema_needs_confirmation")
             result = self._confirm_catalog_through_domain(result)
+            self.assertEqual(result["custom_rpc"]["status"], "method_validated_next")
+            result = answer_pending(result, "finish")
+            self.assertEqual(result["custom_rpc"]["status"], "needs_scope")
+            result = invoke_action(
+                result,
+                {
+                    "type": "rpc_workload_command",
+                    "workload_scope": "mixed_replace",
+                    "rpc_weights": {"eth_chainId": 100},
+                    "finish_methods": True,
+                    "source_evidence": state["last_user_input"],
+                    "confidence": "high",
+                },
+                state["last_user_input"],
+            )
 
         self.assertNotIn("LOCAL_RPC_URL", result.get("confirmed_config", {}))
         self.assertEqual(_catalog_draft(result)["params_json"], [])
@@ -10596,6 +10729,7 @@ response:
                 "confidence": "medium",
             },
         ]
+        _upgrade_seeded_queue(state)
         state["last_user_input"] = "1"
         probe = {"ready": True, "status": "ok", "evidence_file": ".agent/evidence/probe.json"}
 
@@ -10642,12 +10776,16 @@ response:
             result = process_turn(state)
 
         self.assertEqual(result["chain_identity"]["status"], "unsupported_family_handoff")
-        self.assertEqual(result.get("pending_question"), {})
+        self.assertEqual(
+            result.get("pending_question", {}).get("id"),
+            "case3_protocol_evidence",
+        )
         self.assertIn("二次开发", "\n".join(result["visible_response"]))
         self.assertNotIn("你想测试哪条链", "\n".join(result["visible_response"]))
 
     def test_case3_handoff_collects_followup_evidence_without_fallback(self) -> None:
-        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from tests.agent_live.graph_turn import invoke_action
+        from agent.harness.domains.chain_rpc_questions import _case3_evidence_question
         from agent.harness.state import new_state
 
         state = new_state("unit-thread", language="zh")
@@ -10666,25 +10804,19 @@ response:
             "evidence": [],
         }
         state["active_group"] = "chain_identity"
-        state["pending_question"] = {
-            "id": "case3_protocol_evidence",
-            "group": "chain_identity",
-            "kind": "evidence",
-            "field": "case3_protocol_evidence",
-            "manual_input_allowed": True,
-        }
-        state["last_user_input"] = "protocol: weird-p2p"
-
-        with patch(
-            "agent.harness.coordinator.resolve_action_queue",
-            return_value={"actions": [{
+        state["pending_question"] = _case3_evidence_question(state)
+        user_text = "protocol: weird-p2p"
+        result = invoke_action(
+            state,
+            {
                 "type": "secondary_handoff_command",
                 "handoff_command": "append_evidence",
-                "handoff_evidence": state["last_user_input"],
+                "handoff_evidence": user_text,
+                "source_evidence": user_text,
                 "confidence": "high",
-            }]},
-        ):
-            result = process_turn(state)
+            },
+            user_text,
+        )
 
         self.assertEqual(result["chain_identity"]["status"], "case3_collecting_evidence")
         self.assertEqual(result["secondary_handoff"]["evidence"], ["protocol: weird-p2p"])
@@ -11080,6 +11212,7 @@ response:
             "field": "inferred_config_review",
             "options": [{"label": "Y", "value": True}, {"label": "N", "value": False}],
             "resume_action_queue": True,
+            "supersedes_action_types": ["propose_config_values"],
         }
         state["action_queue"] = [
             {
@@ -11097,6 +11230,7 @@ response:
                 "_origin_text": "QPS 用 quick",
             },
         ]
+        _upgrade_seeded_queue(state)
         state["last_user_input"] = "Y"
 
         result = process_turn(state)
@@ -11106,10 +11240,13 @@ response:
         self.assertFalse(result["confirmed_config"]["has_accounts_device"])
         self.assertEqual(result["qps_profile"]["mode"], "quick")
         self.assertNotEqual(result.get("pending_question", {}).get("id"), "inferred_config_review")
-        self.assertFalse(any(item.get("type") == "propose_config_values" for item in result.get("action_queue") or []))
+        self.assertFalse(any(
+            (item.get("action_type") or item.get("type")) == "propose_config_values"
+            for item in result.get("action_queue") or []
+        ))
         self.assertNotIn("unmapped_1", "\n".join(result.get("visible_response") or []))
 
-    def test_pending_config_review_preserves_exact_prompt_across_language_change(self) -> None:
+    def test_pending_config_review_rerenders_in_current_language(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
         from agent.harness.state import new_state
 
@@ -11153,8 +11290,8 @@ response:
         )
         text = "\n".join(result["visible_response"])
 
-        self.assertIn("I inferred these candidate config values", text)
-        self.assertNotIn("我从你粘贴的内容中推断出这些配置候选值", text)
+        self.assertNotIn("I inferred these candidate config values", text)
+        self.assertIn("我从你粘贴的内容中推断出这些配置候选值", text)
 
     def test_complete_traceback_is_analyzed_as_one_semantic_turn(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
@@ -11376,7 +11513,8 @@ response:
         self.assertEqual((result.get("control") or {}).get("deferred_group"), "qps_profile")
 
     def test_execution_rejects_append_after_prior_action_pauses_collection(self) -> None:
-        from agent.harness.coordinator import _process_action_queue
+        from tests.agent_live.graph_turn import invoke_actions
+        from agent.harness.invariants import StateInvariantError
         from agent.harness.state import new_state
 
         state = new_state("stale-evidence-action", language="en")
@@ -11387,23 +11525,23 @@ response:
             "status": "active",
         }
         source = "Pause this paste; the next line belongs elsewhere."
-        result = _process_action_queue(state, [
-            {
-                "type": "pause_evidence_collection",
-                "source_evidence": source,
-                "confidence": "high",
-            },
-            {
-                "type": "append_evidence_collection",
-                "evidence": "do not append",
-                "source_evidence": source,
-                "confidence": "high",
-            },
-        ], source)
+        with self.assertRaises(StateInvariantError):
+            invoke_actions(state, [
+                {
+                    "type": "pause_evidence_collection",
+                    "source_evidence": source,
+                    "confidence": "high",
+                },
+                {
+                    "type": "append_evidence_collection",
+                    "evidence": source,
+                    "source_evidence": source,
+                    "confidence": "high",
+                },
+            ], source)
 
-        self.assertEqual(result["evidence_collection"]["status"], "paused")
-        self.assertEqual(result["evidence_collection"]["lines"], ["Traceback"])
-        self.assertIn("lifecycle_inapplicable", [row.get("error") for row in result.get("action_errors") or []])
+        self.assertEqual(state["evidence_collection"]["status"], "active")
+        self.assertEqual(state["evidence_collection"]["lines"], ["Traceback"])
 
     def test_paused_evidence_collection_resumes_only_through_typed_action(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
@@ -11567,6 +11705,7 @@ response:
 
     def test_multiline_rpc_evidence_is_collected_before_protocol_conflict(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.domains.chain_rpc import question_for_chain_rpc
         from agent.harness.state import new_state
 
         state = new_state("unit-thread", language="zh")
@@ -11582,13 +11721,10 @@ response:
         }
         state["endpoint_evidence"] = {"candidate_endpoint": "http://fake-node:19000", "candidate_endpoint_ready": True}
         state["active_group"] = "endpoint_process"
-        state["pending_question"] = {
-            "id": "new_chain_schema_evidence",
-            "group": "endpoint_process",
-            "kind": "evidence",
-            "field": "new_chain_schema_evidence",
-            "manual_input_allowed": True,
-        }
+        state["pending_question"] = question_for_chain_rpc(
+            state,
+            "endpoint_process",
+        ) or {}
         state["last_user_input"] = "curl --location 'http://fake-node:19000' \\"
 
         first = process_turn(state)
@@ -12944,6 +13080,7 @@ response:
 
     def test_pending_config_review_defers_new_actions_until_user_confirms(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+        from agent.harness.domains.environment import config_proposal_review_question
         from agent.harness.state import new_state
 
         state = new_state("unit-thread", language="zh")
@@ -12955,13 +13092,12 @@ response:
                 "reason": "unit",
             }
         }
-        state["pending_question"] = {
-            "id": "inferred_config_review",
-            "group": "provider_deployment",
-            "kind": "yes_no",
-            "field": "inferred_config_review",
-            "options": [{"label": "Y", "value": True}, {"label": "N", "value": False}],
-        }
+        state["active_group"] = "provider_deployment"
+        state["pending_question"] = config_proposal_review_question(
+            "provider_deployment",
+            state["inferred_config"]["pending_review"],
+            language="zh",
+        )
         state["last_user_input"] = "先把 QPS 改成 quick"
 
         with patch("agent.harness.coordinator.resolve_action_queue") as resolver:
@@ -12971,7 +13107,7 @@ response:
         self.assertEqual(first["pending_question"]["id"], "inferred_config_review")
         self.assertNotIn("resume_action_queue", first["pending_question"])
         self.assertEqual(
-            [item["type"] for item in first["action_queue"]],
+            [item.get("action_type") or item.get("type") for item in first["action_queue"]],
             ["request_target_mode_selection", "set_qps_mode"],
         )
 
@@ -12980,7 +13116,11 @@ response:
 
         self.assertEqual(second["confirmed_config"]["CLOUD_REGION"], "us-1")
         self.assertEqual(second["pending_question"]["id"], "target_mode_select")
-        self.assertEqual(second["action_queue"][0]["type"], "set_qps_mode")
+        self.assertEqual(
+            second["action_queue"][0].get("action_type")
+            or second["action_queue"][0].get("type"),
+            "set_qps_mode",
+        )
 
         second["last_user_input"] = "1"
         third = process_turn(second)
@@ -13634,7 +13774,7 @@ response:
         self.assertIn("Saved a later goal", "\n".join(result.get("visible_response") or []))
 
     def test_activating_saved_workflow_goal_uses_normal_mode_change_contract(self) -> None:
-        from agent.harness.coordinator import _process_action_queue
+        from tests.agent_live.graph_turn import invoke_actions
         from agent.harness.state import new_state
 
         state = new_state("activate-workflow-goal", language="en")
@@ -13649,7 +13789,7 @@ response:
             }],
         })
 
-        result = _process_action_queue(
+        result = invoke_actions(
             state,
             [{
                 "type": "activate_next_workflow_goal",
@@ -13683,7 +13823,7 @@ response:
         )
 
     def test_discarding_saved_workflow_goal_removes_only_the_oldest(self) -> None:
-        from agent.harness.coordinator import _process_action_queue
+        from tests.agent_live.graph_turn import invoke_actions
         from agent.harness.state import new_state
 
         state = new_state("discard-workflow-goal", language="en")
@@ -13700,7 +13840,7 @@ response:
             },
         ]
 
-        result = _process_action_queue(
+        result = invoke_actions(
             state,
             [{
                 "type": "discard_next_workflow_goal",
@@ -13777,7 +13917,7 @@ response:
 
 
     def test_repeated_back_navigation_uses_history_then_reports_no_destination(self) -> None:
-        from agent.harness.coordinator import _process_action_queue
+        from tests.agent_live.graph_turn import invoke_actions
         from agent.harness.state import new_state
 
         state = new_state("repeated-registered-back", language="en")
@@ -13796,8 +13936,8 @@ response:
         })
         action = {"type": "go_back", "source_evidence": "return one step"}
 
-        first = _process_action_queue(state, [action], "return one step")
-        second = _process_action_queue(first, [action], "return one step")
+        first = invoke_actions(state, [action], "return one step")
+        second = invoke_actions(first, [action], "return one step")
 
         self.assertEqual(first["active_group"], "workload_rpc")
         self.assertEqual(first["group_history"], [])
@@ -14016,9 +14156,10 @@ response:
             "analyze_report",
         ):
             self.assertEqual(ACTION_BY_TYPE[action_type].lifetime, "turn_local")
-        for action_type in ("choose_target_mode", "set_qps_mode", "propose_config_values", "inspect_failure"):
+        for action_type in ("choose_target_mode", "set_qps_mode", "propose_config_values"):
             self.assertEqual(ACTION_BY_TYPE[action_type].lifetime, "durable")
-        self.assertEqual(ACTION_BY_TYPE["analyze_evidence"].lifetime, "turn_local")
+        for action_type in ("analyze_evidence", "inspect_failure"):
+            self.assertEqual(ACTION_BY_TYPE[action_type].lifetime, "turn_local")
         self.assertTrue(ACTION_BY_TYPE["analyze_evidence"].crosses_pending_barrier)
 
     def test_inferred_review_consultation_is_same_turn_and_preserves_exact_question(self) -> None:
@@ -14164,9 +14305,11 @@ response:
         self.assertEqual(first["pending_question"], original_question)
         self.assertEqual(first.get("action_queue"), [])
         self.assertIn("endpoint analysis completed", "\n".join(first.get("visible_response") or []))
-        self.assertNotIn(
-            str(original_question.get("prompt") or ""),
-            "\n".join(first.get("visible_response") or []),
+        self.assertEqual(
+            "\n".join(first.get("visible_response") or []).count(
+                str(original_question.get("prompt") or "")
+            ),
+            1,
         )
 
         first["last_user_input"] = "Y"
@@ -14300,8 +14443,19 @@ response:
         ):
             result = process_turn(state)
 
-        self.assertEqual(result["pending_question"], original_question)
-        self.assertEqual([item.get("type") for item in result.get("action_queue") or []], ["set_qps_mode"])
+        self.assertEqual(
+            {
+                key: value
+                for key, value in result["pending_question"].items()
+                if key != "resume_action_queue"
+            },
+            original_question,
+        )
+        self.assertTrue(result["pending_question"].get("resume_action_queue"))
+        self.assertEqual(
+            [item.get("action_type") or item.get("type") for item in result.get("action_queue") or []],
+            ["set_qps_mode"],
+        )
         self.assertIn("Current state:", "\n".join(result.get("visible_response") or []))
 
     def test_qps_customization_request_before_mode_enters_qps_subflow(self) -> None:

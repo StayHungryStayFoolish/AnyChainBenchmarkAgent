@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from ..llm.providers import provider_from_config
 from ..llm.types import LLMTurnTimeoutError, LLMMessage, LLMRequest, ensure_turn_active
@@ -17,6 +17,7 @@ from .action_registry import (
     CONSULTATION_TOPICS,
     SEMANTIC_SUPPORT_RELATIONS,
     TRUSTED_ACTION_METADATA_FIELDS,
+    answer_pending_representation_conflict,
     build_admission_transaction_hash,
     build_field_intake_admission_receipt,
     build_proposal_field_receipt,
@@ -242,6 +243,135 @@ def resolve_action_queue(state: AgentGraphState, text: str) -> dict[str, Any]:
             "actions": [{"type": "unknown", "reason": f"action queue resolver failed: {type(exc).__name__}", "confidence": "low"}],
             "reason": "resolver failed",
         }
+
+
+def adjudicate_active_pending_contract(
+    provider: Any,
+    state: AgentGraphState,
+    text: str,
+    clauses: tuple[TurnClause, ...],
+    *,
+    invalid_candidate: str,
+    validation_errors: Sequence[str],
+    allowed_action_types: frozenset[str],
+) -> tuple[
+    dict[str, Any] | None,
+    tuple[str, ...],
+    tuple[int, ...],
+    int,
+    int,
+]:
+    """Resolve one ambiguous active-question plan through the focused authority."""
+
+    prompt = _pending_contract_adjudication_prompt()
+    original_request = _action_queue_payload(state, text)
+    focused_action_schema = [
+        row
+        for row in original_request["action_schema"]
+        if str(row.get("type") or "") in allowed_action_types
+    ]
+    original_request = {
+        **original_request,
+        "action_schema": focused_action_schema,
+    }
+    payload = {
+        "invalid_output": _parse_json_object(invalid_candidate),
+        "validation_errors": list(dict.fromkeys(str(value) for value in validation_errors)),
+        "action_schema": focused_action_schema,
+        "original_request": original_request,
+    }
+    request_sizes: list[int] = []
+    focused_candidate = "{}"
+    focused_validation = _invalid_plan_coverage(
+        clauses,
+        ("focused pending adjudication was not run",),
+    )
+    compiler_calls = 0
+    prior_output: dict[str, Any] = dict(payload["invalid_output"])
+    prior_errors = list(payload["validation_errors"])
+    for attempt in range(2):
+        request_payload = {
+            **payload,
+            "invalid_output": prior_output,
+            "validation_errors": prior_errors,
+        }
+        request_sizes.append(
+            len(prompt.encode("utf-8"))
+            + len(
+                json.dumps(
+                    request_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ).encode("utf-8")
+            )
+        )
+        focused_response, compilation_errors = _compile_semantic_candidate(
+            provider,
+            system_prompt=prompt,
+            request_payload=request_payload,
+        )
+        compiler_calls += 1
+        focused_candidate, focused_validation = _prepare_bounded_semantic_candidate(
+            focused_response,
+            state,
+            clauses,
+            text,
+            extra_errors=compilation_errors,
+        )
+        if focused_validation.valid:
+            break
+        prior_output = _parse_json_object(focused_candidate)
+        prior_errors = list(focused_validation.errors)
+    if not focused_validation.valid:
+        return (
+            None,
+            focused_validation.errors,
+            tuple(request_sizes),
+            compiler_calls,
+            0,
+        )
+    plan, admission, admission_errors = _review_bounded_semantic_candidate(
+        provider,
+        focused_candidate,
+        focused_validation,
+        state,
+        clauses,
+        allowed_action_types=allowed_action_types,
+        whole_plan_contract_repair=True,
+    )
+    admission_calls = 0
+    if admission is not None:
+        admission_calls = int(getattr(admission, "request_count", 1))
+        request_sizes.extend(getattr(admission, "request_sizes", ()) or ())
+    if (
+        admission is None
+        or not admission.valid
+        or plan is None
+        or _admitted_plan_requires_pending_contract_adjudication(
+            plan,
+            admission,
+            state,
+            focused_adjudication=True,
+        )
+    ):
+        return (
+            None,
+            tuple(dict.fromkeys((*focused_validation.errors, *admission_errors))),
+            tuple(request_sizes),
+            compiler_calls,
+            admission_calls,
+        )
+    try:
+        result = _admitted_action_queue(plan, admission, state)
+    except ValueError as exc:
+        return (
+            None,
+            (f"focused pending receipt attachment failed: {exc}",),
+            tuple(request_sizes),
+            compiler_calls,
+            admission_calls,
+        )
+    return result, (), tuple(request_sizes), compiler_calls, admission_calls
 
 
 def _compile_semantic_candidate(
@@ -773,7 +903,6 @@ def _canonicalize_pending_choice_actions(
         selected = option.get("value")
         actions[index] = {
             "type": "answer_pending",
-            "answer": selected,
             "selected_value": selected,
             "source_evidence": source,
             "confidence": str(action.get("confidence") or "medium"),
@@ -1024,6 +1153,7 @@ def _review_bounded_semantic_candidate(
     clauses: tuple[TurnClause, ...],
     *,
     allowed_action_types: frozenset[str] | None = None,
+    whole_plan_contract_repair: bool = False,
 ) -> tuple[ImmutableSemanticPlan | None, WholePlanAdmission | None, tuple[str, ...]]:
     if not validation.valid:
         return None, None, tuple(validation.errors)
@@ -1045,6 +1175,7 @@ def _review_bounded_semantic_candidate(
             if allowed_action_types is not None
             else ALLOWED_ACTION_TYPES
         ),
+        contract_repair=whole_plan_contract_repair,
     )
     return plan, admission, admission.errors
 
@@ -1984,7 +2115,7 @@ def _validate_action_document(
             action_errors.append(f"action {index} contract invalid: {exc}")
             rejected_action_indexes.add(index)
             continue
-        if _answer_pending_representation_conflict(raw):
+        if answer_pending_representation_conflict(raw):
             action_errors.append(
                 f"action {index} answer_pending has conflicting answer and selected_value representations"
             )
@@ -2265,12 +2396,12 @@ def _manual_value_from_answer_pending(
     action: Mapping[str, Any],
     pending: Mapping[str, Any],
 ) -> Any:
-    """Return one unambiguous manual value from either model representation.
+    """Return one unambiguous manual value from a pending-answer action.
 
-    Models may place a manual pending value in ``answer`` or
-    ``selected_value``. The typed pending contract, not the model's choice of
-    field, owns the canonical representation. Conflicting valid values remain
-    unresolved instead of being selected by field order.
+    The current compiler contract uses ``answer`` for manual input and
+    ``selected_value`` for a declared option. This reader tolerates one supplied
+    representation so checkpoint migration and canonicalization cannot choose
+    between contradictory facts.
     """
 
     if str(action.get("type") or "") != "answer_pending":
@@ -2295,28 +2426,6 @@ def _manual_value_from_answer_pending(
     return value if value_satisfies_pending_contract(value, dict(pending)) else None
 
 
-def _answer_pending_representation_conflict(action: Mapping[str, Any]) -> bool:
-    """Return whether answer and selected_value carry different nonempty facts."""
-
-    if str(action.get("type") or "") != "answer_pending":
-        return False
-    supplied: list[Any] = []
-    for key in ("answer", "selected_value"):
-        if key not in action:
-            continue
-        value = action.get(key)
-        if value is None or (isinstance(value, str) and not value.strip()):
-            continue
-        supplied.append(value.strip() if isinstance(value, str) else value)
-    if len(supplied) < 2:
-        return False
-    identities = {
-        json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-        for value in supplied
-    }
-    return len(identities) > 1
-
-
 def _reject_conflicting_pending_representations(text: str) -> None:
     """Reject raw model contradictions before any canonicalization can erase them."""
 
@@ -2326,7 +2435,7 @@ def _reject_conflicting_pending_representations(text: str) -> None:
         index
         for index, action in enumerate(actions)
         if isinstance(action, Mapping)
-        and _answer_pending_representation_conflict(action)
+        and answer_pending_representation_conflict(action)
     ]
     if conflicting:
         joined = ", ".join(str(index) for index in conflicting)
@@ -2342,10 +2451,9 @@ def _declared_option_for_pending_answer(
 ) -> dict[str, Any]:
     """Resolve one answer action against the exact typed option contract.
 
-    The planner may express a declared option through ``answer`` without
-    repeating it in ``selected_value``. When it supplies both representations,
-    they must agree before the action can become an option anchor. A distinct
-    source-grounded manual value is owned by complete-turn adjudication.
+    New compiler output uses ``selected_value`` for a declared option. Reading
+    ``answer`` remains a migration tolerance for older checkpoints, while the
+    registry rejects contradictory dual representations before admission.
     """
 
     if str(action.get("type") or "") != "answer_pending":
@@ -2872,7 +2980,11 @@ def _pending_contract_adjudication_prompt() -> str:
 
     return (
         "You are the focused typed-question adjudicator for AnyChain Benchmark Agent. "
-        "Return one JSON action plan only; never answer the user. This is the only focused adjudication. "
+        "Return one JSON object whose top-level keys are exactly actions and semantic_units; "
+        "never wrap it in action_plan or any other envelope, and never answer the user. "
+        "Each action is one flat object with type plus only arguments declared by its supplied "
+        "action_schema row. Never place action arguments inside an arguments object or another "
+        "nested action envelope. This is the only focused adjudication. "
         "Read original_request.user_text, clauses, workflow_state.pending_question, "
         "pending_typed_candidates, action_schema, invalid_output, and validation_errors. "
         "Decide only whether the source semantically answers the active typed question, while preserving "
@@ -2880,6 +2992,9 @@ def _pending_contract_adjudication_prompt() -> str:
         "For a declared option, emit answer_pending with selected_value exactly equal to that option's "
         "declared value. For manual input, emit answer_pending with answer equal to one exact extracted "
         "value that satisfies validation. A pending_typed_candidate is syntax evidence, not permission. "
+        "A natural-language request to enter, open, visit, or switch to the result or flow named by one "
+        "declared option is a semantic selection of that option. Emit answer_pending for its exact value; "
+        "never replace that selection with change_group back to the active pending question's own group. "
         "When the source selects exactly one declared option and adjacent prose only gives the reason for "
         "that same selection, emit one answer_pending and map both the direct selection and its explanatory "
         "support to that action. Do not leave the reason unresolved and do not require the reason to repeat "
@@ -3399,6 +3514,8 @@ def _parse_action_queue(
     return {
         "actions": actions,
         "clause_coverage": payload.get("clause_coverage") or [],
+        "semantic_units": payload.get("semantic_units") or [],
         "pending_choice_contracts": payload.get("pending_choice_contracts") or [],
+        "admission_rejections": payload.get("admission_rejections") or [],
         "reason": payload.get("reason") or payload.get("reasoning") or "",
     }

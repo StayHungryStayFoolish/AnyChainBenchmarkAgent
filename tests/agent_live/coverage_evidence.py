@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from agent.harness.coverage_events import state_diff_between
+from tests.agent_live.coverage_events import state_diff_between
 from agent.harness.runtime_identity import repository_revision
 from agent.runners.execution_scenarios import scenario_by_id, workflow_type_from_plan
 from agent.utils.redaction import redact

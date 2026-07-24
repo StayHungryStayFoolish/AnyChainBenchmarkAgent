@@ -165,6 +165,101 @@ class TurnBudgetContractTest(unittest.TestCase):
 
 
 class TurnCheckpointContractTest(unittest.TestCase):
+    def test_turn_receipt_binds_every_semantic_unit_to_its_admitted_action(self) -> None:
+        from agent.harness.state import new_state
+        from tests.agent_live.graph_turn import invoke_product_graph_turn
+
+        state = new_state("receipt-unit-binding", language="en")
+        state["last_user_input"] = "Who are you?"
+        semantic_plan = {
+            "actions": [{
+                "type": "answer_opening_question",
+                "topic": "identity",
+                "source_evidence": "Who are you?",
+                "confidence": "high",
+            }],
+            "semantic_units": [{
+                "unit_id": "identity-unit",
+                "clause_id": "clause-1",
+                "source_text": "Who are you?",
+                "disposition": "action",
+                "action_indexes": [0],
+            }],
+        }
+
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            return_value=semantic_plan,
+        ):
+            result = invoke_product_graph_turn(state)
+
+        receipt = result["turn_receipt"]
+        action_id = receipt["admitted_action_ids"][0]
+        self.assertEqual(
+            receipt["action_unit_bindings"][action_id],
+            ["identity-unit"],
+        )
+        self.assertEqual(
+            receipt["unit_action_bindings"]["identity-unit"],
+            [action_id],
+        )
+        self.assertEqual(
+            receipt["sibling_omission_checks"][0]["verdict"],
+            "covered",
+        )
+
+    def test_prepare_resumes_the_first_incomplete_side_effect_phase(self) -> None:
+        from agent.harness.contracts import ActionEnvelope, action_envelope_to_dict
+        from agent.harness.coordinator import prepare_turn_step
+        from agent.harness.state import new_state
+
+        envelope = ActionEnvelope(
+            action_id="execute-1",
+            action_type="approve_preflight_smoke",
+            owner="execution",
+            target_group="preflight_smoke_execution",
+            effect_kind="external",
+            status="admitted",
+        )
+        for status, expected_phase in (
+            ("prepared", "invoke_effect"),
+            ("invoking", "perform_effect"),
+        ):
+            with self.subTest(status=status):
+                state = new_state(f"resume-{status}", language="en")
+                state["action_queue"] = [action_envelope_to_dict(envelope)]
+                state["selected_action"] = action_envelope_to_dict(
+                    ActionEnvelope(
+                        **{
+                            **envelope.__dict__,
+                            "status": "selected",
+                        }
+                    )
+                )
+                state["current_action"] = {
+                    "type": envelope.action_type,
+                    "action_id": envelope.action_id,
+                }
+                state["control"] = {"selected_owner": "execution"}
+                state["side_effect_intent"] = {
+                    "intent_id": "intent-1",
+                    "turn_id": "turn-1",
+                    "action_id": envelope.action_id,
+                    "operation": envelope.action_type,
+                    "idempotency_key": "harness:request-1",
+                    "request": {},
+                    "request_fingerprint": "fingerprint",
+                    "expected_receipt_kind": "execution_handler_result",
+                    "status": status,
+                    "attempt_count": 1,
+                }
+                before_turn = state["turn_index"]
+
+                resumed = prepare_turn_step(state)
+
+                self.assertEqual(resumed["control"]["phase"], expected_phase)
+                self.assertEqual(resumed["turn_index"], before_turn)
+
     def test_fresh_startup_persists_the_opening_contract_as_next_turn_baseline(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
 
@@ -249,13 +344,15 @@ class TurnCheckpointContractTest(unittest.TestCase):
             before = runtime.snapshot()
 
             class CancelledGraph:
-                def invoke(self, state):
+                def invoke(self, state, **_kwargs):
                     state["target_mode"] = "real-node"
                     state["confirmed_config"]["CLOUD_REGION"] = "corrupt"
                     raise LLMTurnCancelledError("cancelled")
 
-            runtime._turn_graph = CancelledGraph()
-            with self.assertRaises(LLMTurnCancelledError):
+            with (
+                patch.object(runtime.graph, "invoke", side_effect=CancelledGraph().invoke),
+                self.assertRaises(LLMTurnCancelledError),
+            ):
                 runtime.invoke("change everything", language="en")
             after = runtime.snapshot()
             runtime.close()
@@ -272,12 +369,14 @@ class TurnCheckpointContractTest(unittest.TestCase):
             before = runtime.snapshot()
 
             class TimedOutGraph:
-                def invoke(self, state):
+                def invoke(self, state, **_kwargs):
                     state["target_mode"] = "real-node"
                     raise LLMTurnTimeoutError("deadline")
 
-            runtime._turn_graph = TimedOutGraph()
-            with self.assertRaises(LLMTurnTimeoutError):
+            with (
+                patch.object(runtime.graph, "invoke", side_effect=TimedOutGraph().invoke),
+                self.assertRaises(LLMTurnTimeoutError),
+            ):
                 runtime.invoke("change everything", language="en")
             after = runtime.snapshot()
             runtime.close()

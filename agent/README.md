@@ -10,9 +10,11 @@ The human-facing product entrypoint is:
 The product terminal owns stable input/output, language detection, startup
 diagnostics, dependency-installation consent, and job recovery commands. The
 benchmark workflow itself is owned by the LangGraph Harness in
-`agent/harness/`. The Harness's own model calls are plain OpenAI-compatible
-HTTP requests for every provider (OpenAI, DeepSeek, and Gemini on Vertex
-alike) — Google ADK is used for exactly one optional capability, Gemini
+`agent/harness/`. Every provider implements the same `LLMProvider` contract:
+OpenAI, DeepSeek, and Vertex Gemini use OpenAI-compatible transports; Gemini
+API-key mode uses native `generateContent`, Claude API-key mode uses the
+Anthropic Messages API, and Vertex Claude uses `rawPredict`. Google ADK is used
+for exactly one optional capability, Gemini
 `google_search` grounding for unknown-chain/protocol, custom-RPC schema, and
 sync-observe client research (`agent/llm/search_grounding.py`), and must not
 own product workflow state or a second conversation loop.
@@ -87,12 +89,35 @@ LLM output is never executed directly. Repository tools own validation,
 configuration materialization, execution, monitoring, and evidence-backed
 analysis.
 
+The product compiles one checkpointer-backed graph. Each transition admits,
+selects, routes, and commits at most one durable action. Side effects are
+persisted as an intent before invocation and as a receipt afterward. Checkpoint
+schema version 13 is the current contract; version 12 crosses one isolated
+migration adapter, while older state is quarantined for explicit
+reconfirmation.
+
 ## Main Modules
 
 - `harness/graph.py`: LangGraph runtime and checkpoint wiring.
-- `harness/coordinator.py`: deterministic group workflow, transitions, validation
-  gates, and next-blocking-question selection.
-- `harness/intent.py`: typed LLM intent and free-form answer resolver.
+- `harness/coordinator.py`: graph-node transitions and the sole typed commit
+  boundary; it does not interpret natural language or own terminal/domain
+  business rules.
+- `harness/hierarchical_planner.py`: the sole semantic-planning entry; Stage A
+  partitions the complete turn and Stage B compiles actions through
+  owner-scoped schemas before whole-plan admission.
+- `harness/admission.py`: action validation, conflicts, prerequisites, and
+  semantic-coverage reconciliation.
+- `harness/queue.py`: dependency-safe durable action ordering and pending
+  barrier eligibility.
+- `harness/routing.py`: navigation prerequisites, return policy, and canonical
+  fallback selection.
+- `harness/response.py`: the single response-composition authority.
+- `harness/contracts.py`: typed actions, domain results, side-effect
+  intent/receipt, navigation commands, and turn receipts.
+- `harness/checkpoint_migrations.py`: the isolated version-12 checkpoint
+  adapter; current turns must not import it.
+- `harness/intent.py`: focused adjudication plus schema/admission helpers; it is
+  not a second product planner.
 - `workflows/group_registry.py`: the single metadata authority for group order,
   fields, questions, dependencies, invalidations, and ownership.
 - `harness/state.py`: product workflow state schema; its default group order is
@@ -217,13 +242,17 @@ The live matrix drives `./bin/anychain-agent` through the same CLI path users
 run and inspects LangGraph checkpoint state. It must not read or create legacy
 `.agent/sessions/*/conversation_state.json` workflow files.
 
-The fixed matrix is not product acceptance. Follow
+The fixed matrix is not product acceptance. The sole authority that can close
+G0-G6 is `tests/agent_live/run_product_acceptance.py`. Phase 6 closes only the
+deterministic G2 gate. Retained real-user regression replay, real CLI,
+response-driven dual-AI Chaos, and real execution belong to Phase 8 and close
+G3-G6 only after the controller admits their revision-bound evidence. Follow
 `tests/agent_live/README.md` and
 `.agent/task-docs/2026-07-10-agent-handoff-for-external-ai.md` for dynamic
 dual-AI Chaos: DeepSeek runs the real CLI while Codex chooses each next user
-turn from the actual previous response. Generate the registry coverage ledger
-with `tests/agent_live/generate_harness_coverage_ledger.py`; every edge plus the
-documented high-risk sequences needs evidence before claiming completion.
+turn from the actual previous response. Ledger, matrix, PTY, simulator, and
+execution scripts are subordinate evidence providers; their direct exit codes
+cannot declare product readiness.
 
 For local real-node and sync-observe orchestration checks, use the digest-pinned
 Geth development service through `tests/agent_live/local_evm_node.sh` inside

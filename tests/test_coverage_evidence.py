@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent.harness.coverage_events import (
+from tests.agent_live.coverage_events import (
     capture_coverage_events,
     emit_coverage_event,
     observe_compiled_graph_turn,

@@ -1,4 +1,4 @@
-"""Out-of-band observations for executable Harness coverage.
+"""Test-only observations for executable Harness coverage.
 
 The product graph never depends on this module. Coverage runners may wrap the
 same compiled-graph helper used by live tests and record what that invocation

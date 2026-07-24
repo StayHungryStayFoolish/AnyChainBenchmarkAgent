@@ -37,10 +37,15 @@ from .intent import (
     _review_bounded_semantic_candidate,
     _semantic_fulfillment_prompt,
     _unresolved_action_queue,
+    adjudicate_active_pending_contract,
     prepare_hierarchical_candidate,
 )
 from .plan_coverage import TurnClause, segment_user_turn, validate_semantic_partition
-from .questions import typed_pending_value_candidates
+from .questions import (
+    pending_option_value_exists,
+    pending_value_identity,
+    typed_pending_value_candidates,
+)
 from .semantic_compiler import (
     request_semantic_compilation,
     whole_plan_admission_prompt,
@@ -161,15 +166,74 @@ def resolve_product_action_queue(
                 owner_count=0,
                 unit_count=len(partition),
             )
-        partition_admission_errors, admission_request_size = (
+        if _partition_requires_focused_pending_adjudication(
+            state,
+            stage_a_payload,
+            partition,
+        ):
+            allowed_types = _focused_action_types_for_partition(partition)
+            (
+                focused_result,
+                focused_errors,
+                focused_sizes,
+                focused_compiler_calls,
+                focused_admission_calls,
+            ) = adjudicate_active_pending_contract(
+                provider,
+                state,
+                text,
+                clauses,
+                invalid_candidate=json.dumps(
+                    {
+                        "actions": [],
+                        "semantic_units": partition,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                validation_errors=(
+                    "Stage A exposed competing representations of the active "
+                    "typed-question transaction",
+                ),
+                allowed_action_types=allowed_types,
+            )
+            request_sizes.extend(focused_sizes)
+            stage_b_calls += focused_compiler_calls
+            admission_calls += focused_admission_calls
+            if focused_result is not None:
+                return _with_metrics(
+                    focused_result,
+                    started,
+                    request_sizes=request_sizes,
+                    stage_a_calls=stage_a_calls,
+                    stage_b_calls=stage_b_calls,
+                    admission_calls=admission_calls,
+                    owner_count=1,
+                    unit_count=len(partition),
+                )
+            return _with_metrics(
+                _unresolved_action_queue(clauses, focused_errors),
+                started,
+                request_sizes=request_sizes,
+                stage_a_calls=stage_a_calls,
+                stage_b_calls=stage_b_calls,
+                admission_calls=admission_calls,
+                owner_count=1,
+                unit_count=len(partition),
+            )
+        (
+            partition_admission_errors,
+            admission_request_sizes,
+            redundant_unit_ids,
+        ) = (
             _review_stage_a_partition(
                 provider,
                 stage_a_payload,
                 partition,
             )
         )
-        request_sizes.append(admission_request_size)
-        stage_a_calls += 1
+        request_sizes.extend(admission_request_sizes)
+        stage_a_calls += len(admission_request_sizes)
         if partition_admission_errors:
             return _with_metrics(
                 _unresolved_action_queue(clauses, partition_admission_errors),
@@ -181,8 +245,38 @@ def resolve_product_action_queue(
                 owner_count=0,
                 unit_count=len(partition),
             )
-        source_partition = partition
-        partition = _expand_partition_routes(source_partition)
+        source_partition, compilation_partition = (
+            _partition_after_stage_a_admission(
+                partition,
+                redundant_unit_ids,
+            )
+        )
+        source_partition, compilation_partition = (
+            _canonicalize_atomic_evidence_partition(
+                state,
+                clauses,
+                source_partition,
+                compilation_partition,
+            )
+        )
+        source_partition, compilation_partition = (
+            _canonicalize_structured_config_partition(
+                state,
+                clauses,
+                stage_a_payload,
+                source_partition,
+                compilation_partition,
+            )
+        )
+        source_partition, compilation_partition = (
+            _canonicalize_unique_manual_pending_partition(
+                state,
+                clauses,
+                source_partition,
+                compilation_partition,
+            )
+        )
+        partition = _expand_partition_routes(compilation_partition)
 
         requests = _owner_requests(partition)
         owner_inputs: list[tuple[str, tuple[str, ...], frozenset[str]]] = []
@@ -212,9 +306,9 @@ def resolve_product_action_queue(
                 (owner, unit_ids, future.result())
                 for (owner, unit_ids, _groups), future in zip(owner_inputs, futures)
             ]
-        for owner, _unit_ids, (document, errors, request_size) in owner_results:
-            stage_b_calls += 1
-            request_sizes.append(request_size)
+        for owner, _unit_ids, (document, errors, owner_request_sizes) in owner_results:
+            stage_b_calls += len(owner_request_sizes)
+            request_sizes.extend(owner_request_sizes)
             if errors:
                 return _with_metrics(
                     _unresolved_action_queue(clauses, errors),
@@ -254,7 +348,7 @@ def resolve_product_action_queue(
                 owner_count=len(requests),
                 unit_count=len(partition),
             )
-        allowed_types = frozenset(ACTION_BY_TYPE)
+        allowed_types = _allowed_action_types_for_partition(partition)
         plan, admission, admission_errors = _review_bounded_semantic_candidate(
             provider,
             candidate_text,
@@ -262,9 +356,16 @@ def resolve_product_action_queue(
             state,
             clauses,
             allowed_action_types=allowed_types,
+            whole_plan_contract_repair=True,
         )
-        admission_calls = 1
-        if plan is not None:
+        admission_calls = (
+            int(getattr(admission, "request_count", 1))
+            if admission is not None
+            else 0
+        )
+        if admission is not None and getattr(admission, "request_sizes", ()):
+            request_sizes.extend(admission.request_sizes)
+        elif plan is not None:
             request_sizes.append(
                 len(
                     whole_plan_admission_prompt(
@@ -273,16 +374,53 @@ def resolve_product_action_queue(
                 )
                 + len(plan.request_json.encode("utf-8"))
             )
+        needs_focused_pending_adjudication = bool(
+            admission is not None
+            and admission.valid
+            and plan is not None
+            and _admitted_plan_requires_pending_contract_adjudication(
+                plan,
+                admission,
+                state,
+                focused_adjudication=False,
+            )
+        )
+        if needs_focused_pending_adjudication:
+            (
+                focused_result,
+                focused_errors,
+                focused_sizes,
+                focused_compiler_calls,
+                focused_admission_calls,
+            ) = adjudicate_active_pending_contract(
+                provider,
+                state,
+                text,
+                clauses,
+                invalid_candidate=candidate_text,
+                validation_errors=admission_errors,
+                allowed_action_types=allowed_types,
+            )
+            request_sizes.extend(focused_sizes)
+            stage_b_calls += focused_compiler_calls
+            admission_calls += focused_admission_calls
+            if focused_result is not None:
+                return _with_metrics(
+                    focused_result,
+                    started,
+                    request_sizes=request_sizes,
+                    stage_a_calls=stage_a_calls,
+                    stage_b_calls=stage_b_calls,
+                    admission_calls=admission_calls,
+                    owner_count=len(requests),
+                    unit_count=len(partition),
+                )
+            admission_errors = focused_errors
         if (
             admission is None
             or not admission.valid
             or plan is None
-            or _admitted_plan_requires_pending_contract_adjudication(
-                plan,
-                admission,
-                state,
-                focused_adjudication=bool(state.get("pending_question")),
-            )
+            or needs_focused_pending_adjudication
         ):
             return _with_metrics(
                 _unresolved_action_queue(clauses, admission_errors),
@@ -354,9 +492,25 @@ def _stage_a_prompt() -> str:
         "contains independently owned values. Preserve questions, corrections, contradictions, "
         "pending answers, navigation, multiline evidence, and every sibling demand separately. "
         "When a turn answers the active pending question and also supplies sibling configuration, "
-        "emit the exact answer excerpt as one pending_answer unit routed only to coordinator and "
+        "emit the exact answer excerpt as one pending_answer unit routed only to coordinator, using "
+        "the active pending_question.group as that route's group, and "
         "emit every sibling as separate domain_request units. Never label a normal domain_request "
         "as a pending answer, and never combine a pending answer with a sibling mutation. "
+        "A semantic option selection and adjacent prose that only explains the reason, uncertainty, "
+        "basis, referential application, or declared completion effect for that same selection form "
+        "one pending_answer operation even when punctuation or line breaks create several clauses. "
+        "When the source rejects one or more pending options and affirmatively requests another "
+        "declared option's meaning or action, form one pending_answer for the affirmed option. "
+        "The rejected alternative is contrast evidence, not a pending answer of its own, and the "
+        "affirmed option action is not also a sibling domain request. "
+        "The supporting clause may be context, but it is not a separate demand. The explanation is not a "
+        "domain request merely because it discusses the option's subject. Split it only when the "
+        "user independently asks for research, explanation, navigation, or a mutation. "
+        "Apply the same transaction boundary to one parser-proven manual value for the active "
+        "pending question: adjacent prose that only states the value's purpose, scope, exclusion, "
+        "or non-application is support for that pending answer, not a sibling domain request. "
+        "Keep a separate operation only when the prose independently requests another value, "
+        "mutation, consultation, navigation, or analysis. "
         "A semantic unit represents one indivisible source excerpt. Split distinct source "
         "excerpts even when they share an owner. When one compact prose or structured excerpt "
         "directly supplies several independently owned values, keep one unit with several "
@@ -438,6 +592,7 @@ def _validate_partition_document(
     raw_units = payload.get("semantic_units")
     if not isinstance(raw_units, list):
         return [], ("Stage A semantic_units is not a list",)
+    raw_units = _retain_unclaimed_prose_clauses(raw_units, clauses)
     partition = validate_semantic_partition(raw_units, clauses)
     errors = list(partition.errors)
     output: list[dict[str, Any]] = []
@@ -505,6 +660,383 @@ def _validate_partition_document(
     return output, tuple(dict.fromkeys(errors))
 
 
+def _retain_unclaimed_prose_clauses(
+    raw_units: Sequence[Any],
+    clauses: Sequence[TurnClause],
+) -> list[Any]:
+    """Keep unclaimed prose visible to the independent omission reviewer."""
+
+    clause_order = {
+        clause.clause_id: index
+        for index, clause in enumerate(clauses)
+    }
+    rows_by_clause: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    observed_order: list[int] = []
+    used_ids: set[str] = set()
+    for raw in raw_units:
+        if not isinstance(raw, Mapping):
+            return list(raw_units)
+        clause_id = str(raw.get("clause_id") or "")
+        if clause_id not in clause_order:
+            return list(raw_units)
+        observed_order.append(clause_order[clause_id])
+        rows_by_clause[clause_id].append(raw)
+        used_ids.add(str(raw.get("unit_id") or ""))
+    if observed_order != sorted(observed_order):
+        return list(raw_units)
+
+    output: list[Any] = []
+    for clause in clauses:
+        rows = rows_by_clause.get(clause.clause_id, [])
+        if rows:
+            output.extend(rows)
+            continue
+        if clause.input_shape != "prose":
+            continue
+        sequence = 1
+        while True:
+            unit_id = f"__harness_context_{clause.clause_id}_{sequence}"
+            if unit_id not in used_ids:
+                used_ids.add(unit_id)
+                break
+            sequence += 1
+        output.append({
+            "unit_id": unit_id,
+            "clause_id": clause.clause_id,
+            "source_text": clause.text,
+            "operation": "context",
+            "owner_routes": [],
+            "reason": "unclaimed prose retained for independent coverage review",
+        })
+    return output
+
+
+def _partition_after_stage_a_admission(
+    partition: Sequence[Mapping[str, Any]],
+    redundant_unit_ids: frozenset[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Separate immutable source coverage from executable owner compilation."""
+
+    source_partition: list[dict[str, Any]] = []
+    compilation_partition: list[dict[str, Any]] = []
+    for raw in partition:
+        unit = dict(raw)
+        if str(unit.get("unit_id") or "") in redundant_unit_ids:
+            unit["operation"] = "context"
+            unit["owner_routes"] = []
+            unit["reason"] = (
+                f"{str(unit.get('reason') or '').strip()} "
+                "Stage A admission classified this as a non-executable duplicate."
+            ).strip()
+            source_partition.append(unit)
+            continue
+        source_partition.append(unit)
+        compilation_partition.append(dict(unit))
+    return source_partition, compilation_partition
+
+
+def _partition_requires_focused_pending_adjudication(
+    state: AgentGraphState,
+    stage_a_payload: Mapping[str, Any],
+    partition: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Detect unresolved representation conflicts at the typed-question boundary."""
+
+    pending = dict(state.get("pending_question") or {})
+    if not pending:
+        return False
+    pending_units = [
+        unit
+        for unit in partition
+        if str(unit.get("operation") or "") == "pending_answer"
+    ]
+    typed_candidate_identities = {
+        pending_value_identity(value, pending)
+        for value in stage_a_payload.get("pending_typed_candidates") or []
+    }
+    typed_candidate_identities.discard("")
+    if len(typed_candidate_identities) == 1:
+        return (
+            len(pending_units) != 1
+            or any(
+                str(unit.get("operation") or "")
+                not in {"context", "pending_answer"}
+                for unit in partition
+            )
+        )
+    if len(pending_units) > 1:
+        return True
+    if not pending_units:
+        return False
+    structured_clause_ids = {
+        str(candidate.get("clause_id") or "")
+        for candidate in stage_a_payload.get("structured_candidates") or []
+        if isinstance(candidate, Mapping)
+        and candidate.get("config_values")
+    }
+    return any(
+        str(unit.get("clause_id") or "") in structured_clause_ids
+        for unit in pending_units
+    )
+
+
+def _canonicalize_atomic_evidence_partition(
+    state: AgentGraphState,
+    clauses: Sequence[TurnClause],
+    source_partition: Sequence[Mapping[str, Any]],
+    compilation_partition: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Preserve one typed evidence contribution as one lossless owner unit."""
+
+    pending = dict(state.get("pending_question") or {})
+    if (
+        str((pending.get("validation") or {}).get("value_type") or "")
+        != "evidence_contribution"
+        or len(clauses) != 1
+        or clauses[0].input_shape != "structured"
+    ):
+        return (
+            [dict(unit) for unit in source_partition],
+            [dict(unit) for unit in compilation_partition],
+        )
+    executable = [
+        unit
+        for unit in compilation_partition
+        if str(unit.get("operation") or "") != "context"
+    ]
+    if (
+        not executable
+        or any(
+            str(unit.get("operation") or "") != "pending_answer"
+            for unit in executable
+        )
+    ):
+        return (
+            [dict(unit) for unit in source_partition],
+            [dict(unit) for unit in compilation_partition],
+        )
+    atomic = {
+        "unit_id": str(executable[0].get("unit_id") or "evidence-unit"),
+        "clause_id": clauses[0].clause_id,
+        "source_text": clauses[0].text,
+        "operation": "pending_answer",
+        "owner_routes": [{
+            "owner": "coordinator",
+            "group": str(pending.get("group") or state.get("active_group") or ""),
+        }],
+        "reason": (
+            "Typed evidence_contribution remains one lossless pending-owner "
+            "transaction."
+        ),
+    }
+    return [atomic], [dict(atomic)]
+
+
+def _canonicalize_structured_config_partition(
+    state: AgentGraphState,
+    clauses: Sequence[TurnClause],
+    stage_a_payload: Mapping[str, Any],
+    source_partition: Sequence[Mapping[str, Any]],
+    compilation_partition: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Route parsed structured configuration through its review owner."""
+
+    candidate_clause_ids = {
+        str(candidate.get("clause_id") or "")
+        for candidate in stage_a_payload.get("structured_candidates") or []
+        if isinstance(candidate, Mapping)
+        and candidate.get("config_values")
+    }
+    if not candidate_clause_ids:
+        return (
+            [dict(unit) for unit in source_partition],
+            [dict(unit) for unit in compilation_partition],
+        )
+    clause_by_id = {clause.clause_id: clause for clause in clauses}
+    replaceable_clause_ids = {
+        clause_id
+        for clause_id in candidate_clause_ids
+        if clause_id in clause_by_id
+        and all(
+            str(unit.get("operation") or "") in {"pending_answer", "context"}
+            for unit in source_partition
+            if str(unit.get("clause_id") or "") == clause_id
+        )
+        and any(
+            str(unit.get("operation") or "") == "pending_answer"
+            for unit in source_partition
+            if str(unit.get("clause_id") or "") == clause_id
+        )
+    }
+    if not replaceable_clause_ids:
+        return (
+            [dict(unit) for unit in source_partition],
+            [dict(unit) for unit in compilation_partition],
+        )
+    replacement_by_clause: dict[str, dict[str, Any]] = {}
+    for clause_id in replaceable_clause_ids:
+        existing = next(
+            unit
+            for unit in source_partition
+            if str(unit.get("clause_id") or "") == clause_id
+        )
+        replacement_by_clause[clause_id] = {
+            "unit_id": str(existing.get("unit_id") or f"config-{clause_id}"),
+            "clause_id": clause_id,
+            "source_text": clause_by_id[clause_id].text,
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "environment",
+                "group": str(
+                    (state.get("pending_question") or {}).get("group")
+                    or state.get("active_group")
+                    or ""
+                ),
+            }],
+            "reason": (
+                "Parsed structured config_values require the environment "
+                "proposal-and-review transaction."
+            ),
+        }
+
+    def replace(
+        partition: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        emitted: set[str] = set()
+        for unit in partition:
+            clause_id = str(unit.get("clause_id") or "")
+            replacement = replacement_by_clause.get(clause_id)
+            if replacement is None:
+                result.append(dict(unit))
+                continue
+            if clause_id not in emitted:
+                result.append(dict(replacement))
+                emitted.add(clause_id)
+        for clause_id in replaceable_clause_ids - emitted:
+            result.append(dict(replacement_by_clause[clause_id]))
+        return result
+
+    return replace(source_partition), replace(compilation_partition)
+
+
+def _canonicalize_unique_manual_pending_partition(
+    state: AgentGraphState,
+    clauses: Sequence[TurnClause],
+    source_partition: Sequence[Mapping[str, Any]],
+    compilation_partition: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Keep one typed manual value executable and retain its wrapper as context."""
+
+    pending = dict(state.get("pending_question") or {})
+    if (
+        pending.get("manual_input_allowed") is not True
+        or pending.get("options")
+    ):
+        return (
+            [dict(unit) for unit in source_partition],
+            [dict(unit) for unit in compilation_partition],
+        )
+    pending_units = [
+        unit
+        for unit in compilation_partition
+        if str(unit.get("operation") or "") == "pending_answer"
+    ]
+    if len(pending_units) <= 1:
+        return (
+            [dict(unit) for unit in source_partition],
+            [dict(unit) for unit in compilation_partition],
+        )
+    candidates: list[tuple[str, str]] = []
+    for clause in clauses:
+        for value in typed_pending_value_candidates(clause.text, pending):
+            identity = pending_value_identity(value, pending)
+            if identity:
+                candidates.append((clause.clause_id, identity))
+    identities = {identity for _clause_id, identity in candidates}
+    candidate_clause_ids = {
+        clause_id for clause_id, _identity in candidates
+    }
+    if len(identities) != 1 or len(candidate_clause_ids) != 1:
+        return (
+            [dict(unit) for unit in source_partition],
+            [dict(unit) for unit in compilation_partition],
+        )
+    candidate_clause_id = next(iter(candidate_clause_ids))
+    if not any(
+        str(unit.get("clause_id") or "") == candidate_clause_id
+        for unit in pending_units
+    ):
+        return (
+            [dict(unit) for unit in source_partition],
+            [dict(unit) for unit in compilation_partition],
+        )
+    clause_by_id = {clause.clause_id: clause for clause in clauses}
+    candidate_clause = clause_by_id[candidate_clause_id]
+    candidate_unit = next(
+        unit
+        for unit in pending_units
+        if str(unit.get("clause_id") or "") == candidate_clause_id
+    )
+    atomic = {
+        "unit_id": str(
+            candidate_unit.get("unit_id")
+            or f"manual-{candidate_clause_id}"
+        ),
+        "clause_id": candidate_clause_id,
+        "source_text": candidate_clause.text,
+        "operation": "pending_answer",
+        "owner_routes": [{
+            "owner": "coordinator",
+            "group": str(
+                pending.get("group")
+                or state.get("active_group")
+                or ""
+            ),
+        }],
+        "reason": (
+            "The complete turn contains one typed manual candidate; wrapper "
+            "clauses remain visible as non-executable source context."
+        ),
+    }
+
+    def canonicalize(
+        partition: Sequence[Mapping[str, Any]],
+        *,
+        retain_context: bool,
+    ) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        emitted = False
+        for raw in partition:
+            unit = dict(raw)
+            if str(unit.get("operation") or "") != "pending_answer":
+                result.append(unit)
+                continue
+            if (
+                str(unit.get("clause_id") or "") == candidate_clause_id
+                and not emitted
+            ):
+                result.append(dict(atomic))
+                emitted = True
+                continue
+            if retain_context:
+                unit["operation"] = "context"
+                unit["owner_routes"] = []
+                unit["reason"] = (
+                    "Stage A classified this complete wrapper as part of the "
+                    "same unique manual transaction."
+                )
+                result.append(unit)
+        if not emitted:
+            result.append(dict(atomic))
+        return result
+
+    return (
+        canonicalize(source_partition, retain_context=True),
+        canonicalize(compilation_partition, retain_context=False),
+    )
+
+
 def _stage_a_admission_prompt() -> str:
     return (
         "You are the independent Stage A coverage authority for AnyChain Benchmark Agent. "
@@ -512,12 +1044,32 @@ def _stage_a_admission_prompt() -> str:
         "clauses with the immutable semantic units and the supplied owner/group purposes. "
         "Return one strict JSON object with exactly unit_verdicts, clause_verdicts, and reason. "
         "unit_verdicts contains exactly one row per supplied unit in order: "
-        "{unit_id,verdict:'complete'|'unresolved',reason}. clause_verdicts contains exactly one "
+        "{unit_id,verdict:'complete'|'redundant'|'unresolved',supports_unit_id,reason}. "
+        "supports_unit_id must be empty for complete/unresolved. Use redundant only when the "
+        "unit duplicates, contrasts with, or merely restates one other complete unit in this "
+        "turn; set supports_unit_id to that exact distinct complete unit id regardless of whether "
+        "the supporting prose appears before or after it, and require the redundant unit's clause "
+        "to contain no omitted demand. "
+        "clause_verdicts contains exactly one "
         "row per supplied clause in order: {clause_id,verdict:'complete'|'omitted'|'unresolved',"
         "omitted_owner_routes:[{owner,group}],reason}. A clause is complete only when every "
         "independent present request, question, correction, navigation, value, and evidence "
         "contribution appears in an appropriate semantic unit. Connective or framing prose is "
-        "not an omitted demand. If a demand is absent, return omitted and identify its declared "
+        "not an omitted demand. A context unit has no independently admissible product action; "
+        "clause_verdicts, not its unit verdict, are authoritative for detecting whether its "
+        "source actually contains an omitted demand. A reason, uncertainty statement, or basis attached to one "
+        "pending option selection supports that same selection unless it independently asks "
+        "for research, explanation, navigation, or mutation; do not approve a fictitious "
+        "second demand created only from such support. Compare alleged sibling demands with the "
+        "immutable pending_question option actions and completion effects. Mark a unit redundant "
+        "when it only restates the selected option's declared effect; do not count the same effect "
+        "once as a pending answer and again as a domain request. Reject a partition that treats "
+        "rejection of one declared option as selecting that rejected option while separately "
+        "representing an affirmed declared option as a sibling demand. When pending_question "
+        "accepts manual input and pending_typed_candidates proves one candidate, prose that only "
+        "limits that candidate's purpose, application scope, or exclusions supports the candidate "
+        "unit. Mark such wrapper units redundant unless they independently request another value, "
+        "mutation, consultation, navigation, or analysis. If a demand is absent, return omitted and identify its declared "
         "owner/group route; use unresolved when no safe route can be identified. Do not accept "
         "planner reason text as evidence and never invent source text, ids, owners, or groups."
     )
@@ -527,39 +1079,96 @@ def _review_stage_a_partition(
     provider: Any,
     stage_a_payload: Mapping[str, Any],
     partition: Sequence[Mapping[str, Any]],
-) -> tuple[tuple[str, ...], int]:
+) -> tuple[tuple[str, ...], tuple[int, ...], frozenset[str]]:
     prompt = _stage_a_admission_prompt()
     payload = {
         "user_text": stage_a_payload["user_text"],
         "clauses": stage_a_payload["clauses"],
         "semantic_units": [dict(unit) for unit in partition],
+        "pending_question": dict(stage_a_payload.get("pending_question") or {}),
+        "pending_typed_candidates": list(
+            stage_a_payload.get("pending_typed_candidates") or []
+        ),
         "groups": stage_a_payload["groups"],
         "universal_operations": stage_a_payload["universal_operations"],
     }
-    response = request_semantic_compilation(
-        provider,
-        system_prompt=prompt,
-        request_payload=payload,
-        max_tokens=2200,
+    request_sizes: list[int] = []
+    response = ""
+    contract_errors: tuple[str, ...] = ()
+    semantic_errors: tuple[str, ...] = ()
+    redundant_unit_ids: frozenset[str] = frozenset()
+    for attempt in range(2):
+        request_payload = dict(payload)
+        request_prompt = prompt
+        if attempt:
+            request_payload["contract_repair"] = {
+                "prior_invalid_output": response,
+                "validation_errors": list(contract_errors),
+                "instruction": (
+                    "Return a complete replacement admission document. Preserve "
+                    "the same semantic judgment while correcting every structural "
+                    "contract error."
+                ),
+            }
+            request_prompt = (
+                f"{prompt} This is a contract-repair attempt. The prior document "
+                f"was structurally rejected for: {'; '.join(contract_errors)}. "
+                "Return one complete replacement document with every required row "
+                "and key; do not change a semantic verdict merely to pass."
+            )
+        request_sizes.append(_wire_size(request_prompt, request_payload))
+        response = request_semantic_compilation(
+            provider,
+            system_prompt=request_prompt,
+            request_payload=request_payload,
+            max_tokens=2200,
+        )
+        contract_errors, semantic_errors, redundant_unit_ids = (
+            _validate_stage_a_admission_document(
+                response,
+                stage_a_payload,
+                partition,
+            )
+        )
+        if not contract_errors:
+            return semantic_errors, tuple(request_sizes), redundant_unit_ids
+    return (
+        tuple(dict.fromkeys((*contract_errors, *semantic_errors))),
+        tuple(request_sizes),
+        frozenset(),
     )
+
+
+def _validate_stage_a_admission_document(
+    response: str,
+    stage_a_payload: Mapping[str, Any],
+    partition: Sequence[Mapping[str, Any]],
+) -> tuple[tuple[str, ...], tuple[str, ...], frozenset[str]]:
+    """Separate malformed reviewer output from a valid semantic rejection."""
+
     try:
         document = json.loads(response)
     except json.JSONDecodeError:
-        return ("Stage A admission did not return strict JSON",), _wire_size(
-            prompt,
-            payload,
-        )
-    errors: list[str] = []
+        return ("Stage A admission did not return strict JSON",), (), frozenset()
+    contract_errors: list[str] = []
+    semantic_errors: list[str] = []
+    redundant_unit_ids: set[str] = set()
     if not isinstance(document, Mapping) or set(document) != {
         "unit_verdicts",
         "clause_verdicts",
         "reason",
     }:
-        errors.append("Stage A admission returned an invalid top-level contract")
+        contract_errors.append(
+            "Stage A admission returned an invalid top-level contract"
+        )
         document = {}
     unit_verdicts = document.get("unit_verdicts")
     clause_verdicts = document.get("clause_verdicts")
     expected_unit_ids = [str(unit["unit_id"]) for unit in partition]
+    unit_operations = {
+        str(unit["unit_id"]): str(unit.get("operation") or "")
+        for unit in partition
+    }
     expected_clause_ids = [
         str(clause["clause_id"]) for clause in stage_a_payload["clauses"]
     ]
@@ -570,7 +1179,9 @@ def _review_stage_a_partition(
         or [str(row.get("unit_id") or "") for row in unit_verdicts]
         != expected_unit_ids
     ):
-        errors.append("Stage A admission unit verdict order or cardinality mismatch")
+        contract_errors.append(
+            "Stage A admission unit verdict order or cardinality mismatch"
+        )
         unit_verdicts = []
     if (
         not isinstance(clause_verdicts, list)
@@ -579,20 +1190,45 @@ def _review_stage_a_partition(
         or [str(row.get("clause_id") or "") for row in clause_verdicts]
         != expected_clause_ids
     ):
-        errors.append("Stage A admission clause verdict order or cardinality mismatch")
+        contract_errors.append(
+            "Stage A admission clause verdict order or cardinality mismatch"
+        )
         clause_verdicts = []
     valid_routes = {
         (str(group["owner"]), str(group["name"]))
         for group in stage_a_payload["groups"]
     }
     for row in unit_verdicts:
-        if set(row) != {"unit_id", "verdict", "reason"}:
-            errors.append("Stage A admission unit verdict contract is invalid")
+        if set(row) != {
+            "unit_id",
+            "verdict",
+            "supports_unit_id",
+            "reason",
+        }:
+            contract_errors.append(
+                "Stage A admission unit verdict contract is invalid"
+            )
             continue
         if not str(row.get("reason") or "").strip():
-            errors.append("Stage A admission unit verdict has no reason")
-        if str(row.get("verdict") or "") != "complete":
-            errors.append(
+            contract_errors.append(
+                "Stage A admission unit verdict has no reason"
+            )
+        verdict = str(row.get("verdict") or "")
+        if verdict not in {"complete", "redundant", "unresolved"}:
+            contract_errors.append(
+                "Stage A admission unit verdict is invalid"
+            )
+        elif verdict == "redundant":
+            redundant_unit_ids.add(str(row.get("unit_id") or ""))
+        elif str(row.get("supports_unit_id") or ""):
+            contract_errors.append(
+                "Stage A admission non-redundant unit declares support"
+            )
+        elif (
+            verdict != "complete"
+            and unit_operations.get(str(row.get("unit_id") or "")) != "context"
+        ):
+            semantic_errors.append(
                 f"Stage A admission found unresolved unit: {row.get('unit_id')}"
             )
     for row in clause_verdicts:
@@ -602,43 +1238,85 @@ def _review_stage_a_partition(
             "omitted_owner_routes",
             "reason",
         }:
-            errors.append("Stage A admission clause verdict contract is invalid")
+            contract_errors.append(
+                "Stage A admission clause verdict contract is invalid"
+            )
             continue
         verdict = str(row.get("verdict") or "")
         if verdict not in {"complete", "omitted", "unresolved"}:
-            errors.append("Stage A admission clause verdict is invalid")
+            contract_errors.append("Stage A admission clause verdict is invalid")
         if not str(row.get("reason") or "").strip():
-            errors.append("Stage A admission clause verdict has no reason")
+            contract_errors.append(
+                "Stage A admission clause verdict has no reason"
+            )
         routes = row.get("omitted_owner_routes")
         if not isinstance(routes, list):
-            errors.append("Stage A admission omitted_owner_routes is not a list")
+            contract_errors.append(
+                "Stage A admission omitted_owner_routes is not a list"
+            )
             routes = []
         for route in routes:
             if not isinstance(route, Mapping) or set(route) != _ROUTE_KEYS:
-                errors.append("Stage A admission omitted route contract is invalid")
+                contract_errors.append(
+                    "Stage A admission omitted route contract is invalid"
+                )
                 continue
             identity = (
                 str(route.get("owner") or ""),
                 str(route.get("group") or ""),
             )
             if identity not in valid_routes:
-                errors.append(
+                contract_errors.append(
                     f"Stage A admission returned an invalid omitted route: "
                     f"{identity[0]}/{identity[1]}"
                 )
-        if verdict != "complete":
-            errors.append(
+        if verdict in {"omitted", "unresolved"}:
+            semantic_errors.append(
                 f"Stage A admission found {verdict or 'invalid'} demand in "
                 f"{row.get('clause_id')}"
             )
         elif routes:
-            errors.append(
+            contract_errors.append(
                 f"Stage A complete clause declares omitted routes: "
                 f"{row.get('clause_id')}"
             )
     if not str(document.get("reason") or "").strip():
-        errors.append("Stage A admission has no reason")
-    return tuple(dict.fromkeys(errors)), _wire_size(prompt, payload)
+        contract_errors.append("Stage A admission has no reason")
+    complete_clauses = {
+        str(row.get("clause_id") or "")
+        for row in clause_verdicts
+        if str(row.get("verdict") or "") == "complete"
+    }
+    unit_clause = {
+        str(unit["unit_id"]): str(unit.get("clause_id") or "")
+        for unit in partition
+    }
+    complete_unit_ids = {
+        str(row.get("unit_id") or "")
+        for row in unit_verdicts
+        if str(row.get("verdict") or "") == "complete"
+    }
+    support_by_redundant_unit = {
+        str(row.get("unit_id") or ""): str(row.get("supports_unit_id") or "")
+        for row in unit_verdicts
+        if str(row.get("verdict") or "") == "redundant"
+    }
+    for unit_id in redundant_unit_ids:
+        clause_id = unit_clause.get(unit_id, "")
+        support_unit_id = support_by_redundant_unit.get(unit_id, "")
+        if (
+            clause_id not in complete_clauses
+            or support_unit_id not in complete_unit_ids
+            or support_unit_id == unit_id
+        ):
+            contract_errors.append(
+                f"Stage A admission redundant unit has invalid support: {unit_id}"
+            )
+    return (
+        tuple(dict.fromkeys(contract_errors)),
+        tuple(dict.fromkeys(semantic_errors)),
+        frozenset(redundant_unit_ids) if not contract_errors else frozenset(),
+    )
 
 
 def _owner_requests(
@@ -710,7 +1388,9 @@ def _stage_b_prompt(owner: str) -> str:
         "allowed argument in the same object and NEVER emit an arguments object. For example, "
         "{\"type\":\"declared_type\",\"declared_argument\":\"value\"}, not "
         "{\"type\":\"declared_type\",\"arguments\":{...}}. Copy only keys explicitly listed "
-        "in that action's allowed_arguments. source_evidence must be one exact substring of "
+        "in that action's allowed_arguments. When allowed_arguments is empty, the complete "
+        "valid action object is {\"type\":\"declared_type\"}; source provenance remains in "
+        "the binding and semantic unit and is not an action argument. source_evidence must be one exact substring of "
         "a supplied semantic unit, never a paraphrase. Do not copy a value from owner_state "
         "unless the source unit explicitly supplies or confirms it. Do not add inferred "
         "identity, existence, protocol, canonical-name, or evidence-summary arguments to a "
@@ -718,7 +1398,24 @@ def _stage_b_prompt(owner: str) -> str:
         "explanations are read-only actions. A concrete request owned by another group has "
         "no valid action in this owner schema: mark that binding unresolved so Stage A can be "
         "corrected, rather than coercing it into a superficially similar action. Ambiguous or "
-        "incomplete demands remain unresolved instead of being guessed."
+        "incomplete demands remain unresolved instead of being guessed. "
+        "When a semantic unit has operation=pending_answer, compare its complete exact source "
+        "meaning with owner_state.pending_question and every declared option. If exactly one "
+        "option is semantically selected, emit the coordinator-owned answer_pending action with "
+        "selected_value equal to that option's exact value, omit answer, and include exact "
+        "source_evidence from that unit. For valid manual input, emit answer and omit "
+        "selected_value. When pending_question.options is empty, selected_value is always "
+        "invalid: preserve the complete manual or evidence contribution in answer, or emit "
+        "the pending contract's declared manual_action when that action belongs to this "
+        "owner. Never reinterpret an array, boolean, id, method parameter, or other literal "
+        "inside manual evidence as a declared option. The deterministic pending-question coordinator, not "
+        "Stage B, resolves the immutable option.action and dispatches it to its registered owner. "
+        "Never emit that specialized option.action directly from the coordinator compiler. "
+        "The user does not need to repeat an option label or value verbatim; an unambiguous "
+        "natural-language paraphrase, rejection of all listed alternatives, or stated "
+        "uncertainty may select the corresponding declared option. If zero or several options "
+        "fit, keep the unit unresolved. Never invent an option, and never consume an "
+        "independent sibling request as rationale for the pending answer."
     )
 
 
@@ -759,6 +1456,48 @@ def _action_schema_applies(
             operations=operations,
         )
     )
+
+
+def _allowed_action_types_for_partition(
+    partition: Sequence[Mapping[str, Any]],
+) -> frozenset[str]:
+    """Expose only actions reachable from this immutable Stage A partition."""
+
+    operations = frozenset(
+        str(unit.get("operation") or "")
+        for unit in partition
+        if str(unit.get("operation") or "") not in {"context", "unresolved"}
+    )
+    groups = frozenset(
+        str(route.get("group") or "")
+        for unit in partition
+        for route in unit.get("owner_routes") or []
+        if isinstance(route, Mapping) and str(route.get("group") or "")
+    )
+    return frozenset(
+        spec.action_type
+        for spec in ACTION_SPECS
+        if _action_spec_applies(
+            spec,
+            groups=groups,
+            operations=operations,
+        )
+    )
+
+
+def _focused_action_types_for_partition(
+    partition: Sequence[Mapping[str, Any]],
+) -> frozenset[str]:
+    """Allow universal-label correction without reopening domain ownership."""
+
+    partition_types = _allowed_action_types_for_partition(partition)
+    universal_operations = frozenset(_UNIVERSAL_OPERATION_OWNER)
+    universal_types = frozenset(
+        spec.action_type
+        for spec in ACTION_SPECS
+        if universal_operations.intersection(spec.semantic_operations)
+    )
+    return partition_types | universal_types
 
 
 def _stage_b_payload(
@@ -818,7 +1557,7 @@ def _compile_owner_document(
     groups: frozenset[str],
     partition: Sequence[Mapping[str, Any]],
     unit_ids: Sequence[str],
-) -> tuple[dict[str, Any], tuple[str, ...], int]:
+) -> tuple[dict[str, Any], tuple[str, ...], tuple[int, ...]]:
     prompt = _stage_b_prompt(owner)
     payload = _stage_b_payload(
         state,
@@ -827,12 +1566,7 @@ def _compile_owner_document(
         partition,
         unit_ids,
     )
-    response = request_semantic_compilation(
-        provider_from_config(),
-        system_prompt=prompt,
-        request_payload=payload,
-        max_tokens=3200,
-    )
+    provider = provider_from_config()
     expected_groups = {
         str(unit["unit_id"]): frozenset(
             str(route.get("group") or "")
@@ -847,14 +1581,46 @@ def _compile_owner_document(
         for unit in partition
         if str(unit["unit_id"]) in unit_ids
     }
-    document, errors = _validate_owner_document(
-        response,
-        owner,
-        unit_ids,
-        expected_groups=expected_groups,
-        expected_operations=expected_operations,
-    )
-    return document, errors, _wire_size(prompt, payload)
+    request_sizes: list[int] = []
+    response = ""
+    document: dict[str, Any] = {}
+    errors: tuple[str, ...] = ()
+    for attempt in range(2):
+        request_payload = payload
+        request_prompt = prompt
+        if attempt:
+            request_prompt = (
+                f"{prompt} This is a bounded structural-contract repair. Preserve "
+                "the semantic selections and unresolved dispositions from the prior "
+                "document. Correct only the reported JSON, action-schema, ownership, "
+                "route, or binding-contract violations. Do not turn an unresolved "
+                "binding into an action merely because a repair was requested."
+            )
+            request_payload = {
+                **payload,
+                "contract_repair": {
+                    "rejected_document": response,
+                    "validator_errors": list(errors),
+                },
+            }
+        request_sizes.append(_wire_size(request_prompt, request_payload))
+        response = request_semantic_compilation(
+            provider,
+            system_prompt=request_prompt,
+            request_payload=request_payload,
+            max_tokens=3200,
+        )
+        document, errors = _validate_owner_document(
+            response,
+            owner,
+            unit_ids,
+            expected_groups=expected_groups,
+            expected_operations=expected_operations,
+            pending_question=dict(state.get("pending_question") or {}),
+        )
+        if not errors:
+            break
+    return document, errors, tuple(request_sizes)
 
 
 def _validate_owner_document(
@@ -864,6 +1630,7 @@ def _validate_owner_document(
     *,
     expected_groups: Mapping[str, frozenset[str]] | None = None,
     expected_operations: Mapping[str, str] | None = None,
+    pending_question: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], tuple[str, ...]]:
     try:
         payload = json.loads(text)
@@ -890,6 +1657,19 @@ def _validate_owner_document(
             normalized = validate_action_contract(action)
         except ValueError as exc:
             errors.append(f"Stage B {owner} action {index} is invalid: {exc}")
+            continue
+        if (
+            str(normalized.get("type") or "") == "answer_pending"
+            and "selected_value" in normalized
+            and not pending_option_value_exists(
+                normalized.get("selected_value"),
+                dict(pending_question or {}),
+            )
+        ):
+            errors.append(
+                f"Stage B {owner} action {index} selects a value absent from "
+                "the active pending options"
+            )
             continue
         spec = ACTION_BY_TYPE.get(str(normalized.get("type") or ""))
         if spec is None or spec.owner != owner:

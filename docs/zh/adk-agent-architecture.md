@@ -4,9 +4,11 @@
 
 AnyChain Agent 是基于 LangGraph Harness 的产品级 Agent，用于控制
 blockchain-node-benchmark 引擎。Harness 负责 workflow 状态、group 路由、
-fallback 顺序、校验门禁和执行决策。Harness 自身的模型调用对所有 provider
-（OpenAI、DeepSeek、Vertex 上的 Gemini）统一走 OpenAI 兼容的 HTTP 请求；
-Google ADK 只用于唯一一项可选能力——Gemini `google_search` 联网检索
+fallback 顺序、校验门禁和执行决策。所有模型 provider 都实现同一个
+`LLMProvider` contract。OpenAI、DeepSeek 和 Vertex Gemini 使用 OpenAI-compatible
+transport；Gemini API key 模式使用原生 `generateContent`，Claude API key 模式使用
+Anthropic Messages API，Vertex Claude 使用 `rawPredict`。Google ADK 只用于唯一一项
+可选能力——Gemini `google_search` 联网检索
 （`agent/llm/search_grounding.py`），以普通函数调用的方式从 Harness 代码里触发。
 它绝不能拥有第二套 benchmark wizard、第二套对话循环，也不能绕过 Harness 修改
 workflow state。
@@ -66,18 +68,48 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-  A["User turn"] --> B["Typed intent<br/>LLM resolver"]
-  B --> C["Route to group<br/>LangGraph Harness"]
-  C --> D["Ask one blocking question<br/>or activate requested group"]
-  D --> E["Validate<br/>deterministic gates"]
-  E --> F{"Ready?"}
-  F -- "No" --> C
-  F -- "Yes" --> G["Execute<br/>smoke or detached job"]
-  G --> H["Observe<br/>logs and artifacts"]
-  H --> I["Analyze<br/>evidence-backed"]
-  I --> J["Iterate<br/>update state or next plan"]
-  J --> A
+  A["prepare"] --> B["adjudicate"]
+  B --> C{"input authority"}
+  C -- "deterministic option / typed value / command" --> D["admit"]
+  C -- "semantic natural language" --> P["hierarchical plan"]
+  P --> D
+  C -- "empty / no-op" --> L["fallback"]
+  D --> E["select one action"]
+  E --> F["route one owner"]
+  F --> G["commit typed result"]
+  G --> H{"side effect?"}
+  H -- "yes" --> I["persist intent"]
+  I --> J["invoke idempotently"]
+  J --> K["commit receipt"]
+  H -- "no" --> L["next action / fallback"]
+  K --> L
+  L --> M["compose one response"]
+  M --> N["validate and checkpoint"]
 ```
+
+上述生命周期由同一个带 checkpointer 的 compiled graph 执行。框架不存在第二个
+不带 checkpoint 的 turn graph，也不存在一次性排空 action queue 的 Python loop。
+每次 graph transition 最多选择一个已 admission 的 `ActionEnvelope`；domain owner
+只能返回类型化 `HandlerResult`，只有 commit 边界可以修改持久化 domain state。
+外部执行必须先持久化 `SideEffectIntent`，再以幂等方式调用，并写入
+`SideEffectReceipt`。每一轮还会生成 `TurnReceipt`，绑定 semantic units、admitted
+actions、执行顺序、未解析单元和最终问题。
+
+控制平面的职责被明确拆分：
+
+- `admission.py` 在 action 持久化前校验 proposal、冲突、前置条件和 semantic
+  coverage；
+- `hierarchical_planner.py` 是唯一产品语义规划入口；Stage A 对完整 turn
+  分区并分配受限 owner/group route，Stage B 使用 owner-scoped schema 编译
+  action，随后执行 whole-plan admission；
+- `intent.py` 提供 focused adjudication、schema 校验和 admission 辅助，不是第二个
+  产品 planner；
+- `queue.py` 负责满足依赖的排序和 pending barrier 下的执行资格；
+- `routing.py` 负责 navigation prerequisite、return policy 和 canonical fallback；
+- `response.py` 是唯一 response composer，每轮最多输出一个可执行 blocking
+  question；
+- `coordinator.py` 只实现 graph node transition 和唯一的类型化 commit 边界，
+  不解释自然语言、不解析 terminal 输入，也不持有 domain 业务规则。
 
 唯一元数据权威来源是 `agent/workflows/group_registry.py::GROUPS`。它定义
 20 个 group 及其字段、问题、依赖、失效关系和 owner。
@@ -154,6 +186,12 @@ flowchart TD
 `runtime.env` 是每个 job 最终确认的配置，用户不应手动编辑。如果用户修改
 先前答案，Harness 必须更新或失效受影响的 group state，并通过确定性工具重新
 生成下游 runtime 产物。
+
+checkpoint state 当前使用 schema version 13。当前版本的新 turn 绝不调用 legacy
+action compiler。version 12 checkpoint 只通过一个明确的 migration adapter，并立即
+持久化为 version 13。更老的 checkpoint 必须进入 quarantine：仅允许列入白名单的
+环境事实供用户重新确认，旧 pending action 或通过文件路径猜测出的 plan 绝不能恢复
+为可执行任务。
 
 ## Google Search 边界
 

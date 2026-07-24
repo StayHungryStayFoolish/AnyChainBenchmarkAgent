@@ -5,10 +5,12 @@ owns the Agent runtime.
 
 AnyChain Agent is a LangGraph Harness-based product agent that controls the
 blockchain-node-benchmark engine. The Harness owns workflow state, group
-routing, fallback ordering, validation gates, and execution decisions. The
-Harness's own model calls are plain OpenAI-compatible HTTP requests for every
-provider (OpenAI, DeepSeek, and Gemini on Vertex alike); Google ADK is used
-for exactly one optional capability, Gemini `google_search` grounding
+routing, fallback ordering, validation gates, and execution decisions. Every
+model provider implements the same `LLMProvider` contract. OpenAI, DeepSeek,
+and Vertex Gemini use OpenAI-compatible transports; Gemini API-key mode uses
+native `generateContent`, Claude API-key mode uses the Anthropic Messages API,
+and Vertex Claude uses `rawPredict`. Google ADK is used for exactly one optional
+capability, Gemini `google_search` grounding
 (`agent/llm/search_grounding.py`), called as a plain function from Harness
 code. It must never own a second benchmark wizard, a second conversation
 loop, or mutate workflow state outside the Harness.
@@ -69,18 +71,52 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-  A["User turn"] --> B["Typed intent<br/>LLM resolver"]
-  B --> C["Route to group<br/>LangGraph Harness"]
-  C --> D["Ask one blocking question<br/>or activate requested group"]
-  D --> E["Validate<br/>deterministic gates"]
-  E --> F{"Ready?"}
-  F -- "No" --> C
-  F -- "Yes" --> G["Execute<br/>smoke or detached job"]
-  G --> H["Observe<br/>logs and artifacts"]
-  H --> I["Analyze<br/>evidence-backed"]
-  I --> J["Iterate<br/>update state or next plan"]
-  J --> A
+  A["prepare"] --> B["adjudicate"]
+  B --> C{"input authority"}
+  C -- "deterministic option / typed value / command" --> D["admit"]
+  C -- "semantic natural language" --> P["hierarchical plan"]
+  P --> D
+  C -- "empty / no-op" --> L["fallback"]
+  D --> E["select one action"]
+  E --> F["route one owner"]
+  F --> G["commit typed result"]
+  G --> H{"side effect?"}
+  H -- "yes" --> I["persist intent"]
+  I --> J["invoke idempotently"]
+  J --> K["commit receipt"]
+  H -- "no" --> L["next action / fallback"]
+  K --> L
+  L --> M["compose one response"]
+  M --> N["validate and checkpoint"]
 ```
+
+This is one checkpointer-backed compiled graph. There is no secondary
+uncheckpointed turn graph and no post-hoc queue-draining loop. Each graph
+transition selects at most one admitted `ActionEnvelope`; every owner returns
+a typed `HandlerResult`, and only the commit boundary may mutate durable
+domain state. External work is authorized by a persisted `SideEffectIntent`
+and completed by a `SideEffectReceipt`. Every turn records a `TurnReceipt`
+that binds semantic units, admitted actions, execution order, unresolved
+units, and the resulting question.
+
+Control-plane responsibilities are deliberately separate:
+
+- `admission.py` validates proposals, conflicts, prerequisites, and semantic
+  coverage before an action becomes durable;
+- `hierarchical_planner.py` is the sole product semantic-planning entry.
+  Stage A partitions the complete turn and assigns bounded owner/group routes;
+  Stage B compiles actions with owner-scoped schemas before whole-plan
+  admission;
+- `intent.py` supplies focused adjudication and schema/admission helpers. It is
+  not a second product planner;
+- `queue.py` owns dependency-safe ordering and pending-barrier eligibility;
+- `routing.py` owns navigation prerequisites, return policy, and canonical
+  fallback;
+- `response.py` is the only response composer and emits at most one actionable
+  blocking question;
+- `coordinator.py` implements graph-node transitions and the sole typed commit
+  boundary; it does not interpret natural language, parse terminal input, or
+  own domain business rules.
 
 The metadata authority is `agent/workflows/group_registry.py::GROUPS`. It
 defines the 20 groups, their fields, questions, dependencies, invalidations,
@@ -161,6 +197,13 @@ flowchart TD
 edit it manually. If a user changes an earlier answer, the Harness must update
 or invalidate the affected group state and regenerate downstream runtime
 artifacts through deterministic tools.
+
+Checkpoint state uses schema version 13. Current-version turns never invoke a
+legacy action compiler. Version 12 checkpoints cross one explicit migration
+adapter and are immediately persisted as version 13. Older checkpoints are
+quarantined: only an allowlisted set of environment facts is exposed for
+reconfirmation, and old pending actions or guessed plan files are never
+resumed as executable work.
 
 ## Google Search Boundary
 

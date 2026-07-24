@@ -8,6 +8,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
@@ -492,7 +493,6 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
         self.assertEqual([item["example"] for item in positional["params"]], ["0xabc", 7])
 
     def test_catalog_strict_identity_accepts_protocol_request_but_rejects_recovery_prose(self) -> None:
-        from agent.harness.domains.chain_rpc_support import _chain_rpc_draft
         from agent.harness.domains.rpc_endpoint import _apply_method_answer
         from agent.harness.domains.rpc_catalog import draft_view, strict_method_identity
         from agent.harness.state import new_state
@@ -504,7 +504,7 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
         state = new_state("strict-method")
         state["chain_identity"] = {"canonical": "bsc", "adapter_family": "jsonrpc"}
         state["custom_rpc"] = {"status": "needs_method", "endpoint_ready": True}
-        state = _chain_rpc_draft(state)
+        state = deepcopy(state)
         _apply_method_answer(state, "custom_rpc_method", "please recover the previous method")
         self.assertEqual(state["custom_rpc"]["status"], "needs_method")
         self.assertFalse(draft_view(state).get("method"))
@@ -625,7 +625,6 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
         self.assertEqual(result["pending_question"]["id"], "custom_rpc_probe_confirm")
 
     def test_adding_second_method_resets_only_in_progress_evidence(self) -> None:
-        from agent.harness.domains.chain_rpc_support import _chain_rpc_draft
         from agent.harness.domains.rpc_workload import _apply_continue
         from agent.harness.state import new_state
 
@@ -643,14 +642,13 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
             "response_confirmed": True,
         }
 
-        state = _chain_rpc_draft(state)
+        state = deepcopy(state)
         _apply_continue(state, "custom_rpc_continue", "add_another")
 
         self.assertEqual(state["custom_rpc"]["catalog"]["methods"], [{"method": "demo_a", "params": []}])
         self.assertEqual(state["custom_rpc"]["catalog"]["draft"], {})
 
     def test_new_method_or_validation_endpoint_resets_only_unfinished_evidence(self) -> None:
-        from agent.harness.domains.chain_rpc_support import _chain_rpc_draft
         from agent.harness.domains.rpc_endpoint import _apply_endpoint_answer, _apply_method_answer
         from agent.harness.state import new_state
 
@@ -665,7 +663,7 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
             "evidence": [{"content": "stale request"}],
         }
 
-        state = _chain_rpc_draft(state)
+        state = deepcopy(state)
         with patch(
             "agent.harness.domains.rpc_endpoint.validate_rpc_endpoint",
             return_value={"ready": True, "status": "ok", "evidence_file": "second-endpoint.json"},
@@ -692,7 +690,6 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
         self.assertTrue(any("height expected number" in item for item in conflicts))
 
     def test_validated_method_records_its_own_probe_endpoint(self) -> None:
-        from agent.harness.domains.chain_rpc_support import _chain_rpc_draft
         from agent.harness.domains.rpc_endpoint import _probe_schema
         from agent.harness.domains.rpc_catalog import confirm_request, confirm_response, correct_draft
         from agent.harness.state import new_state
@@ -703,7 +700,7 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
             "endpoint": "http://sample-one.invalid",
             "method": "demo_a",
         }
-        state = _chain_rpc_draft(state)
+        state = deepcopy(state)
         correct_draft(state, {
             "method": "demo_a",
             "params": [],
@@ -732,7 +729,6 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
         self.assertEqual(contract["params"], [])
 
     def test_final_endpoint_replays_every_selected_custom_method_with_exact_params(self) -> None:
-        from agent.harness.domains.chain_rpc_support import _chain_rpc_draft
         from agent.harness.domains.rpc_endpoint import _apply_endpoint_answer
         from agent.harness.state import new_state
 
@@ -745,7 +741,7 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
                 {"method": "demo_b", "params": {"owner": "0xabc"}},
             ], chain="bsc"),
         })
-        state = _chain_rpc_draft(state)
+        state = deepcopy(state)
         def probe(**kwargs):
             method = kwargs["methods"][0]
             return {"ready": True, "status": "ok", "evidence_file": f"{method}.json"}
@@ -766,7 +762,6 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
         )
 
     def test_final_endpoint_blocks_when_any_selected_custom_method_fails(self) -> None:
-        from agent.harness.domains.chain_rpc_support import _chain_rpc_draft
         from agent.harness.domains.rpc_endpoint import _apply_endpoint_answer
         from agent.harness.state import new_state
 
@@ -780,7 +775,7 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
             ], chain="bsc"),
         })
 
-        state = _chain_rpc_draft(state)
+        state = deepcopy(state)
         def probe(**kwargs):
             method = kwargs["methods"][0]
             return {
@@ -799,14 +794,13 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
         self.assertTrue(all("final_endpoint" not in item for item in state["custom_rpc"]["catalog"]["methods"]))
 
     def test_weights_require_positive_complete_final_workload_for_replace_and_add(self) -> None:
-        from agent.harness.domains.chain_rpc_support import _chain_rpc_draft
         from agent.harness.domains.rpc_workload import _apply_weights
         from agent.harness.state import new_state
 
         replace = new_state("replace-weights")
         replace["chain_identity"] = {"canonical": "bsc"}
         replace["custom_rpc"] = _custom_rpc_catalog([{"method": "demo_a"}, {"method": "demo_b"}], scope="mixed_replace")
-        replace = _chain_rpc_draft(replace)
+        replace = deepcopy(replace)
         _apply_weights(replace, "custom_rpc_weights", '{"demo_a":0,"demo_b":100}')
         self.assertFalse((replace.get("workload") or {}).get("confirmed"))
 
@@ -816,7 +810,7 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
         add = new_state("add-weights")
         add["chain_identity"] = {"canonical": "bsc"}
         add["custom_rpc"] = _custom_rpc_catalog([{"method": "demo_custom"}], scope="mixed_add")
-        add = _chain_rpc_draft(add)
+        add = deepcopy(add)
         incomplete = {"demo_custom": 100}
         _apply_weights(add, "custom_rpc_weights", json.dumps(incomplete))
         self.assertFalse((add.get("workload") or {}).get("confirmed"))
@@ -856,14 +850,13 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
                 self.assertEqual(parse_weight_spec(invalid), {})
 
     def test_yaml_weights_reach_the_same_workload_domain_contract(self) -> None:
-        from agent.harness.domains.chain_rpc_support import _chain_rpc_draft
         from agent.harness.domains.rpc_workload import _apply_weights
         from agent.harness.state import new_state
 
         state = new_state("yaml-weights")
         state["chain_identity"] = {"canonical": "bsc"}
         state["custom_rpc"] = _custom_rpc_catalog([], scope="mixed_replace")
-        state = _chain_rpc_draft(state)
+        state = deepcopy(state)
 
         _apply_weights(
             state,
@@ -875,7 +868,6 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
         self.assertEqual(sum(state["workload"]["mixed_weights"].values()), 100)
 
     def test_typed_and_manual_mixed_replace_share_the_same_effective_contract(self) -> None:
-        from agent.harness.domains.chain_rpc_support import _chain_rpc_draft
         from agent.harness.domains.rpc_workload import _apply_requested_workload, _apply_weights
         from agent.harness.state import new_state
 
@@ -885,7 +877,7 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
         manual["custom_rpc"] = _custom_rpc_catalog(
             [{"method": "demo_custom", "params": []}], scope="mixed_replace",
         )
-        manual = _chain_rpc_draft(manual)
+        manual = deepcopy(manual)
         _apply_weights(manual, "custom_rpc_weights", json.dumps(weights))
 
         typed = new_state("typed-replace")
@@ -898,7 +890,7 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
             },
         })
 
-        typed = _chain_rpc_draft(typed)
+        typed = deepcopy(typed)
         self.assertTrue(_apply_requested_workload(typed))
         self.assertEqual(manual["workload"]["mixed_weights"], weights)
         self.assertEqual(typed["workload"]["mixed_weights"], weights)

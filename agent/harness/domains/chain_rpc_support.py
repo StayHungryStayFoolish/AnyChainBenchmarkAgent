@@ -22,60 +22,6 @@ from agent.planners import question_prompts
 from agent.validators.rpc_workload import default_workload
 
 
-_CHAIN_CONTROL_KEYS = frozenset({"active_group", "pending_question", "visible_response"})
-
-
-class ChainRpcDraft(dict[str, Any]):
-    """Private domain draft that records control directives out of band."""
-
-    def __init__(self, state: AgentGraphState) -> None:
-        super().__init__(deepcopy(dict(state)))
-        self.original: AgentGraphState = deepcopy(
-            state.original if isinstance(state, ChainRpcDraft) else dict(state)
-        )
-        self._control: dict[str, Any] = {}
-        if isinstance(state, ChainRpcDraft):
-            self._control = deepcopy(state._control)
-
-    def __getitem__(self, key: str) -> Any:
-        if key in self._control:
-            return self._control[key]
-        return super().__getitem__(key)
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        if key in _CHAIN_CONTROL_KEYS:
-            self._control[key] = value
-            return
-        super().__setitem__(key, value)
-
-    def get(self, key: str, default: Any = None) -> Any:
-        if key in self._control:
-            return self._control[key]
-        return super().get(key, default)
-
-    def setdefault(self, key: str, default: Any = None) -> Any:
-        if key in _CHAIN_CONTROL_KEYS:
-            if key not in self._control:
-                self._control[key] = deepcopy(self.get(key, default))
-            return self._control[key]
-        return super().setdefault(key, default)
-
-
-def _chain_rpc_draft(state: AgentGraphState) -> ChainRpcDraft:
-    return state if isinstance(state, ChainRpcDraft) else ChainRpcDraft(state)
-
-
-def _set_control(state: AgentGraphState, key: str, value: Any) -> None:
-    if not isinstance(state, ChainRpcDraft) or key not in _CHAIN_CONTROL_KEYS:
-        raise RuntimeError(f"chain_rpc control directive requires a private draft: {key}")
-    state._control[key] = value
-
-
-def _append_control(state: AgentGraphState, key: str, values: list[str]) -> None:
-    current = list(state.get(key) or [])
-    _set_control(state, key, current + list(values))
-
-
 def _adapter_family(state: AgentGraphState) -> str:
     identity = state.get("chain_identity") or {}
     family = normalize_scalar(identity.get("adapter_family")).casefold()
@@ -373,18 +319,38 @@ def _invalidate_groups(state: AgentGraphState, *groups: str) -> None:
 def _result(
     original: AgentGraphState,
     state: AgentGraphState,
-    action: ActionProposal,
+    action: ActionProposal | None = None,
     *,
     completion: str = "completed",
     stop: bool = False,
 ) -> HandlerResult:
     _assert_external_state_unchanged(original, state)
-    return _domain_result(
-        original,
-        state,
-        consumed_action_ids=(action.action_id,),
-        completion=completion,
-        stop=stop,
+    pending = deepcopy(state.get("pending_question") or {})
+    previous_pending = deepcopy(original.get("pending_question") or {})
+    previous_invalidated = set(original.get("invalidated_groups") or [])
+    current_invalidated = set(state.get("invalidated_groups") or [])
+    previous_responses = list(original.get("visible_response") or [])
+    previous_errors = list(original.get("action_errors") or [])
+    return HandlerResult(
+        delta=StateDelta.between(original, state),
+        consumed_action_ids=((action.action_id,) if action is not None else ()),
+        invalidated_groups=tuple(sorted(current_invalidated - previous_invalidated)),
+        reconfigured_groups=tuple(sorted(previous_invalidated - current_invalidated)),
+        action_errors=tuple(
+            deepcopy(item)
+            for item in state.get("action_errors") or []
+            if item not in previous_errors
+        ),
+        visible_results=tuple(
+            str(item)
+            for item in state.get("visible_response") or []
+            if str(item) and item not in previous_responses
+        ),
+        pending_question=pending or None,
+        clear_pending=bool(previous_pending and not pending),
+        next_group=normalize_scalar(pending.get("group") or state.get("active_group")),
+        completion=completion,  # type: ignore[arg-type]
+        stop_after_response=stop,
     )
 
 
@@ -395,49 +361,11 @@ def _answer_result(
     completion: str = "completed",
     stop: bool = False,
 ) -> HandlerResult:
-    _assert_external_state_unchanged(original, state)
-    return _domain_result(original, state, completion=completion, stop=stop)
-
-
-def _domain_result(
-    original: AgentGraphState,
-    state: AgentGraphState,
-    *,
-    consumed_action_ids: tuple[str, ...] = (),
-    completion: str = "completed",
-    stop: bool = False,
-) -> HandlerResult:
-    if isinstance(original, ChainRpcDraft):
-        original = original.original
-    pending = deepcopy(state.get("pending_question") or {})
-    previous_pending = deepcopy(original.get("pending_question") or {})
-    next_group = normalize_scalar(pending.get("group") or state.get("active_group"))
-    previous_invalidated = set(original.get("invalidated_groups") or [])
-    current_invalidated = set(state.get("invalidated_groups") or [])
-    previous_responses = list(original.get("visible_response") or [])
-    visible_results = tuple(
-        str(item)
-        for item in state.get("visible_response") or []
-        if str(item) and item not in previous_responses
-    )
-    previous_errors = list(original.get("action_errors") or [])
-    action_errors = tuple(
-        deepcopy(item)
-        for item in state.get("action_errors") or []
-        if item not in previous_errors
-    )
-    return HandlerResult(
-        delta=StateDelta.between(original, state),
-        consumed_action_ids=consumed_action_ids,
-        invalidated_groups=tuple(sorted(current_invalidated - previous_invalidated)),
-        reconfigured_groups=tuple(sorted(previous_invalidated - current_invalidated)),
-        action_errors=action_errors,
-        visible_results=visible_results,
-        pending_question=pending or None,
-        clear_pending=bool(previous_pending and not pending),
-        next_group=next_group,
-        completion=completion,  # type: ignore[arg-type]
-        stop_after_response=stop,
+    return _result(
+        original,
+        state,
+        completion=completion,
+        stop=stop,
     )
 
 

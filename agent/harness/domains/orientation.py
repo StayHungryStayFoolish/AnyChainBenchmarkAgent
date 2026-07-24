@@ -151,6 +151,34 @@ def apply_orientation_action(state: AgentGraphState, action: ActionProposal) -> 
     """Apply an orientation action without stealing workflow ownership."""
 
     action_type = action.action_type
+    if action_type == "prepare_session_entry":
+        current_pending = dict(state.get("pending_question") or {})
+        resumable = has_resumable_configuration(state)
+        question = resume_question(state) if resumable else opening_question(state)
+        delta = StateDelta()
+        if (
+            resumable
+            and current_pending
+            and str(current_pending.get("id") or "") != "resume_harness_session"
+        ):
+            delta = StateDelta.set_values({
+                "resume_context": {
+                    "pending_question": current_pending,
+                    "active_group": str(
+                        state.get("active_group")
+                        or current_pending.get("group")
+                        or ""
+                    ),
+                }
+            })
+        return HandlerResult(
+            delta=delta,
+            consumed_action_ids=(action.action_id,),
+            pending_question=question,
+            next_group="opening",
+            completion="blocked",
+            stop_after_response=True,
+        )
     if action_type == "set_response_language":
         language = str(action.arguments.get("language") or "").strip().lower()
         if language not in {"zh", "en"}:
@@ -302,7 +330,8 @@ def apply_orientation_answer(
             clear_pending=not restored_pending,
             next_group=str(resume_context.get("active_group") or restored_pending.get("group") or "opening"),
             visible_result=localized(language, "已继续之前的配置。", "Continuing the previous configuration."),
-            completion="completed",
+            completion="blocked" if restored_pending else "completed",
+            stop_after_response=True,
         )
     if question_id == "accept_recommendation":
         if not value:

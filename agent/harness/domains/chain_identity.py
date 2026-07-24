@@ -25,7 +25,6 @@ from agent.llm.search_grounding import run_google_search_grounding
 from agent.onboarding.families import SUPPORTED_FAMILIES
 from .chain_rpc_questions import _adapter_family_question, _answer_option, _choice
 from .chain_rpc_questions import _endpoint_validation_question
-from .chain_rpc_support import _set_control
 
 SUPPORTED_ADAPTER_FAMILIES = frozenset(SUPPORTED_FAMILIES)
 
@@ -176,17 +175,17 @@ def _identity_confirmation_question(state: AgentGraphState) -> dict[str, Any] | 
 def _apply_chain_candidate(state: AgentGraphState, raw: str, resolution: dict[str, Any] | None = None) -> None:
     known = set(repo_chain_names())
     canonical = canonicalize_chain_scalar(raw, known_chains=known)
-    _set_control(state, 'pending_question', {})
+    state['pending_question'] = {}
     if canonical:
         previous = normalize_scalar((state.get("chain_identity") or {}).get("canonical"))
         if previous and previous != canonical:
             invalidate_for_chain_change(state)
         state["chain_identity"] = {"raw": raw, "canonical": canonical, "status": "confirmed", "case": "known"}
         state.setdefault("confirmed_config", {})["BLOCKCHAIN_NODE"] = canonical
-        _set_control(state, 'active_group', "chain_identity")
-        _set_control(state, 'visible_response', list(state.get("visible_response") or []) + [
+        state['active_group'] = "chain_identity"
+        state['visible_response'] = list(state.get("visible_response") or []) + [
             localized(state.get("language", "en"), f"已确认链为 `{canonical}`。", f"Confirmed chain: `{canonical}`.")
-        ])
+        ]
         return
     resolved = research_chain_identity(state, raw, resolution)
     adapter_family = normalize_scalar(resolved.get("adapter_family") or "unknown")
@@ -201,9 +200,9 @@ def _apply_chain_candidate(state: AgentGraphState, raw: str, resolution: dict[st
             "case": "known_candidate",
             "llm_resolution": resolved,
         }
-        _set_control(state, 'active_group', "chain_identity")
-        _set_control(state, 'pending_question', _identity_confirmation_question(state) or {})
-        _set_control(state, 'visible_response', [render_question(state["pending_question"], state.get("language", "en"))])
+        state['active_group'] = "chain_identity"
+        state['pending_question'] = _identity_confirmation_question(state) or {}
+        state['visible_response'] = [render_question(state["pending_question"], state.get("language", "en"))]
         return
     state["chain_identity"] = {
         "raw": raw,
@@ -215,9 +214,9 @@ def _apply_chain_candidate(state: AgentGraphState, raw: str, resolution: dict[st
         "requires_llm_identity_resolution": True,
         "llm_resolution": resolved,
     }
-    _set_control(state, 'active_group', "chain_identity")
-    _set_control(state, 'pending_question', _identity_confirmation_question(state) or {})
-    _set_control(state, 'visible_response', [render_question(state["pending_question"], state.get("language", "en"))])
+    state['active_group'] = "chain_identity"
+    state['pending_question'] = _identity_confirmation_question(state) or {}
+    state['visible_response'] = [render_question(state["pending_question"], state.get("language", "en"))]
 
 
 def _preserve_same_chain(state: AgentGraphState, chain: str) -> None:
@@ -232,10 +231,10 @@ def _preserve_same_chain(state: AgentGraphState, chain: str) -> None:
         f"The current chain is already `{chain}`. I will continue the current configuration flow.",
     )
     pending = {} if newly_confirmed else (state.get("pending_question") or {})
-    _set_control(state, 'visible_response', [message] + ([render_question(pending, state.get("language", "en"))] if pending else []))
+    state['visible_response'] = [message] + ([render_question(pending, state.get("language", "en"))] if pending else [])
     if newly_confirmed:
-        _set_control(state, 'active_group', "provider_deployment")
-        _set_control(state, 'pending_question', {})
+        state['active_group'] = "provider_deployment"
+        state['pending_question'] = {}
 
 
 def _request_chain_change(
@@ -271,7 +270,7 @@ def _request_chain_change(
         "interrupted_group": state.get("active_group") or "",
     }
     state.setdefault("chain_identity", {})["change_candidate"] = candidate
-    _set_control(state, 'active_group', "chain_identity")
+    state['active_group'] = "chain_identity"
     if canonical:
         options = [
             _answer_option("yes", "Y", True, {"chain_identity.canonical": canonical}),
@@ -311,7 +310,7 @@ def _request_chain_change(
         if summary:
             prompt += localized(state.get("language", "en"), f" 已用 google_search 核实：{summary}", f" Verified via google_search: {summary}")
         kind = "numbered_choice"
-    _set_control(state, 'pending_question', _choice(
+    state['pending_question'] = _choice(
         "chain_identity",
         "chain_change_confirm",
         prompt,
@@ -319,10 +318,10 @@ def _request_chain_change(
         options,
         kind=kind,
         queue_barrier=True,
-    ))
+    )
     state["pending_question"]["interrupted_group"] = candidate["interrupted_group"]
     state["pending_question"]["supersedes_action_types"] = ["choose_chain", "change_chain"]
-    _set_control(state, 'visible_response', [render_question(state["pending_question"], state.get("language", "en"))])
+    state['visible_response'] = [render_question(state["pending_question"], state.get("language", "en"))]
 
 
 def _apply_chain_change_decision(state: AgentGraphState, question: Mapping[str, Any], value: Any) -> None:
@@ -330,7 +329,7 @@ def _apply_chain_change_decision(state: AgentGraphState, question: Mapping[str, 
     candidate = current_identity.get("change_candidate") or {}
     if value is False:
         current_identity.pop("change_candidate", None)
-        _set_control(state, 'active_group', normalize_scalar(candidate.get("interrupted_group") or question.get("interrupted_group")) or "chain_identity")
+        state['active_group'] = normalize_scalar(candidate.get("interrupted_group") or question.get("interrupted_group")) or "chain_identity"
         return
     raw = normalize_scalar(candidate.get("raw"))
     resolution = candidate.get("resolution") if isinstance(candidate.get("resolution"), dict) else {}
@@ -345,14 +344,14 @@ def _apply_chain_change_decision(state: AgentGraphState, question: Mapping[str, 
         current = canonicalize_chain_scalar(normalize_scalar(current_identity.get("canonical")), known_chains=set(repo_chain_names()))
         if possible and possible == current:
             current_identity.pop("change_candidate", None)
-            _set_control(state, 'active_group', normalize_scalar(candidate.get("interrupted_group")) or "chain_identity")
-            _set_control(state, 'visible_response', [localized(state.get("language", "en"), f"保持当前链 `{possible}`，已确认的链相关配置未更改。", f"Keeping the current chain `{possible}`; confirmed chain-dependent configuration is unchanged.")])
+            state['active_group'] = normalize_scalar(candidate.get("interrupted_group")) or "chain_identity"
+            state['visible_response'] = [localized(state.get("language", "en"), f"保持当前链 `{possible}`，已确认的链相关配置未更改。", f"Keeping the current chain `{possible}`; confirmed chain-dependent configuration is unchanged.")]
         else:
             invalidate_for_chain_change(state)
             state["chain_identity"] = {"raw": raw, "canonical": possible, "status": "confirmed", "case": "known"}
             state.setdefault("confirmed_config", {})["BLOCKCHAIN_NODE"] = possible
-            _set_control(state, 'active_group', "chain_identity")
-            _set_control(state, 'visible_response', [localized(state.get("language", "en"), f"已确认链为 `{possible}`。", f"Confirmed chain: `{possible}`.")])
+            state['active_group'] = "chain_identity"
+            state['visible_response'] = [localized(state.get("language", "en"), f"已确认链为 `{possible}`。", f"Confirmed chain: `{possible}`.")]
         return
     invalidate_for_chain_change(state)
     if value in {"confirm_proposed_protocol", "choose_protocol"}:
@@ -369,9 +368,9 @@ def _apply_chain_change_decision(state: AgentGraphState, question: Mapping[str, 
         if value == "confirm_proposed_protocol":
             _enter_case_for_adapter_family(state, normalize_scalar(resolution.get("adapter_family") or "unknown"))
         else:
-            _set_control(state, 'active_group', "chain_identity")
-            _set_control(state, 'pending_question', _adapter_family_question(state))
-            _set_control(state, 'visible_response', [render_question(state["pending_question"], state.get("language", "en"))])
+            state['active_group'] = "chain_identity"
+            state['pending_question'] = _adapter_family_question(state)
+            state['visible_response'] = [render_question(state["pending_question"], state.get("language", "en"))]
         return
     _apply_chain_candidate(state, raw, resolution)
 
@@ -398,15 +397,15 @@ def _apply_unknown_chain_decision(state: AgentGraphState, value: Any, user_text:
         if canonical:
             state["chain_identity"] = {"raw": normalize_scalar(identity.get("raw") or user_text), "canonical": canonical, "status": "confirmed", "case": "known"}
             state.setdefault("confirmed_config", {})["BLOCKCHAIN_NODE"] = canonical
-            _set_control(state, 'active_group', "provider_deployment")
+            state['active_group'] = "provider_deployment"
         return
     if value == "choose_protocol":
         _convert_known_candidate_to_unknown(state)
         state.setdefault("chain_identity", {})["status"] = "needs_protocol_confirmation"
         state["chain_identity"]["identity_confirmed"] = True
-        _set_control(state, 'active_group', "chain_identity")
-        _set_control(state, 'pending_question', _adapter_family_question(state))
-        _set_control(state, 'visible_response', [render_question(state["pending_question"], state.get("language", "en"))])
+        state['active_group'] = "chain_identity"
+        state['pending_question'] = _adapter_family_question(state)
+        state['visible_response'] = [render_question(state["pending_question"], state.get("language", "en"))]
         return
     if value == "confirm_proposed_protocol":
         _enter_case_for_adapter_family(state, normalize_scalar(identity.get("adapter_family")))
@@ -441,9 +440,9 @@ def _enter_case_for_adapter_family(state: AgentGraphState, family: str) -> None:
         _route_unsupported_family(state)
         return
     identity.update({"status": "existing_family_needs_endpoint", "case": "case2", "identity_confirmed": True})
-    _set_control(state, 'active_group', "endpoint_process")
-    _set_control(state, 'pending_question', _endpoint_validation_question(state) or {})
-    _set_control(state, 'visible_response', [render_question(state["pending_question"], state.get("language", "en"))] if state["pending_question"] else [])
+    state['active_group'] = "endpoint_process"
+    state['pending_question'] = _endpoint_validation_question(state) or {}
+    state['visible_response'] = [render_question(state["pending_question"], state.get("language", "en"))] if state["pending_question"] else []
 
 
 def _confirm_custom_rpc_family(state: AgentGraphState, family: str) -> None:
@@ -454,8 +453,8 @@ def _confirm_custom_rpc_family(state: AgentGraphState, family: str) -> None:
         return
     custom = state.setdefault("custom_rpc", {})
     custom.update({"status": "needs_endpoint", "endpoint_ready": False, "job_local_override": True})
-    _set_control(state, 'active_group', "endpoint_process")
-    _set_control(state, 'visible_response', [localized(state.get("language", "en"), f"已更新协议族为 `{family}`。请重新提供可访问的 RPC endpoint 用于验证。", f"Adapter family updated to `{family}`. Provide a reachable RPC endpoint to validate again.")])
+    state['active_group'] = "endpoint_process"
+    state['visible_response'] = [localized(state.get("language", "en"), f"已更新协议族为 `{family}`。请重新提供可访问的 RPC endpoint 用于验证。", f"Adapter family updated to `{family}`. Provide a reachable RPC endpoint to validate again.")]
 
 
 def _route_unsupported_family(state: AgentGraphState) -> None:
@@ -471,9 +470,9 @@ def _route_unsupported_family(state: AgentGraphState) -> None:
             "evidence": list(handoff.get("evidence") or []),
         }
     )
-    _set_control(state, 'active_group', "chain_identity")
-    _set_control(state, 'pending_question', {})
-    _set_control(state, 'visible_response', [localized(state.get("language", "en"), "该链目前不属于已支持协议族。请提供官方协议/RPC 文档、endpoint 文档、request/response 示例；我会生成二次开发交接文档。", "This chain is outside the supported adapter families. Provide official protocol/RPC docs, endpoint docs, and request/response examples; I will generate a secondary-development handoff.")])
+    state['active_group'] = "chain_identity"
+    state['pending_question'] = {}
+    state['visible_response'] = [localized(state.get("language", "en"), "该链目前不属于已支持协议族。请提供官方协议/RPC 文档、endpoint 文档、request/response 示例；我会生成二次开发交接文档。", "This chain is outside the supported adapter families. Provide official protocol/RPC docs, endpoint docs, and request/response examples; I will generate a secondary-development handoff.")]
 
 
 def _request_target_mode_change(state: AgentGraphState, mode: str) -> None:
@@ -492,8 +491,8 @@ def _request_target_mode_change(state: AgentGraphState, mode: str) -> None:
         impact_zh = "环境/机器/磁盘/网络证据会保留；endpoint、进程和执行证据会按新模式重新确认，避免复用不适用的运行状态。"
         impact_en = "Environment, machine, disk, and network evidence is kept. Endpoint, process, and execution evidence is re-confirmed for the new mode so incompatible runtime state is not reused."
     state["target_mode_change_candidate"] = mode
-    _set_control(state, 'active_group', "target_mode")
-    _set_control(state, 'pending_question', _choice(
+    state['active_group'] = "target_mode"
+    state['pending_question'] = _choice(
         "target_mode",
         "target_mode_change_confirm",
         localized(
@@ -508,11 +507,11 @@ def _request_target_mode_change(state: AgentGraphState, mode: str) -> None:
         ],
         kind="yes_no",
         queue_barrier=True,
-    ))
+    )
     state["pending_question"]["interrupted_group"] = interrupted
     state["pending_question"]["previous_mode"] = previous
     state["pending_question"]["supersedes_action_types"] = ["choose_target_mode"]
-    _set_control(state, 'visible_response', [render_question(state["pending_question"], state.get("language", "en"))])
+    state['visible_response'] = [render_question(state["pending_question"], state.get("language", "en"))]
 
 
 def _chain_ambiguity_question(

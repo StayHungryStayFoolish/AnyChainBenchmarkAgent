@@ -89,7 +89,7 @@ class AgentRuntimeIsolationTests(unittest.TestCase):
                     checkpoint_path=root / "checkpoints.sqlite",
                     session_purpose="chaos",
                 ) as runtime,
-                patch.object(runtime._turn_graph, "invoke", return_value=invalid),
+                patch.object(runtime.graph, "invoke", return_value=invalid),
             ):
                 result = runtime.invoke("trigger invalid transition", language="en")
 
@@ -114,7 +114,7 @@ class AgentRuntimeIsolationTests(unittest.TestCase):
                     session_purpose="chaos",
                 ) as runtime,
                 patch.object(
-                    runtime._turn_graph,
+                    runtime.graph,
                     "invoke",
                     side_effect=StateInvariantError("declared option postcondition failed"),
                 ),

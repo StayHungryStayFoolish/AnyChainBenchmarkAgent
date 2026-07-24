@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Collection, Mapping, Sequence
 
 from ..llm.types import LLMMessage, LLMRequest, ensure_turn_active
@@ -160,7 +160,12 @@ def _quote_supports_pending_candidate(
         ):
             return True
     appears_in_source = any(
-        literal.strip().casefold() in source.casefold()
+        re.search(
+            rf"(?<![\w]){re.escape(literal.strip())}(?![\w])",
+            source,
+            flags=re.IGNORECASE,
+        )
+        is not None
         for literal in candidate_literals
         for source in source_texts
         if literal.strip()
@@ -212,6 +217,8 @@ class WholePlanAdmission:
     action_verdicts: tuple[dict[str, Any], ...] = ()
     unit_verdicts: tuple[dict[str, Any], ...] = ()
     response: Mapping[str, Any] | None = None
+    request_count: int = 1
+    request_sizes: tuple[int, ...] = ()
 
     def repair_context(self) -> dict[str, Any]:
         return {
@@ -324,9 +331,9 @@ def whole_plan_admission_prompt(semantic_policy: str) -> str:
         "A pending option may be selected by its number, id, canonical value, label, or a clear natural-language semantic equivalent. Do not require the source to repeat an option number or full label when it directly names the declared value or meaning. "
         "unit_ids must exactly equal that action's supplied immutable unit_ids. An admitted action needs one evidence row for every unit_id, every quote must be a non-empty exact substring of that unit, at least one relation must be direct, and a support row may use only one supplied allowed_support_relation. Direct rows use an empty support_relation. "
         "grounded_arguments must contain exactly one row for every supplied required_value_grounding_argument and no other row. argument_name is the exact required_value_grounding_argument name copied verbatim, never an explanation or value. Its evidence_quote must be a non-empty exact substring of one owned source unit that semantically selects the exact immutable operation_arguments value. Merely naming the argument or dimension, asking to change it without selecting a value, stating a generic benchmark goal, or relying on workflow state does not ground a concrete value. Natural-language equivalents may ground a value only when they unambiguously select that exact value. Actions with no required value-grounding arguments return an empty list. "
-        "pending_answer_argument is empty unless the supplied active pending question allows manual input and exactly one supplied pending_value_candidate semantically answers that question. When it does, set pending_answer_argument to that candidate's exact candidate_id. Each action record also supplies turn_pending_value_candidates scoped to source units owned by that action. For every action with non-empty pending_value_candidates return exactly one turn_candidate_verdict for every supplied turn candidate in supplied order; actions with no pending_value_candidates return an empty list. Each evidence_quote must be a non-empty exact substring of one candidate source unit. For a parser-derived literal it contains the literal; for a semantically normalized number, map, or enum it must be the exact phrase that selects that canonical value. Each reason must explain the source role rather than repeat the verdict. Exactly one row may be selected, and it must have the same contract-owned identity as the immutable operation value selected by pending_answer_argument; every other row is not_selected. Evaluate the selected operation against the complete scoped set, not only its operation argument. When two or more candidates exist, admit one only when the source explicitly distinguishes it as selected and distinguishes every other value as rejected, old, example-only, or otherwise not selected. A comparison, conjunction, disjunction, slash-separated list, or bare sequence is unresolved and must reject the pending answer rather than arbitrarily labeling one selected. A syntax-compatible value for an unrelated interruption is not an answer. A candidate mentioned only as an example, quotation, rejected option, negated operation, correction target, or value the user says not to apply is not an answer. Never invent a candidate id or rewrite the action. "
+        "pending_answer_argument is an opaque manual-candidate id, never an answer value, option id, option label, number, or paraphrase. Declared options are reviewed through the immutable action and pending_choice_contracts; they do not use pending_answer_argument. If an action record supplies an empty pending_value_candidates list, pending_answer_argument must be exactly the empty string even when that action selects a declared option. Only when the supplied active pending question allows manual input and exactly one supplied pending_value_candidate semantically answers that question, set pending_answer_argument to that candidate's exact candidate_id copied verbatim. Each action record also supplies turn_pending_value_candidates scoped to source units owned by that action. For every action with non-empty pending_value_candidates return exactly one turn_candidate_verdict for every supplied turn candidate in supplied order; actions with no pending_value_candidates return an empty list. Each evidence_quote must be a non-empty exact substring of one candidate source unit. For a parser-derived literal it contains the literal; for a semantically normalized number, map, or enum it must be the exact phrase that selects that canonical value. Each reason must explain the source role rather than repeat the verdict. Exactly one row may be selected, and it must have the same contract-owned identity as the immutable operation value selected by pending_answer_argument; every other row is not_selected. Evaluate the selected operation against the complete scoped set, not only its operation argument. When two or more candidates exist, admit one only when the source explicitly distinguishes it as selected and distinguishes every other value as rejected, old, example-only, or otherwise not selected. A comparison, conjunction, disjunction, slash-separated list, or bare sequence is unresolved and must reject the pending answer rather than arbitrarily labeling one selected. A syntax-compatible value for an unrelated interruption is not an answer. A candidate mentioned only as an example, quotation, rejected option, negated operation, correction target, or value the user says not to apply is not an answer. Never invent a candidate id or rewrite the action. "
         "Each unit_verdict is {unit_id,verdict:'complete'|'support'|'context'|'unresolved'|'omitted',owner_action_ids:[string],evidence_quote:string,omitted_action_type:string,reason}. "
-        "owner_action_ids must exactly equal the supplied immutable owner_action_ids. complete is valid only when the unit directly expresses a present demand preserved by every registered owner action. support is valid only when the unit does not independently request another action, every owner action cites it with relation=support and a supplied allowed_support_relation, and each owner action has direct evidence in another unit. context is valid only for a supplied context unit with no present demand and no owner. unresolved means the request is genuinely unsafe or not expressible. omitted means the unit contains a present independently actionable demand expressible by one action_schema type but missing from the immutable actions; set omitted_action_type to that exact registered type. Never propose its arguments or a replacement action. For every other verdict omitted_action_type is empty. Every evidence_quote is a non-empty exact substring of that unit. "
+        "owner_action_ids must exactly equal the supplied immutable owner_action_ids. complete is valid only when the unit directly expresses a present demand preserved by every registered owner action. support is valid only when the unit does not independently request another action, every owner action cites it with relation=support and a supplied allowed_support_relation, and each owner action has direct evidence in another unit. A supplied immutable disposition=context has no owner and must receive verdict=context when it contains no independent omitted demand, or verdict=omitted when it does; never reinterpret it as complete or support and never invent an owner. context is invalid for any other supplied disposition. unresolved means the request is genuinely unsafe or not expressible. omitted means the unit contains a present independently actionable demand expressible by one action_schema type but missing from the immutable actions; set omitted_action_type to that exact registered type. Never propose its arguments or a replacement action. For every other verdict omitted_action_type is empty. Every evidence_quote is a non-empty exact substring of that unit. "
         "The action evidence and unit verdict are one consistency contract, not independent guesses. For each owned unit: if every owner action cites that unit as direct, its unit verdict is complete; if every owner action cites it as support, its unit verdict is support. Never return complete for a support-cited unit or support for a direct-cited unit. "
         "A mapped action may be individually plausible while its unit still has an omitted demand. Questions, corrections, navigation, configuration, evidence analysis, execution approval, and pending answers are all present demands when explicitly requested. Workflow state and planner reasons are context, never user evidence. "
         "A pending option or manual answer is admitted only when current source evidence satisfies the supplied typed pending contract. "
@@ -345,22 +352,89 @@ def request_whole_plan_admission(
     semantic_policy: str,
     allowed_action_types: Collection[str],
     max_tokens: int = 7200,
+    contract_repair: bool = False,
 ) -> WholePlanAdmission:
-    """Run one whole-plan review and validate its strict immutable verdicts."""
+    """Run one immutable review with one bounded structural-contract repair."""
 
-    ensure_turn_active()
-    response = provider.complete(LLMRequest(
-        messages=[
-            LLMMessage(role="system", content=whole_plan_admission_prompt(semantic_policy)),
-            LLMMessage(role="user", content=plan.request_json),
-        ],
-        temperature=0.0,
-        max_tokens=max_tokens,
-    ))
-    return validate_whole_plan_admission(
-        str(response.text or ""),
-        plan,
-        allowed_action_types=allowed_action_types,
+    base_prompt = whole_plan_admission_prompt(semantic_policy)
+    base_payload = plan.request_payload()
+    previous_output = ""
+    previous_errors: tuple[str, ...] = ()
+    request_sizes: list[int] = []
+    admission = WholePlanAdmission(False, ("whole-plan admission was not run",))
+    for attempt in range(2 if contract_repair else 1):
+        ensure_turn_active()
+        prompt = base_prompt
+        payload = dict(base_payload)
+        if attempt:
+            payload["admission_contract_repair"] = {
+                "prior_invalid_output": previous_output,
+                "validation_errors": list(previous_errors),
+                "instruction": (
+                    "Return a complete replacement admission document for the "
+                    "same immutable plan. Preserve semantic verdicts and correct "
+                    "every structural receipt or schema error."
+                ),
+            }
+            prompt = (
+                f"{base_prompt} This is a contract-repair attempt. The prior "
+                f"admission document was structurally rejected for: "
+                f"{'; '.join(previous_errors)}. Return every required row and "
+                "opaque id exactly; do not change an explicit semantic rejection "
+                "merely to pass validation."
+            )
+        payload_text = _canonical_json(payload)
+        request_sizes.append(
+            len(prompt.encode("utf-8")) + len(payload_text.encode("utf-8"))
+        )
+        response = provider.complete(LLMRequest(
+            messages=[
+                LLMMessage(role="system", content=prompt),
+                LLMMessage(role="user", content=payload_text),
+            ],
+            temperature=0.0,
+            max_tokens=max_tokens,
+        ))
+        previous_output = str(response.text or "")
+        admission = validate_whole_plan_admission(
+            previous_output,
+            plan,
+            allowed_action_types=allowed_action_types,
+        )
+        if admission.valid or _is_explicit_semantic_rejection(admission):
+            break
+        previous_errors = admission.errors
+    return replace(
+        admission,
+        request_count=len(request_sizes),
+        request_sizes=tuple(request_sizes),
+    )
+
+
+def _is_explicit_semantic_rejection(
+    admission: WholePlanAdmission,
+) -> bool:
+    """Do not retry a valid reviewer decision to reject immutable semantics."""
+
+    response = admission.response
+    if not isinstance(response, Mapping):
+        return False
+    action_rows = response.get("action_verdicts")
+    unit_rows = response.get("unit_verdicts")
+    return bool(
+        isinstance(action_rows, list)
+        and any(
+            isinstance(row, Mapping)
+            and str(row.get("verdict") or "") == "reject"
+            for row in action_rows
+        )
+    ) or bool(
+        isinstance(unit_rows, list)
+        and any(
+            isinstance(row, Mapping)
+            and str(row.get("verdict") or "") in {"omitted", "unresolved"}
+            for row in unit_rows
+        )
     )
 
 
@@ -827,6 +901,66 @@ def _canonicalize_admission_receipts(
             str((unit_records.get(str(unit_id)) or {}).get("source_text") or "")
             for unit_id in record.get("unit_ids") or []
         ]
+        pending_candidates = [
+            dict(item)
+            for item in record.get("pending_value_candidates") or []
+            if isinstance(item, Mapping)
+        ]
+        turn_candidates = [
+            dict(item)
+            for item in record.get("turn_pending_value_candidates") or []
+            if isinstance(item, Mapping)
+        ]
+        if len(pending_candidates) == 1 and len(turn_candidates) == 1:
+            operation_candidate = pending_candidates[0]
+            turn_candidate = turn_candidates[0]
+            operation_identity = str(operation_candidate.get("identity") or "")
+            candidate_sources = [
+                str(
+                    (unit_records.get(str(unit_id)) or {}).get("source_text")
+                    or ""
+                )
+                for unit_id in turn_candidate.get("source_unit_ids") or []
+            ]
+            supporting_quote = next(
+                (
+                    str(evidence.get("quote") or "")
+                    for evidence in evidence_rows
+                    if str(evidence.get("unit_id") or "")
+                    in {
+                        str(unit_id)
+                        for unit_id in turn_candidate.get("source_unit_ids") or []
+                    }
+                    and _quote_supports_pending_candidate(
+                        str(evidence.get("quote") or ""),
+                        turn_candidate,
+                        {},
+                        candidate_sources,
+                    )
+                ),
+                "",
+            )
+            if (
+                operation_identity
+                and operation_identity
+                == str(turn_candidate.get("identity") or "")
+                and supporting_quote
+            ):
+                raw_row["pending_answer_argument"] = str(
+                    operation_candidate.get("candidate_id") or ""
+                )
+                raw_row["turn_candidate_verdicts"] = [{
+                    "candidate_id": str(
+                        turn_candidate.get("candidate_id") or ""
+                    ),
+                    "verdict": "selected",
+                    "evidence_quote": supporting_quote,
+                    "reason": (
+                        "The sole typed turn candidate matches the sole "
+                        "immutable operation candidate admitted by exact "
+                        "direct evidence."
+                    ),
+                }]
         exact_arguments = {
             str(value)
             for value in record.get("exact_source_value_arguments") or []

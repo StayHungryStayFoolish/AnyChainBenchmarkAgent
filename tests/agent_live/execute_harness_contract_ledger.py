@@ -21,7 +21,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
-from agent.harness.coverage_events import capture_coverage_events, observe_compiled_graph_turn
+from tests.agent_live.coverage_events import capture_coverage_events, observe_compiled_graph_turn
 from agent.harness.invariants import validate_state
 from agent.harness.questions import normalize_scalar
 from tests.agent_live.coverage_evidence import (

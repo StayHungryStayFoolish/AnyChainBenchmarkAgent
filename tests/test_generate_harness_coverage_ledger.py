@@ -26,7 +26,7 @@ from tests.agent_live.generate_harness_coverage_ledger import (
 from tests.agent_live.chaos_scheduler import build_chaos_schedule
 from tests.agent_live.coverage_evidence import build_evidence_artifact, write_evidence_artifact
 from tests.agent_live.coverage_evidence import COMPILED_GRAPH_RUNNER
-from agent.harness.coverage_events import capture_coverage_events, observe_compiled_graph_turn
+from tests.agent_live.coverage_events import capture_coverage_events, observe_compiled_graph_turn
 from tests.agent_live.graph_turn import invoke_product_graph_turn
 from tests.agent_live.harness_contract_scenarios import question_scenarios
 from tests.agent_live.harness_contract_scenarios import QuestionScenario
@@ -300,7 +300,12 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
         ]
         self.assertEqual({edge["input_class"] for edge in edges}, semantic_classes)
         for edge in edges:
-            self.assertEqual(edge["action_type"], "choose_chain")
+            expected_action = (
+                "choose_chain"
+                if "chain_manual" in edge["catalog_scenario_ids"]
+                else "answer_pending"
+            )
+            self.assertEqual(edge["action_type"], expected_action)
             self.assertEqual(
                 edge["expected_postcondition"]["path"],
                 "chain_identity.canonical",

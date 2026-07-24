@@ -127,7 +127,7 @@ class PlanCoverageTest(unittest.TestCase):
 
 
     def test_canonical_pending_choice_receipt_authorizes_exact_typed_value(self) -> None:
-        from agent.harness.coordinator import _validate_action_plan
+        from agent.harness.admission import _validate_action_plan
         from agent.harness.state import new_state
 
         state = new_state("verified-option-reference", language="en")
@@ -176,7 +176,7 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertIs(prepared[0]["selection_contract_verified"], True)
 
     def test_pending_choice_without_exact_canonical_receipt_is_rejected(self) -> None:
-        from agent.harness.coordinator import _validate_action_plan
+        from agent.harness.admission import _validate_action_plan
         from agent.harness.state import new_state
 
         state = new_state("missing-pending-choice-receipt", language="en")

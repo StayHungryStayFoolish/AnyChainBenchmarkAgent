@@ -9,6 +9,17 @@ from pathlib import Path
 from unittest.mock import patch
 
 
+def _upgrade_seeded_queue(state):
+    """Make deferred test proposals conform to the current durable contract."""
+
+    from tests.agent_live.graph_turn import admitted_action_queue
+
+    state["action_queue"] = admitted_action_queue(
+        state,
+        list(state.get("action_queue") or []),
+    )
+
+
 class FailureRecoveryTest(unittest.TestCase):
     @staticmethod
     def _commit_domain_delta(state: dict, result: object, *, owner: str) -> dict:
@@ -238,10 +249,10 @@ class FailureRecoveryTest(unittest.TestCase):
         self.assertIn("Inspect failure evidence and diagnostics", final_response)
 
     def test_inspection_action_queue_keeps_domain_pending_contract_authoritative(self) -> None:
-        from agent.harness.coordinator import _finalize_turn_response, _process_action_queue
         from agent.harness.domains.recovery import question_for_recovery
         from agent.harness.failures import build_failure_record
         from agent.harness.state import new_state
+        from tests.agent_live.graph_turn import answer_pending
 
         state = new_state("recovery-presentation-owner", language="en")
         state["active_group"] = "failure_recovery"
@@ -255,14 +266,7 @@ class FailureRecoveryTest(unittest.TestCase):
         state["visible_response"] = []
 
         with patch("agent.harness.domains.recovery.analyze_evidence_with_model", return_value="advisory"):
-            inspected = _process_action_queue(
-                state,
-                [{"type": "inspect_failure", "action_id": "inspect"}],
-                "inspect the evidence",
-                max_actions=1,
-            )
-        self.assertIsNotNone(inspected)
-        final = _finalize_turn_response(inspected or state)
+            final = answer_pending(state, "2")
         response = "\n".join(final["visible_response"])
 
         self.assertEqual(response.count("Execution recovery:"), 1)
@@ -290,7 +294,7 @@ class FailureRecoveryTest(unittest.TestCase):
         self.assertEqual(cancelled["job"], state["job"])
 
     def test_old_checkpoint_migrates_with_empty_recovery(self) -> None:
-        from agent.harness.state import migrate_state
+        from agent.harness.state import STATE_SCHEMA_VERSION, migrate_state
 
         state = migrate_state(
             {"schema_version": 2, "target_mode": "fake-node"},
@@ -298,7 +302,7 @@ class FailureRecoveryTest(unittest.TestCase):
             language="en",
             session_purpose="user",
         )
-        self.assertEqual(state["schema_version"], 10)
+        self.assertEqual(state["schema_version"], STATE_SCHEMA_VERSION)
         self.assertEqual(state["failure_recovery"], {})
 
     def test_blocked_approved_preflight_activates_recovery(self) -> None:
@@ -467,6 +471,7 @@ class FailureRecoveryTest(unittest.TestCase):
         })
         state["pending_question"] = question_for_chain_rpc(state, "endpoint_process") or {}
         state["pending_question"]["resume_action_queue"] = True
+        _upgrade_seeded_queue(state)
         state["last_user_input"] = "http://127.0.0.1:9"
         probe = {
             "ready": False,
@@ -480,7 +485,10 @@ class FailureRecoveryTest(unittest.TestCase):
 
         self.assertEqual((result.get("pending_question") or {}).get("id"), "custom_rpc_endpoint")
         self.assertTrue((result.get("pending_question") or {}).get("queue_barrier"))
-        self.assertEqual([item.get("type") for item in result.get("action_queue") or []], ["set_qps_mode"])
+        self.assertEqual(
+            [item.get("action_type") or item.get("type") for item in result.get("action_queue") or []],
+            ["set_qps_mode"],
+        )
         self.assertEqual((result.get("custom_rpc") or {}).get("status"), "probe_failed")
         prompt = str((result.get("pending_question") or {}).get("prompt") or "")
         self.assertEqual(sum(prompt in item for item in result.get("visible_response") or []), 1)
@@ -502,6 +510,7 @@ class FailureRecoveryTest(unittest.TestCase):
         })
         state["pending_question"] = question_for_chain_rpc(state, "endpoint_process") or {}
         state["pending_question"]["resume_action_queue"] = True
+        _upgrade_seeded_queue(state)
         state["last_user_input"] = "https://rpc.example"
         probe = {
             "ready": True,
@@ -513,7 +522,10 @@ class FailureRecoveryTest(unittest.TestCase):
             result = invoke_product_graph_turn(state)
 
         self.assertEqual((result.get("pending_question") or {}).get("id"), "custom_rpc_method")
-        self.assertEqual([item.get("type") for item in result.get("action_queue") or []], ["set_qps_mode"])
+        self.assertEqual(
+            [item.get("action_type") or item.get("type") for item in result.get("action_queue") or []],
+            ["set_qps_mode"],
+        )
         prompt = str((result.get("pending_question") or {}).get("prompt") or "")
         self.assertEqual(sum(prompt in item for item in result.get("visible_response") or []), 1)
 

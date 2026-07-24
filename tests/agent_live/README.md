@@ -1,10 +1,12 @@
 # Agent Live CLI Matrix
 
-This directory contains live-model acceptance tests for the AnyChain product
+This directory contains live-model evidence providers for the AnyChain product
 terminal. These tests require a configured LLM provider and may consume provider
-quota.
+quota. The sole product-acceptance authority is
+`tests/agent_live/run_product_acceptance.py`; no provider in this directory may
+independently advance a phase or close G0-G6.
 
-The current live runner is:
+The fixed CLI regression runner is:
 
 ```bash
 python3 tests/agent_live/run_langgraph_cli_matrix.py
@@ -46,6 +48,13 @@ Agent workflow or Harness change, run a real terminal conversation where:
   response and may ask basic product questions before giving benchmark inputs.
 - The full transcript is the primary evidence. Passing state assertions without
   a stable user-facing transcript does not pass this gate.
+
+Phase 6 closes only deterministic gate G2. Retained real-user regression
+replay, real CLI, response-driven dual-AI Chaos, and real execution belong to
+Phase 8 and close G3-G6 only after `run_product_acceptance.py` validates and
+admits their revision-bound artifacts. Matrix, ledger, PTY, simulator, and
+execution runners are subordinate evidence providers. Their direct exit codes
+are raw evidence, not product acceptance.
 
 ### Baseline Persona Transcript That Must Pass
 

@@ -80,6 +80,29 @@ def question_for_recovery(
 def apply_recovery_action(state: AgentGraphState, action: ActionProposal) -> HandlerResult:
     next_state: AgentGraphState = deepcopy(state)
     recovery = next_state.setdefault("failure_recovery", {})
+    if action.action_type == "activate_harness_recovery":
+        failure_record = action.arguments.get("failure_record")
+        if not isinstance(failure_record, dict) or not failure_record.get("code"):
+            return HandlerResult(
+                blocker="Harness recovery activation requires a typed failure record"
+            )
+        next_state["failure_recovery"] = {
+            "status": "pending",
+            "record": deepcopy(failure_record),
+        }
+        pending = question_for_recovery(next_state, "failure_recovery")
+        if pending is None:
+            return HandlerResult(
+                blocker="Harness recovery record has no executable recovery contract"
+            )
+        return HandlerResult(
+            delta=StateDelta.between(state, next_state),
+            consumed_action_ids=(action.action_id,),
+            pending_question=pending,
+            next_group="failure_recovery",
+            completion="blocked",
+            stop_after_response=True,
+        )
     record = dict(recovery.get("record") or {})
     allowed = set(record.get("allowed_actions") or [])
     if not record:
@@ -89,7 +112,12 @@ def apply_recovery_action(state: AgentGraphState, action: ActionProposal) -> Han
 
     if action.action_type == "inspect_failure":
         recovery["selected_action"] = "inspect_failure"
-        responses = [render_failure_summary(record, str(next_state.get("language") or "en"))]
+        active_question = deepcopy(state.get("pending_question") or {})
+        responses = (
+            []
+            if active_question
+            else [render_failure_summary(record, str(next_state.get("language") or "en"))]
+        )
         if record.get("llm_analysis_useful"):
             advisory = analyze_evidence_with_model(
                 next_state,
@@ -101,12 +129,16 @@ def apply_recovery_action(state: AgentGraphState, action: ActionProposal) -> Han
                 ),
             )
             responses.append(advisory)
-        next_question = question_for_recovery(next_state, "failure_recovery", include_summary=False)
+        next_question = (
+            active_question
+            if active_question
+            else question_for_recovery(next_state, "failure_recovery", include_summary=False)
+        )
         return HandlerResult(
             delta=StateDelta.between(state, next_state),
             consumed_action_ids=(action.action_id,),
             visible_results=tuple(responses),
-            clear_pending=True,
+            clear_pending=False,
             pending_question=next_question,
             next_group="failure_recovery",
             completion="in_progress",

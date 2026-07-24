@@ -63,6 +63,7 @@ def _endpoint_validation_question(state: AgentGraphState) -> dict[str, Any] | No
                 "value_argument": "rpc_endpoint",
             },
             queue_barrier=True,
+            barrier_policy="explicit_detour_only",
             requires_capabilities=("chain_identity",),
             evidence_path="custom_rpc.endpoint",
             completion_effect=_endpoint_probe_completion(language),
@@ -80,6 +81,7 @@ def _endpoint_validation_question(state: AgentGraphState) -> dict[str, Any] | No
                 "value_argument": "rpc_method",
             },
             queue_barrier=True,
+            barrier_policy="explicit_detour_only",
             validation={"input_mode": "rpc_method_or_schema_evidence"},
             completion_effect=_method_identity_completion(language),
         )
@@ -109,6 +111,7 @@ def _endpoint_validation_question(state: AgentGraphState) -> dict[str, Any] | No
                 "value_argument": "rpc_schema_evidence",
             },
             queue_barrier=True,
+            barrier_policy="explicit_detour_only",
             help_text=_schema_evidence_help(language),
             completion_effect=_schema_evidence_completion(language),
             structured_input_owner=True,
@@ -146,6 +149,7 @@ def _endpoint_validation_question(state: AgentGraphState) -> dict[str, Any] | No
                 "value_argument": "rpc_endpoint",
             },
             queue_barrier=True,
+            barrier_policy="explicit_detour_only",
             requires_capabilities=("chain_identity",),
             evidence_path="endpoint_evidence.candidate_endpoint",
             completion_effect=_endpoint_probe_completion(language),
@@ -163,6 +167,7 @@ def _endpoint_validation_question(state: AgentGraphState) -> dict[str, Any] | No
                 "value_argument": "rpc_method",
             },
             queue_barrier=True,
+            barrier_policy="explicit_detour_only",
             validation={"input_mode": "rpc_method_or_schema_evidence"},
             completion_effect=_method_identity_completion(language),
         )
@@ -190,6 +195,7 @@ def _endpoint_validation_question(state: AgentGraphState) -> dict[str, Any] | No
                 "value_argument": "rpc_schema_evidence",
             },
             queue_barrier=True,
+            barrier_policy="explicit_detour_only",
             help_text=_schema_evidence_help(language),
             completion_effect=_schema_evidence_completion(language),
             structured_input_owner=True,
@@ -319,7 +325,7 @@ def _target_mode_selection_question(state: AgentGraphState, *, include_current: 
             continue
         expected = {"pending_question.id": "target_mode_change_confirm"} if current and mode != current else {"target_mode": mode}
         options.append(_action_option(mode, mode, mode, "choose_target_mode", expected, target_mode=mode, target_mode_explicit=True))
-    return _choice(
+    question = _choice(
         "target_mode",
         "target_mode_select",
         localized(
@@ -331,6 +337,8 @@ def _target_mode_selection_question(state: AgentGraphState, *, include_current: 
         options,
         queue_barrier=True,
     )
+    question["barrier_policy"] = "exclusive_owner"
+    return question
 
 
 def _adapter_family_question(state: AgentGraphState, *, custom: bool = False) -> dict[str, Any]:
@@ -547,6 +555,8 @@ def _scope_question(state: AgentGraphState, case: str) -> dict[str, Any]:
                 _answer_option("single_replace", "single 中使用一个已验证 method" if zh else "Use one validated method as single", "single_replace", {"chain_identity.workload_scope": "single_replace"}),
                 _answer_option("mixed_replace", "mixed 中只使用这些已验证 methods，并配置权重" if zh else "Use only these validated methods in mixed and configure weights", "mixed_replace", {"chain_identity.status": "existing_family_needs_weights"}),
             ],
+            accepted_action_types=("rpc_workload_command",),
+            queue_barrier=True,
         )
     return _choice(
         "endpoint_process",
@@ -558,6 +568,8 @@ def _scope_question(state: AgentGraphState, case: str) -> dict[str, Any]:
             _answer_option("mixed_replace", "mixed 中只使用我提供的自定义 methods" if zh else "Use only my custom methods in mixed", "mixed_replace", {"custom_rpc.status": "needs_weights"}),
             _answer_option("mixed_add", "mixed 中保留模板默认 methods，并追加自定义 method" if zh else "Keep template defaults in mixed and add this method", "mixed_add", {"custom_rpc.status": "needs_weights"}),
         ],
+        accepted_action_types=("rpc_workload_command",),
+        queue_barrier=True,
     )
 
 
@@ -620,6 +632,7 @@ def _choice(
         manual_input_allowed=manual_input_allowed,
         accepted_action_types=accepted_action_types,
         queue_barrier=queue_barrier,
+        barrier_policy="exclusive_owner" if queue_barrier else "",
     )
 
 

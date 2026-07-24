@@ -365,7 +365,7 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
 
         canonical = json.loads(_canonicalize_pending_choice_actions(candidate, state))
 
-        self.assertEqual(canonical["actions"][0]["answer"], "none")
+        self.assertNotIn("answer", canonical["actions"][0])
         self.assertEqual(canonical["actions"][0]["selected_value"], "none")
         self.assertEqual(
             canonical["pending_choice_contracts"][0]["option"]["selected_value"],
@@ -745,7 +745,7 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         )
 
     def test_same_unit_explicit_mutation_invalidates_the_old_pending_answer(self) -> None:
-        from agent.harness.coordinator import _validate_action_plan
+        from agent.harness.admission import _validate_action_plan
 
         text = "Switch the target mode; keep current values until replacements are confirmed."
         state = _state(
@@ -825,7 +825,7 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         self.assertEqual([item["type"] for item in result["actions"]], ["set_qps_mode"])
 
     def test_distinct_unit_mutation_invalidates_pending_answer(self) -> None:
-        from agent.harness.coordinator import _validate_action_plan
+        from agent.harness.admission import _validate_action_plan
 
         choice = "Switch the target-mode setting."
         mutation = "Use real-node now."
@@ -1336,7 +1336,7 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         self.assertEqual(result["actions"][0]["type"], "answer_pending")
         self.assertEqual(result["actions"][0]["answer"], "eth_accounts")
 
-    def test_missing_reviewer_selection_receipt_fails_closed(self) -> None:
+    def test_unique_reviewer_selection_receipt_is_canonicalized(self) -> None:
         from agent.harness.intent import resolve_action_queue
 
         text = "The custom JSON-RPC method is eth_accounts."
@@ -1370,11 +1370,12 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         with patch("agent.harness.intent.provider_from_config", return_value=provider):
             result = resolve_action_queue(state, text)
 
-        self.assertEqual(provider.complete.call_count, 4)
+        self.assertEqual(provider.complete.call_count, 2)
         self.assertEqual(
             [action["type"] for action in result["actions"]],
-            ["clarify_unresolved"],
+            ["answer_pending"],
         )
+        self.assertEqual(result["actions"][0]["answer"], "eth_accounts")
 
     def test_non_pending_navigation_argument_is_not_a_pending_candidate(self) -> None:
         from agent.harness.intent import resolve_action_queue
@@ -1774,7 +1775,7 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         self.assertEqual(migrated["pending_question"], {})
         self.assertTrue(any(
             event.get("event")
-            == "checkpoint_pending_contract_regeneration_required"
+            == "checkpoint_legacy_quarantined"
             and event.get("from_schema_version") == 9
             for event in migrated.get("audit_events") or []
         ))
@@ -2909,8 +2910,9 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         self.assertEqual(result.get("pending_choice_contracts"), [])
 
     def test_owner_action_without_source_argument_uses_pending_contract_after_admission(self) -> None:
-        from agent.harness.coordinator import _dispatch_pending_action, _validate_action_plan
+        from agent.harness.admission import _validate_action_plan
         from agent.harness.intent import resolve_action_queue
+        from tests.agent_live.graph_turn import invoke_product_graph_turn
 
         state = _recovery_state()
         text = "Pause this recovery and retain its evidence."
@@ -2931,7 +2933,14 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         self.assertEqual([item["type"] for item in admitted], ["answer_pending"])
         self.assertIs(admitted[0]["selection_contract_verified"], True)
 
-        executed = _dispatch_pending_action(state, admitted[0])
+        with patch(
+            "agent.harness.coordinator.resolve_action_queue",
+            return_value=result,
+        ):
+            executed = invoke_product_graph_turn(
+                state,
+                allow_semantic_resolver=True,
+            )
         self.assertEqual((executed.get("failure_recovery") or {}).get("status"), "cancelled")
         self.assertEqual(
             ((executed.get("turn_context") or {}).get("admitted_actions") or [{}])[-1].get("type"),

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any
+from typing import Any, Mapping
 
 from agent.workflows.group_registry import GROUPS
 from .contracts import DOMAIN_CONTROL_ROOTS, StateDelta, StatePath
@@ -149,6 +149,17 @@ def _delete_path(state: dict[str, Any], path: StatePath) -> None:
 
 
 def validate_state(state: AgentGraphState) -> None:
+    declared_roots = (
+        set(AgentGraphState.__optional_keys__)
+        | set(AgentGraphState.__required_keys__)
+    )
+    undeclared_roots = sorted(set(state) - declared_roots)
+    if undeclared_roots:
+        raise StateInvariantError(
+            "state contains undeclared top-level roots: "
+            + ", ".join(undeclared_roots)
+        )
+
     active_group = str(state.get("active_group") or "opening")
     if active_group not in GROUP_OWNER:
         raise StateInvariantError(f"unknown active group: {active_group}")
@@ -178,10 +189,176 @@ def validate_state(state: AgentGraphState) -> None:
                     raise StateInvariantError("pending question requires chain identity")
 
     queue = state.get("action_queue") or []
+    for item in queue:
+        if not isinstance(item, dict):
+            raise StateInvariantError("action queue item must be an object")
+        if (
+            not str(item.get("action_id") or "")
+            or not str(item.get("action_type") or "")
+            or not str(item.get("owner") or "")
+            or not isinstance(item.get("arguments"), dict)
+            or str(item.get("status") or "") != "admitted"
+        ):
+            raise StateInvariantError(
+                "action queue contains a raw or incomplete action envelope"
+            )
+        private_keys = sorted(
+            str(key)
+            for key in item
+            if str(key).startswith("_")
+        )
+        if private_keys:
+            raise StateInvariantError(
+                "action queue envelope contains private metadata: "
+                + ", ".join(private_keys)
+            )
     action_ids = [str(item.get("action_id") or "") for item in queue if isinstance(item, dict)]
     non_empty_ids = [item for item in action_ids if item]
     if len(non_empty_ids) != len(set(non_empty_ids)):
         raise StateInvariantError("action queue contains duplicate action ids")
+
+    selected = state.get("selected_action") or {}
+    if selected:
+        selected_id = str(selected.get("action_id") or "")
+        selected_type = str(selected.get("action_type") or "")
+        selected_owner = str(selected.get("owner") or "")
+        if (
+            not selected_id
+            or not selected_type
+            or not selected_owner
+            or str(selected.get("status") or "") != "selected"
+        ):
+            raise StateInvariantError("selected action envelope is incomplete")
+        if not queue or str((queue[0] or {}).get("action_id") or "") != selected_id:
+            raise StateInvariantError("selected action is not the admitted queue head")
+        current = state.get("current_action") or {}
+        if str(current.get("action_id") or "") != selected_id:
+            raise StateInvariantError("selected action and current action differ")
+        control_owner = str((state.get("control") or {}).get("selected_owner") or "")
+        if control_owner != selected_owner:
+            raise StateInvariantError("selected action owner differs from graph route owner")
+    elif (state.get("control") or {}).get("selected_owner"):
+        raise StateInvariantError("graph route owner exists without a selected action")
+
+    prepared = state.get("pending_domain_result") or {}
+    if prepared:
+        prepared_action = dict(prepared.get("action") or {})
+        if not selected:
+            raise StateInvariantError("pending domain result exists without a selected action")
+        if str(prepared_action.get("action_id") or "") != str(selected.get("action_id") or ""):
+            raise StateInvariantError("pending domain result belongs to another action")
+
+    intent = state.get("side_effect_intent") or {}
+    receipt = state.get("side_effect_receipt") or {}
+    if receipt and not intent:
+        raise StateInvariantError("side-effect receipt exists without its intent")
+    if intent and receipt and str(receipt.get("intent_id") or "") != str(intent.get("intent_id") or ""):
+        raise StateInvariantError("side-effect receipt belongs to another intent")
+
+    turn_receipt = state.get("turn_receipt") or {}
+    if turn_receipt:
+        if not str(turn_receipt.get("turn_id") or ""):
+            raise StateInvariantError("turn receipt has no turn identity")
+        if not str(turn_receipt.get("input_hash") or ""):
+            raise StateInvariantError("turn receipt has no input hash")
+        admitted_ids = [
+            str(item)
+            for item in turn_receipt.get("admitted_action_ids") or []
+            if str(item)
+        ]
+        semantic_order = [
+            str(item)
+            for item in turn_receipt.get("semantic_order") or []
+            if str(item)
+        ]
+        execution_order = [
+            str(item)
+            for item in turn_receipt.get("execution_order") or []
+            if str(item)
+        ]
+        if len(admitted_ids) != len(set(admitted_ids)):
+            raise StateInvariantError("turn receipt contains duplicate admitted actions")
+        if semantic_order != admitted_ids:
+            raise StateInvariantError("turn receipt semantic order differs from admission order")
+        if any(action_id not in admitted_ids for action_id in execution_order):
+            raise StateInvariantError("turn receipt executed an unadmitted action")
+        semantic_units = [
+            dict(item)
+            for item in turn_receipt.get("semantic_units") or []
+            if isinstance(item, Mapping)
+        ]
+        unit_ids = [
+            str(item.get("unit_id") or "")
+            for item in semantic_units
+            if str(item.get("unit_id") or "")
+        ]
+        if len(unit_ids) != len(set(unit_ids)):
+            raise StateInvariantError("turn receipt contains duplicate semantic units")
+        action_units = {
+            str(action_id): [str(unit_id) for unit_id in unit_id_values]
+            for action_id, unit_id_values in dict(
+                turn_receipt.get("action_unit_bindings") or {}
+            ).items()
+        }
+        unit_actions = {
+            str(unit_id): [str(action_id) for action_id in action_id_values]
+            for unit_id, action_id_values in dict(
+                turn_receipt.get("unit_action_bindings") or {}
+            ).items()
+        }
+        if any(action_id not in admitted_ids for action_id in action_units):
+            raise StateInvariantError(
+                "turn receipt binds semantic units to an unadmitted action"
+            )
+        if any(unit_id not in unit_ids for unit_id in unit_actions):
+            raise StateInvariantError(
+                "turn receipt binds actions to an unknown semantic unit"
+            )
+        for action_id, bound_units in action_units.items():
+            for unit_id in bound_units:
+                if action_id not in unit_actions.get(unit_id, []):
+                    raise StateInvariantError(
+                        "turn receipt action/unit bindings are not bidirectional"
+                    )
+        omission_checks = [
+            dict(item)
+            for item in turn_receipt.get("sibling_omission_checks") or []
+            if isinstance(item, Mapping)
+        ]
+        if any(str(item.get("verdict") or "") == "invalid" for item in omission_checks):
+            raise StateInvariantError(
+                "turn receipt contains an invalid sibling omission verdict"
+            )
+        if str(turn_receipt.get("status") or "") in {
+            "planned",
+            "executing",
+            "completed",
+            "blocked",
+            "failed",
+        }:
+            unresolved = {
+                str(item)
+                for item in turn_receipt.get("unresolved_units") or []
+                if str(item)
+            }
+            for unit in semantic_units:
+                unit_id = str(unit.get("unit_id") or "")
+                disposition = str(unit.get("disposition") or "")
+                bindings = unit_actions.get(unit_id, [])
+                if disposition == "action" and not bindings:
+                    raise StateInvariantError(
+                        f"turn receipt omitted admitted semantic unit: {unit_id}"
+                    )
+                if disposition == "unresolved" and (
+                    unit_id not in unresolved or bindings
+                ):
+                    raise StateInvariantError(
+                        f"turn receipt unresolved unit is inconsistent: {unit_id}"
+                    )
+                if disposition == "context" and bindings:
+                    raise StateInvariantError(
+                        f"turn receipt context unit owns an action: {unit_id}"
+                    )
 
     history = state.get("group_history") or []
     unknown_history = [group for group in history if group not in GROUP_OWNER]

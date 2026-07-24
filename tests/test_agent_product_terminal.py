@@ -401,6 +401,7 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
         self.assertEqual(state.get("resume_context"), {})
 
     def test_terminal_resume_continue_preserves_deferred_action_queue(self) -> None:
+        from agent.harness.contracts import ActionEnvelope, action_envelope_to_dict
         from agent.harness.graph import AnyChainGraphRuntime
         from agent.harness.state import new_state
 
@@ -433,14 +434,21 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
                 "pending_question": original,
                 "active_group": "endpoint_process",
                 "action_queue": [
-                    {
-                        "action_id": "obs-deferred",
-                        "type": "set_observability",
-                        "observability_mode": "disabled",
-                        "mutation_explicit": True,
-                        "source_evidence": "Disable observability.",
-                        "confidence": "high",
-                    }
+                    action_envelope_to_dict(
+                        ActionEnvelope(
+                            action_id="obs-deferred",
+                            action_type="set_observability",
+                            owner="observability",
+                            target_group="observability",
+                            arguments={
+                                "observability_mode": "disabled",
+                                "mutation_explicit": True,
+                            },
+                            confidence="high",
+                            origin_text="Disable observability.",
+                            submitted_turn_index=1,
+                        )
+                    )
                 ],
             })
             runtime._persist_state(persisted)
@@ -488,10 +496,17 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
 
     def test_harness_resume_menu_allows_a_natural_language_consultation(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.state import new_state
 
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime = AnyChainGraphRuntime(thread_id="resume-natural-language", checkpoint_path=Path(tmpdir) / "checkpoint.sqlite")
-            runtime._persist_state({"target_mode": "fake-node", "workflow_mode": "rpc_benchmark", "active_group": "target_mode"})
+            persisted = new_state("resume-natural-language", language="zh")
+            persisted.update({
+                "target_mode": "fake-node",
+                "workflow_mode": "rpc_benchmark",
+                "active_group": "target_mode",
+            })
+            runtime._persist_state(persisted)
             runtime.prepare_resume_offer(language="zh")
             with patch(
                 "agent.harness.coordinator.resolve_action_queue",

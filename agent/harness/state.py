@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
-from pathlib import Path
 from copy import deepcopy
 from typing import Any, Literal, Mapping, TypedDict
 
@@ -36,6 +36,7 @@ class PendingQuestion(TypedDict, total=False):
     supersedes_action_types: list[str]
     created_turn_index: int
     queue_barrier: bool
+    barrier_policy: str
 
 
 class AgentGraphState(TypedDict, total=False):
@@ -57,6 +58,11 @@ class AgentGraphState(TypedDict, total=False):
     web_research: dict[str, Any]
     pending_question: PendingQuestion
     action_queue: list[dict[str, Any]]
+    selected_action: dict[str, Any]
+    pending_domain_result: dict[str, Any]
+    side_effect_intent: dict[str, Any]
+    side_effect_receipt: dict[str, Any]
+    turn_receipt: dict[str, Any]
     current_action: dict[str, Any]
     completed_actions: list[dict[str, Any]]
     applied_action_ids: list[str]
@@ -122,7 +128,7 @@ RESET_PRESERVED_KEYS = (
 
 DEFAULT_GROUP_ORDER = list(GROUP_ORDER)
 
-STATE_SCHEMA_VERSION = 10
+STATE_SCHEMA_VERSION = 13
 
 
 class UnsupportedStateVersion(RuntimeError):
@@ -162,12 +168,20 @@ def migrate_state(
     language: str,
     session_purpose: str,
 ) -> AgentGraphState:
-    """Upgrade a persisted checkpoint without inventing workflow progress."""
+    """Upgrade one checkpoint through the explicit version boundary."""
 
     raw_version = int(raw_state.get("schema_version") or 1)
     if raw_version > STATE_SCHEMA_VERSION:
         raise UnsupportedStateVersion(
             f"checkpoint schema {raw_version} is newer than supported schema {STATE_SCHEMA_VERSION}"
+        )
+    if raw_version < 12:
+        return _quarantine_pre_v12_state(
+            raw_state,
+            thread_id=thread_id,
+            language=language,
+            session_purpose=session_purpose,
+            raw_version=raw_version,
         )
     fresh = new_state(thread_id, language=language, session_purpose=session_purpose)
     for key, value in raw_state.items():
@@ -175,36 +189,134 @@ def migrate_state(
             fresh[key] = value  # type: ignore[literal-required]
     for key, value in INVOCATION_CONTEXT_DEFAULTS.items():
         fresh[key] = value.copy() if isinstance(value, dict) else value  # type: ignore[literal-required]
-    _recover_legacy_prepared_plan(raw_state, fresh)
-    from .domains.rpc_catalog import migrate_legacy_catalog
-
-    migrate_legacy_catalog(fresh)
-    _migrate_legacy_action_queue(fresh)
-    _migrate_pending_question_contract_v10(fresh, raw_version)
     _quarantine_unsupported_pending_actions(fresh)
+    if raw_version == 12:
+        _migrate_v12_action_queue_contract(fresh)
+        _migrate_v12_mode_exclusive_state(fresh)
+        fresh["selected_action"] = {}
+        fresh["pending_domain_result"] = {}
+        fresh["side_effect_intent"] = {}
+        fresh["side_effect_receipt"] = {}
+        fresh["turn_receipt"] = {}
+        control = dict(fresh.get("control") or {})
+        control.pop("selected_owner", None)
+        control.pop("phase", None)
+        fresh["control"] = control
+        fresh.setdefault("audit_events", []).append({
+            "event": "checkpoint_schema_migrated",
+            "from_schema_version": 12,
+            "to_schema_version": STATE_SCHEMA_VERSION,
+            "in_flight_transition_retained": False,
+        })
     fresh["schema_version"] = STATE_SCHEMA_VERSION
-    _normalize_mode_exclusive_state(fresh)
-    _normalize_pending_question_contract(fresh)
     return ensure_session_metadata(fresh, thread_id, session_purpose, touch=False)
 
 
-def _migrate_legacy_action_queue(state: AgentGraphState) -> None:
-    """Compile retired durable actions once while loading old checkpoints."""
+_PRE_V12_RECONFIRM_FIELDS = frozenset({
+    "CLOUD_PROVIDER",
+    "CLOUD_REGION",
+    "CLOUD_ZONE",
+    "MACHINE_TYPE",
+    "CPU_CORES",
+    "MEMORY_GIB",
+    "LEDGER_DEVICE",
+    "DATA_VOL_TYPE",
+    "DATA_VOL_SIZE",
+    "DATA_VOL_MAX_IOPS",
+    "DATA_VOL_MAX_THROUGHPUT",
+    "ACCOUNTS_DEVICE",
+    "ACCOUNTS_VOL_TYPE",
+    "ACCOUNTS_VOL_SIZE",
+    "ACCOUNTS_VOL_MAX_IOPS",
+    "ACCOUNTS_VOL_MAX_THROUGHPUT",
+    "NETWORK_INTERFACE",
+    "NETWORK_MAX_BANDWIDTH_GBPS",
+})
 
-    from .action_registry import ACTION_BY_TYPE, compile_legacy_custom_rpc_action
+
+def _quarantine_pre_v12_state(
+    raw_state: Mapping[str, Any],
+    *,
+    thread_id: str,
+    language: str,
+    session_purpose: str,
+    raw_version: int,
+) -> AgentGraphState:
+    """Retain only reviewable metadata from unsupported old checkpoints."""
+
+    state = new_state(
+        thread_id,
+        language=language,
+        session_purpose=session_purpose,
+    )
+    old_confirmed = dict(raw_state.get("confirmed_config") or {})
+    safe_values = {
+        field: deepcopy(value)
+        for field, value in old_confirmed.items()
+        if field in _PRE_V12_RECONFIRM_FIELDS and value not in (None, "")
+    }
+    if safe_values:
+        state["inferred_config"] = {
+            "pending_review": {
+                "config_values": safe_values,
+                "unmapped_values": {},
+                "source_format": "checkpoint_migration",
+            }
+        }
+    state["checkpoint_recovery"] = {
+        "status": "quarantined",
+        "error_type": "UnsupportedLegacyCheckpoint",
+        "from_schema_version": raw_version,
+        "safe_confirmed_config": safe_values,
+        "requires_reconfirmation": sorted(safe_values),
+    }
+    state["audit_events"] = [{
+        "event": "checkpoint_legacy_quarantined",
+        "from_schema_version": raw_version,
+        "to_schema_version": STATE_SCHEMA_VERSION,
+        "retained_fields": sorted(safe_values),
+    }]
+    return state
+
+
+def _migrate_v12_action_queue_contract(state: AgentGraphState) -> None:
+    """Compile every pre-v12 raw queue into admitted ActionEnvelopes once."""
+
+    from .action_registry import (
+        ACTION_BY_TYPE,
+        assign_action_ids,
+    )
+    from .checkpoint_migrations import compile_v12_custom_rpc_action
+    from .contracts import ActionEnvelope, action_envelope_to_dict
+    from .domains.registry import GROUP_OWNER
 
     queue = list(state.get("action_queue") or [])
+    if not queue or all(
+        isinstance(item, dict)
+        and str(item.get("action_type") or "")
+        and str(item.get("owner") or "")
+        and isinstance(item.get("arguments"), Mapping)
+        for item in queue
+    ):
+        return
     migrated: list[dict[str, Any]] = []
     rejected = 0
     for item in queue:
         if not isinstance(item, dict):
             rejected += 1
             continue
-        action_type = str(item.get("type") or "")
-        if action_type in ACTION_BY_TYPE:
+        if (
+            str(item.get("action_type") or "")
+            and str(item.get("owner") or "")
+            and isinstance(item.get("arguments"), Mapping)
+        ):
             migrated.append(item)
             continue
+        action_type = str(item.get("type") or "")
         if action_type != "start_custom_rpc":
+            if action_type in ACTION_BY_TYPE:
+                migrated.append(item)
+                continue
             rejected += 1
             continue
         source = str(item.get("source_evidence") or "").strip()
@@ -216,56 +328,98 @@ def _migrate_legacy_action_queue(state: AgentGraphState) -> None:
         if not source or any(value not in source for value in exact_values):
             rejected += 1
             continue
-        migrated.extend(compile_legacy_custom_rpc_action(item))
-    if migrated == queue:
-        return
-    state["action_queue"] = migrated
+        migrated.extend(compile_v12_custom_rpc_action(item))
+    if any(not str(item.get("action_id") or "") for item in migrated):
+        migration_scope = (
+            f"checkpoint:{state.get('thread_id') or 'default'}:"
+            f"{int(state.get('turn_index') or 0)}"
+        )
+        migrated = assign_action_ids(
+            migration_scope,
+            "checkpoint action queue migration",
+            migrated,
+        )
+    migration_scope = (
+        f"checkpoint:{state.get('thread_id') or 'default'}:"
+        f"{int(state.get('turn_index') or 0)}"
+    )
+    enveloped: list[dict[str, Any]] = []
+    pending_group = str((state.get("pending_question") or {}).get("group") or "")
+    for index, action in enumerate(migrated):
+        if str(action.get("action_type") or ""):
+            enveloped.append(action)
+            continue
+        action_type = str(action.get("type") or "")
+        spec = ACTION_BY_TYPE[action_type]
+        owner = (
+            GROUP_OWNER.get(pending_group, spec.owner)
+            if action_type == "answer_pending"
+            else spec.owner
+        )
+        origin_text = str(
+            action.get("_origin_text")
+            or action.get("source_evidence")
+            or ""
+        )
+        arguments = {
+            str(key): deepcopy(value)
+            for key, value in action.items()
+            if key not in {"type", "action_id", "confidence", "reason"}
+            and not str(key).startswith("_")
+        }
+        effect_kind = (
+            "external"
+            if spec.effect == "execution"
+            else "read_only"
+            if spec.effect == "read_only"
+            else "pure"
+        )
+        enveloped.append(action_envelope_to_dict(ActionEnvelope(
+            action_id=str(action.get("action_id") or ""),
+            action_type=action_type,
+            owner=owner,
+            target_group=spec.target_group,
+            arguments=arguments,
+            confidence=str(action.get("confidence") or "medium"),  # type: ignore[arg-type]
+            reason=str(action.get("reason") or ""),
+            source_evidence_hash=hashlib.sha256(origin_text.encode("utf-8")).hexdigest(),
+            semantic_order=int(action.get("_plan_index") or index),
+            submitted_turn_index=int(
+                action.get("_submitted_turn_index")
+                or state.get("turn_index")
+                or 0
+            ),
+            origin_group=str(action.get("_queue_origin_group") or ""),
+            origin_text=origin_text,
+            plan_scope=str(action.get("_plan_scope") or migration_scope),
+            admission_metadata={
+                str(key).removeprefix("_"): deepcopy(value)
+                for key, value in action.items()
+                if str(key).startswith("_")
+                and str(key) not in {
+                    "_origin_text",
+                    "_queue_origin_group",
+                    "_submitted_turn_index",
+                    "_plan_scope",
+                    "_plan_index",
+                }
+            },
+            effect_kind=effect_kind,  # type: ignore[arg-type]
+            idempotency_key=(
+                f"{state.get('thread_id') or 'default'}:"
+                f"{int(state.get('turn_index') or 0)}:"
+                f"{str(action.get('action_id') or '')}"
+            ),
+        )))
+    state["action_queue"] = enveloped
+    if enveloped and state.get("pending_question"):
+        state["pending_question"]["resume_action_queue"] = True
     state.setdefault("audit_events", []).append({
-        "event": "legacy_custom_rpc_actions_migrated",
+        "event": "checkpoint_action_queue_enveloped",
         "before": len(queue),
-        "after": len(migrated),
+        "after": len(enveloped),
         "rejected_untrusted": rejected,
     })
-
-
-def _migrate_pending_question_contract_v10(
-    state: AgentGraphState,
-    raw_version: int,
-) -> None:
-    """Discard pre-v10 prompts so the graph regenerates declared ownership."""
-
-    locations: list[tuple[str, dict[str, Any]]] = []
-    pending = state.get("pending_question")
-    if (
-        raw_version < 10
-        and
-        isinstance(pending, dict)
-        and pending
-        and int(pending.get("contract_version") or 0) == 1
-    ):
-        locations.append(("top_level", pending))
-        state["pending_question"] = {}
-    resume = state.get("resume_context")
-    if isinstance(resume, dict):
-        resumed = resume.get("pending_question")
-        if (
-            raw_version < 10
-            and
-            isinstance(resumed, dict)
-            and resumed
-            and int(resumed.get("contract_version") or 0) == 1
-        ):
-            locations.append(("resume_context", resumed))
-            updated = dict(resume)
-            updated["pending_question"] = {}
-            state["resume_context"] = updated
-    for location, question in locations:
-        state.setdefault("audit_events", []).append({
-            "event": "checkpoint_pending_contract_regeneration_required",
-            "from_schema_version": raw_version,
-            "location": location,
-            "question_id": str(question.get("id") or ""),
-        })
 
 
 def _quarantine_unsupported_pending_actions(state: AgentGraphState) -> None:
@@ -310,65 +464,42 @@ def _quarantine_unsupported_pending_actions(state: AgentGraphState) -> None:
         })
 
 
-def _recover_legacy_prepared_plan(raw_state: dict[str, Any], state: AgentGraphState) -> None:
-    """Recover the immutable final plan omitted by checkpoint schemas before v6."""
-
-    if state.get("plan_file"):
-        return
-    smoke_result = ((raw_state.get("smoke") or {}).get("result") or {}).get("data") or {}
-    source = str(smoke_result.get("source_plan_file") or "").strip()
-    if not source:
-        smoke_file = Path(str(smoke_result.get("smoke_plan_file") or ""))
-        suffix = "_real_node_smoke.json"
-        if smoke_file.name.endswith(suffix):
-            source = str(Path(__file__).resolve().parents[2] / ".agent" / "prepared" / f"{smoke_file.name[:-len(suffix)]}.json")
-    source_path = Path(source) if source else Path()
-    if not source or not source_path.is_file():
-        return
-    state["plan_file"] = str(source_path)
-    try:
-        import json
-
-        state["plan"] = json.loads(source_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        state["plan"] = {}
-    state.setdefault("audit_events", []).append({"event": "legacy_prepared_plan_recovered"})
-
-
-def _normalize_pending_question_contract(state: AgentGraphState) -> None:
-    """Upgrade persisted generic manual questions to the current type contract."""
-
-    pending = state.get("pending_question") or {}
-    if str(pending.get("kind") or "") != "manual_value" or pending.get("validation"):
-        return
-    pending["validation"] = {"value_type": "scalar_token", "max_length": 180}
-    state["pending_question"] = pending
-    state.setdefault("audit_events", []).append({
-        "event": "checkpoint_question_contract_upgraded",
-        "question_id": str(pending.get("id") or ""),
-    })
-
-
-def _normalize_mode_exclusive_state(state: AgentGraphState) -> None:
-    """Remove checkpoint values that cannot exist in the selected workflow."""
+def _migrate_v12_mode_exclusive_state(state: AgentGraphState) -> None:
+    """Remove v12 RPC-benchmark state from a sync-observe checkpoint."""
 
     if str(state.get("workflow_mode") or "") != "sync_observe":
         return
-    incompatible_groups = {"workload_rpc", "target_samples_fixtures", "qps_profile"}
-    changed = any((state.get("rpc_mode"), state.get("workload"), state.get("custom_rpc"), state.get("fixture_evidence"), state.get("qps_profile")))
+    incompatible_groups = {
+        "workload_rpc",
+        "target_samples_fixtures",
+        "qps_profile",
+    }
+    changed = any((
+        state.get("rpc_mode"),
+        state.get("workload"),
+        state.get("custom_rpc"),
+        state.get("fixture_evidence"),
+        state.get("qps_profile"),
+    ))
     state["rpc_mode"] = ""
     state["workload"] = {}
     state["custom_rpc"] = {}
     state["fixture_evidence"] = {}
     state["qps_profile"] = {}
     queue = list(state.get("action_queue") or [])
+    incompatible_actions = {
+        "set_rpc_mode",
+        "set_qps_mode",
+        "set_qps_override",
+        "rpc_catalog_command",
+        "rpc_workload_command",
+        "use_default_workload",
+        "configure_workload_weights",
+    }
     filtered = [
-        item for item in queue
-        if str((item or {}).get("type") or "") not in {
-            "set_rpc_mode", "set_qps_mode", "set_qps_override", "start_custom_rpc",
-            "rpc_catalog_command", "rpc_workload_command",
-            "use_default_workload", "configure_workload_weights",
-        }
+        item
+        for item in queue
+        if str((item or {}).get("action_type") or "") not in incompatible_actions
     ]
     changed = changed or len(filtered) != len(queue)
     state["action_queue"] = filtered
@@ -379,7 +510,10 @@ def _normalize_mode_exclusive_state(state: AgentGraphState) -> None:
         state["active_group"] = "opening"
         changed = True
     if changed:
-        state.setdefault("audit_events", []).append({"event": "checkpoint_mode_exclusivity_repaired", "workflow_mode": "sync_observe"})
+        state.setdefault("audit_events", []).append({
+            "event": "checkpoint_v12_mode_exclusivity_migrated",
+            "workflow_mode": "sync_observe",
+        })
 
 
 def new_state(thread_id: str, language: str = "en", session_purpose: str = "user") -> AgentGraphState:
@@ -408,6 +542,11 @@ def new_state(thread_id: str, language: str = "en", session_purpose: str = "user
         "web_research": {},
         "pending_question": {},
         "action_queue": [],
+        "selected_action": {},
+        "pending_domain_result": {},
+        "side_effect_intent": {},
+        "side_effect_receipt": {},
+        "turn_receipt": {},
         "current_action": {},
         "completed_actions": [],
         "applied_action_ids": [],

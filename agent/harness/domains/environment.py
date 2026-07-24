@@ -449,7 +449,7 @@ def merge_config_proposal_from_text(
 def config_proposal_review_question(group: str, proposal: dict[str, Any], *, language: str = "en") -> dict[str, Any]:
     """Build the typed Y/N review contract; rendering remains coordinator-owned."""
 
-    return choice_question(
+    question = choice_question(
         group,
         "inferred_config_review",
         format_config_proposal_prompt(proposal, language=language),
@@ -463,6 +463,9 @@ def config_proposal_review_question(group: str, proposal: dict[str, Any], *, lan
         accepted_action_types=("propose_config_values",),
         queue_barrier=True,
     )
+    question["supersedes_action_types"] = ["propose_config_values"]
+    question["barrier_policy"] = "explicit_detour_only"
+    return question
 
 
 def format_config_proposal_prompt(proposal: dict[str, Any], *, language: str = "en") -> str:

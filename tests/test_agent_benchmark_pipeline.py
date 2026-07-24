@@ -13,6 +13,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import json
+from copy import deepcopy
 from pathlib import Path
 
 
@@ -391,7 +392,6 @@ class BenchmarkPipelineTest(unittest.TestCase):
 
     def test_custom_single_fake_node_routes_to_fixture_gate_when_fixture_is_missing(self) -> None:
         from agent.harness.domains.chain_rpc import question_for_chain_rpc
-        from agent.harness.domains.chain_rpc_support import _chain_rpc_draft
         from agent.harness.domains.rpc_workload import _set_single_workload
         from agent.harness.routing import next_group_and_reason
         from agent.harness.state import new_state
@@ -403,7 +403,7 @@ class BenchmarkPipelineTest(unittest.TestCase):
             "chain_identity": {"canonical": "bsc", "status": "confirmed", "case": "known"},
             "custom_rpc": {"status": "needs_scope", "method": "eth_accounts"},
         })
-        state = _chain_rpc_draft(state)
+        state = deepcopy(state)
         _set_single_workload(state, "eth_accounts", "custom_rpc")
         self.assertEqual(state["fixture_evidence"]["status"], "missing")
         group, _reason = next_group_and_reason(state)
@@ -435,7 +435,6 @@ class BenchmarkPipelineTest(unittest.TestCase):
         )
 
     def test_custom_single_with_existing_fixture_does_not_require_fixture_choice(self) -> None:
-        from agent.harness.domains.chain_rpc_support import _chain_rpc_draft
         from agent.harness.domains.rpc_workload import _set_single_workload
         from agent.harness.state import new_state
 
@@ -446,7 +445,7 @@ class BenchmarkPipelineTest(unittest.TestCase):
             "chain_identity": {"canonical": "bsc", "status": "confirmed", "case": "known"},
             "custom_rpc": {"status": "needs_scope", "method": "eth_blockNumber"},
         })
-        state = _chain_rpc_draft(state)
+        state = deepcopy(state)
         _set_single_workload(state, "eth_blockNumber", "custom_rpc")
         self.assertEqual(state["fixture_evidence"]["status"], "validated")
         self.assertEqual(state["active_group"], "workload_rpc")

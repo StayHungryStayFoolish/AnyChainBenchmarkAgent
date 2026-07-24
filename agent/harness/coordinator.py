@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from copy import deepcopy
 from dataclasses import asdict, is_dataclass, replace
@@ -17,50 +18,89 @@ from .oracle import (
     compute_next_action,
     format_recommended_next_action,
 )
-from .routing import chain_identity_confirmed, group_readiness, next_group_and_reason
+from .routing import (
+    chain_identity_confirmed,
+    navigation_prerequisite as _navigation_prerequisite,
+    next_group_and_reason,
+    option_return_policy as _option_return_policy,
+)
 from .turns import adjudicate_turn
 from .plan_coverage import segment_user_turn
-from .action_registry import ACTION_BY_TYPE, action_crosses_pending_barrier, action_execution_phase, action_is_turn_local, action_merge_key, assign_action_ids, lifecycle_rejected_action_indexes, merge_semantic_actions, normalize_action_relations, validate_action_contract, validate_action_transaction_contract, validate_field_intake_admission_receipt, validate_proposal_field_receipts
-from .contracts import ActionProposal, CheckpointCommand, HandlerResult, RecoveryCommand
+from .action_registry import ACTION_BY_TYPE, action_crosses_pending_barrier, action_execution_phase, action_is_turn_local, action_merge_key, action_preserves_pending, assign_action_ids, lifecycle_rejected_action_indexes, merge_semantic_actions, normalize_action_relations, validate_action_contract, validate_action_transaction_contract, validate_field_intake_admission_receipt, validate_proposal_field_receipts
+from .contracts import (
+    ActionEnvelope,
+    ActionProposal,
+    CheckpointCommand,
+    FieldReconfigurationCommand,
+    HandlerResult,
+    NavigationCommand,
+    RecoveryCommand,
+    PendingDomainResult,
+    SideEffectIntent,
+    SideEffectReceipt,
+    TurnReceipt,
+    WorkflowGoalCommand,
+    StateDelta,
+    action_envelope_from_dict,
+    action_envelope_to_dict,
+    handler_result_from_dict,
+    handler_result_to_dict,
+    pending_domain_result_from_dict,
+    pending_domain_result_to_dict,
+    side_effect_intent_to_dict,
+    side_effect_receipt_to_dict,
+    turn_receipt_to_dict,
+)
 from .localization import localized as _localized
 from .domains.orientation import completed_group_status
 from .domains.environment import (
     apply_inferred_config_review,
     config_proposal_review_question,
 )
-from .domains.chain_rpc import apply_chain_rpc_action
 from .domains.chain_rpc_support import is_existing_family_lifecycle
 from .domains.analysis import (
     JOB_ID_RE,
-    EvidenceCollectionOutcome,
-    cancel_evidence_collection,
-    continue_evidence_collection,
-    finish_evidence_collection,
-    pause_evidence_collection,
-    resume_evidence_collection,
     is_evidence_completion_command,
     prompt_evidence_collection_waiting,
     should_start_evidence_collection,
-    start_evidence_collection,
 )
 from .domains.execution import reconcile_execution_state
 from .domains.recovery import question_for_recovery
 from .failures import domain_blocker_failure_record, model_provider_failure_record, render_failure_summary
 from .domains.registry import GROUP_OWNER
 from .domains.runtime import DOMAIN_RUNTIME, DomainRuntime
-from .invariants import StateInvariantError, apply_state_delta, validate_state, verify_expected_patch
+from .invariants import StateInvariantError, apply_state_delta, validate_state
 from .transitions import mark_group_reconfigured, mark_group_reconfiguring
 from .questions import (
     action_for_value,
     answer_fits_pending as _answer_fits_pending,
     coerce_pending_answer as _coerce_answer,
     exact_answer as contract_exact_answer,
-    expected_patch_for_value,
     manual_literal_violation,
     matches_numbered_option as _matches_numbered_option,
     pending_option_value_exists as _pending_option_value_exists,
     value_satisfies_pending_contract as _value_satisfies_pending_contract,
     render_question as _render_question,
+)
+from .response import (
+    append_active_question_once as _append_active_question_once,
+    finalize_turn_response as _finalize_turn_response,
+    question_is_actionable_in_responses as _question_is_actionable_in_responses,
+    without_superseded_question as _without_superseded_question,
+)
+from .queue import (
+    action_can_run_while_pending as _action_can_run_while_pending,
+    order_action_queue as _order_action_queue,
+)
+from .admission import (
+    _action_answers_pending_contract,
+    _action_satisfies_pending_manual_effect,
+    _drop_conflicting_answer_actions,
+    _has_meaningful_queue,
+    _normalized_action_queue,
+    _validate_action_plan,
+    _validate_admission_transaction,
+    reconcile_admission_coverage,
 )
 from .input_values import normalize_target_mode, target_mode_evidence_matches
 from agent.workflows.group_registry import (
@@ -79,18 +119,27 @@ QUEUE_RESUME_PENDING_IDS = {
     "unknown_chain_identity_confirm",
 }
 
+_ADMISSION_METADATA_KEYS = (
+    "_semantic_admission_receipt",
+    "_proposal_field_receipts",
+    "_proposal_transaction_hashes",
+    "_admission_action_id",
+    "_transaction_action_ids",
+    "_plan_transaction_hash",
+    "_merged_origin_texts",
+)
+
 
 def apply_coordinator_action(state: AgentGraphState, action: ActionProposal) -> HandlerResult:
     """Apply navigation actions owned by the single workflow coordinator."""
 
-    next_state = state
     if action.action_type == "resume_current_flow":
-        pending = dict(next_state.get("pending_question") or {})
+        pending = dict(state.get("pending_question") or {})
         if not pending:
             return HandlerResult(blocker="no active typed question is available to resume")
         return HandlerResult(
             consumed_action_ids=(action.action_id,),
-            visible_result=_render_question(pending, next_state.get("language", "en")),
+            visible_result=_render_question(pending, state.get("language", "en")),
             pending_question=pending,
             completion="unchanged",
             stop_after_response=True,
@@ -103,7 +152,7 @@ def apply_coordinator_action(state: AgentGraphState, action: ActionProposal) -> 
             return HandlerResult(blocker=f"field is not registered for typed reconfiguration: {field or '<missing>'}")
         runtime = DOMAIN_RUNTIME.get(GROUP_OWNER.get(group, ""))
         question = (
-            runtime.field_question_factory(next_state, group, field)
+            runtime.field_question_factory(state, group, field)
             if runtime and runtime.field_question_factory
             else None
         )
@@ -116,21 +165,20 @@ def apply_coordinator_action(state: AgentGraphState, action: ActionProposal) -> 
             or str(question.get("field") or "") not in owner_spec.fields
         ):
             return HandlerResult(blocker=f"registered field question is unavailable: {field}")
-        control = dict(next_state.get("control") or {})
-        if str(question.get("field") or "") != field:
-            control["field_reconfiguration_continuation"] = {
-                "group": group,
-                "config_field": field,
-                "prerequisite_question_id": str(question.get("id") or ""),
-            }
-        else:
-            control.pop("field_reconfiguration_continuation", None)
-        next_state["control"] = control
-        _record_group_transition(next_state, group)
-        _install_pending_question(next_state, question)
-        next_state["visible_response"] = [_render_question(question, next_state.get("language", "en"))]
         return HandlerResult(
             consumed_action_ids=(action.action_id,),
+            visible_result=_render_question(question, state.get("language", "en")),
+            pending_question=question,
+            next_group=group,
+            field_reconfiguration_command=FieldReconfigurationCommand(
+                group=group,
+                config_field=field,
+                prerequisite_question_id=(
+                    str(question.get("id") or "")
+                    if str(question.get("field") or "") != field
+                    else ""
+                ),
+            ),
             completion="blocked",
             stop_after_response=True,
         )
@@ -138,81 +186,20 @@ def apply_coordinator_action(state: AgentGraphState, action: ActionProposal) -> 
         group = str(action.arguments.get("group") or "").strip()
         if group not in ALLOWED_GROUPS or not is_user_navigable_group(group):
             return HandlerResult(blocker=f"group is not a user-navigable destination: {group or '<missing>'}")
-        prerequisite = _navigation_prerequisite(next_state, group)
-        if prerequisite:
-            control = dict(next_state.get("control") or {})
-            control["deferred_group"] = group
-            next_state["control"] = control
-            next_state = _activate_group_question(next_state, prerequisite)
-            return HandlerResult(
-                consumed_action_ids=(action.action_id,),
-                completion="blocked",
-                stop_after_response=True,
-            )
-        if group == str(action.arguments.get("queue_origin_group") or "").strip() and _active_group_has_blocking_question(next_state):
-            pending = dict(next_state.get("pending_question") or {})
-            return HandlerResult(
-                consumed_action_ids=(action.action_id,),
-                visible_result=_render_question(pending, next_state.get("language", "en")),
-                completion="unchanged",
-                stop_after_response=True,
-            )
-        if _queue_has_followup_for_group(next_state, group):
-            _record_group_transition(next_state, group)
-            next_state["pending_question"] = {}
-            return HandlerResult(
-                consumed_action_ids=(action.action_id,),
-                completion="completed",
-            )
-        if group == "chain_identity" and (next_state.get("chain_identity") or {}).get("canonical"):
-            return HandlerResult(
-                consumed_action_ids=(action.action_id,),
-                followup_actions=(
-                    {
-                        "type": "request_chain_selection",
-                        "confidence": "high",
-                    },
-                ),
-                completion="completed",
-            )
-        next_state = _activate_group_question(next_state, group, reconfigure=True)
         return HandlerResult(
             consumed_action_ids=(action.action_id,),
-            completion="blocked" if next_state.get("pending_question") else "completed",
+            navigation_command=NavigationCommand(
+                operation="change_group",
+                target_group=group,
+                origin_group=str(action.arguments.get("queue_origin_group") or "").strip(),
+            ),
+            completion="completed",
             stop_after_response=True,
         )
     if action.action_type == "go_back":
-        control = dict(next_state.get("control") or {})
-        control.pop("field_reconfiguration_continuation", None)
-        next_state["control"] = control
-        resume_group = str(action.arguments.get("cancellation_resume_group") or "").strip()
-        interrupted_question = _pop_interruption_question(next_state)
-        if interrupted_question:
-            _install_pending_question(next_state, interrupted_question)
-            return HandlerResult(
-                consumed_action_ids=(action.action_id,),
-                pending_question=interrupted_question,
-                visible_result=_render_question(
-                    interrupted_question,
-                    next_state.get("language", "en"),
-                ),
-                completion="blocked",
-                stop_after_response=True,
-            )
-        if resume_group:
-            _discard_cancelled_origin_from_history(next_state)
-        previous_group = resume_group or _pop_previous_group(next_state)
-        if previous_group:
-            next_state = _activate_group_question(next_state, previous_group, record_history=False)
-        else:
-            next_state["visible_response"] = [_localized(
-                next_state.get("language", "en"),
-                "当前没有可回退的配置组。你可以直接说明要回到哪个配置项，例如 RPC、QPS、磁盘或可观测性。",
-                "There is no previous configuration group to return to. Name the area to revisit, such as RPC, QPS, disk, or observability.",
-            )]
-            next_state["_stop_after_response"] = True
         return HandlerResult(
             consumed_action_ids=(action.action_id,),
+            navigation_command=NavigationCommand(operation="go_back"),
             completion="completed",
             stop_after_response=True,
         )
@@ -222,34 +209,37 @@ def apply_coordinator_action(state: AgentGraphState, action: ActionProposal) -> 
         source = str(action.arguments.get("source_evidence") or "").strip()
         if not target_mode or not goal or not source:
             return HandlerResult(blocker="queued workflow goal requires target_mode, goal, and source_evidence")
-        goals = [dict(item) for item in next_state.get("workflow_goals") or [] if isinstance(item, dict)]
+        goals = [dict(item) for item in state.get("workflow_goals") or [] if isinstance(item, dict)]
         candidate = {"target_mode": target_mode, "goal": goal, "source_evidence": source}
-        if not any(
+        already_queued = any(
             item.get("target_mode") == target_mode and item.get("goal") == goal
             for item in goals
-        ):
-            goals.append(candidate)
-        next_state["workflow_goals"] = goals
+        )
         return HandlerResult(
             consumed_action_ids=(action.action_id,),
+            workflow_goal_command=(
+                None
+                if already_queued
+                else WorkflowGoalCommand(operation="enqueue", goal=candidate)
+            ),
             visible_result=_localized(
-                next_state.get("language", "en"),
+                state.get("language", "en"),
                 f"已保存后续目标：完成当前流程后进入 `{target_mode}`（{goal}）。",
                 f"Saved a later goal: enter `{target_mode}` after the current workflow ({goal}).",
             ),
             completion="completed",
         )
     if action.action_type in {"activate_next_workflow_goal", "discard_next_workflow_goal"}:
-        goals = [dict(item) for item in next_state.get("workflow_goals") or [] if isinstance(item, dict)]
+        goals = [dict(item) for item in state.get("workflow_goals") or [] if isinstance(item, dict)]
         if not goals:
             return HandlerResult(blocker="no queued workflow goal is available")
         goal = goals.pop(0)
-        next_state["workflow_goals"] = goals
         if action.action_type == "discard_next_workflow_goal":
             return HandlerResult(
                 consumed_action_ids=(action.action_id,),
+                workflow_goal_command=WorkflowGoalCommand(operation="remove_first"),
                 visible_result=_localized(
-                    next_state.get("language", "en"),
+                    state.get("language", "en"),
                     "已移除最早保存的后续测试目标。",
                     "Removed the oldest saved workflow goal.",
                 ),
@@ -257,6 +247,7 @@ def apply_coordinator_action(state: AgentGraphState, action: ActionProposal) -> 
             )
         return HandlerResult(
             consumed_action_ids=(action.action_id,),
+            workflow_goal_command=WorkflowGoalCommand(operation="remove_first"),
             followup_actions=({
                 "type": "choose_target_mode",
                 "target_mode": str(goal.get("target_mode") or ""),
@@ -266,7 +257,7 @@ def apply_coordinator_action(state: AgentGraphState, action: ActionProposal) -> 
                 "confidence": "high",
             },),
             visible_result=_localized(
-                next_state.get("language", "en"),
+                state.get("language", "en"),
                 f"正在切换到已保存的后续目标：{goal.get('goal') or goal.get('target_mode')}。",
                 f"Activating the saved workflow goal: {goal.get('goal') or goal.get('target_mode')}.",
             ),
@@ -301,7 +292,11 @@ def _record_admitted_action(
     this turn-scoped admission ledger as the authoritative control-plane fact.
     """
 
-    action_type = str(action.get("type") or "").strip()
+    action_type = str(
+        action.get("type")
+        or action.get("action_type")
+        or ""
+    ).strip()
     if not action_type:
         return
     turn = state.setdefault("turn_context", {})
@@ -320,10 +315,132 @@ def _record_admitted_action(
         "source": source,
     }
     if action_type == "change_group":
-        target_group = str(action.get("group") or "").strip()
+        target_group = str(
+            action.get("group")
+            or (action.get("arguments") or {}).get("group")
+            or ""
+        ).strip()
         if target_group:
             admitted_action["group"] = target_group
     admitted.append(admitted_action)
+    receipt = dict(state.get("turn_receipt") or {})
+    if not str(receipt.get("turn_id") or ""):
+        return
+    admitted_ids = list(receipt.get("admitted_action_ids") or [])
+    semantic_order = list(receipt.get("semantic_order") or [])
+    owners = dict(receipt.get("owner_bindings") or {})
+    action_units = {
+        str(key): list(value)
+        for key, value in dict(receipt.get("action_unit_bindings") or {}).items()
+    }
+    unit_actions = {
+        str(key): list(value)
+        for key, value in dict(receipt.get("unit_action_bindings") or {}).items()
+    }
+    if action_id and action_id not in admitted_ids:
+        admitted_ids.append(action_id)
+        semantic_order.append(action_id)
+    spec = ACTION_BY_TYPE.get(action_type)
+    if action_id and spec is not None:
+        owners[action_id] = (
+            GROUP_OWNER.get(
+                str((state.get("pending_question") or {}).get("group") or ""),
+                spec.owner,
+            )
+            if action_type == "answer_pending"
+            else spec.owner
+        )
+    source_unit_ids = [
+        str(item)
+        for item in (
+            action.get("source_unit_ids")
+            or action.get("_source_unit_ids")
+            or ()
+        )
+        if str(item)
+    ]
+    if action_id and source_unit_ids:
+        action_units[action_id] = list(dict.fromkeys(source_unit_ids))
+        for unit_id in source_unit_ids:
+            bindings = unit_actions.setdefault(unit_id, [])
+            if action_id not in bindings:
+                bindings.append(action_id)
+    receipt["admitted_action_ids"] = admitted_ids
+    receipt["semantic_order"] = semantic_order
+    receipt["owner_bindings"] = owners
+    receipt["action_unit_bindings"] = action_units
+    receipt["unit_action_bindings"] = unit_actions
+    receipt["status"] = "planned"
+    state["turn_receipt"] = receipt
+
+
+def _record_semantic_plan_receipt(
+    state: AgentGraphState,
+    semantic_units: list[Mapping[str, Any]],
+    pending_choice_contracts: list[Mapping[str, Any]],
+) -> None:
+    """Persist lossless unit coverage before any admitted action can execute."""
+
+    receipt = dict(state.get("turn_receipt") or {})
+    if not receipt:
+        return
+    normalized_units = [
+        deepcopy(dict(unit))
+        for unit in semantic_units
+        if str(unit.get("unit_id") or "")
+    ]
+    unresolved = [
+        str(unit.get("unit_id") or "")
+        for unit in normalized_units
+        if str(unit.get("disposition") or "") == "unresolved"
+    ]
+    omission_checks: list[dict[str, Any]] = []
+    for unit in normalized_units:
+        unit_id = str(unit.get("unit_id") or "")
+        disposition = str(unit.get("disposition") or "")
+        indexes = [
+            int(index)
+            for index in unit.get("action_indexes") or []
+            if isinstance(index, int) and not isinstance(index, bool)
+        ]
+        verdict = (
+            "covered"
+            if disposition == "action" and indexes
+            else "context"
+            if disposition == "context" and not indexes
+            else "unresolved"
+            if disposition == "unresolved" and not indexes
+            else "invalid"
+        )
+        omission_checks.append({
+            "unit_id": unit_id,
+            "disposition": disposition,
+            "action_indexes": indexes,
+            "verdict": verdict,
+        })
+    pending_verdicts = [
+        {
+            "action_index": contract.get("action_index"),
+            "admission_action_id": str(
+                contract.get("admission_action_id") or ""
+            ),
+            "candidate_value": deepcopy(contract.get("candidate_value")),
+            "semantic_unit_ids": [
+                str(unit.get("unit_id") or "")
+                for unit in contract.get("semantic_units") or []
+                if isinstance(unit, Mapping)
+                and str(unit.get("unit_id") or "")
+            ],
+            "verdict": "admitted",
+        }
+        for contract in pending_choice_contracts
+        if isinstance(contract, Mapping)
+    ]
+    receipt["semantic_units"] = normalized_units
+    receipt["unresolved_units"] = unresolved
+    receipt["pending_candidate_verdicts"] = pending_verdicts
+    receipt["sibling_omission_checks"] = omission_checks
+    state["turn_receipt"] = receipt
 
 
 def prepare_turn_step(state: AgentGraphState) -> AgentGraphState:
@@ -331,6 +448,14 @@ def prepare_turn_step(state: AgentGraphState) -> AgentGraphState:
 
     state = _copy_state(state)
     state["action_queue"] = _durable_actions(state.get("action_queue") or [])
+    resumed_phase = _inflight_transition_phase(state)
+    if resumed_phase:
+        validate_state(state)
+        return _set_turn_phase(
+            state,
+            resumed_phase,
+            "inflight_transition_resumed",
+        )
     state = _apply_handler_result(state, reconcile_execution_state(state), owner="execution")
     pending_owner = str((state.get("pending_question") or {}).get("group") or "").strip()
     if pending_owner:
@@ -361,14 +486,59 @@ def prepare_turn_step(state: AgentGraphState) -> AgentGraphState:
         "pending_snapshot": dict(state.get("pending_question") or {}),
         "admitted_actions": [],
     }
+    turn_id = (
+        f"{state.get('thread_id') or 'default'}:"
+        f"{int(state.get('turn_index') or 0)}"
+    )
+    state["turn_receipt"] = turn_receipt_to_dict(
+        TurnReceipt(
+            turn_id=turn_id,
+            input_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            language=str(state.get("language") or "en"),
+            input_shape=input_shape,
+            clauses=tuple(clause.as_dict() for clause in clauses),
+            pending_before=deepcopy(state.get("pending_question") or {}),
+        )
+    )
     state["proposed_actions"] = []
     return _set_turn_phase(state, "adjudicate")
+
+
+def _inflight_transition_phase(state: AgentGraphState) -> str:
+    """Return the first incomplete checkpointed action phase, if any."""
+
+    selected = dict(state.get("selected_action") or {})
+    if not selected:
+        return ""
+    if state.get("pending_domain_result"):
+        return "commit"
+    intent = dict(state.get("side_effect_intent") or {})
+    receipt = dict(state.get("side_effect_receipt") or {})
+    if receipt:
+        return "commit_receipt"
+    if not intent:
+        return "execute"
+    status = str(intent.get("status") or "")
+    if status == "prepared":
+        return "invoke_effect"
+    if status == "invoking":
+        return "perform_effect"
+    return ""
 
 
 def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
     """Handle only deterministic contracts; free text proceeds to planning."""
 
     text = str((state.get("turn_context") or {}).get("text") or "")
+    runtime_action = dict(
+        (state.get("turn_context") or {}).get("runtime_action") or {}
+    )
+    if runtime_action:
+        return _admit_deterministic_action(
+            state,
+            runtime_action,
+            source="runtime_command",
+        )
     turn_kind = str((state.get("turn_context") or {}).get("kind") or "free_text")
     language = str(state.get("language") or "en")
     collecting = state.get("evidence_collection") or {}
@@ -378,10 +548,15 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
             state = _apply_handler_result(state, prompt_evidence_collection_waiting(state, collecting), owner="analysis")
             return _set_turn_phase(state, "compose", "evidence_waiting")
         if is_evidence_completion_command(text):
-            state = _apply_evidence_outcome(state, continue_evidence_collection(state, text, collecting))
-            if state.pop("_stop_after_response", False) or state.get("pending_question"):
-                return _set_turn_phase(state, "compose", "evidence_collected")
-            return _set_turn_phase(state, "fallback", "evidence_collected")
+            return _admit_deterministic_action(
+                state,
+                {
+                    "type": "finish_evidence_collection",
+                    "source_evidence": text,
+                    "confidence": "high",
+                },
+                source="evidence_transport",
+            )
         return _set_turn_phase(state, "plan", "typed_evidence_collection_turn")
 
     if turn_kind == "empty":
@@ -394,8 +569,16 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
     # multiline block before asking the semantic planner to classify it. The
     # completed block re-enters the normal semantic owner as one turn.
     if pending and str(pending.get("kind") or "") == "evidence" and should_start_evidence_collection(text):
-        state = _apply_evidence_outcome(state, start_evidence_collection(state, text, pending))
-        return _set_turn_phase(state, "compose", "evidence_collection_started")
+        return _admit_deterministic_action(
+            state,
+            {
+                "type": "start_evidence_collection",
+                "evidence": text,
+                "source_evidence": text,
+                "confidence": "high",
+            },
+            source="evidence_transport",
+        )
 
     pending_fits = bool(pending and _answer_fits_pending(text, pending))
     pending_owns_structured_input = bool(
@@ -430,29 +613,74 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
     if pending_fits:
         pending_question_id = str(pending.get("id") or "")
         resume_queue = bool(
-            _queue_has_admitted_durable_work(state)
-            or pending.get("resume_action_queue")
+            pending.get("resume_action_queue")
             or pending_question_id in QUEUE_RESUME_PENDING_IDS
         )
-        if not resume_queue:
-            # Discard only deferred work that predates this blocking answer.
-            # The answer handler may emit new follow-up actions (for example a
-            # recommended chain+mode setup); clearing after the handler would
-            # silently erase those newly authorized actions.
-            state["action_queue"] = []
-        state = _apply_pending_answer(state, text, pending)
-        state.pop("_handler_completion", None)
-        if resume_queue:
-            _discard_superseded_queue_actions(state, pending)
-        if resume_queue and state.get("pending_question"):
-            state["pending_question"]["resume_action_queue"] = True
-        if resume_queue and not state.get("_stop_after_response") and state.get("action_queue") and _queue_can_continue_through_pending(state):
-            return _set_turn_phase(state, "execute", "resume_queue_after_answer")
-        if not state.get("pending_question") and not state.get("_stop_after_response") and state.get("action_queue"):
-            return _set_turn_phase(state, "execute", "continue_queue_after_answer")
-        if state.pop("_stop_after_response", False) or state.get("pending_question"):
-            return _set_turn_phase(state, "compose", "pending_answer_applied")
-        return _set_turn_phase(state, "fallback", "pending_answer_applied")
+        matched, selected_value = contract_exact_answer(text, pending)
+        action = {
+            "type": "answer_pending",
+            "answer": text,
+            "source_evidence": text,
+            "confidence": "high",
+            "selection_contract_verified": True,
+        }
+        if matched:
+            action["selected_value"] = selected_value
+        else:
+            action["selected_value"] = _coerce_answer(text, pending)
+        action = assign_action_ids(
+            f"{state.get('thread_id') or 'default'}:{int(state.get('turn_index') or 0)}",
+            text,
+            [action],
+        )[0]
+        source_unit_ids = [
+            str(clause.get("clause_id") or "")
+            for clause in (state.get("turn_receipt") or {}).get("clauses") or []
+            if isinstance(clause, Mapping)
+            and str(clause.get("clause_id") or "")
+        ]
+        action["_source_unit_ids"] = source_unit_ids
+        _record_semantic_plan_receipt(
+            state,
+            [
+                {
+                    "unit_id": unit_id,
+                    "clause_id": unit_id,
+                    "source_text": text,
+                    "disposition": "action",
+                    "action_indexes": [0],
+                }
+                for unit_id in source_unit_ids
+            ],
+            [],
+        )
+        scope = (
+            f"{state.get('thread_id') or 'default'}:"
+            f"{int(state.get('turn_index') or 0)}"
+        )
+        action = action_envelope_to_dict(
+            _build_action_envelope(
+                state,
+                action,
+                semantic_order=0,
+                submitted_turn_index=int(state.get("turn_index") or 0),
+                origin_group=str(state.get("active_group") or ""),
+                origin_text=text,
+                plan_scope=scope,
+            )
+        )
+        existing = (
+            [dict(item) for item in state.get("action_queue") or [] if isinstance(item, Mapping)]
+            if resume_queue
+            else []
+        )
+        state["action_queue"] = [action, *existing]
+        _record_admitted_action(
+            state,
+            action,
+            source="pending_question_contract",
+        )
+        return _set_turn_phase(state, "execute", "pending_answer_admitted")
 
     if pending and str(pending.get("kind") or "") == "device" and text.lower() in {"y", "yes", "n", "no"}:
         state["visible_response"] = [_localized(
@@ -490,6 +718,59 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
     return _set_turn_phase(state, "plan", "semantic_input")
 
 
+def _admit_deterministic_action(
+    state: AgentGraphState,
+    action: Mapping[str, Any],
+    *,
+    source: str,
+) -> AgentGraphState:
+    """Admit one exact local contract through the normal graph lifecycle."""
+
+    text = str((state.get("turn_context") or {}).get("text") or "")
+    scope = f"{state.get('thread_id') or 'default'}:{int(state.get('turn_index') or 0)}"
+    admitted = assign_action_ids(scope, text, [dict(action)])[0]
+    source_unit_ids = [
+        str(clause.get("clause_id") or "")
+        for clause in (state.get("turn_receipt") or {}).get("clauses") or []
+        if isinstance(clause, Mapping)
+        and str(clause.get("clause_id") or "")
+    ]
+    admitted["_source_unit_ids"] = source_unit_ids
+    _record_semantic_plan_receipt(
+        state,
+        [
+            {
+                "unit_id": unit_id,
+                "clause_id": unit_id,
+                "source_text": text,
+                "disposition": "action",
+                "action_indexes": [0],
+            }
+            for unit_id in source_unit_ids
+        ],
+        [],
+    )
+    admitted = action_envelope_to_dict(
+        _build_action_envelope(
+            state,
+            admitted,
+            semantic_order=0,
+            submitted_turn_index=int(state.get("turn_index") or 0),
+            origin_group=str(state.get("active_group") or ""),
+            origin_text=text,
+            plan_scope=scope,
+        )
+    )
+    existing = [
+        dict(item)
+        for item in state.get("action_queue") or []
+        if isinstance(item, Mapping)
+    ]
+    state["action_queue"] = [admitted, *existing]
+    _record_admitted_action(state, admitted, source=source)
+    return _set_turn_phase(state, "execute", "deterministic_action_admitted")
+
+
 def plan_turn_step(state: AgentGraphState) -> AgentGraphState:
     """Call the configured LLM once to propose typed actions."""
 
@@ -510,25 +791,86 @@ def plan_turn_step(state: AgentGraphState) -> AgentGraphState:
         for row in queue.get("pending_choice_contracts") or []
         if isinstance(row, Mapping)
     ]
+    state["turn_context"]["semantic_units"] = [
+        dict(row)
+        for row in queue.get("semantic_units") or []
+        if isinstance(row, Mapping)
+    ]
+    for index, action in enumerate(actions):
+        action["_source_unit_ids"] = [
+            str(unit.get("unit_id") or "")
+            for unit in state["turn_context"]["semantic_units"]
+            if index in (
+                unit.get("action_indexes")
+                if isinstance(unit.get("action_indexes"), list)
+                else []
+            )
+            and str(unit.get("unit_id") or "")
+        ]
+    _record_semantic_plan_receipt(
+        state,
+        state["turn_context"]["semantic_units"],
+        state["turn_context"]["pending_choice_contracts"],
+    )
     state["proposed_actions"] = actions
     return _set_turn_phase(state, "admit", "planner_completed")
 
 
 def admit_turn_step(state: AgentGraphState) -> AgentGraphState:
-    """Execute turn-local results and admit durable commands to the queue."""
+    """Admit every reviewed action to the graph-owned execution queue."""
 
     text = str((state.get("turn_context") or {}).get("text") or "")
     actions = _validate_action_plan(state, list(state.get("proposed_actions") or []))
     _validate_admission_transaction(state, actions, current_submission=True)
     scope = f"{state.get('thread_id') or 'default'}:{int(state.get('turn_index') or 0)}"
     actions = assign_action_ids(scope, text, actions)
+    for index, action in enumerate(actions):
+        action["_plan_scope"] = scope
+        action["_plan_index"] = index
+        action["_submitted_turn_index"] = int(state.get("turn_index") or 0)
+        action["_origin_text"] = text
+        action["_source_unit_ids"] = list(dict.fromkeys(
+            str(unit_id)
+            for unit_id in action.get("_source_unit_ids") or []
+            if str(unit_id)
+        ))
+    receipt = reconcile_admission_coverage(
+        state.get("turn_receipt") or {},
+        actions,
+    )
+    pending_verdicts = [
+        dict(row)
+        for row in receipt.get("pending_candidate_verdicts") or []
+        if isinstance(row, Mapping)
+    ]
+    for verdict in pending_verdicts:
+        index = verdict.get("action_index")
+        if (
+            isinstance(index, int)
+            and not isinstance(index, bool)
+            and 0 <= index < len(actions)
+        ):
+            verdict["action_id"] = str(actions[index].get("action_id") or "")
+    omission_checks = [
+        dict(row)
+        for row in receipt.get("sibling_omission_checks") or []
+        if isinstance(row, Mapping)
+    ]
+    for check in omission_checks:
+        unit_id = str(check.get("unit_id") or "")
+        check["action_ids"] = [
+            str(action.get("action_id") or "")
+            for action in actions
+            if unit_id
+            and unit_id in {
+                str(item)
+                for item in action.get("_source_unit_ids") or []
+            }
+        ]
+    receipt["pending_candidate_verdicts"] = pending_verdicts
+    receipt["sibling_omission_checks"] = omission_checks
+    state["turn_receipt"] = receipt
     origin_group = str(state.get("active_group") or "")
-    for plan_index, action in enumerate(actions):
-        action.setdefault("_origin_text", text)
-        action.setdefault("_queue_origin_group", origin_group)
-        action.setdefault("_submitted_turn_index", int(state.get("turn_index") or 0))
-        action.setdefault("_plan_scope", scope)
-        action.setdefault("_plan_index", plan_index)
     turn_local_actions = [item for item in actions if action_is_turn_local(item)]
     durable_actions = [item for item in actions if not action_is_turn_local(item)]
     if not _has_meaningful_queue(actions):
@@ -543,11 +885,9 @@ def admit_turn_step(state: AgentGraphState) -> AgentGraphState:
         return _set_turn_phase(state, "fallback", "no_admitted_actions")
     for action in actions:
         _record_admitted_action(state, action, source="semantic_plan")
-    if turn_local_actions:
-        state = _execute_turn_local_actions(state, turn_local_actions, text)
     pending = state.get("pending_question") or {}
     existing_queue = [
-        dict(item)
+        _admission_action_from_envelope(item)
         for item in state.get("action_queue") or []
         if isinstance(item, dict)
     ]
@@ -568,27 +908,30 @@ def admit_turn_step(state: AgentGraphState) -> AgentGraphState:
         )
     )
     if answers_active_semantic_contract and not pending.get("resume_action_queue"):
-        # A pre-Harness checkpoint may contain an unadmitted command with no
-        # plan identity. It must never outrank a current-turn action accepted
-        # by the active question contract. Properly admitted deferred work is
-        # retained and resumes through the normal queue barrier.
-        existing_queue = [
-            item
-            for item in existing_queue
-            if "_plan_scope" in item or "_submitted_turn_index" in item
-        ]
-    ordered_queue = _order_action_queue(
+        # The question contract is the sole authority for retaining deferred
+        # work. Without resume_action_queue, accepting the current semantic
+        # answer supersedes every pre-existing queue entry regardless of
+        # whether a legacy checkpoint happens to contain plan-like metadata.
+        existing_queue = []
+    ordered_actions = _order_action_queue(state, [
+        *turn_local_actions,
+        *_merge_durable_action_queue(existing_queue, durable_actions),
+    ])
+    ordered_queue = _serialize_admitted_actions(
         state,
-        _merge_durable_action_queue(
-            existing_queue,
-            durable_actions,
-        ),
+        ordered_actions,
+        default_origin_text=text,
+        default_origin_group=origin_group,
+        default_plan_scope=scope,
     )
     if (
         str(pending.get("id") or "") == "inferred_config_review"
         and not any(str(item.get("type") or "") == "answer_pending" for item in durable_actions)
         and not extends_active_config_review
-        and not (ordered_queue and action_crosses_pending_barrier(ordered_queue[0]))
+        and not any(
+            _action_can_run_while_pending(state, dict(item))
+            for item in ordered_actions
+        )
     ):
         state["action_queue"] = ordered_queue
         return _set_turn_phase(state, "compose", "config_review_barrier")
@@ -596,93 +939,926 @@ def admit_turn_step(state: AgentGraphState) -> AgentGraphState:
     state["completed_actions"] = []
     state["action_errors"] = []
     if state.get("action_queue"):
-        if (
-            turn_local_actions
-            and state.get("pending_question")
-            and _pending_is_queue_barrier(state)
-            and not _queue_can_continue_through_pending(state)
-        ):
-            return _set_turn_phase(state, "compose", "turn_local_barrier_preserved")
         return _set_turn_phase(state, "execute", "actions_admitted")
-    if turn_local_actions:
-        return _set_turn_phase(state, "compose", "turn_local_actions_completed")
     return _set_turn_phase(state, "fallback", "no_durable_actions")
 
 
-def _execute_turn_local_actions(
-    state: AgentGraphState,
-    actions: list[dict[str, Any]],
-    text: str,
-) -> AgentGraphState:
-    """Dispatch read-only actions without committing them to workflow state."""
+def select_action_step(state: AgentGraphState) -> AgentGraphState:
+    """Select one durable action without applying domain state."""
 
-    pending_snapshot = deepcopy(state.get("pending_question") or {})
-    responses = list(state.get("visible_response") or [])
-    suppress_pending_render = False
-    completed_result_count = 0
-    for action in actions:
-        isolated = deepcopy(state)
-        isolated["action_queue"] = []
-        isolated["visible_response"] = []
-        routed = _apply_queue_action(isolated, action, text)
-        if routed is None:
-            continue
-        action_type = str(action.get("type") or "")
-        suppress_pending_render = suppress_pending_render or bool(
-            routed.get("_stop_after_response")
-            and action_type in {"analyze_evidence", "analyze_report"}
+    state = _copy_state(state)
+    queue = [
+        dict(item)
+        for item in state.get("action_queue") or []
+        if isinstance(item, Mapping)
+    ]
+    state["action_queue"] = queue
+    state["selected_action"] = {}
+    state["current_action"] = {}
+    if not queue:
+        if state.get("pending_question"):
+            return _set_turn_phase(state, "compose", "queue_blocked_or_complete")
+        return _set_turn_phase(state, "fallback", "queue_complete")
+    pending = dict(state.get("pending_question") or {})
+    if pending:
+        eligible_index = next(
+            (
+                index
+                for index, queued_action in enumerate(queue)
+                if _action_can_run_while_pending(
+                    state,
+                    _queue_action(queued_action),
+                )
+            ),
+            None,
         )
-        spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
-        for root in tuple(spec.turn_local_result_roots if spec else ()):
-            if root in routed:
-                state[root] = deepcopy(routed[root])
-            else:
-                state.pop(root, None)
-        for response in routed.get("visible_response") or []:
-            if pending_snapshot and _question_is_actionable_in_responses([str(response)], pending_snapshot):
-                continue
-            if response and response not in responses:
-                responses.append(response)
-                completed_result_count += 1
-        if not pending_snapshot and routed.get("pending_question"):
-            state["pending_question"] = deepcopy(routed.get("pending_question") or {})
-            state["active_group"] = str(routed.get("active_group") or state.get("active_group") or "")
-    state["visible_response"] = responses
-    if completed_result_count:
-        state.setdefault("turn_context", {})["turn_local_result_count"] = completed_result_count
-    if pending_snapshot:
-        state["pending_question"] = pending_snapshot
-    if suppress_pending_render:
-        state.setdefault("turn_context", {})["suppress_pending_render"] = True
-    return state
+        if eligible_index is None:
+            return _set_turn_phase(state, "compose", "pending_barrier_blocks_queue")
+        if eligible_index:
+            action = queue.pop(eligible_index)
+            queue.insert(0, action)
+            state["action_queue"] = queue
+        queued_envelope = dict(queue[0])
+    else:
+        queued_envelope = dict(queue[0])
+    envelope = action_envelope_from_dict(queued_envelope)
+    action = _action_from_envelope(queued_envelope)
+    if lifecycle_rejected_action_indexes(state, [action]):
+        state["action_queue"] = queue[1:]
+        state.setdefault("action_errors", []).append({
+            "action": action,
+            "error": "lifecycle_inapplicable",
+        })
+        return _set_turn_phase(state, "execute", "lifecycle_action_rejected")
+    action_id = str(action.get("action_id") or "")
+    if action_id and action_id in set(state.get("applied_action_ids") or []):
+        state["action_queue"] = queue[1:]
+        return _set_turn_phase(state, "execute", "already_applied_action_skipped")
+    spec = ACTION_BY_TYPE.get(envelope.action_type)
+    if spec is None:
+        state["action_queue"] = queue[1:]
+        state.setdefault("action_errors", []).append({
+            "action": action,
+            "error": "unregistered_action",
+        })
+        return _set_turn_phase(state, "execute", "unregistered_action_rejected")
+    _record_admitted_action(state, action, source="durable_queue")
+    state["selected_action"] = action_envelope_to_dict(
+        replace(envelope, status="selected")
+    )
+    state["current_action"] = action
+    control = dict(state.get("control") or {})
+    control["selected_owner"] = envelope.owner
+    state["control"] = control
+    validate_state(state)
+    return _set_turn_phase(state, "route_owner", "action_selected")
 
 
-def execute_turn_step(state: AgentGraphState) -> AgentGraphState:
-    """Execute exactly one admitted action through its owning domain."""
+def _build_action_envelope(
+    state: AgentGraphState,
+    action: Mapping[str, Any],
+    *,
+    semantic_order: int | None = None,
+    submitted_turn_index: int | None = None,
+    origin_group: str | None = None,
+    origin_text: str | None = None,
+    plan_scope: str | None = None,
+) -> ActionEnvelope:
+    """Separate validated action arguments from Harness-owned provenance."""
 
-    queued = state.get("action_queue") or []
-    text = str(
-        (state.get("turn_context") or {}).get("text")
-        or ((queued[0] or {}).get("_origin_text") if queued else "")
+    action_type = str(action.get("type") or "")
+    spec = ACTION_BY_TYPE.get(action_type)
+    if spec is None:
+        raise StateInvariantError(f"cannot envelope unregistered action: {action_type}")
+    arguments = {
+        str(key): deepcopy(value)
+        for key, value in action.items()
+        if key not in {"type", "action_id", "confidence", "reason"}
+        and not str(key).startswith("_")
+    }
+    exact_origin_text = str(
+        origin_text
+        if origin_text is not None
+        else action.get("_origin_text")
+        or (state.get("turn_context") or {}).get("text")
         or ""
     )
-    routed = _process_action_queue(state, [], text, max_actions=1)
-    if routed is not None:
-        state = routed
-    stop = bool(state.pop("_stop_after_response", False))
-    if (
-        not stop
-        and state.get("action_queue")
-        and (
-            not state.get("pending_question")
-            or _queue_can_continue_through_pending(state)
-            or _next_queue_action_crosses_pending_barrier(state)
+    source_evidence = str(
+        arguments.get("source_evidence")
+        or exact_origin_text
+        or ""
+    )
+    receipt = action.get("_semantic_admission_receipt")
+    source_unit_ids = tuple(
+        str(item)
+        for item in (
+            action.get("_source_unit_ids")
+            or (
+                (receipt or {}).get("source_unit_ids")
+                if isinstance(receipt, Mapping)
+                else ()
+            )
         )
+        or ()
+    )
+    effect_kind = (
+        "external"
+        if spec.effect == "execution"
+        else "read_only"
+        if spec.effect == "read_only"
+        else "pure"
+    )
+    action_id = str(action.get("action_id") or "")
+    pending = state.get("pending_question") or {}
+    owner = spec.owner
+    if action_type == "answer_pending":
+        owner = (
+            "environment"
+            if str(pending.get("id") or "") == "inferred_config_review"
+            else GROUP_OWNER.get(str(pending.get("group") or ""), spec.owner)
+        )
+    return ActionEnvelope(
+        action_id=action_id,
+        action_type=action_type,
+        owner=owner,
+        target_group=spec.target_group,
+        arguments=arguments,
+        confidence=str(action.get("confidence") or "medium"),  # type: ignore[arg-type]
+        reason=str(action.get("reason") or ""),
+        source_unit_ids=source_unit_ids,
+        source_evidence_hash=hashlib.sha256(source_evidence.encode("utf-8")).hexdigest(),
+        semantic_order=int(
+            semantic_order
+            if semantic_order is not None
+            else action.get("_plan_index")
+            or 0
+        ),
+        execution_order=len(state.get("completed_actions") or []),
+        submitted_turn_index=int(
+            submitted_turn_index
+            if submitted_turn_index is not None
+            else action.get("_submitted_turn_index")
+            or state.get("turn_index")
+            or 0
+        ),
+        origin_group=str(
+            origin_group
+            if origin_group is not None
+            else action.get("_queue_origin_group")
+            or (state.get("turn_context") or {}).get("origin_group")
+            or ""
+        ),
+        origin_text=exact_origin_text,
+        plan_scope=str(
+            plan_scope
+            if plan_scope is not None
+            else action.get("_plan_scope")
+            or ""
+        ),
+        admission_metadata={
+            key.removeprefix("_"): deepcopy(action[key])
+            for key in _ADMISSION_METADATA_KEYS
+            if key in action
+        },
+        effect_kind=effect_kind,  # type: ignore[arg-type]
+        idempotency_key=(
+            f"{state.get('thread_id') or 'default'}:"
+            f"{int(state.get('turn_index') or 0)}:{action_id}"
+        ),
+    )
+
+
+def _action_from_envelope(payload: Mapping[str, Any]) -> dict[str, Any]:
+    envelope = action_envelope_from_dict(payload)
+    return {
+        "type": envelope.action_type,
+        "action_id": envelope.action_id,
+        "confidence": envelope.confidence,
+        "reason": envelope.reason,
+        **deepcopy(dict(envelope.arguments)),
+    }
+
+
+def _admission_action_from_envelope(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Reconstruct a proposal only at registry and admission boundaries."""
+
+    envelope = action_envelope_from_dict(payload)
+    action = _action_from_envelope(payload)
+    for key, value in envelope.admission_metadata.items():
+        action[f"_{key}"] = deepcopy(value)
+    action["_origin_text"] = envelope.origin_text
+    action["_queue_origin_group"] = envelope.origin_group
+    action["_submitted_turn_index"] = envelope.submitted_turn_index
+    action["_plan_scope"] = envelope.plan_scope
+    action["_plan_index"] = envelope.semantic_order
+    return action
+
+
+def _is_serialized_action_envelope(payload: Mapping[str, Any]) -> bool:
+    return bool(
+        str(payload.get("action_type") or "")
+        and str(payload.get("owner") or "")
+        and isinstance(payload.get("arguments"), Mapping)
+    )
+
+
+def _queue_action(payload: Mapping[str, Any]) -> dict[str, Any]:
+    if not _is_serialized_action_envelope(payload):
+        raise StateInvariantError("durable action queue contains a raw proposal")
+    envelope = action_envelope_from_dict(payload)
+    action = _action_from_envelope(payload)
+    action["_origin_text"] = envelope.origin_text
+    return action
+
+
+def _serialize_admitted_actions(
+    state: AgentGraphState,
+    actions: list[dict[str, Any]],
+    *,
+    default_origin_text: str,
+    default_origin_group: str,
+    default_plan_scope: str,
+) -> list[dict[str, Any]]:
+    """Create the only durable queue representation after admission."""
+
+    serialized: list[dict[str, Any]] = []
+    for index, action in enumerate(actions):
+        envelope = _build_action_envelope(
+            state,
+            action,
+            semantic_order=int(action.get("_plan_index") or index),
+            submitted_turn_index=int(
+                action.get("_submitted_turn_index")
+                or state.get("turn_index")
+                or 0
+            ),
+            origin_group=str(
+                action.get("_queue_origin_group")
+                or default_origin_group
+            ),
+            origin_text=str(
+                action.get("_origin_text")
+                or default_origin_text
+            ),
+            plan_scope=str(
+                action.get("_plan_scope")
+                or default_plan_scope
+            ),
+        )
+        serialized.append(action_envelope_to_dict(envelope))
+    return serialized
+
+
+def _domain_action_from_envelope(
+    state: AgentGraphState,
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the owner input from trusted envelope provenance."""
+
+    action = _action_from_envelope(payload)
+    envelope = action_envelope_from_dict(payload)
+    origin_text = envelope.origin_text
+    if envelope.action_type == "propose_config_values":
+        action["source_text"] = origin_text
+    if envelope.owner == "chain_rpc":
+        action["origin_text"] = origin_text
+    if envelope.owner == "coordinator":
+        action["queue_origin_group"] = envelope.origin_group
+    if envelope.action_type == "analyze_report" and not action.get("job_id"):
+        requested_job = JOB_ID_RE.search(origin_text)
+        if requested_job:
+            action["job_id"] = requested_job.group(0)
+    return action
+
+
+def _queue_has_eligible_action(state: AgentGraphState) -> bool:
+    queue = [
+        dict(item)
+        for item in state.get("action_queue") or []
+        if isinstance(item, Mapping)
+    ]
+    if not queue:
+        return False
+    if not state.get("pending_question"):
+        return True
+    return any(
+        _action_can_run_while_pending(state, _queue_action(action))
+        for action in queue
+    )
+
+
+def execute_selected_owner_step(
+    state: AgentGraphState,
+    *,
+    expected_owner: str,
+) -> AgentGraphState:
+    """Prepare one owner result or run an explicitly unmigrated lifecycle."""
+
+    selected_envelope = dict(state.get("selected_action") or {})
+    envelope = (
+        action_envelope_from_dict(selected_envelope)
+        if selected_envelope
+        else None
+    )
+    selected = _action_from_envelope(selected_envelope) if selected_envelope else {}
+    spec = ACTION_BY_TYPE.get(str(selected.get("type") or ""))
+    if not selected or spec is None or envelope is None or envelope.owner != expected_owner:
+        raise StateInvariantError(
+            f"selected action owner mismatch: {expected_owner}/"
+            f"{str(selected.get('type') or '<missing>')}"
+        )
+    if spec.effect == "execution":
+        return prepare_execution_intent_step(
+            state,
+            expected_owner=expected_owner,
+        )
+    return prepare_selected_owner_result_step(
+        state,
+        expected_owner=expected_owner,
+    )
+
+
+def prepare_execution_intent_step(
+    state: AgentGraphState,
+    *,
+    expected_owner: str,
+) -> AgentGraphState:
+    """Persist one external execution authorization before invocation."""
+
+    candidate = _copy_state(state)
+    envelope = action_envelope_from_dict(candidate.get("selected_action") or {})
+    if envelope.owner != "execution" or expected_owner != "execution":
+        raise StateInvariantError("only the execution owner may prepare a side effect")
+    request_id = str(
+        (candidate.get("preflight") or {}).get("execution_request_id")
+        or envelope.action_id
+    )
+    idempotency_key = f"harness:{request_id}"
+    turn_id = (
+        f"{candidate.get('thread_id') or 'default'}:"
+        f"{int(candidate.get('turn_index') or 0)}"
+    )
+    request = {
+        "action": action_envelope_to_dict(
+            replace(
+                envelope,
+                idempotency_key=idempotency_key,
+                status="prepared",
+            )
+        ),
+        "workflow_mode": str(candidate.get("workflow_mode") or ""),
+        "target_mode": str(candidate.get("target_mode") or ""),
+        "plan_file": str(candidate.get("plan_file") or ""),
+    }
+    request_fingerprint = hashlib.sha256(
+        json.dumps(
+            request,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    intent_id = hashlib.sha256(
+        f"{turn_id}:{envelope.action_id}:{idempotency_key}".encode("utf-8")
+    ).hexdigest()
+    candidate.setdefault("preflight", {})["execution_request_id"] = request_id
+    candidate["side_effect_intent"] = side_effect_intent_to_dict(
+        SideEffectIntent(
+            intent_id=intent_id,
+            turn_id=turn_id,
+            action_id=envelope.action_id,
+            operation=envelope.action_type,
+            idempotency_key=idempotency_key,
+            request=request,
+            request_fingerprint=request_fingerprint,
+            expected_receipt_kind="execution_handler_result",
+        )
+    )
+    candidate["side_effect_receipt"] = {}
+    validate_state(candidate)
+    return _set_turn_phase(candidate, "invoke_effect", "execution_intent_committed")
+
+
+def mark_side_effect_invoking_step(state: AgentGraphState) -> AgentGraphState:
+    """Checkpoint the execution attempt before entering the application service."""
+
+    candidate = _copy_state(state)
+    intent = dict(candidate.get("side_effect_intent") or {})
+    if not intent:
+        raise StateInvariantError("side-effect invocation has no durable intent")
+    if intent.get("status") not in {"prepared", "invoking"}:
+        raise StateInvariantError(
+            f"side-effect intent cannot be invoked from status {intent.get('status')}"
+        )
+    intent["status"] = "invoking"
+    intent["attempt_count"] = int(intent.get("attempt_count") or 0) + 1
+    candidate["side_effect_intent"] = intent
+    validate_state(candidate)
+    return _set_turn_phase(candidate, "perform_effect", "execution_attempt_checkpointed")
+
+
+def invoke_idempotent_side_effect_step(state: AgentGraphState) -> AgentGraphState:
+    """Invoke one external execution operation under its persisted identity."""
+
+    candidate = _copy_state(state)
+    intent = dict(candidate.get("side_effect_intent") or {})
+    selected = dict(candidate.get("selected_action") or {})
+    if not intent or not selected:
+        raise StateInvariantError("external invocation is missing intent or selected action")
+    envelope = action_envelope_from_dict(selected)
+    if intent.get("action_id") != envelope.action_id:
+        raise StateInvariantError("side-effect intent does not match the selected action")
+    action = _domain_action_from_envelope(candidate, selected)
+    result = DOMAIN_RUNTIME["execution"].apply_action(
+        deepcopy(candidate),
+        _action_proposal(action, envelope.confidence),
+    )
+    serialized_result = handler_result_to_dict(result)
+    job_id = ""
+    for write in result.delta.writes:
+        if write.path == ("job", "job_id"):
+            job_id = str(write.value or "")
+            break
+    status = "blocked" if result.blocker or result.completion == "blocked" else "succeeded"
+    receipt_id = hashlib.sha256(
+        f"{intent.get('intent_id')}:{intent.get('attempt_count')}".encode("utf-8")
+    ).hexdigest()
+    candidate["side_effect_receipt"] = side_effect_receipt_to_dict(
+        SideEffectReceipt(
+            receipt_id=receipt_id,
+            intent_id=str(intent.get("intent_id") or ""),
+            action_id=envelope.action_id,
+            status=status,  # type: ignore[arg-type]
+            idempotency_key=str(intent.get("idempotency_key") or ""),
+            result={"handler_result": serialized_result},
+            job_id=job_id,
+            failure_code=result.blocker,
+            retryable=False,
+        )
+    )
+    validate_state(candidate)
+    return _set_turn_phase(candidate, "commit_receipt", "execution_receipt_observed")
+
+
+def commit_side_effect_receipt_step(state: AgentGraphState) -> AgentGraphState:
+    """Admit a persisted external receipt to the common action commit path."""
+
+    candidate = _copy_state(state)
+    intent = dict(candidate.get("side_effect_intent") or {})
+    receipt = dict(candidate.get("side_effect_receipt") or {})
+    if not intent or not receipt:
+        raise StateInvariantError("execution receipt commit requires intent and receipt")
+    if receipt.get("intent_id") != intent.get("intent_id"):
+        raise StateInvariantError("execution receipt does not match its intent")
+    envelope = action_envelope_from_dict(candidate.get("selected_action") or {})
+    handler_payload = dict((receipt.get("result") or {}).get("handler_result") or {})
+    result = handler_result_from_dict(handler_payload)
+    intent["status"] = str(receipt.get("status") or "failed")
+    candidate["side_effect_intent"] = intent
+    candidate = _set_turn_phase(candidate, "commit", "execution_receipt_committed")
+    candidate["pending_domain_result"] = pending_domain_result_to_dict(
+        PendingDomainResult(
+            action=replace(envelope, status="prepared"),
+            result=result,
+            prepared_state_hash=_prepared_state_hash(candidate),
+        )
+    )
+    validate_state(candidate)
+    return candidate
+
+
+def prepare_selected_owner_result_step(
+    state: AgentGraphState,
+    *,
+    expected_owner: str,
+) -> AgentGraphState:
+    """Run one side-effect-free domain handler and persist its typed result."""
+
+    candidate = _copy_state(state)
+    envelope = action_envelope_from_dict(candidate.get("selected_action") or {})
+    if envelope.owner != expected_owner:
+        raise StateInvariantError(
+            f"prepared action owner mismatch: {expected_owner}/{envelope.owner}"
+        )
+    if envelope.effect_kind == "external":
+        raise StateInvariantError(
+            "external action reached pure owner preparation without a side-effect intent"
+        )
+    action = _domain_action_from_envelope(
+        candidate,
+        candidate["selected_action"],
+    )
+    if envelope.action_type == "answer_pending":
+        result = _prepare_pending_answer_result(
+            candidate,
+            action,
+            envelope,
+        )
+        candidate = _set_turn_phase(candidate, "commit", "pending_result_prepared")
+        candidate["pending_domain_result"] = pending_domain_result_to_dict(
+            PendingDomainResult(
+                action=replace(envelope, status="prepared"),
+                result=result,
+                prepared_state_hash=_prepared_state_hash(candidate),
+            )
+        )
+        validate_state(candidate)
+        return candidate
+    runtime = (
+        COORDINATOR_RUNTIME
+        if expected_owner == "coordinator"
+        else DOMAIN_RUNTIME.get(expected_owner)
+    )
+    if runtime is None:
+        raise StateInvariantError(f"no runtime is registered for owner: {expected_owner}")
+    handler_state = deepcopy(candidate)
+    result = runtime.apply_action(
+        handler_state,
+        _action_proposal(action, envelope.confidence),
+    )
+    spec = ACTION_BY_TYPE.get(envelope.action_type)
+    if spec is not None and spec.lifetime == "turn_local":
+        allowed_roots = set(spec.turn_local_result_roots)
+        overlay_question = (
+            result.pending_question
+            if not candidate.get("pending_question") and result.pending_question is not None
+            else None
+        )
+        turn_local_delta = StateDelta(
+            writes=tuple(
+                write
+                for write in result.delta.writes
+                if write.path and write.path[0] in allowed_roots
+            ),
+            deletes=tuple(
+                path
+                for path in result.delta.deletes
+                if path and path[0] in allowed_roots
+            ),
+        )
+        result = replace(
+            result,
+            delta=turn_local_delta,
+            next_group=(
+                str(
+                    (
+                        asdict(overlay_question)
+                        if is_dataclass(overlay_question)
+                        else dict(overlay_question or {})
+                    ).get("group")
+                    or ""
+                )
+                if overlay_question is not None
+                else ""
+            ),
+            pending_question=overlay_question,
+            clear_pending=False,
+            navigation_command=None,
+            checkpoint_command=None,
+            invalidated_groups=(),
+            reconfigured_groups=(),
+            invalidated_fields=(),
+            followup_actions=(),
+        )
+    candidate = _set_turn_phase(candidate, "commit", "domain_result_prepared")
+    candidate["pending_domain_result"] = pending_domain_result_to_dict(
+        PendingDomainResult(
+            action=replace(envelope, status="prepared"),
+            result=result,
+            prepared_state_hash=_prepared_state_hash(candidate),
+        )
+    )
+    validate_state(candidate)
+    return candidate
+
+
+def _prepare_pending_answer_result(
+    state: AgentGraphState,
+    action: dict[str, Any],
+    envelope: ActionEnvelope,
+) -> HandlerResult:
+    """Translate one admitted answer into a domain result or one follow-up."""
+
+    pending = dict(state.get("pending_question") or {})
+    if not pending:
+        return HandlerResult(blocker="no pending question is available for this answer")
+    raw_answer = action.get("answer", "")
+    selected = action.get("selected_value")
+    if isinstance(selected, str) and not selected.strip():
+        selected = None
+    choice_question = str(pending.get("kind") or "") in {
+        "numbered_choice",
+        "yes_no",
+    }
+    interpreted: Any = selected if selected is not None else raw_answer
+    if not choice_question and (
+        interpreted is None
+        or (isinstance(interpreted, str) and not interpreted.strip())
     ):
-        return _set_turn_phase(state, "execute", "queue_has_next_action")
-    if stop or state.get("pending_question"):
-        return _set_turn_phase(state, "compose", "queue_blocked_or_complete")
-    return _set_turn_phase(state, "fallback", "queue_complete")
+        return HandlerResult(blocker="the pending answer is empty")
+    if not choice_question and not (
+        _pending_option_value_exists(selected, pending)
+        or _value_satisfies_pending_contract(interpreted, pending)
+    ):
+        return HandlerResult(
+            blocker=_localized(
+                state.get("language", "en"),
+                "模型给出的结构化值不符合当前字段契约，当前问题保持不变。",
+                "The model-derived value does not satisfy the current field contract. The question remains active.",
+            )
+        )
+    manual_choice_value = bool(
+        choice_question
+        and pending.get("manual_input_allowed") is True
+        and not _pending_option_value_exists(selected, pending)
+        and _value_satisfies_pending_contract(
+            selected if selected is not None else str(raw_answer),
+            pending,
+        )
+    )
+    if (
+        choice_question
+        and not _pending_option_value_exists(selected, pending)
+        and not manual_choice_value
+    ):
+        return HandlerResult(
+            blocker=_localized(
+                state.get("language", "en"),
+                "模型没有把这段回复映射到一个已声明选项，当前问题保持不变。请换一种说法，或回复显示的选项。",
+                "The model did not map that reply to a declared option. The question remains active; rephrase or use a displayed option.",
+            )
+        )
+    value = selected if _pending_option_value_exists(selected, pending) else interpreted
+    declared_action = action_for_value(pending, value)
+    if declared_action and str(declared_action.get("type") or "") != "answer_pending":
+        followup = dict(declared_action)
+        spec = ACTION_BY_TYPE.get(str(followup.get("type") or ""))
+        if (
+            spec is not None
+            and "source_evidence" in spec.allowed_arguments
+            and not str(followup.get("source_evidence") or "").strip()
+        ):
+            followup["source_evidence"] = str(raw_answer or "").strip()
+        followup["confidence"] = "high"
+        followup["selection_contract_verified"] = True
+        policy = _option_return_policy(pending, value)
+        return HandlerResult(
+            consumed_action_ids=(envelope.action_id,),
+            clear_pending=policy != "stay",
+            pending_question=pending if policy == "stay" else None,
+            followup_actions=(followup,),
+            completion="completed",
+        )
+    question_id = str(pending.get("id") or "")
+    if question_id == "inferred_config_review":
+        return replace(
+            apply_inferred_config_review(state, bool(value)),
+            consumed_action_ids=(envelope.action_id,),
+        )
+    group = str(pending.get("group") or "")
+    runtime = DOMAIN_RUNTIME.get(GROUP_OWNER.get(group, ""))
+    if runtime is None or runtime.apply_answer is None:
+        return HandlerResult(
+            blocker=f"no answer handler owns question: {group}/{question_id}"
+        )
+    return replace(
+        runtime.apply_answer(
+            deepcopy(state),
+            pending,
+            value,
+            str(raw_answer or ""),
+        ),
+        consumed_action_ids=(envelope.action_id,),
+    )
+
+
+def commit_selected_action_step(state: AgentGraphState) -> AgentGraphState:
+    """Commit exactly one prepared owner result and disposition its action."""
+
+    candidate = _copy_state(state)
+    prepared_payload = dict(candidate.get("pending_domain_result") or {})
+    if not prepared_payload:
+        raise StateInvariantError("commit node has no pending domain result")
+    prepared = pending_domain_result_from_dict(prepared_payload)
+    envelope = prepared.action
+    if prepared.prepared_state_hash != _prepared_state_hash(candidate):
+        raise StateInvariantError("prepared domain result state fingerprint changed before commit")
+    queue = [
+        dict(item)
+        for item in candidate.get("action_queue") or []
+        if isinstance(item, Mapping)
+    ]
+    if not queue or str(queue[0].get("action_id") or "") != envelope.action_id:
+        raise StateInvariantError("prepared action is not the admitted queue head")
+    action = _action_from_envelope(action_envelope_to_dict(envelope))
+    before_pending = dict(candidate.get("pending_question") or {})
+    before_pending_id = str(before_pending.get("id") or "")
+    before_responses = list(candidate.get("visible_response") or [])
+    spec = ACTION_BY_TYPE.get(envelope.action_type)
+    candidate["action_queue"] = queue[1:]
+    if envelope.action_type == "answer_pending":
+        _discard_superseded_queue_actions(candidate, before_pending)
+    candidate["pending_domain_result"] = {}
+    candidate["selected_action"] = {}
+    candidate["current_action"] = action
+    control = dict(candidate.get("control") or {})
+    control.pop("selected_owner", None)
+    candidate["control"] = control
+    if (
+        envelope.action_type != "answer_pending"
+        and not (spec is not None and spec.lifetime == "turn_local")
+        and envelope.action_type
+        in {
+            str(item).strip()
+            for item in before_pending.get("accepted_action_types") or []
+            if str(item).strip()
+        }
+    ):
+        candidate["pending_question"] = {}
+    committed = _apply_handler_result(
+        candidate,
+        prepared.result,
+        owner=envelope.owner,
+    )
+    if (
+        prepared.result.completion == "in_progress"
+        and prepared.result.next_group
+        and not committed.get("pending_question")
+    ):
+        active_group = str(prepared.result.next_group)
+        internal_group_progression = bool(
+            active_group
+            and active_group
+            in {
+                str(envelope.target_group or ""),
+                str(before_pending.get("group") or ""),
+                str(candidate.get("active_group") or ""),
+            }
+        )
+        prerequisite = (
+            _navigation_prerequisite(committed, active_group)
+            if active_group and not internal_group_progression
+            else ""
+        )
+        if prerequisite:
+            control = dict(committed.get("control") or {})
+            control["deferred_group"] = active_group
+            committed["control"] = control
+            _record_group_transition(committed, prerequisite)
+            active_group = prerequisite
+        next_question = _question_for_group(committed, active_group) if active_group else None
+        if next_question:
+            next_question["same_turn_navigation_allowed"] = (
+                prepared.result.completion != "blocked"
+            )
+            _install_pending_question(committed, next_question)
+    if committed.get("pending_question") and committed.get("action_queue"):
+        committed["pending_question"]["resume_action_queue"] = True
+    defer_after_answer = False
+    if envelope.action_type == "answer_pending":
+        committed = _resume_field_reconfiguration_after_prerequisite(
+            committed,
+            answered_question=before_pending,
+        )
+        if (
+            before_pending_id
+            and str((committed.get("pending_question") or {}).get("id") or "")
+            == before_pending_id
+            and prepared.result.completion == "blocked"
+        ):
+            committed["pending_question"]["created_turn_index"] = int(
+                committed.get("turn_index") or 0
+            )
+        if (
+            prepared.result.completion == "blocked"
+            and committed.get("pending_question")
+            and committed.get("action_queue")
+        ):
+            committed["pending_question"]["resume_action_queue"] = True
+            defer_after_answer = True
+        elif committed.get("pending_question") and committed.get("action_queue"):
+            committed["pending_question"]["resume_action_queue"] = True
+            if (
+                not _queue_has_eligible_action(committed)
+            ):
+                defer_after_answer = True
+    if envelope.action_type == "reset_session" and queue[1:]:
+        committed["action_queue"] = queue[1:]
+    after_pending_id = str((committed.get("pending_question") or {}).get("id") or "")
+    if (
+        spec is not None
+        and spec.preserve_pending
+        and before_pending_id
+        and after_pending_id != before_pending_id
+        and not _action_satisfies_pending_manual_effect(before_pending, action)
+    ):
+        _push_interruption_frame(
+            committed,
+            before_pending,
+            reason=f"{envelope.action_type}_overlay",
+        )
+    if before_responses:
+        merged = list(before_responses)
+        if before_pending_id and after_pending_id != before_pending_id:
+            merged = _without_superseded_question(
+                merged,
+                before_pending,
+                committed.get("language", "en"),
+            )
+        for response in committed.get("visible_response") or []:
+            if response not in merged:
+                merged.append(response)
+        committed["visible_response"] = merged
+    rejected = bool(prepared.result.blocker)
+    if not rejected:
+        if spec is None or spec.lifetime != "turn_local":
+            completed = list(committed.get("completed_actions") or [])
+            completed.append(action)
+            committed["completed_actions"] = completed[-20:]
+        if envelope.action_id:
+            applied = list(committed.get("applied_action_ids") or [])
+            if envelope.action_id not in applied:
+                applied.append(envelope.action_id)
+            committed["applied_action_ids"] = applied[-200:]
+        receipt = dict(committed.get("turn_receipt") or {})
+        execution_order = list(receipt.get("execution_order") or [])
+        if envelope.action_id and envelope.action_id not in execution_order:
+            execution_order.append(envelope.action_id)
+        receipt["execution_order"] = execution_order
+        receipt["status"] = "executing"
+        committed["turn_receipt"] = receipt
+        if spec is not None and spec.lifetime == "turn_local":
+            result_count = len(
+                [
+                    response
+                    for response in (
+                        *prepared.result.visible_results,
+                        prepared.result.visible_result,
+                    )
+                    if response
+                ]
+            )
+            if result_count:
+                turn_context = dict(committed.get("turn_context") or {})
+                turn_context["turn_local_result_count"] = int(
+                    turn_context.get("turn_local_result_count") or 0
+                ) + result_count
+                committed["turn_context"] = turn_context
+    committed["current_action"] = {}
+    if (
+        spec is not None
+        and spec.lifetime == "turn_local"
+        and not committed.get("action_queue")
+    ):
+        validate_state(committed)
+        return _set_turn_phase(
+            committed,
+            "compose",
+            "turn_local_result_completed",
+        )
+    if defer_after_answer:
+        validate_state(committed)
+        return _set_turn_phase(
+            committed,
+            "compose",
+            "new_pending_contract_defers_remaining_queue",
+        )
+    queue_can_continue = _queue_has_eligible_action(committed)
+    if rejected or (
+        prepared.result.stop_after_response
+        and not committed.get("action_queue")
+    ):
+        return _set_turn_phase(committed, "compose", "action_commit_stopped")
+    if queue_can_continue:
+        validate_state(committed)
+        return _set_turn_phase(committed, "execute", "action_committed_queue_continues")
+    if committed.get("pending_question"):
+        validate_state(committed)
+        return _set_turn_phase(committed, "compose", "action_committed_pending")
+    validate_state(committed)
+    return _set_turn_phase(committed, "fallback", "action_committed_queue_complete")
+
+
+def _prepared_state_hash(state: Mapping[str, Any]) -> str:
+    payload = {
+        key: value
+        for key, value in state.items()
+        if key not in {
+            "discovery",
+            "framework_summary",
+            "web_research",
+            "pending_domain_result",
+        }
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def fallback_turn_step(state: AgentGraphState) -> AgentGraphState:
@@ -692,6 +1868,16 @@ def fallback_turn_step(state: AgentGraphState) -> AgentGraphState:
 
 def compose_turn_step(state: AgentGraphState) -> AgentGraphState:
     state = _finalize_turn_response(state)
+    receipt = dict(state.get("turn_receipt") or {})
+    if receipt:
+        receipt["pending_after"] = deepcopy(state.get("pending_question") or {})
+        receipt["response_count"] = len(state.get("visible_response") or [])
+        receipt["status"] = (
+            "blocked"
+            if state.get("pending_question") or state.get("failure_recovery")
+            else "completed"
+        )
+        state["turn_receipt"] = receipt
     return _set_turn_phase(state, "end", "response_composed")
 
 
@@ -724,957 +1910,13 @@ def _copy_state(state: AgentGraphState) -> AgentGraphState:
     return output
 
 
-def _normalized_action_queue(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    raw_actions = payload.get("actions") if isinstance(payload, dict) else None
-    if isinstance(raw_actions, dict):
-        raw_actions = [raw_actions]
-    if not isinstance(raw_actions, list):
-        return []
-    output: list[dict[str, Any]] = []
-    current_actions = [raw for raw in raw_actions[:12] if isinstance(raw, dict)]
-    for raw in current_actions:
-        try:
-            # The resolver is the sole producer of trusted admission receipts.
-            # Model documents are validated before those receipts are attached.
-            action = validate_action_contract(raw, trusted_metadata=True)
-        except ValueError as exc:
-            action = {"type": "unknown", "reason": str(exc), "confidence": "low"}
-        action_type = str(action.get("type") or action.get("intent") or "unknown").strip()
-        action["type"] = action_type
-        action["confidence"] = str(action.get("confidence") or "medium").strip().lower()
-        output.append(action)
-    return output
-
-
-def _canonical_pending_choice_matches(
-    state: AgentGraphState,
-    action: Mapping[str, Any],
-) -> bool:
-    """Verify one admitted semantic choice against its immutable contract."""
-
-    pending = dict(state.get("pending_question") or {})
-    selected = action.get("selected_value")
-    action_id = str(action.get("_admission_action_id") or "")
-    matches = []
-    for row in (state.get("turn_context") or {}).get("pending_choice_contracts") or []:
-        if not isinstance(row, Mapping):
-            continue
-        question = row.get("question") if isinstance(row.get("question"), Mapping) else {}
-        option = row.get("option") if isinstance(row.get("option"), Mapping) else {}
-        provenance = row.get("semantic_units") if isinstance(row.get("semantic_units"), list) else []
-        if (
-            str(question.get("id") or "") == str(pending.get("id") or "")
-            and str(question.get("group") or "") == str(pending.get("group") or "")
-            and option.get("selected_value") == selected
-            and str(row.get("admission_action_id") or "") == action_id
-            and provenance
-        ):
-            matches.append(row)
-    return len(matches) == 1
-
-
-def _bypasses_canonical_pending_choice(
-    state: AgentGraphState,
-    action: Mapping[str, Any],
-) -> bool:
-    """Reject a declared option owner that bypassed canonical admission."""
-
-    if str(action.get("type") or "") == "answer_pending":
-        return False
-    pending = dict(state.get("pending_question") or {})
-    for option in pending.get("options") or []:
-        declared = option.get("action") if isinstance(option, Mapping) else None
-        if not isinstance(declared, Mapping):
-            continue
-        if str(declared.get("type") or "") != str(action.get("type") or ""):
-            continue
-        spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
-        if spec is None or not spec.pending_option_admission:
-            continue
-        if all(key == "type" or action.get(key) == value for key, value in declared.items()):
-            return True
-    return False
-
-
-def _validate_action_plan(state: AgentGraphState, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Validate typed plan semantics without reinterpreting user language."""
-    if not actions:
-        return actions
-    prepared = normalize_action_relations([dict(item) for item in actions])
-    try:
-        validate_action_transaction_contract(prepared)
-    except ValueError:
-        # The semantic resolver normally repairs this before admission. Keep a
-        # fail-closed boundary for stale checkpoints or invalid integrations:
-        # clarification is atomic, so no sibling may mutate state.
-        prepared = [
-            item
-            for item in prepared
-            if str(item.get("type") or "") == "clarify_unresolved"
-        ]
-    prepared = [
-        item
-        for item in prepared
-        if not _bypasses_canonical_pending_choice(state, item)
-    ]
-    for item in prepared:
-        if item.get("pending_option_semantic_verified") is True and _canonical_pending_choice_matches(state, item):
-            item["selection_contract_verified"] = True
-    prepared = _resolve_pending_answer_invalidation_conflicts(state, prepared)
-    lifecycle_rejected = lifecycle_rejected_action_indexes(state, prepared)
-    if lifecycle_rejected:
-        rejected_types = ", ".join(
-            str(prepared[index].get("type") or "unknown")
-            for index in lifecycle_rejected
-        )
-        raise StateInvariantError(
-            f"actions incompatible with current typed lifecycle state: {rejected_types}"
-        )
-    identity = state.get("chain_identity") or {}
-    if identity.get("case") == "case3" and identity.get("adapter_family") == "unsupported":
-        # An unsupported-family handoff cannot also mutate the RPC catalog.
-        # The user must explicitly leave Case 3 by changing chain/family first.
-        changes_case = any(
-            str(item.get("type") or "") in {"choose_chain", "change_chain", "choose_adapter_family"}
-            for item in prepared
-        )
-        if not changes_case:
-            prepared = [
-                item for item in prepared
-                if str(item.get("type") or "") not in {"rpc_catalog_command", "rpc_workload_command"}
-            ]
-    if any(str(item.get("type") or "") != "unknown" for item in prepared):
-        # ``unknown`` is the whole-turn fallback, not an executable sibling.
-        # A provider may emit one invalid proposal and other valid actions in
-        # the same plan; retaining the normalized fallback would block those
-        # valid actions and surface a false "no safe action" response.
-        prepared = [item for item in prepared if str(item.get("type") or "") != "unknown"]
-    prepared = _drop_conflicting_answer_actions(state, prepared)
-    if state.get("target_mode"):
-        # A free-standing model request cannot reopen replacement of a
-        # confirmed mode. Declared menu choices have already been rebound to
-        # answer_pending; explicit user navigation uses change_group.
-        prepared = [
-            item
-            for item in prepared
-            if str(item.get("type") or "") != "request_target_mode_selection"
-        ]
-    admitted: list[dict[str, Any]] = []
-    current_answer_checked = False
-    for item in prepared:
-        if str(item.get("type") or "") != "answer_pending":
-            admitted.append(item)
-            continue
-        # A user turn can answer only the question that existed when the turn
-        # began. Future decisions must be represented by domain actions, not by
-        # speculative answer_pending entries for questions that do not exist.
-        if not current_answer_checked:
-            current_answer_checked = True
-            if _action_answers_pending_contract(state, item):
-                admitted.append(item)
-            continue
-        continue
-    prepared = admitted
-    pending_id = str((state.get("pending_question") or {}).get("id") or "")
-    # A model plan cannot answer a domain question that does not exist yet.
-    # Protocol selection is intentionally a separate user-confirmed decision
-    # after an unknown-chain identity choice. Exact menu answers are applied
-    # locally and never need this speculative domain action.
-    if pending_id not in {"adapter_family_confirm", "custom_rpc_adapter_family_confirm"}:
-        prepared = [
-            item for item in prepared
-            if str(item.get("type") or "") != "choose_adapter_family"
-        ]
-    pending_answers = [
-        item for item in prepared
-        if str(item.get("type") or "") == "answer_pending"
-    ]
-    if pending_answers:
-        # One turn may express the current answer both as answer_pending and as
-        # its declared domain effect. Drop only that exact duplicate effect.
-        # Another operation owned by the same action type (for example a
-        # custom-RPC method supplied beside an endpoint answer) is independent
-        # durable work and must survive the newly created question barrier.
-        prepared = [
-            item for item in prepared
-            if str(item.get("type") or "") == "answer_pending"
-            or not any(
-                _action_duplicates_pending_answer_effect(state, item, answer)
-                for answer in pending_answers
-            )
-        ]
-    prepared = [
-        item
-        for item in prepared
-        if str(item.get("type") or "") != "choose_target_mode"
-        or (
-            bool(normalize_target_mode(item.get("target_mode")))
-            and (
-                item.get("selection_contract_verified") is True
-                or item.get("target_mode_semantic_verified") is True
-                or target_mode_evidence_matches(
-                    item.get("target_mode"),
-                    item.get("source_evidence"),
-                    state.get("last_user_input"),
-                )
-            )
-        )
-    ]
-    prepared = [
-        item
-        for item in prepared
-        if str(item.get("type") or "") != "queue_workflow_goal"
-        or (
-            bool(normalize_target_mode(item.get("target_mode")))
-            and bool(str(item.get("goal") or "").strip())
-            and bool(str(item.get("source_evidence") or "").strip())
-            and str(item.get("source_evidence") or "").strip() in str(state.get("last_user_input") or "")
-        )
-    ]
-    normalized_partial_actions: list[dict[str, Any]] = []
-    for item in prepared:
-        if str(item.get("type") or "") == "set_qps_override" and not isinstance(item.get("qps_overrides"), dict):
-            item = {
-                **item,
-                "type": "request_qps_customization",
-                "qps_fields": item.get("qps_fields") or [],
-            }
-            item.pop("qps_overrides", None)
-        normalized_partial_actions.append(item)
-    prepared = normalized_partial_actions
-    prepared = [
-        item
-        for item in prepared
-        if str(item.get("type") or "") != "change_group"
-        or item.get("selection_contract_verified") is True
-        or (
-            item.get("navigation_explicit") is True
-            and bool(str(item.get("source_evidence") or "").strip())
-            and str(item.get("source_evidence") or "").strip() in str(state.get("last_user_input") or "")
-        )
-    ]
-    extension_consultation = any(
-        str(item.get("type") or "") == "answer_opening_question"
-        and str(item.get("topic") or "").strip().lower() == "extension"
-        for item in prepared
-    )
-    if extension_consultation:
-        prepared = [
-            item
-            for item in prepared
-            if str(item.get("type") or "") != "rpc_catalog_command"
-            or str(item.get("catalog_command") or "") != "enter"
-        ]
-    mutation_types = {
-        "choose_chain", "change_chain", "set_rpc_mode", "set_qps_mode", "request_qps_customization",
-        "set_qps_override", "set_observability", "rpc_catalog_command", "rpc_workload_command",
-    }
-    has_benchmark_mutation = any(str(item.get("type") or "") in mutation_types for item in prepared)
-    chooses_mode = any(
-        str(item.get("type") or "") == "choose_target_mode"
-        or (
-            str(item.get("type") or "") == "answer_pending"
-            and _pending_answer_declared_action_type(state, item) == "choose_target_mode"
-        )
-        for item in prepared
-    )
-    requests_mode = any(str(item.get("type") or "") == "request_target_mode_selection" for item in prepared)
-    if has_benchmark_mutation and not state.get("target_mode") and not chooses_mode and not requests_mode:
-        prepared.append({
-            "type": "request_target_mode_selection",
-            "confidence": "high",
-            "reason": "benchmark actions require an explicit target mode",
-        })
-    prepared = _drop_redundant_group_navigation(state, prepared)
-    return _ensure_action_prerequisites(state, prepared)
-
-
-def _action_duplicates_pending_answer_effect(
-    state: AgentGraphState,
-    action: Mapping[str, Any],
-    pending_answer: Mapping[str, Any],
-) -> bool:
-    """Match a sibling action to the current answer's declared exact effect."""
-
-    pending = dict(state.get("pending_question") or {})
-    selected = pending_answer.get("selected_value")
-    declared = action_for_value(pending, selected)
-    if not declared and pending.get("manual_input_allowed") is True:
-        manual = pending.get("manual_action")
-        if isinstance(manual, Mapping):
-            declared = {
-                str(key): value
-                for key, value in manual.items()
-                if str(key) not in {"value_argument", "use_complete_turn"}
-            }
-            value_argument = str(manual.get("value_argument") or "").strip()
-            answer_value = (
-                selected
-                if selected not in (None, "")
-                else pending_answer.get("answer")
-            )
-            if value_argument and answer_value not in (None, ""):
-                declared[value_argument] = answer_value
-    if not declared or str(action.get("type") or "") != str(declared.get("type") or ""):
-        return False
-    effect_fields = {
-        key: value
-        for key, value in declared.items()
-        if key != "type"
-        and key != "source_evidence"
-        and not key.endswith("_explicit")
-        and key not in {"selection_contract_verified", "semantic_purpose_verified"}
-    }
-    if not effect_fields:
-        return False
-    return all(
-        action.get(key) == value
-        for key, value in effect_fields.items()
-    )
-
-
-def _action_satisfies_pending_manual_effect(
-    pending: Mapping[str, Any],
-    action: Mapping[str, Any],
-) -> bool:
-    """Return whether one typed action supplies the pending manual contract."""
-
-    manual = pending.get("manual_action")
-    if not isinstance(manual, Mapping):
-        return False
-    if str(action.get("type") or "") != str(manual.get("type") or ""):
-        return False
-    value_argument = str(manual.get("value_argument") or "").strip()
-    fixed = {
-        str(key): value
-        for key, value in manual.items()
-        if str(key) not in {"type", "value_argument", "use_complete_turn"}
-    }
-    if any(action.get(key) != value for key, value in fixed.items()):
-        return False
-    return bool(value_argument and action.get(value_argument) not in (None, ""))
-
-
-def _resolve_pending_answer_invalidation_conflicts(
-    state: AgentGraphState,
-    actions: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Resolve pending answers against invalidating sibling mutations."""
-
-    pending_group = str((state.get("pending_question") or {}).get("group") or "").strip()
-    if not pending_group:
-        return actions
-    invalidating: list[dict[str, Any]] = []
-    for action in actions:
-        if str(action.get("type") or "") == "answer_pending":
-            continue
-        spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
-        if spec is None or not spec.mutation_dimension:
-            continue
-        source_group = str(spec.target_group or spec.mutation_dimension).strip()
-        if pending_group in set(invalidation_targets(source_group)):
-            invalidating.append(action)
-    if invalidating:
-        return [
-            item for item in actions
-            if str(item.get("type") or "") != "answer_pending"
-        ]
-    return actions
-
-
-def _drop_redundant_group_navigation(state: AgentGraphState, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Remove navigation when a concrete action already owns that destination."""
-
-    concrete_groups = {
-        "chain_identity": {"choose_chain", "change_chain", "request_chain_selection"},
-        "workload_rpc": {"set_rpc_mode", "rpc_catalog_command", "rpc_workload_command", "use_default_workload", "configure_workload_weights"},
-        "qps_profile": {"set_qps_mode", "request_qps_customization", "set_qps_override"},
-        "observability": {"set_observability"},
-        "sync_observe": {
-            "set_sync_observe_source",
-            "clear_sync_observe_source",
-            "set_sync_observe_options",
-        },
-    }
-    action_types = {str(item.get("type") or "") for item in actions}
-    output: list[dict[str, Any]] = []
-    for item in actions:
-        if str(item.get("type") or "") == "change_group":
-            group = str(item.get("group") or "")
-            if action_types & concrete_groups.get(group, set()):
-                continue
-            if "answer_pending" in action_types and group == str(state.get("active_group") or ""):
-                continue
-        output.append(item)
-    return output
-
-
-def _ensure_action_prerequisites(state: AgentGraphState, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Add typed prerequisite questions without inventing user choices."""
-
-    output = list(actions)
-    action_types = {str(item.get("type") or "") for item in output}
-    chain_required = {"set_rpc_mode", "rpc_workload_command", "use_default_workload", "configure_workload_weights"}
-    chain_confirmed = chain_identity_confirmed(state)
-    identity = state.get("chain_identity") or {}
-    catalog_continues_case2 = is_existing_family_lifecycle(identity)
-    needs_chain_prerequisite = bool(action_types & chain_required) or (
-        "rpc_catalog_command" in action_types and not catalog_continues_case2
-    )
-    chain_planned = bool(action_types & {"choose_chain", "change_chain", "request_chain_selection"})
-    if needs_chain_prerequisite and not chain_confirmed and not chain_planned:
-        output.insert(0, {
-            "type": "change_group",
-            "group": "workload_rpc",
-            "navigation_explicit": True,
-            "source_evidence": str(state.get("last_user_input") or ""),
-            "confidence": "high",
-            "reason": "workload actions require confirmed chain identity",
-        })
-    return output
-
-
-def _action_answers_pending_contract(state: AgentGraphState, action: dict[str, Any]) -> bool:
-    """Reject model answers that bypass the active typed question contract."""
-
-    pending = state.get("pending_question") or {}
-    if not pending:
-        return False
-    if str(pending.get("kind") or "") in {"numbered_choice", "yes_no"}:
-        selected = action.get("selected_value")
-        if not _pending_option_value_exists(selected, pending):
-            answer = str(action.get("answer") or "").strip()
-            evidence = str(action.get("source_evidence") or "").strip()
-            user_text = str(state.get("last_user_input") or "")
-            return bool(
-                pending.get("manual_input_allowed") is True
-                and answer
-                and evidence
-                and evidence in user_text
-                and answer in evidence
-                and _value_satisfies_pending_contract(answer, pending)
-                and action.get("semantic_purpose_verified") is True
-            )
-        if not (
-            action.get("selection_contract_verified") is True
-            and _canonical_pending_choice_matches(state, action)
-        ):
-            return False
-        return True
-    selected = action.get("selected_value")
-    if isinstance(selected, str) and not selected.strip():
-        selected = None
-    raw_answer = selected if selected is not None else action.get("answer")
-    answer = str(raw_answer or "").strip()
-    evidence = str(action.get("source_evidence") or "").strip()
-    user_text = str(state.get("last_user_input") or "")
-    declared_option = _pending_option_value_exists(selected, pending)
-    if not evidence or evidence not in user_text:
-        return False
-    if (
-        not declared_option
-        and answer not in evidence
-        and action.get("semantic_purpose_verified") is not True
-    ):
-        return False
-    reserved_identifiers = {
-        str(pending.get("id") or "").strip().casefold(),
-        str(pending.get("field") or "").strip().casefold(),
-        str(pending.get("group") or "").strip().casefold(),
-    }
-    if answer.casefold() in reserved_identifiers:
-        return False
-    return bool(
-        raw_answer not in (None, "")
-        and (
-            declared_option
-            or _value_satisfies_pending_contract(raw_answer, pending)
-        )
-    )
-
-
-def _pending_answer_declared_action_type(state: AgentGraphState, action: dict[str, Any]) -> str:
-    pending = state.get("pending_question") or {}
-    selected = action.get("selected_value")
-    declared = action_for_value(pending, selected)
-    return str(declared.get("type") or "")
-
-
-def _drop_conflicting_answer_actions(state: AgentGraphState, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    user_text = str(state.get("last_user_input") or "")
-    pending = dict(state.get("pending_question") or {})
-    evidenced_consultation_topics = {
-        str(item.get("topic") or "").strip().lower()
-        for item in actions
-        if str(item.get("type") or "") == "answer_opening_question"
-        and bool(str(item.get("source_evidence") or "").strip())
-        and str(item.get("source_evidence") or "").strip() in user_text
-    }
-    if evidenced_consultation_topics:
-        actions = [
-            item
-            for item in actions
-            if not (
-                str(item.get("type") or "") == "answer_opening_question"
-                and str(item.get("topic") or "").strip().lower() in evidenced_consultation_topics
-                and not (
-                    bool(str(item.get("source_evidence") or "").strip())
-                    and str(item.get("source_evidence") or "").strip() in user_text
-                )
-            )
-        ]
-        raw_selects_pending, _selected_value = contract_exact_answer(user_text, pending)
-        if pending and not raw_selects_pending:
-            # A read-only consultation is an overlay on the active workflow.
-            # The model may not turn that prose into a menu value and thereby
-            # consume the pending contract. Exact option selection is owned by
-            # the raw-input contract matcher above.
-            actions = [
-                item
-                for item in actions
-                if str(item.get("type") or "") != "answer_pending"
-                or item.get("pending_option_semantic_verified") is True
-            ]
-    requests_target_mode = any(
-        str(item.get("type") or "") == "request_target_mode_selection"
-        for item in actions
-    )
-    if requests_target_mode and str((state.get("pending_question") or {}).get("id") or "") == "opening_next_action":
-        actions = [
-            item
-            for item in actions
-            if str(item.get("type") or "") != "answer_pending"
-        ]
-    if any(str(item.get("type") or "") == "change_group" for item in actions):
-        actions = [item for item in actions if str(item.get("type") or "") != "go_back"]
-    if any(str(item.get("type") or "") == "analyze_report" for item in actions):
-        actions = [
-            item
-            for item in actions
-            if not (
-                str(item.get("type") or "") in {"ask_capabilities", "answer_opening_question"}
-                and str(item.get("topic") or "capabilities").strip().lower()
-                in {"capabilities", "current_job", "job_status", "execution_status", "evidence_help", "log_help"}
-            )
-        ]
-    consultation_topics = {
-        str(item.get("topic") or "").strip().lower()
-        for item in actions
-        if str(item.get("type") or "") == "answer_opening_question"
-    }
-    if "workload_config" in consultation_topics:
-        workload_will_be_rendered_by_mutation = any(
-            str(item.get("type") or "") in {
-                "set_rpc_mode",
-                "use_default_workload",
-                "configure_workload_weights",
-                "rpc_catalog_command",
-                "rpc_workload_command",
-            }
-            for item in actions
-        )
-        actions = [
-            item
-            for item in actions
-            if not (
-                str(item.get("type") or "") == "answer_opening_question"
-                and (
-                    str(item.get("topic") or "").strip().lower()
-                    in {"current_config", "config_explanation"}
-                    or (
-                        workload_will_be_rendered_by_mutation
-                        and str(item.get("topic") or "").strip().lower() == "workload_config"
-                    )
-                )
-            )
-        ]
-        consultation_topics = {
-            str(item.get("topic") or "").strip().lower()
-            for item in actions
-            if str(item.get("type") or "") == "answer_opening_question"
-        }
-    if "current_config" in consultation_topics:
-        # The current-config renderer owns current context and includes the
-        # computed next blocker. These two topics are proven output subsets,
-        # unlike requirements/workflow questions which must remain independent.
-        actions = [
-            item
-            for item in actions
-            if not (
-                str(item.get("type") or "") == "answer_opening_question"
-                and str(item.get("topic") or "").strip().lower() in {"current_context", "next_action"}
-            )
-        ]
-    topics = {
-        str(item.get("topic") or "").strip().lower()
-        for item in actions
-        if str(item.get("type") or "") == "answer_opening_question"
-    }
-    specific_chain_consultation = any(
-        str(item.get("type") or "") == "answer_opening_question"
-        and str(item.get("topic") or "").strip().lower() == "supported_chains"
-        and bool(str(item.get("subject") or "").strip())
-        for item in actions
-    )
-    if specific_chain_consultation:
-        actions = [
-            item
-            for item in actions
-            if not (
-                str(item.get("type") or "") in {"ask_capabilities", "answer_opening_question"}
-                and str(item.get("topic") or "capabilities").strip().lower() in {"identity", "capabilities", "agent_capability"}
-            )
-        ]
-        topics = {
-            str(item.get("topic") or "").strip().lower()
-            for item in actions
-            if str(item.get("type") or "") == "answer_opening_question"
-        }
-    if not (topics & {"performance_benchmark_guidance", "mode_comparison"}):
-        return actions
-    pruned: list[dict[str, Any]] = []
-    for item in actions:
-        action_type = str(item.get("type") or "").strip()
-        topic = str(item.get("topic") or "").strip().lower()
-        target_mode = _normalized_target_mode(item.get("target_mode"))
-        if action_type == "answer_opening_question" and topic in {"recommendation", "recommend_start"}:
-            continue
-        if "performance_benchmark_guidance" in topics and action_type == "choose_target_mode" and target_mode == "fake-node":
-            continue
-        pruned.append(item)
-    return pruned
-
-
-def _has_meaningful_queue(actions: list[dict[str, Any]]) -> bool:
-    return any(
-        action_type in ACTION_BY_TYPE and action_type != "unknown"
-        for item in actions
-        if (action_type := str(item.get("type") or "").strip())
-    )
-
-
-def _validate_admission_transaction(
-    state: AgentGraphState,
-    actions: list[dict[str, Any]],
-    *,
-    current_submission: bool,
-) -> None:
-    """Validate Harness receipts against their session and ordered transaction."""
-
-    thread_id = str(state.get("thread_id") or "default")
-    session_id = str((state.get("session") or {}).get("id") or thread_id)
-    turn_index = int(state.get("turn_index") or 0)
-    receipt_actions = [
-        action for action in actions
-        if isinstance(action, dict) and action.get("_admission_action_id")
-    ]
-    if receipt_actions:
-        declared_orders = {
-            tuple(str(value) for value in action.get("_transaction_action_ids") or [])
-            for action in receipt_actions
-        }
-        if len(declared_orders) != 1:
-            raise StateInvariantError("admission transaction order metadata is inconsistent")
-        declared_order = next(iter(declared_orders))
-        actual_order = tuple(str(action.get("_admission_action_id") or "") for action in receipt_actions)
-        if actual_order != tuple(value for value in declared_order if value in set(actual_order)):
-            raise StateInvariantError("admission transaction action order mismatch")
-    for action in actions:
-        action_type = str(action.get("type") or "")
-        if action_type == "request_config_field_input":
-            validate_field_intake_admission_receipt(
-                action,
-                thread_id=thread_id,
-                session_id=session_id,
-            )
-            receipt = action.get("_semantic_admission_receipt") or {}
-            if current_submission and int(receipt.get("submitted_turn_index") or 0) != turn_index:
-                raise StateInvariantError("field intake receipt belongs to another turn")
-        elif action_type == "propose_config_values":
-            validate_proposal_field_receipts(
-                action,
-                thread_id=thread_id,
-                session_id=session_id,
-                submitted_turn_index=turn_index if current_submission else None,
-            )
-
-
-def _process_action_queue(
-    state: AgentGraphState,
-    actions: list[dict[str, Any]],
-    text: str,
-    *,
-    max_actions: int | None = None,
-) -> AgentGraphState | None:
-    turn_local_actions = [dict(item) for item in actions if isinstance(item, dict) and action_is_turn_local(item)]
-    durable_incoming = [dict(item) for item in actions if isinstance(item, dict) and not action_is_turn_local(item)]
-    if turn_local_actions:
-        state = _execute_turn_local_actions(state, turn_local_actions, text)
-    prepared_actions = []
-    origin_group = str(state.get("active_group") or "").strip()
-    for item in durable_incoming:
-        action = dict(item)
-        action.setdefault("_origin_text", text)
-        action.setdefault("_queue_origin_group", origin_group)
-        action.setdefault("_submitted_turn_index", int(state.get("turn_index") or 0))
-        prepared_actions.append(action)
-    prepared_actions = _merge_durable_action_queue(
-        [dict(item) for item in state.get("action_queue") or [] if isinstance(item, dict)],
-        prepared_actions,
-    )
-    prepared_actions = _order_action_queue(state, prepared_actions)
-    state["action_queue"] = prepared_actions
-    if (
-        turn_local_actions
-        and state.get("pending_question")
-        and state.get("action_queue")
-        and _pending_is_queue_barrier(state)
-        and not _queue_can_continue_through_pending(state)
-    ):
-        _append_active_question_once(state)
-        state["current_action"] = {}
-        return state
-    if actions:
-        state["completed_actions"] = []
-        state["action_errors"] = []
-    changed = False
-    executed = 0
-    while state.get("action_queue"):
-        action = dict(state["action_queue"].pop(0))
-        remaining_actions = [dict(item) for item in state.get("action_queue") or [] if isinstance(item, dict)]
-        if lifecycle_rejected_action_indexes(state, [action]):
-            state.setdefault("action_errors", []).append({
-                "action": action,
-                "error": "lifecycle_inapplicable",
-            })
-            changed = True
-            continue
-        action_id = str(action.get("action_id") or "")
-        if action_id and action_id in set(state.get("applied_action_ids") or []):
-            continue
-        state["current_action"] = action
-        before_pending = dict(state.get("pending_question") or {})
-        before_pending_id = str(before_pending.get("id") or "")
-        before_responses = list(state.get("visible_response") or [])
-        routed = _apply_queue_action(state, action, text)
-        if routed is None:
-            state.setdefault("action_errors", []).append({"action": action, "error": "unsupported_or_low_confidence"})
-            continue
-        state = routed
-        if action.get("type") == "reset_session" and remaining_actions:
-            # Reset clears state from earlier turns, not explicit work still
-            # queued from the current user turn.  The orientation domain uses
-            # replace-state semantics, so the coordinator must reattach the
-            # already-validated remainder and allow it to continue.
-            state["action_queue"] = remaining_actions
-            state.pop("_stop_after_response", None)
-        action_spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
-        after_action_pending_id = str((state.get("pending_question") or {}).get("id") or "")
-        if (
-            action_spec is not None
-            and action_spec.preserve_pending
-            and before_pending_id
-            and after_action_pending_id != before_pending_id
-            and not _action_satisfies_pending_manual_effect(before_pending, action)
-        ):
-            _push_interruption_frame(state, before_pending, reason=f"{action_spec.action_type}_overlay")
-        if before_responses and action.get("type") != "reset_session":
-            merged_responses = list(before_responses)
-            if before_pending_id and after_action_pending_id != before_pending_id:
-                merged_responses = _without_superseded_question(
-                    merged_responses,
-                    before_pending,
-                    state.get("language", "en"),
-                )
-            for response in state.get("visible_response") or []:
-                if response not in merged_responses:
-                    merged_responses.append(response)
-            state["visible_response"] = merged_responses
-        completion = str(state.pop("_handler_completion", "unchanged"))
-        rejected = bool(state.pop("_handler_rejected", False))
-        changed = True
-        executed += 1
-        if rejected:
-            break
-        state.setdefault("completed_actions", []).append(action)
-        state["completed_actions"] = state["completed_actions"][-20:]
-        if action_id:
-            applied = list(state.get("applied_action_ids") or [])
-            if action_id not in applied:
-                applied.append(action_id)
-            state["applied_action_ids"] = applied[-200:]
-        if (
-            not state.get("pending_question")
-            and state.get("action_queue")
-            and str((state["action_queue"][0] or {}).get("type") or "") == "answer_pending"
-        ):
-            active_group = str(state.get("active_group") or "")
-            next_question = _question_for_group(state, active_group) if active_group else None
-            if next_question:
-                _install_pending_question(state, next_question)
-                state["pending_question"]["resume_action_queue"] = True
-        if completion == "in_progress" and not state.get("pending_question"):
-            active_group = str(state.get("active_group") or "")
-            if not _queue_has_followup_for_group(state, active_group):
-                question = _question_for_group(state, active_group)
-                if question:
-                    _install_pending_question(state, question)
-                    if state.get("action_queue"):
-                        state["pending_question"]["resume_action_queue"] = True
-                    if (
-                        state.get("action_queue")
-                        and not _queue_can_continue_through_pending(state)
-                        and not _next_queue_action_crosses_pending_barrier(state)
-                        and not _pending_is_queue_barrier(state)
-                    ):
-                        _suspend_pending_for_remaining_queue(state)
-                    elif not _queue_can_continue_through_pending(state) and not _next_queue_action_crosses_pending_barrier(state):
-                        state["visible_response"] = list(state.get("visible_response") or []) + [
-                            _render_question(question, state.get("language", "en"))
-                        ]
-                        break
-        after_pending_id = str((state.get("pending_question") or {}).get("id") or "")
-        pending_changed = bool(after_pending_id and after_pending_id != before_pending_id)
-        if pending_changed:
-            state["pending_question"]["resume_action_queue"] = True
-            if _queue_can_continue_through_pending(state) or _next_queue_action_crosses_pending_barrier(state):
-                # A domain may establish the next pending contract, but the
-                # coordinator owns turn-level presentation.  An action that
-                # consumes this pending contract, or a consultation queued in
-                # the same turn, runs before the question is rendered.
-                state["visible_response"] = before_responses
-            elif state.get("action_queue") and not _pending_is_queue_barrier(state):
-                state["visible_response"] = before_responses
-                _suspend_pending_for_remaining_queue(state)
-        if state.pop("_queue_pause", False):
-            if state.get("pending_question") and state.get("action_queue"):
-                state["pending_question"]["resume_action_queue"] = True
-            break
-        if state.get("_stop_after_response"):
-            if action_spec and action_spec.allows_followup_actions and state.get("action_queue"):
-                # A consultation/report answer completes its own work but must
-                # not discard another validated request from the same user
-                # turn. The registry, rather than individual domains, declares
-                # which read-only actions are safe to compose this way.
-                state.pop("_stop_after_response", None)
-            else:
-                break
-        if (
-            state.get("pending_question")
-            and state.get("action_queue")
-            and _pending_is_queue_barrier(state)
-            and not _queue_can_continue_through_pending(state)
-            and not _next_queue_action_crosses_pending_barrier(state)
-        ):
-            # Read-only consultations may overlay a blocking question. Once
-            # those consultations finish, unrelated mutations remain queued
-            # until the user resolves the active typed contract.
-            if _next_action_was_submitted_after_pending(state):
-                _suspend_pending_for_remaining_queue(state)
-            else:
-                state["pending_question"]["resume_action_queue"] = True
-                _append_active_question_once(state)
-                break
-        if (
-            pending_changed
-            and state.get("pending_question")
-            and not _queue_can_continue_through_pending(state)
-            and not _next_queue_action_crosses_pending_barrier(state)
-        ):
-            break
-        if max_actions is not None and executed >= max_actions:
-            break
-    state["current_action"] = {}
-    return state if changed else None
-
-
-def _append_active_question_once(state: AgentGraphState) -> None:
-    pending = state.get("pending_question") or {}
-    if not pending:
-        return
-    rendered = _render_question(pending, state.get("language", "en"))
-    responses = list(state.get("visible_response") or [])
-    already_actionable = _question_is_actionable_in_responses(responses, pending)
-    if rendered not in responses and not already_actionable:
-        responses.append(rendered)
-    state["visible_response"] = responses
-
-
-def _question_is_actionable_in_responses(
-    responses: list[str],
-    pending: PendingQuestion,
-) -> bool:
-    """Recognize one rendered question across equivalent presenter formats."""
-
-    prompt = str(pending.get("prompt") or "").strip()
-    if not prompt:
-        return False
-    option_labels = [
-        str(option.get("label") or "").strip()
-        for option in pending.get("options") or []
-        if str(option.get("label") or "").strip()
-    ]
-    return any(
-        prompt in response
-        and (not option_labels or all(label in response for label in option_labels))
-        for response in responses
-    )
-
-
-def _finalize_turn_response(state: AgentGraphState) -> AgentGraphState:
-    """Apply one response-composition policy after every coordinator path."""
-
-    responses: list[str] = []
-    seen: set[str] = set()
-    for item in state.get("visible_response") or []:
-        rendered = str(item or "").strip()
-        if not rendered or rendered in seen:
-            continue
-        seen.add(rendered)
-        responses.append(rendered)
-
-    turn_context = dict(state.get("turn_context") or {})
-    pending = state.get("pending_question") or {}
-    active_rendered = _render_question(pending, state.get("language", "en")).strip() if pending else ""
-    for installed in turn_context.get("installed_questions") or []:
-        if not isinstance(installed, dict):
-            continue
-        installed_rendered = _render_question(installed, state.get("language", "en")).strip()
-        if not installed_rendered or installed_rendered == active_rendered:
-            continue
-        responses = _without_superseded_question(
-            responses,
-            installed,
-            state.get("language", "en"),
-        )
-    suppress_pending_render = bool(turn_context.pop("suppress_pending_render", False))
-    state["turn_context"] = turn_context
-    if pending and not suppress_pending_render:
-        actionable = [
-            index
-            for index, response in enumerate(responses)
-            if _question_is_actionable_in_responses([response], pending)
-        ]
-        if not actionable:
-            responses.append(_render_question(pending, state.get("language", "en")))
-        elif len(actionable) > 1:
-            keep = actionable[0]
-            responses = [
-                response
-                for index, response in enumerate(responses)
-                if index == keep or index not in actionable
-            ]
-    state["visible_response"] = responses
-    validate_state(state)
-    return state
-
 
 def _next_action_was_submitted_after_pending(state: AgentGraphState) -> bool:
     queue = state.get("action_queue") or []
     pending = state.get("pending_question") or {}
     if not queue or not pending:
         return False
-    submitted = int((queue[0] or {}).get("_submitted_turn_index") or 0)
+    submitted = action_envelope_from_dict(queue[0]).submitted_turn_index
     created = int(pending.get("created_turn_index") or 0)
     return submitted > created
 
@@ -1691,8 +1933,22 @@ def _merge_durable_action_queue(
     deferred work from the prior workflow.
     """
 
-    existing = _durable_actions(existing)
-    incoming = _durable_actions(incoming)
+    existing = [
+        (
+            _admission_action_from_envelope(item)
+            if _is_serialized_action_envelope(item)
+            else dict(item)
+        )
+        for item in _durable_actions(existing)
+    ]
+    incoming = [
+        (
+            _admission_action_from_envelope(item)
+            if _is_serialized_action_envelope(item)
+            else dict(item)
+        )
+        for item in _durable_actions(incoming)
+    ]
     if any(str(item.get("type") or "") == "reset_session" for item in incoming):
         return incoming
     merged_incoming = [dict(item) for item in incoming]
@@ -1726,7 +1982,14 @@ def _durable_actions(actions: Any) -> list[dict[str, Any]]:
     return [
         dict(item)
         for item in actions or []
-        if isinstance(item, dict) and not action_is_turn_local(item)
+        if (
+            isinstance(item, dict)
+            and not action_is_turn_local(
+                _action_from_envelope(item)
+                if _is_serialized_action_envelope(item)
+                else item
+            )
+        )
     ]
 
 
@@ -1734,8 +1997,8 @@ def _queue_has_admitted_durable_work(state: AgentGraphState) -> bool:
     """Distinguish admitted commands from unannotated legacy stale entries."""
 
     return any(
-        not action_is_turn_local(item)
-        and ("_plan_scope" in item or "_submitted_turn_index" in item)
+        _is_serialized_action_envelope(item)
+        and not action_is_turn_local(_action_from_envelope(item))
         for item in state.get("action_queue") or []
         if isinstance(item, dict)
     )
@@ -1758,7 +2021,7 @@ def _discard_superseded_queue_actions(state: AgentGraphState, question: PendingQ
     state["action_queue"] = [
         action
         for action in state.get("action_queue") or []
-        if str((action or {}).get("type") or "").strip() not in superseded
+        if str(_queue_action(action).get("type") or "").strip() not in superseded
     ]
 
 
@@ -1769,7 +2032,7 @@ def _queue_can_continue_through_pending(state: AgentGraphState) -> bool:
     queue = state.get("action_queue") or []
     if not pending_group or not queue:
         return not pending_group
-    next_action_type = str((queue[0] or {}).get("type") or "").strip()
+    next_action_type = str(_queue_action(queue[0]).get("type") or "").strip()
     accepted = {
         str(action_type).strip()
         for action_type in (state.get("pending_question") or {}).get("accepted_action_types") or []
@@ -1782,7 +2045,8 @@ def _next_queue_action_crosses_pending_barrier(state: AgentGraphState) -> bool:
     queue = state.get("action_queue") or []
     if not queue:
         return False
-    action = dict(queue[0] or {})
+    envelope = action_envelope_from_dict(queue[0])
+    action = _action_from_envelope(queue[0])
     if not action_crosses_pending_barrier(action):
         return False
     pending = state.get("pending_question") or {}
@@ -1793,7 +2057,7 @@ def _next_queue_action_crosses_pending_barrier(state: AgentGraphState) -> bool:
     # the same semantic transaction may also suspend a question created by an
     # earlier sibling action; the interruption stack, not the barrier, owns
     # resumption. Other actions cannot bypass a newly created contract.
-    submitted_turn = int(action.get("_submitted_turn_index") or 0)
+    submitted_turn = envelope.submitted_turn_index
     created_turn = int(pending.get("created_turn_index") or 0)
     if submitted_turn and created_turn < submitted_turn:
         return True
@@ -1835,7 +2099,17 @@ def _push_interruption_frame(state: AgentGraphState, pending: PendingQuestion, *
     if not frame["group"] or not frame["question_id"]:
         return
     stack = list(state.get("interruption_stack") or [])
-    if not stack or stack[-1] != frame:
+    frame_identity = (
+        frame["group"],
+        frame["question_id"],
+        str(frame.get("field") or ""),
+    )
+    top_identity = (
+        str((stack[-1] if stack else {}).get("group") or ""),
+        str((stack[-1] if stack else {}).get("question_id") or ""),
+        str((stack[-1] if stack else {}).get("field") or ""),
+    )
+    if top_identity != frame_identity:
         stack.append(frame)
     state["interruption_stack"] = stack[-40:]
 
@@ -1899,125 +2173,6 @@ def _pop_interruption_question(state: AgentGraphState) -> PendingQuestion | None
     return None
 
 
-def _order_action_queue(
-    state: AgentGraphState,
-    actions: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Topologically order typed actions without rewriting user intent order.
-
-    The intent planner returns an ordered plan. Dependencies declared by action
-    and question contracts may move a prerequisite before its consumer, but a
-    static registry phase must not otherwise reverse explicit user sequencing.
-    For legacy/deferred actions that predate plan metadata, current queue order
-    is the stable fallback. Dependencies are never inferred from prose.
-    """
-
-    requirements = [_action_requirements(state, action) for action in actions]
-    providers = [_action_provisions(action) for action in actions]
-    incoming: list[set[int]] = [set() for _ in actions]
-    outgoing: list[set[int]] = [set() for _ in actions]
-    for consumer_index, required in enumerate(requirements):
-        missing = {item for item in required if not _state_has_capability(state, item)}
-        if not missing:
-            continue
-        for provider_index, provided in enumerate(providers):
-            if provider_index == consumer_index or not (missing & provided):
-                continue
-            incoming[consumer_index].add(provider_index)
-            outgoing[provider_index].add(consumer_index)
-
-    # Structured configuration is an untrusted proposal that must cross its
-    # review barrier before independent mutations from the same turn execute.
-    # This is a typed transaction dependency, not a numeric phase convention.
-    proposal_indexes = [
-        index
-        for index, action in enumerate(actions)
-        if str(action.get("type") or "") == "propose_config_values"
-    ]
-    proposal_blocked_types = {
-        "rpc_catalog_command",
-        "rpc_workload_command",
-        "set_rpc_mode",
-        "use_default_workload",
-        "configure_workload_weights",
-        "set_qps_mode",
-        "request_qps_customization",
-        "set_qps_override",
-        "set_observability",
-        "set_sync_observe_source",
-        "clear_sync_observe_source",
-        "set_sync_observe_options",
-        "approve_preflight_smoke",
-        "approve_final_benchmark",
-    }
-    for proposal_index in proposal_indexes:
-        for consumer_index, action in enumerate(actions):
-            if consumer_index == proposal_index:
-                continue
-            proposal_scope = str(actions[proposal_index].get("_plan_scope") or "")
-            consumer_scope = str(action.get("_plan_scope") or "")
-            if not proposal_scope or proposal_scope != consumer_scope:
-                continue
-            if str(action.get("type") or "") not in proposal_blocked_types:
-                continue
-            incoming[consumer_index].add(proposal_index)
-            outgoing[proposal_index].add(consumer_index)
-
-    ready = [index for index, dependencies in enumerate(incoming) if not dependencies]
-    ordered: list[dict[str, Any]] = []
-    while ready:
-        ready.sort(key=lambda index: _action_plan_order(actions[index], index))
-        current = ready.pop(0)
-        ordered.append(actions[current])
-        for consumer in sorted(outgoing[current]):
-            incoming[consumer].discard(current)
-            if not incoming[consumer] and consumer not in ready:
-                ready.append(consumer)
-    if len(ordered) != len(actions):
-        raise RuntimeError("Harness action dependency cycle")
-    return ordered
-
-
-def _action_plan_order(action: dict[str, Any], queue_index: int) -> tuple[int, int, int]:
-    """Return a durable plan-first order for one ready action.
-
-    Newer turns are merged before retained deferred work, and each turn's model
-    order is persisted as metadata. Registry phase remains only a legacy tie
-    breaker for checkpoints created before ordered plans existed.
-    """
-
-    plan_index = action.get("_plan_index")
-    if isinstance(plan_index, int) and plan_index >= 0:
-        return (0, plan_index, queue_index)
-    return (1, action_execution_phase(action), queue_index)
-
-
-def _action_requirements(state: AgentGraphState, action: dict[str, Any]) -> set[str]:
-    spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
-    required = set(spec.requires_capabilities if spec else ())
-    if str(action.get("type") or "") == "answer_pending":
-        required.update(
-            str(item).strip()
-            for item in (state.get("pending_question") or {}).get("requires_capabilities") or []
-            if str(item).strip()
-        )
-    return required
-
-
-def _action_provisions(action: dict[str, Any]) -> set[str]:
-    spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
-    return set(spec.provides_capabilities if spec else ())
-
-
-def _state_has_capability(state: AgentGraphState, capability: str) -> bool:
-    if capability == "chain_identity":
-        identity = state.get("chain_identity") or {}
-        return bool(str(identity.get("canonical") or identity.get("raw") or "").strip())
-    if capability == "target_mode":
-        return bool(normalize_target_mode(state.get("target_mode")))
-    return False
-
-
 def _apply_handler_result(
     state: AgentGraphState,
     result: HandlerResult,
@@ -2068,18 +2223,67 @@ def _apply_handler_result(
         responses = list(candidate.get("visible_response") or [])
         responses.append(blocker_response)
         candidate["visible_response"] = responses
-        candidate["_stop_after_response"] = True
-        candidate["_handler_completion"] = "blocked"
-        candidate["_handler_rejected"] = True
         validate_state(candidate)
         return candidate
 
+    navigation_state: AgentGraphState | None = None
+    navigation_followups: tuple[Mapping[str, Any], ...] = ()
+    if result.navigation_command is not None:
+        navigation_state, navigation_followups = _commit_navigation_command(
+            state,
+            result.navigation_command,
+        )
+        result = replace(
+            result,
+            navigation_command=None,
+            followup_actions=(
+                *navigation_followups,
+                *result.followup_actions,
+            ),
+        )
     if result.checkpoint_command is not None:
         candidate = _apply_checkpoint_command(state, result.checkpoint_command)
+    elif navigation_state is not None:
+        candidate = navigation_state
     elif owner == "coordinator" and control_state is not None:
         candidate = deepcopy(control_state)
     else:
         candidate = deepcopy(state)
+    if result.field_reconfiguration_command is not None:
+        command = result.field_reconfiguration_command
+        control = dict(candidate.get("control") or {})
+        if command.prerequisite_question_id:
+            control["field_reconfiguration_continuation"] = {
+                "group": command.group,
+                "config_field": command.config_field,
+                "prerequisite_question_id": command.prerequisite_question_id,
+            }
+        else:
+            control.pop("field_reconfiguration_continuation", None)
+        candidate["control"] = control
+    if result.workflow_goal_command is not None:
+        command = result.workflow_goal_command
+        goals = [
+            dict(item)
+            for item in candidate.get("workflow_goals") or []
+            if isinstance(item, dict)
+        ]
+        if command.operation == "enqueue":
+            goal = dict(command.goal)
+            if not any(
+                item.get("target_mode") == goal.get("target_mode")
+                and item.get("goal") == goal.get("goal")
+                for item in goals
+            ):
+                goals.append(goal)
+        elif command.operation == "remove_first":
+            if goals:
+                goals.pop(0)
+        else:
+            raise StateInvariantError(
+                f"unsupported workflow goal command: {command.operation}"
+            )
+        candidate["workflow_goals"] = goals
     candidate = apply_state_delta(candidate, result.delta, owner=owner)
 
     recovery_pending: dict[str, Any] | None = None
@@ -2120,17 +2324,21 @@ def _apply_handler_result(
     effective_pending = recovery_pending if recovery_pending is not None else result.pending_question
     if effective_pending is not None:
         pending = asdict(effective_pending) if is_dataclass(effective_pending) else dict(effective_pending)
-        _install_pending_question(candidate, pending)
-        if not _next_queue_action_crosses_pending_barrier(candidate):
-            rendered = _render_question(pending, candidate.get("language", "en"))
-            responses = _without_superseded_question(
-                list(candidate.get("visible_response") or []),
-                previous_pending,
-                candidate.get("language", "en"),
+        if pending != previous_pending:
+            pending["same_turn_navigation_allowed"] = (
+                result.completion != "blocked"
             )
-            if rendered not in responses and not _question_is_actionable_in_responses(responses, pending):
-                responses.append(rendered)
-            candidate["visible_response"] = responses
+            _install_pending_question(candidate, pending)
+            if not _next_queue_action_crosses_pending_barrier(candidate):
+                rendered = _render_question(pending, candidate.get("language", "en"))
+                responses = _without_superseded_question(
+                    list(candidate.get("visible_response") or []),
+                    previous_pending,
+                    candidate.get("language", "en"),
+                )
+                if rendered not in responses and not _question_is_actionable_in_responses(responses, pending):
+                    responses.append(rendered)
+                candidate["visible_response"] = responses
     pending_owner = str((candidate.get("pending_question") or {}).get("group") or "").strip()
     if pending_owner:
         candidate["active_group"] = pending_owner
@@ -2147,27 +2355,158 @@ def _apply_handler_result(
         candidate["applied_action_ids"] = applied[-200:]
     if result.followup_actions:
         origin_text = str((candidate.get("turn_context") or {}).get("text") or candidate.get("last_user_input") or "")
+        scope = (
+            f"{candidate.get('thread_id') or 'default'}:"
+            f"{int(candidate.get('turn_index') or 0)}:followup"
+        )
         followups = assign_action_ids(
-            str(candidate.get("thread_id") or "default"),
+            scope,
             origin_text,
             [dict(item) for item in result.followup_actions],
         )
-        for action in followups:
-            action.setdefault("_origin_text", origin_text)
-            action.setdefault("_queue_origin_group", str(candidate.get("active_group") or ""))
-            action.setdefault("_submitted_turn_index", int(candidate.get("turn_index") or 0))
-        candidate["action_queue"] = _order_action_queue(
+        for index, action in enumerate(followups):
+            action["_origin_text"] = origin_text
+            action["_queue_origin_group"] = str(candidate.get("active_group") or "")
+            action["_submitted_turn_index"] = int(candidate.get("turn_index") or 0)
+            action["_plan_scope"] = scope
+            action["_plan_index"] = index
+        ordered_followups = _order_action_queue(
             candidate,
-            [*followups, *[dict(item) for item in candidate.get("action_queue") or []]],
+            [
+                *followups,
+                *[
+                    _admission_action_from_envelope(item)
+                    for item in candidate.get("action_queue") or []
+                ],
+            ],
         )
+        candidate["action_queue"] = _serialize_admitted_actions(
+            candidate,
+            ordered_followups,
+            default_origin_text=origin_text,
+            default_origin_group=str(candidate.get("active_group") or ""),
+            default_plan_scope=scope,
+        )
+    if candidate.get("pending_question") and not candidate.get("action_queue"):
+        candidate["pending_question"].pop("resume_action_queue", None)
 
     candidate = _activate_ready_deferred_group(candidate)
 
-    if result.stop_after_response and not candidate.get("action_queue"):
-        candidate["_stop_after_response"] = True
-    candidate["_handler_completion"] = result.completion
     validate_state(candidate)
     return candidate
+
+
+def _commit_navigation_command(
+    state: AgentGraphState,
+    command: NavigationCommand,
+) -> tuple[AgentGraphState, tuple[Mapping[str, Any], ...]]:
+    """Commit one typed navigation transaction at the control boundary."""
+
+    candidate = deepcopy(state)
+    followups: tuple[Mapping[str, Any], ...] = ()
+    if command.operation == "change_group":
+        target_group = command.target_group
+        interrupted_pending = deepcopy(candidate.get("pending_question") or {})
+        pending_group = str(interrupted_pending.get("group") or "").strip()
+        if (
+            interrupted_pending
+            and target_group != pending_group
+            and _reconstruct_question(candidate, interrupted_pending) is not None
+        ):
+            _push_interruption_frame(
+                candidate,
+                interrupted_pending,
+                reason="explicit_navigation",
+            )
+        prerequisite = _navigation_prerequisite(candidate, target_group)
+        if prerequisite:
+            control = dict(candidate.get("control") or {})
+            control["deferred_group"] = target_group
+            candidate["control"] = control
+            return _activate_group_question(candidate, prerequisite), followups
+        if (
+            target_group == command.origin_group
+            and _active_group_has_blocking_question(candidate)
+        ):
+            pending = dict(candidate.get("pending_question") or {})
+            candidate["visible_response"] = [
+                _render_question(pending, candidate.get("language", "en"))
+            ]
+            return candidate, followups
+        if _queue_has_followup_for_group(candidate, target_group):
+            _record_group_transition(candidate, target_group)
+            candidate["pending_question"] = {}
+            return candidate, followups
+        if (
+            target_group == "chain_identity"
+            and (candidate.get("chain_identity") or {}).get("canonical")
+        ):
+            candidate["pending_question"] = {}
+            followups = (
+                {
+                    "type": "request_chain_selection",
+                    "confidence": "high",
+                },
+            )
+            return candidate, followups
+        return (
+            _activate_group_question(
+                candidate,
+                target_group,
+                reconfigure=True,
+            ),
+            followups,
+        )
+
+    control = dict(candidate.get("control") or {})
+    control.pop("field_reconfiguration_continuation", None)
+    candidate["control"] = control
+    resume_group = ""
+    pending = dict(candidate.get("pending_question") or {})
+    pending_owner = GROUP_OWNER.get(str(pending.get("group") or ""), "")
+    runtime = DOMAIN_RUNTIME.get(pending_owner)
+    if pending and runtime is not None and runtime.cancel_question is not None:
+        cancellation = runtime.cancel_question(deepcopy(candidate), pending)
+        resume_group = str(cancellation.navigation_resume_group or "").strip()
+        candidate = _apply_handler_result(
+            candidate,
+            replace(
+                cancellation,
+                followup_actions=(),
+                stop_after_response=False,
+            ),
+            owner=pending_owner,
+        )
+        followups = tuple(cancellation.followup_actions)
+    interrupted_question = _pop_interruption_question(candidate)
+    if interrupted_question:
+        _install_pending_question(candidate, interrupted_question)
+        candidate["visible_response"] = [
+            _render_question(
+                interrupted_question,
+                candidate.get("language", "en"),
+            )
+        ]
+        return candidate, followups
+    if resume_group:
+        _discard_cancelled_origin_from_history(candidate)
+    previous_group = resume_group or _pop_previous_group(candidate)
+    if previous_group:
+        candidate = _activate_group_question(
+            candidate,
+            previous_group,
+            record_history=False,
+        )
+    else:
+        candidate["pending_question"] = {}
+        candidate["visible_response"] = [
+            _localized(
+                candidate.get("language", "en"),
+                "当前没有可回退的配置组。你可以直接说明要回到哪个配置项，例如 RPC、QPS、磁盘或可观测性。",
+                "There is no previous configuration group to return to. Name the area to revisit, such as RPC, QPS, disk, or observability.",
+            )
+        ]
+    return candidate, followups
 
 
 def _activate_ready_deferred_group(state: AgentGraphState) -> AgentGraphState:
@@ -2256,199 +2595,11 @@ def _apply_checkpoint_command(state: AgentGraphState, command: CheckpointCommand
     candidate["turn_index"] = int(state.get("turn_index") or 0)
     candidate["last_user_input"] = str(state.get("last_user_input") or "")
     candidate["turn_context"] = deepcopy(dict(state.get("turn_context") or {}))
+    candidate["turn_receipt"] = deepcopy(dict(state.get("turn_receipt") or {}))
     candidate["audit_events"] = list(state.get("audit_events") or []) + [{"event": "workflow_reset"}]
     if command.command == "retain_safe":
         candidate["confirmed_config"] = deepcopy(dict(command.confirmed_config))
     return candidate
-
-
-def _without_superseded_question(
-    responses: list[str],
-    previous_pending: PendingQuestion,
-    language: str,
-) -> list[str]:
-    """Remove only a superseded pending question from the response composition.
-
-    A single user turn may legitimately apply several typed actions. Each
-    handler can create a newer blocking question, but the product terminal must
-    never display every intermediate question. Keeping non-question results
-    while replacing the rendered previous question preserves useful evidence
-    and enforces the one-active-question contract.
-    """
-
-    if not previous_pending:
-        return responses
-    candidates = {
-        str(previous_pending.get("prompt") or "").strip(),
-        _render_question(previous_pending, language).strip(),
-    }
-    candidates.discard("")
-    return [response for response in responses if str(response).strip() not in candidates]
-
-
-def _apply_evidence_outcome(
-    state: AgentGraphState,
-    outcome: EvidenceCollectionOutcome,
-) -> AgentGraphState:
-    state = _apply_handler_result(state, outcome.result, owner="analysis")
-    if outcome.disposition == "pending_answer":
-        return _apply_pending_answer(
-            state,
-            outcome.collected_text,
-            dict(outcome.pending_question),
-        )
-    return state
-
-
-def _apply_queue_action(state: AgentGraphState, action: dict[str, Any], text: str) -> AgentGraphState | None:
-    action = validate_action_contract(action, trusted_metadata=True)
-    action_type = str(action.get("type") or "unknown").strip()
-    if action_type in {"request_config_field_input", "propose_config_values"}:
-        _validate_admission_transaction(state, [action], current_submission=False)
-    confidence = str(action.get("confidence") or "medium").strip().lower()
-    origin_text = str(action.get("_origin_text") or text)
-    if confidence == "low" and action_type not in {"greeting", "unknown"}:
-        state.setdefault("action_errors", []).append({"action": action, "error": "low_confidence"})
-        return None
-    spec = ACTION_BY_TYPE.get(action_type)
-    owner = spec.owner if spec else ""
-    if action_type == "answer_pending":
-        return _dispatch_pending_action(state, action)
-    if action_type == "append_evidence_collection":
-        outcome = continue_evidence_collection(
-            state,
-            str(action.get("evidence") or origin_text),
-            state.get("evidence_collection") or {},
-        )
-        return _apply_evidence_outcome(state, outcome)
-    if action_type == "finish_evidence_collection":
-        return _apply_evidence_outcome(
-            state,
-            finish_evidence_collection(state, state.get("evidence_collection") or {}),
-        )
-    if action_type == "pause_evidence_collection":
-        return _apply_handler_result(state, pause_evidence_collection(state), owner="analysis")
-    if action_type == "resume_evidence_collection":
-        return _apply_handler_result(state, resume_evidence_collection(state), owner="analysis")
-    if action_type == "cancel_evidence_collection":
-        return _apply_handler_result(state, cancel_evidence_collection(state), owner="analysis")
-    runtime = COORDINATOR_RUNTIME if owner == "coordinator" else DOMAIN_RUNTIME.get(owner)
-    if runtime is not None:
-        domain_action = dict(action)
-        if action_type == "propose_config_values":
-            domain_action["source_text"] = origin_text
-        if spec and spec.owner == "chain_rpc":
-            domain_action["origin_text"] = origin_text
-        if spec and spec.owner == "coordinator":
-            domain_action["queue_origin_group"] = action.get("_queue_origin_group")
-        if action_type == "analyze_report" and not domain_action.get("job_id"):
-            requested_job = JOB_ID_RE.search(origin_text)
-            if requested_job:
-                domain_action["job_id"] = requested_job.group(0)
-        dispatch_state = state
-        if owner == "coordinator" and action_type in {"change_group", "go_back"}:
-            target_group = str(domain_action.get("group") or "").strip()
-            interrupted_pending = deepcopy(state.get("pending_question") or {})
-            pending_group = str(interrupted_pending.get("group") or "").strip()
-            same_group_navigation = action_type == "change_group" and target_group == pending_group
-            if not same_group_navigation:
-                if action_type == "go_back":
-                    dispatch_state, cancellation_resume_group = _cancel_transient_question(state)
-                    if cancellation_resume_group:
-                        domain_action["cancellation_resume_group"] = cancellation_resume_group
-                else:
-                    # Named detours suspend a domain-owned question without
-                    # cancelling or rewriting its partial state.
-                    dispatch_state = deepcopy(state)
-                    if (
-                        interrupted_pending
-                        and _reconstruct_question(dispatch_state, interrupted_pending) is not None
-                    ):
-                        _push_interruption_frame(
-                            dispatch_state,
-                            interrupted_pending,
-                            reason="explicit_navigation",
-                        )
-        handler_state = deepcopy(dispatch_state)
-        result = runtime.apply_action(handler_state, _action_proposal(domain_action, confidence))
-        return _apply_handler_result(
-            dispatch_state,
-            result,
-            owner=owner,
-            control_state=handler_state if owner == "coordinator" else None,
-        )
-    return None
-
-
-_UNSET_PENDING_VALUE = object()
-
-
-def _dispatch_pending_action(state: AgentGraphState, action: dict[str, Any]) -> AgentGraphState:
-    pending = dict(state.get("pending_question") or {})
-    if not pending:
-        return _apply_handler_result(
-            state,
-            HandlerResult(blocker="no pending question is available for this answer"),
-            owner="coordinator",
-        )
-    raw_answer = action["answer"] if "answer" in action else action.get("_origin_text", "")
-    answer = str(raw_answer).strip()
-    selected = action.get("selected_value")
-    if isinstance(selected, str) and not selected.strip():
-        selected = None
-    choice_question = str(pending.get("kind") or "") in {"numbered_choice", "yes_no"}
-    interpreted: Any = selected if selected is not None else raw_answer
-    if not choice_question and (
-        interpreted is None
-        or (isinstance(interpreted, str) and not interpreted.strip())
-    ):
-        return _apply_handler_result(
-            state,
-            HandlerResult(blocker="the pending answer is empty"),
-            owner="coordinator",
-        )
-    if not choice_question and not (
-        _pending_option_value_exists(selected, pending)
-        or _value_satisfies_pending_contract(interpreted, pending)
-    ):
-        return _apply_handler_result(
-            state,
-            HandlerResult(
-                blocker=_localized(
-                    state.get("language", "en"),
-                    "模型给出的结构化值不符合当前字段契约，当前问题保持不变。",
-                    "The model-derived value does not satisfy the current field contract. The question remains active.",
-                )
-            ),
-            owner="coordinator",
-        )
-    manual_choice_value = bool(
-        choice_question
-        and pending.get("manual_input_allowed") is True
-        and selected is None
-        and _value_satisfies_pending_contract(answer, pending)
-    )
-    if choice_question and not _pending_option_value_exists(selected, pending) and not manual_choice_value:
-        return _apply_handler_result(
-            state,
-            HandlerResult(
-                blocker=_localized(
-                    state.get("language", "en"),
-                    "模型没有把这段回复映射到一个已声明选项，当前问题保持不变。请换一种说法，或回复显示的选项。",
-                    "The model did not map that reply to a declared option. The question remains active; rephrase or use a displayed option.",
-                )
-            ),
-            owner="coordinator",
-        )
-    declared_selection = _pending_option_value_exists(selected, pending)
-    source_text = str(action.get("_origin_text") or action.get("source_evidence") or answer).strip()
-    return _apply_pending_answer(
-        state,
-        source_text,
-        pending,
-        selected_value=selected if declared_selection else _UNSET_PENDING_VALUE,
-        manual_value=interpreted if not declared_selection else _UNSET_PENDING_VALUE,
-    )
 
 
 def _action_proposal(action: dict[str, Any], confidence: str) -> ActionProposal:
@@ -2466,7 +2617,11 @@ def _action_proposal(action: dict[str, Any], confidence: str) -> ActionProposal:
 
 
 def _queue_has_followup_for_group(state: AgentGraphState, group: str) -> bool:
-    action_types = {str(item.get("type") or "").strip() for item in state.get("action_queue") or [] if isinstance(item, dict)}
+    action_types = {
+        str(_queue_action(item).get("type") or "").strip()
+        for item in state.get("action_queue") or []
+        if isinstance(item, dict)
+    }
     if group == "qps_profile":
         return bool(action_types & {"set_qps_mode", "request_qps_customization", "set_qps_override"})
     if group == "observability":
@@ -2490,23 +2645,6 @@ def _active_group_has_blocking_question(state: AgentGraphState) -> bool:
     if not active_group:
         return False
     return bool(_question_for_group(state, active_group))
-
-
-def _navigation_prerequisite(state: AgentGraphState, group: str) -> str:
-    """Return the first typed prerequisite for one public group destination."""
-
-    spec = GROUP_SPEC_BY_NAME.get(group)
-    if spec is None or not is_user_navigable_group(group):
-        return ""
-    workflow_mode = str(state.get("workflow_mode") or "").strip()
-    if spec.workflow_modes and workflow_mode not in spec.workflow_modes:
-        return "target_mode"
-    for dependency in spec.depends_on:
-        if dependency == "target_mode" and not str(state.get("target_mode") or "").strip():
-            return dependency
-        if not group_readiness(state, dependency).ready:
-            return dependency
-    return ""
 
 
 def _ask_next_blocking_question(state: AgentGraphState) -> AgentGraphState:
@@ -2621,7 +2759,6 @@ def _activate_group_question(
         if status:
             state["pending_question"] = {}
             state["visible_response"] = [status]
-            state["_stop_after_response"] = True
             return state
         state["pending_question"] = {}
         state["visible_response"] = [_localized(
@@ -2629,9 +2766,7 @@ def _activate_group_question(
             f"已进入 `{group}`。该配置组当前没有需要确认的阻塞项；你可以说明要修改的内容，或在下一轮继续默认配置流程。",
             f"Entered `{group}`. This configuration group currently has no blocking item; describe what to change, or continue the default configuration flow on the next turn.",
         )]
-        state["_stop_after_response"] = True
         return state
-    state["_stop_after_response"] = True
     return state
 
 
@@ -2670,39 +2805,6 @@ def _install_pending_question(state: AgentGraphState, question: PendingQuestion)
     if group:
         state["active_group"] = group
         mark_group_reconfiguring(state, group)
-
-
-def _cancel_transient_question(state: AgentGraphState) -> tuple[AgentGraphState, str]:
-    pending = state.get("pending_question") or {}
-    owner = GROUP_OWNER.get(str(pending.get("group") or ""), "")
-    runtime = DOMAIN_RUNTIME.get(owner)
-    if runtime is None or runtime.cancel_question is None:
-        return state, ""
-    result = runtime.cancel_question(deepcopy(state), pending)
-    resume_group = str(result.navigation_resume_group or "").strip()
-    candidate = _apply_handler_result(
-        state,
-        replace(result, followup_actions=()),
-        owner=owner,
-    )
-    for raw_followup in result.followup_actions:
-        followup = validate_action_contract(dict(raw_followup))
-        spec = ACTION_BY_TYPE[str(followup["type"])]
-        followup_runtime = DOMAIN_RUNTIME.get(spec.owner)
-        if followup_runtime is None:
-            raise StateInvariantError(
-                f"cancel follow-up has no domain runtime: {followup['type']}"
-            )
-        followup_result = followup_runtime.apply_action(
-            deepcopy(candidate),
-            _action_proposal(followup, "high"),
-        )
-        candidate = _apply_handler_result(
-            candidate,
-            followup_result,
-            owner=spec.owner,
-        )
-    return candidate, resume_group
 
 
 def _pop_previous_group(state: AgentGraphState) -> str:
@@ -2780,110 +2882,6 @@ def _reconstruct_question(
         return question
     return None
 
-def _apply_pending_answer(
-    state: AgentGraphState,
-    text: str,
-    question: PendingQuestion,
-    *,
-    selected_value: Any = _UNSET_PENDING_VALUE,
-    manual_value: Any = _UNSET_PENDING_VALUE,
-) -> AgentGraphState:
-    group = str(question.get("group") or "")
-    question_id = str(question.get("id") or "")
-    if selected_value is not _UNSET_PENDING_VALUE:
-        if not _pending_option_value_exists(selected_value, question):
-            return state
-        value = selected_value
-    elif manual_value is not _UNSET_PENDING_VALUE:
-        if not _value_satisfies_pending_contract(manual_value, question):
-            return state
-        value = manual_value
-    elif question.get("contract_version") == 1:
-        matched, value = contract_exact_answer(text, question)
-        if not matched:
-            return state
-    else:
-        value = _coerce_answer(text, question)
-    declared_action = action_for_value(question, value)
-    if declared_action and str(declared_action.get("type") or "") != "answer_pending":
-        return_policy = _option_return_policy(question, value)
-        action_spec = ACTION_BY_TYPE.get(str(declared_action.get("type") or ""))
-        runtime_arguments: dict[str, Any] = {}
-        if (
-            action_spec is not None
-            and "source_evidence" in action_spec.allowed_arguments
-            and not str(declared_action.get("source_evidence") or "").strip()
-        ):
-            # The pending-question contract owns option interpretation. Once
-            # it has matched an exact or model-selected declared option, the
-            # original answer is trusted provenance for the declared action;
-            # individual domains must not reconstruct that provenance.
-            runtime_arguments["source_evidence"] = str(text or "").strip()
-        action = {
-            **declared_action,
-            **runtime_arguments,
-            "action_id": f"{state.get('thread_id') or 'default'}:{int(state.get('turn_index') or 0)}:{question_id}:{value}",
-            "confidence": "high",
-            "selection_contract_verified": True,
-            "_origin_text": text,
-        }
-        # A declared option action consumes the question that authorized it.
-        # Whether the turn stops afterwards is a separate return-policy
-        # concern; coupling the two leaves the old selector installed while a
-        # valid follow-up action is queued behind it.
-        dispatch_state = deepcopy(state)
-        dispatch_state["pending_question"] = {}
-        result = _apply_queue_action(dispatch_state, action, text)
-        if result is None:
-            raise RuntimeError(f"option action was not executable: {question_id}/{value}")
-        expected = expected_patch_for_value(question, value)
-        if expected:
-            verify_expected_patch(result, expected)
-        result = _apply_option_return_policy(result, question, value)
-        _record_admitted_action(result, action, source="pending_question_contract")
-        return result
-    if question_id == "inferred_config_review":
-        state["action_queue"] = [
-            item
-            for item in state.get("action_queue") or []
-            if str(item.get("type") or "") != "propose_config_values"
-        ]
-        result = _apply_handler_result(state, apply_inferred_config_review(state, bool(value)), owner="environment")
-        _record_admitted_action(
-            result,
-            {
-                "type": "answer_pending",
-                "action_id": f"{state.get('thread_id') or 'default'}:{int(state.get('turn_index') or 0)}:{question_id}",
-            },
-            source="pending_question_contract",
-        )
-        return result
-    runtime = DOMAIN_RUNTIME.get(GROUP_OWNER.get(group, ""))
-    if runtime is None or runtime.apply_answer is None:
-        raise RuntimeError(f"no answer handler owns question: {group}/{question_id}")
-    expected = expected_patch_for_value(question, value)
-    result = _apply_handler_result(
-        state,
-        runtime.apply_answer(deepcopy(state), question, value, text),
-        owner=GROUP_OWNER.get(group, ""),
-    )
-    if expected:
-        verify_expected_patch(result, expected)
-    result = _resume_field_reconfiguration_after_prerequisite(
-        result,
-        answered_question=question,
-    )
-    _record_admitted_action(
-        result,
-        {
-            "type": "answer_pending",
-            "action_id": f"{state.get('thread_id') or 'default'}:{int(state.get('turn_index') or 0)}:{question_id}",
-        },
-        source="pending_question_contract",
-    )
-    return result
-
-
 def _resume_field_reconfiguration_after_prerequisite(
     state: AgentGraphState,
     *,
@@ -2932,31 +2930,6 @@ def _resume_field_reconfiguration_after_prerequisite(
     return state
 
 
-def _option_return_policy(question: PendingQuestion, value: Any) -> str:
-    selected = next(
-        (option for option in question.get("options") or [] if option.get("value") == value),
-        {},
-    )
-    return str(selected.get("return_policy") or "fallback")
-
-
-def _apply_option_return_policy(
-    state: AgentGraphState,
-    question: PendingQuestion,
-    value: Any,
-) -> AgentGraphState:
-    """Apply the selected option's declared control-plane return policy."""
-
-    policy = _option_return_policy(question, value)
-    if policy == "stay":
-        state["pending_question"] = deepcopy(question)
-        state["active_group"] = str(question.get("group") or state.get("active_group") or "")
-        state["_stop_after_response"] = True
-    if policy == "stop_after_response":
-        state["_stop_after_response"] = True
-    return state
-
-
 def _looks_like_assignment_answer(text: str) -> bool:
     raw = str(text or "").strip().rstrip(",，;；、").strip()
     if not raw or "\n" in raw:
@@ -2965,22 +2938,6 @@ def _looks_like_assignment_answer(text: str) -> bool:
     if not parts:
         return False
     return all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.:/-]*\s*=\s*[^=,]+", part) for part in parts)
-
-
-def _normalized_target_mode(value: Any) -> str:
-    text = str(value or "").strip().lower().replace("_", "-")
-    aliases = {
-        "fake": "fake-node",
-        "fake-node": "fake-node",
-        "fakenode": "fake-node",
-        "real": "real-node",
-        "real-node": "real-node",
-        "realnode": "real-node",
-        "sync": "sync-observe",
-        "sync-observe": "sync-observe",
-        "syncobserve": "sync-observe",
-    }
-    return aliases.get(text, "")
 
 
 # Typed actions that mean the user is navigating away from the secondary-handoff

@@ -7,7 +7,9 @@ import json
 import os
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, TypedDict
+
+from langgraph.runtime import Runtime
 
 from .checkpoints import create_sqlite_checkpointer, default_checkpoint_path
 from ..llm.config import load_llm_config
@@ -16,14 +18,18 @@ from .coordinator import (
     admit_turn_step,
     adjudicate_turn_step,
     compose_turn_step,
-    execute_turn_step,
+    commit_selected_action_step,
+    commit_side_effect_receipt_step,
     fallback_turn_step,
     plan_turn_step,
     prepare_turn_step,
+    invoke_idempotent_side_effect_step,
+    mark_side_effect_invoking_step,
+    select_action_step,
+    execute_selected_owner_step,
 )
 from .failures import build_failure_record
 from .invariants import StateInvariantError, validate_state
-from .domains.orientation import has_resumable_configuration, opening_question, resume_question
 from .domains.recovery import question_for_recovery
 from .questions import render_question
 from .runtime_identity import repository_revision
@@ -45,7 +51,6 @@ class AnyChainGraphRuntime:
         self.checkpoint_path = Path(checkpoint_path or default_checkpoint_path())
         self.checkpointer = checkpointer or create_sqlite_checkpointer(self.checkpoint_path)
         self.graph = build_graph(self.checkpointer)
-        self._turn_graph = build_graph(None)
 
     def close(self) -> None:
         manager = getattr(self.checkpointer, "_anychain_context_manager", None)
@@ -70,14 +75,20 @@ class AnyChainGraphRuntime:
         before = deepcopy(state)
         state["last_user_input"] = text
         state["language"] = language
-        if context:
-            for key, value in context.items():
-                state[key] = value
+        invocation_context: InvocationContext = {
+            key: deepcopy((context or {}).get(key) or {})
+            for key in _INVOCATION_CONTEXT_KEYS
+        }
         state = ensure_session_metadata(state, self.thread_id, self.session_purpose)
+        config = {"configurable": {"thread_id": self.thread_id}}
         with llm_turn_scope(load_llm_config().turn_timeout_seconds):
             ensure_turn_active()
             try:
-                result = self._turn_graph.invoke(state)
+                result = self.graph.invoke(
+                    state,
+                    config=config,
+                    context=invocation_context,
+                )
                 ensure_turn_active()
                 validate_state(result)
             except StateInvariantError as exc:
@@ -89,57 +100,69 @@ class AnyChainGraphRuntime:
                 recovered = self._recover_invariant_failure(candidate, exc)
                 self._write_turn_observation("turn_recovered", before, recovered)
                 return recovered
-            persisted = self._persist_state(result)
+            persisted = dict(result)
             self._write_turn_observation("turn_committed", before, persisted)
             return persisted
 
     def _recover_invariant_failure(self, state: AgentGraphState, exc: StateInvariantError) -> AgentGraphState:
-        """Quarantine an invalid transition at the graph's validation boundary."""
+        """Re-enter the product graph from its last valid checkpoint."""
 
-        recovered: AgentGraphState = dict(state)
         record = build_failure_record(
             "HARNESS_INVARIANT_FAILED",
             source="harness",
             severity="blocking",
             facts=[{"code": "HARNESS_INVARIANT_FAILED", "source": "harness", "detail": str(exc)}],
-            confirmed_config=recovered.get("confirmed_config") or {},
+            confirmed_config=state.get("confirmed_config") or {},
         )
-        recovered["action_queue"] = []
-        recovered["current_action"] = {}
-        recovered["pending_question"] = {}
-        recovered["failure_recovery"] = {"status": "pending", "record": record}
-        recovered["active_group"] = "failure_recovery"
-        recovered["pending_question"] = question_for_recovery(recovered, "failure_recovery") or {}
-        recovered["visible_response"] = [render_question(recovered["pending_question"], recovered.get("language", "en"))]
-        validate_state(recovered)
-        return self._persist_state(recovered)
+        try:
+            return self._invoke_runtime_action(
+                {
+                    "type": "activate_harness_recovery",
+                    "failure_record": record,
+                    "confidence": "high",
+                },
+                language=str(state.get("language") or "en"),
+                observation="",
+            )
+        except Exception:
+            # If the graph itself cannot execute its recovery action, retain
+            # only a typed quarantine state. This is the sole emergency direct
+            # checkpoint path and cannot apply normal user or domain actions.
+            recovered: AgentGraphState = dict(state)
+            recovered["action_queue"] = []
+            recovered["selected_action"] = {}
+            recovered["current_action"] = {}
+            recovered["pending_domain_result"] = {}
+            recovered["side_effect_intent"] = {}
+            recovered["side_effect_receipt"] = {}
+            recovered["pending_question"] = {}
+            recovered["failure_recovery"] = {
+                "status": "pending",
+                "record": record,
+            }
+            recovered["active_group"] = "failure_recovery"
+            recovered["control"] = {}
+            recovered["pending_question"] = (
+                question_for_recovery(recovered, "failure_recovery") or {}
+            )
+            recovered["visible_response"] = [
+                render_question(
+                    recovered["pending_question"],
+                    recovered.get("language", "en"),
+                )
+            ]
+            validate_state(recovered)
+            return self._persist_state(recovered)
 
     def snapshot(self) -> AgentGraphState:
         return self._load_state(language="en")
 
     def prepare_resume_offer(self, language: str) -> AgentGraphState:
-        state = self._load_state(language=language)
-        if not has_resumable_configuration(state):
-            state["language"] = language
-            state["active_group"] = "opening"
-            state["pending_question"] = opening_question(state)
-            state["visible_response"] = [render_question(state["pending_question"], state.get("language", "en"))]
-            persisted = self._persist_state(state)
-            self._write_turn_observation("startup_snapshot", persisted, persisted)
-            return persisted
-        current_pending = dict(state.get("pending_question") or {})
-        if current_pending and str(current_pending.get("id") or "") != "resume_harness_session":
-            state["resume_context"] = {
-                "pending_question": current_pending,
-                "active_group": str(state.get("active_group") or current_pending.get("group") or ""),
-            }
-        state["language"] = language
-        state["active_group"] = "opening"
-        state["pending_question"] = resume_question(state)
-        state["visible_response"] = [str(state["pending_question"]["prompt"])]
-        persisted = self._persist_state(state)
-        self._write_turn_observation("startup_snapshot", persisted, persisted)
-        return persisted
+        return self._invoke_runtime_action(
+            {"type": "prepare_session_entry", "confidence": "high"},
+            language=language,
+            observation="startup_snapshot",
+        )
 
     def reset(self, language: str = "en") -> AgentGraphState:
         """Reset workflow configuration without checkpointing startup read models.
@@ -150,20 +173,59 @@ class AnyChainGraphRuntime:
         context across this reset.
         """
 
-        current = self._load_state(language=language)
-        fresh = new_state(self.thread_id, language=language, session_purpose=self.session_purpose)
-        for key in RESET_PRESERVED_KEYS:
-            if key in current:
-                fresh[key] = current[key]  # type: ignore[literal-required]
-        fresh["audit_events"] = list(current.get("audit_events") or []) + [{"event": "workflow_reset"}]
-        return self._persist_state(fresh)
+        return self._invoke_runtime_action(
+            {"type": "reset_session", "confidence": "high"},
+            language=language,
+            observation="workflow_reset",
+        )
 
     def clear_evidence_collection(self) -> AgentGraphState:
         """Cancel terminal evidence capture without exposing arbitrary writes."""
 
-        current = self._load_state(language="en")
-        current["evidence_collection"] = {}
-        return self._persist_state(current)
+        return self._invoke_runtime_action(
+            {
+                "type": "cancel_evidence_collection",
+                "source_evidence": "terminal evidence collection cancellation",
+                "confidence": "high",
+            },
+            language="en",
+            observation="evidence_collection_cancelled",
+        )
+
+    def _invoke_runtime_action(
+        self,
+        action: Mapping[str, Any],
+        *,
+        language: str,
+        observation: str,
+    ) -> AgentGraphState:
+        """Run one trusted terminal command through the product graph."""
+
+        state = self._load_state(language=language)
+        before = deepcopy(state)
+        state["last_user_input"] = ""
+        state["language"] = language
+        state = ensure_session_metadata(
+            state,
+            self.thread_id,
+            self.session_purpose,
+        )
+        config = {"configurable": {"thread_id": self.thread_id}}
+        result = self.graph.invoke(
+            state,
+            config=config,
+            context={
+                "discovery": {},
+                "framework_summary": {},
+                "web_research": {},
+                "runtime_action": deepcopy(dict(action)),
+            },
+        )
+        validate_state(result)
+        persisted = dict(result)
+        if observation:
+            self._write_turn_observation(observation, before, persisted)
+        return persisted
 
     def _persist_state(self, patch: dict[str, Any]) -> AgentGraphState:
         """Internal checkpoint write used by typed runtime operations."""
@@ -190,6 +252,8 @@ class AnyChainGraphRuntime:
                     session_purpose=self.session_purpose,
                 )
                 validate_state(migrated)
+                if migrated != project_checkpoint_state(values):
+                    return self._persist_state(migrated)
                 return migrated
         except Exception as exc:
             quarantined = new_state(self.thread_id, language=language, session_purpose=self.session_purpose)
@@ -231,12 +295,6 @@ class AnyChainGraphRuntime:
             action_type = str((item or {}).get("type") or "")
             if action_type and action_type not in admitted_action_types:
                 admitted_action_types.append(action_type)
-        current_turn = int(after.get("turn_index") or 0)
-        for item in after.get("completed_actions") or []:
-            action_type = str((item or {}).get("type") or "")
-            submitted_turn = int((item or {}).get("_submitted_turn_index") or 0)
-            if action_type and submitted_turn == current_turn and action_type not in admitted_action_types:
-                admitted_action_types.append(action_type)
         payload = {
             "schema_version": 2,
             "event_type": event_type,
@@ -250,7 +308,7 @@ class AnyChainGraphRuntime:
             "pending_contract": deepcopy(after.get("pending_question") or {}),
             "revision": repository_revision(Path(__file__).resolve().parents[2]),
             "action_queue_types": [
-                str((item or {}).get("type") or "")
+                str((item or {}).get("action_type") or "")
                 for item in after.get("action_queue") or []
             ],
             "admitted_action_types": admitted_action_types,
@@ -343,25 +401,125 @@ def _next_result(state: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+class InvocationContext(TypedDict, total=False):
+    discovery: dict[str, Any]
+    framework_summary: dict[str, Any]
+    web_research: dict[str, Any]
+    runtime_action: dict[str, Any]
+
+
+_INVOCATION_CONTEXT_KEYS = (
+    "discovery",
+    "framework_summary",
+    "web_research",
+)
+
+
+def _contextual_step(
+    step: Callable[[AgentGraphState], AgentGraphState],
+) -> Callable[[AgentGraphState, Runtime[InvocationContext]], AgentGraphState]:
+    """Expose invocation read models to one node without checkpointing them."""
+
+    def run(
+        state: AgentGraphState,
+        runtime: Runtime[InvocationContext],
+    ) -> AgentGraphState:
+        contextual: AgentGraphState = deepcopy(state)
+        invocation_context = runtime.context or {}
+        for key in _INVOCATION_CONTEXT_KEYS:
+            contextual[key] = deepcopy(
+                invocation_context.get(key)
+                or state.get(key)
+                or {}
+            )  # type: ignore[literal-required]
+        result = step(contextual)
+        for key in _INVOCATION_CONTEXT_KEYS:
+            result[key] = {}  # type: ignore[literal-required]
+        return result
+
+    return run
+
+
+def _prepare_graph_step(
+    state: AgentGraphState,
+    runtime: Runtime[InvocationContext],
+) -> AgentGraphState:
+    """Prepare a turn and bind a trusted runtime command without checkpointing it."""
+
+    contextual: AgentGraphState = deepcopy(state)
+    invocation_context = runtime.context or {}
+    for key in _INVOCATION_CONTEXT_KEYS:
+        contextual[key] = deepcopy(invocation_context.get(key) or {})
+    result = prepare_turn_step(contextual)
+    runtime_action = dict(invocation_context.get("runtime_action") or {})
+    if (
+        runtime_action
+        and str((result.get("control") or {}).get("phase") or "")
+        == "adjudicate"
+    ):
+        result.setdefault("turn_context", {})["runtime_action"] = runtime_action
+    for key in _INVOCATION_CONTEXT_KEYS:
+        result[key] = {}  # type: ignore[literal-required]
+    return result
+
+
+def _owner_step(
+    owner: str,
+) -> Callable[[AgentGraphState, Runtime[InvocationContext]], AgentGraphState]:
+    def run(
+        state: AgentGraphState,
+        runtime: Runtime[InvocationContext],
+    ) -> AgentGraphState:
+        return _contextual_step(
+            lambda contextual: execute_selected_owner_step(
+                contextual,
+                expected_owner=owner,
+            )
+        )(state, runtime)
+
+    return run
+
+
 def build_graph(checkpointer: Any) -> Any:
     from langgraph.graph import END, START, StateGraph
 
-    graph = StateGraph(AgentGraphState)
-    graph.add_node("prepare", prepare_turn_step)
-    graph.add_node("adjudicate", adjudicate_turn_step)
-    graph.add_node("plan", plan_turn_step)
-    graph.add_node("admit", admit_turn_step)
-    graph.add_node("execute", execute_turn_step)
-    graph.add_node("fallback", fallback_turn_step)
-    graph.add_node("compose", compose_turn_step)
+    graph = StateGraph(AgentGraphState, context_schema=InvocationContext)
+    graph.add_node("prepare", _prepare_graph_step)
+    graph.add_node("adjudicate", _contextual_step(adjudicate_turn_step))
+    graph.add_node("plan", _contextual_step(plan_turn_step))
+    graph.add_node("admit", _contextual_step(admit_turn_step))
+    graph.add_node("select_action", _contextual_step(select_action_step))
+    for owner in _OWNER_NODE:
+        graph.add_node(f"owner_{owner}", _owner_step(owner))
+    graph.add_node("commit_action", _contextual_step(commit_selected_action_step))
+    graph.add_node("invoke_effect", _contextual_step(mark_side_effect_invoking_step))
+    graph.add_node("perform_effect", _contextual_step(invoke_idempotent_side_effect_step))
+    graph.add_node("commit_receipt", _contextual_step(commit_side_effect_receipt_step))
+    graph.add_node("fallback", _contextual_step(fallback_turn_step))
+    graph.add_node("compose", _contextual_step(compose_turn_step))
     graph.add_node("validate", _validate_graph_state)
 
     graph.add_edge(START, "prepare")
-    graph.add_edge("prepare", "adjudicate")
+    graph.add_conditional_edges("prepare", _next_phase, _PHASE_NODE)
     graph.add_conditional_edges("adjudicate", _next_phase, _PHASE_NODE)
     graph.add_conditional_edges("plan", _next_phase, _PHASE_NODE)
     graph.add_conditional_edges("admit", _next_phase, _PHASE_NODE)
-    graph.add_conditional_edges("execute", _next_phase, _PHASE_NODE)
+    graph.add_conditional_edges(
+        "select_action",
+        _selected_owner_node,
+        {
+            **{node: node for node in _OWNER_NODE.values()},
+            "select_action": "select_action",
+            "fallback": "fallback",
+            "compose": "compose",
+        },
+    )
+    for node in _OWNER_NODE.values():
+        graph.add_conditional_edges(node, _next_phase, _PHASE_NODE)
+    graph.add_conditional_edges("commit_action", _next_phase, _PHASE_NODE)
+    graph.add_conditional_edges("invoke_effect", _next_phase, _PHASE_NODE)
+    graph.add_conditional_edges("perform_effect", _next_phase, _PHASE_NODE)
+    graph.add_conditional_edges("commit_receipt", _next_phase, _PHASE_NODE)
     graph.add_edge("fallback", "compose")
     graph.add_edge("compose", "validate")
     graph.add_edge("validate", END)
@@ -369,12 +527,43 @@ def build_graph(checkpointer: Any) -> Any:
 
 
 _PHASE_NODE = {
+    "adjudicate": "adjudicate",
     "plan": "plan",
     "admit": "admit",
-    "execute": "execute",
+    "execute": "select_action",
+    "commit": "commit_action",
+    "invoke_effect": "invoke_effect",
+    "perform_effect": "perform_effect",
+    "commit_receipt": "commit_receipt",
     "fallback": "fallback",
     "compose": "compose",
 }
+
+
+_OWNER_NODE = {
+    owner: f"owner_{owner}"
+    for owner in (
+        "orientation",
+        "environment",
+        "chain_rpc",
+        "performance",
+        "sync_observe",
+        "execution",
+        "recovery",
+        "analysis",
+        "coordinator",
+    )
+}
+
+
+def _selected_owner_node(state: AgentGraphState) -> str:
+    phase = str((state.get("control") or {}).get("phase") or "")
+    if phase != "route_owner":
+        return _PHASE_NODE.get(phase, "compose")
+    owner = str((state.get("control") or {}).get("selected_owner") or "")
+    if owner not in _OWNER_NODE:
+        raise RuntimeError(f"invalid selected action owner: {owner or '<missing>'}")
+    return _OWNER_NODE[owner]
 
 
 def _next_phase(state: AgentGraphState) -> str:

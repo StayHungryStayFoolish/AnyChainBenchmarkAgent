@@ -69,18 +69,35 @@ class EvidenceCollectionOutcome:
 def apply_analysis_action(state: AgentGraphState, action: ActionProposal) -> HandlerResult:
     """Apply one evidence/report action without choosing another workflow group."""
 
+    if action.action_type == "start_evidence_collection":
+        pending = dict(state.get("pending_question") or {})
+        if not pending or str(pending.get("kind") or "") != "evidence":
+            return HandlerResult(blocker="start evidence requires an active evidence question")
+        return _collection_result(
+            start_evidence_collection(
+                state,
+                str(action.arguments.get("evidence") or ""),
+                pending,
+            )
+        )
     if action.action_type == "append_evidence_collection":
         if not state.get("evidence_collection"):
             return HandlerResult(blocker="append evidence requires an active evidence collection")
-        return continue_evidence_collection(
-            state,
-            str(action.arguments.get("evidence") or ""),
-            state.get("evidence_collection") or {},
-        ).result
+        return _collection_result(
+            continue_evidence_collection(
+                state,
+                str(action.arguments.get("evidence") or ""),
+                state.get("evidence_collection") or {},
+            )
+        )
     if action.action_type == "finish_evidence_collection":
         if not state.get("evidence_collection"):
             return HandlerResult(blocker="finish evidence requires an active evidence collection")
-        return finish_evidence_collection(state, state.get("evidence_collection") or {}).result
+        outcome = finish_evidence_collection(
+            state,
+            state.get("evidence_collection") or {},
+        )
+        return _collection_result(outcome)
     if action.action_type == "pause_evidence_collection":
         return pause_evidence_collection(state)
     if action.action_type == "resume_evidence_collection":
@@ -132,11 +149,30 @@ def apply_analysis_action(state: AgentGraphState, action: ActionProposal) -> Han
                 evidence,
                 str(action.arguments.get("question") or state.get("last_user_input") or evidence),
             ),
-            next_group="" if state.get("pending_question") else "error_evidence_analysis",
             completion="completed",
             stop_after_response=True,
         )
     return HandlerResult(blocker=f"unsupported analysis action: {action.action_type}")
+
+
+def _collection_result(outcome: EvidenceCollectionOutcome) -> HandlerResult:
+    """Convert collection transport output into the normal graph lifecycle."""
+
+    if outcome.disposition != "pending_answer":
+        return outcome.result
+    return HandlerResult(
+        delta=outcome.result.delta,
+        clear_pending=False,
+        pending_question=dict(outcome.pending_question),
+        followup_actions=({
+            "type": "answer_pending",
+            "answer": outcome.collected_text,
+            "source_evidence": outcome.collected_text,
+            "confidence": "high",
+            "selection_contract_verified": True,
+        },),
+        completion="completed",
+    )
 
 
 def should_start_evidence_collection(text: str) -> bool:

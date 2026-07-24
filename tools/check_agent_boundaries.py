@@ -8,6 +8,7 @@ LLM quality; live model matrices do that. Keep this script small and targeted.
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 
 
@@ -50,6 +51,19 @@ TERMINAL_FORBIDDEN = [
 
 HARNESS_FORBIDDEN_MARKERS = [
     "adk_app",
+]
+
+RETIRED_CONTROL_IDENTIFIERS = [
+    "_process_action_queue",
+    "execute_turn_step",
+    "_execute_turn_local_actions",
+    "_turn_graph",
+    "coordinator_updates",
+    "coordinator_deletes",
+    "_set_control",
+    "_append_control",
+    "_chain_rpc_draft",
+    "_domain_result",
 ]
 
 PURE_METADATA_FILES = {
@@ -110,6 +124,12 @@ def main() -> int:
         for needle in HARNESS_FORBIDDEN_MARKERS:
             if needle in text:
                 failures.append(f"Harness must not depend on the ADK bridge layer, found {needle!r}: {path}")
+        for needle in RETIRED_CONTROL_IDENTIFIERS:
+            if re.search(rf"(?<![A-Za-z0-9_]){re.escape(needle)}(?![A-Za-z0-9_])", text):
+                failures.append(
+                    "retired Harness control path must not reappear, "
+                    f"found {needle!r}: {path}"
+                )
 
     for rel, needles in PURE_METADATA_FILES.items():
         path = root / rel

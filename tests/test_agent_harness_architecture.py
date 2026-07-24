@@ -727,7 +727,8 @@ def _admitted_field_intake_action(
     }
     thread_id = str(state.get("thread_id") or "default")
     session_id = str((state.get("session") or {}).get("id") or thread_id)
-    turn_index = int(state.get("turn_index") or 0)
+    # Product admission occurs after the graph prepares and increments the turn.
+    turn_index = int(state.get("turn_index") or 0) + 1
     admission_action_id = "field-admission-1"
     transaction_hash = build_admission_transaction_hash(
         thread_id=thread_id,
@@ -1073,6 +1074,28 @@ class HarnessArchitectureTest(unittest.TestCase):
             [source],
         ))
 
+    def test_short_option_label_does_not_match_inside_natural_language(self) -> None:
+        from agent.harness.semantic_compiler import (
+            _quote_supports_pending_candidate,
+        )
+
+        source = "No, reject that detected size."
+        self.assertTrue(_quote_supports_pending_candidate(
+            source,
+            {
+                "identity": 'option:"__manual__"',
+                "value": "__manual__",
+            },
+            {
+                "options": [{
+                    "id": "2",
+                    "label": "N",
+                    "value": "__manual__",
+                }],
+            },
+            [source],
+        ))
+
     def test_go_back_cancels_field_reconfiguration_continuation(self) -> None:
         from agent.harness.coordinator import apply_coordinator_action
         from agent.harness.contracts import ActionProposal
@@ -1091,13 +1114,18 @@ class HarnessArchitectureTest(unittest.TestCase):
             state,
             ActionProposal("back-1", "go_back", {}, "high"),
         )
-        self.assertNotIn("field_reconfiguration_continuation", state.get("control") or {})
+        committed = _commit_result(state, result, owner="coordinator")
+        self.assertNotIn(
+            "field_reconfiguration_continuation",
+            committed.get("control") or {},
+        )
         self.assertEqual(result.completion, "completed")
 
     def test_legacy_custom_rpc_migration_quarantines_untrusted_source(self) -> None:
         from agent.harness.state import migrate_state
 
         base = {
+            "schema_version": 12,
             "action_queue": [{
                 "type": "start_custom_rpc",
                 "rpc_endpoint": "https://second.example/rpc",
@@ -1112,7 +1140,12 @@ class HarnessArchitectureTest(unittest.TestCase):
             session_purpose="user",
         )
         self.assertEqual(rejected["action_queue"], [])
-        self.assertEqual(rejected["audit_events"][-1]["rejected_untrusted"], 1)
+        migration_event = next(
+            event
+            for event in rejected["audit_events"]
+            if event.get("event") == "checkpoint_action_queue_enveloped"
+        )
+        self.assertEqual(migration_event["rejected_untrusted"], 1)
 
         trusted = deepcopy(base)
         trusted["action_queue"][0]["source_evidence"] = (
@@ -1125,7 +1158,10 @@ class HarnessArchitectureTest(unittest.TestCase):
             session_purpose="user",
         )
         self.assertEqual(
-            [row.get("catalog_command") for row in migrated["action_queue"]],
+            [
+                (row.get("arguments") or {}).get("catalog_command")
+                for row in migrated["action_queue"]
+            ],
             ["set_endpoint", "set_method"],
         )
 
@@ -1148,6 +1184,7 @@ class HarnessArchitectureTest(unittest.TestCase):
         }
         migrated = migrate_state(
             {
+                "schema_version": 12,
                 "active_group": "workload_rpc",
                 "pending_question": pending,
                 "action_queue": [{"type": "unknown_retired_action"}],
@@ -1161,10 +1198,7 @@ class HarnessArchitectureTest(unittest.TestCase):
         self.assertEqual(migrated["active_group"], "workload_rpc")
         self.assertEqual(migrated["action_queue"], [])
         events = migrated["audit_events"]
-        self.assertEqual(
-            events[-1]["event"],
-            "checkpoint_pending_contract_regeneration_required",
-        )
+        self.assertEqual(events[-1]["event"], "checkpoint_schema_migrated")
 
     def test_checkpoint_migration_preserves_current_pending_action_contracts(self) -> None:
         from agent.harness.state import migrate_state
@@ -1188,7 +1222,11 @@ class HarnessArchitectureTest(unittest.TestCase):
             "accepted_action_types": ["answer_pending", "choose_target_mode"],
         }
         migrated = migrate_state(
-            {"active_group": "opening", "pending_question": pending},
+            {
+                "schema_version": 12,
+                "active_group": "opening",
+                "pending_question": pending,
+            },
             thread_id="current-pending-action",
             language="en",
             session_purpose="user",
@@ -1212,6 +1250,7 @@ class HarnessArchitectureTest(unittest.TestCase):
         }
         migrated = migrate_state(
             {
+                "schema_version": 12,
                 "active_group": "opening",
                 "pending_question": {
                     "contract_version": 2,
@@ -1239,12 +1278,12 @@ class HarnessArchitectureTest(unittest.TestCase):
 
         self.assertEqual(migrated["pending_question"]["id"], "resume_harness_session")
         self.assertEqual(migrated["resume_context"]["pending_question"], {})
-        event = migrated["audit_events"][-1]
-        self.assertEqual(event["location"], "resume_context")
-        self.assertEqual(
-            event["event"],
-            "checkpoint_pending_contract_regeneration_required",
+        event = next(
+            row
+            for row in migrated["audit_events"]
+            if row.get("event") == "checkpoint_pending_actions_quarantined"
         )
+        self.assertEqual(event["location"], "resume_context")
 
     def test_state_policy_removes_inapplicable_evidence_pause_without_losing_navigation(self) -> None:
         from agent.harness.intent import _apply_state_plan_policy
@@ -1456,7 +1495,7 @@ class HarnessArchitectureTest(unittest.TestCase):
 
 
     def test_scalar_reconfiguration_opens_exact_question_without_copying_state(self) -> None:
-        from agent.harness.coordinator import _apply_queue_action
+        from tests.agent_live.graph_turn import invoke_action
 
         cases = (
             ("CLOUD_REGION", "provider_deployment", "CLOUD_REGION", "asia-east1"),
@@ -1483,7 +1522,7 @@ class HarnessArchitectureTest(unittest.TestCase):
                 source = f"change {field}"
                 action = _admitted_field_intake_action(state, field, source)
                 action["action_id"] = f"edit-{field}"
-                result = _apply_queue_action(state, action, f"change {field}")
+                result = invoke_action(state, action, f"change {field}")
                 self.assertIsNotNone(result)
                 assert result is not None
                 self.assertEqual(result["active_group"], group)
@@ -1493,7 +1532,7 @@ class HarnessArchitectureTest(unittest.TestCase):
                 self.assertNotIn(current_value, result["visible_response"][-1])
 
     def test_scalar_reconfiguration_respects_environment_prerequisites(self) -> None:
-        from agent.harness.coordinator import _apply_pending_answer, _apply_queue_action
+        from tests.agent_live.graph_turn import answer_pending, invoke_action
 
         state = _state(
             active_group="opening",
@@ -1502,7 +1541,7 @@ class HarnessArchitectureTest(unittest.TestCase):
         source = "change ACCOUNTS_VOL_MAX_IOPS"
         action = _admitted_field_intake_action(state, "ACCOUNTS_VOL_MAX_IOPS", source)
         action["action_id"] = "edit-accounts-iops"
-        result = _apply_queue_action(state, action, "change ACCOUNTS_VOL_MAX_IOPS")
+        result = invoke_action(state, action, "change ACCOUNTS_VOL_MAX_IOPS")
         self.assertIsNotNone(result)
         assert result is not None
         self.assertEqual(result["active_group"], "accounts_disk")
@@ -1512,7 +1551,7 @@ class HarnessArchitectureTest(unittest.TestCase):
             "ACCOUNTS_VOL_MAX_IOPS",
         )
         self.assertNotIn("ACCOUNTS_VOL_MAX_IOPS", result["confirmed_config"])
-        resumed = _apply_pending_answer(
+        resumed = answer_pending(
             result,
             "Y",
             dict(result["pending_question"]),
@@ -1524,7 +1563,7 @@ class HarnessArchitectureTest(unittest.TestCase):
             ("ACCOUNTS_VOL_SIZE", "1000"),
         ):
             self.assertEqual(resumed["pending_question"]["id"], question_id)
-            resumed = _apply_pending_answer(
+            resumed = answer_pending(
                 resumed,
                 value,
                 dict(resumed["pending_question"]),
@@ -1576,7 +1615,7 @@ class HarnessArchitectureTest(unittest.TestCase):
         }])
 
     def test_chain_rpc_invalidations_commit_cross_domain_state_once_at_coordinator(self) -> None:
-        from agent.harness.domains.chain_rpc_support import _domain_result
+        from agent.harness.contracts import HandlerResult, StateDelta
         from agent.harness.transitions import (
             invalidate_for_chain_change,
             invalidate_for_rpc_mode_change,
@@ -1641,7 +1680,13 @@ class HarnessArchitectureTest(unittest.TestCase):
 
                 committed = _commit_result(
                     original,
-                    _domain_result(original, changed),
+                    HandlerResult(
+                        delta=StateDelta.between(original, changed),
+                        invalidated_groups=tuple(sorted(
+                            set(changed.get("invalidated_groups") or [])
+                            - set(original.get("invalidated_groups") or [])
+                        )),
+                    ),
                     owner="chain_rpc",
                 )
 
@@ -1761,7 +1806,7 @@ class HarnessArchitectureTest(unittest.TestCase):
 
     def test_clarification_is_a_whole_turn_transaction_barrier(self) -> None:
         from agent.harness.action_registry import validate_action_transaction_contract
-        from agent.harness.coordinator import _validate_action_plan
+        from agent.harness.admission import _validate_action_plan
 
         with self.assertRaisesRegex(ValueError, "whole-turn transaction barrier"):
             validate_action_transaction_contract([
@@ -1844,7 +1889,7 @@ class HarnessArchitectureTest(unittest.TestCase):
         self.assertEqual(merged[0]["_merged_origin_texts"], [first_source, second_source])
 
     def test_upstream_mutation_rejects_answer_bound_to_stale_pending_group(self) -> None:
-        from agent.harness.coordinator import _validate_action_plan
+        from agent.harness.admission import _validate_action_plan
 
         state = _state(
             target_mode="fake-node",
@@ -1899,9 +1944,9 @@ class HarnessArchitectureTest(unittest.TestCase):
         self.assertIn("propose_config_values", [item.get("type") for item in actions])
 
     def test_model_action_envelope_normalizes_nested_arguments_at_boundary(self) -> None:
-        from agent.harness.action_registry import normalize_action_envelope
+        from agent.harness.checkpoint_migrations import normalize_v12_action_envelope
 
-        normalized = normalize_action_envelope({
+        normalized = normalize_v12_action_envelope({
             "type": "answer_opening_question",
             "confidence": "high",
             "arguments": {"topic": "current_config", "subject": "workload"},
@@ -1912,9 +1957,9 @@ class HarnessArchitectureTest(unittest.TestCase):
         self.assertNotIn("arguments", normalized)
 
     def test_nested_arguments_cannot_override_action_identity(self) -> None:
-        from agent.harness.action_registry import normalize_action_envelope
+        from agent.harness.checkpoint_migrations import normalize_v12_action_envelope
 
-        normalized = normalize_action_envelope({
+        normalized = normalize_v12_action_envelope({
             "type": "set_qps_mode",
             "arguments": {"type": "reset_session", "qps_mode": "quick"},
         })
@@ -1923,16 +1968,16 @@ class HarnessArchitectureTest(unittest.TestCase):
         self.assertEqual(normalized["qps_mode"], "quick")
 
     def test_nested_arguments_cannot_conflict_with_flat_arguments(self) -> None:
-        from agent.harness.action_registry import normalize_action_envelope
+        from agent.harness.checkpoint_migrations import normalize_v12_action_envelope
 
-        with self.assertRaisesRegex(ValueError, "conflicting flat and arguments.v1"):
-            normalize_action_envelope({
+        with self.assertRaisesRegex(ValueError, "conflicting flat and v12 arguments"):
+            normalize_v12_action_envelope({
                 "type": "answer_pending",
                 "answer": "Y",
                 "arguments": {"answer": "N"},
             })
 
-        normalized = normalize_action_envelope({
+        normalized = normalize_v12_action_envelope({
             "type": "answer_pending",
             "answer": "Y",
             "arguments": {"answer": "Y"},
@@ -2151,7 +2196,20 @@ class HarnessArchitectureTest(unittest.TestCase):
         from agent.harness import graph as graph_module
 
         source = (REPO_ROOT / "agent/harness/graph.py").read_text(encoding="utf-8")
-        for node in ("prepare", "adjudicate", "plan", "admit", "execute", "fallback", "compose", "validate"):
+        for node in (
+            "prepare",
+            "adjudicate",
+            "plan",
+            "admit",
+            "select_action",
+            "commit_action",
+            "invoke_effect",
+            "perform_effect",
+            "commit_receipt",
+            "fallback",
+            "compose",
+            "validate",
+        ):
             self.assertIn(f'graph.add_node("{node}"', source)
         self.assertNotIn('graph.add_node("turn"', source)
         self.assertFalse(hasattr(graph_module, "process_turn"))
@@ -2612,8 +2670,8 @@ class HarnessQuestionContractTest(unittest.TestCase):
     def test_model_pending_admission_uses_extracted_value_contract(self) -> None:
         from agent.harness.coordinator import (
             _action_answers_pending_contract,
-            _dispatch_pending_action,
         )
+        from tests.agent_live.graph_turn import invoke_action
         from agent.harness.domains.chain_rpc import question_for_chain_rpc
         from agent.harness.domains.environment import question_for_environment
 
@@ -2638,7 +2696,11 @@ class HarnessQuestionContractTest(unittest.TestCase):
             "pending_option_semantic_verified": True,
         }
         self.assertTrue(_action_answers_pending_contract(process_state, process_action))
-        process_result = _dispatch_pending_action(process_state, process_action)
+        process_result = invoke_action(
+            process_state,
+            process_action,
+            process_state["last_user_input"],
+        )
         self.assertEqual(
             process_result["confirmed_config"]["BLOCKCHAIN_PROCESS_NAMES"],
             "geth --networkid 1337",
@@ -2663,7 +2725,11 @@ class HarnessQuestionContractTest(unittest.TestCase):
             "pending_option_semantic_verified": True,
         }
         self.assertTrue(_action_answers_pending_contract(region_state, region_action))
-        region_result = _dispatch_pending_action(region_state, region_action)
+        region_result = invoke_action(
+            region_state,
+            region_action,
+            region_state["last_user_input"],
+        )
         self.assertEqual(region_result["confirmed_config"]["CLOUD_REGION"], "us-central1")
 
         detected_region_action = {
@@ -2673,15 +2739,19 @@ class HarnessQuestionContractTest(unittest.TestCase):
             "semantic_purpose_verified": True,
             "pending_option_semantic_verified": True,
         }
-        detected_region_result = _dispatch_pending_action(
+        detected_region_result = invoke_action(
             region_state,
             detected_region_action,
+            detected_region_action["source_evidence"],
         )
         self.assertEqual(
             detected_region_result["confirmed_config"]["CLOUD_REGION"],
             "asia-east1",
         )
-        self.assertEqual(detected_region_result["pending_question"], {})
+        self.assertEqual(
+            detected_region_result["pending_question"]["id"],
+            "CLOUD_ZONE",
+        )
 
         normalized_state = _state("en")
         normalized_state["pending_question"] = question_for_environment(
@@ -2694,7 +2764,11 @@ class HarnessQuestionContractTest(unittest.TestCase):
             "source_evidence": "us-central1",
             "_origin_text": "Use the following region for this run:\nus-central1",
         }
-        normalized_result = _dispatch_pending_action(normalized_state, normalized_action)
+        normalized_result = invoke_action(
+            normalized_state,
+            normalized_action,
+            normalized_action["_origin_text"],
+        )
         self.assertEqual(
             normalized_result["confirmed_config"]["CLOUD_REGION"],
             "us-central1",
@@ -3956,7 +4030,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
         self.assertEqual(actions, assign_action_ids("thread:9", "set two values", actions))
 
     def test_model_manual_answer_must_be_grounded_in_the_current_turn(self) -> None:
-        from agent.harness.coordinator import _action_answers_pending_contract
+        from agent.harness.admission import _action_answers_pending_contract
 
         state = _state(
             last_user_input="I want to configure QPS first",
@@ -3994,7 +4068,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
         self.assertTrue(_action_answers_pending_contract(state, grounded))
 
     def test_model_cannot_infer_fake_node_from_an_unresolved_benchmark_goal(self) -> None:
-        from agent.harness.coordinator import _action_answers_pending_contract
+        from agent.harness.admission import _action_answers_pending_contract
         from agent.harness.domains.orientation import opening_question
 
         user_text = "我要测试 BNB，用 mixed，QPS quick，并开启本地 Grafana"
@@ -4009,7 +4083,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
         self.assertFalse(_action_answers_pending_contract(state, invented))
 
     def test_distinct_consultation_topics_are_not_dropped_after_coverage(self) -> None:
-        from agent.harness.coordinator import _drop_conflicting_answer_actions
+        from agent.harness.admission import _drop_conflicting_answer_actions
 
         actions = [
             {"type": "answer_opening_question", "topic": "current_config"},
@@ -4090,9 +4164,11 @@ class HarnessStateInvariantTest(unittest.TestCase):
 
     def test_sync_observe_checkpoint_migration_removes_rpc_only_state(self) -> None:
         from agent.harness.state import migrate_state
+        from tests.agent_live.graph_turn import action_types
 
         migrated = migrate_state(
             {
+                "schema_version": 12,
                 "workflow_mode": "sync_observe",
                 "target_mode": "sync-observe",
                 "active_group": "qps_profile",
@@ -4115,7 +4191,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
         self.assertEqual(migrated["qps_profile"], {})
         self.assertEqual(migrated["active_group"], "opening")
         self.assertEqual(migrated["pending_question"], {})
-        self.assertEqual([item["type"] for item in migrated["action_queue"]], ["answer_opening_question"])
+        self.assertEqual(action_types(migrated), ["answer_opening_question"])
 
     def test_sync_observe_invariant_rejects_runtime_qps_contamination(self) -> None:
         from agent.harness.invariants import StateInvariantError, validate_state
@@ -4144,7 +4220,24 @@ class HarnessStateInvariantTest(unittest.TestCase):
             ),
             _state(
                 active_group="network",
-                action_queue=[{"action_id": "one"}, {"action_id": "two"}],
+                action_queue=[
+                    {
+                        "action_id": "one",
+                        "action_type": "set_qps_mode",
+                        "owner": "performance",
+                        "arguments": {"qps_mode": "quick"},
+                        "effect_kind": "pure",
+                        "status": "admitted",
+                    },
+                    {
+                        "action_id": "two",
+                        "action_type": "set_observability",
+                        "owner": "performance",
+                        "arguments": {"observability_mode": "disabled"},
+                        "effect_kind": "pure",
+                        "status": "admitted",
+                    },
+                ],
                 group_history=["opening", "provider_deployment"],
             ),
             _state(
@@ -4263,7 +4356,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
         self.assertEqual(template_path.read_bytes(), file_before)
 
     def test_report_analysis_owns_job_status_and_evidence_help_for_the_turn(self) -> None:
-        from agent.harness.coordinator import _drop_conflicting_answer_actions
+        from agent.harness.admission import _drop_conflicting_answer_actions
 
         actions = [
             {"type": "answer_opening_question", "topic": "current_job"},
@@ -4434,7 +4527,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
         self.assertEqual(lifecycle_rejected_action_indexes(state, reversed_order), (0,))
 
     def test_sync_observe_catalog_plan_fails_closed_before_dispatch(self) -> None:
-        from agent.harness.coordinator import _validate_action_plan
+        from agent.harness.admission import _validate_action_plan
         from agent.harness.invariants import StateInvariantError
         from agent.harness.state import new_state
 

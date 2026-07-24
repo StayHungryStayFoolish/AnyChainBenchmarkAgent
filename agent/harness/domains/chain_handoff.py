@@ -10,7 +10,7 @@ from ..questions import render_question
 from ..state import AgentGraphState
 from ..transitions import mark_group_reconfigured, record_group_invalidations
 from .chain_rpc_questions import _case3_evidence_question
-from .chain_rpc_support import _next_group, _set_control
+from .chain_rpc_support import _next_group
 from .rpc_catalog import catalog_method_names, draft_view, validated_contracts_view
 
 def _promote_case2_endpoint(state: AgentGraphState) -> None:
@@ -36,8 +36,8 @@ def _promote_case2_endpoint(state: AgentGraphState) -> None:
     # new mode. They are not stale dependents to clear at commit time.
     mark_group_reconfigured(state, "endpoint_process")
     mark_group_reconfigured(state, "workload_rpc")
-    _set_control(state, 'active_group', _next_group(state))
-    _set_control(state, 'visible_response', [localized(state.get("language", "en"), "已切换到 real-node 路径，并把已验证 endpoint/method 作为本次 job-local workload override 继续；不会修改 config/chains 原始模板。", "Switched to the real-node path and will continue with the verified endpoint/method as a job-local workload override; config/chains templates are not modified.")])
+    state['active_group'] = _next_group(state)
+    state['visible_response'] = [localized(state.get("language", "en"), "已切换到 real-node 路径，并把已验证 endpoint/method 作为本次 job-local workload override 继续；不会修改 config/chains 原始模板。", "Switched to the real-node path and will continue with the verified endpoint/method as a job-local workload override; config/chains templates are not modified.")]
 
 
 def _prepare_case2_handoff(state: AgentGraphState) -> None:
@@ -59,7 +59,7 @@ def _prepare_case2_handoff(state: AgentGraphState) -> None:
         "requirements": ["chain template", "recorded endpoint fixture", "fixture coverage", "preflight and smoke validation"],
     }
     state["secondary_handoff"] = handoff
-    _set_control(state, 'visible_response', [_case2_handoff_message(state)])
+    state['visible_response'] = [_case2_handoff_message(state)]
 
 
 def _record_case3_evidence(state: AgentGraphState, evidence: str) -> None:
@@ -70,12 +70,12 @@ def _record_case3_evidence(state: AgentGraphState, evidence: str) -> None:
         items.append(evidence)
     identity.update({"status": "case3_collecting_evidence", "case": "case3"})
     handoff.update({"status": "collecting_evidence", "kind": "case3_protocol_adapter_implementation", "chain": normalize_scalar(identity.get("canonical") or identity.get("raw"))})
-    _set_control(state, 'active_group', "chain_identity")
-    _set_control(state, 'pending_question', _case3_evidence_question(state))
-    _set_control(state, 'visible_response', [
+    state['active_group'] = "chain_identity"
+    state['pending_question'] = _case3_evidence_question(state)
+    state['visible_response'] = [
         localized(state.get("language", "en"), f"已记录第 {len(items)} 条协议开发证据。", f"Recorded protocol-development evidence item {len(items)}."),
         render_question(state["pending_question"], state.get("language", "en")),
-    ])
+    ]
 
 
 def _prepare_case3_handoff(state: AgentGraphState) -> None:
@@ -101,7 +101,7 @@ def _prepare_case3_handoff(state: AgentGraphState) -> None:
         }
     )
     handoff["draft"] = _case3_handoff_draft(state, evidence)
-    _set_control(state, 'visible_response', [handoff["draft"]])
+    state['visible_response'] = [handoff["draft"]]
 
 
 def _case2_handoff_message(state: AgentGraphState) -> str:

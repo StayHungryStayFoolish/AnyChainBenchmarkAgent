@@ -36,13 +36,15 @@ The LangGraph Harness is the single conversation and workflow authority:
 ```text
 complete terminal turn
 -> exact active option or typed literal fast path when deterministic
--> otherwise one LLM typed-action plan
--> action admission and prerequisite ordering
--> owning domain handler
--> shared invalidation and invariants
--> canonical fallback resolver
--> one result plus at most one blocking question
--> one versioned checkpoint
+-> otherwise hierarchical semantic partition and bounded owner compilation
+-> admission and dependency-safe ordering
+-> select exactly one durable action
+-> route exactly one owning domain
+-> commit one typed result
+-> persist/invoke/receipt when the action has an external side effect
+-> repeat selection through graph transitions while admitted work remains
+-> canonical fallback and one response with at most one blocking question
+-> validate and checkpoint schema version 13
 ```
 
 The single metadata authority is
@@ -89,13 +91,24 @@ The eight owners are:
 Important implementation files:
 
 - `agent/harness/graph.py`: LangGraph/checkpoint runtime
-- `agent/harness/coordinator.py`: thin turn orchestration
+- `agent/harness/coordinator.py`: graph-node transitions and sole typed commit
+  boundary
+- `agent/harness/hierarchical_planner.py`: sole semantic-planning entry; Stage
+  A partitions the complete turn and Stage B compiles owner-scoped actions
+  before whole-plan admission
 - `agent/harness/action_registry.py`: typed action contracts and prerequisites
+- `agent/harness/admission.py`: admission, conflict, prerequisite, and semantic
+  coverage validation
+- `agent/harness/queue.py`: dependency ordering and pending-barrier eligibility
+- `agent/harness/routing.py`: navigation and canonical fallback authority
+- `agent/harness/response.py`: single response-composition authority
+- `agent/harness/contracts.py`: durable action/result/effect/turn contracts
+- `agent/harness/checkpoint_migrations.py`: isolated version-12 migration only
 - `agent/harness/questions.py`: typed question/option contracts
 - `agent/harness/transitions.py`: invalidation and reconfiguration state
-- `agent/harness/routing.py`: canonical next-group fallback
 - `agent/harness/invariants.py`: state and expected-patch enforcement
-- `agent/harness/intent.py`: ambiguous natural-language to typed actions
+- `agent/harness/intent.py`: focused adjudication and schema/admission helpers,
+  not a second product planner
 - `agent/harness/domains/`: the eight product domain owners
 - `agent/terminal/repl.py`: product terminal shell only
 - `agent/runners/benchmark_pipeline.py`: plan materialization and submission
@@ -104,6 +117,13 @@ The retired monolithic group owner, retired graph-node layer, and terminal or
 workflow business routers must not return. Architecture tests enforce these
 boundaries without making retired implementation files part of the active
 design contract.
+
+The runtime compiles one graph with its SQLite checkpointer. It must not create
+a second uncheckpointed turn graph or drain the complete durable queue inside
+one Python node. Current-version turns must not invoke checkpoint compatibility
+code. Version 12 crosses the isolated adapter once and is persisted as version
+13; older state is quarantined and only allowlisted environment facts may be
+offered for reconfirmation.
 
 ## Migrated Historical Findings
 
@@ -198,6 +218,15 @@ acceptance requires a live Docker CLI in which DeepSeek is the AnyChain Agent
 model and Codex acts as the user. Codex must read each actual Agent response
 before choosing the next turn. A prewritten prompt sequence is not dual-AI
 Chaos.
+
+`tests/agent_live/run_product_acceptance.py` is the sole authority that may
+advance phases or close G0-G6. Phase 6 closes only deterministic gate G2.
+Retained real-user replay, real CLI, response-driven dual-AI Chaos, and real
+execution belong to Phase 8 and close G3-G6 only after the controller admits
+their revision-bound evidence. Ledger, matrix, PTY, simulator, and execution
+scripts are subordinate evidence providers; their direct exit codes never
+declare product readiness. Until Phase 8 is implemented and passes, the
+product status remains not ready.
 
 Generate the registry ledger first:
 

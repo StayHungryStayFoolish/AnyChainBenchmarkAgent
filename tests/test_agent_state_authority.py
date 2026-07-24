@@ -69,11 +69,54 @@ class TerminalPersistenceAuthorityTest(unittest.TestCase):
 
 
 class InvocationContextAuthorityTest(unittest.TestCase):
+    def test_current_checkpoint_never_invokes_v12_action_adapter(self) -> None:
+        from agent.harness.state import migrate_state, new_state
+
+        current = new_state("current-no-compat", language="en")
+        with patch(
+            "agent.harness.checkpoint_migrations.compile_v12_custom_rpc_action"
+        ) as legacy_adapter:
+            migrated = migrate_state(
+                current,
+                thread_id="current-no-compat",
+                language="en",
+                session_purpose="user",
+            )
+
+        legacy_adapter.assert_not_called()
+        self.assertEqual(migrated["schema_version"], current["schema_version"])
+
+    def test_v12_checkpoint_is_persisted_as_v13_once(self) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.state import STATE_SCHEMA_VERSION, new_state
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "migration.sqlite"
+            runtime = AnyChainGraphRuntime(
+                thread_id="persist-migration",
+                checkpoint_path=path,
+            )
+            old = new_state("persist-migration", language="en")
+            old["schema_version"] = 12
+            runtime._persist_state(old)
+            first = runtime.snapshot()
+            second = runtime.snapshot()
+            runtime.close()
+
+        self.assertEqual(first["schema_version"], STATE_SCHEMA_VERSION)
+        self.assertEqual(second["schema_version"], STATE_SCHEMA_VERSION)
+        migration_events = [
+            event
+            for event in second.get("audit_events") or []
+            if event.get("event") == "checkpoint_schema_migrated"
+        ]
+        self.assertEqual(len(migration_events), 1)
+
     def test_invariant_recovery_projects_external_context_before_raw_checkpoint_write(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
 
         class InvalidTurnGraph:
-            def invoke(self, state):
+            def invoke(self, state, **_kwargs):
                 state["active_group"] = "not-a-product-group"
                 return state
 
@@ -83,16 +126,20 @@ class InvocationContextAuthorityTest(unittest.TestCase):
                 checkpoint_path=Path(tmpdir) / "checkpoints.sqlite3",
             )
             try:
-                runtime._turn_graph = InvalidTurnGraph()
-                runtime.invoke(
-                    "trigger recovery",
-                    context={
-                        "discovery": {"cloud": {"provider": "gcp"}},
-                        "framework_summary": {"chain_count": 36},
-                        "web_research": {"available": True},
-                        "latest_job_id": "job_external",
-                    },
-                )
+                with patch.object(
+                    runtime.graph,
+                    "invoke",
+                    side_effect=InvalidTurnGraph().invoke,
+                ):
+                    runtime.invoke(
+                        "trigger recovery",
+                        context={
+                            "discovery": {"cloud": {"provider": "gcp"}},
+                            "framework_summary": {"chain_count": 36},
+                            "web_research": {"available": True},
+                            "latest_job_id": "job_external",
+                        },
+                    )
                 raw = dict(runtime.graph.get_state(
                     {"configurable": {"thread_id": "external-context-recovery"}}
                 ).values or {})
@@ -126,7 +173,11 @@ class InvocationContextAuthorityTest(unittest.TestCase):
         self.assertEqual(migrated["framework_summary"], {})
         self.assertEqual(migrated["web_research"], {})
         self.assertNotIn("latest_job_id", migrated)
-        self.assertEqual(migrated["confirmed_config"], {"CLOUD_REGION": "asia-east1"})
+        self.assertEqual(migrated["confirmed_config"], {})
+        self.assertEqual(
+            migrated["inferred_config"]["pending_review"]["config_values"],
+            {"CLOUD_REGION": "asia-east1"},
+        )
 
     def test_graph_invocation_uses_but_never_checkpoints_external_context(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
@@ -134,10 +185,11 @@ class InvocationContextAuthorityTest(unittest.TestCase):
         class EchoTurnGraph:
             observed = {}
 
-            def invoke(self, state):
+            def invoke(self, state, **kwargs):
+                context = kwargs.get("context") or {}
                 self.observed = {
-                    "discovery": state.get("discovery"),
-                    "framework_summary": state.get("framework_summary"),
+                    "discovery": context.get("discovery"),
+                    "framework_summary": context.get("framework_summary"),
                 }
                 state["visible_response"] = ["context consumed"]
                 state["turn_index"] = int(state.get("turn_index") or 0) + 1
@@ -150,14 +202,18 @@ class InvocationContextAuthorityTest(unittest.TestCase):
             )
             try:
                 turn_graph = EchoTurnGraph()
-                runtime._turn_graph = turn_graph
-                runtime.invoke(
-                    "show current environment",
-                    context={
-                        "discovery": {"cloud": {"provider": "gcp"}},
-                        "framework_summary": {"chain_count": 36},
-                    },
-                )
+                with patch.object(
+                    runtime.graph,
+                    "invoke",
+                    side_effect=turn_graph.invoke,
+                ):
+                    runtime.invoke(
+                        "show current environment",
+                        context={
+                            "discovery": {"cloud": {"provider": "gcp"}},
+                            "framework_summary": {"chain_count": 36},
+                        },
+                    )
                 persisted = runtime.snapshot()
             finally:
                 runtime.close()

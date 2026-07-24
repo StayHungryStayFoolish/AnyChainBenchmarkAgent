@@ -67,6 +67,7 @@ def question_for_performance(state: AgentGraphState, group: str) -> dict[str, An
                     {"label": "Y", "value": True, "expected_patch": {"qps_profile.confirmed": True}},
                     {"label": "N", "value": False, "expected_patch": {"qps_profile.default_decision_made": True}},
                 ],
+                accepted_action_types=("request_qps_customization",),
                 queue_barrier=True,
             )
         if not qps.get("confirmed"):

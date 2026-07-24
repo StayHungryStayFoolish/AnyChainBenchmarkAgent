@@ -167,6 +167,7 @@ def manual_question(
     accepted_action_types: tuple[str, ...] = (),
     manual_action: dict[str, Any] | None = None,
     queue_barrier: bool = False,
+    barrier_policy: str = "",
     validation: dict[str, Any] | None = None,
     requires_capabilities: tuple[str, ...] = (),
     help_text: str = "",
@@ -178,6 +179,10 @@ def manual_question(
     candidate_bindings: tuple[dict[str, Any], ...] = (),
 ) -> dict[str, Any]:
     field_validation = _question_validation(kind, validation)
+    effective_barrier_policy = (
+        str(barrier_policy or "").strip()
+        or ("exclusive_owner" if queue_barrier else "")
+    )
     declared_manual_action = _manual_owner_contract(
         manual_input_allowed=True,
         manual_action=manual_action,
@@ -209,9 +214,15 @@ def manual_question(
             *([declared_action_type] if declared_action_type else []),
             *declared_binding_types,
             *(["propose_config_values"] if structured_key else []),
+            *(["start_evidence_collection"] if kind == "evidence" else []),
         }),
         **({"manual_action": declared_manual_action} if declared_manual_action else {}),
         "queue_barrier": queue_barrier,
+        **(
+            {"barrier_policy": effective_barrier_policy}
+            if effective_barrier_policy
+            else {}
+        ),
         "validation": field_validation,
         "requires_capabilities": list(requires_capabilities),
         "help_text": str(help_text or "").strip(),
@@ -237,6 +248,7 @@ def choice_question(
     accepted_action_types: tuple[str, ...] = (),
     manual_action: dict[str, Any] | None = None,
     queue_barrier: bool = False,
+    barrier_policy: str = "",
     validation: dict[str, Any] | None = None,
     requires_capabilities: tuple[str, ...] = (),
     help_text: str = "",
@@ -246,6 +258,10 @@ def choice_question(
     structured_config_key: str = "",
     candidate_bindings: tuple[dict[str, Any], ...] = (),
 ) -> dict[str, Any]:
+    effective_barrier_policy = (
+        str(barrier_policy or "").strip()
+        or ("exclusive_owner" if queue_barrier else "")
+    )
     declared_manual_action = _manual_owner_contract(
         manual_input_allowed=manual_input_allowed,
         manual_action=manual_action,
@@ -350,6 +366,11 @@ def choice_question(
         ),
         **({"manual_action": declared_manual_action} if declared_manual_action else {}),
         "queue_barrier": queue_barrier,
+        **(
+            {"barrier_policy": effective_barrier_policy}
+            if effective_barrier_policy
+            else {}
+        ),
         "validation": _question_validation(kind, validation),
         "requires_capabilities": list(requires_capabilities),
         "help_text": str(help_text or "").strip(),

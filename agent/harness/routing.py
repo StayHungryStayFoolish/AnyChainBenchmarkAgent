@@ -10,9 +10,14 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from agent.planners.chain_template_requirements import inspect_chain_template
-from agent.workflows.group_registry import fallback_groups_for_workflow
+from agent.workflows.group_registry import (
+    GROUP_SPEC_BY_NAME,
+    fallback_groups_for_workflow,
+    is_user_navigable_group,
+)
 
 from .failures import unresolved_recovery
+from .state import PendingQuestion
 from .sync_observe_contract import SyncObserveBlocker, SyncObserveRequest
 
 
@@ -283,3 +288,34 @@ def next_group_and_reason(state: dict[str, Any]) -> tuple[str, str]:
         else "monitor benchmark job"
     )
     return "job_monitoring", terminal_reason
+
+
+def navigation_prerequisite(state: dict[str, Any], group: str) -> str:
+    """Return the first typed prerequisite for one public destination."""
+
+    spec = GROUP_SPEC_BY_NAME.get(group)
+    if spec is None or not is_user_navigable_group(group):
+        return ""
+    workflow_mode = str(state.get("workflow_mode") or "").strip()
+    if spec.workflow_modes and workflow_mode not in spec.workflow_modes:
+        return "target_mode"
+    for dependency in spec.depends_on:
+        if dependency == "target_mode" and not str(state.get("target_mode") or "").strip():
+            return dependency
+        if not group_readiness(state, dependency).ready:
+            return dependency
+    return ""
+
+
+def option_return_policy(question: PendingQuestion, value: Any) -> str:
+    """Return the declared interruption policy for one selected option."""
+
+    selected = next(
+        (
+            option
+            for option in question.get("options") or []
+            if option.get("value") == value
+        ),
+        {},
+    )
+    return str(selected.get("return_policy") or "fallback")

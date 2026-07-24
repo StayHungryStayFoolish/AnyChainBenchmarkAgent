@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Mapping
 
@@ -60,6 +59,28 @@ SEMANTIC_OPERATIONS = frozenset({
     "context",
     "unresolved",
 })
+
+
+def answer_pending_representation_conflict(action: Mapping[str, Any]) -> bool:
+    """Return whether one pending answer carries two different facts."""
+
+    if str(action.get("type") or "") != "answer_pending":
+        return False
+    supplied: list[Any] = []
+    for key in ("answer", "selected_value"):
+        if key not in action:
+            continue
+        value = action.get(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        supplied.append(value.strip() if isinstance(value, str) else value)
+    if len(supplied) < 2:
+        return False
+    identities = {
+        json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        for value in supplied
+    }
+    return len(identities) > 1
 
 
 SEMANTIC_SCOPE_POLICIES: dict[str, dict[str, Any]] = {
@@ -240,6 +261,7 @@ class ActionSpec:
     entry_intake: bool = False
     entry_intake_purpose: str = ""
     entry_intake_arguments: tuple[tuple[str, Any], ...] = ()
+    internal_only: bool = False
     validator: ActionValidator | None = None
 
     @property
@@ -285,7 +307,17 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         semantic_operations=("unresolved",),
         required_arguments=("clauses",),
     ),
-    ActionSpec("reset_session", "orientation", "Clear workflow configuration while preserving the workflow job receipt; startup discovery and historical jobs remain external read models.", execution_phase=0, effect="workflow_state_mutation", semantic_operations=("administrative",)),
+    ActionSpec("reset_session", "orientation", "Clear workflow configuration while preserving the workflow job receipt; startup discovery and historical jobs remain external read models.", execution_phase=0, effect="workflow_state_mutation", crosses_pending_barrier=True, semantic_operations=("administrative",)),
+    ActionSpec(
+        "prepare_session_entry",
+        "orientation",
+        "Open the typed fresh-session or resumable-session question at terminal startup.",
+        execution_phase=0,
+        effect="workflow_navigation",
+        crosses_pending_barrier=True,
+        semantic_operations=("administrative",),
+        internal_only=True,
+    ),
     ActionSpec("ask_capabilities", "orientation", "Explain supported product capabilities from framework facts.", execution_phase=5, lifetime="turn_local", effect="read_only", semantic_operations=("consultation",)),
     ActionSpec(
         "answer_opening_question",
@@ -304,9 +336,63 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
             "non_mutation_scope",
         ),
     ),
-    ActionSpec("choose_target_mode", "chain_rpc", "Select fake-node, real-node, or sync-observe only when the user explicitly requests that mutation.", ("target_mode", "target_mode_explicit", "source_evidence"), 10, "target_mode", mutation_dimension="target_mode", provides_capabilities=("target_mode",), required_arguments=("target_mode", "target_mode_explicit", "source_evidence"), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS, semantic_value_grounding_arguments=("target_mode",)),
-    ActionSpec("choose_chain", "chain_rpc", "Select a user-supplied raw chain name when none is confirmed, or expose multiple user-supplied candidates without choosing silently. Chain existence, canonical identity, and protocol research belong to the chain-identity domain after this action.", ("chain_text", "chain_candidates", "source_evidence"), 20, "chain_identity", mutation_dimension="chain", provides_capabilities=("chain_identity",), required_arguments=("source_evidence",), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS, validator=_validate_chain_selection),
-    ActionSpec("change_chain", "chain_rpc", "Request a user-supplied raw replacement chain, or expose multiple user-supplied candidates without choosing silently. Chain existence, canonical identity, and protocol research belong to the chain-identity domain after this action.", ("chain_text", "chain_candidates", "source_evidence"), 20, "chain_identity", mutation_dimension="chain", provides_capabilities=("chain_identity",), required_arguments=("source_evidence",), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS, validator=_validate_chain_selection),
+    ActionSpec(
+        "choose_target_mode",
+        "chain_rpc",
+        "Select fake-node, real-node, or sync-observe only when the user explicitly requests that mutation.",
+        ("target_mode", "target_mode_explicit", "source_evidence"),
+        10,
+        "target_mode",
+        preserve_pending=True,
+        mutation_dimension="target_mode",
+        provides_capabilities=("target_mode",),
+        crosses_pending_barrier=True,
+        required_arguments=("target_mode", "target_mode_explicit", "source_evidence"),
+        semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
+        semantic_value_grounding_arguments=("target_mode",),
+        entry_intake=True,
+        entry_intake_purpose="Enter target-mode selection from any active workflow group.",
+        entry_intake_arguments=(
+            ("target_mode", "fake-node"),
+            ("target_mode_explicit", True),
+        ),
+    ),
+    ActionSpec(
+        "choose_chain",
+        "chain_rpc",
+        "Select a user-supplied raw chain name when none is confirmed, or expose multiple user-supplied candidates without choosing silently. Chain existence, canonical identity, and protocol research belong to the chain-identity domain after this action.",
+        ("chain_text", "chain_candidates", "source_evidence"),
+        20,
+        "chain_identity",
+        preserve_pending=True,
+        mutation_dimension="chain",
+        provides_capabilities=("chain_identity",),
+        crosses_pending_barrier=True,
+        required_arguments=("source_evidence",),
+        semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
+        entry_intake=True,
+        entry_intake_purpose="Enter initial chain identity selection from any active workflow group.",
+        entry_intake_arguments=(("chain_text", "registry"),),
+        validator=_validate_chain_selection,
+    ),
+    ActionSpec(
+        "change_chain",
+        "chain_rpc",
+        "Request a user-supplied raw replacement chain, or expose multiple user-supplied candidates without choosing silently. Chain existence, canonical identity, and protocol research belong to the chain-identity domain after this action.",
+        ("chain_text", "chain_candidates", "source_evidence"),
+        20,
+        "chain_identity",
+        preserve_pending=True,
+        mutation_dimension="chain",
+        provides_capabilities=("chain_identity",),
+        crosses_pending_barrier=True,
+        required_arguments=("source_evidence",),
+        semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
+        entry_intake=True,
+        entry_intake_purpose="Enter chain replacement from any active workflow group.",
+        entry_intake_arguments=(("chain_text", "registry"),),
+        validator=_validate_chain_selection,
+    ),
     ActionSpec(
         "request_chain_selection",
         "chain_rpc",
@@ -314,10 +400,16 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         ("chain_candidates", "source_evidence"),
         execution_phase=25,
         target_group="chain_identity",
+        preserve_pending=True,
         requires_capabilities=("target_mode",),
         provides_capabilities=("chain_identity",),
+        crosses_pending_barrier=True,
+        effect="workflow_navigation",
         incomplete_mutation_intake=True,
-        semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
+        semantic_support_relations=(
+            *FRAMED_OPERATION_SUPPORT_RELATIONS,
+            "non_mutation_scope",
+        ),
     ),
     ActionSpec(
         "request_target_mode_selection",
@@ -326,9 +418,15 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         ("source_evidence",),
         execution_phase=24,
         target_group="target_mode",
+        preserve_pending=True,
         provides_capabilities=("target_mode",),
+        crosses_pending_barrier=True,
+        effect="workflow_navigation",
         incomplete_mutation_intake=True,
-        semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
+        semantic_support_relations=(
+            *FRAMED_OPERATION_SUPPORT_RELATIONS,
+            "non_mutation_scope",
+        ),
     ),
     ActionSpec(
         "change_group",
@@ -337,6 +435,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         ("group", "navigation_explicit", "source_evidence"),
         50,
         merge_identity=("group",),
+        preserve_pending=True,
         crosses_pending_barrier=True,
         required_arguments=("group", "navigation_explicit", "source_evidence"),
         effect="workflow_navigation",
@@ -390,6 +489,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         "Return to the most recent relevant interrupted group.",
         ("source_evidence",),
         effect="workflow_navigation",
+        crosses_pending_barrier=True,
         semantic_recovery_source_argument="source_evidence",
         semantic_operations=("navigation",),
         semantic_support_relations=(
@@ -464,6 +564,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         40,
         "endpoint_process",
         preserve_pending=True,
+        crosses_pending_barrier=True,
         requires_capabilities=("chain_identity",),
         required_arguments=("catalog_command", "source_evidence"),
         constraints=(
@@ -496,10 +597,11 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         "rpc_workload_command",
         "chain_rpc",
         "Apply the workload selection only after catalog methods are validated.",
-        ("workload_scope", "rpc_weights", "finish_methods"),
+        ("workload_scope", "rpc_weights", "finish_methods", "source_evidence"),
         41,
         "endpoint_process",
         preserve_pending=True,
+        crosses_pending_barrier=True,
         requires_capabilities=("target_mode", "chain_identity"),
         required_arguments=("workload_scope",),
         constraints=(
@@ -519,8 +621,21 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
     ),
     ActionSpec("cancel_target_change", "chain_rpc", "Return to workload configuration without changing chain or target mode.", compiler_groups=("workload_rpc",)),
     ActionSpec("set_qps_mode", "performance", "Select quick, standard, or intensive profile. Do not use set_qps_override unless concrete numeric values were supplied.", ("qps_mode", "mutation_explicit", "source_evidence"), 50, "qps_profile", preserve_pending=True, mutation_dimension="qps_profile", requires_capabilities=("target_mode",), crosses_pending_barrier=True, required_arguments=("qps_mode", "mutation_explicit", "source_evidence"), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS, semantic_value_grounding_arguments=("qps_mode",)),
-    ActionSpec("request_qps_customization", "performance", "Enter QPS customization when the user wants to adjust the selected profile but has not supplied every numeric value yet.", ("qps_fields", "source_evidence"), 50, "qps_profile", preserve_pending=True, mutation_dimension="qps_profile", requires_capabilities=("target_mode",), crosses_pending_barrier=True, requires_specific_change=True, required_arguments=("source_evidence",), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS),
-    ActionSpec("set_qps_override", "performance", "Apply concrete QPS profile overrides only when qps_overrides contains user-supplied numeric values. For an adjustment request without values, use request_qps_customization.", ("qps_overrides",), 50, "qps_profile", preserve_pending=True, mutation_dimension="qps_profile", requires_capabilities=("target_mode",), crosses_pending_barrier=True, required_arguments=("qps_overrides",)),
+    ActionSpec("request_qps_customization", "performance", "Enter QPS customization when the user wants to adjust the selected profile but has not supplied every numeric value yet.", ("qps_fields", "source_evidence"), 50, "qps_profile", preserve_pending=True, mutation_dimension="qps_profile", requires_capabilities=("target_mode",), crosses_pending_barrier=True, requires_specific_change=True, incomplete_mutation_intake=True, required_arguments=("source_evidence",), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS),
+    ActionSpec(
+        "set_qps_override",
+        "performance",
+        "Apply concrete QPS profile overrides only when qps_overrides contains user-supplied numeric values. For an adjustment request without values, use request_qps_customization.",
+        ("qps_overrides", "source_evidence"),
+        50,
+        "qps_profile",
+        preserve_pending=True,
+        mutation_dimension="qps_profile",
+        requires_capabilities=("target_mode",),
+        crosses_pending_barrier=True,
+        required_arguments=("qps_overrides",),
+        semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
+    ),
     ActionSpec("set_observability", "performance", "Select disabled, local, or exporter-only observability.", ("observability_mode", "mutation_explicit", "source_evidence"), 60, "observability", preserve_pending=True, mutation_dimension="observability", requires_capabilities=("target_mode",), crosses_pending_barrier=True, required_arguments=("observability_mode", "mutation_explicit", "source_evidence"), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS, semantic_value_grounding_arguments=("observability_mode",)),
     ActionSpec("set_sync_observe_source", "sync_observe", "Select the real sync-observe data source.", ("sync_observe_source",), target_group="sync_observe", required_arguments=("sync_observe_source",), semantic_value_grounding_arguments=("sync_observe_source",)),
     ActionSpec("clear_sync_observe_source", "sync_observe", "Clear a sync-observe source after its endpoint setup is cancelled.", target_group="sync_observe"),
@@ -540,7 +655,18 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
     ActionSpec("reject_preflight_smoke", "execution", "Pause before preflight/smoke without submitting a job.", compiler_groups=("preflight_smoke_execution",)),
     ActionSpec("approve_final_benchmark", "execution", "Approve final real-node benchmark submission after isolated smoke success.", compiler_groups=("job_monitoring",), effect="execution"),
     ActionSpec("reject_final_benchmark", "execution", "Pause after successful real-node smoke without submitting the final benchmark.", compiler_groups=("job_monitoring",)),
-    ActionSpec("set_accounts_presence", "environment", "Confirm whether a separate accounts/state disk exists.", ("has_accounts_device",), target_group="accounts_disk", required_arguments=("has_accounts_device",), semantic_value_grounding_arguments=("has_accounts_device",)),
+    ActionSpec(
+        "set_accounts_presence",
+        "environment",
+        "Confirm whether a separate accounts/state disk exists.",
+        ("has_accounts_device", "source_evidence"),
+        target_group="accounts_disk",
+        preserve_pending=True,
+        crosses_pending_barrier=True,
+        required_arguments=("has_accounts_device",),
+        semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
+        semantic_value_grounding_arguments=("has_accounts_device",),
+    ),
     ActionSpec(
         "propose_config_values",
         "environment",
@@ -557,6 +683,17 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         merge_mapping_fields=("config_values", "unmapped_values"),
         merge_sequence_fields=("conflicts",),
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
+    ),
+    ActionSpec(
+        "start_evidence_collection",
+        "analysis",
+        "Start framed multi-line evidence collection for the active evidence question.",
+        ("evidence", "source_evidence"),
+        execution_phase=3,
+        crosses_pending_barrier=True,
+        required_arguments=("evidence", "source_evidence"),
+        semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
+        semantic_operations=("evidence_analysis",),
     ),
     ActionSpec(
         "append_evidence_collection",
@@ -665,10 +802,24 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         "recovery",
         "Inspect structured failure evidence without changing workflow configuration.",
         compiler_groups=("failure_recovery",),
+        lifetime="turn_local",
         effect="read_only",
     ),
     ActionSpec("retry_failure", "recovery", "Clear a retryable external-service failure without executing a benchmark side effect.", compiler_groups=("failure_recovery",)),
     ActionSpec("cancel_failure_recovery", "recovery", "Pause recovery while preserving evidence and confirmed configuration.", compiler_groups=("failure_recovery",)),
+    ActionSpec(
+        "activate_harness_recovery",
+        "recovery",
+        "Install one validated Harness invariant failure for typed recovery.",
+        ("failure_record",),
+        execution_phase=0,
+        target_group="failure_recovery",
+        effect="workflow_state_mutation",
+        crosses_pending_barrier=True,
+        semantic_operations=("administrative",),
+        required_arguments=("failure_record",),
+        internal_only=True,
+    ),
     ActionSpec("answer_pending", "coordinator", "Answer the active typed question after interpreting non-exact user language.", ("answer", "selected_value", "source_evidence"), 0, required_arguments=("source_evidence",), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS, semantic_operations=("pending_answer",)),
     ActionSpec("unknown", "orientation", "Report that no safe action could be resolved.", ("reason",), effect="read_only", required_arguments=("reason",), semantic_operations=("unresolved",)),
 )
@@ -771,6 +922,7 @@ def project_action_specs(
         spec
         for spec in ACTION_SPECS
         if (owners is None or spec.owner in owners)
+        and not spec.internal_only
         and (
             groups is None
             or spec.target_group in groups
@@ -987,6 +1139,7 @@ def action_registry_contract_hash() -> str:
             "required_state_values": list(spec.required_state_values),
             "state_transition_path": list(spec.state_transition_path),
             "state_transition_value": spec.state_transition_value,
+            "internal_only": spec.internal_only,
             "state_transition_resolver": (
                 f"{spec.state_transition_resolver.__module__}.{spec.state_transition_resolver.__qualname__}"
                 if spec.state_transition_resolver is not None
@@ -1282,9 +1435,6 @@ def validate_proposal_field_receipts(
             raise ValueError(f"proposal field receipt session mismatch: {field}")
         if submitted_turn_index is not None and int(receipt.get("submitted_turn_index") or 0) != int(submitted_turn_index):
             raise ValueError(f"proposal field receipt turn mismatch: {field}")
-LEGACY_ARGUMENTS_ENVELOPE_VERSION = "arguments.v1"
-_COMPATIBILITY_USAGE: Counter[str] = Counter()
-
 ACTION_ARGUMENT_SCHEMAS: dict[str, Mapping[str, Any]] = {
     "adapter_family": {"type": "string", "minLength": 1},
     "answer": {},
@@ -1300,6 +1450,7 @@ ACTION_ARGUMENT_SCHEMAS: dict[str, Mapping[str, Any]] = {
     "evidence": {},
     "evidence_summary": {"type": "string", "minLength": 1},
     "finish_methods": {"type": "boolean"},
+    "failure_record": {"type": "object", "minProperties": 1},
     "goal": {"type": "string", "minLength": 1},
     "group": {"type": "string", "minLength": 1},
     "handoff_command": {"type": "string", "enum": ["append_evidence"]},
@@ -1410,74 +1561,6 @@ def validate_candidate_binding_contract(raw: Mapping[str, Any]) -> dict[str, str
     return binding
 
 
-def compile_legacy_custom_rpc_action(raw: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Compile the retired omnibus action into ordered catalog/workload commands."""
-
-    action = dict(raw)
-    if str(action.get("type") or "") != "start_custom_rpc":
-        return [action]
-    # Expanded commands receive fresh action IDs later. Carrying the retired
-    # action identity here would either restore its old type or create several
-    # commands with the same durable ID.
-    metadata = {
-        key: value
-        for key, value in action.items()
-        if key in {"confidence", "reason"}
-    }
-    catalog_metadata = dict(metadata)
-    if str(action.get("source_evidence") or "").strip():
-        catalog_metadata["source_evidence"] = action["source_evidence"]
-    commands: list[dict[str, Any]] = []
-    if action.get("rpc_endpoint"):
-        commands.append({"type": "rpc_catalog_command", "catalog_command": "set_endpoint", "rpc_endpoint": action["rpc_endpoint"], **catalog_metadata})
-    if action.get("rpc_method"):
-        commands.append({"type": "rpc_catalog_command", "catalog_command": "set_method", "rpc_method": action["rpc_method"], **catalog_metadata})
-    if action.get("rpc_schema_evidence"):
-        commands.append({"type": "rpc_catalog_command", "catalog_command": "append_evidence", "rpc_schema_evidence": action["rpc_schema_evidence"], **catalog_metadata})
-    if action.get("workload_scope"):
-        workload = {
-            "type": "rpc_workload_command",
-            "workload_scope": action["workload_scope"],
-            **metadata,
-        }
-        if isinstance(action.get("rpc_weights"), dict):
-            workload["rpc_weights"] = dict(action["rpc_weights"])
-        if "finish_methods" in action:
-            workload["finish_methods"] = bool(action.get("finish_methods"))
-        commands.append(workload)
-    if not commands:
-        commands.append({"type": "rpc_catalog_command", "catalog_command": "enter", **catalog_metadata})
-    _COMPATIBILITY_USAGE["start_custom_rpc.v1"] += 1
-    return commands
-
-
-def normalize_action_envelope(raw: dict[str, Any]) -> dict[str, Any]:
-    """Normalize a model action into the registry's flat wire contract.
-
-    Nested ``arguments`` is the measured ``arguments.v1`` compatibility path.
-    The current wire contract is flat. Duplicate argument representations must
-    agree; the compatibility object cannot overwrite action identity or audit
-    metadata.
-    """
-
-    action = dict(raw)
-    nested = action.pop("arguments", None)
-    if isinstance(nested, dict):
-        _COMPATIBILITY_USAGE[LEGACY_ARGUMENTS_ENVELOPE_VERSION] += 1
-        for key, value in nested.items():
-            if key not in {"type", "intent", "action_id", "confidence", "reason"}:
-                normalized_key = str(key)
-                if normalized_key in action and action[normalized_key] != value:
-                    raise ValueError(
-                        f"conflicting flat and arguments.v1 values for {normalized_key}"
-                    )
-                action.setdefault(normalized_key, value)
-    if "type" not in action and "intent" in action:
-        action["type"] = action["intent"]
-    action.pop("intent", None)
-    return action
-
-
 def normalize_current_action_envelope(raw: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize the current flat action wire contract without legacy repair."""
 
@@ -1488,12 +1571,6 @@ def normalize_current_action_envelope(raw: Mapping[str, Any]) -> dict[str, Any]:
         action["type"] = action["intent"]
     action.pop("intent", None)
     return action
-
-
-def compatibility_usage() -> dict[str, int]:
-    """Return a snapshot of legacy action-envelope usage."""
-
-    return dict(_COMPATIBILITY_USAGE)
 
 
 def validate_action_contract(
@@ -1540,6 +1617,10 @@ def validate_action_contract(
             or (isinstance(selected, str) and selected.strip())
         ):
             raise ValueError("answer_pending requires answer or selected_value")
+        if answer_pending_representation_conflict(action):
+            raise ValueError(
+                "answer_pending has conflicting answer and selected_value representations"
+            )
     if spec.validator is not None:
         spec.validator(action)
     if (
