@@ -20,11 +20,22 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tests.agent_live.generate_harness_coverage_ledger import build_ledger
+from tests.agent_live.generate_harness_coverage_ledger import ingest_evidence_artifacts
 from tests.agent_live.execute_harness_contract_ledger import execute_ledger
+from tests.agent_live.product_chaos_obligations import (
+    build_product_chaos_obligations,
+)
+from tests.agent_live.product_obligation_evidence import (
+    admit_product_obligation_evidence,
+)
+from tests.agent_live.retained_regression_obligations import (
+    build_retained_regression_obligations,
+)
 
 
 SCHEMA_VERSION = 1
-IMPLEMENTED_THROUGH_PHASE = 7
+IMPLEMENTED_THROUGH_PHASE = 8
+EMPTY_WORKTREE_HASH = hashlib.sha256(b"").hexdigest()
 
 
 def _run(command: Sequence[str]) -> dict[str, Any]:
@@ -53,6 +64,29 @@ def _git_output(*arguments: str) -> str:
         check=True,
     )
     return completed.stdout.strip()
+
+
+def _revision_id(revision: dict[str, Any]) -> str:
+    commit = str(revision.get("commit") or "unknown")
+    worktree_hash = str(revision.get("worktree_hash") or "")
+    if not worktree_hash or worktree_hash == EMPTY_WORKTREE_HASH:
+        return commit
+    return f"{commit}-{worktree_hash[:16]}"
+
+
+def _json_files(path: Path) -> list[Path]:
+    if not path.is_dir():
+        return []
+    return sorted(item for item in path.glob("*.json") if item.is_file())
+
+
+def _write_json(path: Path, payload: Any) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return path
 
 
 def _g0_source() -> dict[str, Any]:
@@ -232,7 +266,7 @@ def _phase6_source(inventory: dict[str, Any]) -> dict[str, Any]:
     from agent.workflows.group_registry import GROUPS
 
     revision = dict(inventory.get("revision") or {})
-    revision_id = str(revision.get("worktree_hash") or revision.get("commit") or "unknown")
+    revision_id = _revision_id(revision)
     phase_root = (
         REPO_ROOT
         / ".agent"
@@ -302,6 +336,188 @@ def _phase7_source() -> dict[str, Any]:
     )
 
 
+def _phase8_source(inventory: dict[str, Any]) -> dict[str, Any]:
+    revision = dict(inventory.get("revision") or {})
+    phase_root = (
+        REPO_ROOT
+        / ".agent"
+        / "evidence"
+        / "control-plane"
+        / _revision_id(revision)
+        / "phase8"
+    )
+
+    g3_obligations = build_retained_regression_obligations(
+        repo_root=REPO_ROOT,
+        revision=revision,
+    )
+    g4_obligations = build_product_chaos_obligations(revision=revision)
+    g3_catalog = _write_json(
+        phase_root / "g3" / "obligations.json",
+        {"revision": revision, "obligations": g3_obligations},
+    )
+    g4_catalog = _write_json(
+        phase_root / "g4" / "obligations.json",
+        {"revision": revision, "obligations": g4_obligations},
+    )
+    g3_summary = admit_product_obligation_evidence(
+        obligations=g3_obligations,
+        evidence_paths=_json_files(phase_root / "g3" / "evidence"),
+        revision=revision,
+    )
+    g4_summary = admit_product_obligation_evidence(
+        obligations=g4_obligations,
+        evidence_paths=_json_files(phase_root / "g4" / "evidence"),
+        revision=revision,
+    )
+
+    execution_ledger = build_ledger(revision=revision)
+    g5_paths = _json_files(phase_root / "g5" / "evidence")
+    if g5_paths:
+        execution_ledger = ingest_evidence_artifacts(execution_ledger, g5_paths)
+    g5_summary = dict(
+        (execution_ledger.get("summary") or {})
+        .get("execution_closure", {})
+        .get("real_execution", {})
+    )
+    _write_json(phase_root / "g5" / "execution-ledger.json", execution_ledger)
+
+    g3_status = "passed" if g3_summary["complete"] else g3_summary["status"]
+    g4_status = "passed" if g4_summary["complete"] else g4_summary["status"]
+    g5_status = (
+        "passed"
+        if g5_summary.get("status") == "complete"
+        and int(g5_summary.get("required_denominator") or 0) == 4
+        and int(g5_summary.get("open_required", -1)) == 0
+        else "failed"
+        if g5_summary.get("status") == "failed"
+        else "incomplete"
+    )
+    prerequisites_passed = all(
+        status == "passed" for status in (g3_status, g4_status, g5_status)
+    )
+    g6 = _phase8_product_review(
+        revision=revision,
+        phase_root=phase_root,
+        prerequisites_passed=prerequisites_passed,
+    )
+    statuses = (g3_status, g4_status, g5_status, g6["status"])
+    phase_status = (
+        "passed"
+        if all(status == "passed" for status in statuses)
+        else "failed"
+        if "failed" in statuses
+        else "incomplete"
+    )
+    return {
+        "phase": 8,
+        "obligation_catalogs": {
+            "G3": str(g3_catalog.relative_to(REPO_ROOT)),
+            "G4": str(g4_catalog.relative_to(REPO_ROOT)),
+        },
+        "gates": {
+            "G3": {**g3_summary, "status": g3_status},
+            "G4": {**g4_summary, "status": g4_status},
+            "G5": {**g5_summary, "status": g5_status},
+            "G6": g6,
+        },
+        "status": phase_status,
+    }
+
+
+def _phase8_product_review(
+    *,
+    revision: dict[str, str],
+    phase_root: Path,
+    prerequisites_passed: bool,
+) -> dict[str, Any]:
+    if not prerequisites_passed:
+        return {
+            "status": "not_run",
+            "reason": "G3-G5 must pass before final product review",
+        }
+    checks = [
+        _run((
+            sys.executable,
+            "-m",
+            "unittest",
+            "tests.test_agent_dependency_and_docs_contract",
+            "tests.test_agent_legacy_issue_map",
+            "tests.test_agent_state_authority",
+        )),
+        _run((sys.executable, "tools/check_agent_boundaries.py", "--root", ".")),
+        _run(("git", "diff", "--check")),
+    ]
+    tracked = _git_output("ls-files").splitlines()
+    forbidden_tracked = sorted(
+        path
+        for path in tracked
+        if "/__pycache__/" in f"/{path}"
+        or path.endswith(".pyc")
+        or path.startswith(".agent/")
+    )
+    review_path = phase_root / "g6" / "product-review.json"
+    if not review_path.is_file():
+        return {
+            "status": "incomplete",
+            "reason": "revision-bound product review artifact is missing",
+            "checks": checks,
+            "forbidden_tracked_files": forbidden_tracked,
+        }
+    try:
+        review = json.loads(review_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            "status": "failed",
+            "reason": f"product review artifact is invalid: {exc}",
+            "checks": checks,
+            "forbidden_tracked_files": forbidden_tracked,
+        }
+    expected_fields = {
+        "schema_version",
+        "revision",
+        "open_findings",
+        "planner_metrics",
+        "migration_cutoff_verified",
+        "bilingual_docs_verified",
+        "external_capabilities",
+        "review_hash",
+    }
+    unsigned = dict(review)
+    review_hash = str(unsigned.pop("review_hash", "") or "")
+    review_valid = (
+        set(review) == expected_fields
+        and review.get("schema_version") == 1
+        and review.get("revision") == revision
+        and review_hash == hashlib.sha256(
+            json.dumps(
+                unsigned,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        and dict(review.get("open_findings") or {}).get("S0") == 0
+        and dict(review.get("open_findings") or {}).get("S1") == 0
+        and bool(review.get("planner_metrics"))
+        and review.get("migration_cutoff_verified") is True
+        and review.get("bilingual_docs_verified") is True
+        and bool(review.get("external_capabilities"))
+    )
+    passed = (
+        review_valid
+        and not forbidden_tracked
+        and all(check["passed"] for check in checks)
+    )
+    return {
+        "status": "passed" if passed else "failed",
+        "review_artifact": str(review_path.relative_to(REPO_ROOT)),
+        "review_valid": review_valid,
+        "checks": checks,
+        "forbidden_tracked_files": forbidden_tracked,
+    }
+
+
 def build_report(through_phase: int) -> dict[str, Any]:
     inventory = build_ledger(None)
     g0 = _g0_source()
@@ -313,6 +529,7 @@ def build_report(through_phase: int) -> dict[str, Any]:
         5: _phase5_source,
         6: lambda: _phase6_source(inventory),
         7: _phase7_source,
+        8: lambda: _phase8_source(inventory),
     }
     phase_checks = {
         str(phase): phase_sources[phase]()
@@ -358,10 +575,30 @@ def build_report(through_phase: int) -> dict[str, Any]:
                 ),
                 "owning_phase": 6,
             },
-            "G3": {"status": "not_run", "owning_phase": 8},
-            "G4": {"status": "not_run", "owning_phase": 8},
-            "G5": {"status": "not_run", "owning_phase": 8},
-            "G6": {"status": "not_run", "owning_phase": 8},
+            "G3": {
+                **phase_checks.get("8", {}).get("gates", {}).get(
+                    "G3", {"status": "not_run"}
+                ),
+                "owning_phase": 8,
+            },
+            "G4": {
+                **phase_checks.get("8", {}).get("gates", {}).get(
+                    "G4", {"status": "not_run"}
+                ),
+                "owning_phase": 8,
+            },
+            "G5": {
+                **phase_checks.get("8", {}).get("gates", {}).get(
+                    "G5", {"status": "not_run"}
+                ),
+                "owning_phase": 8,
+            },
+            "G6": {
+                **phase_checks.get("8", {}).get("gates", {}).get(
+                    "G6", {"status": "not_run"}
+                ),
+                "owning_phase": 8,
+            },
         },
         "status": (
             "passed"
@@ -370,6 +607,10 @@ def build_report(through_phase: int) -> dict[str, Any]:
             and requested_phase_checks_pass
             else "incomplete"
             if not requested_supported
+            or any(
+                check.get("status") in {"incomplete", "not_run"}
+                for check in phase_checks.values()
+            )
             else "failed"
         ),
     }

@@ -30,7 +30,7 @@ EXECUTION_SCENARIOS: tuple[ExecutionScenarioSpec, ...] = (
         scenario_id="rpc_fake_node_smoke",
         action_type="approve_preflight_smoke",
         operation="fake_node_smoke",
-        operation_kind="fake_node_smoke",
+        operation_kind="preflight_smoke",
         workflow_type=RPC_BENCHMARK_WORKFLOW,
         target_modes=frozenset({"fake-node"}),
         required_artifacts=(
@@ -40,7 +40,7 @@ EXECUTION_SCENARIOS: tuple[ExecutionScenarioSpec, ...] = (
             "proxy_method_csv",
             "vegeta_json",
         ),
-        real_evidence_required=False,
+        required_command_tokens=("--fake-node",),
         forbidden_command_tokens=("--sync-observe",),
     ),
     ExecutionScenarioSpec(
@@ -57,7 +57,7 @@ EXECUTION_SCENARIOS: tuple[ExecutionScenarioSpec, ...] = (
             "proxy_method_csv",
             "vegeta_json",
         ),
-        forbidden_command_tokens=("--sync-observe",),
+        forbidden_command_tokens=("--fake-node", "--sync-observe"),
     ),
     ExecutionScenarioSpec(
         scenario_id="rpc_real_node_final",
@@ -73,7 +73,7 @@ EXECUTION_SCENARIOS: tuple[ExecutionScenarioSpec, ...] = (
             "proxy_method_csv",
             "vegeta_json",
         ),
-        forbidden_command_tokens=("--sync-observe",),
+        forbidden_command_tokens=("--fake-node", "--sync-observe"),
     ),
     ExecutionScenarioSpec(
         scenario_id="sync_observe_bounded",

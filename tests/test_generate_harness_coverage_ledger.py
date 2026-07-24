@@ -377,8 +377,8 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
 
     def test_real_execution_closure_is_counted_by_scenario(self) -> None:
         closure = self.ledger["summary"]["execution_closure"]["real_execution"]
-        self.assertEqual(closure["required_denominator"], 3)
-        self.assertEqual(closure["not_run"], 3)
+        self.assertEqual(closure["required_denominator"], 4)
+        self.assertEqual(closure["not_run"], 4)
         lanes = {
             edge["action_type"]: edge["evidence"]["real_execution"]
             for edge in self.ledger["edges"]
@@ -386,7 +386,7 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
         }
         self.assertEqual(
             lanes["approve_preflight_smoke"]["required_scenario_ids"],
-            ["rpc_real_node_smoke", "sync_observe_bounded"],
+            ["rpc_fake_node_smoke", "rpc_real_node_smoke", "sync_observe_bounded"],
         )
         self.assertEqual(
             lanes["approve_final_benchmark"]["required_scenario_ids"],
@@ -429,7 +429,7 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
         self.assertNotIn("sync_observe_bounded", lane["scenario_evidence"])
         closure = updated["summary"]["execution_closure"]["real_execution"]
         self.assertEqual(closure["observed_pass"], 1)
-        self.assertEqual(closure["not_run"], 2)
+        self.assertEqual(closure["not_run"], 3)
 
     def test_rebuild_preserves_each_valid_real_execution_scenario(self) -> None:
         ledger = build_ledger(revision=self.revision)
@@ -440,6 +440,7 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
             and item["evidence"]["real_execution"]["required"]
         )
         references = {
+            "rpc_fake_node_smoke": "/tmp/rpc-fake-node-smoke.json",
             "rpc_real_node_smoke": "/tmp/rpc-real-node-smoke.json",
             "sync_observe_bounded": "/tmp/sync-observe-bounded.json",
         }
@@ -482,6 +483,7 @@ class HarnessCoverageLedgerTest(unittest.TestCase):
                 for scenario, evidence in lane["scenario_evidence"].items()
             },
             {
+                "rpc_fake_node_smoke": "passed",
                 "rpc_real_node_smoke": "passed",
                 "sync_observe_bounded": "passed",
             },

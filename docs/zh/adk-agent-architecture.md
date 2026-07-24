@@ -251,10 +251,11 @@ sync-observe workflow。
 workload、mixed weights、Vegeta 或 QPS profile。
 
 产品执行证据按 execution scenario 计数，不能只按用户可见的审批 action 计数。
-必需的真实场景包括隔离 RPC real-node smoke、最终 RPC real-node benchmark 和
-bounded sync-observe。bounded sync-observe 证据必须包含真实观测的 performance/sync
-CSV、中英文 HTML 报告和 sync timeline 图，且不得包含 Vegeta 或 proxy workload
-产物。
+必需场景包括独立 fake-node smoke、隔离 RPC real-node smoke、最终 RPC real-node
+benchmark 和 bounded sync-observe。这四个 job 必须来自三份不同的 approved plan，
+fake-node 证据不能冒充 real-node 证据。bounded sync-observe 证据必须包含真实观测的
+performance/sync CSV、中英文 HTML 报告和 sync timeline 图，且不得包含 Vegeta 或
+proxy workload 产物。
 
 ## 开发门禁
 

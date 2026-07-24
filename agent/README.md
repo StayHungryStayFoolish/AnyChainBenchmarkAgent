@@ -264,6 +264,10 @@ The execution application boundary resolves every side-effecting request
 through `runners/execution_scenarios.py`. RPC smoke, RPC final benchmark, and
 bounded sync-observe are distinct scenarios with strict workflow, command,
 artifact, and evidence contracts; they are not interchangeable aliases.
+Product gate G5 requires four fresh jobs from three distinct approved plans:
+fake-node smoke, Geth real-node smoke, Geth real-node final, and bounded
+sync-observe. Reused job identities and missing hashed runtime/report artifacts
+fail closed.
 
 ## CLI Tools For Automation
 

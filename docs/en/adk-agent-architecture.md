@@ -270,10 +270,12 @@ QPS profile unless the user explicitly switches to an RPC benchmark.
 
 Product execution evidence is counted by scenario, not only by the visible
 approval action. The required real scenarios are isolated RPC real-node smoke,
-final RPC real-node benchmark, and bounded sync-observe. A bounded
-sync-observe proof must contain observed performance/sync CSV rows, both
-localized HTML reports, and the sync timeline chart; it must not contain
-Vegeta or proxy workload artifacts.
+final RPC real-node benchmark, bounded sync-observe, and an independent
+fake-node smoke that proves the fixture/tool/report loop. These four jobs use
+three distinct approved plans; fake-node evidence cannot alias real-node
+evidence. A bounded sync-observe proof must contain observed performance/sync
+CSV rows, both localized HTML reports, and the sync timeline chart; it must not
+contain Vegeta or proxy workload artifacts.
 
 ## Development Gates
 

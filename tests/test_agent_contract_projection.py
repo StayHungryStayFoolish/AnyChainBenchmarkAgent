@@ -108,6 +108,16 @@ class AgentContractProjectionTest(unittest.TestCase):
                 "tests.agent_live.run_product_acceptance._phase7_source",
                 return_value=passed_phase,
             ),
+            patch(
+                "tests.agent_live.run_product_acceptance._phase8_source",
+                return_value={
+                    "status": "incomplete",
+                    "gates": {
+                        gate: {"status": "incomplete"}
+                        for gate in ("G3", "G4", "G5")
+                    } | {"G6": {"status": "not_run"}},
+                },
+            ),
         ):
             phase_two = build_report(2)
             phase_five = build_report(5)
@@ -130,6 +140,8 @@ class AgentContractProjectionTest(unittest.TestCase):
         self.assertEqual(phase_seven["gates"]["G3"]["status"], "not_run")
         self.assertEqual(future["status"], "incomplete")
         self.assertEqual(future["gates"]["G2"]["status"], "passed")
+        self.assertEqual(future["implemented_through_phase"], 8)
+        self.assertEqual(future["gates"]["G3"]["status"], "incomplete")
 
     def test_phase_six_completion_preserves_zero_open_edges(self) -> None:
         from tests.agent_live.run_product_acceptance import _phase6_complete
