@@ -97,6 +97,60 @@ class CoverageEvidenceTest(unittest.TestCase):
                 )
             )
 
+    def test_runtime_event_rejects_rehashed_semantically_invalid_domain_receipt(
+        self,
+    ) -> None:
+        from agent.harness.domains.rpc_receipts import emit_endpoint_role_receipt
+
+        state = new_state("runtime-domain-receipt")
+        state["turn_index"] = 1
+        state["turn_context"] = {"text": "endpoint"}
+        emit_endpoint_role_receipt(
+            state,
+            role="validation",
+            case="custom_rpc",
+            endpoint="https://example.invalid/private-token",
+            ready=True,
+            probe_status="ok",
+            chain="bsc",
+            adapter_family="jsonrpc",
+        )
+        receipt = dict(state["turn_context"]["control_receipts"][-1])
+        receipt["owner"] = "analysis"
+        receipt["receipt_id"] = content_hash(
+            {key: value for key, value in receipt.items() if key != "receipt_id"}
+        )
+        event = RuntimeTurnEvent(
+            schema_version=3,
+            event_type="turn_committed",
+            thread_id="runtime-test",
+            session_purpose="chaos",
+            before_fingerprint="a" * 64,
+            after_fingerprint="b" * 64,
+            turn_index=1,
+            active_group="endpoint_process",
+            pending_question_id="",
+            action_queue_types=(),
+            revision={"commit": "commit", "worktree_hash": "c" * 64},
+            turn_receipt_summary={
+                "turn_id": "turn-1",
+                "input_hash": "d" * 64,
+                "admitted_action_ids": [],
+                "execution_order": [],
+            },
+            pending_transition={
+                "before_hash": "e" * 64,
+                "after_hash": "f" * 64,
+            },
+            control_receipts=(receipt,),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "runtime domain control receipt is invalid",
+        ):
+            _validate_runtime_event(event)
+
     def test_redaction_preserves_coverage_identity_that_names_secret_fields(self) -> None:
         edge_key = "chain_auxiliary_endpoints::RPC_API_KEY::contract-hash"
         secret = "runtime-secret-4821"

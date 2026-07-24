@@ -12,8 +12,9 @@ from ..transitions import mark_group_reconfigured, record_group_invalidations
 from .chain_rpc_questions import _case3_evidence_question
 from .chain_rpc_support import _next_group
 from .rpc_catalog import catalog_method_names, draft_view, validated_contracts_view
+from .rpc_receipts import emit_endpoint_role_receipt, emit_workload_commit_receipt
 
-def _promote_case2_endpoint(state: AgentGraphState) -> None:
+def _promote_case2_endpoint(state: AgentGraphState) -> bool:
     identity = state.setdefault("chain_identity", {})
     evidence = state.setdefault("endpoint_evidence", {})
     confirmed = state.setdefault("confirmed_config", {})
@@ -21,16 +22,56 @@ def _promote_case2_endpoint(state: AgentGraphState) -> None:
     endpoint = normalize_scalar(evidence.get("candidate_endpoint"))
     methods = catalog_method_names(state)
     method = methods[0] if len(methods) == 1 else ""
+    endpoint_probe = (
+        evidence.get("new_chain_endpoint_probe")
+        if isinstance(evidence.get("new_chain_endpoint_probe"), dict)
+        else {}
+    )
+    probe_matches = bool(
+        endpoint
+        and endpoint_probe.get("ready") is True
+        and normalize_scalar(endpoint_probe.get("endpoint")) == endpoint
+        and normalize_scalar(endpoint_probe.get("chain")) == chain
+        and normalize_scalar(endpoint_probe.get("transport"))
+        == normalize_scalar(identity.get("adapter_family"))
+        and evidence.get("candidate_endpoint_ready") is True
+    )
+    if not probe_matches or not methods:
+        identity["status"] = (
+            "existing_family_needs_endpoint"
+            if not probe_matches
+            else "existing_family_needs_method"
+        )
+        state["visible_response"] = [
+            localized(
+                state.get("language", "en"),
+                "无法把新链配置提升到 real-node：endpoint 探测证据与当前链/协议/地址不一致，或还没有已验证的 RPC method。请重新完成对应验证。",
+                "Cannot promote the new-chain configuration to real-node: the endpoint probe is not bound to the current chain/family/address, or no validated RPC method exists. Complete the corresponding validation again.",
+            )
+        ]
+        return False
     identity.update({"status": "confirmed", "case": "case2_runtime_override"})
     confirmed["BLOCKCHAIN_NODE"] = chain
     if endpoint:
         confirmed["LOCAL_RPC_URL"] = endpoint
         evidence["local_rpc_url_ready"] = True
+        emit_endpoint_role_receipt(
+            state,
+            role="final_benchmark",
+            case="new_chain",
+            endpoint=endpoint,
+            ready=True,
+            probe_status=endpoint_probe.get("status"),
+            chain=chain,
+            adapter_family=identity.get("adapter_family"),
+            methods=methods,
+        )
     state["target_mode"] = "real-node"
     state["workflow_mode"] = "rpc_benchmark"
     if method and not (state.get("workload") or {}).get("confirmed"):
         state["rpc_mode"] = "single"
         state["workload"] = {"confirmed": True, "choice": "new_chain_verified_method", "methods": [method], "replace_defaults": True, "job_local_override": True}
+        emit_workload_commit_receipt(state, case="new_chain")
     record_group_invalidations(state, "target_mode")
     # This atomic promotion supplies fresh endpoint and workload state for the
     # new mode. They are not stale dependents to clear at commit time.
@@ -38,6 +79,7 @@ def _promote_case2_endpoint(state: AgentGraphState) -> None:
     mark_group_reconfigured(state, "workload_rpc")
     state['active_group'] = _next_group(state)
     state['visible_response'] = [localized(state.get("language", "en"), "已切换到 real-node 路径，并把已验证 endpoint/method 作为本次 job-local workload override 继续；不会修改 config/chains 原始模板。", "Switched to the real-node path and will continue with the verified endpoint/method as a job-local workload override; config/chains templates are not modified.")]
+    return True
 
 
 def _prepare_case2_handoff(state: AgentGraphState) -> None:

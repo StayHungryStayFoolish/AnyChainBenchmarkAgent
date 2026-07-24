@@ -881,8 +881,14 @@ def apply_chain_rpc_answer(
         return _answer_result(state, next_state, completion="in_progress" if not (next_state.get("workload") or {}).get("confirmed") else "completed")
     if question_id == "new_chain_runtime_choice":
         if value == "use_verified_endpoint_real_node":
-            _promote_case2_endpoint(next_state)
-            return _answer_result(state, next_state)
+            promoted = _promote_case2_endpoint(next_state)
+            if not promoted:
+                _install_chain_rpc_next_question(next_state, "endpoint_process")
+            return _answer_result(
+                state,
+                next_state,
+                completion="completed" if promoted else "blocked",
+            )
         if value == "generate_handoff":
             _prepare_case2_handoff(next_state)
             return _answer_result(state, next_state, stop=True)

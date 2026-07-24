@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any
+from typing import Any, Mapping
 
 from ...runners.application_service import (
     ExecutionOperation,
@@ -20,6 +20,7 @@ from ..sync_observe_contract import SyncObserveRequest
 from ..contracts import HandlerResult, RecoveryCommand, StateDelta
 from ..failures import failure_record_from_job, failure_record_from_preflight
 from .rpc_catalog import validated_contracts_view
+from .rpc_receipts import emit_materialization_receipt
 
 
 def execute_approved_preflight_and_smoke(state: AgentGraphState) -> HandlerResult:
@@ -212,8 +213,19 @@ def _execution_result(
     visible: str = "",
     completion: str = "completed",
 ) -> HandlerResult:
+    previous_receipt_ids = {
+        str(item.get("receipt_id") or "")
+        for item in (original.get("turn_context") or {}).get("control_receipts") or ()
+        if isinstance(item, Mapping)
+    }
     return HandlerResult(
         delta=StateDelta.between(original, output),
+        control_receipts=tuple(
+            deepcopy(dict(item))
+            for item in (output.get("turn_context") or {}).get("control_receipts") or ()
+            if isinstance(item, Mapping)
+            and str(item.get("receipt_id") or "") not in previous_receipt_ids
+        ),
         recovery_command=recovery_command,
         clear_pending=recovery_command is None,
         visible_result=visible,
@@ -335,6 +347,13 @@ def _prepare_benchmark_with_runtime_contract(state: AgentGraphState) -> dict[str
     )
     if not override:
         return prepared
+    materialization_evidence = (
+        (override.get("_meta") or {}).get("materialization_evidence")
+        if isinstance(override.get("_meta"), dict)
+        else {}
+    )
+    if isinstance(materialization_evidence, dict):
+        emit_materialization_receipt(state, materialization_evidence)
 
     data = prepared.setdefault("data", {})
     plan = data.setdefault("plan", {})

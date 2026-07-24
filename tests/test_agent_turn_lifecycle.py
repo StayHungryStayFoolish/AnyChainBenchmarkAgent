@@ -335,6 +335,21 @@ class TurnCheckpointContractTest(unittest.TestCase):
         self.assertEqual(len(pending_receipts), 1)
         self.assertEqual(pending_receipts[0]["pending_id"], "CLOUD_REGION")
         self.assertEqual(pending_receipts[0]["verdict"], "accepted")
+        semantic_unit = event["turn_receipt_summary"]["semantic_units"][0]
+        self.assertEqual(
+            (semantic_unit["start"], semantic_unit["end"]),
+            (0, len("asia-east1")),
+        )
+        response_receipts = [
+            item
+            for item in event["control_receipts"]
+            if item["receipt_type"] == "response_composition"
+        ]
+        self.assertEqual(len(response_receipts), 1)
+        self.assertEqual(
+            len(response_receipts[0]["fragments"]),
+            len(result["visible_response"]),
+        )
 
     def test_cancelled_turn_does_not_commit_partial_checkpoint(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime

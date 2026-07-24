@@ -250,6 +250,7 @@ class HandlerResult:
     """The only result a domain handler may return to the coordinator."""
 
     delta: StateDelta = dataclass_field(default_factory=StateDelta)
+    control_receipts: tuple[Mapping[str, Any], ...] = ()
     consumed_action_ids: tuple[str, ...] = ()
     invalidated_groups: tuple[str, ...] = ()
     reconfigured_groups: tuple[str, ...] = ()
@@ -425,6 +426,9 @@ def handler_result_to_dict(result: HandlerResult) -> dict[str, Any]:
             ],
             "deletes": [list(path) for path in result.delta.deletes],
         },
+        "control_receipts": [
+            deepcopy(dict(item)) for item in result.control_receipts
+        ],
         "consumed_action_ids": list(result.consumed_action_ids),
         "invalidated_groups": list(result.invalidated_groups),
         "reconfigured_groups": list(result.reconfigured_groups),
@@ -519,6 +523,11 @@ def handler_result_from_dict(payload: Mapping[str, Any]) -> HandlerResult:
     workflow_goal = payload.get("workflow_goal_command")
     return HandlerResult(
         delta=delta,
+        control_receipts=tuple(
+            deepcopy(dict(item))
+            for item in payload.get("control_receipts") or ()
+            if isinstance(item, Mapping)
+        ),
         consumed_action_ids=tuple(str(item) for item in payload.get("consumed_action_ids") or ()),
         invalidated_groups=tuple(str(item) for item in payload.get("invalidated_groups") or ()),
         reconfigured_groups=tuple(str(item) for item in payload.get("reconfigured_groups") or ()),

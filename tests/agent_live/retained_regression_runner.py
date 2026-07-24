@@ -351,7 +351,7 @@ def _response_driven_selection_observed(
     }
 
 
-def _duplicate_job_submission_absent(
+def _duplicate_job_submission(
     context: JourneyVerifierContext,
 ) -> tuple[bool, dict[str, Any]]:
     submissions: dict[str, set[tuple[str, str]]] = {}
@@ -371,13 +371,13 @@ def _duplicate_job_submission_absent(
         for key, identities in submissions.items()
         if len(identities) > 1
     }
-    return not duplicates, {
+    return bool(duplicates), {
         "submission_key_count": len(submissions),
         "duplicate_submission_counts": duplicates,
     }
 
 
-def _typed_confirmation_rejected_by_side_channel_absent(
+def _typed_confirmation_rejected_by_side_channel(
     context: JourneyVerifierContext,
 ) -> tuple[bool, dict[str, Any]]:
     rejected_after_acceptance: list[str] = []
@@ -397,7 +397,7 @@ def _typed_confirmation_rejected_by_side_channel_absent(
             if receipt.get("receipt_type") == "domain_commit"
             and receipt.get("completion") == "rejected"
         )
-    return not rejected_after_acceptance, {
+    return bool(rejected_after_acceptance), {
         "accepted_pending_resolution_count": accepted_pending_resolution_count,
         "rejected_domain_receipt_ids": rejected_after_acceptance,
     }
@@ -405,9 +405,9 @@ def _typed_confirmation_rejected_by_side_channel_absent(
 
 _IMPLEMENTED_POSTCONDITION_EVALUATORS = {
     "response_driven_selection_observed": _response_driven_selection_observed,
-    "duplicate_job_submission": _duplicate_job_submission_absent,
+    "duplicate_job_submission": _duplicate_job_submission,
     "typed_confirmation_rejected_by_side_channel": (
-        _typed_confirmation_rejected_by_side_channel_absent
+        _typed_confirmation_rejected_by_side_channel
     ),
 }
 

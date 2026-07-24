@@ -7,6 +7,8 @@ from copy import deepcopy
 from dataclasses import replace
 from typing import Any
 
+from agent.runners.job_manager import get_job, verify_job_receipt
+
 from ..contracts import ActionProposal, HandlerResult, RecoveryCommand, StateDelta
 from ..localization import localized
 from .execution_runtime import execute_approved_final_benchmark, execute_approved_preflight_and_smoke
@@ -176,11 +178,22 @@ def reconcile_execution_state(state: AgentGraphState) -> HandlerResult:
     job_id = str(current_job.get("job_id") or "").strip()
     if not job_id:
         return HandlerResult()
-    from agent.runners.job_manager import get_job
     try:
         persisted = get_job(job_id)
     except (FileNotFoundError, OSError, ValueError):
         return HandlerResult()
+    receipts = persisted.get("execution_receipts") or {}
+    read_receipt = (
+        dict(receipts.get("last_read") or {})
+        if isinstance(receipts, dict)
+        else {}
+    )
+    if (
+        not verify_job_receipt(read_receipt)
+        or read_receipt.get("job_id") != job_id
+        or read_receipt.get("observed_status") != persisted.get("status")
+    ):
+        return HandlerResult(blocker="job-manager read receipt is invalid")
     next_state["job"] = persisted
     status = str(persisted.get("status") or "unknown")
 

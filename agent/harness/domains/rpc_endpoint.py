@@ -56,6 +56,10 @@ from .rpc_catalog import (
     strict_method_identity,
     validated_contracts,
 )
+from .rpc_receipts import (
+    emit_endpoint_role_receipt,
+    evidence_hash,
+)
 
 def _apply_endpoint_answer(state: AgentGraphState, question_id: str, value: Any) -> None:
     language = str(state.get("language") or "en")
@@ -100,6 +104,36 @@ def _apply_endpoint_answer(state: AgentGraphState, question_id: str, value: Any)
             method_params=params,
             timeout=3.0,
         )
+    role = (
+        "final_benchmark"
+        if question_id == "LOCAL_RPC_URL"
+        else "sync_observe"
+        if question_id == "SYNC_OBSERVE_RPC_URL"
+        else "validation"
+    )
+    case = (
+        "custom_rpc"
+        if question_id == "custom_rpc_endpoint"
+        else "new_chain"
+        if question_id == "new_chain_endpoint"
+        else "runtime"
+    )
+    emit_endpoint_role_receipt(
+        state,
+        role=role,
+        case=case,
+        endpoint=endpoint,
+        previous_endpoint=previous_endpoint,
+        ready=bool(result.get("ready")),
+        probe_status=result.get("status"),
+        chain=chain,
+        adapter_family=family,
+        methods=(
+            [contract.get("method") for contract in contracts]
+            if question_id == "LOCAL_RPC_URL" and contracts
+            else methods or ()
+        ),
+    )
     evidence = state.setdefault("endpoint_evidence", {})
     if question_id == "LOCAL_RPC_URL":
         evidence["local_rpc_url_probe"] = result
@@ -306,13 +340,25 @@ def _apply_schema_evidence(state: AgentGraphState, *, case: str, evidence: str) 
             extracted["response_fields"] = []
             extracted.pop("response_sample", None)
             extracted.pop("response_example", None)
+        previous_draft = draft_view(state)
         draft = _merge_rpc_schema_draft(
             method=method,
             params_json=parsed,
             extracted=extracted,
-            previous=draft_view(state),
+            previous=previous_draft,
         )
         draft["validation_endpoint"] = _validation_endpoint(state, case)
+        draft["field_provenance"] = _schema_field_provenance(
+            draft,
+            previous=previous_draft,
+            extracted=extracted,
+            evidence_fragments=[
+                item
+                for item in previous_draft.get("evidence") or ()
+                if isinstance(item, Mapping)
+            ],
+            wire_request_observed=True,
+        )
         correct_draft(state, draft)
         case_dict["status"] = "existing_family_schema_needs_confirmation" if case == "new_chain" else "schema_needs_confirmation"
         if incomplete_parameters(state):
@@ -335,6 +381,21 @@ def _apply_schema_evidence(state: AgentGraphState, *, case: str, evidence: str) 
     if previous:
         draft = {**previous, **draft}
     draft["validation_endpoint"] = _validation_endpoint(state, case)
+    draft["field_provenance"] = _schema_field_provenance(
+        draft,
+        previous=previous,
+        extracted={
+            key: value
+            for key, value in draft.items()
+            if key not in previous or previous.get(key) != value
+        },
+        evidence_fragments=[
+            item
+            for item in previous.get("evidence") or ()
+            if isinstance(item, Mapping)
+        ],
+        wire_request_observed=False,
+    )
     correct_draft(state, draft)
     if _schema_conflict(state, draft, case=case):
         return True
@@ -392,6 +453,119 @@ def _fragment_contributes_rpc_fact(
         if value and value in source:
             return True
     return False
+
+
+def _schema_field_provenance(
+    draft: Mapping[str, Any],
+    *,
+    previous: Mapping[str, Any],
+    extracted: Mapping[str, Any],
+    evidence_fragments: list[Mapping[str, Any]],
+    wire_request_observed: bool,
+) -> list[dict[str, Any]]:
+    """Describe where schema fields came from without retaining their values."""
+
+    prior = {
+        normalize_scalar(item.get("field_path")): dict(item)
+        for item in previous.get("field_provenance") or ()
+        if isinstance(item, Mapping) and normalize_scalar(item.get("field_path"))
+    }
+    revisions = sorted(
+        {
+            int(item.get("revision"))
+            for item in evidence_fragments
+            if isinstance(item.get("revision"), int) and int(item.get("revision")) >= 0
+        }
+    )
+    output: dict[str, dict[str, Any]] = {}
+
+    def record(path: str, value: Any, source_kind: str) -> None:
+        existing = prior.get(path)
+        value_digest = evidence_hash(value)
+        if existing and existing.get("value_hash") == value_digest and source_kind == "retained":
+            output[path] = existing
+            return
+        output[path] = {
+            "field_path": path,
+            "source_kind": source_kind,
+            "source_revisions": revisions,
+            "value_hash": value_digest,
+        }
+
+    if normalize_scalar(draft.get("method")):
+        record(
+            "method",
+            draft.get("method"),
+            "protocol_request_parser"
+            if wire_request_observed
+            else "model_extraction_from_user_evidence"
+            if "method" in extracted
+            else "retained",
+        )
+    if "transport" in draft:
+        record(
+            "transport",
+            draft.get("transport"),
+            "protocol_request_parser"
+            if wire_request_observed
+            else "model_extraction_from_user_evidence"
+            if "transport" in extracted
+            else "retained",
+        )
+    if "params_json" in draft:
+        record(
+            "params_json",
+            draft.get("params_json"),
+            "protocol_request_parser"
+            if wire_request_observed
+            else "model_extraction_from_user_evidence"
+            if "params_json" in extracted
+            else "retained",
+        )
+    params = draft.get("params") if isinstance(draft.get("params"), list) else []
+    extracted_params = extracted.get("params") if isinstance(extracted.get("params"), list) else []
+    semantic_fields = {"semantic_type", "encoding", "meaning", "required"}
+    for index, parameter in enumerate(params):
+        if not isinstance(parameter, Mapping):
+            continue
+        extracted_parameter = (
+            extracted_params[index]
+            if index < len(extracted_params) and isinstance(extracted_params[index], Mapping)
+            else {}
+        )
+        for field, value in sorted(parameter.items()):
+            path = f"params[{index}].{field}"
+            if wire_request_observed and (
+                field in {"index", "json_type", "example"}
+                or field == "name" and isinstance(draft.get("params_json"), dict)
+            ):
+                source = "protocol_request_parser"
+            elif field in semantic_fields or field in extracted_parameter:
+                source = "model_extraction_from_user_evidence"
+            else:
+                source = "retained"
+            record(path, value, source)
+    for field in (
+        "response_summary",
+        "response_fields",
+        "response_sample",
+        "response_example",
+    ):
+        if field not in draft:
+            continue
+        source = (
+            "model_extraction_from_user_evidence"
+            if field in extracted
+            else "retained"
+        )
+        record(field, draft.get(field), source)
+    if normalize_scalar(draft.get("validation_endpoint")):
+        record(
+            "validation_endpoint",
+            draft.get("validation_endpoint"),
+            "rpc_endpoint_role",
+        )
+    return [output[path] for path in sorted(output)]
 
 
 def _request_only_schema_evidence(fragments: list[str], method: str) -> bool:

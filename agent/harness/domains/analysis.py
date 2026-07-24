@@ -9,17 +9,30 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
 from agent.analyzers.result_analyzer import analyze_job
 from agent.harness.failures import failure_record_from_job, render_failure_summary
-from agent.runners.job_manager import get_job, list_jobs, resume_job, tail_job_log
+from agent.runners.job_manager import (
+    get_job,
+    list_jobs,
+    resume_job,
+    tail_job_log,
+    verify_job_receipt,
+)
 from ..contracts import ActionProposal, HandlerResult, StateDelta
 from ..intent import analyze_evidence_with_model
 from ..localization import localized
 from ..state import AgentGraphState, PendingQuestion
+from .analysis_receipts import (
+    emit_analysis_invocation_receipt,
+    emit_evidence_block_receipt,
+    emit_report_analysis_receipt,
+    evidence_block_id,
+)
 
 
 ANALYSIS_GROUPS = {"error_evidence_analysis", "report_artifact_analysis"}
@@ -67,6 +80,20 @@ class EvidenceCollectionOutcome:
 
 
 def apply_analysis_action(state: AgentGraphState, action: ActionProposal) -> HandlerResult:
+    """Return analysis receipts through the typed domain commit boundary."""
+
+    previous_ids = _control_receipt_ids(state)
+    result = _apply_analysis_action(state, action)
+    receipts = _control_receipts_since(state, previous_ids)
+    if not receipts:
+        return result
+    return replace(
+        result,
+        control_receipts=(*result.control_receipts, *receipts),
+    )
+
+
+def _apply_analysis_action(state: AgentGraphState, action: ActionProposal) -> HandlerResult:
     """Apply one evidence/report action without choosing another workflow group."""
 
     if action.action_type == "start_evidence_collection":
@@ -115,10 +142,11 @@ def apply_analysis_action(state: AgentGraphState, action: ActionProposal) -> Han
             report_context["subject"] = subject
         state_view: AgentGraphState = dict(state)
         state_view["report_context"] = report_context
-        result = report_artifact_entry_result(state_view)
+        result = report_artifact_entry_result(state_view, receipt_state=state)
         return HandlerResult(
             delta=result.delta,
             consumed_action_ids=(action.action_id,),
+            evidence=result.evidence,
             visible_result=result.visible_result,
             visible_results=result.visible_results,
             clear_pending=result.clear_pending,
@@ -132,23 +160,46 @@ def apply_analysis_action(state: AgentGraphState, action: ActionProposal) -> Han
         if collecting:
             evidence = "\n".join(str(item) for item in collecting.get("lines") or [] if str(item).strip())
         if not evidence:
+            response = evidence_help_response(state)
+            emit_analysis_invocation_receipt(
+                state,
+                source_kind="missing",
+                evidence="",
+                question=str(action.arguments.get("question") or state.get("last_user_input") or ""),
+                visible_result=response,
+                invoked=False,
+            )
             return HandlerResult(
                 consumed_action_ids=(action.action_id,),
-                visible_result=evidence_help_response(state),
+                visible_result=response,
                 completion="in_progress",
                 stop_after_response=True,
             )
         evidence_buffer = [dict(item) for item in list(state.get("evidence_buffer") or [])]
         if not collecting:
             evidence_buffer.append({"text": evidence})
+        question = str(action.arguments.get("question") or state.get("last_user_input") or evidence)
+        response = analyze_evidence_with_model(state, evidence, question)
+        emit_analysis_invocation_receipt(
+            state,
+            source_kind="active_block" if collecting else "action_argument",
+            evidence=evidence,
+            question=question,
+            visible_result=response,
+            invoked=True,
+            block_id=(
+                evidence_block_id(
+                    collecting.get("question") if isinstance(collecting.get("question"), Mapping) else {},
+                    [str(item) for item in collecting.get("lines") or ()],
+                )
+                if collecting
+                else ""
+            ),
+        )
         return HandlerResult(
             delta=StateDelta.set_values({"evidence_buffer": evidence_buffer}) if not collecting else StateDelta(),
             consumed_action_ids=(action.action_id,),
-            visible_result=analyze_evidence_with_model(
-                state,
-                evidence,
-                str(action.arguments.get("question") or state.get("last_user_input") or evidence),
-            ),
+            visible_result=response,
             completion="completed",
             stop_after_response=True,
         )
@@ -162,6 +213,7 @@ def _collection_result(outcome: EvidenceCollectionOutcome) -> HandlerResult:
         return outcome.result
     return HandlerResult(
         delta=outcome.result.delta,
+        control_receipts=outcome.result.control_receipts,
         clear_pending=False,
         pending_question=dict(outcome.pending_question),
         followup_actions=({
@@ -207,6 +259,18 @@ def start_evidence_collection(
         "language": str(state.get("language") or "en"),
         "status": "active",
     }
+    block_id = evidence_block_id(dict(pending), lines)
+    collecting["block_id"] = block_id
+    emit_evidence_block_receipt(
+        state,
+        operation="start",
+        question=dict(pending),
+        lines=lines,
+        input_text=text,
+        input_disposition="accepted",
+        status="active",
+        block_id=block_id,
+    )
     if evidence_collection_complete(lines):
         return finish_evidence_collection(state, collecting)
     return EvidenceCollectionOutcome(
@@ -233,17 +297,67 @@ def continue_evidence_collection(
     """Record one continuation turn or finish the active evidence block."""
 
     active = collecting if collecting is not None else (state.get("evidence_collection") or {})
-    lines = [str(item) for item in list(active.get("lines") or [])]
+    lines = [str(item) for item in list(active.get("lines") or []) if str(item).strip()]
     raw = str(text or "").rstrip("\n")
     question = active.get("question") if isinstance(active.get("question"), dict) else {}
     language = str(active.get("language") or state.get("language") or "en")
-    normalized = {"question": dict(question), "lines": lines, "language": language, "status": "active"}
+    block_id = str(active.get("block_id") or "") or evidence_block_id(question, lines)
+    normalized = {
+        "question": dict(question),
+        "lines": lines,
+        "language": language,
+        "status": "active",
+        "block_id": block_id,
+    }
 
     if is_evidence_completion_command(raw):
+        emit_evidence_block_receipt(
+            state,
+            operation="finish_requested",
+            question=question,
+            lines=lines,
+            input_text=raw,
+            input_disposition="completion",
+            status="active",
+            block_id=block_id,
+        )
         return finish_evidence_collection(state, normalized)
+
+    if not raw.strip():
+        response = _evidence_waiting_response(language, question)
+        emit_evidence_block_receipt(
+            state,
+            operation="ignore",
+            question=question,
+            lines=lines,
+            input_text=raw,
+            input_disposition="blank_ignored",
+            status="active",
+            visible_result=response,
+            block_id=block_id,
+        )
+        return EvidenceCollectionOutcome(
+            result=HandlerResult(
+                delta=StateDelta.set_values({"evidence_collection": normalized}),
+                visible_result=response,
+                completion="in_progress",
+                stop_after_response=True,
+            ),
+            disposition="collecting",
+        )
 
     lines.append(raw)
     normalized["lines"] = lines
+    emit_evidence_block_receipt(
+        state,
+        operation="append",
+        question=question,
+        lines=lines,
+        input_text=raw,
+        input_disposition="accepted",
+        status="active",
+        block_id=block_id,
+    )
     if evidence_collection_complete(lines):
         return finish_evidence_collection(state, normalized)
     return EvidenceCollectionOutcome(
@@ -272,20 +386,23 @@ def prompt_evidence_collection_waiting(
     lines = [str(item) for item in list(active.get("lines") or []) if str(item).strip()]
     language = str(active.get("language") or state.get("language") or "en")
     normalized = {"question": dict(question), "lines": lines, "language": language, "status": "active"}
-    if str(question.get("id") or "") == "freeform_evidence":
-        response = localized(
-            language,
-            "还没有收到新的日志内容。请继续粘贴真实日志/错误栈，完成后输入 `END`；如果要退出日志分析，可以直接说明要回到哪个配置项。",
-            "No new log content was received. Paste the actual log/stack trace and type `END` when done; to leave log analysis, name the configuration area to return to.",
-        )
-    else:
-        response = localized(
-            language,
-            "还没有收到新的 RPC 证据。请继续粘贴 request/response/docs，完成后输入 `END`；如果要退出，请直接说明要回到哪个配置项。",
-            "No new RPC evidence was received. Continue pasting request/response/docs and type `END` when done; to leave this flow, name the configuration area to return to.",
-        )
+    block_id = str(active.get("block_id") or "") or evidence_block_id(question, lines)
+    normalized["block_id"] = block_id
+    response = _evidence_waiting_response(language, question)
+    previous_ids = _control_receipt_ids(state)
+    emit_evidence_block_receipt(
+        state,
+        operation="ignore",
+        question=question,
+        lines=lines,
+        input_disposition="blank_ignored",
+        status="active",
+        visible_result=response,
+        block_id=block_id,
+    )
     return HandlerResult(
         delta=StateDelta.set_values({"evidence_collection": normalized}),
+        control_receipts=_control_receipts_since(state, previous_ids),
         visible_result=response,
         completion="in_progress",
         stop_after_response=True,
@@ -304,19 +421,31 @@ def finish_evidence_collection(
     question = active.get("question") if isinstance(active.get("question"), dict) else {}
     lines = [str(item) for item in list(active.get("lines") or []) if str(item).strip()]
     language = str(active.get("language") or state.get("language") or "en")
+    block_id = str(active.get("block_id") or "") or evidence_block_id(question, lines)
     values: dict[str, Any] = {
         "evidence_collection": {},
     }
     if not question or not lines:
+        response = localized(
+            language,
+            "没有可解析的多行证据。请重新提供 request/response/docs，或直接输入 params JSON。",
+            "No parseable multi-line evidence was collected. Provide request/response/docs again, or enter params JSON directly.",
+        )
+        emit_evidence_block_receipt(
+            state,
+            operation="finish",
+            question=question,
+            lines=lines,
+            input_disposition="completion",
+            status="empty",
+            visible_result=response,
+            block_id=block_id,
+        )
         return EvidenceCollectionOutcome(
             result=HandlerResult(
                 delta=StateDelta.set_values(values),
                 clear_pending=True,
-                visible_result=localized(
-                    language,
-                    "没有可解析的多行证据。请重新提供 request/response/docs，或直接输入 params JSON。",
-                    "No parseable multi-line evidence was collected. Provide request/response/docs again, or enter params JSON directly.",
-                ),
+                visible_result=response,
                 completion="blocked",
                 stop_after_response=True,
             ),
@@ -339,6 +468,16 @@ def finish_evidence_collection(
                 "这类内容会作为错误/日志证据分析；如果你希望继续配置 benchmark，也可以直接说明要回到哪个配置项。",
                 "I will analyze this as error/log evidence. If you want to continue benchmark configuration instead, name the configuration area.",
             )
+        emit_evidence_block_receipt(
+            state,
+            operation="finish",
+            question=question,
+            lines=lines,
+            input_disposition="completion",
+            status="saved",
+            visible_result=response,
+            block_id=block_id,
+        )
         return EvidenceCollectionOutcome(
             result=HandlerResult(
                 delta=StateDelta.set_values(values),
@@ -351,6 +490,15 @@ def finish_evidence_collection(
             collected_text=collected_text,
         )
 
+    emit_evidence_block_receipt(
+        state,
+        operation="finish",
+        question=question,
+        lines=lines,
+        input_disposition="completion",
+        status="pending_answer",
+        block_id=block_id,
+    )
     return EvidenceCollectionOutcome(
         result=HandlerResult(
             delta=StateDelta.set_values(values),
@@ -366,6 +514,18 @@ def finish_evidence_collection(
 def cancel_evidence_collection(state: AgentGraphState) -> HandlerResult:
     """Clear only evidence collection state before coordinator-owned routing."""
 
+    collecting = state.get("evidence_collection") or {}
+    question = collecting.get("question") if isinstance(collecting.get("question"), Mapping) else {}
+    lines = [str(item) for item in collecting.get("lines") or () if str(item).strip()]
+    emit_evidence_block_receipt(
+        state,
+        operation="cancel",
+        question=question,
+        lines=lines,
+        input_disposition="cancel",
+        status="cancelled",
+        block_id=str(collecting.get("block_id") or "") or evidence_block_id(question, lines),
+    )
     return HandlerResult(
         delta=StateDelta.set_values({"evidence_collection": {}}),
         completion="unchanged",
@@ -379,6 +539,19 @@ def pause_evidence_collection(state: AgentGraphState) -> HandlerResult:
     if not collecting:
         return HandlerResult(blocker="pause evidence requires an active evidence collection")
     collecting["status"] = "paused"
+    question = collecting.get("question") if isinstance(collecting.get("question"), Mapping) else {}
+    lines = [str(item) for item in collecting.get("lines") or () if str(item).strip()]
+    block_id = str(collecting.get("block_id") or "") or evidence_block_id(question, lines)
+    collecting["block_id"] = block_id
+    emit_evidence_block_receipt(
+        state,
+        operation="pause",
+        question=question,
+        lines=lines,
+        input_disposition="pause",
+        status="paused",
+        block_id=block_id,
+    )
     return HandlerResult(
         delta=StateDelta.set_values({"evidence_collection": collecting}),
         completion="completed",
@@ -394,13 +567,27 @@ def resume_evidence_collection(state: AgentGraphState) -> HandlerResult:
     collecting["status"] = "active"
     language = str(collecting.get("language") or state.get("language") or "en")
     lines = [str(item) for item in collecting.get("lines") or []]
+    question = collecting.get("question") if isinstance(collecting.get("question"), Mapping) else {}
+    block_id = str(collecting.get("block_id") or "") or evidence_block_id(question, lines)
+    collecting["block_id"] = block_id
+    response = localized(
+        language,
+        f"已恢复证据收集，当前保留 {len(lines)} 行。请继续粘贴，完成后输入 `END`。",
+        f"Resumed evidence collection with {len(lines)} saved line(s). Continue pasting, or type `END` when done.",
+    )
+    emit_evidence_block_receipt(
+        state,
+        operation="resume",
+        question=question,
+        lines=lines,
+        input_disposition="resume",
+        status="active",
+        visible_result=response,
+        block_id=block_id,
+    )
     return HandlerResult(
         delta=StateDelta.set_values({"evidence_collection": collecting}),
-        visible_result=localized(
-            language,
-            f"已恢复证据收集，当前保留 {len(lines)} 行。请继续粘贴，完成后输入 `END`。",
-            f"Resumed evidence collection with {len(lines)} saved line(s). Continue pasting, or type `END` when done.",
-        ),
+        visible_result=response,
         completion="in_progress",
         stop_after_response=True,
     )
@@ -435,9 +622,18 @@ def analyze_inline_evidence_result(state: AgentGraphState, text: str) -> Handler
     evidence = str(text or "").strip()
     evidence_buffer = [dict(item) for item in list(state.get("evidence_buffer") or [])]
     evidence_buffer.append({"text": evidence})
+    response = analyze_evidence_with_model(state, evidence, evidence)
+    emit_analysis_invocation_receipt(
+        state,
+        source_kind="inline",
+        evidence=evidence,
+        question=evidence,
+        visible_result=response,
+        invoked=True,
+    )
     return HandlerResult(
         delta=StateDelta.set_values({"evidence_buffer": evidence_buffer}),
-        visible_result=analyze_evidence_with_model(state, evidence, evidence),
+        visible_result=response,
         next_group="" if state.get("pending_question") else "error_evidence_analysis",
         completion="completed",
         stop_after_response=True,
@@ -457,10 +653,19 @@ def analyze_saved_evidence_result(state: AgentGraphState, user_question: str) ->
 
     evidence_items = list(state.get("evidence_buffer") or [])
     evidence = str((evidence_items[-1] if evidence_items else {}).get("text") or "").strip()
+    response = analyze_evidence_with_model(state, evidence, user_question)
+    emit_analysis_invocation_receipt(
+        state,
+        source_kind="saved_buffer",
+        evidence=evidence,
+        question=user_question,
+        visible_result=response,
+        invoked=True,
+    )
     return HandlerResult(
         clear_pending=True,
         next_group="error_evidence_analysis",
-        visible_result=analyze_evidence_with_model(state, evidence, user_question),
+        visible_result=response,
         completion="completed",
         stop_after_response=True,
     )
@@ -518,16 +723,50 @@ def _report_artifact_entry(state: AgentGraphState) -> tuple[str, dict[str, Any]]
     return response, job
 
 
-def report_artifact_entry_result(state: AgentGraphState) -> HandlerResult:
+def report_artifact_entry_result(
+    state: AgentGraphState,
+    *,
+    receipt_state: AgentGraphState | None = None,
+) -> HandlerResult:
     """Read a requested/latest job without claiming execution-state authority."""
 
     report_context = dict(state.get("report_context") or {})
     state_view: AgentGraphState = dict(state)
     state_view["report_context"] = report_context
     response, persisted_job = _report_artifact_entry(state_view)
+    execution_receipts = (
+        persisted_job.get("execution_receipts")
+        if isinstance(persisted_job.get("execution_receipts"), Mapping)
+        else {}
+    )
+    read_receipt = (
+        dict(execution_receipts.get("last_read") or {})
+        if isinstance(execution_receipts, Mapping)
+        and isinstance(execution_receipts.get("last_read"), Mapping)
+        else {}
+    )
+    evidence_verified = bool(
+        verify_job_receipt(read_receipt)
+        and read_receipt.get("job_id") == persisted_job.get("job_id")
+        and read_receipt.get("observed_status") == persisted_job.get("status")
+    )
     if persisted_job:
         report_context["analyzed_job_id"] = str(persisted_job.get("job_id") or "")
         report_context["analyzed_job_status"] = str(persisted_job.get("status") or "unknown")
+    emit_report_analysis_receipt(
+        receipt_state if receipt_state is not None else state,
+        requested_job_id=str(report_context.get("requested_job_id") or ""),
+        resolved_job_id=str(persisted_job.get("job_id") or ""),
+        resolved_status=str(persisted_job.get("status") or ""),
+        visible_result=response,
+        invoked=bool(persisted_job) and evidence_verified,
+        job_read_receipt_id=(
+            str(read_receipt.get("receipt_id") or "")
+            if evidence_verified
+            else ""
+        ),
+        evidence_verified=evidence_verified,
+    )
     return HandlerResult(
         delta=StateDelta.set_values({"report_context": report_context}),
         clear_pending=True,
@@ -535,6 +774,41 @@ def report_artifact_entry_result(state: AgentGraphState) -> HandlerResult:
         visible_result=response,
         completion="completed",
         stop_after_response=True,
+    )
+
+
+def _evidence_waiting_response(language: str, question: Mapping[str, Any]) -> str:
+    if str(question.get("id") or "") == "freeform_evidence":
+        return localized(
+            language,
+            "还没有收到新的日志内容。请继续粘贴真实日志/错误栈，完成后输入 `END`；如果要退出日志分析，可以直接说明要回到哪个配置项。",
+            "No new log content was received. Paste the actual log/stack trace and type `END` when done; to leave log analysis, name the configuration area to return to.",
+        )
+    return localized(
+        language,
+        "还没有收到新的 RPC 证据。请继续粘贴 request/response/docs，完成后输入 `END`；如果要退出，请直接说明要回到哪个配置项。",
+        "No new RPC evidence was received. Continue pasting request/response/docs and type `END` when done; to leave this flow, name the configuration area to return to.",
+    )
+
+
+def _control_receipt_ids(state: Mapping[str, Any]) -> set[str]:
+    return {
+        str(item.get("receipt_id") or "")
+        for item in (state.get("turn_context") or {}).get("control_receipts") or ()
+        if isinstance(item, Mapping) and str(item.get("receipt_id") or "")
+    }
+
+
+def _control_receipts_since(
+    state: Mapping[str, Any],
+    previous_ids: set[str],
+) -> tuple[Mapping[str, Any], ...]:
+    return tuple(
+        deepcopy(dict(item))
+        for item in (state.get("turn_context") or {}).get("control_receipts") or ()
+        if isinstance(item, Mapping)
+        and str(item.get("receipt_id") or "")
+        and str(item.get("receipt_id") or "") not in previous_ids
     )
 
 

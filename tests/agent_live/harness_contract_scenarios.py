@@ -954,7 +954,46 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
             {
                 "target_mode": "fake-node",
                 "workflow_mode": "rpc_benchmark",
-                "chain_identity": {"status": "existing_family_runtime_choice"},
+                "chain_identity": {
+                    "raw": "coverage-evm",
+                    "canonical": "coverage-evm",
+                    "adapter_family": "jsonrpc",
+                    "status": "existing_family_runtime_choice",
+                    "case": "case2",
+                },
+                "endpoint_evidence": {
+                    "candidate_endpoint": "http://geth-dev:8545",
+                    "candidate_endpoint_ready": True,
+                    "new_chain_endpoint_probe": {
+                        "ready": True,
+                        "status": "ok",
+                        "endpoint": "http://geth-dev:8545",
+                        "chain": "coverage-evm",
+                        "transport": "jsonrpc",
+                        "evidence_file": ".agent/evidence/coverage-endpoint.json",
+                    },
+                },
+                "custom_rpc": {
+                    "catalog": {
+                        "contract_version": 1,
+                        "revision": 1,
+                        "chain": "coverage-evm",
+                        "methods": [
+                            {
+                                "contract_version": 1,
+                                "revision": 1,
+                                "method": "eth_blockNumber",
+                                "params": [],
+                                "request_confirmed": True,
+                                "response_confirmed": True,
+                                "validation_endpoint": "http://geth-dev:8545",
+                                "evidence_file": ".agent/evidence/coverage-method.json",
+                                "chain": "coverage-evm",
+                            },
+                        ],
+                        "finished": True,
+                    },
+                },
             },
         ),
         (

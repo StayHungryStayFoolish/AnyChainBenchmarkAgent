@@ -491,6 +491,42 @@ def materialize_custom_rpc_template(
     if not proxy_extraction:
         return {}
     template["proxy_extraction"] = proxy_extraction
+    materialization_evidence = {
+        "source_kind": (
+            "canonical_template_overlay"
+            if has_canonical_template
+            else "new_chain_runtime_template"
+        ),
+        "chain": chain,
+        "adapter_family": family,
+        "rpc_mode": rpc_mode,
+        "method_hashes": [_stable_digest(method) for method in selected],
+        "mixed_weight_entries": [
+            {
+                "method_hash": _stable_digest(method),
+                "weight": weights[method],
+            }
+            for method in selected
+            if method in weights
+        ],
+        "replace_defaults": bool(workload.get("replace_defaults")),
+        "required_contract_method_hashes": [
+            _stable_digest(method) for method in sorted(contract_required)
+        ],
+        "parameter_contracts": [
+            {
+                "method_hash": _stable_digest(method),
+                "contract_hash": _stable_digest(param_spec.get(method)),
+            }
+            for method in selected
+            if method in param_spec
+        ],
+        "effective_rpc_methods_hash": _stable_digest(rpc_methods),
+        "template_hash": _stable_digest(template),
+        "template_hash_scope": "template_without_materialization_evidence",
+    }
+    meta["materialization_evidence"] = materialization_evidence
+    template["_meta"] = meta
     return template
 
 
@@ -570,6 +606,18 @@ def template_requirements_from_override(chain: str, template: dict[str, Any]) ->
         "runtime_endpoint_variables": ["LOCAL_RPC_URL"],
         "sync_health_mode": str(((template.get("_meta") or {}).get("sync_health") or {}).get("mode") or ""),
     }
+
+
+def _stable_digest(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _ordered_required_inputs(items: set[str]) -> list[str]:

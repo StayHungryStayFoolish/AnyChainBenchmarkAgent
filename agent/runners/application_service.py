@@ -111,6 +111,7 @@ class ExecutionResult:
     requires_user_confirmation: bool = False
     idempotency_key: str = ""
     reused: bool = False
+    receipts: tuple[Mapping[str, Any], ...] = ()
     failure: ExecutionFailure | None = None
 
     @property
@@ -128,6 +129,7 @@ class ExecutionResult:
             "requires_user_confirmation": self.requires_user_confirmation,
             "idempotency_key": self.idempotency_key,
             "reused": self.reused,
+            "receipts": [dict(item) for item in self.receipts],
             "failure": self.failure.to_dict() if self.failure else None,
         }
 
@@ -358,6 +360,7 @@ class BenchmarkExecutionService:
         data = dict(payload.get("data") or {})
         job = data.get("job") if isinstance(data.get("job"), dict) else {}
         reused = bool(job.get("submission_reused"))
+        receipts = _job_execution_receipts(job)
         warnings = tuple(str(item) for item in payload.get("warnings") or [] if str(item))
         failure = None
         if status is not ExecutionStatus.OK:
@@ -381,6 +384,7 @@ class BenchmarkExecutionService:
             requires_user_confirmation=bool(payload.get("requires_user_confirmation")),
             idempotency_key=idempotency_key,
             reused=reused,
+            receipts=receipts,
             failure=failure,
         )
 
@@ -394,7 +398,6 @@ class BenchmarkExecutionService:
             "warnings": [str(job.get("error") or "")] if job.get("error") else [],
             "next_actions": [],
         }
-
     @staticmethod
     def _failure(
         operation: ExecutionOperation,
@@ -415,6 +418,17 @@ class BenchmarkExecutionService:
             requires_user_confirmation=requires_user_confirmation,
             failure=failure,
         )
+
+
+def _job_execution_receipts(job: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+    receipts = job.get("execution_receipts")
+    if not isinstance(receipts, Mapping):
+        return ()
+    return tuple(
+        dict(receipt)
+        for _name, receipt in sorted(receipts.items(), key=lambda item: str(item[0]))
+        if isinstance(receipt, Mapping)
+    )
 
 
 execution_service = BenchmarkExecutionService()

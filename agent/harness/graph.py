@@ -385,6 +385,8 @@ def _turn_receipt_summary(state: Mapping[str, Any]) -> dict[str, Any]:
             "unit_id": str(raw.get("unit_id") or ""),
             "clause_id": str(raw.get("clause_id") or ""),
             "disposition": str(raw.get("disposition") or ""),
+            "start": raw.get("start"),
+            "end": raw.get("end"),
             "action_indexes": [
                 int(index)
                 for index in raw.get("action_indexes") or ()
@@ -511,9 +513,54 @@ def _render_manifest(state: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _execution_receipt_summary(state: Mapping[str, Any]) -> dict[str, Any]:
+    from agent.runners.job_manager import verify_job_receipt
+
     intent = dict(state.get("side_effect_intent") or {})
     receipt = dict(state.get("side_effect_receipt") or {})
     job = dict(state.get("job") or {})
+    execution_receipts = (
+        dict(job.get("execution_receipts") or {})
+        if isinstance(job.get("execution_receipts"), Mapping)
+        else {}
+    )
+    base_submission = (
+        dict(execution_receipts.get("submission") or {})
+        if isinstance(execution_receipts.get("submission"), Mapping)
+        else {}
+    )
+    submission_attempt = (
+        dict(execution_receipts.get("submission_attempt") or {})
+        if isinstance(execution_receipts.get("submission_attempt"), Mapping)
+        else {}
+    )
+    submission = submission_attempt or base_submission
+    last_read = (
+        dict(execution_receipts.get("last_read") or {})
+        if isinstance(execution_receipts.get("last_read"), Mapping)
+        else {}
+    )
+    job_id = str(job.get("job_id") or "")
+    if (
+        not verify_job_receipt(base_submission)
+        or base_submission.get("job_id") != job_id
+    ):
+        base_submission = {}
+    if (
+        not verify_job_receipt(submission)
+        or submission.get("job_id") != job_id
+    ):
+        submission = {}
+    if (
+        not verify_job_receipt(last_read)
+        or last_read.get("job_id") != job_id
+        or last_read.get("observed_status") != job.get("status")
+        or (
+            last_read.get("submission_receipt_id")
+            and last_read.get("submission_receipt_id")
+            != base_submission.get("receipt_id")
+        )
+    ):
+        last_read = {}
     return {
         "intent_id": str(intent.get("intent_id") or ""),
         "intent_action_type": str(intent.get("operation") or ""),
@@ -521,8 +568,27 @@ def _execution_receipt_summary(state: Mapping[str, Any]) -> dict[str, Any]:
         "receipt_id": str(receipt.get("receipt_id") or ""),
         "receipt_status": str(receipt.get("status") or ""),
         "receipt_idempotency_key": str(receipt.get("idempotency_key") or ""),
-        "job_id": str(job.get("job_id") or ""),
+        "job_id": job_id,
         "job_status": str(job.get("status") or ""),
+        "manager_submission_receipt_id": str(
+            submission.get("receipt_id") or ""
+        ),
+        "manager_submission_disposition": str(
+            submission.get("disposition") or ""
+        ),
+        "manager_matching_job_count": (
+            int(submission.get("matching_job_count"))
+            if isinstance(submission.get("matching_job_count"), int)
+            and not isinstance(submission.get("matching_job_count"), bool)
+            else 0
+        ),
+        "manager_execution_key_hash": str(
+            submission.get("execution_key_hash") or ""
+        ),
+        "manager_read_receipt_id": str(last_read.get("receipt_id") or ""),
+        "manager_observed_status": str(
+            last_read.get("observed_status") or ""
+        ),
     }
 
 

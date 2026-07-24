@@ -15,6 +15,7 @@ from agent.validators.rpc_workload import default_workload
 from agent.validators.fixture_checks import validate_effective_fake_node_workload
 from .chain_rpc_support import _case_dict, _format_weights, _invalidate_execution
 from .rpc_catalog import catalog_method_names, finish_catalog, reset_draft
+from .rpc_receipts import emit_workload_commit_receipt
 
 def _apply_continue(state: AgentGraphState, question_id: str, value: Any) -> None:
     case = "new_chain" if question_id.startswith("new_chain") else "custom_rpc"
@@ -73,6 +74,7 @@ def _set_single_workload(state: AgentGraphState, method: str, case: str) -> None
     case_dict["methods"] = [method]
     case_dict["job_local_override"] = True
     _refresh_fixture_evidence(state, case)
+    emit_workload_commit_receipt(state, case=case)
     state['active_group'] = _completed_workload_group(state, case)
     _invalidate_execution(state)
 
@@ -145,6 +147,7 @@ def _apply_weights(state: AgentGraphState, question_id: str, value: Any) -> None
         "job_local_override": True,
     }
     _refresh_fixture_evidence(state, case)
+    emit_workload_commit_receipt(state, case=case)
     state['active_group'] = _completed_workload_group(state, case)
     _invalidate_execution(state)
     if case == "custom_rpc":
@@ -191,6 +194,7 @@ def _apply_requested_workload(state: AgentGraphState) -> bool:
         state["rpc_mode"] = "mixed"
         state["workload"] = {"confirmed": True, "choice": "custom_rpc", "methods": list(weights), "mixed_weights": weights, "replace_defaults": scope == "mixed_replace", "job_local_override": True}
         _refresh_fixture_evidence(state, "custom_rpc")
+        emit_workload_commit_receipt(state, case="custom_rpc")
         state['active_group'] = "target_samples_fixtures" if _fixtures_block(state) else "workload_rpc"
         _invalidate_execution(state)
         replaced = scope == "mixed_replace"

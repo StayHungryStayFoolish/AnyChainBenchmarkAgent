@@ -52,6 +52,7 @@ from .contracts import (
     side_effect_receipt_to_dict,
     turn_receipt_to_dict,
 )
+from .control_receipts import validate_domain_control_receipt
 from .localization import localized as _localized
 from .domains.orientation import completed_group_status
 from .domains.environment import (
@@ -450,6 +451,43 @@ def _append_control_receipt(
     state["turn_context"] = turn_context
 
 
+def _append_domain_control_receipts(
+    state: AgentGraphState,
+    receipts_to_commit: tuple[Mapping[str, Any], ...],
+    *,
+    owner: str,
+) -> None:
+    """Commit only original, owner-validated domain observation receipts."""
+
+    turn_index = int(state.get("turn_index") or 0)
+    turn_context = dict(state.get("turn_context") or {})
+    receipts = [
+        dict(item)
+        for item in turn_context.get("control_receipts") or ()
+        if isinstance(item, Mapping)
+    ]
+    known_ids = {
+        str(item.get("receipt_id") or "")
+        for item in receipts
+        if str(item.get("receipt_id") or "")
+    }
+    for raw in receipts_to_commit:
+        receipt = deepcopy(dict(raw))
+        valid, reason = validate_domain_control_receipt(
+            receipt,
+            handler_owner=owner,
+            turn_index=turn_index,
+        )
+        if not valid:
+            raise StateInvariantError(f"invalid domain control receipt: {reason}")
+        receipt_id = str(receipt.get("receipt_id") or "")
+        if receipt_id not in known_ids:
+            receipts.append(receipt)
+            known_ids.add(receipt_id)
+    turn_context["control_receipts"] = receipts
+    state["turn_context"] = turn_context
+
+
 def _record_semantic_plan_receipt(
     state: AgentGraphState,
     semantic_units: list[Mapping[str, Any]],
@@ -746,24 +784,30 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
             text,
             [action],
         )[0]
-        source_unit_ids = [
-            str(clause.get("clause_id") or "")
+        source_clauses = [
+            dict(clause)
             for clause in (state.get("turn_receipt") or {}).get("clauses") or []
             if isinstance(clause, Mapping)
             and str(clause.get("clause_id") or "")
+        ]
+        source_unit_ids = [
+            str(clause.get("clause_id") or "")
+            for clause in source_clauses
         ]
         action["_source_unit_ids"] = source_unit_ids
         _record_semantic_plan_receipt(
             state,
             [
                 {
-                    "unit_id": unit_id,
-                    "clause_id": unit_id,
-                    "source_text": text,
+                    "unit_id": str(clause.get("clause_id") or ""),
+                    "clause_id": str(clause.get("clause_id") or ""),
+                    "source_text": str(clause.get("text") or ""),
+                    "start": 0,
+                    "end": len(str(clause.get("text") or "")),
                     "disposition": "action",
                     "action_indexes": [0],
                 }
-                for unit_id in source_unit_ids
+                for clause in source_clauses
             ],
             [],
         )
@@ -842,24 +886,30 @@ def _admit_deterministic_action(
     text = str((state.get("turn_context") or {}).get("text") or "")
     scope = f"{state.get('thread_id') or 'default'}:{int(state.get('turn_index') or 0)}"
     admitted = assign_action_ids(scope, text, [dict(action)])[0]
-    source_unit_ids = [
-        str(clause.get("clause_id") or "")
+    source_clauses = [
+        dict(clause)
         for clause in (state.get("turn_receipt") or {}).get("clauses") or []
         if isinstance(clause, Mapping)
         and str(clause.get("clause_id") or "")
+    ]
+    source_unit_ids = [
+        str(clause.get("clause_id") or "")
+        for clause in source_clauses
     ]
     admitted["_source_unit_ids"] = source_unit_ids
     _record_semantic_plan_receipt(
         state,
         [
             {
-                "unit_id": unit_id,
-                "clause_id": unit_id,
-                "source_text": text,
+                "unit_id": str(clause.get("clause_id") or ""),
+                "clause_id": str(clause.get("clause_id") or ""),
+                "source_text": str(clause.get("text") or ""),
+                "start": 0,
+                "end": len(str(clause.get("text") or "")),
                 "disposition": "action",
                 "action_indexes": [0],
             }
-            for unit_id in source_unit_ids
+            for clause in source_clauses
         ],
         [],
     )
@@ -2048,6 +2098,42 @@ def compose_turn_step(state: AgentGraphState) -> AgentGraphState:
             else "completed"
         )
         state["turn_receipt"] = receipt
+    pending = dict(state.get("pending_question") or {})
+    rendered_pending = (
+        _render_question(pending, state.get("language", "en"))
+        if pending
+        else ""
+    )
+    _append_control_receipt(
+        state,
+        "response_composition",
+        {
+            "language": str(state.get("language") or ""),
+            "active_group": str(state.get("active_group") or ""),
+            "source_action_ids": [
+                str(item)
+                for item in (state.get("turn_receipt") or {}).get(
+                    "execution_order"
+                )
+                or ()
+                if str(item)
+            ],
+            "pending_contract_hash": _receipt_hash(pending),
+            "fragments": [
+                {
+                    "fragment_hash": hashlib.sha256(
+                        str(fragment).encode("utf-8")
+                    ).hexdigest(),
+                    "role": (
+                        "pending_question"
+                        if rendered_pending and str(fragment) == rendered_pending
+                        else "visible_result"
+                    ),
+                }
+                for fragment in state.get("visible_response") or ()
+            ],
+        },
+    )
     return _set_turn_phase(state, "end", "response_composed")
 
 
@@ -2362,6 +2448,11 @@ def _apply_handler_result(
     navigation_command = result.navigation_command
     if result.blocker:
         candidate: AgentGraphState = deepcopy(state)
+        _append_domain_control_receipts(
+            candidate,
+            result.control_receipts,
+            owner=owner,
+        )
         current_action = dict(candidate.get("current_action") or {})
         if current_action and owner not in {"coordinator", "orientation", "recovery"}:
             retained_state = {
@@ -2584,6 +2675,27 @@ def _apply_handler_result(
         candidate["pending_question"].pop("resume_action_queue", None)
 
     candidate = _activate_ready_deferred_group(candidate)
+    _append_domain_control_receipts(
+        candidate,
+        result.control_receipts,
+        owner=owner,
+    )
+    delta_paths = [
+        {
+            "operation": "write",
+            "path": ".".join(write.path),
+            "value_hash": _receipt_hash(write.value),
+        }
+        for write in result.delta.writes
+    ]
+    delta_paths.extend(
+        {
+            "operation": "delete",
+            "path": ".".join(path),
+            "value_hash": "",
+        }
+        for path in result.delta.deletes
+    )
     _append_control_receipt(
         candidate,
         "domain_commit",
@@ -2602,6 +2714,7 @@ def _apply_handler_result(
             "reconfigured_groups": [
                 str(item) for item in result.reconfigured_groups if str(item)
             ],
+            "material_delta": delta_paths,
             "navigation_operation": str(
                 navigation_command.operation if navigation_command else ""
             ),

@@ -288,7 +288,7 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
                 evaluating_postcondition_id="duplicate_job_submission",
             )
         )
-        self.assertTrue(no_duplicate.satisfied)
+        self.assertFalse(no_duplicate.satisfied)
 
         no_side_channel_rejection = registry.definitions[
             "typed_confirmation_rejected_by_side_channel"
@@ -298,7 +298,7 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
                 "typed_confirmation_rejected_by_side_channel"
             ),
         ))
-        self.assertTrue(no_side_channel_rejection.satisfied)
+        self.assertFalse(no_side_channel_rejection.satisfied)
 
     def test_forbidden_predicates_fail_when_violation_is_observed(self) -> None:
         target = next(
@@ -385,7 +385,7 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
         duplicate = RETAINED_REGRESSION_JOURNEY_VERIFIER_REGISTRY.definitions[
             "duplicate_job_submission"
         ].verifier(duplicate_context)
-        self.assertFalse(duplicate.satisfied)
+        self.assertTrue(duplicate.satisfied)
         self.assertEqual(
             duplicate.details["duplicate_submission_counts"],
             {"same-key": 2},
@@ -416,7 +416,7 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
         rejection = RETAINED_REGRESSION_JOURNEY_VERIFIER_REGISTRY.definitions[
             "typed_confirmation_rejected_by_side_channel"
         ].verifier(rejection_context)
-        self.assertFalse(rejection.satisfied)
+        self.assertTrue(rejection.satisfied)
         self.assertEqual(rejection.details["rejected_domain_receipt_ids"], ["b" * 64])
 
     def _one_turn_context(self, target: dict) -> JourneyVerifierContext:

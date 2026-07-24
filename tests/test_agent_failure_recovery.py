@@ -334,15 +334,29 @@ class FailureRecoveryTest(unittest.TestCase):
         from agent.harness.state import new_state
 
         state = new_state("current-job")
-        with patch("agent.runners.job_manager.get_job") as get_job:
+        with patch("agent.harness.domains.execution.get_job") as get_job:
             result = reconcile_execution_state(state)
         get_job.assert_not_called()
         state = self._commit_domain_delta(state, result, owner="execution")
         self.assertEqual(state["failure_recovery"], {})
 
         state["job"] = {"job_id": "job_current_failed"}
-        persisted = {"job_id": "job_current_failed", "status": "failed", "error": "exit 2", "artifacts": {}}
-        with patch("agent.runners.job_manager.get_job", return_value=persisted):
+        persisted = {
+            "job_id": "job_current_failed",
+            "status": "failed",
+            "error": "exit 2",
+            "artifacts": {},
+            "execution_receipts": {
+                "last_read": {
+                    "job_id": "job_current_failed",
+                    "observed_status": "failed",
+                }
+            },
+        }
+        with (
+            patch("agent.harness.domains.execution.get_job", return_value=persisted),
+            patch("agent.harness.domains.execution.verify_job_receipt", return_value=True),
+        ):
             result = reconcile_execution_state(state)
         state = self._commit_domain_delta(state, result, owner="execution")
         self.assertEqual(state["failure_recovery"]["status"], "pending")

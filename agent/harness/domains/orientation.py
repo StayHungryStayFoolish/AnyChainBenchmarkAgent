@@ -12,7 +12,7 @@ from agent.knowledge.entry_contract import ALL_RUNTIME_FIELDS
 from agent.knowledge.chain_identity import canonicalize_chain_scalar, repo_chain_names
 from agent.workflows.group_registry import GROUPS
 from agent.validators.rpc_workload import default_workload
-from agent.runners.job_manager import get_job, list_jobs
+from agent.runners.job_manager import get_job, list_jobs, verify_job_receipt
 from ..action_registry import canonical_consultation_topic
 from ..contracts import ActionProposal, CheckpointCommand, HandlerResult, StateDelta
 from ..failures import render_failure_summary, unresolved_recovery
@@ -887,5 +887,27 @@ def _job_status(state: AgentGraphState, language: str) -> str:
         persisted = get_job(job_id)
     except (FileNotFoundError, OSError, ValueError):
         persisted = {}
-    status = str(persisted.get("status") or job.get("status") or "unknown")
-    return localized(language, f"当前 job：`{job_id}`，状态：`{status}`。", f"Current job: `{job_id}`, status: `{status}`.")
+    receipts = persisted.get("execution_receipts") or {}
+    read_receipt = (
+        dict(receipts.get("last_read") or {})
+        if isinstance(receipts, dict)
+        else {}
+    )
+    if (
+        verify_job_receipt(read_receipt)
+        and read_receipt.get("job_id") == job_id
+        and read_receipt.get("observed_status") == persisted.get("status")
+    ):
+        status = str(read_receipt.get("observed_status") or "unknown")
+        return localized(
+            language,
+            f"当前 job：`{job_id}`，状态：`{status}`。",
+            f"Current job: `{job_id}`, status: `{status}`.",
+        )
+    else:
+        last_known = str(job.get("status") or "unknown")
+        return localized(
+            language,
+            f"当前无法验证 job `{job_id}` 的实时状态；checkpoint 中最后记录为 `{last_known}`。请检查 job 产物是否仍可访问。",
+            f"The live status of job `{job_id}` cannot be verified; the checkpoint's last-known status is `{last_known}`. Check whether the job artifacts are still accessible.",
+        )

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from copy import deepcopy
-from typing import Any
+from typing import Any, Mapping
 
 from ..contracts import ActionProposal, HandlerResult, StateDelta
 from ..input_values import (
@@ -331,8 +331,19 @@ def _result(
     current_invalidated = set(state.get("invalidated_groups") or [])
     previous_responses = list(original.get("visible_response") or [])
     previous_errors = list(original.get("action_errors") or [])
+    previous_receipt_ids = {
+        str(item.get("receipt_id") or "")
+        for item in (original.get("turn_context") or {}).get("control_receipts") or ()
+        if isinstance(item, Mapping)
+    }
     return HandlerResult(
         delta=StateDelta.between(original, state),
+        control_receipts=tuple(
+            deepcopy(dict(item))
+            for item in (state.get("turn_context") or {}).get("control_receipts") or ()
+            if isinstance(item, Mapping)
+            and str(item.get("receipt_id") or "") not in previous_receipt_ids
+        ),
         consumed_action_ids=((action.action_id,) if action is not None else ()),
         invalidated_groups=tuple(sorted(current_invalidated - previous_invalidated)),
         reconfigured_groups=tuple(sorted(previous_invalidated - current_invalidated)),

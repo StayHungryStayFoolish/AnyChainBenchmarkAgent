@@ -13,6 +13,9 @@ from typing import Any, Iterable, Mapping
 
 from tests.agent_live.coverage_events import state_diff_between
 from agent.harness.runtime_identity import repository_revision
+from agent.harness.control_receipts import (
+    validate_persisted_domain_control_receipt,
+)
 from agent.runners.execution_scenarios import scenario_by_id, workflow_type_from_plan
 from agent.utils.redaction import redact
 
@@ -1447,6 +1450,14 @@ def _validate_runtime_event(event: RuntimeTurnEvent) -> None:
             receipt_id = str(unsigned.pop("receipt_id"))
             if content_hash(unsigned) != receipt_id:
                 raise ValueError("runtime control receipt hash is stale")
+            valid, reason = validate_persisted_domain_control_receipt(
+                receipt,
+                turn_index=event.turn_index,
+            )
+            if not valid:
+                raise ValueError(
+                    f"runtime domain control receipt is invalid: {reason}"
+                )
         for path, hashes in event.material_state_diff_hashes.items():
             if (
                 not str(path)

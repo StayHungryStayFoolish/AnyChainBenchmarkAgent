@@ -758,8 +758,21 @@ class RealNodeExecutionStateMachineTest(unittest.TestCase):
             "smoke": {"purpose": "real_node_isolated_smoke", "status": "running", "job_id": "job-smoke"},
             "job": {"job_id": "job-smoke", "status": "running"},
         })
-        persisted = {"job_id": "job-smoke", "status": "completed", "artifacts": {}}
-        with patch("agent.runners.job_manager.get_job", return_value=persisted):
+        persisted = {
+            "job_id": "job-smoke",
+            "status": "completed",
+            "artifacts": {},
+            "execution_receipts": {
+                "last_read": {
+                    "job_id": "job-smoke",
+                    "observed_status": "completed",
+                }
+            },
+        }
+        with (
+            patch("agent.harness.domains.execution.get_job", return_value=persisted),
+            patch("agent.harness.domains.execution.verify_job_receipt", return_value=True),
+        ):
             reconciled = reconcile_execution_state(state)
         state = apply_state_delta(state, reconciled.delta, owner="execution")
         question = question_for_execution(state, "job_monitoring")

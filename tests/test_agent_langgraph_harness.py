@@ -2690,7 +2690,14 @@ network:
 
         self.assertEqual(result["pending_question"]["id"], "inferred_config_review")
 
-        ok_probe = {"ready": True, "status": "ok", "evidence_file": ".agent/evidence/probe.json"}
+        ok_probe = {
+            "ready": True,
+            "status": "ok",
+            "evidence_file": ".agent/evidence/probe.json",
+            "endpoint": "https://example.invalid/rpc",
+            "chain": "flow-evm",
+            "transport": "jsonrpc",
+        }
         schema = {"status": "draft", "method": "eth_blockNumber", "params": [], "params_json": [], "response_summary": "hex block height", "confidence": "high"}
         with patch("agent.harness.domains.rpc_endpoint.extract_rpc_schema_from_evidence", return_value=schema), patch("agent.harness.domains.rpc_endpoint.validate_rpc_endpoint", return_value=ok_probe):
             result["last_user_input"] = "Y"
@@ -3952,15 +3959,28 @@ network:
         from agent.harness.oracle import compute_next_action
 
         state = {"job": {"job_id": "job_demo", "status": "running"}}
-        with patch("agent.harness.oracle.get_job", return_value={"status": "failed"}):
+        persisted = {
+            "job_id": "job_demo",
+            "status": "failed",
+            "execution_receipts": {
+                "last_read": {
+                    "job_id": "job_demo",
+                    "observed_status": "failed",
+                }
+            },
+        }
+        with (
+            patch("agent.harness.oracle.get_job", return_value=persisted),
+            patch("agent.harness.oracle.verify_job_receipt", return_value=True),
+        ):
             action = compute_next_action(state)
         self.assertEqual(action.execution_status, "job_failed")
 
-        # If the live lookup fails (e.g. the job directory is gone), fall
-        # back to the snapshot rather than raising.
+        # If the live lookup fails (e.g. the job directory is gone), expose
+        # the snapshot only as unverified rather than treating it as live.
         with patch("agent.harness.oracle.get_job", side_effect=FileNotFoundError("gone")):
             action = compute_next_action(state)
-        self.assertEqual(action.execution_status, "job_running")
+        self.assertEqual(action.execution_status, "job_unverified")
 
     def test_config_status_not_forced_complete_by_a_stale_unrelated_job(self) -> None:
         """Live-found regression (2026-07-13, user manual testing): `job`/
@@ -4001,7 +4021,20 @@ network:
             "sync_observe": {"source": "demo_only", "demo_acknowledged": True},
             "job": {"job_id": "job_old_unrelated", "status": "failed"},
         }
-        with patch("agent.harness.oracle.get_job", return_value={"status": "failed"}):
+        persisted = {
+            "job_id": "job_old_unrelated",
+            "status": "failed",
+            "execution_receipts": {
+                "last_read": {
+                    "job_id": "job_old_unrelated",
+                    "observed_status": "failed",
+                }
+            },
+        }
+        with (
+            patch("agent.harness.oracle.get_job", return_value=persisted),
+            patch("agent.harness.oracle.verify_job_receipt", return_value=True),
+        ):
             action = compute_next_action(state)
         self.assertEqual(action.execution_status, "job_failed")
         self.assertEqual(action.config_status, "incomplete")
@@ -8211,7 +8244,14 @@ response:
             "manual_input_allowed": True,
         }
 
-        ok_probe = {"ready": True, "status": "ok", "evidence_file": ".agent/evidence/probe.json"}
+        ok_probe = {
+            "ready": True,
+            "status": "ok",
+            "evidence_file": ".agent/evidence/probe.json",
+            "endpoint": "https://example.invalid/rpc",
+            "chain": "flow-evm",
+            "transport": "jsonrpc",
+        }
         unknown_response_schema = {
             "status": "draft",
             "method": "eth_blockNumber",

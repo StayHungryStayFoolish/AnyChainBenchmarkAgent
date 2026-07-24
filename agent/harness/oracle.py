@@ -8,7 +8,7 @@ from typing import Any
 from .routing import next_group_and_reason
 from .state import AgentGraphState
 
-from agent.runners.job_manager import get_job
+from agent.runners.job_manager import get_job, verify_job_receipt
 from agent.utils.redaction import redact
 @dataclass(frozen=True)
 class NextAction:
@@ -20,6 +20,7 @@ class NextAction:
     recommended_next_action: str
     blockers: tuple[str, ...] = field(default_factory=tuple)
     latest_job_id: str = ""
+    job_read_receipt: dict[str, Any] = field(default_factory=dict)
 
 
 def compute_next_action(state: dict[str, Any]) -> NextAction:
@@ -29,7 +30,7 @@ def compute_next_action(state: dict[str, Any]) -> NextAction:
     pending_id = str(pending.get("id") or "").strip()
     pending_group = str(pending.get("group") or state.get("active_group") or "").strip()
     latest_job_id = str((state.get("job") or {}).get("job_id") or "").strip()
-    execution_status = _execution_status(state)
+    execution_status, job_read_receipt = _execution_status(state)
 
     if pending_id:
         return NextAction(
@@ -41,6 +42,7 @@ def compute_next_action(state: dict[str, Any]) -> NextAction:
             recommended_next_action=_answer_pending_action(pending),
             blockers=(pending_id,),
             latest_job_id=latest_job_id,
+            job_read_receipt=job_read_receipt,
         )
 
     group, reason = _next_group_and_reason(state)
@@ -69,6 +71,7 @@ def compute_next_action(state: dict[str, Any]) -> NextAction:
         recommended_next_action=action,
         blockers=tuple(item for item in blockers if item),
         latest_job_id=latest_job_id,
+        job_read_receipt=job_read_receipt,
     )
 
 
@@ -488,7 +491,7 @@ def _next_group_and_reason(state: dict[str, Any]) -> tuple[str, str]:
     return next_group_and_reason(state)
 
 
-def _execution_status(state: dict[str, Any]) -> str:
+def _execution_status(state: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     job = state.get("job") or {}
     smoke = state.get("smoke") or {}
     preflight = state.get("preflight") or {}
@@ -500,27 +503,52 @@ def _execution_status(state: dict[str, Any]) -> str:
         # deterministic `status`/`jobs`/`logs` commands (which already read
         # correctly from disk via `job_manager`). Prefer the live on-disk
         # status by `job_id` when available; fall back to the snapshot only
-        # if the job can no longer be read (e.g. its directory was removed).
+        # A checkpoint snapshot is only last-known state. It must not become a
+        # verified live status when the persisted job cannot be read.
         job_id = str(job.get("job_id") or "").strip()
         status = str(job.get("status"))
+        read_receipt: dict[str, Any] = {}
         if job_id:
             try:
-                status = str(get_job(job_id).get("status") or status)
+                persisted = get_job(job_id)
+                receipts = persisted.get("execution_receipts") or {}
+                read_receipt = (
+                    dict(receipts.get("last_read") or {})
+                    if isinstance(receipts, dict)
+                    else {}
+                )
+                if (
+                    verify_job_receipt(read_receipt)
+                    and read_receipt.get("job_id") == job_id
+                    and read_receipt.get("observed_status") == persisted.get("status")
+                ):
+                    status = str(read_receipt.get("observed_status") or status)
+                else:
+                    read_receipt = {}
             except Exception:
-                pass
-        if status in {"running", "submitted", "completed", "failed", "partial"}:
-            return f"job_{status}" if status != "submitted" else "job_submitted"
-        return status
+                read_receipt = {}
+        if read_receipt and status in {
+            "running",
+            "submitted",
+            "completed",
+            "failed",
+            "partial",
+        }:
+            return (
+                f"job_{status}" if status != "submitted" else "job_submitted",
+                read_receipt,
+            )
+        return ("job_unverified" if job_id else status), {}
     if smoke.get("status"):
-        return f"smoke_{smoke.get('status')}"
+        return f"smoke_{smoke.get('status')}", {}
     if preflight.get("status"):
-        return f"preflight_{preflight.get('status')}"
+        return f"preflight_{preflight.get('status')}", {}
     if preflight.get("approved"):
-        return "approval_recorded"
+        return "approval_recorded", {}
     pending = state.get("pending_question") or {}
     if pending.get("id") == "preflight_smoke_confirm":
-        return "approval_pending"
-    return "not_requested"
+        return "approval_pending", {}
+    return "not_requested", {}
 
 
 def _pending_reason(pending: dict[str, Any]) -> str:

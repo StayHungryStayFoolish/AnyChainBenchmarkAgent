@@ -12,6 +12,11 @@ from ..input_values import (
     normalize_scalar,
 )
 from ..state import AgentGraphState
+from .rpc_receipts import (
+    emit_catalog_transition_receipt,
+    emit_schema_provenance_receipt,
+    evidence_hash,
+)
 
 
 RPC_CATALOG_VERSION = 1
@@ -52,6 +57,7 @@ class MethodDraft(TypedDict, total=False):
     response_fields: list[dict[str, Any]]
     response_sample: Any
     evidence: list[EvidenceFragment]
+    field_provenance: list[dict[str, Any]]
     validation_endpoint: str
     probe: dict[str, Any]
 
@@ -271,10 +277,10 @@ def append_evidence(
     current = normalize_scalar(draft.get("method"))
     incoming = normalize_scalar(method)
     if current and incoming and current != incoming:
-        return _transition(catalog, "append_evidence", False, str(draft.get("phase") or "draft"), "conflicting method identity")
+        return _transition(state, catalog, "append_evidence", False, str(draft.get("phase") or "draft"), "conflicting method identity")
     clean = str(content or "").strip()
     if not clean:
-        return _transition(catalog, "append_evidence", False, str(draft.get("phase") or "draft"), "empty evidence")
+        return _transition(state, catalog, "append_evidence", False, str(draft.get("phase") or "draft"), "empty evidence")
     revision = _next_revision(catalog)
     fragment: EvidenceFragment = {
         "revision": revision,
@@ -295,7 +301,7 @@ def append_evidence(
         draft["method"] = incoming
     draft["revision"] = revision
     _sync_projection(state)
-    return _record_transition(catalog, "append_evidence", revision, True, str(draft.get("phase") or "draft"))
+    return _record_transition(state, catalog, "append_evidence", revision, True, str(draft.get("phase") or "draft"))
 
 
 def correct_draft(state: AgentGraphState, draft_patch: Mapping[str, Any]) -> CatalogTransition:
@@ -320,7 +326,25 @@ def correct_draft(state: AgentGraphState, draft_patch: Mapping[str, Any]) -> Cat
     catalog["draft"] = next_draft  # type: ignore[assignment]
     catalog["finished"] = False
     _sync_projection(state)
-    return _record_transition(catalog, "correct_draft", revision, True, str(next_draft["phase"]))
+    transition = _record_transition(
+        state,
+        catalog,
+        "correct_draft",
+        revision,
+        True,
+        str(next_draft["phase"]),
+    )
+    emit_schema_provenance_receipt(
+        state,
+        method=next_draft.get("method"),
+        catalog_revision=revision,
+        field_provenance=[
+            item
+            for item in next_draft.get("field_provenance") or ()
+            if isinstance(item, Mapping)
+        ],
+    )
+    return transition
 
 
 def parameter_contract_missing(parameter: Mapping[str, Any]) -> list[str]:
@@ -370,7 +394,7 @@ def confirm_parameter(state: AgentGraphState, index: int, accepted: bool) -> Cat
     draft = _draft(catalog)
     params = draft.get("params")
     if not isinstance(params, list) or index < 0 or index >= len(params):
-        return _transition(catalog, "confirm_parameter", False, str(draft.get("phase") or "draft"), "unknown parameter")
+        return _transition(state, catalog, "confirm_parameter", False, str(draft.get("phase") or "draft"), "unknown parameter")
     missing = parameter_contract_missing(params[index]) if isinstance(params[index], dict) else ["parameter_contract"]
     if not accepted or missing:
         draft["phase"] = "evidence"
@@ -392,12 +416,12 @@ def confirm_request(state: AgentGraphState, accepted: bool) -> CatalogTransition
         draft["phase"] = "evidence"
         return _commit_transition(state, catalog, "confirm_request", False, "evidence", "declined")
     if not normalize_scalar(draft.get("method")) or not isinstance(draft.get("params_json"), (list, dict)):
-        return _transition(catalog, "confirm_request", False, str(draft.get("phase") or "draft"), "incomplete wire request")
+        return _transition(state, catalog, "confirm_request", False, str(draft.get("phase") or "draft"), "incomplete wire request")
     if incomplete_parameters(state):
         draft["phase"] = "evidence"
         return _commit_transition(state, catalog, "confirm_request", False, "evidence", "incomplete parameter semantics")
     if isinstance(params, list) and len(params) != len(draft.get("confirmed_parameters") or []):
-        return _transition(catalog, "confirm_request", False, "parameter_confirmation", "parameters are not individually confirmed")
+        return _transition(state, catalog, "confirm_request", False, "parameter_confirmation", "parameters are not individually confirmed")
     draft["request_confirmed"] = True
     draft["phase"] = "response_confirmation" if has_expected_response(draft) and not draft.get("response_confirmed") else "probe_confirmation"
     return _commit_transition(state, catalog, "confirm_request", True, str(draft["phase"]))
@@ -421,7 +445,7 @@ def confirm_response(state: AgentGraphState, accepted: bool, *, observed: bool =
         draft["phase"] = "evidence"
         return _commit_transition(state, catalog, "confirm_response", False, "evidence", "declined")
     if not observed and not has_expected_response(draft):
-        return _transition(catalog, "confirm_response", False, str(draft.get("phase") or "draft"), "missing response contract")
+        return _transition(state, catalog, "confirm_response", False, str(draft.get("phase") or "draft"), "missing response contract")
     draft["response_confirmed"] = True
     draft["phase"] = "validated" if observed and (draft.get("probe") or {}).get("ready") else "probe_confirmation"
     return _commit_transition(state, catalog, "confirm_response", True, str(draft["phase"]))
@@ -433,9 +457,44 @@ def record_probe(state: AgentGraphState, result: Mapping[str, Any], observed_res
     draft["probe"] = deepcopy(dict(result))
     if observed_response:
         draft["observed_response"] = deepcopy(dict(observed_response))
+        provenance = [
+            dict(item)
+            for item in draft.get("field_provenance") or ()
+            if isinstance(item, Mapping)
+            and not str(item.get("field_path") or "").startswith("observed_response.")
+        ]
+        source_revision = int(catalog.get("revision") or 0) + 1
+        provenance.extend(
+            {
+                "field_path": f"observed_response.{field}",
+                "source_kind": "endpoint_probe",
+                "source_revisions": [source_revision],
+                "value_hash": evidence_hash(value),
+            }
+            for field, value in sorted(observed_response.items())
+        )
+        draft["field_provenance"] = provenance
     ready = bool(result.get("ready"))
     draft["phase"] = "probe_succeeded" if ready else "probe_confirmation"
-    return _commit_transition(state, catalog, "probe_method", ready, str(draft["phase"]), str(result.get("error") or ""))
+    transition = _commit_transition(
+        state,
+        catalog,
+        "probe_method",
+        ready,
+        str(draft["phase"]),
+        str(result.get("error") or ""),
+    )
+    emit_schema_provenance_receipt(
+        state,
+        method=draft.get("method"),
+        catalog_revision=transition.revision,
+        field_provenance=[
+            item
+            for item in draft.get("field_provenance") or ()
+            if isinstance(item, Mapping)
+        ],
+    )
+    return transition
 
 
 def add_validated_method(state: AgentGraphState, contract: Mapping[str, Any]) -> CatalogTransition:
@@ -443,9 +502,9 @@ def add_validated_method(state: AgentGraphState, contract: Mapping[str, Any]) ->
     draft = _draft(catalog)
     method = normalize_scalar(contract.get("method") or draft.get("method"))
     if not method or not draft.get("request_confirmed") or not (draft.get("probe") or {}).get("ready"):
-        return _transition(catalog, "add_method", False, str(draft.get("phase") or "draft"), "request confirmation and successful probe are required")
+        return _transition(state, catalog, "add_method", False, str(draft.get("phase") or "draft"), "request confirmation and successful probe are required")
     if not draft.get("response_confirmed"):
-        return _transition(catalog, "add_method", False, str(draft.get("phase") or "draft"), "response confirmation is required")
+        return _transition(state, catalog, "add_method", False, str(draft.get("phase") or "draft"), "response confirmation is required")
     revision = _next_revision(catalog)
     record: ValidatedMethodContract = deepcopy(dict(contract))  # type: ignore[assignment]
     record.update({
@@ -467,7 +526,7 @@ def add_validated_method(state: AgentGraphState, contract: Mapping[str, Any]) ->
     draft["phase"] = "validated"
     draft["revision"] = revision
     _sync_projection(state)
-    return _record_transition(catalog, "add_method", revision, True, "validated")
+    return _record_transition(state, catalog, "add_method", revision, True, "validated")
 
 
 def reset_draft(state: AgentGraphState) -> CatalogTransition:
@@ -475,13 +534,13 @@ def reset_draft(state: AgentGraphState) -> CatalogTransition:
     catalog["draft"] = {}
     revision = _next_revision(catalog)
     _sync_projection(state)
-    return _record_transition(catalog, "correct_draft", revision, True, "empty")
+    return _record_transition(state, catalog, "correct_draft", revision, True, "empty")
 
 
 def finish_catalog(state: AgentGraphState) -> CatalogTransition:
     catalog = ensure_catalog(state)
     if not catalog.get("methods"):
-        return _transition(catalog, "finish_catalog", False, "empty", "at least one validated method is required")
+        return _transition(state, catalog, "finish_catalog", False, "empty", "at least one validated method is required")
     catalog["finished"] = True
     return _commit_transition(state, catalog, "finish_catalog", True, "finished")
 
@@ -512,20 +571,37 @@ def _commit_transition(
     draft = _draft(catalog)
     draft["revision"] = revision
     _sync_projection(state)
-    return _record_transition(catalog, command, revision, accepted, phase, detail)
+    return _record_transition(state, catalog, command, revision, accepted, phase, detail)
 
 
 def _transition(
+    state: AgentGraphState,
     catalog: RpcCatalog,
     command: CatalogCommand,
     accepted: bool,
     phase: str,
     detail: str = "",
 ) -> CatalogTransition:
-    return CatalogTransition(command, int(catalog.get("revision") or 0), accepted, phase, detail)
+    transition = CatalogTransition(
+        command,
+        int(catalog.get("revision") or 0),
+        accepted,
+        phase,
+        detail,
+    )
+    emit_catalog_transition_receipt(
+        state,
+        command=command,
+        revision=transition.revision,
+        accepted=accepted,
+        phase=phase,
+        catalog=catalog,
+    )
+    return transition
 
 
 def _record_transition(
+    state: AgentGraphState,
     catalog: RpcCatalog,
     command: CatalogCommand,
     revision: int,
@@ -540,7 +616,16 @@ def _record_transition(
         "phase": phase,
         "detail": detail,
     }
-    return CatalogTransition(command, revision, accepted, phase, detail)
+    transition = CatalogTransition(command, revision, accepted, phase, detail)
+    emit_catalog_transition_receipt(
+        state,
+        command=command,
+        revision=revision,
+        accepted=accepted,
+        phase=phase,
+        catalog=catalog,
+    )
+    return transition
 
 
 def _sync_projection(state: AgentGraphState) -> None:
