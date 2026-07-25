@@ -41,6 +41,7 @@ _JOB_RECEIPT_FIELDS = {
             "scenario_id",
             "workflow_type",
             "execution_key_hash",
+            "approved_plan_hash",
             "execution_plan_hash",
             "command_hash",
             "disposition",
@@ -94,9 +95,12 @@ def submit_job(
         if existing:
             result = dict(existing)
             result["submission_reused"] = True
+            persisted_plan = _read_json(
+                Path(str(result.get("plan_file") or ""))
+            )
             receipts = dict(result.get("execution_receipts") or {})
             receipts["submission_attempt"] = _submission_receipt(
-                plan=plan,
+                plan=persisted_plan,
                 job_id=str(result.get("job_id") or ""),
                 execution_key=execution_key,
                 disposition="reused",
@@ -414,6 +418,7 @@ def verify_job_receipt(receipt: dict[str, Any]) -> bool:
             or isinstance(receipt.get("matching_job_count"), bool)
             or int(receipt["matching_job_count"]) < 1
             or not _is_sha256(receipt.get("execution_key_hash"))
+            or not _is_sha256(receipt.get("approved_plan_hash"))
             or not _is_sha256(receipt.get("execution_plan_hash"))
             or not _is_sha256(receipt.get("command_hash"))
             or receipt.get("load_generator") not in {"none", "vegeta"}
@@ -459,7 +464,8 @@ def _submission_receipt(
     disposition: str,
     matching_job_count: int,
 ) -> dict[str, Any]:
-    operation = str((plan.get("execution_provenance") or {}).get("operation") or "")
+    provenance = dict(plan.get("execution_provenance") or {})
+    operation = str(provenance.get("operation") or "")
     workflow_type = workflow_type_from_plan(plan)
     scenario_id = ""
     if operation:
@@ -476,7 +482,11 @@ def _submission_receipt(
         "scenario_id": scenario_id,
         "workflow_type": workflow_type,
         "execution_key_hash": _evidence_hash(execution_key),
-        "execution_plan_hash": _evidence_hash(redact(plan)),
+        "approved_plan_hash": str(
+            provenance.get("approved_plan_hash")
+            or _evidence_hash(plan)
+        ),
+        "execution_plan_hash": _evidence_hash(plan),
         "command_hash": _evidence_hash(
             redact((plan.get("execution") or {}).get("command") or [])
         ),

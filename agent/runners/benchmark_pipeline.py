@@ -59,6 +59,7 @@ def prepare_benchmark_run(
     duration_seconds: int | None = None,
     rpc_methods: list[str] | None = None,
     mixed_weights: dict[str, int] | None = None,
+    chain_config_override: dict[str, Any] | None = None,
     observability_enabled: bool | None = None,
     observability_mode: str = "",
     observability_auto_stop: bool | None = None,
@@ -119,6 +120,7 @@ def prepare_benchmark_run(
         duration_seconds=duration_seconds,
         rpc_methods=rpc_methods,
         mixed_weights=mixed_weights,
+        chain_config_override=chain_config_override,
         observability_enabled=observability_enabled,
         observability_mode=observability_mode,
         observability_auto_stop=observability_auto_stop,
@@ -382,6 +384,7 @@ def _structured_request(
     confirmations: list[str] | None,
     assumed_values: dict | None,
     assumed_for_smoke: bool,
+    chain_config_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if assumed_for_smoke:
         (
@@ -525,6 +528,10 @@ def _structured_request(
             {"method": method, "weight": int(weight)}
             for method, weight in mixed_weights.items()
         ]
+    if chain_config_override:
+        request["chain_config_override"] = json.loads(
+            json.dumps(chain_config_override)
+        )
     return request
 
 

@@ -9,6 +9,7 @@ import tempfile
 import unittest
 import zlib
 from pathlib import Path
+from unittest.mock import patch
 
 from tests.agent_live import coverage_evidence as coverage_evidence_module
 from tests.agent_live.coverage_events import (
@@ -45,6 +46,7 @@ from tests.agent_live.coverage_evidence import (
     validate_real_execution_predecessor,
     validate_real_execution_evidence_artifact,
 )
+from tests.agent_live.export_approved_plan import _content_hash as approval_content_hash
 from tests.agent_live.graph_turn import invoke_product_graph_turn
 
 
@@ -730,7 +732,6 @@ class CoverageEvidenceTest(unittest.TestCase):
                     "command": ["./blockchain_node_benchmark.sh", "--quick", "--single"],
                     "environment": {
                         "LOCAL_RPC_URL": G5_RUNTIME_CONTRACT.rpc_url,
-                        "NODE_PROMETHEUS_METRICS_URL": G5_RUNTIME_CONTRACT.metrics_url,
                         "QUICK_INITIAL_QPS": "1",
                         "QUICK_MAX_QPS": "1",
                         "QUICK_QPS_STEP": "1",
@@ -752,6 +753,95 @@ class CoverageEvidenceTest(unittest.TestCase):
             proxy_file = data_dir / "proxy.csv"
             vegeta_file = data_dir / "vegeta.json"
             approved_hash = hashlib.sha256(approved_file.read_bytes()).hexdigest()
+            checkpoint_bytes = b"immutable-checkpoint"
+            checkpoint_hash = hashlib.sha256(checkpoint_bytes).hexdigest()
+            checkpoint_file = root / f"checkpoint-{checkpoint_hash}.sqlite"
+            checkpoint_file.write_bytes(checkpoint_bytes)
+            approval_receipt = {
+                "receipt_type": "pending_resolution",
+                "receipt_id": "receipt-1",
+                "pending_id": "preflight_smoke_confirm",
+                "verdict": "accepted",
+                "resolved_action_id": "action-1",
+            }
+            approval_action = {
+                "action_id": "action-1",
+                "type": "approve_preflight_smoke",
+            }
+            checkpoint_snapshot = {
+                "thread_id": "thread-1",
+                "session_purpose": "user",
+                "turn_index": 7,
+                "target_mode": "real-node",
+                "workflow_mode": "rpc_benchmark",
+                "chain": "bsc",
+                "plan_sha256": approved_hash,
+                "approval_receipt_id": "receipt-1",
+                "approval_action_id": "action-1",
+            }
+            approval_artifact = {
+                "schema_version": 1,
+                "artifact_type": "agent_approved_plan",
+                "revision": self.revision,
+                "thread_id": "thread-1",
+                "session_purpose": "user",
+                "checkpoint_files": [{
+                    "path": str(checkpoint_file.resolve()),
+                    "sha256": checkpoint_hash,
+                    "size_bytes": len(checkpoint_bytes),
+                    "source_name": "checkpoint.sqlite",
+                }],
+                "checkpoint_snapshot": checkpoint_snapshot,
+                "checkpoint_snapshot_hash": approval_content_hash(checkpoint_snapshot),
+                "approval_receipt": approval_receipt,
+                "approval_action": approval_action,
+                "source_plan_file": str(approved_file.resolve()),
+                "source_plan_sha256": approved_hash,
+                "exported_plan_file": str(approved_file.resolve()),
+                "exported_plan_sha256": approved_hash,
+                "workflow_type": "rpc_benchmark",
+                "target_mode": "real-node",
+            }
+            approval_artifact["artifact_hash"] = approval_content_hash(approval_artifact)
+            approval_file = root / (
+                f"approval-{approval_artifact['artifact_hash']}.json"
+            )
+            approval_file.write_text(
+                json.dumps(approval_artifact, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            approval_file_hash = hashlib.sha256(approval_file.read_bytes()).hexdigest()
+
+            checkpoint_state = {
+                "session": {"id": "thread-1", "purpose": "user"},
+                "preflight": {"approved": True},
+                "turn_context": {
+                    "control_receipts": [approval_receipt],
+                    "admitted_actions": [approval_action],
+                },
+                "plan": approved_plan,
+                "turn_index": 7,
+                "target_mode": "real-node",
+                "workflow_mode": "rpc_benchmark",
+                "chain_identity": {"canonical": "bsc"},
+            }
+
+            class CheckpointRuntime:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    return None
+
+                def snapshot(self):
+                    return checkpoint_state
+
+            approval_validation = patch(
+                "tests.agent_live.coverage_evidence.validate_approved_plan_artifact",
+                return_value=(True, ""),
+            )
+            approval_validation.start()
+            self.addCleanup(approval_validation.stop)
             endpoint_hash = hashlib.sha256(
                 approved_plan["execution"]["environment"]["LOCAL_RPC_URL"].encode()
             ).hexdigest()
@@ -801,6 +891,7 @@ class CoverageEvidenceTest(unittest.TestCase):
                     "operation": "real_node_smoke",
                     "approved_plan_file": str(approved_file.resolve()),
                     "approved_plan_sha256": approved_hash,
+                    "approved_plan_hash": content_hash(approved_plan),
                     "runtime_overrides": [],
                 },
             }
@@ -1087,6 +1178,8 @@ class CoverageEvidenceTest(unittest.TestCase):
                     "approved_plan_file": str(approved_file.resolve()),
                     "approved_plan_sha256": approved_hash,
                     "approved_plan_revision": self.revision,
+                    "approved_plan_provenance_file": str(approval_file.resolve()),
+                    "approved_plan_provenance_sha256": approval_file_hash,
                     "admission_envelope_file": str(envelope_file.resolve()),
                     "admission_envelope_sha256": envelope_hash,
                     "jobs_dir": str(jobs_dir.resolve()),

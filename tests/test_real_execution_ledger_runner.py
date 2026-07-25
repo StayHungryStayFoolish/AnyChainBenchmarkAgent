@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,7 @@ from agent.runners.execution_scenarios import (
     SYNC_OBSERVE_WORKFLOW,
 )
 from tests.agent_live.execute_real_execution_ledger import (
+    ATTESTATION_ENV,
     G5ExecutionStageError,
     _admit_fresh_jobs_root,
     _attest_geth_dev_runtime,
@@ -32,6 +34,7 @@ from tests.agent_live.execute_real_execution_ledger import (
     _validate_source_plan,
     _write_g5_failure_artifact,
     execute_required_edges,
+    main as execute_main,
     validate_g5_failure_artifact,
 )
 from tests.agent_live.coverage_evidence import G5_RUNTIME_CONTRACT
@@ -106,20 +109,38 @@ class RealExecutionLedgerRunnerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             plans = []
+            approvals = []
             for name in ("fake", "rpc", "sync"):
                 path = root / f"{name}.json"
                 path.write_text(json.dumps({"name": name}), encoding="utf-8")
                 plans.append(path)
+                approval = root / f"{name}-approval.json"
+                approval.write_text(
+                    json.dumps({"approved_plan": name}),
+                    encoding="utf-8",
+                )
+                approvals.append(approval)
+            final_approval = root / "rpc-final-approval.json"
+            final_approval.write_text(
+                json.dumps({"approved_plan": "rpc-final"}),
+                encoding="utf-8",
+            )
+            approvals.append(final_approval)
+            host_file = root / "host.json"
+            host_file.write_text('{"host":"linux"}', encoding="utf-8")
             failure = _write_g5_failure_artifact(
                 evidence_dir=root / "evidence",
                 revision={"commit": "a" * 40, "worktree_hash": "b" * 64},
-                scenario_id="rpc_real_node_smoke",
+                scenario_id="rpc_fake_node_smoke",
                 stage="endpoint_probe",
                 error="Bearer abcdefghijklmnopqrstuvwxyz123456",
                 plan_files=plans,
+                approval_files=approvals,
                 host_attestation={
-                    "attestation_file": str(root / "host.json"),
-                    "attestation_file_sha256": "c" * 64,
+                    "attestation_file": str(host_file),
+                    "attestation_file_sha256": hashlib.sha256(
+                        host_file.read_bytes()
+                    ).hexdigest(),
                 },
             )
             payload = json.loads(failure.read_text(encoding="utf-8"))
@@ -129,17 +150,72 @@ class RealExecutionLedgerRunnerTest(unittest.TestCase):
                 f"g5-real-execution-failure-{observed_hash}.json",
             )
             self.assertEqual(payload["stage"], "endpoint_probe")
-            self.assertEqual(payload["scenario_id"], "rpc_real_node_smoke")
+            self.assertEqual(payload["scenario_id"], "rpc_fake_node_smoke")
             self.assertNotIn(
                 "abcdefghijklmnopqrstuvwxyz123456",
                 failure.read_text(encoding="utf-8"),
             )
             self.assertIn("***REDACTED***", payload["error"])
+
+    def test_worker_admission_failure_rejects_unvalidated_retained_lanes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            revision = {"commit": "a" * 40, "worktree_hash": "b" * 64}
+            plans = [root / name for name in ("fake.json", "rpc.json", "sync.json")]
+            plans[0].write_text("{}", encoding="utf-8")
+            plans[2].write_text("{}", encoding="utf-8")
+            approvals = [
+                root / f"approval-{index}.json"
+                for index in range(4)
+            ]
+            for approval in approvals:
+                approval.write_text("{}", encoding="utf-8")
+            host_file = root / "host.json"
+            host_file.write_text("{}", encoding="utf-8")
+            evidence_dir = root / "evidence"
+            evidence_dir.mkdir()
+            retained_payload = {
+                "evidence_class": "real_execution",
+                "revision": revision,
+                "evidence_id": "d" * 64,
+                "scenario_id": "rpc_fake_node_smoke",
+            }
+            retained = evidence_dir / "retained.json"
+            retained.write_text(
+                json.dumps(retained_payload),
+                encoding="utf-8",
+            )
+            retained.chmod(0o400)
+
+            failure = _write_g5_failure_artifact(
+                evidence_dir=evidence_dir,
+                revision=revision,
+                scenario_id="",
+                stage="worker_admission",
+                error="missing rpc plan",
+                plan_files=plans,
+                approval_files=approvals,
+                host_attestation={
+                    "attestation_file": str(host_file),
+                    "attestation_file_sha256": hashlib.sha256(
+                        host_file.read_bytes()
+                    ).hexdigest(),
+                },
+            )
+            payload = json.loads(failure.read_text(encoding="utf-8"))
+            self.assertEqual(
+                payload["approved_plans"][1]["status"],
+                "missing",
+            )
+            self.assertEqual(payload["retained_scenario_evidence"], [])
             valid, reason = validate_g5_failure_artifact(
                 failure,
                 revision={"commit": "a" * 40, "worktree_hash": "b" * 64},
             )
             self.assertTrue(valid, reason)
+            failure.chmod(0o600)
             failure.write_bytes(failure.read_bytes() + b" ")
             valid, reason = validate_g5_failure_artifact(
                 failure,
@@ -147,6 +223,48 @@ class RealExecutionLedgerRunnerTest(unittest.TestCase):
             )
             self.assertFalse(valid)
             self.assertIn("content-addressed", reason)
+
+    def test_failure_writer_rejects_missing_legal_predecessor_evidence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            plans = [root / name for name in ("fake.json", "rpc.json", "sync.json")]
+            approvals = [root / f"approval-{index}.json" for index in range(4)]
+            for path in plans + approvals:
+                path.write_text("{}", encoding="utf-8")
+            host_file = root / "host.json"
+            host_file.write_text("{}", encoding="utf-8")
+            evidence_dir = root / "evidence"
+            evidence_dir.mkdir()
+            (evidence_dir / "candidate.json").write_text(
+                json.dumps({
+                    "evidence_class": "real_execution",
+                    "scenario_id": "rpc_fake_node_smoke",
+                }),
+                encoding="utf-8",
+            )
+            revision = {"commit": "a" * 40, "worktree_hash": "b" * 64}
+            with (
+                patch(
+                    "tests.agent_live.execute_real_execution_ledger.build_ledger",
+                    side_effect=OSError("registry storage unavailable"),
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "exact legal predecessor prefix",
+                ),
+            ):
+                _write_g5_failure_artifact(
+                    evidence_dir=evidence_dir,
+                    revision=revision,
+                    scenario_id="rpc_real_node_final",
+                    stage="ledger_validation",
+                    error="ledger failed",
+                    plan_files=plans,
+                    approval_files=approvals,
+                    host_attestation={"attestation_file": str(host_file)},
+                )
 
     def test_stage_call_preserves_failure_owner(self) -> None:
         with self.assertRaises(G5ExecutionStageError) as observed:
@@ -157,6 +275,87 @@ class RealExecutionLedgerRunnerTest(unittest.TestCase):
             )
         self.assertEqual(observed.exception.scenario_id, "sync_observe_bounded")
         self.assertEqual(observed.exception.stage, "runtime_attestation")
+
+    def test_worker_entry_records_missing_host_attestation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = [root / f"input-{index}.json" for index in range(7)]
+            for path in paths:
+                path.write_text("{}", encoding="utf-8")
+            evidence_dir = root / "evidence"
+            argv = [
+                "--fake-plan", str(paths[0]),
+                "--rpc-plan", str(paths[1]),
+                "--sync-plan", str(paths[2]),
+                "--fake-approval", str(paths[3]),
+                "--rpc-smoke-approval", str(paths[4]),
+                "--rpc-final-approval", str(paths[5]),
+                "--sync-approval", str(paths[6]),
+                "--jobs-dir", str(root / "jobs"),
+                "--evidence-dir", str(evidence_dir),
+            ]
+            environment = dict(os.environ)
+            environment.pop(ATTESTATION_ENV, None)
+            revision = {"commit": "a" * 40, "worktree_hash": "b" * 64}
+            with (
+                patch.dict(os.environ, environment, clear=True),
+                patch(
+                    "tests.agent_live.execute_real_execution_ledger.repository_revision",
+                    return_value=revision,
+                ),
+                self.assertRaisesRegex(RuntimeError, "retained evidence"),
+            ):
+                execute_main(argv)
+            failures = sorted(
+                evidence_dir.rglob("g5-real-execution-failure-*.json")
+            )
+            self.assertEqual(len(failures), 1)
+            valid, reason = validate_g5_failure_artifact(
+                failures[0],
+                revision=revision,
+            )
+            self.assertTrue(valid, reason)
+            payload = json.loads(failures[0].read_text(encoding="utf-8"))
+            self.assertEqual(payload["host_attestation"]["status"], "missing")
+
+    def test_worker_entry_records_nonqualifying_revision_bootstrap_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = [root / f"input-{index}.json" for index in range(7)]
+            for path in paths:
+                path.write_text("{}", encoding="utf-8")
+            evidence_dir = root / "evidence"
+            argv = [
+                "--fake-plan", str(paths[0]),
+                "--rpc-plan", str(paths[1]),
+                "--sync-plan", str(paths[2]),
+                "--fake-approval", str(paths[3]),
+                "--rpc-smoke-approval", str(paths[4]),
+                "--rpc-final-approval", str(paths[5]),
+                "--sync-approval", str(paths[6]),
+                "--jobs-dir", str(root / "jobs"),
+                "--evidence-dir", str(evidence_dir),
+            ]
+            with (
+                patch(
+                    "tests.agent_live.execute_real_execution_ledger.repository_revision",
+                    side_effect=RuntimeError("git identity unavailable"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "bootstrap failed"),
+            ):
+                execute_main(argv)
+            failures = sorted(
+                evidence_dir.rglob("g5-worker-bootstrap-failure-*.json")
+            )
+            self.assertEqual(len(failures), 1)
+            payload = json.loads(failures[0].read_text(encoding="utf-8"))
+            self.assertFalse(payload["qualifying_evidence"])
+            self.assertEqual(
+                payload["repository_revision_status"],
+                "unavailable",
+            )
 
     def test_direct_script_entrypoint_loads_repository_modules(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
@@ -278,10 +477,14 @@ class RealExecutionLedgerRunnerTest(unittest.TestCase):
                     use_fake_node=False,
                 )
 
-    def test_approved_plan_keeps_business_schema_and_requires_runtime_endpoints(self) -> None:
-        scenario = next(
+    def test_approved_plan_keeps_metrics_out_of_rpc_business_schema(self) -> None:
+        rpc_scenario = next(
             item for item in EXECUTION_SCENARIOS
             if item.scenario_id == "rpc_real_node_smoke"
+        )
+        sync_scenario = next(
+            item for item in EXECUTION_SCENARIOS
+            if item.workflow_type == SYNC_OBSERVE_WORKFLOW
         )
         with tempfile.TemporaryDirectory() as tmpdir:
             plan_file = Path(tmpdir) / "approved.json"
@@ -292,22 +495,24 @@ class RealExecutionLedgerRunnerTest(unittest.TestCase):
                 "execution": {
                     "environment": {
                         "LOCAL_RPC_URL": G5_RUNTIME_CONTRACT.rpc_url,
-                        "NODE_PROMETHEUS_METRICS_URL": G5_RUNTIME_CONTRACT.metrics_url,
                     },
                 },
             }), encoding="utf-8")
             _validate_approved_plan_binding(
                 plan_file,
-                scenario=scenario,
+                scenario=rpc_scenario,
             )
             payload = json.loads(plan_file.read_text(encoding="utf-8"))
             self.assertNotIn("execution_acceptance", payload)
-            payload["execution"]["environment"].pop("NODE_PROMETHEUS_METRICS_URL")
+            payload["workflow_type"] = SYNC_OBSERVE_WORKFLOW
+            payload["execution"]["environment"] = {
+                "SYNC_OBSERVE_RPC_URL": G5_RUNTIME_CONTRACT.rpc_url,
+            }
             plan_file.write_text(json.dumps(payload), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "metrics endpoint"):
                 _validate_approved_plan_binding(
                     plan_file,
-                    scenario=scenario,
+                    scenario=sync_scenario,
                 )
 
     def test_g5_envelope_remains_external_to_the_business_plan(self) -> None:
@@ -328,7 +533,6 @@ class RealExecutionLedgerRunnerTest(unittest.TestCase):
                 "execution": {
                     "environment": {
                         "LOCAL_RPC_URL": G5_RUNTIME_CONTRACT.rpc_url,
-                        "NODE_PROMETHEUS_METRICS_URL": G5_RUNTIME_CONTRACT.metrics_url,
                     },
                 },
             }
@@ -438,7 +642,6 @@ class RealExecutionLedgerRunnerTest(unittest.TestCase):
             "execution": {
                 "environment": {
                     "LOCAL_RPC_URL": G5_RUNTIME_CONTRACT.rpc_url,
-                    "NODE_PROMETHEUS_METRICS_URL": G5_RUNTIME_CONTRACT.metrics_url,
                 },
             },
         }
@@ -659,6 +862,17 @@ class RealExecutionLedgerRunnerTest(unittest.TestCase):
             fake_plan = root / "fake.json"
             rpc_plan = root / "rpc.json"
             sync_plan = root / "sync.json"
+            fake_approval = root / "fake-approval.json"
+            rpc_smoke_approval = root / "rpc-smoke-approval.json"
+            rpc_final_approval = root / "rpc-final-approval.json"
+            sync_approval = root / "sync-approval.json"
+            for approval in (
+                fake_approval,
+                rpc_smoke_approval,
+                rpc_final_approval,
+                sync_approval,
+            ):
+                approval.write_text("{}", encoding="utf-8")
             fake_plan.write_text(json.dumps({
                 "chain": "bsc",
                 "workflow_type": RPC_BENCHMARK_WORKFLOW,
@@ -672,7 +886,6 @@ class RealExecutionLedgerRunnerTest(unittest.TestCase):
                 "execution": {
                     "environment": {
                         "LOCAL_RPC_URL": "http://geth-dev:8545",
-                        "NODE_PROMETHEUS_METRICS_URL": "http://geth-dev:6060/debug/metrics/prometheus",
                     },
                 },
             }), encoding="utf-8")
@@ -730,6 +943,10 @@ class RealExecutionLedgerRunnerTest(unittest.TestCase):
                 patch(
                     "tests.agent_live.execute_real_execution_ledger.repository_revision",
                     return_value=revision,
+                ),
+                patch(
+                    "tests.agent_live.execute_real_execution_ledger.validate_approved_plan_artifact",
+                    return_value=(True, ""),
                 ),
                 patch(
                     "tests.agent_live.execute_real_execution_ledger.build_ledger",
@@ -808,6 +1025,10 @@ class RealExecutionLedgerRunnerTest(unittest.TestCase):
                     fake_plan_file=fake_plan,
                     rpc_plan_file=rpc_plan,
                     sync_plan_file=sync_plan,
+                    fake_approval_file=fake_approval,
+                    rpc_smoke_approval_file=rpc_smoke_approval,
+                    rpc_final_approval_file=rpc_final_approval,
+                    sync_approval_file=sync_approval,
                     jobs_dir=jobs_dir,
                     evidence_dir=evidence_dir,
                     timeout_seconds=1,
@@ -830,6 +1051,51 @@ class RealExecutionLedgerRunnerTest(unittest.TestCase):
             )
             self.assertNotIn("execution_acceptance", json.loads(rpc_plan.read_text()))
 
+    def test_execute_required_edges_rejects_unproven_plans_before_job_submission(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            revision = {"commit": "a" * 40, "worktree_hash": "b" * 64}
+            plans = [root / name for name in ("fake.json", "rpc.json", "sync.json")]
+            approvals = [
+                root / name
+                for name in (
+                    "fake-approval.json",
+                    "rpc-smoke-approval.json",
+                    "rpc-final-approval.json",
+                    "sync-approval.json",
+                )
+            ]
+            for path in plans + approvals:
+                path.write_text("{}", encoding="utf-8")
+            with (
+                patch(
+                    "tests.agent_live.execute_real_execution_ledger.repository_revision",
+                    return_value=revision,
+                ),
+                patch(
+                    "tests.agent_live.execute_real_execution_ledger.validate_approved_plan_artifact",
+                    return_value=(False, "checkpoint state binding is invalid"),
+                ),
+                patch(
+                    "tests.agent_live.execute_real_execution_ledger.BenchmarkExecutionService",
+                ) as service,
+                self.assertRaisesRegex(RuntimeError, "approved-plan provenance is invalid"),
+            ):
+                execute_required_edges(
+                    fake_plan_file=plans[0],
+                    rpc_plan_file=plans[1],
+                    sync_plan_file=plans[2],
+                    fake_approval_file=approvals[0],
+                    rpc_smoke_approval_file=approvals[1],
+                    rpc_final_approval_file=approvals[2],
+                    sync_approval_file=approvals[3],
+                    jobs_dir=root / "jobs",
+                    evidence_dir=root / "evidence",
+                    timeout_seconds=1,
+                    host_attestation={},
+                )
+            service.assert_not_called()
+
     def test_failed_job_writes_observed_fail_and_stops_the_ledger(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -837,6 +1103,17 @@ class RealExecutionLedgerRunnerTest(unittest.TestCase):
             fake_plan = root / "fake.json"
             rpc_plan = root / "rpc.json"
             sync_plan = root / "sync.json"
+            fake_approval = root / "fake-approval.json"
+            rpc_smoke_approval = root / "rpc-smoke-approval.json"
+            rpc_final_approval = root / "rpc-final-approval.json"
+            sync_approval = root / "sync-approval.json"
+            for approval in (
+                fake_approval,
+                rpc_smoke_approval,
+                rpc_final_approval,
+                sync_approval,
+            ):
+                approval.write_text("{}", encoding="utf-8")
             fake_plan.write_text(json.dumps({
                 "chain": "bsc",
                 "workflow_type": RPC_BENCHMARK_WORKFLOW,
@@ -850,7 +1127,6 @@ class RealExecutionLedgerRunnerTest(unittest.TestCase):
                 "execution": {
                     "environment": {
                         "LOCAL_RPC_URL": "http://geth-dev:8545",
-                        "NODE_PROMETHEUS_METRICS_URL": "http://geth-dev:6060/debug/metrics/prometheus",
                     },
                 },
             }), encoding="utf-8")
@@ -887,6 +1163,10 @@ class RealExecutionLedgerRunnerTest(unittest.TestCase):
                 patch(
                     "tests.agent_live.execute_real_execution_ledger.repository_revision",
                     return_value=revision,
+                ),
+                patch(
+                    "tests.agent_live.execute_real_execution_ledger.validate_approved_plan_artifact",
+                    return_value=(True, ""),
                 ),
                 patch(
                     "tests.agent_live.execute_real_execution_ledger._require_current_revision",
@@ -939,6 +1219,10 @@ class RealExecutionLedgerRunnerTest(unittest.TestCase):
                         fake_plan_file=fake_plan,
                         rpc_plan_file=rpc_plan,
                         sync_plan_file=sync_plan,
+                        fake_approval_file=fake_approval,
+                        rpc_smoke_approval_file=rpc_smoke_approval,
+                        rpc_final_approval_file=rpc_final_approval,
+                        sync_approval_file=sync_approval,
                         jobs_dir=jobs_dir,
                         evidence_dir=evidence_dir,
                         timeout_seconds=1,

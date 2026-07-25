@@ -79,6 +79,47 @@ class JobManagerReceiptTest(unittest.TestCase):
         contradictory["receipt_id"] = "0" * 64
         self.assertFalse(verify_job_receipt(contradictory))
 
+    def test_execution_plan_hash_binds_secret_bearing_plan_exactly(self) -> None:
+        from agent.runners.job_manager import _submission_receipt
+
+        first_plan = {
+            "plan_id": "exact-plan",
+            "workflow_type": "rpc_benchmark",
+            "execution": {
+                "environment": {
+                    "LOCAL_RPC_URL": "https://rpc.invalid/token-a",
+                },
+            },
+        }
+        second_plan = {
+            **first_plan,
+            "execution": {
+                "environment": {
+                    "LOCAL_RPC_URL": "https://rpc.invalid/token-b",
+                },
+            },
+        }
+        first = _submission_receipt(
+            plan=first_plan,
+            job_id="job-1",
+            execution_key="execution:test",
+            disposition="created",
+            matching_job_count=1,
+        )
+        second = _submission_receipt(
+            plan=second_plan,
+            job_id="job-1",
+            execution_key="execution:test",
+            disposition="created",
+            matching_job_count=1,
+        )
+        self.assertNotEqual(
+            first["execution_plan_hash"],
+            second["execution_plan_hash"],
+        )
+        self.assertNotEqual(first["receipt_id"], second["receipt_id"])
+        self.assertNotIn("token-a", json.dumps(first, sort_keys=True))
+
     def test_job_read_receipt_binds_status_to_job_file(self) -> None:
         from agent.runners.job_manager import get_job, submit_job, verify_job_receipt
 

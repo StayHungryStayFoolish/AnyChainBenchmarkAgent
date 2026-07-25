@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -98,7 +97,6 @@ class ExecutionRequest:
     prepare_kwargs: Mapping[str, Any] = field(default_factory=dict)
     jobs_dir: str | Path = DEFAULT_JOBS_DIR
     mock: bool = False
-    runtime_override_sources: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -192,7 +190,6 @@ class BenchmarkExecutionService:
                 operation=operation,
                 scenario_id=scenario.scenario_id,
                 idempotency_key=idempotency_key,
-                runtime_override_sources=request.runtime_override_sources,
             )
             validate_execution_plan_projection(
                 plan,
@@ -261,30 +258,17 @@ class BenchmarkExecutionService:
         request: ExecutionRequest,
         approved_plan_file: Path,
     ) -> dict[str, Any]:
-        """Load the approved baseline and admit only typed job-local overrides."""
+        """Load the immutable approved source plan without runtime overlays."""
 
         baseline = json.loads(approved_plan_file.read_text(encoding="utf-8"))
         if request.plan is None:
             return baseline
         proposed = dict(request.plan)
-        changed = _changed_paths(baseline, proposed)
-        if not changed:
-            return baseline
-        if not request.runtime_override_sources:
-            raise ValueError("runtime plan overrides require an explicit typed source")
-        forbidden = sorted(
-            ".".join(path)
-            for path in changed
-            if not _runtime_override_path_allowed(path)
-        )
-        if forbidden:
+        if proposed != baseline:
             raise ValueError(
-                "runtime plan attempted to replace approved content: " + ", ".join(forbidden)
+                "runtime plan differs from the immutable approved source plan"
             )
-        admitted = deepcopy(baseline)
-        for path in changed:
-            _copy_override_path(admitted, proposed, path)
-        return admitted
+        return baseline
 
     @staticmethod
     def _require_plan_file(request: ExecutionRequest) -> Path:
@@ -319,7 +303,6 @@ class BenchmarkExecutionService:
         operation: ExecutionOperation,
         scenario_id: str,
         idempotency_key: str,
-        runtime_override_sources: tuple[str, ...],
     ) -> dict[str, Any]:
         """Build the admitted execution view without creating a second plan file."""
 
@@ -335,16 +318,22 @@ class BenchmarkExecutionService:
         execution_plan.pop("execution_provenance", None)
         source_file = str(approved_plan_file)
         source_sha256 = approved_sha256
-        overrides = [str(item) for item in runtime_override_sources if str(item)]
+        overrides: list[str] = []
         if previous_key != idempotency_key:
             overrides.append("execution.idempotency_key")
-        if execution_plan.get("chain_config_override"):
-            overrides.append("custom_rpc.chain_config_override")
-        overrides = list(dict.fromkeys(overrides))
 
         execution_plan["execution_provenance"] = {
             "approved_plan_file": source_file,
             "approved_plan_sha256": source_sha256,
+            "approved_plan_hash": hashlib.sha256(
+                json.dumps(
+                    plan,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest(),
             "operation": operation.value,
             "scenario_id": scenario_id,
             "runtime_overrides": overrides,
@@ -440,70 +429,3 @@ def _job_execution_receipts(job: Mapping[str, Any]) -> tuple[Mapping[str, Any], 
 
 
 execution_service = BenchmarkExecutionService()
-
-
-_RUNTIME_OVERRIDE_PREFIXES = (
-    ("chain_config_override",),
-    ("chain_template_requirements",),
-    ("artifacts", "chain_config_override_file"),
-)
-
-
-def _runtime_override_path_allowed(path: tuple[str, ...]) -> bool:
-    return any(path[: len(prefix)] == prefix for prefix in _RUNTIME_OVERRIDE_PREFIXES)
-
-
-def _changed_paths(
-    baseline: Mapping[str, Any],
-    proposed: Mapping[str, Any],
-    prefix: tuple[str, ...] = (),
-) -> set[tuple[str, ...]]:
-    changed: set[tuple[str, ...]] = set()
-    for key in set(baseline) | set(proposed):
-        path = (*prefix, str(key))
-        if key not in baseline:
-            value = proposed[key]
-            if isinstance(value, Mapping):
-                changed.update(_changed_paths({}, value, path))
-            else:
-                changed.add(path)
-            continue
-        if key not in proposed:
-            value = baseline[key]
-            if isinstance(value, Mapping):
-                changed.update(_changed_paths(value, {}, path))
-            else:
-                changed.add(path)
-            continue
-        left = baseline[key]
-        right = proposed[key]
-        if isinstance(left, Mapping) and isinstance(right, Mapping):
-            changed.update(_changed_paths(left, right, path))
-        elif left != right:
-            changed.add(path)
-    return changed
-
-
-def _copy_override_path(
-    target: dict[str, Any],
-    source: Mapping[str, Any],
-    path: tuple[str, ...],
-) -> None:
-    target_parent: dict[str, Any] = target
-    source_parent: Mapping[str, Any] = source
-    for part in path[:-1]:
-        source_child = source_parent.get(part)
-        if not isinstance(source_child, Mapping):
-            target_parent.pop(part, None)
-            return
-        target_child = target_parent.get(part)
-        if not isinstance(target_child, dict):
-            target_child = {}
-            target_parent[part] = target_child
-        target_parent = target_child
-        source_parent = source_child
-    leaf = path[-1]
-    if leaf in source_parent:
-        target_parent[leaf] = deepcopy(source_parent[leaf])
-    else:
-        target_parent.pop(leaf, None)

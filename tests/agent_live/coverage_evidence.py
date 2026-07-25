@@ -39,6 +39,7 @@ from agent.utils.redaction import redact
 from tests.agent_live.real_execution_host_attestation import (
     validate_host_attestation_file,
 )
+from tests.agent_live.export_approved_plan import validate_approved_plan_artifact
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -2541,6 +2542,30 @@ def _real_execution_scenario_error(
         return "approved plan hash mismatch"
     if dict(request.get("approved_plan_revision") or {}) != dict(artifact.get("revision") or {}):
         return "approved plan revision binding mismatch"
+    approval_file = Path(str(request.get("approved_plan_provenance_file") or ""))
+    try:
+        approval_sha256 = hashlib.sha256(approval_file.read_bytes()).hexdigest()
+    except OSError as exc:
+        return f"approved-plan provenance cannot be rehashed: {exc}"
+    if approval_sha256 != str(request.get("approved_plan_provenance_sha256") or ""):
+        return "approved-plan provenance hash mismatch"
+    expected_target_mode = (
+        "sync-observe"
+        if scenario.workflow_type == "sync_observe"
+        else "fake-node"
+        if scenario.operation == "fake_node_smoke"
+        else "real-node"
+    )
+    approval_valid, approval_reason = validate_approved_plan_artifact(
+        approval_file,
+        expected_revision=dict(artifact.get("revision") or {}),
+        expected_plan_file=approved_plan_file,
+        expected_workflow=scenario.workflow_type,
+        expected_target_mode=expected_target_mode,
+        expected_approval_action=scenario.action_type,
+    )
+    if not approval_valid:
+        return f"approved-plan provenance is invalid: {approval_reason}"
     try:
         approved_plan = json.loads(approved_plan_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -3256,7 +3281,12 @@ def _g5_admission_envelope_error(
         return "G5 runtime contract binding mismatch"
     execution_env = dict((approved_plan.get("execution") or {}).get("environment") or {})
     endpoint = str(execution_env.get(admission.endpoint_env_var) or "")
-    metrics_url = str(execution_env.get("NODE_PROMETHEUS_METRICS_URL") or "")
+    plan_metrics_url = str(execution_env.get("NODE_PROMETHEUS_METRICS_URL") or "")
+    if (
+        admission.endpoint_env_var == "SYNC_OBSERVE_RPC_URL"
+        and plan_metrics_url != G5_RUNTIME_CONTRACT.metrics_url
+    ):
+        return "sync-observe approved plan metrics endpoint mismatch"
     expected_endpoint = {
         "chain": str(approved_plan.get("chain") or ""),
         "env_var": admission.endpoint_env_var,
@@ -3267,7 +3297,6 @@ def _g5_admission_envelope_error(
     }
     if (
         endpoint != G5_RUNTIME_CONTRACT.rpc_url
-        or metrics_url != G5_RUNTIME_CONTRACT.metrics_url
         or endpoint_contract != expected_endpoint
     ):
         return "G5 admission endpoint identity contract mismatch"
@@ -3279,7 +3308,9 @@ def _g5_admission_envelope_error(
             G5_RUNTIME_CONTRACT.rpc_url.encode("utf-8")
         ).hexdigest(),
         "metrics_env_var": "NODE_PROMETHEUS_METRICS_URL",
-        "metrics_url_sha256": hashlib.sha256(metrics_url.encode("utf-8")).hexdigest(),
+        "metrics_url_sha256": hashlib.sha256(
+            G5_RUNTIME_CONTRACT.metrics_url.encode("utf-8")
+        ).hexdigest(),
         "metrics_required": True,
     }
     if container_requirements != expected_container:
@@ -3507,12 +3538,8 @@ def _real_execution_runtime_attestation_error(
             or not set(route.get("resolved_addresses") or ()) & container_addresses
         ):
             return f"geth-dev {label} route is not bound to the inspected container"
-    execution_env = dict((plan.get("execution") or {}).get("environment") or {})
-    metrics_env_var = str(requirements.get("metrics_env_var") or "")
-    metrics_url = str(execution_env.get(metrics_env_var) or "").strip()
+    metrics_url = G5_RUNTIME_CONTRACT.metrics_url
     metrics = dict(attestation.get("metrics_probe") or {})
-    if not metrics_url:
-        return "geth-dev metrics endpoint is absent from the approved plan"
     if metrics.get("metrics_url_sha256") != hashlib.sha256(
         metrics_url.encode("utf-8")
     ).hexdigest():

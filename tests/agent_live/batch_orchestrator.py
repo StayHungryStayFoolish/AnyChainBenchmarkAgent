@@ -14,7 +14,7 @@ import json
 import os
 import sys
 import time
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence
@@ -2007,6 +2007,37 @@ def result_index_payload(index: BatchResultIndex) -> dict[str, Any]:
         "shards": [_result_payload(item) for item in index.shards],
         "schema_version": index.schema_version,
     }
+
+
+def validate_completed_shard_result(
+    shard: FrozenShardSpec,
+    payload: Mapping[str, Any],
+) -> ShardResult:
+    """Rebuild and validate one persisted shard result and its cleanup proof."""
+
+    expected_fields = {item.name for item in fields(ShardResult)}
+    if set(payload) != expected_fields:
+        raise ValueError("persisted shard result fields do not match the schema")
+    normalized = dict(payload)
+    for key in (
+        "response_hashes",
+        "decision_hashes",
+        "evidence_hashes",
+        "diagnostic_hashes",
+        "evidence_ids",
+        "diagnostic_ids",
+    ):
+        value = normalized.get(key)
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) for item in value
+        ):
+            raise ValueError(f"persisted shard result {key} is invalid")
+        normalized[key] = tuple(value)
+    result = ShardResult(**normalized)
+    if result.shard_id != shard.shard_id:
+        raise ValueError("persisted shard result identity mismatch")
+    _validate_composite_cleanup_receipt(shard, result)
+    return result
 
 
 def _manifest_unsigned_payload(manifest: FrozenBatchManifest) -> dict[str, Any]:

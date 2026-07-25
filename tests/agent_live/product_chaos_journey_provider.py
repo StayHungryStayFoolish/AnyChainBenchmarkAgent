@@ -31,6 +31,10 @@ from tests.agent_live.batch_orchestrator import (
 from tests.agent_live.coverage_evidence import content_hash
 from tests.agent_live.coverage_evidence import PtyCliTurnRecord, RuntimeTurnEvent
 from tests.agent_live.codex_simulator_bridge import validate_simulator_attestation
+from tests.agent_live.completed_journey_batch import (
+    G4_ARTIFACT_TYPE,
+    convert_completed_journey_batch,
+)
 from tests.agent_live.container_process_guard import (
     validate_cleanup_receipt_artifact,
 )
@@ -1685,6 +1689,18 @@ def _parser() -> argparse.ArgumentParser:
     evidence.add_argument("--checkpoint-diff", type=Path)
     evidence.add_argument("--provider", default=DEFAULT_PROVIDER)
     evidence.add_argument("--model", default=DEFAULT_MODEL)
+
+    evidence_batch = subparsers.add_parser(
+        "evidence-batch",
+        help="Convert one complete response-driven G4 batch into declared evidence.",
+    )
+    evidence_batch.add_argument("--catalog", required=True, type=Path)
+    evidence_batch.add_argument("--manifest", required=True, type=Path)
+    evidence_batch.add_argument("--result-index", required=True, type=Path)
+    evidence_batch.add_argument("--round-id", required=True)
+    evidence_batch.add_argument("--output-dir", required=True, type=Path)
+    evidence_batch.add_argument("--provider", default=DEFAULT_PROVIDER)
+    evidence_batch.add_argument("--model", default=DEFAULT_MODEL)
     return parser
 
 
@@ -1735,6 +1751,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             obligation_id=args.obligation_id,
         )
         write_product_chaos_journey_manifest(manifest, args.output)
+        return 0
+    if args.command == "evidence-batch":
+        def convert_one(
+            obligation: Mapping[str, Any],
+            runtime_root: Path,
+            evidence_path: Path,
+            checkpoint_diff: Path | None,
+        ) -> Path:
+            return convert_completed_journey_to_product_evidence(
+                obligation,
+                revision=revision,
+                round_id=args.round_id,
+                runtime_root=runtime_root,
+                evidence_path=evidence_path,
+                checkpoint_diff_path=checkpoint_diff,
+                provider=args.provider,
+                model=args.model,
+            )
+
+        convert_completed_journey_batch(
+            manifest_path=args.manifest,
+            result_index_path=args.result_index,
+            output_dir=args.output_dir,
+            obligations=rows,
+            revision=revision,
+            artifact_type=G4_ARTIFACT_TYPE,
+            round_id=args.round_id,
+            convert_one=convert_one,
+        )
         return 0
 
     matches = tuple(

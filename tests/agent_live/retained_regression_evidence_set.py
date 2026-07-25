@@ -8,6 +8,7 @@ manifest that binds the complete set.
 
 from __future__ import annotations
 
+import argparse
 import ctypes
 import errno
 import hashlib
@@ -25,9 +26,14 @@ from tests.agent_live.batch_orchestrator import (
 from tests.agent_live.product_obligation_evidence import (
     admit_product_obligation_evidence,
 )
+from tests.agent_live.completed_journey_batch import (
+    G3_ARTIFACT_TYPE,
+    load_completed_journey_batch_evidence,
+)
 from tests.agent_live.retained_regression_runner import (
     RETAINED_REGRESSION_EXACT_COUNT,
     RETAINED_REGRESSION_OPEN_COUNT,
+    load_retained_regression_provider,
     validate_retained_regression_runner_provider,
 )
 
@@ -654,3 +660,63 @@ def _make_tree_read_only(root: Path) -> None:
         elif path.is_dir():
             path.chmod(0o500)
     root.chmod(0o500)
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Publish one immutable complete G3 evidence set.",
+    )
+    parser.add_argument("--repo-root", required=True, type=Path)
+    parser.add_argument("--provider", required=True, type=Path)
+    parser.add_argument("--exact-index", required=True, type=Path)
+    parser.add_argument("--open-batch-manifest", required=True, type=Path)
+    parser.add_argument("--open-batch-result", required=True, type=Path)
+    parser.add_argument("--open-evidence-index", required=True, type=Path)
+    parser.add_argument("--output-dir", required=True, type=Path)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    provider, obligations, revision = load_retained_regression_provider(
+        repo_root=args.repo_root,
+        provider_path=args.provider,
+    )
+    exact_index = _load_mapping(
+        args.exact_index.resolve(),
+        "G3 exact execution index",
+    )
+    exact_rows = _required_rows(exact_index, "evidence")
+    if len(exact_rows) != RETAINED_REGRESSION_EXACT_COUNT:
+        raise ValueError("G3 exact execution index does not declare 15 rows")
+    exact_paths: list[Path] = []
+    for row in exact_rows:
+        path = _resolved_file(str(row.get("path") or ""), "G3 exact evidence")
+        if _sha256_file(path) != str(row.get("sha256") or ""):
+            raise ValueError("G3 exact evidence hash differs from its index")
+        exact_paths.append(path)
+    open_obligations = tuple(
+        row for row in obligations if row.get("variant") != "exact"
+    )
+    open_paths = load_completed_journey_batch_evidence(
+        args.open_evidence_index,
+        obligations=open_obligations,
+        revision=revision,
+        artifact_type=G3_ARTIFACT_TYPE,
+        round_id="",
+    )
+    publish_retained_regression_evidence_set(
+        output_dir=args.output_dir,
+        provider=provider,
+        obligations=obligations,
+        revision=revision,
+        exact_execution_index_path=args.exact_index,
+        open_batch_manifest_path=args.open_batch_manifest,
+        open_batch_result_path=args.open_batch_result,
+        evidence_paths=(*exact_paths, *open_paths),
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

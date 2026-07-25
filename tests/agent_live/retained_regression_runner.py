@@ -35,6 +35,10 @@ from tests.agent_live.chaos_scheduler import (
     journey_schedule_payload,
 )
 from tests.agent_live.codex_simulator_bridge import validate_simulator_attestation
+from tests.agent_live.completed_journey_batch import (
+    G3_ARTIFACT_TYPE,
+    convert_completed_journey_batch,
+)
 from tests.agent_live.dynamic_dual_ai_chaos import (
     ChaosRunConfig,
     JsonlRuntimeEventStream,
@@ -2526,6 +2530,15 @@ def _parser() -> argparse.ArgumentParser:
     evidence.add_argument("--output", required=True, type=Path)
     evidence.add_argument("--provider-name", default=DEFAULT_PROVIDER)
     evidence.add_argument("--model", default=DEFAULT_MODEL)
+
+    evidence_batch = commands.add_parser("evidence-batch")
+    evidence_batch.add_argument("--repo-root", required=True, type=Path)
+    evidence_batch.add_argument("--provider", required=True, type=Path)
+    evidence_batch.add_argument("--manifest", required=True, type=Path)
+    evidence_batch.add_argument("--result-index", required=True, type=Path)
+    evidence_batch.add_argument("--output-dir", required=True, type=Path)
+    evidence_batch.add_argument("--provider-name", default=DEFAULT_PROVIDER)
+    evidence_batch.add_argument("--model", default=DEFAULT_MODEL)
     return parser
 
 
@@ -2585,6 +2598,43 @@ def main(argv: Sequence[str] | None = None) -> int:
             runtime_base=args.runtime_base,
             max_concurrency=args.max_concurrency,
             worker_runtime=args.worker_runtime,
+        )
+        return 0
+
+    if args.command == "evidence-batch":
+        open_obligations = tuple(
+            row for row in obligations if row.get("variant") != "exact"
+        )
+        target_index = {
+            str(row["obligation_id"]): dict(row)
+            for row in provider["targets"]
+        }
+
+        def convert_one(
+            obligation: Mapping[str, Any],
+            runtime_root: Path,
+            evidence_path: Path,
+            _checkpoint_diff: Path | None,
+        ) -> Path:
+            return convert_completed_retained_journey_to_product_evidence(
+                obligation=obligation,
+                target=target_index[str(obligation["obligation_id"])],
+                revision=revision,
+                runtime_root=runtime_root,
+                evidence_path=evidence_path,
+                provider=args.provider_name,
+                model=args.model,
+            )
+
+        convert_completed_journey_batch(
+            manifest_path=args.manifest,
+            result_index_path=args.result_index,
+            output_dir=args.output_dir,
+            obligations=open_obligations,
+            revision=revision,
+            artifact_type=G3_ARTIFACT_TYPE,
+            round_id="",
+            convert_one=convert_one,
         )
         return 0
 

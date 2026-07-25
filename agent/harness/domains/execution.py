@@ -60,7 +60,7 @@ def question_for_execution(state: AgentGraphState, group: str) -> dict[str, Any]
         question["execution_request_id"] = str((state.get("preflight") or {}).get("execution_request_id") or uuid.uuid4().hex)
         return question
     if group == "job_monitoring" and _ready_for_final_benchmark(state):
-        return choice_question(
+        question = choice_question(
             group,
             "real_node_final_benchmark_confirm",
             question_text("question.execution.final_benchmark.prompt"),
@@ -88,6 +88,8 @@ def question_for_execution(state: AgentGraphState, group: str) -> dict[str, Any]
             ],
             queue_barrier=True,
         )
+        question["execution_request_id"] = uuid.uuid4().hex
+        return question
     if group != "preflight_smoke_execution":
         return None
     next_group, _reason = next_group_and_reason(state)
@@ -128,6 +130,9 @@ def apply_execution_answer(
     active_question = dict(question or next_state.get("pending_question") or {})
     question_id = str(active_question.get("id") or "")
     if question_id == "real_node_final_benchmark_confirm":
+        request_id = str(active_question.get("execution_request_id") or "").strip()
+        if request_id:
+            next_state.setdefault("preflight", {})["execution_request_id"] = request_id
         return _apply_final_benchmark_answer(next_state, bool(value))
     request_id = str(active_question.get("execution_request_id") or "").strip()
     approved = bool(value)

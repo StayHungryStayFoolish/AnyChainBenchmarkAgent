@@ -8,6 +8,8 @@ from copy import deepcopy
 from dataclasses import asdict, is_dataclass, replace
 from typing import Any, Mapping
 
+from agent.runners.job_manager import verify_job_receipt
+
 from .state import AgentGraphState, PendingQuestion, RESET_PRESERVED_KEYS, new_state
 from . import hierarchical_planner
 from .oracle import (
@@ -62,7 +64,10 @@ from .contracts import (
     response_fragment_to_dict,
     ResponseFragment,
 )
-from .control_receipts import validate_domain_control_receipt
+from .control_receipts import (
+    validate_coordinator_control_receipt,
+    validate_domain_control_receipt,
+)
 from .domains.analysis import (
     JOB_ID_RE,
     is_evidence_completion_command,
@@ -623,6 +628,152 @@ def _record_pending_resolution(
                 )
             ),
             "verdict": "accepted",
+        },
+    )
+
+
+def _record_execution_approval(
+    state: AgentGraphState,
+    action: Mapping[str, Any],
+) -> None:
+    """Bind one committed execution approval to its answer, plan, and revision."""
+
+    approval_action_type = str(
+        action.get("type") or action.get("action_type") or ""
+    )
+    approval_contracts = {
+        "approve_preflight_smoke": {
+            "preflight_smoke_confirm",
+            "real_node_smoke_confirm",
+        },
+        "approve_final_benchmark": {
+            "real_node_final_benchmark_confirm",
+        },
+    }
+    if approval_action_type not in approval_contracts:
+        return
+    turn_index = int(state.get("turn_index") or 0)
+    context = dict(state.get("turn_context") or {})
+    pending_receipts = [
+        dict(item)
+        for item in context.get("control_receipts") or ()
+        if isinstance(item, Mapping)
+        and item.get("receipt_type") == "pending_resolution"
+        and item.get("pending_id") in approval_contracts[approval_action_type]
+        and item.get("verdict") == "accepted"
+    ]
+    valid_pending = []
+    for receipt in pending_receipts:
+        valid, _reason = validate_coordinator_control_receipt(
+            receipt,
+            turn_index=turn_index,
+        )
+        if valid:
+            valid_pending.append(receipt)
+    if len(valid_pending) != 1:
+        raise StateInvariantError(
+            "execution approval requires one canonical pending-resolution receipt"
+        )
+    revision = dict(context.get("repository_revision") or {})
+    plan = dict(state.get("plan") or {})
+    job_id = str((state.get("job") or {}).get("job_id") or "")
+    execution_request_id = str(
+        (state.get("preflight") or {}).get("execution_request_id") or ""
+    )
+    if not plan or not job_id:
+        raise StateInvariantError(
+            "execution approval completed without a plan or submitted job"
+        )
+    if not revision or not execution_request_id:
+        raise StateInvariantError(
+            "submitted execution approval is missing revision or request evidence"
+        )
+    pending_receipt = valid_pending[0]
+    answer_actions = [
+        dict(item)
+        for item in state.get("completed_actions") or ()
+        if isinstance(item, Mapping)
+        and str(item.get("action_id") or "")
+        == str(pending_receipt.get("resolved_action_id") or "")
+        and str(item.get("type") or item.get("action_type") or "")
+        == "answer_pending"
+    ]
+    answer_value = (
+        answer_actions[0].get("selected_value")
+        if answer_actions and "selected_value" in answer_actions[0]
+        else answer_actions[0].get("answer")
+        if answer_actions
+        else None
+    )
+    if (
+        len(answer_actions) != 1
+        or answer_value is not True
+        or pending_receipt.get("selected_value_hash") != _receipt_hash(True)
+    ):
+        raise StateInvariantError(
+            "execution approval requires one canonical affirmative answer"
+        )
+    intent = dict(state.get("side_effect_intent") or {})
+    side_effect_receipt = dict(state.get("side_effect_receipt") or {})
+    execution_receipts = dict(
+        (state.get("job") or {}).get("execution_receipts") or {}
+    )
+    submission_receipt = dict(
+        execution_receipts.get("submission_attempt")
+        or execution_receipts.get("submission")
+        or {}
+    )
+    expected_action_id = str(action.get("action_id") or action.get("id") or "")
+    expected_request_fingerprint = _receipt_hash(intent.get("request") or {})
+    approved_plan_hash = _receipt_hash(plan)
+    if (
+        not intent
+        or intent.get("status") != "succeeded"
+        or intent.get("action_id") != expected_action_id
+        or intent.get("operation") != approval_action_type
+        or intent.get("request_fingerprint") != expected_request_fingerprint
+        or not side_effect_receipt
+        or side_effect_receipt.get("status") != "succeeded"
+        or side_effect_receipt.get("intent_id") != intent.get("intent_id")
+        or side_effect_receipt.get("action_id") != expected_action_id
+        or side_effect_receipt.get("idempotency_key")
+        != intent.get("idempotency_key")
+        or side_effect_receipt.get("job_id") != job_id
+        or not verify_job_receipt(submission_receipt)
+        or submission_receipt.get("job_id") != job_id
+        or submission_receipt.get("approved_plan_hash") != approved_plan_hash
+    ):
+        raise StateInvariantError(
+            "execution approval lacks a canonical side-effect submission chain"
+        )
+    _append_control_receipt(
+        state,
+        "execution_approval",
+        {
+            "approval_question_id": str(pending_receipt["pending_id"]),
+            "pending_resolution_receipt_id": str(pending_receipt["receipt_id"]),
+            "answer_action_id": str(pending_receipt["resolved_action_id"]),
+            "approval_action_id": expected_action_id,
+            "approval_action_type": approval_action_type,
+            "execution_request_id": execution_request_id,
+            "side_effect_intent_id": str(intent["intent_id"]),
+            "side_effect_intent_hash": _receipt_hash(intent),
+            "side_effect_receipt_id": str(side_effect_receipt["receipt_id"]),
+            "side_effect_receipt_hash": _receipt_hash(side_effect_receipt),
+            "idempotency_key_hash": _receipt_hash(intent["idempotency_key"]),
+            "request_fingerprint": str(intent["request_fingerprint"]),
+            "job_submission_receipt_id": str(
+                submission_receipt["receipt_id"]
+            ),
+            "job_submission_receipt_hash": _receipt_hash(
+                submission_receipt
+            ),
+            "approved_plan_hash": approved_plan_hash,
+            "repository_revision": revision,
+            "plan_hash": _receipt_hash(plan),
+            "workflow_type": str(state.get("workflow_mode") or ""),
+            "target_mode": str(state.get("target_mode") or ""),
+            "job_id": job_id,
         },
     )
 
@@ -2225,6 +2376,7 @@ def commit_selected_action_step(state: AgentGraphState) -> AgentGraphState:
         receipt["execution_order"] = execution_order
         receipt["status"] = "executing"
         committed["turn_receipt"] = receipt
+        _record_execution_approval(committed, action)
         if spec is not None and spec.lifetime == "turn_local":
             result_count = len(prepared.result.response_fragments)
             if result_count:

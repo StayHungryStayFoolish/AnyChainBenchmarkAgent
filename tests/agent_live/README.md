@@ -76,6 +76,30 @@ The Phase 8 execution adapters are:
   Journey artifacts into atomic obligation evidence;
 - `product_obligation_evidence.py` for revision-, contract-, verifier-, and
   artifact-bound G3/G4 admission.
+- `export_approved_plan.py` for exporting one immutable plan from a real
+  LangGraph approval checkpoint. The G5 runner independently reopens the
+  exported checkpoint and rejects caller-authored plans without matching
+  current-turn approval provenance. These artifacts are confidential,
+  owner-only local evidence (`0700` directory, `0400` files), must never be
+  published, and are deleted by the Phase 8 authority only after G3-G6 reach
+  one terminal passing decision. A content-addressed cleanup receipt remains;
+  the checkpoint, plan, and approval sources do not. Failed or incomplete
+  acceptance retains them owner-only for diagnosis; they require explicit
+  cleanup before any evidence directory is copied or published.
+- `execute_real_execution_ledger.py` consumes four approved-plan artifacts
+  and produces the four G5 jobs: fake-node smoke, real-node smoke,
+  real-node final benchmark, and sync-observe. The two real-node approvals
+  bind the same immutable plan to two distinct user decisions. RPC benchmark plans own
+  `LOCAL_RPC_URL`; only sync-observe plans own
+  `NODE_PROMETHEUS_METRICS_URL`. The fixed Geth metrics probe remains an
+  external G5 runtime attestation for both real Geth lanes.
+- `completed_journey_batch.py` validates a complete frozen Journey batch,
+  converts every declared G3/G4 obligation through the existing strict
+  per-obligation adapter, and publishes one read-only evidence index.
+  `retained_regression_evidence_set.py` combines the exact execution index and
+  the declared open-batch index into the immutable 60-row G3 collection.
+  Product acceptance consumes these indexes and never discovers G3/G4
+  evidence by directory globbing.
 
 An adapter is not a pass. G3 remains blocked while any retained semantic
 postcondition lacks a reviewed machine evaluator. Its current executable

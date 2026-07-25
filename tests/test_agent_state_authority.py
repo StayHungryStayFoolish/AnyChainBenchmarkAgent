@@ -446,15 +446,13 @@ class ImmutableExecutionPlanTest(unittest.TestCase):
                     plan=malicious,
                     jobs_dir=root / "jobs",
                     mock=True,
-                    runtime_override_sources=("untrusted.full_plan",),
                 )
             )
 
         self.assertEqual(result.failure.code, ExecutionFailureCode.INVALID_REQUEST)
-        self.assertIn("execution.command", result.failure.message)
-        self.assertIn("execution_provenance", result.failure.message)
+        self.assertIn("immutable approved source plan", result.failure.message)
 
-    def test_idempotency_and_custom_rpc_overrides_live_in_job_plan_with_provenance(self) -> None:
+    def test_custom_rpc_is_part_of_immutable_source_plan_and_job_provenance(self) -> None:
         from agent.runners.application_service import (
             BenchmarkExecutionService,
             ExecutionOperation,
@@ -469,22 +467,18 @@ class ImmutableExecutionPlanTest(unittest.TestCase):
                 "chain": "bsc",
                 "strategy": "smoke",
                 "execution": {"command": ["true"], "environment": {}, "runner_mode": "foreground"},
+                "chain_config_override": {"rpc_methods": {"single": "eth_accounts"}},
             }
             approved_plan.write_text(json.dumps(approved_payload, sort_keys=True), encoding="utf-8")
             approved_bytes = approved_plan.read_bytes()
-            runtime_plan = {
-                **approved_payload,
-                "chain_config_override": {"rpc_methods": {"single": "eth_accounts"}},
-            }
             request = ExecutionRequest(
                 operation=ExecutionOperation.FINAL_BENCHMARK,
                 approved=True,
                 idempotency_key="harness:request-40",
                 plan_file=approved_plan,
-                plan=runtime_plan,
+                plan=approved_payload,
                 jobs_dir=root / "jobs",
                 mock=True,
-                runtime_override_sources=("harness.custom_rpc",),
             )
 
             first = BenchmarkExecutionService().execute(request)
@@ -496,18 +490,19 @@ class ImmutableExecutionPlanTest(unittest.TestCase):
 
         provenance = job_plan["execution_provenance"]
         self.assertEqual(job_plan["execution"]["idempotency_key"], "harness:request-40")
-        self.assertEqual(job_plan["chain_config_override"], runtime_plan["chain_config_override"])
+        self.assertEqual(
+            job_plan["chain_config_override"],
+            approved_payload["chain_config_override"],
+        )
         self.assertEqual(provenance["approved_plan_file"], str(approved_plan.resolve()))
         self.assertEqual(provenance["approved_plan_sha256"], hashlib.sha256(approved_bytes).hexdigest())
         self.assertEqual(provenance["job_id"], job["job_id"])
         self.assertEqual(provenance["job_plan_file"], job["plan_file"])
-        self.assertIn("harness.custom_rpc", provenance["runtime_overrides"])
-        self.assertIn("execution.idempotency_key", provenance["runtime_overrides"])
-        self.assertIn("custom_rpc.chain_config_override", provenance["runtime_overrides"])
+        self.assertEqual(provenance["runtime_overrides"], ["execution.idempotency_key"])
         self.assertTrue(second.reused)
         self.assertEqual(second.data["job"]["job_id"], job["job_id"])
 
-    def test_custom_rpc_closure_does_not_write_the_prepared_plan(self) -> None:
+    def test_custom_rpc_closure_is_written_by_prepare_into_the_source_plan(self) -> None:
         from agent.harness.domains.execution_runtime import _prepare_benchmark_with_runtime_contract
         from agent.runners.application_service import (
             ExecutionOperation,
@@ -519,21 +514,6 @@ class ImmutableExecutionPlanTest(unittest.TestCase):
             plan_file = Path(tmpdir) / "approved.json"
             base_plan = {"plan_id": "prepared", "chain": "bsc", "execution": {}}
             plan_file.write_text(json.dumps(base_plan, sort_keys=True), encoding="utf-8")
-            approved_bytes = plan_file.read_bytes()
-            prepared = ExecutionResult(
-                operation=ExecutionOperation.PREPARE,
-                status=ExecutionStatus.OK,
-                data={
-                    "plan": dict(base_plan),
-                    "plan_file": str(plan_file),
-                    "preflight": {"passed": True, "checks": [], "blockers": []},
-                },
-            )
-            preflight = ExecutionResult(
-                operation=ExecutionOperation.PREFLIGHT,
-                status=ExecutionStatus.OK,
-                data={"preflight": {"passed": True, "checks": [], "blockers": []}},
-            )
             state = {
                 "rpc_mode": "single",
                 "chain_identity": {"canonical": "bsc", "adapter_family": "jsonrpc"},
@@ -553,15 +533,33 @@ class ImmutableExecutionPlanTest(unittest.TestCase):
                 },
             }
 
+            def prepare(request):
+                override = dict(request.prepare_kwargs["chain_config_override"])
+                source_plan = {**base_plan, "chain_config_override": override}
+                plan_file.write_text(
+                    json.dumps(source_plan, sort_keys=True),
+                    encoding="utf-8",
+                )
+                return ExecutionResult(
+                    operation=ExecutionOperation.PREPARE,
+                    status=ExecutionStatus.OK,
+                    data={
+                        "plan": source_plan,
+                        "plan_file": str(plan_file),
+                        "preflight": {"passed": True, "checks": [], "blockers": []},
+                    },
+                )
+
             with patch(
                 "agent.harness.domains.execution_runtime.execution_service.execute",
-                side_effect=[prepared, preflight],
+                side_effect=prepare,
             ):
                 result = _prepare_benchmark_with_runtime_contract(state)
 
-            self.assertEqual(plan_file.read_bytes(), approved_bytes)
+            source_plan = json.loads(plan_file.read_text(encoding="utf-8"))
 
-        self.assertIn("chain_config_override", result["data"]["plan"])
+        self.assertEqual(result["data"]["plan"], source_plan)
+        self.assertIn("chain_config_override", source_plan)
 
 
 class HistoricalAnalysisAuthorityTest(unittest.TestCase):

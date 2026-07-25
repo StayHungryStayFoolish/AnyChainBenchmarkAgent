@@ -26,11 +26,26 @@ from tests.agent_live.execute_harness_contract_ledger import execute_ledger
 from tests.agent_live.coverage_evidence import (
     validate_real_execution_ledger_artifacts,
 )
+from tests.agent_live.execute_real_execution_ledger import (
+    validate_g5_failure_artifact,
+)
+from tests.agent_live.g5_collection_manifest import (
+    load_active_g5_collection,
+)
+from tests.agent_live.export_approved_plan import (
+    cleanup_approved_plan_evidence,
+    validate_completed_cleanup_receipt,
+)
+from agent.runners.execution_scenarios import scenario_by_id
 from tests.agent_live.product_chaos_obligations import (
     build_product_chaos_obligations,
 )
 from tests.agent_live.product_obligation_evidence import (
     admit_product_chaos_rounds,
+)
+from tests.agent_live.completed_journey_batch import (
+    G4_ARTIFACT_TYPE,
+    load_completed_journey_batch_evidence,
 )
 from tests.agent_live.generate_product_review_evidence import (
     generate_product_review_evidence,
@@ -491,6 +506,159 @@ def _phase8_g3_gate(
     }
 
 
+def _phase8_g4_gate(
+    *,
+    phase_root: Path,
+    obligations: Sequence[dict[str, Any]],
+    revision: dict[str, str],
+) -> dict[str, Any]:
+    evidence_by_round: dict[str, tuple[Path, ...]] = {}
+    missing: list[str] = []
+    try:
+        for round_id in ("round-1", "round-2"):
+            index_path = (
+                phase_root
+                / "g4"
+                / round_id
+                / "evidence-set"
+                / "manifest.json"
+            )
+            if not index_path.is_file():
+                missing.append(_display_path(index_path))
+                evidence_by_round[round_id] = ()
+                continue
+            evidence_by_round[round_id] = load_completed_journey_batch_evidence(
+                index_path,
+                obligations=obligations,
+                revision=revision,
+                artifact_type=G4_ARTIFACT_TYPE,
+                round_id=round_id,
+            )
+        if missing:
+            return {
+                "status": "incomplete",
+                "complete": False,
+                "reason": "immutable G4 round evidence is not available",
+                "missing": missing,
+            }
+        return admit_product_chaos_rounds(
+            obligations=obligations,
+            evidence_by_round=evidence_by_round,
+            revision=revision,
+        )
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        return {
+            "status": "failed",
+            "complete": False,
+            "reason": f"immutable G4 evidence set was rejected: {exc}",
+        }
+
+
+def _phase8_g5_gate(
+    *,
+    phase_root: Path,
+    revision: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    execution_ledger = build_ledger(revision=revision)
+    g5_root = phase_root / "g5"
+    pointer_exists = (g5_root / "active-collection.json").exists()
+    manifest, manifest_reason = load_active_g5_collection(
+        g5_root,
+        revision=revision,
+    )
+    if manifest is None:
+        return execution_ledger, {
+            "status": "failed" if pointer_exists else "incomplete",
+            "global_ledger_valid": False,
+            "global_ledger_reason": (
+                manifest_reason or "G5 collection has not been published"
+            ),
+        }
+
+    summary: dict[str, Any] = {
+        "attempt_id": str(manifest.get("attempt_id") or ""),
+        "collection_status": str(manifest.get("status") or ""),
+    }
+    try:
+        evidence_paths = [
+            Path(str(item.get("path") or ""))
+            for item in manifest.get("evidence") or ()
+        ]
+        if evidence_paths:
+            execution_ledger = ingest_evidence_artifacts(
+                execution_ledger,
+                evidence_paths,
+            )
+        summary.update(
+            dict(
+                (execution_ledger.get("summary") or {})
+                .get("execution_closure", {})
+                .get("real_execution", {})
+            )
+        )
+        if manifest.get("status") == "failed":
+            failure = manifest.get("failure_evidence")
+            reason = "G5 attempt failed before completing all required lanes"
+            if isinstance(failure, dict):
+                failure_path = Path(str(failure.get("path") or ""))
+                failure_payload = _load_json_object(
+                    failure_path,
+                    "G5 failure evidence",
+                )
+                if failure_payload.get("artifact_type") == "g5_real_execution_failure":
+                    valid, failure_reason = validate_g5_failure_artifact(
+                        failure_path,
+                        revision=revision,
+                    )
+                    if not valid:
+                        raise ValueError(failure_reason)
+                    reason = "G5 attempt failed with validated stage evidence"
+                elif failure_payload.get("evidence_class") == "real_execution":
+                    reason = "G5 attempt retained an observed execution failure"
+                else:
+                    raise ValueError("G5 failure evidence type is invalid")
+            return execution_ledger, {
+                **summary,
+                "status": "failed",
+                "global_ledger_valid": False,
+                "global_ledger_reason": reason,
+            }
+
+        artifacts = [
+            _load_json_object(path, "G5 real-execution evidence")
+            for path in evidence_paths
+        ]
+        artifacts.sort(
+            key=lambda artifact: int(
+                ((artifact.get("request") or {}).get("ledger_sequence") or 0)
+            )
+        )
+        globally_valid, global_reason = (
+            validate_real_execution_ledger_artifacts(
+                artifacts,
+                revision=revision,
+            )
+        )
+        complete = (
+            summary.get("status") == "complete"
+            and int(summary.get("required_denominator") or 0) == 4
+            and int(summary.get("open_required", -1)) == 0
+        )
+        return execution_ledger, {
+            **summary,
+            "status": "passed" if complete and globally_valid else "failed",
+            "global_ledger_valid": globally_valid,
+            "global_ledger_reason": global_reason,
+        }
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        return execution_ledger, {
+            **summary,
+            "status": "failed",
+            "global_ledger_valid": False,
+            "global_ledger_reason": f"G5 collection was rejected: {exc}",
+        }
+
+
 def _phase8_source(inventory: dict[str, Any]) -> dict[str, Any]:
     revision = dict(inventory.get("revision") or {})
     phase_root = (
@@ -520,66 +688,21 @@ def _phase8_source(inventory: dict[str, Any]) -> dict[str, Any]:
         obligations=g3_obligations,
         revision=revision,
     )
-    g4_summary = admit_product_chaos_rounds(
+    g4_summary = _phase8_g4_gate(
+        phase_root=phase_root,
         obligations=g4_obligations,
-        evidence_by_round={
-            round_id: _json_files(
-                phase_root / "g4" / round_id / "evidence"
-            )
-            for round_id in ("round-1", "round-2")
-        },
         revision=revision,
     )
 
-    execution_ledger = build_ledger(revision=revision)
-    g5_paths = _json_files(phase_root / "g5" / "evidence")
-    if g5_paths:
-        execution_ledger = ingest_evidence_artifacts(execution_ledger, g5_paths)
-    g5_summary = dict(
-        (execution_ledger.get("summary") or {})
-        .get("execution_closure", {})
-        .get("real_execution", {})
+    execution_ledger, g5_summary = _phase8_g5_gate(
+        phase_root=phase_root,
+        revision=revision,
     )
-    g5_globally_valid = False
-    g5_global_reason = "real execution ledger is incomplete"
-    if (
-        g5_summary.get("status") == "complete"
-        and int(g5_summary.get("required_denominator") or 0) == 4
-        and int(g5_summary.get("open_required", -1)) == 0
-    ):
-        g5_artifacts = [
-            json.loads(path.read_text(encoding="utf-8"))
-            for path in g5_paths
-        ]
-        g5_artifacts.sort(
-            key=lambda artifact: int(
-                ((artifact.get("request") or {}).get("ledger_sequence") or 0)
-            )
-        )
-        g5_globally_valid, g5_global_reason = (
-            validate_real_execution_ledger_artifacts(
-                g5_artifacts,
-                revision=revision,
-            )
-        )
     _write_json(phase_root / "g5" / "execution-ledger.json", execution_ledger)
 
     g3_status = str(g3_summary["status"])
     g4_status = "passed" if g4_summary["complete"] else g4_summary["status"]
-    g5_status = (
-        "passed"
-        if g5_summary.get("status") == "complete"
-        and int(g5_summary.get("required_denominator") or 0) == 4
-        and int(g5_summary.get("open_required", -1)) == 0
-        and g5_globally_valid
-        else "failed"
-        if g5_summary.get("status") == "failed"
-        or (
-            g5_summary.get("status") == "complete"
-            and not g5_globally_valid
-        )
-        else "incomplete"
-    )
+    g5_status = str(g5_summary["status"])
     prerequisites_passed = all(
         status == "passed" for status in (g3_status, g4_status, g5_status)
     )
@@ -608,8 +731,6 @@ def _phase8_source(inventory: dict[str, Any]) -> dict[str, Any]:
             "G5": {
                 **g5_summary,
                 "status": g5_status,
-                "global_ledger_valid": g5_globally_valid,
-                "global_ledger_reason": g5_global_reason,
             },
             "G6": g6,
         },
@@ -686,6 +807,87 @@ def _phase8_product_review(
         "config": _display_path(config_path),
         "manifest": _display_path(manifest_path),
         "generation": "generated",
+    }
+
+
+def _cleanup_phase8_confidential_evidence(
+    report: dict[str, Any],
+) -> dict[str, Any]:
+    revision = dict((report.get("inventory") or {}).get("revision") or {})
+    phase_root = (
+        REPO_ROOT
+        / ".agent"
+        / "evidence"
+        / "control-plane"
+        / _revision_id(revision)
+        / "phase8"
+    )
+    contracts: list[dict[str, Any]] = []
+    collection, reason = load_active_g5_collection(
+        phase_root / "g5",
+        revision=revision,
+    )
+    if collection is None or collection.get("status") != "complete":
+        raise ValueError(
+            "terminal confidential cleanup requires a complete G5 collection: "
+            + reason
+        )
+    evidence_paths = [
+        Path(str(item.get("path") or ""))
+        for item in collection.get("evidence") or ()
+    ]
+    for path in evidence_paths:
+        artifact = _load_json_object(path, "G5 real-execution evidence")
+        if artifact.get("evidence_class") != "real_execution":
+            continue
+        request = dict(artifact.get("request") or {})
+        scenario = scenario_by_id(str(artifact.get("scenario_id") or ""))
+        target_mode = (
+            "sync-observe"
+            if scenario.workflow_type == "sync_observe"
+            else "fake-node"
+            if scenario.operation == "fake_node_smoke"
+            else "real-node"
+        )
+        contracts.append({
+            "artifact_file": str(
+                request.get("approved_plan_provenance_file") or ""
+            ),
+            "plan_file": str(request.get("approved_plan_file") or ""),
+            "approval_artifact_sha256": str(
+                request.get("approved_plan_provenance_sha256") or ""
+            ),
+            "plan_sha256": str(
+                request.get("approved_plan_sha256") or ""
+            ),
+            "workflow": scenario.workflow_type,
+            "target_mode": target_mode,
+            "approval_action": scenario.action_type,
+        })
+    if len(contracts) != 4:
+        raise ValueError(
+            "terminal confidential cleanup requires four validated G5 lanes"
+        )
+    receipt = cleanup_approved_plan_evidence(
+        contracts,
+        expected_revision=revision,
+        output_dir=phase_root / "g5" / "confidential-cleanup",
+    )
+    payload = validate_completed_cleanup_receipt(
+        receipt,
+        expected_revision=revision,
+        expected_evidence_root=Path(
+            str(contracts[0].get("artifact_file") or "")
+        ).resolve().parent,
+        expected_contracts=contracts,
+        output_dir=(phase_root / "g5" / "confidential-cleanup").resolve(),
+    )
+    return {
+        "status": "passed",
+        "receipt": _display_path(receipt),
+        "receipt_sha256": hashlib.sha256(receipt.read_bytes()).hexdigest(),
+        "cleanup_outcome": str(payload.get("status") or ""),
+        "deleted_file_count": int(payload.get("deleted_file_count") or 0),
     }
 
 
@@ -853,7 +1055,30 @@ def main() -> int:
         / "product-acceptance.json"
     )
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if report["status"] == "passed" and args.through_phase == 8:
+        provisional = {
+            **report,
+            "status": "finalizing",
+            "confidential_evidence_cleanup": {"status": "pending"},
+        }
+        output.write_text(
+            json.dumps(provisional, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        try:
+            report["confidential_evidence_cleanup"] = (
+                _cleanup_phase8_confidential_evidence(report)
+            )
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            report["status"] = "failed"
+            report["confidential_evidence_cleanup"] = {
+                "status": "failed",
+                "reason": str(exc),
+            }
+    output.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     print(json.dumps({
         "status": report["status"],
         "through_phase": args.through_phase,

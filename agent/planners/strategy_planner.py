@@ -251,6 +251,9 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
     if chain_override:
         plan["chain_config_override"] = chain_override
         plan["artifacts"]["chain_config_override_file"] = "<job_run_dir>/chain_template.override.json"
+        plan["chain_template_requirements"] = (
+            template_requirements_from_override(chain, chain_override)
+        )
     checklist = build_configuration_checklist(request, plan)
     plan["configuration_checklist"] = checklist
     combined_required = _ordered_required_inputs(set(plan["required_inputs"]) | set(missing_required_from_checklist(checklist)))
@@ -357,6 +360,9 @@ def _chain_config_override(chain: str, request: dict[str, Any]) -> dict[str, Any
     """
     if not chain:
         return {}
+    explicit = request.get("chain_config_override")
+    if isinstance(explicit, dict) and explicit:
+        return json.loads(json.dumps(explicit))
     chain_file = REPO_ROOT / "config" / "chains" / f"{chain}.json"
     if not chain_file.is_file():
         return {}

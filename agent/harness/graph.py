@@ -38,6 +38,17 @@ from .runtime_identity import repository_revision
 from .state import AgentGraphState, RESET_PRESERVED_KEYS, ensure_session_metadata, migrate_state, new_state, project_checkpoint_state
 
 
+_EXECUTION_APPROVAL_QUESTIONS = frozenset({
+    "preflight_smoke_confirm",
+    "real_node_smoke_confirm",
+    "real_node_final_benchmark_confirm",
+})
+_EXECUTION_APPROVAL_ACTIONS = frozenset({
+    "approve_preflight_smoke",
+    "approve_final_benchmark",
+})
+
+
 class AnyChainGraphRuntime:
     """Thin wrapper around the LangGraph product workflow graph."""
 
@@ -81,6 +92,15 @@ class AnyChainGraphRuntime:
             key: deepcopy((context or {}).get(key) or {})
             for key in _INVOCATION_CONTEXT_KEYS
         }
+        approval_question_id = str(
+            (state.get("pending_question") or {}).get("id") or ""
+        )
+        invocation_context["repository_revision"] = (
+            repository_revision(Path(__file__).resolve().parents[2])
+            if approval_question_id
+            in _EXECUTION_APPROVAL_QUESTIONS
+            else {}
+        )
         # Runtime commands are invocation-scoped capabilities. Explicitly
         # clear the field for user turns so a checkpointer/runtime cannot carry
         # a prior startup command into the next graph invocation.
@@ -221,6 +241,7 @@ class AnyChainGraphRuntime:
                 "framework_summary": {},
                 "web_research": {},
                 "runtime_action": deepcopy(dict(action)),
+                "repository_revision": {},
             },
         )
         validate_state(result)
@@ -739,6 +760,7 @@ class InvocationContext(TypedDict, total=False):
     framework_summary: dict[str, Any]
     web_research: dict[str, Any]
     runtime_action: dict[str, Any]
+    repository_revision: dict[str, str]
 
 
 _INVOCATION_CONTEXT_KEYS = (
@@ -784,6 +806,9 @@ def _prepare_graph_step(
     for key in _INVOCATION_CONTEXT_KEYS:
         contextual[key] = deepcopy(invocation_context.get(key) or {})
     result = prepare_turn_step(contextual)
+    revision = dict(invocation_context.get("repository_revision") or {})
+    if revision:
+        result.setdefault("turn_context", {})["repository_revision"] = revision
     runtime_action = (
         dict(invocation_context.get("runtime_action") or {})
         if not str((result.get("turn_context") or {}).get("text") or "").strip()
@@ -807,6 +832,24 @@ def _owner_step(
         state: AgentGraphState,
         runtime: Runtime[InvocationContext],
     ) -> AgentGraphState:
+        contextual = deepcopy(state)
+        action_type = str(
+            (contextual.get("selected_action") or {}).get("action_type")
+            or (contextual.get("selected_action") or {}).get("type")
+            or ""
+        )
+        if owner == "execution" and action_type in _EXECUTION_APPROVAL_ACTIONS:
+            expected = dict(
+                (contextual.get("turn_context") or {}).get(
+                    "repository_revision"
+                )
+                or {}
+            )
+            observed = repository_revision(Path(__file__).resolve().parents[2])
+            if not expected or observed != expected:
+                raise StateInvariantError(
+                    "repository revision changed before execution approval"
+                )
         return _contextual_step(
             lambda contextual: execute_selected_owner_step(
                 contextual,
@@ -815,6 +858,29 @@ def _owner_step(
         )(state, runtime)
 
     return run
+
+
+def _commit_action_step(
+    state: AgentGraphState,
+    runtime: Runtime[InvocationContext],
+) -> AgentGraphState:
+    """Commit an execution approval only if its source revision stayed stable."""
+
+    selected = dict(state.get("selected_action") or {})
+    action_type = str(
+        selected.get("action_type") or selected.get("type") or ""
+    )
+    if action_type in _EXECUTION_APPROVAL_ACTIONS:
+        expected = dict(
+            (state.get("turn_context") or {}).get("repository_revision")
+            or {}
+        )
+        observed = repository_revision(Path(__file__).resolve().parents[2])
+        if not expected or observed != expected:
+            raise StateInvariantError(
+                "repository revision changed during execution approval"
+            )
+    return _contextual_step(commit_selected_action_step)(state, runtime)
 
 
 def build_graph(checkpointer: Any) -> Any:
@@ -830,7 +896,7 @@ def build_graph(checkpointer: Any) -> Any:
     graph.add_node("select_action", _contextual_step(select_action_step))
     for owner in _OWNER_NODE:
         graph.add_node(f"owner_{owner}", _owner_step(owner))
-    graph.add_node("commit_action", _contextual_step(commit_selected_action_step))
+    graph.add_node("commit_action", _commit_action_step)
     graph.add_node("invoke_effect", _contextual_step(mark_side_effect_invoking_step))
     graph.add_node("perform_effect", _contextual_step(invoke_idempotent_side_effect_step))
     graph.add_node("commit_receipt", _contextual_step(commit_side_effect_receipt_step))

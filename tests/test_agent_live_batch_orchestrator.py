@@ -1338,7 +1338,9 @@ class BatchOrchestratorTests(unittest.TestCase):
             command_factory=self._factory(
                 ["stubborn-after-result"], self.root / ".agent" / "stubborn-markers"
             ),
-            timeout_policy=TimeoutPolicy(shard_seconds=0.1, decision_seconds=1, cleanup_seconds=0.2),
+            # Leave enough time for the worker to install SIGTERM=SIG_IGN and
+            # publish its result before the wait phase times out.
+            timeout_policy=TimeoutPolicy(shard_seconds=1, decision_seconds=1, cleanup_seconds=0.2),
         )
         index = asyncio.run(run_batch(
             manifest,

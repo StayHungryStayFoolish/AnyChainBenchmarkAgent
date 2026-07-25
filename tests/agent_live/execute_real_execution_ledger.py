@@ -44,10 +44,12 @@ from agent.runners.execution_scenarios import (
     RPC_BENCHMARK_WORKFLOW,
     SYNC_OBSERVE_WORKFLOW,
     ExecutionScenarioSpec,
+    scenario_by_id,
     workflow_type_from_plan,
 )
 from agent.utils.redaction import redact
 from tests.agent_live.coverage_evidence import (
+    G5_SCENARIO_ADMISSION,
     G5_RUNTIME_CONTRACT,
     build_real_execution_evidence_artifact,
     g5_scenario_admission,
@@ -57,9 +59,14 @@ from tests.agent_live.coverage_evidence import (
     write_evidence_artifact,
 )
 from tests.agent_live.generate_harness_coverage_ledger import build_ledger
+from tests.agent_live.g5_collection_manifest import (
+    create_g5_attempt,
+    publish_g5_collection,
+)
 from tests.agent_live.real_execution_host_attestation import (
     validate_host_attestation_file,
 )
+from tests.agent_live.export_approved_plan import validate_approved_plan_artifact
 from tests.agent_live.real_execution_host_supervisor import (
     ATTESTATION_ENV,
     TARGET_SERVICE,
@@ -67,7 +74,8 @@ from tests.agent_live.real_execution_host_supervisor import (
 
 TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "partial", "cancelled"})
 OPERATION_BY_VALUE = {operation.value: operation for operation in ExecutionOperation}
-G5_FAILURE_ARTIFACT_SCHEMA_VERSION = 1
+G5_FAILURE_ARTIFACT_SCHEMA_VERSION = 4
+G5_BOOTSTRAP_FAILURE_SCHEMA_VERSION = 1
 G5_FAILURE_STAGES = frozenset({
     "worker_admission",
     "plan_admission",
@@ -269,7 +277,6 @@ def _validate_approved_plan_binding(
     if not chain:
         raise RuntimeError(f"approved plan has no chain identity: {plan_file}")
     endpoint = str(execution_env.get(admission.endpoint_env_var) or "").strip()
-    metrics_url = str(execution_env.get("NODE_PROMETHEUS_METRICS_URL") or "").strip()
     if not endpoint:
         raise RuntimeError(
             f"approved plan has no {admission.endpoint_env_var}: {plan_file}"
@@ -278,12 +285,17 @@ def _validate_approved_plan_binding(
         raise RuntimeError(
             f"approved plan endpoint is outside the frozen G5 runtime contract: {plan_file}"
         )
-    if not metrics_url:
-        raise RuntimeError(f"approved plan has no metrics endpoint: {plan_file}")
-    if metrics_url != G5_RUNTIME_CONTRACT.metrics_url:
-        raise RuntimeError(
-            f"approved plan metrics endpoint is outside the frozen G5 runtime contract: {plan_file}"
-        )
+    if admission.endpoint_env_var == "SYNC_OBSERVE_RPC_URL":
+        metrics_url = str(
+            execution_env.get("NODE_PROMETHEUS_METRICS_URL") or ""
+        ).strip()
+        if not metrics_url:
+            raise RuntimeError(f"approved sync-observe plan has no metrics endpoint: {plan_file}")
+        if metrics_url != G5_RUNTIME_CONTRACT.metrics_url:
+            raise RuntimeError(
+                "approved sync-observe plan metrics endpoint is outside "
+                f"the frozen G5 runtime contract: {plan_file}"
+            )
     return plan
 
 
@@ -308,6 +320,7 @@ def _write_immutable_json(path: Path, payload: Mapping[str, Any]) -> str:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(serialized)
             handle.flush()
+            os.fchmod(handle.fileno(), 0o400)
             os.fsync(handle.fileno())
         os.link(temporary, path)
         directory_fd = os.open(path.parent, os.O_RDONLY)
@@ -344,29 +357,91 @@ def _write_g5_failure_artifact(
     stage: str,
     error: Exception | str,
     plan_files: Sequence[Path],
+    approval_files: Sequence[Path],
     host_attestation: Mapping[str, Any],
+    attempt_id: str = "00000000000000000000000000000000",
 ) -> Path:
-    plans: list[dict[str, str]] = []
-    for path in plan_files:
-        resolved = path.resolve()
-        plans.append({
-            "path": str(resolved),
-            "sha256": _sha256(resolved) if resolved.is_file() else "",
-        })
+    plans = [_failure_input_binding(path) for path in plan_files]
+    approvals = [_failure_input_binding(path) for path in approval_files]
+    retained_by_scenario: dict[str, dict[str, Any]] = {}
+    ledger: Mapping[str, Any] | None = None
+    if evidence_dir.is_dir():
+        for path in sorted(evidence_dir.glob("*.json")):
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                candidate = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            candidate_scenario_id = str(
+                candidate.get("scenario_id") or ""
+            ) if isinstance(candidate, Mapping) else ""
+            try:
+                if ledger is None:
+                    ledger = build_ledger(revision=revision)
+                scenario = scenario_by_id(candidate_scenario_id)
+                edge = _edge_by_action(ledger, scenario.action_type)
+                valid, _reason = validate_real_execution_evidence_artifact(
+                    candidate,
+                    edge=edge,
+                    revision=revision,
+                    allow_observed_failure=True,
+                )
+            except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+                valid = False
+            if valid:
+                retained_by_scenario[candidate_scenario_id] = {
+                    "path": str(path.resolve()),
+                    "sha256": _sha256(path),
+                    "evidence_id": str(candidate.get("evidence_id") or ""),
+                    "scenario_id": candidate_scenario_id,
+                }
+    expected_predecessors: tuple[str, ...] = ()
+    if scenario_id:
+        admission = g5_scenario_admission(scenario_id)
+        expected_predecessors = tuple(
+            candidate_id
+            for candidate_id, candidate_admission in sorted(
+                (
+                    (item.scenario_id, g5_scenario_admission(item.scenario_id))
+                    for item in EXECUTION_SCENARIOS
+                    if item.real_evidence_required
+                ),
+                key=lambda item: item[1].sequence_index,
+            )
+            if candidate_admission.sequence_index < admission.sequence_index
+        )
+    if set(retained_by_scenario) != set(expected_predecessors):
+        raise RuntimeError(
+            "G5 retained evidence is not the exact legal predecessor prefix"
+        )
+    retained_evidence = [
+        retained_by_scenario[predecessor]
+        for predecessor in expected_predecessors
+    ]
+    host_path = str(host_attestation.get("attestation_file") or "").strip()
     payload: dict[str, Any] = {
         "artifact_type": "g5_real_execution_failure",
         "schema_version": G5_FAILURE_ARTIFACT_SCHEMA_VERSION,
         "repository_revision": dict(revision),
+        "attempt_id": str(attempt_id),
         "scenario_id": str(scenario_id),
         "stage": str(stage),
         "error_type": type(error).__name__,
         "error": str(redact(str(error))),
         "approved_plans": plans,
-        "host_attestation_file": str(
-            host_attestation.get("attestation_file") or ""
-        ),
-        "host_attestation_sha256": str(
-            host_attestation.get("attestation_file_sha256") or ""
+        "approved_plan_provenance": approvals,
+        "retained_scenario_evidence": retained_evidence,
+        "host_attestation": (
+            _failure_input_binding(Path(host_path))
+            if host_path
+            else {
+                "path": "",
+                "status": "missing",
+                "sha256": "",
+                "size_bytes": 0,
+                "error": f"{ATTESTATION_ENV} is not set",
+            }
         ),
         "observed_at": _utc_timestamp(),
     }
@@ -377,10 +452,134 @@ def _write_g5_failure_artifact(
     digest = hashlib.sha256(serialized).hexdigest()
     path = evidence_dir / f"g5-real-execution-failure-{digest}.json"
     _write_immutable_json(path, payload)
+    path.chmod(0o400)
     valid, reason = validate_g5_failure_artifact(path, revision=revision)
     if not valid:
         raise RuntimeError(f"persisted G5 failure evidence is invalid: {reason}")
     return path
+
+
+def _write_g5_bootstrap_failure_artifact(
+    *,
+    evidence_dir: Path,
+    stage: str,
+    error: Exception | str,
+    plan_files: Sequence[Path],
+    approval_files: Sequence[Path],
+    host_attestation_file: str,
+) -> Path:
+    """Persist a non-qualifying failure when revision identity is unavailable."""
+
+    host_path = str(host_attestation_file or "").strip()
+    payload: dict[str, Any] = {
+        "artifact_type": "g5_worker_bootstrap_failure",
+        "schema_version": G5_BOOTSTRAP_FAILURE_SCHEMA_VERSION,
+        "qualifying_evidence": False,
+        "repository_revision_status": "unavailable",
+        "stage": str(stage),
+        "error_type": type(error).__name__,
+        "error": str(redact(str(error))),
+        "approved_plans": [
+            _failure_input_binding(path) for path in plan_files
+        ],
+        "approved_plan_provenance": [
+            _failure_input_binding(path) for path in approval_files
+        ],
+        "host_attestation": (
+            _failure_input_binding(Path(host_path))
+            if host_path
+            else {
+                "path": "",
+                "status": "missing",
+                "sha256": "",
+                "size_bytes": 0,
+                "error": f"{ATTESTATION_ENV} is not set",
+            }
+        ),
+        "observed_at": _utc_timestamp(),
+    }
+    payload["failure_id"] = _canonical_hash(payload)
+    serialized = (
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    digest = hashlib.sha256(serialized).hexdigest()
+    path = evidence_dir / f"g5-worker-bootstrap-failure-{digest}.json"
+    _write_immutable_json(path, payload)
+    path.chmod(0o400)
+    if _sha256(path) != digest:
+        raise RuntimeError("persisted G5 bootstrap failure identity mismatch")
+    return path
+
+
+def _failure_input_binding(path: Path) -> dict[str, Any]:
+    resolved = path.resolve(strict=False)
+    record: dict[str, Any] = {
+        "path": str(resolved),
+        "status": "missing",
+        "sha256": "",
+        "size_bytes": 0,
+        "error": "",
+    }
+    try:
+        if path.is_symlink():
+            record.update(
+                status="unreadable",
+                error="input path is a symlink",
+            )
+        elif not resolved.exists():
+            record["error"] = "input path does not exist"
+        elif not resolved.is_file():
+            record.update(
+                status="unreadable",
+                error="input path is not a regular file",
+            )
+        else:
+            record.update(
+                status="present",
+                sha256=_sha256(resolved),
+                size_bytes=resolved.stat().st_size,
+            )
+    except OSError as exc:
+        record.update(
+            status="unreadable",
+            error=str(redact(str(exc))),
+        )
+    return record
+
+
+def _validate_failure_input_binding(
+    item: Mapping[str, Any],
+    *,
+    label: str,
+) -> tuple[bool, str]:
+    if set(item) != {
+        "path",
+        "status",
+        "sha256",
+        "size_bytes",
+        "error",
+    }:
+        return False, f"G5 failure evidence {label} binding shape is invalid"
+    path = Path(str(item.get("path") or ""))
+    status = str(item.get("status") or "")
+    if status not in {"present", "missing", "unreadable"}:
+        return False, f"G5 failure evidence {label} status is invalid"
+    if status == "present":
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or _sha256(path) != str(item.get("sha256") or "")
+            or path.stat().st_size != item.get("size_bytes")
+            or item.get("error")
+        ):
+            return False, f"G5 failure evidence {label} binding is invalid"
+    elif (
+        item.get("sha256")
+        or item.get("size_bytes") != 0
+        or not str(item.get("error") or "")
+    ):
+        return False, f"G5 failure evidence {label} absence is invalid"
+    return True, ""
 
 
 def validate_g5_failure_artifact(
@@ -403,6 +602,20 @@ def validate_g5_failure_artifact(
         return False, "G5 failure evidence schema is invalid"
     if dict(payload.get("repository_revision") or {}) != dict(revision):
         return False, "G5 failure evidence revision mismatch"
+    attempt_id = str(payload.get("attempt_id") or "")
+    if (
+        len(attempt_id) != 32
+        or any(character not in "0123456789abcdef" for character in attempt_id)
+    ):
+        return False, "G5 failure evidence attempt identity is invalid"
+    scenario_id = str(payload.get("scenario_id") or "")
+    if scenario_id:
+        try:
+            failed_admission = g5_scenario_admission(scenario_id)
+        except ValueError:
+            return False, "G5 failure evidence scenario is invalid"
+    elif str(payload.get("stage") or "") != "worker_admission":
+        return False, "G5 failure evidence global scenario is invalid"
     if str(payload.get("stage") or "") not in G5_FAILURE_STAGES:
         return False, "G5 failure evidence stage is invalid"
     if not str(payload.get("error") or ""):
@@ -411,12 +624,91 @@ def validate_g5_failure_artifact(
     if len(plans) != 3 or len({str(item.get("path") or "") for item in plans}) != 3:
         return False, "G5 failure evidence plan set is invalid"
     for item in plans:
-        plan_path = Path(str(item.get("path") or ""))
-        if not plan_path.is_file() or _sha256(plan_path) != str(item.get("sha256") or ""):
-            return False, "G5 failure evidence plan binding is invalid"
-    host_hash = str(payload.get("host_attestation_sha256") or "")
-    if not _is_sha256(host_hash):
+        valid, reason = _validate_failure_input_binding(item, label="plan")
+        if not valid:
+            return False, reason
+    approvals = list(payload.get("approved_plan_provenance") or ())
+    if (
+        len(approvals) != 4
+        or len({str(item.get("path") or "") for item in approvals}) != 4
+    ):
+        return False, "G5 failure evidence approval provenance set is invalid"
+    for item in approvals:
+        valid, reason = _validate_failure_input_binding(
+            item,
+            label="approval provenance",
+        )
+        if not valid:
+            return False, reason
+    retained = list(payload.get("retained_scenario_evidence") or ())
+    ledger: Mapping[str, Any] | None = None
+    if retained:
+        try:
+            ledger = build_ledger(revision=revision)
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            return False, f"G5 retained evidence ledger is unavailable: {exc}"
+    retained_scenarios: set[str] = set()
+    for item in retained:
+        if set(item) != {"path", "sha256", "evidence_id", "scenario_id"}:
+            return False, "G5 retained scenario evidence shape is invalid"
+        retained_path = Path(str(item.get("path") or ""))
+        scenario = str(item.get("scenario_id") or "")
+        retained_payload: Mapping[str, Any] = {}
+        try:
+            retained_payload = json.loads(retained_path.read_text(encoding="utf-8"))
+            retained_spec = scenario_by_id(scenario)
+            retained_edge = _edge_by_action(
+                ledger or {},
+                retained_spec.action_type,
+            )
+            retained_valid, _retained_reason = (
+                validate_real_execution_evidence_artifact(
+                    retained_payload,
+                    edge=retained_edge,
+                    revision=revision,
+                    allow_observed_failure=True,
+                )
+            )
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            retained_valid = False
+        if (
+            retained_path.is_symlink()
+            or not retained_path.is_file()
+            or retained_path.stat().st_mode & 0o222
+            or _sha256(retained_path) != str(item.get("sha256") or "")
+            or not _is_sha256(str(item.get("evidence_id") or ""))
+            or not scenario
+            or scenario in retained_scenarios
+            or not retained_valid
+            or str(retained_payload.get("evidence_id") or "")
+            != str(item.get("evidence_id") or "")
+        ):
+            return False, "G5 retained scenario evidence binding is invalid"
+        retained_scenarios.add(scenario)
+    expected_predecessors: tuple[str, ...] = ()
+    if scenario_id:
+        expected_predecessors = tuple(
+            candidate_id
+            for candidate_id, candidate_admission in sorted(
+                G5_SCENARIO_ADMISSION.items(),
+                key=lambda item: item[1].sequence_index,
+            )
+            if candidate_admission.sequence_index
+            < failed_admission.sequence_index
+        )
+    if tuple(
+        str(item.get("scenario_id") or "") for item in retained
+    ) != expected_predecessors:
+        return False, "G5 retained evidence is not the legal predecessor prefix"
+    host_binding = payload.get("host_attestation")
+    if not isinstance(host_binding, Mapping):
         return False, "G5 failure evidence host binding is invalid"
+    valid, reason = _validate_failure_input_binding(
+        host_binding,
+        label="host attestation",
+    )
+    if not valid:
+        return False, reason
     unsigned = dict(payload)
     failure_id = str(unsigned.pop("failure_id", ""))
     if _canonical_hash(unsigned) != failure_id:
@@ -450,7 +742,6 @@ def _build_admission_envelope(
     admission = g5_scenario_admission(scenario.scenario_id)
     execution_env = dict((plan.get("execution") or {}).get("environment") or {})
     endpoint = str(execution_env.get(admission.endpoint_env_var) or "").strip()
-    metrics_url = str(execution_env.get("NODE_PROMETHEUS_METRICS_URL") or "").strip()
     endpoint_contract: dict[str, Any] = {}
     container_requirements: dict[str, Any] = {}
     if admission.endpoint_env_var:
@@ -472,7 +763,7 @@ def _build_admission_envelope(
             ).hexdigest(),
             "metrics_env_var": "NODE_PROMETHEUS_METRICS_URL",
             "metrics_url_sha256": hashlib.sha256(
-                metrics_url.encode("utf-8")
+                G5_RUNTIME_CONTRACT.metrics_url.encode("utf-8")
             ).hexdigest(),
             "metrics_required": True,
         }
@@ -687,7 +978,6 @@ def _attest_geth_dev_runtime(
     route_resolver = route_resolver or _resolve_endpoint_route
     requirements = dict(envelope.get("container_metrics_requirements") or {})
     compose_service = str(requirements.get("compose_service") or "")
-    metrics_env_var = str(requirements.get("metrics_env_var") or "")
     container = dict(host_attestation.get("target_container") or {})
     networks = dict(container.get("networks") or {})
     container_id = str(container.get("container_id") or "")
@@ -716,9 +1006,7 @@ def _attest_geth_dev_runtime(
     ):
         raise RuntimeError("host attestation identity does not describe geth-dev")
     execution_env = dict((plan.get("execution") or {}).get("environment") or {})
-    metrics_url = str(execution_env.get(metrics_env_var) or "").strip()
-    if not metrics_url:
-        raise RuntimeError("approved plan has no geth-dev metrics endpoint")
+    metrics_url = G5_RUNTIME_CONTRACT.metrics_url
     endpoint_env_var = str(
         (envelope.get("endpoint_identity_contract") or {}).get("env_var") or ""
     )
@@ -924,6 +1212,10 @@ def execute_required_edges(
     fake_plan_file: Path,
     rpc_plan_file: Path,
     sync_plan_file: Path,
+    fake_approval_file: Path,
+    rpc_smoke_approval_file: Path,
+    rpc_final_approval_file: Path,
+    sync_approval_file: Path,
     jobs_dir: Path,
     evidence_dir: Path,
     timeout_seconds: float,
@@ -935,6 +1227,53 @@ def execute_required_edges(
         if not plan_file.is_file():
             raise FileNotFoundError(f"approved plan not found: {plan_file}")
     revision = repository_revision(REPO_ROOT)
+    approval_contracts = (
+        (
+            fake_approval_file,
+            fake_plan_file,
+            RPC_BENCHMARK_WORKFLOW,
+            "fake-node",
+            "approve_preflight_smoke",
+        ),
+        (
+            rpc_smoke_approval_file,
+            rpc_plan_file,
+            RPC_BENCHMARK_WORKFLOW,
+            "real-node",
+            "approve_preflight_smoke",
+        ),
+        (
+            rpc_final_approval_file,
+            rpc_plan_file,
+            RPC_BENCHMARK_WORKFLOW,
+            "real-node",
+            "approve_final_benchmark",
+        ),
+        (
+            sync_approval_file,
+            sync_plan_file,
+            SYNC_OBSERVE_WORKFLOW,
+            "sync-observe",
+            "approve_preflight_smoke",
+        ),
+    )
+    for (
+        approval_file,
+        plan_file,
+        workflow,
+        target_mode,
+        approval_action,
+    ) in approval_contracts:
+        valid, reason = validate_approved_plan_artifact(
+            approval_file,
+            expected_revision=revision,
+            expected_plan_file=plan_file,
+            expected_workflow=workflow,
+            expected_target_mode=target_mode,
+            expected_approval_action=approval_action,
+        )
+        if not valid:
+            raise RuntimeError(f"Agent approved-plan provenance is invalid: {reason}")
     _validate_source_plan(
         fake_plan_file,
         workflow_type=RPC_BENCHMARK_WORKFLOW,
@@ -971,6 +1310,15 @@ def execute_required_edges(
             fake_plan_file=fake_plan_file,
             rpc_plan_file=rpc_plan_file,
             sync_plan_file=sync_plan_file,
+        )
+        approval_file = (
+            rpc_final_approval_file.resolve()
+            if scenario.action_type == "approve_final_benchmark"
+            else {
+                fake_plan_file.resolve(): fake_approval_file.resolve(),
+                rpc_plan_file.resolve(): rpc_smoke_approval_file.resolve(),
+                sync_plan_file.resolve(): sync_approval_file.resolve(),
+            }[plan_file.resolve()]
         )
         approved_plan = _stage_call(
             scenario.scenario_id,
@@ -1147,6 +1495,8 @@ def execute_required_edges(
             "approved_plan_file": str(plan_file.resolve()),
             "approved_plan_sha256": plan_hash,
             "approved_plan_revision": dict(revision),
+            "approved_plan_provenance_file": str(approval_file),
+            "approved_plan_provenance_sha256": _sha256(approval_file),
             "admission_envelope_file": str(envelope_file.resolve()),
             "admission_envelope_sha256": envelope_hash,
             "jobs_dir": str(jobs_dir.resolve()),
@@ -1191,8 +1541,11 @@ def execute_required_edges(
                 f"real execution evidence failed validation: {reason}",
             )
         artifacts.append(artifact)
+        written_path = write_evidence_artifact(artifact, evidence_dir)
+        if written_path.is_file():
+            written_path.chmod(0o400)
+        written.append(written_path)
         if not succeeded:
-            written_path = write_evidence_artifact(artifact, evidence_dir)
             raise G5ExecutionStageError(
                 scenario.scenario_id,
                 "terminal_job",
@@ -1218,8 +1571,6 @@ def execute_required_edges(
             "ledger_validation",
             f"real execution ledger failed validation: {reason}",
         )
-    for artifact in artifacts:
-        written.append(write_evidence_artifact(artifact, evidence_dir))
     return written
 
 
@@ -1228,73 +1579,181 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--fake-plan", required=True, type=Path)
     parser.add_argument("--rpc-plan", required=True, type=Path)
     parser.add_argument("--sync-plan", required=True, type=Path)
+    parser.add_argument("--fake-approval", required=True, type=Path)
+    parser.add_argument("--rpc-smoke-approval", required=True, type=Path)
+    parser.add_argument("--rpc-final-approval", required=True, type=Path)
+    parser.add_argument("--sync-approval", required=True, type=Path)
     parser.add_argument("--jobs-dir", required=True, type=Path)
     parser.add_argument("--evidence-dir", required=True, type=Path)
     parser.add_argument("--timeout", type=float, default=300.0)
     return parser.parse_args(argv)
 
 
+def _attempt_evidence_paths(attempt_dir: Path) -> list[Path]:
+    paths: list[tuple[int, Path]] = []
+    for path in attempt_dir.glob("*.json"):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("evidence_class") != "real_execution":
+            continue
+        admission = g5_scenario_admission(
+            str(payload.get("scenario_id") or "")
+        )
+        paths.append((admission.sequence_index, path))
+    return [path for _sequence, path in sorted(paths)]
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     raw_argv = list(argv if argv is not None else sys.argv[1:])
     args = _parse_args(raw_argv)
-    revision = repository_revision(REPO_ROOT)
     attestation_file = os.environ.get(ATTESTATION_ENV, "").strip()
-    if not attestation_file:
-        raise RuntimeError(
-            f"{ATTESTATION_ENV} is required; launch this worker through "
-            "real_execution_host_supervisor"
-        )
-    host_attestation = _load_host_attestation(
-        attestation_file,
-        revision=revision,
-        worker_argv=raw_argv,
-    )
     plan_files = (
         args.fake_plan.resolve(),
         args.rpc_plan.resolve(),
         args.sync_plan.resolve(),
     )
+    approval_files = (
+        args.fake_approval.resolve(),
+        args.rpc_smoke_approval.resolve(),
+        args.rpc_final_approval.resolve(),
+        args.sync_approval.resolve(),
+    )
+    revision: dict[str, str] | None = None
+    host_attestation: dict[str, Any] = {
+        "attestation_file": attestation_file,
+    }
+    g5_root = args.evidence_dir.resolve().parent
+    attempt_id, attempt_evidence_dir = create_g5_attempt(
+        args.evidence_dir.resolve()
+    )
     try:
+        revision = repository_revision(REPO_ROOT)
+        if not attestation_file:
+            raise RuntimeError(
+                f"{ATTESTATION_ENV} is required; launch this worker through "
+                "real_execution_host_supervisor"
+            )
+        host_attestation = _load_host_attestation(
+            attestation_file,
+            revision=revision,
+            worker_argv=raw_argv,
+        )
         paths = execute_required_edges(
             fake_plan_file=plan_files[0],
             rpc_plan_file=plan_files[1],
             sync_plan_file=plan_files[2],
+            fake_approval_file=args.fake_approval.resolve(),
+            rpc_smoke_approval_file=args.rpc_smoke_approval.resolve(),
+            rpc_final_approval_file=args.rpc_final_approval.resolve(),
+            sync_approval_file=args.sync_approval.resolve(),
             jobs_dir=args.jobs_dir.resolve(),
-            evidence_dir=args.evidence_dir.resolve(),
+            evidence_dir=attempt_evidence_dir,
             timeout_seconds=args.timeout,
             host_attestation=host_attestation,
         )
     except G5ExecutionStageError as exc:
+        if exc.scenario_id == "<ledger>":
+            publish_g5_collection(
+                g5_root=g5_root,
+                attempt_id=attempt_id,
+                revision=revision,
+                evidence_paths=_attempt_evidence_paths(
+                    attempt_evidence_dir
+                ),
+                status="failed",
+            )
+            raise RuntimeError(
+                f"G5 ledger validation failed: {exc.cause}"
+            ) from exc
         if exc.evidence_path is not None:
+            publish_g5_collection(
+                g5_root=g5_root,
+                attempt_id=attempt_id,
+                revision=revision,
+                evidence_paths=_attempt_evidence_paths(
+                    attempt_evidence_dir
+                ),
+                status="failed",
+                failure_path=exc.evidence_path,
+            )
             raise RuntimeError(
                 f"G5 execution failed with retained evidence: {exc.evidence_path}"
             ) from exc
         failure_path = _write_g5_failure_artifact(
-            evidence_dir=args.evidence_dir.resolve(),
+            evidence_dir=attempt_evidence_dir,
             revision=revision,
             scenario_id=exc.scenario_id,
             stage=exc.stage,
             error=exc.cause,
             plan_files=plan_files,
+            approval_files=approval_files,
             host_attestation=host_attestation,
+            attempt_id=attempt_id,
+        )
+        retained_paths = [
+            Path(str(item["path"]))
+            for item in json.loads(
+                failure_path.read_text(encoding="utf-8")
+            ).get("retained_scenario_evidence", [])
+        ]
+        publish_g5_collection(
+            g5_root=g5_root,
+            attempt_id=attempt_id,
+            revision=revision,
+            evidence_paths=retained_paths,
+            status="failed",
+            failure_path=failure_path,
         )
         raise RuntimeError(
             f"G5 execution failed with retained stage evidence: {failure_path}"
         ) from exc
     except Exception as exc:
+        if revision is None:
+            failure_path = _write_g5_bootstrap_failure_artifact(
+                evidence_dir=attempt_evidence_dir,
+                stage="worker_admission",
+                error=exc,
+                plan_files=plan_files,
+                approval_files=approval_files,
+                host_attestation_file=attestation_file,
+            )
+            raise RuntimeError(
+                "G5 worker bootstrap failed without a repository revision; "
+                f"non-qualifying evidence: {failure_path}"
+            ) from exc
         failure_path = _write_g5_failure_artifact(
-            evidence_dir=args.evidence_dir.resolve(),
+            evidence_dir=attempt_evidence_dir,
             revision=revision,
             scenario_id="",
             stage="worker_admission",
             error=exc,
             plan_files=plan_files,
+            approval_files=approval_files,
             host_attestation=host_attestation,
+            attempt_id=attempt_id,
+        )
+        publish_g5_collection(
+            g5_root=g5_root,
+            attempt_id=attempt_id,
+            revision=revision,
+            evidence_paths=(),
+            status="failed",
+            failure_path=failure_path,
         )
         raise RuntimeError(
             f"G5 worker failed with retained evidence: {failure_path}"
         ) from exc
-    print(json.dumps({"executed": len(paths), "evidence": [str(path) for path in paths]}))
+    manifest = publish_g5_collection(
+        g5_root=g5_root,
+        attempt_id=attempt_id,
+        revision=revision,
+        evidence_paths=paths,
+        status="complete",
+    )
+    print(json.dumps({
+        "executed": len(paths),
+        "evidence": [str(path) for path in paths],
+        "collection_manifest": str(manifest),
+    }))
     return 0
 
 

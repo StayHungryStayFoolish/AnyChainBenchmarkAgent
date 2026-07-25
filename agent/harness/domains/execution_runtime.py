@@ -12,7 +12,6 @@ from ...runners.application_service import (
 )
 from ...planners.strategy_planner import (
     materialize_custom_rpc_template,
-    template_requirements_from_override,
 )
 
 from ..state import AgentGraphState
@@ -57,7 +56,6 @@ def execute_approved_preflight_and_smoke(state: AgentGraphState) -> HandlerResul
                 plan=output.get("plan") or None,
                 approved=True,
                 idempotency_key=_execution_idempotency_key(output),
-                runtime_override_sources=_runtime_override_sources(output),
             )
         ).to_dict()
         output["job"] = _job_from_execution_result(job_result)
@@ -106,7 +104,6 @@ def execute_approved_preflight_and_smoke(state: AgentGraphState) -> HandlerResul
                 plan=output.get("plan") or None,
                 approved=True,
                 idempotency_key=_execution_idempotency_key(output),
-                runtime_override_sources=_runtime_override_sources(output),
             )
         ).to_dict()
         output["smoke"] = smoke
@@ -137,7 +134,6 @@ def execute_approved_preflight_and_smoke(state: AgentGraphState) -> HandlerResul
             plan=output.get("plan") or None,
             approved=True,
             idempotency_key=_execution_idempotency_key(output),
-            runtime_override_sources=_runtime_override_sources(output),
         )
     ).to_dict()
     smoke_job = _job_from_execution_result(smoke)
@@ -180,7 +176,6 @@ def execute_approved_final_benchmark(state: AgentGraphState) -> HandlerResult:
             plan=output.get("plan") or None,
             approved=True,
             idempotency_key=_execution_idempotency_key(output),
-            runtime_override_sources=_runtime_override_sources(output),
         )
     ).to_dict()
     job = (result.get("data") or {}).get("job", {})
@@ -330,12 +325,41 @@ def _prepare_kwargs(state: AgentGraphState) -> dict[str, Any]:
 
 
 def _prepare_benchmark_with_runtime_contract(state: AgentGraphState) -> dict[str, Any]:
-    """Prepare a plan, then close any validated custom-RPC runtime contract."""
+    """Prepare one immutable plan containing the validated custom-RPC closure."""
 
+    prepare_kwargs = _prepare_kwargs(state)
+    workload = state.get("workload") or {}
+    if workload.get("job_local_override"):
+        identity = state.get("chain_identity") or {}
+        validated = [
+            dict(item)
+            for item in validated_contracts_view(state)
+            if isinstance(item, dict)
+        ]
+        chain = str(
+            identity.get("canonical") or identity.get("raw") or ""
+        ).strip().lower()
+        family = str(identity.get("adapter_family") or "").strip().lower()
+        override = materialize_custom_rpc_template(
+            chain=chain,
+            adapter_family=family,
+            rpc_mode=str(state.get("rpc_mode") or "single"),
+            workload=dict(workload),
+            validated_methods=validated,
+        )
+        if override:
+            materialization_evidence = (
+                (override.get("_meta") or {}).get("materialization_evidence")
+                if isinstance(override.get("_meta"), dict)
+                else {}
+            )
+            if isinstance(materialization_evidence, dict):
+                emit_materialization_receipt(state, materialization_evidence)
+            prepare_kwargs["chain_config_override"] = override
     prepared_result = execution_service.execute(
         ExecutionRequest(
             operation=ExecutionOperation.PREPARE,
-            prepare_kwargs=_prepare_kwargs(state),
+            prepare_kwargs=prepare_kwargs,
         )
     )
     prepared = prepared_result.to_dict()
@@ -346,79 +370,12 @@ def _prepare_benchmark_with_runtime_contract(state: AgentGraphState) -> dict[str
             "checks": [],
             "warnings": list(prepared_result.warnings),
         }
-    workload = state.get("workload") or {}
-    if not workload.get("job_local_override"):
-        return prepared
-    identity = state.get("chain_identity") or {}
-    validated = [dict(item) for item in validated_contracts_view(state) if isinstance(item, dict)]
-    if not validated:
-        return prepared
-    chain = str(identity.get("canonical") or identity.get("raw") or "").strip().lower()
-    family = str(identity.get("adapter_family") or "").strip().lower()
-    override = materialize_custom_rpc_template(
-        chain=chain,
-        adapter_family=family,
-        rpc_mode=str(state.get("rpc_mode") or "single"),
-        workload=dict(workload),
-        validated_methods=validated,
-    )
-    if not override:
-        return prepared
-    materialization_evidence = (
-        (override.get("_meta") or {}).get("materialization_evidence")
-        if isinstance(override.get("_meta"), dict)
-        else {}
-    )
-    if isinstance(materialization_evidence, dict):
-        emit_materialization_receipt(state, materialization_evidence)
-
-    data = prepared.setdefault("data", {})
-    plan = data.setdefault("plan", {})
-    original_preflight = data.get("preflight") if isinstance(data.get("preflight"), dict) else {}
-    stale_blockers = {str(item) for item in original_preflight.get("blockers") or []}
-    plan["chain_config_override"] = override
-    plan["chain_template_requirements"] = template_requirements_from_override(chain, override)
-    plan.setdefault("artifacts", {})["chain_config_override_file"] = "<job_run_dir>/chain_template.override.json"
-    preflight_result = execution_service.execute(
-        ExecutionRequest(operation=ExecutionOperation.PREFLIGHT, plan=plan)
-    )
-    preflight = dict(preflight_result.data.get("preflight") or {})
-    # A complete job-local Case2 template is the chain template for this job;
-    # canonical config existence is deliberately not required.
-    for check in preflight.get("checks") or []:
-        if check.get("name") in {"chain_template_exists", "chain_template_json_valid"}:
-            check.update({"passed": True, "detail": "<job-local-chain-template>"})
-    preflight["passed"] = all(bool(item.get("passed")) for item in preflight.get("checks") or [])
-    preflight["blockers"] = [
-        f"{item.get('name')}: {item.get('detail')}"
-        for item in preflight.get("checks") or []
-        if not item.get("passed")
-    ]
-    data["preflight"] = preflight
-    prepared["status"] = "ok" if preflight.get("passed") else "blocked"
-    retained_warnings = [
-        str(item)
-        for item in prepared.get("warnings") or []
-        if str(item) not in stale_blockers
-    ]
-    prepared["warnings"] = list(dict.fromkeys([
-        *retained_warnings,
-        *(str(item) for item in preflight.get("warnings") or []),
-        *(str(item) for item in preflight.get("blockers") or []),
-    ]))
     return prepared
 
 
 def _execution_idempotency_key(state: AgentGraphState) -> str:
     request_id = str((state.get("preflight") or {}).get("execution_request_id") or "").strip()
     return f"harness:{request_id}" if request_id else ""
-
-
-def _runtime_override_sources(state: AgentGraphState) -> tuple[str, ...]:
-    sources: list[str] = []
-    if (state.get("workload") or {}).get("job_local_override"):
-        sources.append("harness.custom_rpc")
-    return tuple(sources)
 
 
 def _job_from_execution_result(result: dict[str, Any]) -> dict[str, Any]:

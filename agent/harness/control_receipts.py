@@ -35,6 +35,7 @@ _COORDINATOR_RECEIPT_TYPES = frozenset({
     "fallback_selection",
     "response_composition",
     "domain_commit",
+    "execution_approval",
 })
 _SHA256_LENGTH = 64
 
@@ -157,6 +158,73 @@ def _validate_pending_resolution(
         or not _valid_hash(receipt.get("input_hash"))
     ):
         return False, "pending-resolution receipt semantics are invalid"
+    return True, ""
+
+
+def _validate_execution_approval(
+    receipt: Mapping[str, Any],
+) -> tuple[bool, str]:
+    fields = {
+        "receipt_type",
+        "turn_index",
+        "approval_question_id",
+        "pending_resolution_receipt_id",
+        "answer_action_id",
+        "approval_action_id",
+        "approval_action_type",
+        "execution_request_id",
+        "side_effect_intent_id",
+        "side_effect_intent_hash",
+        "side_effect_receipt_id",
+        "side_effect_receipt_hash",
+        "idempotency_key_hash",
+        "request_fingerprint",
+        "job_submission_receipt_id",
+        "job_submission_receipt_hash",
+        "approved_plan_hash",
+        "repository_revision",
+        "plan_hash",
+        "workflow_type",
+        "target_mode",
+        "job_id",
+    }
+    if not _exact_fields(receipt, fields):
+        return False, "execution-approval receipt shape is invalid"
+    revision = receipt.get("repository_revision")
+    approval_contracts = {
+        "preflight_smoke_confirm": "approve_preflight_smoke",
+        "real_node_smoke_confirm": "approve_preflight_smoke",
+        "real_node_final_benchmark_confirm": "approve_final_benchmark",
+    }
+    question_id = str(receipt.get("approval_question_id") or "")
+    if (
+        approval_contracts.get(question_id)
+        != receipt.get("approval_action_type")
+        or not _valid_hash(receipt.get("pending_resolution_receipt_id"))
+        or not str(receipt.get("answer_action_id") or "")
+        or not str(receipt.get("approval_action_id") or "")
+        or receipt.get("answer_action_id") == receipt.get("approval_action_id")
+        or not str(receipt.get("execution_request_id") or "")
+        or not _valid_hash(receipt.get("side_effect_intent_id"))
+        or not _valid_hash(receipt.get("side_effect_intent_hash"))
+        or not _valid_hash(receipt.get("side_effect_receipt_id"))
+        or not _valid_hash(receipt.get("side_effect_receipt_hash"))
+        or not _valid_hash(receipt.get("idempotency_key_hash"))
+        or not _valid_hash(receipt.get("request_fingerprint"))
+        or not _valid_hash(receipt.get("job_submission_receipt_id"))
+        or not _valid_hash(receipt.get("job_submission_receipt_hash"))
+        or not _valid_hash(receipt.get("approved_plan_hash"))
+        or not isinstance(revision, Mapping)
+        or set(revision) != {"commit", "worktree_hash"}
+        or not _valid_hash(revision.get("worktree_hash"))
+        or len(str(revision.get("commit") or "")) != 40
+        or not _valid_hash(receipt.get("plan_hash"))
+        or receipt.get("workflow_type") not in {"rpc_benchmark", "sync_observe"}
+        or receipt.get("target_mode")
+        not in {"fake-node", "real-node", "sync-observe"}
+        or not str(receipt.get("job_id") or "")
+    ):
+        return False, "execution-approval receipt semantics are invalid"
     return True, ""
 
 
@@ -507,6 +575,7 @@ def validate_coordinator_control_receipt(
         "fallback_selection": _validate_fallback_selection,
         "response_composition": _validate_response_composition,
         "domain_commit": _validate_domain_commit,
+        "execution_approval": _validate_execution_approval,
     }
     return validators[receipt_type](receipt)
 

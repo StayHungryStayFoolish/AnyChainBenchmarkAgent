@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-PROJECTION_SCHEMA_VERSION = 1
+PROJECTION_SCHEMA_VERSION = 2
 JOB_LOCAL_ENV_FIELDS = frozenset({
     "BLOCKCHAIN_BENCHMARK_DATA_DIR",
     "MEMORY_SHARE_DIR",
@@ -92,6 +92,7 @@ def validate_execution_plan_projection(
     expected = {
         "approved_plan_file": str(source),
         "approved_plan_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "approved_plan_hash": _content_hash(approved_plan),
         "operation": str(operation),
         "scenario_id": str(scenario_id),
         "runtime_overrides": list(provenance.get("runtime_overrides") or ()),
@@ -120,6 +121,7 @@ def validate_execution_plan_projection(
     receipt = {
         "schema_version": PROJECTION_SCHEMA_VERSION,
         "approved_plan_sha256": expected["approved_plan_sha256"],
+        "approved_plan_hash": expected["approved_plan_hash"],
         "materialized_plan_sha256": _content_hash(materialized_plan),
         "operation": str(operation),
         "scenario_id": str(scenario_id),
@@ -160,6 +162,7 @@ def _validate_persisted_job_projection(
     expected_provenance = {
         "approved_plan_file": str(source),
         "approved_plan_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "approved_plan_hash": _content_hash(approved_plan),
         "operation": str(operation),
         "scenario_id": str(scenario_id),
         "runtime_overrides": list(provenance.get("runtime_overrides") or ()),
@@ -216,6 +219,7 @@ def _validate_persisted_job_projection(
     receipt = {
         "schema_version": PROJECTION_SCHEMA_VERSION,
         "approved_plan_sha256": expected_provenance["approved_plan_sha256"],
+        "approved_plan_hash": expected_provenance["approved_plan_hash"],
         "materialized_plan_sha256": _content_hash(materialized_plan),
         "operation": str(operation),
         "scenario_id": str(scenario_id),

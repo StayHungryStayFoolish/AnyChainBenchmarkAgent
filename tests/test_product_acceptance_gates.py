@@ -97,6 +97,31 @@ class ProductAcceptanceGateWiringTests(unittest.TestCase):
             revision=REVISION,
         )
 
+    def test_g4_malformed_declared_evidence_becomes_a_failed_gate(self) -> None:
+        for round_id in ("round-1", "round-2"):
+            path = (
+                self.phase_root
+                / "g4"
+                / round_id
+                / "evidence-set"
+                / "manifest.json"
+            )
+            path.parent.mkdir(parents=True)
+            path.write_text("{}", encoding="utf-8")
+        with patch.object(
+            acceptance,
+            "load_completed_journey_batch_evidence",
+            side_effect=ValueError("source join failed"),
+        ):
+            result = acceptance._phase8_g4_gate(
+                phase_root=self.phase_root,
+                obligations=({"obligation_id": "obligation-1"},),
+                revision=REVISION,
+            )
+        self.assertEqual(result["status"], "failed")
+        self.assertFalse(result["complete"])
+        self.assertIn("source join failed", result["reason"])
+
     def test_g3_missing_or_rejected_manifest_fails_closed(self) -> None:
         missing = acceptance._phase8_g3_gate(
             phase_root=self.phase_root,
@@ -132,6 +157,36 @@ class ProductAcceptanceGateWiringTests(unittest.TestCase):
         g3_section = source.split("g4_summary", 1)[0]
         self.assertNotIn("_json_files", g3_section)
         self.assertIn("_phase8_g3_gate", g3_section)
+
+    def test_g5_missing_collection_is_incomplete(self) -> None:
+        ledger = {"summary": {"execution_closure": {"real_execution": {}}}}
+        with patch.object(acceptance, "build_ledger", return_value=ledger):
+            observed_ledger, result = acceptance._phase8_g5_gate(
+                phase_root=self.phase_root,
+                revision=REVISION,
+            )
+
+        self.assertIs(observed_ledger, ledger)
+        self.assertEqual(result["status"], "incomplete")
+
+    def test_g5_invalid_active_collection_is_structured_failure(self) -> None:
+        pointer = self.phase_root / "g5" / "active-collection.json"
+        pointer.parent.mkdir(parents=True)
+        pointer.write_text('{"artifact_type":"invalid"}', encoding="utf-8")
+        ledger = {"summary": {"execution_closure": {"real_execution": {}}}}
+        with patch.object(acceptance, "build_ledger", return_value=ledger):
+            _observed_ledger, result = acceptance._phase8_g5_gate(
+                phase_root=self.phase_root,
+                revision=REVISION,
+            )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("schema is invalid", result["global_ledger_reason"])
+
+    def test_g5_controller_contains_no_evidence_directory_glob(self) -> None:
+        source = inspect.getsource(acceptance._phase8_source)
+        self.assertNotIn("_json_files(phase_root / \"g5\"", source)
+        self.assertIn("_phase8_g5_gate", source)
 
     def test_g6_runs_typed_generator_then_independent_validator(self) -> None:
         config_path = self._write_g6_config()
