@@ -518,7 +518,12 @@ class CoverageEvidenceTest(unittest.TestCase):
             "pending_question": question,
             "last_user_input": "n2-standard-16",
         }
-        with capture_coverage_events() as events:
+        from tests.agent_live.graph_turn import reviewed_execution_planner
+
+        with capture_coverage_events() as events, reviewed_execution_planner(
+            expected_input="n2-standard-16",
+            expected_admitted=True,
+        ):
             observation = observe_compiled_graph_turn(
                 invoke_product_graph_turn,
                 before,
@@ -567,7 +572,12 @@ class CoverageEvidenceTest(unittest.TestCase):
             "pending_question": question,
             "last_user_input": "n2-standard-16",
         }
-        with capture_coverage_events() as captured:
+        from tests.agent_live.graph_turn import reviewed_execution_planner
+
+        with capture_coverage_events() as captured, reviewed_execution_planner(
+            expected_input="n2-standard-16",
+            expected_admitted=True,
+        ):
             observation = observe_compiled_graph_turn(
                 invoke_product_graph_turn,
                 before,

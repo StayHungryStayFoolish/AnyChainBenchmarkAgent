@@ -7,6 +7,11 @@ import json
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from .contracts import (
+    FailureDescriptor,
+    ResponseFragment,
+    failure_descriptor_to_dict,
+)
 from agent.utils.redaction import redact
 
 
@@ -183,7 +188,7 @@ def domain_blocker_failure_record(
     action: Mapping[str, Any],
     *,
     owner: str,
-    validation_detail: str,
+    validation_detail: FailureDescriptor,
     retained_state: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Describe a rejected domain command without losing its recovery context."""
@@ -208,7 +213,7 @@ def domain_blocker_failure_record(
         facts=[{
             "code": "DOMAIN_ACTION_BLOCKED",
             "source": f"domain:{owner or 'unknown'}",
-            "detail": validation_detail,
+            "failure": failure_descriptor_to_dict(validation_detail),
         }],
         confirmed_config=retained_state.get("confirmed_config") or {},
     )
@@ -220,7 +225,9 @@ def domain_blocker_failure_record(
     })
     record.update({
         "action_identity": safe_action,
-        "validation": {"detail": str(redact(validation_detail))},
+        "validation": {
+            "failure": redact(failure_descriptor_to_dict(validation_detail))
+        },
         "retained_state": redact(dict(retained_state)),
         "affected_group": affected_group,
         "recovery_paths": {
@@ -287,51 +294,87 @@ def build_failure_record(
     }
 
 
-def render_failure_summary(record: Mapping[str, Any], language: str) -> str:
-    zh = str(language or "").startswith("zh")
-    facts = list(record.get("facts") or [])
-    detail = "; ".join(_fact_detail(item) for item in facts if isinstance(item, dict)) or "<none>"
-    paths = ", ".join(str(item) for item in record.get("evidence_paths") or []) or "<none>"
-    preserved = ", ".join(str(item) for item in record.get("preserved_config_keys") or []) or "<none>"
-    action = record.get("action_identity") if isinstance(record.get("action_identity"), Mapping) else {}
-    action_type = str(action.get("type") or "").strip()
-    recovery_paths = record.get("recovery_paths") if isinstance(record.get("recovery_paths"), Mapping) else {}
-    choices = ", ".join(str(name) for name in recovery_paths) or "<none>"
-    if zh:
-        summary = (
-            f"执行恢复：{record.get('severity', 'blocking')} / {record.get('code', 'UNKNOWN')} "
-            f"（诊断 ID：`{record.get('failure_id', '<unknown>')}`）。\n"
-            f"- 已观察到的证据：{detail}\n"
-            f"- 保留的已确认配置：{preserved}\n"
-            f"- 证据路径：{paths}"
-        )
-        if action_type:
-            summary += f"\n- 失败 action：`{action_type}`（`{action.get('action_id') or '<unknown>'}`）\n- 恢复选择：{choices}"
-        return summary
-    summary = (
-        f"Execution recovery: {record.get('severity', 'blocking')} / {record.get('code', 'UNKNOWN')} "
-        f"(diagnostic id: `{record.get('failure_id', '<unknown>')}`).\n"
-        f"- Observed evidence: {detail}\n"
-        f"- Preserved confirmed config: {preserved}\n"
-        f"- Evidence paths: {paths}"
+def failure_response_fragment(failure: FailureDescriptor) -> ResponseFragment:
+    """Project a typed failure into the central response-rendering path."""
+
+    return ResponseFragment(
+        kind="error",
+        message_id=failure.code,
+        arguments=failure.arguments,
+        payload={
+            **dict(failure.payload),
+            "retryable": failure.retryable,
+            "severity": failure.severity,
+        },
+        source=failure.source,
     )
+
+
+def failure_record_response_fragment(record: Mapping[str, Any]) -> ResponseFragment:
+    """Project a durable recovery record without owning localized prose."""
+
+    facts = _canonical_json(record.get("facts") or [])
+    paths = _canonical_json(record.get("evidence_paths") or [])
+    preserved = _canonical_json(record.get("preserved_config_keys") or [])
+    action = (
+        record.get("action_identity")
+        if isinstance(record.get("action_identity"), Mapping)
+        else {}
+    )
+    action_type = str(action.get("type") or "").strip()
+    arguments = {
+        "severity": str(record.get("severity") or "blocking"),
+        "code": str(record.get("code") or "UNKNOWN"),
+        "failure_id": str(record.get("failure_id") or "<unknown>"),
+        "facts": facts,
+        "preserved_config_keys": preserved,
+        "evidence_paths": paths,
+    }
+    message_id = "harness.failure.recovery_summary"
     if action_type:
-        summary += f"\n- Failed action: `{action_type}` (`{action.get('action_id') or '<unknown>'}`)\n- Recovery choices: {choices}"
-    return summary
+        message_id = "harness.failure.recovery_action_summary"
+        recovery_paths = (
+            record.get("recovery_paths")
+            if isinstance(record.get("recovery_paths"), Mapping)
+            else {}
+        )
+        arguments.update({
+            "action_type": action_type,
+            "action_id": str(action.get("action_id") or "<unknown>"),
+            "recovery_choices": _canonical_json(sorted(recovery_paths)),
+        })
+    return ResponseFragment(
+        kind="error",
+        message_id=message_id,
+        arguments=arguments,
+        payload={
+            "failure_id": str(record.get("failure_id") or ""),
+            "failure_code": str(record.get("code") or ""),
+        },
+        source=__name__,
+    )
+
+
+def render_failure_summary(record: Mapping[str, Any], language: str) -> str:
+    """Render legacy analysis callers through the central catalog."""
+
+    from .response_catalog import render_fragment
+
+    return render_fragment(
+        failure_record_response_fragment(record),
+        language,
+    ).text
 
 
 def unresolved_recovery(recovery: Mapping[str, Any] | None) -> bool:
     return bool(recovery and recovery.get("record") and recovery.get("status") in {"pending", "ready_to_revalidate"})
 
 
-def _fact_detail(fact: Mapping[str, Any]) -> str:
-    detail = str(fact.get("detail") or "").strip()
-    if detail:
-        return detail
-    if fact.get("status_codes"):
-        return f"status_codes={fact.get('status_codes')}"
-    if fact.get("artifact"):
-        return f"missing artifact: {fact.get('artifact')}"
-    if fact.get("returncode") is not None:
-        return f"process exit code {fact.get('returncode')}"
-    return str(fact.get("code") or "failure")
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        redact(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )

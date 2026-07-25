@@ -15,9 +15,7 @@ from ..input_values import (
     looks_like_url_value,
     normalize_scalar,
 )
-from ..intent import extract_rpc_schema_from_evidence
-from ..localization import localized
-from ..questions import render_question
+from ..advisory import extract_rpc_schema_from_evidence
 from ..state import AgentGraphState
 from ..transitions import (
     invalidate_for_endpoint_change,
@@ -39,6 +37,7 @@ from .chain_rpc_questions import (
 )
 from .chain_rpc_support import _adapter_family, _case_dict, _draft_has_params, _looks_like_rest_method, _merge_rpc_schema_draft, _schema_indicates_jsonrpc, _schema_indicates_rest
 from .rpc_workload import _apply_requested_workload
+from .response_fragments import ResponseCollector, emit
 from .rpc_catalog import (
     add_validated_method,
     append_evidence,
@@ -61,23 +60,36 @@ from .rpc_receipts import (
     evidence_hash,
 )
 
-def _apply_endpoint_answer(state: AgentGraphState, question_id: str, value: Any) -> None:
-    language = str(state.get("language") or "en")
+def _apply_endpoint_answer(
+    state: AgentGraphState,
+    endpoint_contract: Mapping[str, Any],
+    value: Any,
+    *,
+    responses: ResponseCollector,
+) -> None:
     endpoint = extract_url_candidate(value) or normalize_scalar(value)
     identity = state.setdefault("chain_identity", {})
     chain = normalize_scalar(identity.get("canonical") or identity.get("raw"))
     family = _adapter_family(state)
     confirmed = state.setdefault("confirmed_config", {})
+    role = normalize_scalar(endpoint_contract.get("endpoint_role"))
+    case = normalize_scalar(endpoint_contract.get("rpc_case"))
+    config_field = normalize_scalar(endpoint_contract.get("config_field"))
+    if (role, case, config_field) not in {
+        ("final_benchmark", "runtime", "LOCAL_RPC_URL"),
+        ("sync_observe", "runtime", "SYNC_OBSERVE_RPC_URL"),
+        ("validation", "custom_rpc", ""),
+        ("validation", "new_chain", ""),
+    }:
+        raise ValueError("invalid typed RPC endpoint contract")
     previous_endpoint = normalize_scalar(
-        confirmed.get("LOCAL_RPC_URL")
-        if question_id == "LOCAL_RPC_URL"
-        else confirmed.get("SYNC_OBSERVE_RPC_URL")
-        if question_id == "SYNC_OBSERVE_RPC_URL"
+        confirmed.get(config_field)
+        if role in {"final_benchmark", "sync_observe"}
         else (state.get("custom_rpc") or {}).get("endpoint")
-        if question_id == "custom_rpc_endpoint"
+        if case == "custom_rpc"
         else (state.get("endpoint_evidence") or {}).get("candidate_endpoint")
     )
-    if question_id == "LOCAL_RPC_URL":
+    if role == "final_benchmark":
         contracts = _selected_custom_contracts(state)
         if contracts:
             result = _validate_final_endpoint_contracts(
@@ -90,12 +102,12 @@ def _apply_endpoint_answer(state: AgentGraphState, question_id: str, value: Any)
             params = None
         else:
             methods, params = health_probe_methods(chain, family)
-    elif question_id == "SYNC_OBSERVE_RPC_URL":
+    elif role == "sync_observe":
         methods = None
         params = None
     else:
         methods, params = health_probe_methods(chain, family)
-    if not (question_id == "LOCAL_RPC_URL" and contracts):
+    if not (role == "final_benchmark" and contracts):
         result = validate_rpc_endpoint(
             chain=chain,
             endpoint=endpoint,
@@ -104,20 +116,6 @@ def _apply_endpoint_answer(state: AgentGraphState, question_id: str, value: Any)
             method_params=params,
             timeout=3.0,
         )
-    role = (
-        "final_benchmark"
-        if question_id == "LOCAL_RPC_URL"
-        else "sync_observe"
-        if question_id == "SYNC_OBSERVE_RPC_URL"
-        else "validation"
-    )
-    case = (
-        "custom_rpc"
-        if question_id == "custom_rpc_endpoint"
-        else "new_chain"
-        if question_id == "new_chain_endpoint"
-        else "runtime"
-    )
     emit_endpoint_role_receipt(
         state,
         role=role,
@@ -130,19 +128,19 @@ def _apply_endpoint_answer(state: AgentGraphState, question_id: str, value: Any)
         adapter_family=family,
         methods=(
             [contract.get("method") for contract in contracts]
-            if question_id == "LOCAL_RPC_URL" and contracts
+            if role == "final_benchmark" and contracts
             else methods or ()
         ),
     )
     evidence = state.setdefault("endpoint_evidence", {})
-    if question_id == "LOCAL_RPC_URL":
+    if role == "final_benchmark":
         evidence["local_rpc_url_probe"] = result
         if contracts:
             evidence["final_custom_rpc_probe"] = result
         if not result.get("ready"):
             evidence["local_rpc_url_ready"] = False
             _record_validation_failure(state, "ENDPOINT_UNREACHABLE", result)
-            state['visible_response'] = [localized(language, f"LOCAL_RPC_URL 验证失败：{result.get('error') or result.get('status')}。证据：{result.get('evidence_file') or '<none>'}。请提供可访问的 endpoint。", f"LOCAL_RPC_URL validation failed: {result.get('error') or result.get('status')}. Evidence: {result.get('evidence_file') or '<none>'}. Provide a reachable endpoint.")]
+            _emit_endpoint_result(responses, "LOCAL_RPC_URL", result, ready=False)
             return
         evidence["local_rpc_url_ready"] = True
         if contracts:
@@ -152,25 +150,25 @@ def _apply_endpoint_answer(state: AgentGraphState, question_id: str, value: Any)
                 contract["final_endpoint_evidence_file"] = str(method_result.get("evidence_file") or "")
             refresh_catalog_projection(state)
         evidence.pop("last_failure_record", None)
-        state.setdefault("confirmed_config", {})["LOCAL_RPC_URL"] = endpoint
+        state.setdefault("confirmed_config", {})[config_field] = endpoint
         if endpoint != previous_endpoint:
             record_group_invalidations(state, "endpoint_process")
-        state['visible_response'] = [localized(language, f"LOCAL_RPC_URL 验证通过。证据：{result.get('evidence_file') or '<none>'}。", f"LOCAL_RPC_URL validation passed. Evidence: {result.get('evidence_file') or '<none>'}.")]
+        _emit_endpoint_result(responses, "LOCAL_RPC_URL", result, ready=True)
         return
-    if question_id == "SYNC_OBSERVE_RPC_URL":
+    if role == "sync_observe":
         evidence["sync_rpc_url_probe"] = result
         evidence["sync_rpc_url_ready"] = bool(result.get("ready"))
         if not result.get("ready"):
             _record_validation_failure(state, "ENDPOINT_UNREACHABLE", result)
-            state['visible_response'] = [localized(language, f"sync-observe endpoint 验证失败：{result.get('error') or result.get('status')}。证据：{result.get('evidence_file') or '<none>'}。请提供真实可访问的节点 RPC endpoint。", f"Sync-observe endpoint validation failed: {result.get('error') or result.get('status')}. Evidence: {result.get('evidence_file') or '<none>'}. Provide a real reachable node RPC endpoint.")]
+            _emit_endpoint_result(responses, "sync-observe endpoint", result, ready=False)
             return
-        state.setdefault("confirmed_config", {})["SYNC_OBSERVE_RPC_URL"] = endpoint
+        state.setdefault("confirmed_config", {})[config_field] = endpoint
         if endpoint != previous_endpoint:
             record_group_invalidations(state, "endpoint_process")
         evidence.pop("last_failure_record", None)
-        state['visible_response'] = [localized(language, f"sync-observe endpoint 验证通过。证据：{result.get('evidence_file') or '<none>'}。", f"Sync-observe endpoint validation passed. Evidence: {result.get('evidence_file') or '<none>'}.")]
+        _emit_endpoint_result(responses, "sync-observe endpoint", result, ready=True)
         return
-    if question_id == "custom_rpc_endpoint":
+    if case == "custom_rpc":
         custom = state.setdefault("custom_rpc", {})
         previous_endpoint = normalize_scalar(custom.get("endpoint"))
         if previous_endpoint and previous_endpoint != endpoint:
@@ -181,16 +179,21 @@ def _apply_endpoint_answer(state: AgentGraphState, question_id: str, value: Any)
         if not result.get("ready"):
             custom["status"] = "probe_failed"
             _record_validation_failure(state, "ENDPOINT_UNREACHABLE", result)
-            state['visible_response'] = [localized(language, f"endpoint 验证失败：{result.get('error') or result.get('status')}。证据：{result.get('evidence_file') or '<none>'}。请提供可访问的 HTTP RPC endpoint。", f"Endpoint validation failed: {result.get('error') or result.get('status')}. Evidence: {result.get('evidence_file') or '<none>'}. Provide a reachable HTTP RPC endpoint.")]
+            _emit_endpoint_result(responses, "validation endpoint", result, ready=False)
             return
         ensure_catalog(state)
         if endpoint != previous_endpoint:
             record_group_invalidations(state, "endpoint_process")
         custom["status"] = "needs_schema_evidence" if draft_view(state).get("method") else "needs_method"
         evidence.pop("last_failure_record", None)
-        state['visible_response'] = [localized(language, f"endpoint 验证通过。证据：{result.get('evidence_file') or '<none>'}。这个 endpoint 只作为自定义 RPC method/schema 验证证据，不会自动作为最终压测的 LOCAL_RPC_URL。", f"Endpoint validation passed. Evidence: {result.get('evidence_file') or '<none>'}. This endpoint is stored only as custom RPC method/schema validation evidence and will not automatically become the final benchmark LOCAL_RPC_URL.")]
+        emit(
+            responses,
+            "chain_rpc.response.custom_endpoint_validation_passed",
+            arguments={"evidence": str(result.get("evidence_file") or "<none>")},
+            source=__name__,
+        )
         if extract_json_object_or_array(value) and extract_rpc_params_or_request(value)[1] is not None:
-            _apply_method_answer(state, "custom_rpc_method", value)
+            _apply_method_answer(state, "custom_rpc", value, responses=responses)
         return
     previous_endpoint = normalize_scalar(evidence.get("candidate_endpoint"))
     if previous_endpoint and previous_endpoint != endpoint:
@@ -199,20 +202,52 @@ def _apply_endpoint_answer(state: AgentGraphState, question_id: str, value: Any)
     if not result.get("ready"):
         identity["status"] = "existing_family_needs_endpoint"
         _record_validation_failure(state, "ENDPOINT_UNREACHABLE", result)
-        state['visible_response'] = [localized(language, f"新链 endpoint 验证失败：{result.get('error') or result.get('status')}。证据：{result.get('evidence_file') or '<none>'}。请提供可访问的 endpoint。", f"New-chain endpoint validation failed: {result.get('error') or result.get('status')}. Evidence: {result.get('evidence_file') or '<none>'}. Provide a reachable endpoint.")]
+        _emit_endpoint_result(responses, "new-chain endpoint", result, ready=False)
         return
     identity["status"] = "existing_family_needs_method"
     if endpoint != previous_endpoint:
         record_group_invalidations(state, "endpoint_process")
     ensure_catalog(state)
     evidence.pop("last_failure_record", None)
-    state['visible_response'] = [localized(language, f"新链 endpoint 验证通过。证据：{result.get('evidence_file') or '<none>'}。", f"New-chain endpoint validation passed. Evidence: {result.get('evidence_file') or '<none>'}.")]
+    _emit_endpoint_result(responses, "new-chain endpoint", result, ready=True)
     if extract_json_object_or_array(value) and extract_rpc_params_or_request(value)[1] is not None:
-        _apply_method_answer(state, "new_chain_method", value)
+        _apply_method_answer(state, "new_chain", value, responses=responses)
 
 
-def _apply_method_answer(state: AgentGraphState, question_id: str, value: Any) -> None:
-    case = "new_chain" if question_id.startswith("new_chain") else "custom_rpc"
+def _emit_endpoint_result(
+    responses: ResponseCollector,
+    endpoint_role: str,
+    result: Mapping[str, Any],
+    *,
+    ready: bool,
+) -> None:
+    arguments: dict[str, str] = {
+        "endpoint_role": endpoint_role,
+        "evidence": str(result.get("evidence_file") or "<none>"),
+    }
+    if not ready:
+        arguments["reason"] = str(
+            result.get("error") or result.get("status") or "validation failed"
+        )
+    emit(
+        responses,
+        (
+            "chain_rpc.response.endpoint_validation_passed"
+            if ready
+            else "chain_rpc.response.endpoint_validation_failed"
+        ),
+        arguments=arguments,
+        source=__name__,
+    )
+
+
+def _apply_method_answer(
+    state: AgentGraphState,
+    case: str,
+    value: Any,
+    *,
+    responses: ResponseCollector,
+) -> None:
     case_dict = _case_dict(state, case)
     raw = str(value or "")
     method_value = normalize_scalar(raw)
@@ -224,11 +259,7 @@ def _apply_method_answer(state: AgentGraphState, question_id: str, value: Any) -
     )
     if not next_method:
         case_dict["status"] = "existing_family_needs_method" if case == "new_chain" else "needs_method"
-        state['visible_response'] = [localized(
-            state.get("language", "en"),
-            "该值既不是可解析 protocol request 中的 method，也不像可直接验证的 RPC method 名称，不符合当前协议族的严格 method grammar。请提供精确 method token 或完整 request。",
-            "The value is neither a method parsed from a protocol request nor a directly verifiable RPC method name accepted by this adapter family's strict grammar. Provide the exact method token or a complete request.",
-        )]
+        emit(responses, "chain_rpc.response.method_identity_required", source=__name__)
         return
     current_method = normalize_scalar(draft_view(state).get("method"))
     if current_method and current_method != next_method:
@@ -241,11 +272,15 @@ def _apply_method_answer(state: AgentGraphState, question_id: str, value: Any) -
         )
         if not transition.accepted:
             case_dict["status"] = "existing_family_needs_schema_evidence" if case == "new_chain" else "needs_schema_evidence"
-            state['visible_response'] = [localized(
-                state.get("language", "en"),
-                f"当前 draft method 是 `{current_method}`，新证据中的 method 是 `{next_method}`。冲突证据不会覆盖 deterministic method identity；请明确修正当前 draft 或先完成/取消它。",
-                f"The current draft method is `{current_method}`, while the new evidence identifies `{next_method}`. Conflicting evidence cannot overwrite deterministic method identity; explicitly correct the current draft or finish/cancel it first.",
-            )]
+            emit(
+                responses,
+                "chain_rpc.response.rpc_method_conflict",
+                arguments={
+                    "incoming_method": next_method,
+                    "current_method": current_method,
+                },
+                source=__name__,
+            )
             return
     elif not current_method:
         append_evidence(
@@ -261,15 +296,26 @@ def _apply_method_answer(state: AgentGraphState, question_id: str, value: Any) -
         or (_looks_like_rest_method(method_value) and not family_is_rest_shaped)
     ):
         case_dict["status"] = "existing_family_needs_method" if case == "new_chain" else "needs_method"
-        state['visible_response'] = [localized(state.get("language", "en"), "这看起来像 endpoint、REST path 或文档标题，不像可直接验证的 RPC method 名称。请提供 method 名称；如果这是 REST API，请先切换/确认协议族为 `rest`，再提供 REST path 和 request/response 证据。" if case == "new_chain" else "这看起来像 endpoint、REST path 或文档标题，不像当前链可直接验证的 RPC method 名称。请提供 method 名称；如果你要改协议/链，请直接说明要切换到哪个链或协议族。", "This looks like an endpoint, REST path, or documentation title rather than a directly verifiable RPC method name. Provide the method name; if this is a REST API, switch/confirm the adapter family as `rest` first, then provide the REST path and request/response evidence." if case == "new_chain" else "This looks like an endpoint, REST path, or documentation title rather than a verifiable RPC method name for the current chain. Provide the method name; if you need to change protocol or chain, say which chain or adapter family to switch to.")]
+        emit(responses, "chain_rpc.response.method_identity_required", source=__name__)
         return
     if parsed is not None:
-        _apply_schema_evidence(state, case=case, evidence=raw)
+        _apply_schema_evidence(
+            state,
+            case=case,
+            evidence=raw,
+            responses=responses,
+        )
         return
     case_dict["status"] = "existing_family_needs_schema_evidence" if case == "new_chain" else "needs_schema_evidence"
 
 
-def _apply_schema_evidence(state: AgentGraphState, *, case: str, evidence: str) -> bool:
+def _apply_schema_evidence(
+    state: AgentGraphState,
+    *,
+    case: str,
+    evidence: str,
+    responses: ResponseCollector,
+) -> bool:
     case_dict = _case_dict(state, case)
     clean_evidence = str(evidence or "").strip()
     incoming_method, incoming_params = extract_rpc_params_or_request(clean_evidence)
@@ -291,16 +337,7 @@ def _apply_schema_evidence(state: AgentGraphState, *, case: str, evidence: str) 
         incoming_params=incoming_params,
         extracted=fragment_draft,
     ):
-        pending = dict(state.get("pending_question") or {})
-        message = localized(
-            state.get("language", "en"),
-            "本轮内容没有贡献可归因的 RPC request、参数、response 或官方文档事实，因此没有写入 method catalog。当前 draft 和待确认问题保持不变。请直接粘贴 request/response/docs；如果你是在询问当前配置，请明确提出要查看的状态。",
-            "This turn did not contribute an attributable RPC request, parameter, response, or documentation fact, so nothing was written to the method catalog. The current draft and pending question are unchanged. Paste request/response/docs, or ask explicitly for the state you want to inspect.",
-        )
-        response = [message]
-        if pending:
-            response.append(render_question(pending, state.get("language", "en")))
-        state['visible_response'] = response
+        emit(responses, "chain_rpc.response.rpc_evidence_rejected", source=__name__)
         return False
     current_method = normalize_scalar(draft_view(state).get("method"))
     transition = append_evidence(
@@ -312,11 +349,15 @@ def _apply_schema_evidence(state: AgentGraphState, *, case: str, evidence: str) 
     )
     if not transition.accepted:
         case_dict["status"] = "existing_family_needs_schema_evidence" if case == "new_chain" else "needs_schema_evidence"
-        state['visible_response'] = [localized(
-            state.get("language", "en"),
-            f"证据中的 method `{incoming_method}` 与当前 deterministic method `{current_method}` 冲突。已拒绝该 fragment，当前 draft 和既有证据保持不变。",
-            f"Evidence method `{incoming_method}` conflicts with deterministic method `{current_method}`. The fragment was rejected; the current draft and prior evidence are unchanged.",
-        )]
+        emit(
+            responses,
+            "chain_rpc.response.rpc_method_conflict",
+            arguments={
+                "incoming_method": incoming_method,
+                "current_method": current_method,
+            },
+            source=__name__,
+        )
         return False
     fragments = [
         str(item.get("content") or "")
@@ -337,6 +378,7 @@ def _apply_schema_evidence(state: AgentGraphState, *, case: str, evidence: str) 
             # endpoint probe will produce an observed response that is reviewed
             # through its own confirmation contract.
             extracted["response_summary"] = "unknown"
+            extracted["response_json_type"] = "unknown"
             extracted["response_fields"] = []
             extracted.pop("response_sample", None)
             extracted.pop("response_example", None)
@@ -363,10 +405,14 @@ def _apply_schema_evidence(state: AgentGraphState, *, case: str, evidence: str) 
         case_dict["status"] = "existing_family_schema_needs_confirmation" if case == "new_chain" else "schema_needs_confirmation"
         if incomplete_parameters(state):
             case_dict["status"] = "existing_family_needs_schema_evidence" if case == "new_chain" else "needs_schema_evidence"
-            state['visible_response'] = [_parameter_semantics_missing_message(state)]
+            emit(
+                responses,
+                "chain_rpc.response.parameter_semantics_missing",
+                arguments={"details": _parameter_semantics_missing_details(state)},
+                source=__name__,
+            )
             return True
         state['pending_question'] = _catalog_confirmation_question(state, case)
-        state['visible_response'] = [render_question(state["pending_question"], state.get("language", "en"))]
         return True
     draft = dict(extract_rpc_schema_from_evidence(state, combined_evidence, method_hint=normalize_scalar(draft_view(state).get("method"))) or {})
     if (state.get("web_research") or {}).get("google_search_available"):
@@ -376,6 +422,17 @@ def _apply_schema_evidence(state: AgentGraphState, *, case: str, evidence: str) 
         draft["search_result"] = result.as_dict()
         if result.available and result.text_summary:
             draft["evidence_summary"] = result.text_summary
+            emit(
+                responses,
+                "chain_rpc.response.search_grounding",
+                arguments={
+                    "query": result.query,
+                    "summary": result.text_summary,
+                    "citations": ", ".join(result.citations) or "<none>",
+                },
+                kind="evidence",
+                source=__name__,
+            )
     case_dict["schema_evidence"] = combined_evidence
     previous = draft_view(state)
     if previous:
@@ -397,19 +454,23 @@ def _apply_schema_evidence(state: AgentGraphState, *, case: str, evidence: str) 
         wire_request_observed=False,
     )
     correct_draft(state, draft)
-    if _schema_conflict(state, draft, case=case):
+    if _schema_conflict(state, draft, case=case, responses=responses):
         return True
     if not _draft_has_params(draft):
         case_dict["status"] = "existing_family_needs_schema_evidence" if case == "new_chain" else "needs_schema_evidence"
-        state['visible_response'] = [localized(state.get("language", "en"), "没有从证据中提取到可验证的 params。请提供更完整的 request/response/docs，或直接输入 params JSON；没有参数时输入 `[]`。", "I could not extract verifiable params from the evidence. Provide clearer request/response/docs, or enter params JSON directly; use `[]` when there are no params.")]
+        emit(responses, "chain_rpc.response.params_evidence_required", source=__name__)
         return True
     if incomplete_parameters(state):
         case_dict["status"] = "existing_family_needs_schema_evidence" if case == "new_chain" else "needs_schema_evidence"
-        state['visible_response'] = [_parameter_semantics_missing_message(state)]
+        emit(
+            responses,
+            "chain_rpc.response.parameter_semantics_missing",
+            arguments={"details": _parameter_semantics_missing_details(state)},
+            source=__name__,
+        )
         return True
     case_dict["status"] = "existing_family_schema_needs_confirmation" if case == "new_chain" else "schema_needs_confirmation"
     state['pending_question'] = _catalog_confirmation_question(state, case)
-    state['visible_response'] = [render_question(state["pending_question"], state.get("language", "en"))]
     return True
 
 
@@ -547,6 +608,7 @@ def _schema_field_provenance(
             record(path, value, source)
     for field in (
         "response_summary",
+        "response_json_type",
         "response_fields",
         "response_sample",
         "response_example",
@@ -589,13 +651,23 @@ def _request_only_schema_evidence(fragments: list[str], method: str) -> bool:
     return saw_request
 
 
-def _probe_schema(state: AgentGraphState, case: str, params: Any) -> None:
+def _probe_schema(
+    state: AgentGraphState,
+    case: str,
+    params: Any,
+    *,
+    responses: ResponseCollector,
+) -> None:
     case_dict = _case_dict(state, case)
     draft = draft_view(state)
     method = normalize_scalar(draft.get("method"))
     if not draft.get("request_confirmed"):
         case_dict["status"] = "existing_family_schema_needs_confirmation" if case == "new_chain" else "schema_needs_confirmation"
-        state['visible_response'] = [localized(state.get("language", "en"), "必须先确认 request contract，才能执行 probe。", "The request contract must be confirmed before a probe can run.")]
+        emit(
+            responses,
+            "chain_rpc.response.request_confirmation_required",
+            source=__name__,
+        )
         return
     params = draft.get("params_json")
     endpoint = normalize_scalar((state.get("endpoint_evidence") or {}).get("candidate_endpoint")) if case == "new_chain" else normalize_scalar(case_dict.get("endpoint"))
@@ -614,9 +686,17 @@ def _probe_schema(state: AgentGraphState, case: str, params: Any) -> None:
     if not result.get("ready"):
         record_probe(state, result, {})
         case_dict["status"] = "existing_family_schema_needs_confirmation" if case == "new_chain" else "probe_failed"
-        prefix = "新链 " if case == "new_chain" else ""
         _record_validation_failure(state, "RPC_METHOD_OR_SCHEMA_INVALID", result)
-        state['visible_response'] = [localized(state.get("language", "en"), f"{prefix}method probe 失败：{result.get('error') or result.get('status')}。证据：{result.get('evidence_file') or '<none>'}。已确认的 request/response contract 和 endpoint provenance 均已保留，可重试 probe 或返回证据修正。", f"{'New-chain ' if case == 'new_chain' else ''}method probe failed: {result.get('error') or result.get('status')}. Evidence: {result.get('evidence_file') or '<none>'}. The confirmed request/response contract and endpoint provenance are preserved; retry the probe or return to evidence correction.")]
+        emit(
+            responses,
+            "chain_rpc.response.method_probe_failed",
+            arguments={
+                "case_label": "Case 2 " if case == "new_chain" else "",
+                "reason": str(result.get("error") or result.get("status") or "failed"),
+                "evidence": str(result.get("evidence_file") or "<none>"),
+            },
+            source=__name__,
+        )
         return
     selected_check = next(
         (
@@ -653,21 +733,26 @@ def _probe_schema(state: AgentGraphState, case: str, params: Any) -> None:
     if response_unknown or conflicts:
         case_dict["status"] = "existing_family_response_needs_confirmation" if case == "new_chain" else "response_needs_confirmation"
         state['pending_question'] = _response_confirmation_question(state, case)
-        state['visible_response'] = [render_question(state["pending_question"], state.get("language", "en"))]
         return
-    _finalize_probed_method(state, case)
+    _finalize_probed_method(state, case, responses=responses)
 
 
-def _confirm_probe_response(state: AgentGraphState, case: str, accepted: bool) -> None:
+def _confirm_probe_response(
+    state: AgentGraphState,
+    case: str,
+    accepted: bool,
+    *,
+    responses: ResponseCollector,
+) -> None:
     case_dict = _case_dict(state, case)
     if not accepted:
         confirm_response(state, False, observed=bool(draft_view(state).get("observed_response")))
         case_dict["status"] = "existing_family_needs_schema_evidence" if case == "new_chain" else "needs_schema_evidence"
-        state['visible_response'] = [localized(
-            state.get("language", "en"),
-            "请补充正确的 response sample、response schema 或官方文档；已确认的 request 证据会保留。",
-            "Provide the correct response sample, response schema, or official docs. Confirmed request evidence is preserved.",
-        )]
+        emit(
+            responses,
+            "chain_rpc.response.response_evidence_required",
+            source=__name__,
+        )
         return
     observed = bool(draft_view(state).get("observed_response"))
     transition = confirm_response(state, True, observed=observed)
@@ -677,7 +762,7 @@ def _confirm_probe_response(state: AgentGraphState, case: str, accepted: bool) -
     if not observed:
         case_dict["status"] = "existing_family_schema_needs_confirmation" if case == "new_chain" else "schema_needs_confirmation"
         return
-    _finalize_probed_method(state, case)
+    _finalize_probed_method(state, case, responses=responses)
 
 
 def _confirm_parameter_contract(state: AgentGraphState, case: str, accepted: bool) -> None:
@@ -707,7 +792,13 @@ def _confirm_request_contract(state: AgentGraphState, case: str, accepted: bool)
         case_dict["status"] = "existing_family_schema_needs_confirmation" if case == "new_chain" else "schema_needs_confirmation"
 
 
-def _confirm_method_probe(state: AgentGraphState, case: str, accepted: bool) -> None:
+def _confirm_method_probe(
+    state: AgentGraphState,
+    case: str,
+    accepted: bool,
+    *,
+    responses: ResponseCollector,
+) -> None:
     case_dict = _case_dict(state, case)
     if not accepted:
         draft = draft_view(state)
@@ -715,10 +806,20 @@ def _confirm_method_probe(state: AgentGraphState, case: str, accepted: bool) -> 
         correct_draft(state, draft)
         case_dict["status"] = "existing_family_needs_schema_evidence" if case == "new_chain" else "needs_schema_evidence"
         return
-    _probe_schema(state, case, draft_view(state).get("params_json"))
+    _probe_schema(
+        state,
+        case,
+        draft_view(state).get("params_json"),
+        responses=responses,
+    )
 
 
-def _finalize_probed_method(state: AgentGraphState, case: str) -> None:
+def _finalize_probed_method(
+    state: AgentGraphState,
+    case: str,
+    *,
+    responses: ResponseCollector,
+) -> None:
     case_dict = _case_dict(state, case)
     draft = draft_view(state)
     method = normalize_scalar(draft.get("method"))
@@ -747,54 +848,59 @@ def _finalize_probed_method(state: AgentGraphState, case: str) -> None:
         # transaction, so honor the persisted request before asking the generic
         # "add another" question. The workload helper installs a precise
         # disambiguation/weight state when more input is still required.
-        if _apply_requested_workload(state):
+        if _apply_requested_workload(state, responses=responses):
             return
         case_dict["status"] = "method_validated_next"
-        state['visible_response'] = [localized(state.get("language", "en"), f"method/schema 验证通过。证据：{result.get('evidence_file') or '<none>'}。验证 endpoint 仍只作为证据保存，最终测试 endpoint 会在 endpoint 配置组单独确认。", f"Method/schema validation passed. Evidence: {result.get('evidence_file') or '<none>'}. The validation endpoint remains evidence-only; the final benchmark endpoint will be confirmed separately in the endpoint configuration group.")]
+        emit(
+            responses,
+            "chain_rpc.response.method_schema_validated",
+            arguments={"evidence": str(result.get("evidence_file") or "<none>")},
+            source=__name__,
+        )
         state['pending_question'] = _continue_question(state, case)
-        state['visible_response'] = list(state.get('visible_response') or []) + list([render_question(state["pending_question"], state.get("language", "en"))])
         return
     case_dict["status"] = "existing_family_method_validated_next"
     state['active_group'] = "endpoint_process"
     state['pending_question'] = _continue_question(state, case)
-    state['visible_response'] = [
-        localized(
-            state.get("language", "en"),
-            f"新链 endpoint 和 method/schema 已验证通过。证据：{result.get('evidence_file') or '<none>'}。",
-            f"New-chain endpoint and method/schema validation passed. Evidence: {result.get('evidence_file') or '<none>'}.",
-        ),
-        render_question(state["pending_question"], state.get("language", "en")),
-    ]
+    emit(
+        responses,
+        "chain_rpc.response.new_chain_method_validated",
+        arguments={"evidence": str(result.get("evidence_file") or "<none>")},
+        source=__name__,
+    )
 
 
-def _schema_conflict(state: AgentGraphState, draft: dict[str, Any], *, case: str) -> bool:
+def _schema_conflict(
+    state: AgentGraphState,
+    draft: dict[str, Any],
+    *,
+    case: str,
+    responses: ResponseCollector,
+) -> bool:
     family = _adapter_family(state)
     rest = _schema_indicates_rest(draft)
     jsonrpc = _schema_indicates_jsonrpc(draft)
     if not ((family == "jsonrpc" and rest) or (family == "rest" and jsonrpc)):
         return False
-    language = state.get("language", "en")
     if case == "new_chain":
         identity = state.setdefault("chain_identity", {})
         identity["status"] = "needs_protocol_confirmation"
         if family == "jsonrpc" and rest:
             identity["adapter_family"] = ""
             state.setdefault("endpoint_evidence", {})["candidate_endpoint_ready"] = False
-            message = localized(language, "你刚提供的证据更像 REST API（REST path、URL 或 REST 文档片段），但当前选择的是 `jsonrpc / EVM`。请先重新确认协议族；如果确认是 REST，我会重新验证 REST endpoint 和 method schema。", "The evidence looks like a REST API (REST path, URL, or REST docs excerpt), but the current adapter family is `jsonrpc / EVM`. Confirm the adapter family first; if it is REST, I will re-validate the REST endpoint and method schema.")
-        else:
-            message = localized(language, "你刚提供的证据更像 JSON-RPC request/method，但当前选择的是 `rest`。请先重新确认协议族。", "The evidence looks like a JSON-RPC request/method, but the current adapter family is `rest`. Confirm the adapter family first.")
         state['active_group'] = "chain_identity"
         state['pending_question'] = _adapter_family_question(state)
     else:
         custom = state.setdefault("custom_rpc", {})
         custom.update({"status": "needs_adapter_family_confirmation", "endpoint_ready": False})
-        if family == "jsonrpc" and rest:
-            message = localized(language, "你提供的证据更像 REST API，但当前已确认链的 adapter family 是 `jsonrpc`。请先重新确认协议族；如果确认是 REST，我会重新验证 REST endpoint 和 method schema。", "The evidence looks like a REST API, but the confirmed chain adapter family is `jsonrpc`. Confirm the adapter family first; if it is REST, I will re-validate the REST endpoint and method schema.")
-        else:
-            message = localized(language, "你提供的证据更像 JSON-RPC，但当前链 adapter family 是 `rest`。请先重新确认协议族。", "The evidence looks like JSON-RPC, but the current chain adapter family is `rest`. Confirm the adapter family first.")
         state['active_group'] = "endpoint_process"
         state['pending_question'] = _adapter_family_question(state, custom=True)
-    state['visible_response'] = [message, render_question(state["pending_question"], state.get("language", "en"))]
+    emit(
+        responses,
+        "chain_rpc.response.schema_protocol_conflict",
+        arguments={"adapter_family": family},
+        source=__name__,
+    )
     return True
 
 
@@ -930,20 +1036,12 @@ def _reset_in_progress_method_evidence(state: AgentGraphState, *, case: str) -> 
         owner.pop(key, None)
 
 
-def _parameter_semantics_missing_message(state: AgentGraphState) -> str:
+def _parameter_semantics_missing_details(state: AgentGraphState) -> str:
     details = "; ".join(
         f"param[{index}]: {', '.join(missing)}"
         for index, missing in incomplete_parameters(state)
     )
-    draft = draft_view(state)
-    summary = normalize_scalar(draft.get("evidence_summary"))
-    suffix_zh = f" 证据摘要：{summary}" if summary else ""
-    suffix_en = f" Evidence summary: {summary}" if summary else ""
-    return localized(
-        state.get("language", "en"),
-        f"request wire facts 已保留，但参数语义 contract 还不完整：{details}。请提供每个参数的 name/index、blockchain semantic type 或 encoding、meaning、required/optional 和 example；hex/string 语法本身不证明语义。{suffix_zh}",
-        f"The request wire facts are preserved, but parameter semantics are incomplete: {details}. Provide each parameter's name/index, blockchain semantic type or encoding, meaning, required/optional status, and example; hex/string syntax alone does not prove semantics.{suffix_en}",
-    )
+    return details or "<unknown>"
 
 
 def _validation_endpoint(state: AgentGraphState, case: str) -> str:
@@ -1005,12 +1103,14 @@ def _response_contract_conflicts(
                 if expected_type and expected_type != observed_type:
                     conflicts.append(f"response field {name} expected {expected_type}, observed {observed_type}")
 
-    summary_type = _response_summary_type(normalize_scalar(draft.get("response_summary")))
-    if summary_type:
+    declared_type = _declared_response_json_type(draft.get("response_json_type"))
+    if declared_type:
         result_value = observed.get("result") if isinstance(observed, dict) and "result" in observed else observed
         observed_type = _json_type(result_value)
-        if observed_type != summary_type:
-            conflicts.append(f"response summary expected {summary_type}, observed {observed_type}")
+        if observed_type != declared_type:
+            conflicts.append(
+                f"response contract expected {declared_type}, observed {observed_type}"
+            )
     return list(dict.fromkeys(conflicts))
 
 
@@ -1044,19 +1144,10 @@ def _normalized_json_type(value: Any) -> str:
     return aliases.get(text, text if text in {"null", "boolean", "string", "number", "array", "object"} else "")
 
 
-def _response_summary_type(summary: str) -> str:
-    text = summary.casefold()
-    for marker, json_type in (
-        ("array", "array"),
-        ("list", "array"),
-        ("object", "object"),
-        ("boolean", "boolean"),
-        ("bool", "boolean"),
-        ("string", "string"),
-        ("hex", "string"),
-        ("number", "number"),
-        ("integer", "number"),
-    ):
-        if marker in text:
-            return json_type
-    return ""
+def _declared_response_json_type(value: Any) -> str:
+    declared = normalize_scalar(value).casefold()
+    return (
+        declared
+        if declared in {"null", "boolean", "string", "number", "array", "object"}
+        else ""
+    )

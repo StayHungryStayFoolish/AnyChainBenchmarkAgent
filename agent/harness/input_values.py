@@ -90,48 +90,6 @@ def looks_like_wire_method_identity(value: Any) -> bool:
     return looks_like_rpc_method_token(value) or looks_like_rest_method_identity(value)
 
 
-def target_mode_evidence_matches(mode: Any, evidence: Any, origin_text: Any) -> bool:
-    """Verify that cited user text explicitly expresses one product mode.
-
-    The evidence must be an exact excerpt from the current user turn. Product
-    identifiers are accepted directly; sync-observe also accepts the complete
-    semantic concept (sync/catch-up plus observation) in either word order.
-    """
-
-    canonical = normalize_target_mode(mode)
-    source = normalize_scalar(evidence)
-    origin = str(origin_text or "")
-    if not canonical or not source or source not in origin:
-        return False
-    normalized = source.casefold().replace("_", "-")
-    normalized_origin = origin.casefold().replace("_", "-")
-    identifiers = {
-        "fake-node": ("fake-node", "fake node", "fakenode", "模拟节点"),
-        "real-node": ("real-node", "real node", "realnode", "真实节点"),
-        "sync-observe": ("sync-observe", "sync observe", "syncobserve"),
-    }
-    mentioned_modes = {
-        product_mode
-        for product_mode, product_identifiers in identifiers.items()
-        if any(identifier in normalized_origin for identifier in product_identifiers)
-    }
-    if len(mentioned_modes) > 1:
-        return False
-    if any(identifier in normalized for identifier in identifiers[canonical]):
-        return True
-    if canonical != "sync-observe":
-        return False
-    english_tokens = set(re.findall(r"[a-z]+", normalized))
-    english_concept = bool(english_tokens & {"sync", "synchronization", "catchup"}) and bool(
-        english_tokens & {"observe", "observing", "observation", "monitor", "monitoring"}
-    )
-    chinese_concept = (
-        any(concept in source for concept in ("同步", "追块", "追赶"))
-        and any(concept in source for concept in ("观察", "监控", "查看"))
-    )
-    return english_concept or chinese_concept
-
-
 def looks_like_url_value(value: Any) -> bool:
     """Return whether a complete scalar is an HTTP, WS, host, or localhost URL."""
 
@@ -364,33 +322,12 @@ def extract_json_object_or_array(value: Any) -> str:
     return ""
 
 
-def declares_no_rpc_params(value: Any) -> bool:
-    text = str(value or "").strip().casefold()
-    return bool(text) and any(
-        marker in text
-        for marker in (
-            "no parameters",
-            "no params",
-            "without parameters",
-            "without params",
-            "params: none",
-            "params none",
-            "没有参数",
-            "无参数",
-            "不需要参数",
-            "参数为空",
-        )
-    )
-
-
 def extract_rpc_params_or_request(value: Any) -> tuple[str, Any | None]:
     """Extract a JSON-RPC method and params from JSON/YAML request text."""
 
     text = str(value or "").strip()
     if not text:
         return "", None
-    if declares_no_rpc_params(text):
-        return "", []
     for parsed in _rpc_wire_payloads(text):
         if isinstance(parsed, dict) and "params" in parsed and (
             "method" in parsed or "jsonrpc" in parsed
@@ -430,11 +367,6 @@ def schema_evidence_from_turn_text(value: Any, *, method_hint: str = "") -> str:
             return text
         return json.dumps(
             {"jsonrpc": "2.0", "id": 1, "method": method_hint, "params": parsed},
-            ensure_ascii=False,
-        )
-    if declares_no_rpc_params(text) and method_hint:
-        return json.dumps(
-            {"jsonrpc": "2.0", "id": 1, "method": method_hint, "params": []},
             ensure_ascii=False,
         )
     return ""
@@ -521,17 +453,10 @@ def _weight_mapping(value: Any) -> dict[str, int] | None:
 
 
 def single_method_weight_number_text(value: Any) -> str:
+    """Return one exact numeric literal without interpreting prose."""
+
     text = str(value or "").strip()
-    if not text:
-        return ""
-    if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", text):
-        return text
-    match = re.search(
-        r"(?:weight|权重)\s*(?:is|为|=|:|：)?\s*([0-9]+(?:\.[0-9]+)?)",
-        text,
-        re.IGNORECASE,
-    )
-    return match.group(1) if match else ""
+    return text if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", text) else ""
 
 
 def parse_weight_spec_for_methods(value: Any, methods: list[str]) -> dict[str, int]:
@@ -550,37 +475,3 @@ def parse_weight_spec_for_methods(value: Any, methods: list[str]) -> dict[str, i
         return {unique[0]: int(float(number))}
     except ValueError:
         return {}
-
-
-_ADAPTER_FAMILY_NEGATION_RE = re.compile(
-    r"(没有|没|无|不是|不用|非|not|no|without|non[- ]?)"
-    r"(?:[\s\-_,，、/|]|也|且|and|or|json[-_ ]?rpc|jsonrpc|evm|rest|substrate|polkadot|"
-    r"tendermint|cosmos(?:[ -]?sdk)?|cometbft|bitcoin(?:[_ ]?jsonrpc)?|hedera|"
-    r"ethereum[-_ ]?compatible|api|http)*$"
-)
-
-
-def adapter_family_hint(value: Any) -> str:
-    """Normalize an explicit adapter-family statement without ignoring negation."""
-
-    text = normalize_scalar(value).casefold()
-    if not text:
-        return ""
-
-    def mentioned(pattern: str) -> bool:
-        match = re.search(pattern, text)
-        return bool(match) and not _ADAPTER_FAMILY_NEGATION_RE.search(text[: match.start()])
-
-    if mentioned(r"\b(evm|json[-_ ]?rpc|ethereum[-_ ]?compatible|eth_[a-z0-9_]+)\b"):
-        return "jsonrpc"
-    if mentioned(r"substrate|polkadot"):
-        return "substrate"
-    if mentioned(r"\b(rest|http api|rest api)\b"):
-        return "rest"
-    if mentioned(r"tendermint|cosmos sdk|cometbft"):
-        return "tendermint"
-    if mentioned(r"bitcoin[_ ]jsonrpc|bitcoin json-rpc"):
-        return "bitcoin_jsonrpc"
-    if mentioned(r"hedera"):
-        return "hedera_dual"
-    return ""

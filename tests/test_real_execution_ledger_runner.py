@@ -25,8 +25,6 @@ from tests.agent_live.execute_real_execution_ledger import (
     _job_evidence_files,
     _plan_file_for_scenario,
     _probe_endpoint_identity,
-    _probe_metrics_endpoint,
-    _resolve_endpoint_route,
     _required_artifact_manifest,
     _stage_call,
     _validate_approved_plan_binding,
@@ -492,67 +490,6 @@ class RealExecutionLedgerRunnerTest(unittest.TestCase):
             G5_RUNTIME_CONTRACT.image_digest,
         )
         self.assertEqual(attestation["metrics_probe"], metrics)
-
-    def test_composed_admission_probes_live_geth_without_submitting_a_job(self) -> None:
-        scenario = next(
-            item for item in EXECUTION_SCENARIOS
-            if item.scenario_id == "rpc_real_node_smoke"
-        )
-        revision = {"commit": "a" * 40, "worktree_hash": "b" * 64}
-        plan = {
-            "chain": "bsc",
-            "workflow_type": RPC_BENCHMARK_WORKFLOW,
-            "use_fake_node": False,
-            "execution": {
-                "environment": {
-                    "LOCAL_RPC_URL": G5_RUNTIME_CONTRACT.rpc_url,
-                    "NODE_PROMETHEUS_METRICS_URL": G5_RUNTIME_CONTRACT.metrics_url,
-                },
-            },
-        }
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            jobs_dir = root / "jobs"
-            jobs_dir.mkdir()
-            plan_file = root / "approved.json"
-            plan_file.write_text(json.dumps(plan), encoding="utf-8")
-            _, envelope, _ = _build_admission_envelope(
-                plan_file,
-                plan,
-                scenario,
-                revision=revision,
-                jobs_dir=jobs_dir,
-            )
-            endpoint_probe = _probe_endpoint_identity(plan, scenario, envelope)
-            metrics_probe = _probe_metrics_endpoint(
-                G5_RUNTIME_CONTRACT.metrics_url,
-                timeout_seconds=5,
-            )
-            route = _resolve_endpoint_route(G5_RUNTIME_CONTRACT.rpc_url)
-            container_ip = route["resolved_addresses"][0]
-            attestation = _attest_geth_dev_runtime(
-                plan,
-                endpoint_probe,
-                envelope,
-                revision=revision,
-                host_attestation=_runtime_host_attestation(
-                    revision=revision,
-                    container_ip=container_ip,
-                ),
-            )
-            self.assertEqual(
-                endpoint_probe["observed_identity"],
-                G5_RUNTIME_CONTRACT.chain_id,
-            )
-            self.assertGreater(metrics_probe["non_comment_sample_count"], 0)
-            self.assertGreater(
-                attestation["metrics_probe"]["metric_family_count"],
-                0,
-            )
-            self.assertIn(
-                container_ip,
-                attestation["rpc_route"]["resolved_addresses"],
-            )
 
     def test_fresh_jobs_root_and_job_creation_time_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

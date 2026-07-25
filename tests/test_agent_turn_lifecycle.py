@@ -60,71 +60,6 @@ class TurnBudgetContractTest(unittest.TestCase):
                 with self.assertRaises(LLMTurnCancelledError):
                     future.result(timeout=1)
 
-    def test_bounded_recovery_and_repair_use_remaining_whole_turn_budget(self) -> None:
-        from agent.harness.intent import resolve_action_queue
-        from agent.llm.types import LLMResponse, llm_turn_scope, remaining_turn_seconds
-
-        observed: list[float] = []
-
-        class Provider:
-            def complete(self, _request):
-                observed.append(remaining_turn_seconds())
-                if len(observed) == 1:
-                    time.sleep(0.03)
-                    return LLMResponse(text="not-json", model="test", provider="test")
-                return LLMResponse(text='{"actions": [], "conflicts": [], "reason": "done"}', model="test", provider="test")
-
-        with patch("agent.harness.intent.provider_from_config", return_value=Provider()):
-            with llm_turn_scope(0.25):
-                resolve_action_queue({}, "hello")
-
-        self.assertGreaterEqual(len(observed), 2)
-        self.assertLessEqual(len(observed), 8)
-        self.assertLess(observed[1], observed[0] - 0.02)
-        self.assertTrue(all(later <= earlier for earlier, later in zip(observed, observed[1:])))
-
-    def test_distinct_resolvers_share_the_same_turn_deadline(self) -> None:
-        from agent.harness.intent import resolve_action_queue, resolve_unknown_chain_identity
-        from agent.llm.types import LLMResponse, llm_turn_scope, remaining_turn_seconds
-
-        observed: list[float] = []
-
-        class Provider:
-            def complete(self, _request):
-                observed.append(remaining_turn_seconds())
-                if len(observed) == 1:
-                    return LLMResponse(
-                        text=(
-                            '{"actions":[{"type":"answer_opening_question","topic":"identity"}],'
-                            '"semantic_units":[{"unit_id":"unit-1","clause_id":"clause-1","start":0,"end":5,'
-                            '"source_text":"hello","disposition":"action","action_indexes":[0],'
-                            '"reason":"identity greeting"}],'
-                            '"conflicts":[],"reason":"done"}'
-                        ),
-                        model="test",
-                        provider="test",
-                    )
-                if len(observed) == 2:
-                    return LLMResponse(
-                        text='{"reviews":[{"action_index":0,"supported":true,"reason":"identity question"}],"unit_reviews":[]}',
-                        model="test",
-                        provider="test",
-                    )
-                return LLMResponse(
-                    text='{"chain_exists": true, "confidence": "medium"}',
-                    model="test",
-                    provider="test",
-                )
-
-        with patch("agent.harness.intent.provider_from_config", return_value=Provider()):
-            with llm_turn_scope(0.25):
-                resolve_action_queue({}, "hello")
-                time.sleep(0.03)
-                resolve_unknown_chain_identity({}, "example-chain")
-
-        self.assertGreaterEqual(len(observed), 3)
-        self.assertTrue(all(later <= earlier for earlier, later in zip(observed, observed[1:])))
-        self.assertLess(observed[-1], observed[0] - 0.02)
 
     def test_deepseek_has_explicit_transport_limits_and_bounded_retries(self) -> None:
         from agent.llm.config import LLMConfig
@@ -375,7 +310,7 @@ class TurnCheckpointContractTest(unittest.TestCase):
         }
 
         with patch(
-            "agent.harness.coordinator.resolve_action_queue",
+            "tests.agent_live.graph_turn.TEST_SEMANTIC_PLANNER",
             return_value=semantic_plan,
         ):
             result = invoke_product_graph_turn(state)
@@ -449,6 +384,10 @@ class TurnCheckpointContractTest(unittest.TestCase):
 
     def test_fresh_startup_persists_the_opening_contract_as_next_turn_baseline(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
+        from tests.agent_live.graph_turn import (
+            reviewed_action_plan,
+            reviewed_stage_planner,
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -460,9 +399,12 @@ class TurnCheckpointContractTest(unittest.TestCase):
                     session_purpose="dynamic-dual-ai-chaos",
                 )
                 offered = runtime.prepare_resume_offer("en")
-                with patch(
-                    "agent.harness.coordinator.resolve_action_queue",
-                    return_value={"actions": [{"type": "greeting", "confidence": "high"}]},
+                with reviewed_stage_planner(
+                    lambda state, text: reviewed_action_plan(
+                        state,
+                        text,
+                        [{"type": "greeting", "confidence": "high"}],
+                    )
                 ):
                     runtime.invoke("Hi", language="en")
                 runtime.close()
@@ -477,8 +419,9 @@ class TurnCheckpointContractTest(unittest.TestCase):
 
     def test_turn_event_reports_only_current_pending_answer_admission(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
-        from agent.harness.questions import manual_question
+        from agent.harness.questions import manual_question, question_text
         from agent.harness.state import new_state
+        from tests.agent_live.graph_turn import reviewed_execution_planner
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -497,7 +440,8 @@ class TurnCheckpointContractTest(unittest.TestCase):
             state["pending_question"] = manual_question(
                 "provider_deployment",
                 "CLOUD_REGION",
-                "Enter CLOUD_REGION.",
+                question_text("question.environment.cloud_region.prompt"),
+                owner="environment",
                 field="CLOUD_REGION",
             )
             state["completed_actions"] = [{
@@ -506,7 +450,11 @@ class TurnCheckpointContractTest(unittest.TestCase):
             }]
             runtime._persist_state(state)
             with patch.dict(os.environ, {"ANYCHAIN_AGENT_TURN_EVENT_FILE": str(event_file)}):
-                result = runtime.invoke("asia-east1", language="en")
+                with reviewed_execution_planner(
+                    expected_input="asia-east1",
+                    expected_admitted=True,
+                ):
+                    result = runtime.invoke("asia-east1", language="en")
             runtime.close()
 
             event = json.loads(event_file.read_text(encoding="utf-8").splitlines()[-1])

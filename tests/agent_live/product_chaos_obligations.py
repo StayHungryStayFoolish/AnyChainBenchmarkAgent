@@ -334,6 +334,21 @@ def _build_obligation(
                 "mechanical_response_loop",
                 "state_regressed",
             ],
+            "forbidden_bindings": [
+                {
+                    key: value
+                    for key, value in asdict(
+                        FORMAL_JOURNEY_VERIFIER_REGISTRY.definitions[
+                            postcondition_id
+                        ]
+                    ).items()
+                    if key != "verifier"
+                }
+                for postcondition_id in (
+                    "mechanical_response_loop",
+                    "state_regressed",
+                )
+            ],
             "required_evidence": [
                 "revision_bound_schedule",
                 "response_bound_codex_decisions",
@@ -576,6 +591,15 @@ def _validate_verifier_contract(row: Mapping[str, Any]) -> None:
         expected_bindings.append(binding)
     if verifier.get("required_bindings") != expected_bindings:
         raise ValueError(f"product Chaos verifier bindings drifted: {obligation_id}")
+    expected_forbidden_bindings = []
+    for postcondition_id in forbidden:
+        binding = asdict(registry.definitions[postcondition_id])
+        binding.pop("verifier", None)
+        expected_forbidden_bindings.append(binding)
+    if verifier.get("forbidden_bindings") != expected_forbidden_bindings:
+        raise ValueError(
+            f"product Chaos forbidden verifier bindings drifted: {obligation_id}"
+        )
     if not all(str(item).strip() for item in verifier.get("required_evidence") or ()):
         raise ValueError(f"product Chaos evidence contract is incomplete: {obligation_id}")
 

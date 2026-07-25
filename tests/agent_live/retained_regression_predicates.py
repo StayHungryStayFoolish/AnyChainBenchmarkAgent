@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 import hashlib
+import json
 from typing import Any, Callable, Mapping, Sequence
 
 from agent.harness.control_receipts import (
@@ -789,6 +790,261 @@ def _stale_menu_choice_applied(context: Any) -> PredicateResult:
         invalid,
         stale_count=len(stale),
     )
+
+
+def _source_step_event(context: Any, position: int) -> Any | None:
+    source_step_id = f"source-{position}"
+    valid_attestations, invalid_attestations = collect_valid_variant_attestations(
+        context
+    )
+    if invalid_attestations:
+        return None
+    attested = [
+        int(item["turn_index"])
+        for item in valid_attestations
+        if item.get("source_step_id") == source_step_id
+    ]
+    if len(attested) > 1:
+        return None
+    if attested:
+        turn_index = attested[0]
+    else:
+        verifier_input = getattr(context, "verifier_input_contract", {}) or {}
+        source_steps = (
+            (verifier_input.get("source_contract") or {}).get("source_steps")
+            or ()
+        )
+        source_step = next(
+            (
+                item
+                for item in source_steps
+                if isinstance(item, Mapping)
+                and item.get("step_id") == source_step_id
+            ),
+            None,
+        )
+        turns = _turns(context)
+        if not isinstance(source_step, Mapping):
+            if verifier_input:
+                return None
+            source_turn_position = position
+        else:
+            source_turn_position = int(source_step.get("turn_index") or -1)
+        if source_turn_position < 1 or source_turn_position > len(turns):
+            return None
+        turn_index = int(
+            getattr(turns[source_turn_position - 1], "turn_index", -1)
+        )
+    return next(
+        (
+            event
+            for event in _events(context)
+            if int(getattr(event, "turn_index", -2)) == turn_index
+        ),
+        None,
+    )
+
+
+def _planned_action_types(event: Any) -> tuple[str, ...]:
+    if event is None:
+        return ()
+    planned: list[str] = []
+    for receipt in tuple(getattr(event, "control_receipts", ()) or ()):
+        if not isinstance(receipt, Mapping):
+            continue
+        if receipt.get("receipt_type") != "semantic_planner":
+            continue
+        accepted, _ = validate_persisted_domain_control_receipt(
+            receipt,
+            turn_index=int(getattr(event, "turn_index", -1)),
+        )
+        if accepted:
+            planned.extend(
+                str(action_type)
+                for action_type in receipt.get("planned_action_types") or ()
+            )
+    return tuple(planned)
+
+
+def _value_hash(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _admitted_actions(
+    event: Any,
+    action_type: str,
+) -> tuple[Mapping[str, Any], ...]:
+    if event is None:
+        return ()
+    return tuple(
+        item
+        for item in tuple(
+            getattr(event, "admitted_action_provenance", ()) or ()
+        )
+        if isinstance(item, Mapping)
+        and item.get("type") == action_type
+    )
+
+
+def _mode_change_request_routed_from_chain_pending(
+    context: Any,
+) -> PredicateResult:
+    event = _source_step_event(context, 3)
+    transition = _valid_pending_transition(event) if event else None
+    owner_bindings = dict(
+        dict(getattr(event, "turn_receipt_summary", {}) or {}).get(
+            "owner_bindings"
+        )
+        or {}
+    ) if event else {}
+    chain_paths = sorted(
+        path
+        for path in _valid_material_diffs(event)
+        if _path_root(path) == "chain_identity"
+    ) if event else []
+    admitted = _admitted_actions(event, "choose_target_mode")
+    transition_consumers = set(
+        (transition or {}).get("consumer_action_ids") or ()
+    )
+    execution_order = set(
+        dict(getattr(event, "turn_receipt_summary", {}) or {}).get(
+            "execution_order"
+        )
+        or ()
+    ) if event else set()
+    matching_actions = [
+        action
+        for action in admitted
+        if action.get("owner") == "chain_rpc"
+        and action.get("effect") == "configuration_mutation"
+        and action.get("group") == "target_mode"
+        and dict(action.get("argument_value_hashes") or {}).get("target_mode")
+        == _value_hash("fake-node")
+        and str(action.get("action_id") or "") in transition_consumers
+        and str(action.get("action_id") or "") in execution_order
+    ]
+    satisfied = bool(
+        transition
+        and transition["before_id"] == "chain"
+        and transition["before_group"] == "chain_identity"
+        and transition["after_id"] == "target_mode_change_confirm"
+        and transition["after_group"] == "target_mode"
+        and "choose_target_mode" in _planned_action_types(event)
+        and "chain_rpc" in set(owner_bindings.values())
+        and len(matching_actions) == 1
+        and not chain_paths
+    )
+    return satisfied, {
+        "evidence_family": "turn_bound_domain_routing",
+        "source_step_position": 3,
+        "turn_index": int(getattr(event, "turn_index", -1)) if event else -1,
+        "planned_action_types": list(_planned_action_types(event)),
+        "pending_transition": dict(transition or {}),
+        "owner_bindings": owner_bindings,
+        "matching_admitted_action_ids": [
+            str(action.get("action_id") or "")
+            for action in matching_actions
+        ],
+        "chain_identity_changed_paths": chain_paths,
+    }
+
+
+def _declined_mode_change_resumes_chain_pending(
+    context: Any,
+) -> PredicateResult:
+    event = _source_step_event(context, 4)
+    transition = _valid_pending_transition(event) if event else None
+    valid, invalid = _valid_receipts(context, "pending_resolution")
+    turn_index = int(getattr(event, "turn_index", -1)) if event else -1
+    matching = [
+        item
+        for item in valid
+        if int(item["turn_index"]) == turn_index
+        and item["receipt"].get("pending_id") == "target_mode_change_confirm"
+        and item["receipt"].get("selected_option_id") == "no"
+    ]
+    admitted_ids = set(
+        dict(getattr(event, "turn_receipt_summary", {}) or {}).get(
+            "admitted_action_ids"
+        )
+        or ()
+    ) if event else set()
+    execution_order = set(
+        dict(getattr(event, "turn_receipt_summary", {}) or {}).get(
+            "execution_order"
+        )
+        or ()
+    ) if event else set()
+    transition_consumers = set(
+        (transition or {}).get("consumer_action_ids") or ()
+    )
+    matching = [
+        item
+        for item in matching
+        if str(item["receipt"].get("resolved_action_id") or "")
+        in admitted_ids & execution_order & transition_consumers
+    ]
+    target_mode_paths = sorted(
+        path
+        for path in _valid_material_diffs(event)
+        if path == "target_mode" or path.startswith("target_mode.")
+    ) if event else []
+    satisfied = bool(
+        transition
+        and transition["before_id"] == "target_mode_change_confirm"
+        and transition["before_group"] == "target_mode"
+        and transition["after_id"] == "chain"
+        and transition["after_group"] == "chain_identity"
+        and matching
+        and not invalid
+        and not target_mode_paths
+    )
+    return satisfied, _receipt_details(
+        "turn_bound_pending_resume",
+        matching,
+        invalid,
+        source_step_position=4,
+        turn_index=turn_index,
+        pending_transition=dict(transition or {}),
+        target_mode_changed_paths=target_mode_paths,
+    )
+
+
+def _mode_request_consumed_as_chain_identity(
+    context: Any,
+) -> PredicateResult:
+    event = _source_step_event(context, 3)
+    transition = _valid_pending_transition(event) if event else None
+    chain_paths = sorted(
+        path
+        for path in _valid_material_diffs(event)
+        if _path_root(path) == "chain_identity"
+    ) if event else []
+    observed = bool(
+        chain_paths
+        or (
+            transition
+            and transition["after_group"] == "chain_identity"
+            and transition["after_id"] != "chain"
+        )
+        or "answer_pending" in _planned_action_types(event)
+    )
+    return observed, {
+        "evidence_family": "turn_bound_domain_misroute",
+        "source_step_position": 3,
+        "turn_index": int(getattr(event, "turn_index", -1)) if event else -1,
+        "planned_action_types": list(_planned_action_types(event)),
+        "pending_transition": dict(transition or {}),
+        "chain_identity_changed_paths": chain_paths,
+    }
 
 
 def _unknown_chain_identity_resolution_started(context: Any) -> PredicateResult:
@@ -1753,6 +2009,15 @@ POSTCONDITION_EVALUATORS: Mapping[str, PostconditionEvaluator] = {
     ),
     "visible_option_action_executed": _visible_option_action_executed,
     "current_menu_binding_preserved": _current_menu_binding_preserved,
+    "mode_change_request_routed_from_chain_pending": (
+        _mode_change_request_routed_from_chain_pending
+    ),
+    "declined_mode_change_resumes_chain_pending": (
+        _declined_mode_change_resumes_chain_pending
+    ),
+    "mode_request_consumed_as_chain_identity": (
+        _mode_request_consumed_as_chain_identity
+    ),
     "unhandled_visible_option": _unhandled_visible_option,
     "stale_menu_choice_applied": _stale_menu_choice_applied,
     "unknown_chain_identity_resolution_started": (

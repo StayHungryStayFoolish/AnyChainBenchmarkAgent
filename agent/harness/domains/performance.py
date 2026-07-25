@@ -4,51 +4,64 @@ from __future__ import annotations
 
 import re
 from copy import deepcopy
+from functools import partial
 from typing import Any
 
-from ..contracts import ActionProposal, HandlerResult, StateDelta
-from ..localization import localized
-from ..questions import choice_question, manual_question, normalize_scalar
+from ..contracts import (
+    ActionProposal,
+    FailureDescriptor,
+    HandlerResult,
+    ResponseFragment,
+    StateDelta,
+)
+from ..questions import (
+    choice_question as _choice_question,
+    manual_question as _manual_question,
+    normalize_scalar,
+    question_text,
+)
 from ..state import AgentGraphState
 from ..input_values import normalize_observability_mode
 from ..transitions import record_group_invalidations
 
-from agent.planners import question_prompts
+from agent.knowledge.qps_profiles import qps_profile_defaults
+
+choice_question = partial(_choice_question, owner="performance")
+manual_question = partial(_manual_question, owner="performance")
+
 PERFORMANCE_GROUPS = {"qps_profile", "observability", "advanced_tuning"}
 QPS_FIELDS = ("INITIAL_QPS", "MAX_QPS", "QPS_STEP", "DURATION")
 ADVANCED_FIELDS = {
-    "MONITOR_INTERVAL": "MONITOR_INTERVAL / unified monitoring interval (seconds)",
-    "DISK_MONITOR_RATE": "DISK_MONITOR_RATE / disk-specific monitor rate",
-    "SUCCESS_RATE_THRESHOLD": "SUCCESS_RATE_THRESHOLD / QPS success-rate threshold (%)",
-    "MAX_LATENCY_THRESHOLD": "MAX_LATENCY_THRESHOLD / QPS max latency threshold (ms)",
-    "BOTTLENECK_CPU_THRESHOLD": "BOTTLENECK_CPU_THRESHOLD / CPU bottleneck threshold (%)",
-    "BOTTLENECK_MEMORY_THRESHOLD": "BOTTLENECK_MEMORY_THRESHOLD / memory bottleneck threshold (%)",
-    "BOTTLENECK_DISK_UTIL_THRESHOLD": "BOTTLENECK_DISK_UTIL_THRESHOLD / disk utilization bottleneck threshold (%)",
-    "BOTTLENECK_DISK_LATENCY_THRESHOLD": "BOTTLENECK_DISK_LATENCY_THRESHOLD / disk latency bottleneck threshold (ms)",
-    "BOTTLENECK_NETWORK_THRESHOLD": "BOTTLENECK_NETWORK_THRESHOLD / network bottleneck threshold (%)",
-    "BOTTLENECK_ERROR_RATE_THRESHOLD": "BOTTLENECK_ERROR_RATE_THRESHOLD / error-rate bottleneck threshold (%)",
-    "BOTTLENECK_DISK_IOPS_THRESHOLD": "BOTTLENECK_DISK_IOPS_THRESHOLD / disk IOPS bottleneck threshold (%)",
-    "BOTTLENECK_DISK_THROUGHPUT_THRESHOLD": "BOTTLENECK_DISK_THROUGHPUT_THRESHOLD / disk throughput bottleneck threshold (%)",
+    "MONITOR_INTERVAL": "unified monitoring interval (seconds)",
+    "DISK_MONITOR_RATE": "disk-specific monitor rate",
+    "SUCCESS_RATE_THRESHOLD": "QPS success-rate threshold (%)",
+    "MAX_LATENCY_THRESHOLD": "QPS max latency threshold (ms)",
+    "BOTTLENECK_CPU_THRESHOLD": "CPU bottleneck threshold (%)",
+    "BOTTLENECK_MEMORY_THRESHOLD": "memory bottleneck threshold (%)",
+    "BOTTLENECK_DISK_UTIL_THRESHOLD": "disk utilization bottleneck threshold (%)",
+    "BOTTLENECK_DISK_LATENCY_THRESHOLD": "disk latency bottleneck threshold (ms)",
+    "BOTTLENECK_NETWORK_THRESHOLD": "network bottleneck threshold (%)",
+    "BOTTLENECK_ERROR_RATE_THRESHOLD": "error-rate bottleneck threshold (%)",
+    "BOTTLENECK_DISK_IOPS_THRESHOLD": "disk IOPS bottleneck threshold (%)",
+    "BOTTLENECK_DISK_THROUGHPUT_THRESHOLD": "disk throughput bottleneck threshold (%)",
 }
 
 
 def question_for_performance(state: AgentGraphState, group: str) -> dict[str, Any] | None:
     if group not in PERFORMANCE_GROUPS:
         return None
-    language = str(state.get("language") or "en")
-    zh = language.startswith("zh")
     if group == "qps_profile":
         qps = state.get("qps_profile") or {}
         if not qps.get("mode"):
             return choice_question(
                 group,
                 "benchmark_mode",
-                localized(language, "请选择 benchmark 模式。", "Choose benchmark mode."),
+                question_text("question.performance.benchmark_mode.prompt"),
                 field="benchmark_mode",
                 options=[
-                    {"label": "quick", "value": "quick", "expected_patch": {"qps_profile.mode": "quick"}},
-                    {"label": "standard", "value": "standard", "expected_patch": {"qps_profile.mode": "standard"}},
-                    {"label": "intensive", "value": "intensive", "expected_patch": {"qps_profile.mode": "intensive"}},
+                    {"label": question_text("question.performance.qps_mode.quick"), "value": "quick", "expected_patch": {"qps_profile.mode": "quick"}},
+                    {"label": question_text("question.performance.qps_mode.standard"), "value": "standard", "expected_patch": {"qps_profile.mode": "standard"}},
+                    {"label": question_text("question.performance.qps_mode.intensive"), "value": "intensive", "expected_patch": {"qps_profile.mode": "intensive"}},
                 ],
                 accepted_action_types=("set_qps_mode",),
             )
@@ -56,16 +69,25 @@ def question_for_performance(state: AgentGraphState, group: str) -> dict[str, An
             return choice_question(
                 group,
                 "qps_profile_confirm",
-                question_prompts.qps_profile_prompt(
-                    str(qps.get("mode") or ""),
-                    fake_node=state.get("target_mode") == "fake-node",
-                    language=language,
+                question_text(
+                    (
+                        "question.performance.qps_profile_confirm_fake.prompt"
+                        if state.get("target_mode") == "fake-node"
+                        else "question.performance.qps_profile_confirm.prompt"
+                    ),
+                    mode=str(qps.get("mode") or ""),
+                    profile=", ".join(
+                        f"{key}={value}"
+                        for key, value in qps_profile_defaults(
+                            str(qps.get("mode") or "")
+                        ).items()
+                    ),
                 ),
                 field="qps_profile_confirmed",
                 kind="yes_no",
                 options=[
-                    {"label": "Y", "value": True, "expected_patch": {"qps_profile.confirmed": True}},
-                    {"label": "N", "value": False, "expected_patch": {"qps_profile.default_decision_made": True}},
+                    {"label": question_text("question.common.option.yes"), "value": True, "expected_patch": {"qps_profile.confirmed": True}},
+                    {"label": question_text("question.common.option.no"), "value": False, "expected_patch": {"qps_profile.default_decision_made": True}},
                 ],
                 accepted_action_types=("request_qps_customization",),
                 queue_barrier=True,
@@ -73,17 +95,20 @@ def question_for_performance(state: AgentGraphState, group: str) -> dict[str, An
         if not qps.get("confirmed"):
             if not qps.get("adjust_field"):
                 options = [
-                    {"label": f"{field} / {label}", "value": field, "expected_patch": {"qps_profile.adjust_field": field}}
-                    for field, label in (
-                        ("INITIAL_QPS", "起始 QPS" if zh else "initial QPS"),
-                        ("MAX_QPS", "最高 QPS" if zh else "max QPS"),
-                        ("QPS_STEP", "每级递增" if zh else "increment"),
-                        ("DURATION", "每档持续秒数" if zh else "seconds per step"),
-                    )
+                    {
+                        "label": question_text(
+                            f"question.performance.qps_field.{field.lower()}"
+                        ),
+                        "value": field,
+                        "expected_patch": {"qps_profile.adjust_field": field},
+                    }
+                    for field in QPS_FIELDS
                 ]
                 options.append(
                     {
-                        "label": "完成调整" if zh else "Finish QPS adjustments",
+                        "label": question_text(
+                            "question.performance.qps_adjustments.finish"
+                        ),
                         "value": "done",
                         "expected_patch": {"qps_profile.confirmed": True},
                     }
@@ -91,14 +116,20 @@ def question_for_performance(state: AgentGraphState, group: str) -> dict[str, An
                 return choice_question(
                     group,
                     "qps_adjust_field",
-                    localized(language, f"请选择要调整的 {qps.get('mode')} QPS 参数。", f"Choose the {qps.get('mode')} QPS parameter to adjust."),
+                    question_text(
+                        "question.performance.qps_adjust_field.prompt",
+                        mode=str(qps.get("mode") or ""),
+                    ),
                     field="qps_adjust_field",
                     options=options,
                 )
             return manual_question(
                 group,
                 "qps_adjust_value",
-                localized(language, f"请输入 {qps.get('adjust_field')} 的值。", f"Enter the value for {qps.get('adjust_field')}."),
+                question_text(
+                    "question.performance.qps_adjust_value.prompt",
+                    field=str(qps.get("adjust_field") or ""),
+                ),
                 field="qps_adjust_value",
                 validation={"value_type": "positive_number"},
                 candidate_bindings=({
@@ -114,12 +145,12 @@ def question_for_performance(state: AgentGraphState, group: str) -> dict[str, An
         return choice_question(
             group,
             "observability_mode",
-            localized(language, "请选择可观测性模式。", "Choose observability mode."),
+            question_text("question.performance.observability_mode.prompt"),
             field="observability_mode",
             options=[
-                {"label": "禁用" if zh else "Disabled", "value": "disabled", "expected_patch": {"observability.mode": "disabled"}},
-                {"label": "本地 Prometheus/Grafana" if zh else "Local Prometheus/Grafana", "value": "local", "expected_patch": {"observability.mode": "local"}},
-                {"label": "仅 exporter，对接已有 Prometheus" if zh else "Exporter only for existing Prometheus", "value": "exporter", "expected_patch": {"observability.mode": "exporter"}},
+                {"label": question_text("question.performance.observability.disabled"), "value": "disabled", "expected_patch": {"observability.mode": "disabled"}},
+                {"label": question_text("question.performance.observability.local"), "value": "local", "expected_patch": {"observability.mode": "local"}},
+                {"label": question_text("question.performance.observability.exporter"), "value": "exporter", "expected_patch": {"observability.mode": "exporter"}},
             ],
             accepted_action_types=("set_observability",),
         )
@@ -128,23 +159,35 @@ def question_for_performance(state: AgentGraphState, group: str) -> dict[str, An
         return choice_question(
             group,
             "advanced_tuning_confirm",
-            question_prompts.advanced_tuning_default_prompt(language=language),
+            question_text(
+                "question.performance.advanced_tuning_confirm.prompt",
+                fields=", ".join(ADVANCED_FIELDS),
+            ),
             field="advanced_tuning_confirmed",
             kind="yes_no",
             options=[
-                {"label": "Y", "value": True, "expected_patch": {"advanced_tuning.confirmed": True}},
-                {"label": "N", "value": False, "expected_patch": {"advanced_tuning.default_decision_made": True}},
+                {"label": question_text("question.common.option.yes"), "value": True, "expected_patch": {"advanced_tuning.confirmed": True}},
+                {"label": question_text("question.common.option.no"), "value": False, "expected_patch": {"advanced_tuning.default_decision_made": True}},
             ],
         )
     if not tuning.get("confirmed"):
         if not tuning.get("adjust_field"):
             options = [
-                {"label": label, "value": field, "expected_patch": {"advanced_tuning.adjust_field": field}}
-                for field, label in ADVANCED_FIELDS.items()
+                {
+                    "label": question_text(
+                        "question.performance.advanced_field.option",
+                        field=field,
+                    ),
+                    "value": field,
+                    "expected_patch": {"advanced_tuning.adjust_field": field},
+                }
+                for field in ADVANCED_FIELDS
             ]
             options.append(
                 {
-                    "label": "完成调整" if zh else "Finish adjustments",
+                    "label": question_text(
+                        "question.performance.advanced_adjustments.finish"
+                    ),
                     "value": "done",
                     "expected_patch": {"advanced_tuning.confirmed": True},
                 }
@@ -152,14 +195,19 @@ def question_for_performance(state: AgentGraphState, group: str) -> dict[str, An
             return choice_question(
                 group,
                 "advanced_tuning_adjust_field",
-                localized(language, "请选择要调整的高级调优参数。", "Choose the advanced tuning parameter to adjust."),
+                question_text(
+                    "question.performance.advanced_tuning_adjust_field.prompt"
+                ),
                 field="advanced_tuning_adjust_field",
                 options=options,
             )
         return manual_question(
             group,
             "advanced_tuning_adjust_value",
-            localized(language, f"请输入 {tuning.get('adjust_field')} 的值。", f"Enter the value for {tuning.get('adjust_field')}."),
+            question_text(
+                "question.performance.advanced_tuning_adjust_value.prompt",
+                field=str(tuning.get("adjust_field") or ""),
+            ),
             field="advanced_tuning_adjust_value",
             validation={"value_type": "positive_number"},
         )
@@ -167,7 +215,9 @@ def question_for_performance(state: AgentGraphState, group: str) -> dict[str, An
 
 
 def apply_performance_answer(state: AgentGraphState, question: dict[str, Any], value: Any) -> HandlerResult:
-    next_state, visible, blocked = _apply_performance_answer_state(deepcopy(state), question, value)
+    next_state, response_fragment, blocked = _apply_performance_answer_state(
+        deepcopy(state), question, value
+    )
     group = str(question.get("group") or "")
     previous_invalidated = set(state.get("invalidated_groups") or [])
     next_invalidated = set(next_state.get("invalidated_groups") or [])
@@ -175,7 +225,7 @@ def apply_performance_answer(state: AgentGraphState, question: dict[str, Any], v
         delta=StateDelta.between(state, next_state),
         invalidated_groups=tuple(sorted(next_invalidated - previous_invalidated)),
         reconfigured_groups=tuple(sorted(previous_invalidated - next_invalidated)),
-        visible_result=visible,
+        response_fragments=(response_fragment,) if response_fragment else (),
         pending_question=question if blocked else None,
         clear_pending=not blocked,
         next_group=group,
@@ -187,10 +237,10 @@ def _apply_performance_answer_state(
     state: AgentGraphState,
     question: dict[str, Any],
     value: Any,
-) -> tuple[AgentGraphState, str, bool]:
+) -> tuple[AgentGraphState, ResponseFragment | None, bool]:
     group = str(question.get("group") or "")
     field = str(question.get("field") or "")
-    visible = ""
+    response_fragment = None
     if group == "qps_profile":
         qps = state.setdefault("qps_profile", {})
         if field == "benchmark_mode":
@@ -213,20 +263,33 @@ def _apply_performance_answer_state(
         elif field == "qps_adjust_value":
             adjust_field = str(qps.get("adjust_field") or "")
             candidate = normalize_scalar(str(value))
-            merged = {**question_prompts.qps_profile_defaults(qps.get("mode")), **(qps.get("overrides") or {}), adjust_field: candidate}
+            merged = {**qps_profile_defaults(qps.get("mode")), **(qps.get("overrides") or {}), adjust_field: candidate}
             error = validate_qps_profile(merged)
             if error:
-                visible = localized(state.get("language", "en"), f"QPS 数值无效：{error}。请重新输入。", f"Invalid QPS value: {error}. Please re-enter.")
-                return state, visible, True
+                response_fragment = ResponseFragment(
+                    kind="warning",
+                    message_id="harness.performance.invalid_qps_value",
+                    arguments={"error": error},
+                    source=__name__,
+                )
+                return state, response_fragment, True
             qps.setdefault("overrides", {})[adjust_field] = candidate
             qps.pop("adjust_field", None)
     elif group == "observability":
         mode = str(value)
         state.setdefault("observability", {})["mode"] = mode
         if mode == "exporter":
-            visible = localized(state.get("language", "en"), "仅启动 exporter；请让已有 Prometheus 抓取 `http://<benchmark-host>:9108/metrics`。", "Exporter only; configure existing Prometheus to scrape `http://<benchmark-host>:9108/metrics`.")
+            response_fragment = ResponseFragment(
+                kind="message",
+                message_id="harness.performance.exporter_selected",
+                source=__name__,
+            )
         elif mode == "local":
-            visible = localized(state.get("language", "en"), "将启动 exporter:9108、Prometheus:9091 和 Grafana:3001。", "Will start exporter:9108, Prometheus:9091, and Grafana:3001.")
+            response_fragment = ResponseFragment(
+                kind="message",
+                message_id="harness.performance.local_observability_selected",
+                source=__name__,
+            )
     else:
         tuning = state.setdefault("advanced_tuning", {})
         if field == "advanced_tuning_confirmed":
@@ -242,15 +305,19 @@ def _apply_performance_answer_state(
             adjust_field = str(tuning.get("adjust_field") or "")
             candidate = normalize_scalar(str(value))
             if not valid_advanced_value(adjust_field, candidate):
-                visible = localized(state.get("language", "en"), "数值无效：请输入正数；百分比字段不得超过 100。", "Invalid value: enter a positive number; percentage fields must not exceed 100.")
-                return state, visible, True
+                response_fragment = ResponseFragment(
+                    kind="warning",
+                    message_id="harness.performance.invalid_advanced_value",
+                    source=__name__,
+                )
+                return state, response_fragment, True
             tuning.setdefault("overrides", {})[adjust_field] = candidate
             tuning.pop("adjust_field", None)
     invalidated = set(state.get("invalidated_groups") or [])
     invalidated.discard(group)
     state["invalidated_groups"] = sorted(invalidated)
     record_group_invalidations(state, group)
-    return state, visible, False
+    return state, response_fragment, False
 
 
 def validate_qps_profile(values: dict[str, Any]) -> str:
@@ -273,7 +340,7 @@ def validate_qps_overrides(
     """Validate partial overrides against the selected mode's full profile."""
 
     merged = {
-        **question_prompts.qps_profile_defaults(mode),
+        **qps_profile_defaults(mode),
         **(current_overrides or {}),
         **{str(key): normalize_scalar(str(value)) for key, value in overrides.items()},
     }
@@ -288,12 +355,17 @@ def valid_advanced_value(field: str, value: str) -> bool:
 
 def apply_performance_action(state: AgentGraphState, action: ActionProposal) -> HandlerResult:
     next_state: AgentGraphState = deepcopy(state)
-    visible = ""
+    response_fragment = None
     completion = "completed"
     if action.action_type == "set_qps_mode":
         mode = str(action.arguments.get("qps_mode") or "").strip().lower()
         if mode not in {"quick", "standard", "intensive"}:
-            return HandlerResult(blocker="qps_mode must be quick, standard, or intensive")
+            return HandlerResult(
+                blocker=FailureDescriptor(
+                    code="harness.performance.failure.invalid_qps_mode",
+                    source=__name__,
+                )
+            )
         customization_requested = bool((next_state.get("qps_profile") or {}).get("customization_requested"))
         next_state["qps_profile"] = {
             "mode": mode,
@@ -326,7 +398,12 @@ def apply_performance_action(state: AgentGraphState, action: ActionProposal) -> 
     elif action.action_type == "set_qps_override":
         values = action.arguments.get("qps_overrides")
         if not isinstance(values, dict) or not values:
-            return HandlerResult(blocker="qps_overrides is required")
+            return HandlerResult(
+                blocker=FailureDescriptor(
+                    code="harness.performance.failure.qps_overrides_required",
+                    source=__name__,
+                )
+            )
         qps = next_state.setdefault("qps_profile", {})
         normalized = {str(key): normalize_scalar(str(value)) for key, value in values.items()}
         error = validate_qps_overrides(
@@ -335,32 +412,53 @@ def apply_performance_action(state: AgentGraphState, action: ActionProposal) -> 
             qps.get("overrides") or {},
         )
         if error:
-            return HandlerResult(blocker=f"invalid QPS profile: {error}")
+            return HandlerResult(
+                blocker=FailureDescriptor(
+                    code="harness.performance.failure.invalid_qps_profile",
+                    arguments={"error": error},
+                    source=__name__,
+                )
+            )
         qps.setdefault("overrides", {}).update({key: normalized[key] for key in QPS_FIELDS if key in normalized})
         qps.update({"confirmed": True, "default_decision_made": True})
         next_group = "qps_profile"
     elif action.action_type == "set_observability":
         mode = normalize_observability_mode(action.arguments.get("observability_mode"))
         if not mode:
-            return HandlerResult(blocker="observability_mode must be disabled, local, or exporter")
+            return HandlerResult(
+                blocker=FailureDescriptor(
+                    code="harness.performance.failure.invalid_observability_mode",
+                    source=__name__,
+                )
+            )
         next_state["observability"] = {"mode": mode}
         next_group = "observability"
         if mode == "exporter":
-            visible = localized(
-                state.get("language", "en"),
-                "已选择 exporter-only；已有 Prometheus 应抓取 `http://<benchmark-host>:9108/metrics`。",
-                "Selected exporter-only; configure the existing Prometheus to scrape `http://<benchmark-host>:9108/metrics`.",
+            response_fragment = ResponseFragment(
+                kind="message",
+                message_id="harness.performance.exporter_selected",
+                source=__name__,
             )
         elif mode == "local":
-            visible = localized(
-                state.get("language", "en"),
-                "已选择本地可观测性：exporter:9108、Prometheus:9091、Grafana:3001。",
-                "Selected local observability: exporter:9108, Prometheus:9091, Grafana:3001.",
+            response_fragment = ResponseFragment(
+                kind="message",
+                message_id="harness.performance.local_observability_selected",
+                source=__name__,
             )
         else:
-            visible = localized(state.get("language", "en"), "已禁用本地可观测性组件。", "Local observability components are disabled.")
+            response_fragment = ResponseFragment(
+                kind="message",
+                message_id="harness.performance.observability_disabled",
+                source=__name__,
+            )
     else:
-        return HandlerResult(blocker=f"unsupported performance action: {action.action_type}")
+        return HandlerResult(
+            blocker=FailureDescriptor(
+                code="harness.performance.failure.unsupported_action",
+                arguments={"action_type": action.action_type},
+                source=__name__,
+            )
+        )
     invalidated = set(next_state.get("invalidated_groups") or [])
     invalidated.discard(next_group)
     next_state["invalidated_groups"] = sorted(invalidated)
@@ -374,5 +472,5 @@ def apply_performance_action(state: AgentGraphState, action: ActionProposal) -> 
         clear_pending=True,
         next_group=next_group,
         completion=completion,
-        visible_result=visible,
+        response_fragments=(response_fragment,) if response_fragment else (),
     )

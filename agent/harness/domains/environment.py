@@ -5,17 +5,32 @@ from __future__ import annotations
 import json
 import re
 from copy import deepcopy
+from functools import partial
 from typing import Any
 
-from ..contracts import ActionProposal, HandlerResult, StateDelta
-from ..localization import localized
-from ..questions import choice_question, manual_question, normalize_scalar
+from ..contracts import (
+    ActionProposal,
+    FailureDescriptor,
+    HandlerResult,
+    ResponseFragment,
+    StateDelta,
+    text_ref_to_dict,
+)
+from ..questions import (
+    choice_question as _choice_question,
+    manual_question as _manual_question,
+    normalize_scalar,
+    question_text,
+)
 from ..state import AgentGraphState
 from ..transitions import record_group_invalidations
 
-from agent.planners import question_prompts
 from agent.utils.redaction import redact
 from agent.workflows.group_registry import group_for_field, invalidation_targets
+
+choice_question = partial(_choice_question, owner="environment")
+manual_question = partial(_manual_question, owner="environment")
+
 ENVIRONMENT_GROUPS = {"provider_deployment", "ledger_disk", "accounts_disk", "network"}
 
 CONFIRMABLE_CONFIG_FIELDS = {
@@ -187,10 +202,6 @@ def build_config_proposal(action: dict[str, Any]) -> dict[str, Any]:
             and not _is_workflow_dimension_key(normalized_key)
         ):
             unmapped[normalized_key] = value
-    if "HAS_ACCOUNTS_DEVICE" not in config_values and _text_mentions_no_accounts_disk(
-        action.get("source_text") or action.get("_origin_text") or ""
-    ):
-        config_values["HAS_ACCOUNTS_DEVICE"] = False
     raw_unmapped = action.get("unmapped_values")
     if isinstance(raw_unmapped, dict):
         for key, value in raw_unmapped.items():
@@ -224,7 +235,12 @@ def apply_environment_action(state: AgentGraphState, action: ActionProposal) -> 
 
     if action.action_type == "set_accounts_presence":
         if "has_accounts_device" not in action.arguments:
-            return HandlerResult(blocker="set_accounts_presence requires has_accounts_device")
+            return HandlerResult(
+                blocker=FailureDescriptor(
+                    code="harness.environment.failure.accounts_presence_missing",
+                    source=__name__,
+                )
+            )
         next_state: AgentGraphState = deepcopy(state)
         confirmed = next_state.setdefault("confirmed_config", {})
         has_accounts = bool(action.arguments.get("has_accounts_device"))
@@ -270,7 +286,13 @@ def apply_environment_action(state: AgentGraphState, action: ActionProposal) -> 
             proposal,
             consumed_action_ids=(action.action_id,),
         )
-    return HandlerResult(blocker=f"unsupported environment action: {action.action_type}")
+    return HandlerResult(
+        blocker=FailureDescriptor(
+            code="harness.environment.failure.unsupported_action",
+            arguments={"action_type": action.action_type},
+            source=__name__,
+        )
+    )
 
 
 def propose_config_assignments_for_review(
@@ -452,24 +474,66 @@ def config_proposal_review_question(group: str, proposal: dict[str, Any], *, lan
     question = choice_question(
         group,
         "inferred_config_review",
-        format_config_proposal_prompt(proposal, language=language),
+        question_text(
+            "question.environment.inferred_config_review.prompt",
+            **_config_proposal_prompt_arguments(proposal),
+        ),
         field="inferred_config_review",
         kind="yes_no",
         manual_input_allowed=False,
         options=[
-            {"label": "Y", "value": True, "expected_patch": {"inferred_config.pending_review": {}}},
-            {"label": "N", "value": False, "expected_patch": {"inferred_config.pending_review": {}}},
+            {
+                "label": question_text("question.common.option.yes"),
+                "value": True,
+                "expected_patch": {"inferred_config.pending_review": {}},
+            },
+            {
+                "label": question_text("question.common.option.no"),
+                "value": False,
+                "expected_patch": {"inferred_config.pending_review": {}},
+            },
         ],
         accepted_action_types=("propose_config_values",),
         queue_barrier=True,
+        owner="environment",
     )
     question["supersedes_action_types"] = ["propose_config_values"]
     question["barrier_policy"] = "explicit_detour_only"
     return question
 
 
-def format_config_proposal_prompt(proposal: dict[str, Any], *, language: str = "en") -> str:
-    """Format review content without performing final terminal rendering."""
+def reconstruct_environment_question(
+    state: AgentGraphState,
+    identity: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Rebuild an environment-owned question from current authoritative state."""
+
+    group = str(identity.get("group") or "").strip()
+    question_id = str(
+        identity.get("question_id") or identity.get("id") or ""
+    ).strip()
+    field = str(identity.get("field") or "").strip()
+    if question_id == "inferred_config_review":
+        proposal = (state.get("inferred_config") or {}).get("pending_review")
+        if not isinstance(proposal, dict) or not proposal.get("config_values"):
+            return None
+        return config_proposal_review_question(
+            group,
+            proposal,
+            language=str(state.get("language") or "en"),
+        )
+    if field:
+        question = question_for_environment_field(state, group, field)
+        if question and str(question.get("id") or "") == question_id:
+            return question
+    question = question_for_environment(state, group)
+    if question and str(question.get("id") or "") == question_id:
+        return question
+    return None
+
+
+def _config_proposal_prompt_arguments(proposal: dict[str, Any]) -> dict[str, str]:
+    """Build language-neutral arguments for the central review template."""
 
     config_values = proposal.get("config_values") if isinstance(proposal.get("config_values"), dict) else {}
     unmapped = proposal.get("unmapped_values") if isinstance(proposal.get("unmapped_values"), dict) else {}
@@ -477,23 +541,21 @@ def format_config_proposal_prompt(proposal: dict[str, Any], *, language: str = "
     display_config_values = redact(config_values)
     display_unmapped = redact(unmapped)
     display_conflicts = redact(conflicts)
-    lines = []
-    if display_config_values:
-        lines.append(localized(language, "我从你粘贴的内容中推断出这些配置候选值：", "I inferred these candidate config values from your pasted content:"))
-        for key in sorted(display_config_values):
-            lines.append(f"- {key}: `{display_config_values[key]}`")
-    if display_unmapped:
-        lines.append(localized(language, "以下内容没有自动映射到已知配置项，不会自动写入：", "These extracted values did not map to known config fields and will not be applied automatically:"))
-        for key in sorted(display_unmapped):
-            lines.append(f"- {key}: `{display_unmapped[key]}`")
-    if display_conflicts:
-        lines.append(localized(language, "以下输入存在冲突，请在确认前核对：", "The following inputs conflict; review them before confirming:"))
-        lines.extend(f"- {item}" for item in display_conflicts)
-    if proposal.get("reason"):
-        lines.append(localized(language, f"推断依据：{proposal.get('reason')}", f"Reason: {proposal.get('reason')}"))
-    lines.append(localized(language, "是否确认应用这些已映射的候选值？", "Apply the mapped candidate values?"))
-    lines.append(localized(language, "endpoint 类值只会保存为待验证候选，后续仍必须通过 endpoint probe。", "Endpoint values are saved only as candidates; they must still pass endpoint probing later."))
-    return "\n".join(lines)
+    mapped_text = "\n".join(
+        f"- {key}: `{display_config_values[key]}`"
+        for key in sorted(display_config_values)
+    ) or "<none>"
+    unmapped_text = "\n".join(
+        f"- {key}: `{display_unmapped[key]}`"
+        for key in sorted(display_unmapped)
+    ) or "<none>"
+    conflicts_text = "\n".join(f"- {item}" for item in display_conflicts) or "<none>"
+    return {
+        "mapped_values": mapped_text,
+        "unmapped_values": unmapped_text,
+        "conflicts": conflicts_text,
+        "reason": str(proposal.get("reason") or "<none>"),
+    }
 
 
 def apply_direct_config_assignments(state: AgentGraphState, config_values: dict[str, Any]) -> HandlerResult:
@@ -532,10 +594,12 @@ def apply_inferred_config_review(
         return HandlerResult(
             delta=StateDelta.between(state, next_state),
             clear_pending=True,
-            visible_result=localized(
-                next_state.get("language", "en"),
-                "已丢弃这次推断的候选配置。你可以重新粘贴更完整的信息，或直接说明要修改哪个配置组。",
-                "Discarded these inferred candidate values. Paste corrected information, or name the configuration group to change.",
+            response_fragments=(
+                ResponseFragment(
+                    kind="message",
+                    message_id="harness.environment.inferred_config_discarded",
+                    source=__name__,
+                ),
             ),
             evidence=({
                 "type": "inferred_config_review",
@@ -557,36 +621,47 @@ def apply_inferred_config_review(
     if conflicts:
         accepted_review["conflicts"] = conflicts
     inferred.setdefault("accepted_reviews", []).append(accepted_review)
-    messages: list[str] = []
+    response_fragments: list[ResponseFragment] = []
     if outcome["applied"]:
         details = ", ".join(f"{key}={value}" for key, value in sorted(outcome["applied"].items()))
-        messages.append(localized(
-            next_state.get("language", "en"),
-            f"已应用确认的配置候选值：{details}",
-            f"Applied confirmed candidate values: {details}",
-        ))
+        response_fragments.append(
+            ResponseFragment(
+                kind="message",
+                message_id="harness.environment.inferred_config_applied",
+                arguments={"details": details},
+                source=__name__,
+            )
+        )
     if outcome["endpoint_proposals"]:
         details = ", ".join(
             f"{key}={value}" for key, value in sorted(outcome["endpoint_proposals"].items())
         )
-        messages.append(localized(
-            next_state.get("language", "en"),
-            f"已保存 endpoint 候选值，后续仍会进行真实性验证：{details}",
-            f"Saved endpoint candidate values for mandatory validation later: {details}",
-        ))
+        response_fragments.append(
+            ResponseFragment(
+                kind="message",
+                message_id="harness.environment.endpoint_candidates_saved",
+                arguments={"details": details},
+                source=__name__,
+            )
+        )
     if outcome["invalid"]:
         details = ", ".join(f"{key}={value}" for key, value in sorted(outcome["invalid"].items()))
-        messages.append(localized(
-            next_state.get("language", "en"),
-            f"以下候选值无效，未写入：{details}",
-            f"These candidate values were invalid and were not applied: {details}",
-        ))
+        response_fragments.append(
+            ResponseFragment(
+                kind="warning",
+                message_id="harness.environment.invalid_candidates_ignored",
+                arguments={"details": details},
+                source=__name__,
+            )
+        )
     if accepted_review["unmapped_values"]:
-        messages.append(localized(
-            next_state.get("language", "en"),
-            "未映射字段已作为证据保留，不会自动写入配置。",
-            "Unmapped values were retained as evidence and were not applied automatically.",
-        ))
+        response_fragments.append(
+            ResponseFragment(
+                kind="evidence",
+                message_id="harness.environment.unmapped_values_retained",
+                source=__name__,
+            )
+        )
     followups: tuple[dict[str, Any], ...] = ()
     if outcome["sync_options"]:
         followups = ({"type": "set_sync_observe_options", **outcome["sync_options"]},)
@@ -595,7 +670,7 @@ def apply_inferred_config_review(
         invalidated_groups=tuple(sorted(set(next_state.get("invalidated_groups") or []) - set(state.get("invalidated_groups") or []))),
         reconfigured_groups=tuple(sorted(set(state.get("invalidated_groups") or []) - set(next_state.get("invalidated_groups") or []))),
         clear_pending=True,
-        visible_result="\n".join(messages),
+        response_fragments=tuple(response_fragments),
         evidence=({
             "type": "inferred_config_review",
             "accepted": True,
@@ -752,6 +827,8 @@ def normalize_proposed_config_value(key: str, value: Any) -> tuple[str, Any]:
     """Normalize inferred, structured, and direct values to one contract."""
 
     normalized_key = str(key or "").strip().upper()
+    if normalized_key == "HAS_ACCOUNTS_DEVICE" and isinstance(value, bool):
+        return normalized_key, value
     scalar = _strip_scalar(str(value)).strip().strip("\"'")
     if not normalized_key or not scalar:
         return normalized_key, ""
@@ -761,14 +838,10 @@ def normalize_proposed_config_value(key: str, value: Any) -> tuple[str, Any]:
         "SYNC_OBSERVE_STOP_CONDITIONS": "SYNC_OBSERVE_STOP_CONDITION",
     }
     normalized_key = key_aliases.get(normalized_key, normalized_key)
-    if normalized_key == "ACCOUNTS_DEVICE" and _is_absence_value(scalar):
-        return "HAS_ACCOUNTS_DEVICE", False
     if normalized_key == "HAS_ACCOUNTS_DEVICE":
-        if _is_absence_value(scalar):
-            return normalized_key, False
-        if scalar.lower() in {"y", "yes", "true", "1", "有", "是"}:
+        if scalar.lower() in {"true", "1"}:
             return normalized_key, True
-        if scalar.lower() in {"n", "no", "false", "0", "没有", "无"}:
+        if scalar.lower() in {"false", "0"}:
             return normalized_key, False
         return normalized_key, scalar
     if normalized_key in {"DATA_VOL_SIZE", "ACCOUNTS_VOL_SIZE"}:
@@ -904,22 +977,6 @@ def _signed_number_text(value: Any) -> str:
     return _first_number_text(text)
 
 
-def _is_absence_value(value: Any) -> bool:
-    text = _strip_scalar(str(value or "")).strip().lower()
-    return text in {
-        "none", "<none>", "null", "nil", "n/a", "na", "false", "0", "no", "n",
-        "none detected", "not detected", "no separate disk", "no accounts", "no accounts disk",
-        "without accounts", "没有", "无", "没有 accounts", "没有 accounts 盘", "没有独立 accounts 盘", "不需要",
-    }
-
-
-def _text_mentions_no_accounts_disk(value: Any) -> bool:
-    text = str(value or "").strip().lower()
-    if not text or "accounts" not in text and "account" not in text:
-        return False
-    return any(marker in text for marker in ("没有", "无", "no ", "without", "not have", "don't have", "does not have"))
-
-
 def _strip_scalar(value: str) -> str:
     text = str(value or "").strip()
     if len(text) >= 2 and text[0] in {"`", "'", '"'} and text[-1] in {"`", "'", '"'}:
@@ -932,7 +989,6 @@ def _strip_scalar(value: str) -> str:
 def question_for_environment(state: AgentGraphState, group: str) -> dict[str, Any] | None:
     if group not in ENVIRONMENT_GROUPS:
         return None
-    language = str(state.get("language") or "en")
     confirmed = state.get("confirmed_config") or {}
     discovery = state.get("discovery") or {}
     if group == "provider_deployment":
@@ -950,16 +1006,23 @@ def question_for_environment(state: AgentGraphState, group: str) -> dict[str, An
                 return choice_question(
                     group,
                     env_key,
-                    localized(language, f"检测到 {env_key} 为 `{detected}`，是否使用？", f"Detected {env_key}: `{detected}`. Use it?"),
+                    question_text(
+                        "question.environment.detected_value.prompt",
+                        field=env_key,
+                        value=detected,
+                    ),
                     field=env_key,
                     kind="yes_no",
                     manual_input_allowed=True,
                     structured_config_key=env_key,
                     validation={"value_type": "scalar_token"},
                     options=[
-                        {"label": "Y", "value": detected},
                         {
-                            "label": "N",
+                            "label": question_text("question.common.option.yes"),
+                            "value": detected,
+                        },
+                        {
+                            "label": question_text("question.common.option.no"),
                             "value": "__manual__",
                             "manual_entry": True,
                             "expected_patch": {f"inferred_config.{env_key}_manual_required": True},
@@ -969,7 +1032,7 @@ def question_for_environment(state: AgentGraphState, group: str) -> dict[str, An
             return manual_question(
                 group,
                 env_key,
-                question_prompts.text_for(prompt_key, language=language),
+                question_text(f"question.environment.{prompt_key}.prompt"),
                 field=env_key,
                 structured_config_key=env_key,
                 validation={"value_type": "scalar_token"},
@@ -982,10 +1045,13 @@ def question_for_environment(state: AgentGraphState, group: str) -> dict[str, An
             return choice_question(
                 group,
                 "has_accounts_device",
-                localized(language, "这个节点是否有独立的 accounts/state 磁盘？", "Does this node have a separate accounts/state disk?"),
+                question_text("question.environment.has_accounts_device.prompt"),
                 field="has_accounts_device",
                 kind="yes_no",
-                options=[{"label": "Y", "value": True}, {"label": "N", "value": False}],
+                options=[
+                    {"label": question_text("question.common.option.yes"), "value": True},
+                    {"label": question_text("question.common.option.no"), "value": False},
+                ],
             )
         if confirmed.get("has_accounts_device"):
             return _disk_question(state, prefix="ACCOUNTS", device_key="ACCOUNTS_DEVICE", group=group)
@@ -999,18 +1065,31 @@ def question_for_environment(state: AgentGraphState, group: str) -> dict[str, An
                 return choice_question(
                     group,
                     "network_interface",
-                    question_prompts.text_for("network_interface", language=language),
+                    question_text("question.environment.network_interface.prompt"),
                     field="NETWORK_INTERFACE",
                     kind="device",
                     manual_input_allowed=True,
                     structured_config_key="NETWORK_INTERFACE",
                     validation={"value_type": "scalar_token"},
-                    options=[{"label": f"{item}{' (default)' if item == default else ''}", "value": item} for item in interfaces],
+                    options=[
+                        {
+                            "label": question_text(
+                                (
+                                    "question.environment.network_interface.option_default"
+                                    if item == default
+                                    else "question.environment.network_interface.option"
+                                ),
+                                interface=item,
+                            ),
+                            "value": item,
+                        }
+                        for item in interfaces
+                    ],
                 )
             return manual_question(
                 group,
                 "network_interface",
-                question_prompts.text_for("network_interface", language=language),
+                question_text("question.environment.network_interface.prompt"),
                 field="NETWORK_INTERFACE",
                 kind="device",
                 structured_config_key="NETWORK_INTERFACE",
@@ -1020,7 +1099,9 @@ def question_for_environment(state: AgentGraphState, group: str) -> dict[str, An
             return manual_question(
                 group,
                 "NETWORK_MAX_BANDWIDTH_GBPS",
-                question_prompts.text_for("network_max_bandwidth_gbps", language=language),
+                question_text(
+                    "question.environment.network_max_bandwidth_gbps.prompt"
+                ),
                 field="NETWORK_MAX_BANDWIDTH_GBPS",
                 structured_config_key="NETWORK_MAX_BANDWIDTH_GBPS",
                 validation={"value_type": "positive_number"},
@@ -1057,17 +1138,19 @@ def question_for_environment_field(
         question = dict(question)
         question["reconfiguration_target_field"] = field
         if str(question.get("field") or "") == field:
-            language = str(projected.get("language") or "en")
-            question["prompt"] = localized(
-                language,
-                f"请输入新的 {field}。",
-                f"Enter the new {field}.",
+            question["prompt_ref"] = text_ref_to_dict(
+                question_text(
+                    "question.environment.reconfiguration_value.prompt",
+                    field=field,
+                )
             )
         return question
     return None
 
 
 def apply_environment_answer(state: AgentGraphState, question: dict[str, Any], value: Any) -> HandlerResult:
+    if str(question.get("id") or "") == "inferred_config_review":
+        return apply_inferred_config_review(state, bool(value))
     next_state: AgentGraphState = deepcopy(state)
     field = str(question.get("field") or "")
     group = str(question.get("group") or "")
@@ -1092,7 +1175,13 @@ def apply_environment_answer(state: AgentGraphState, question: dict[str, Any], v
         normalized = normalize_scalar(str(value))
         if not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", normalized) or float(normalized) <= 0:
             return HandlerResult(
-                visible_result=localized(state.get("language", "en"), "输入无效：请输入大于 0 的数值。", "Invalid input: enter a number greater than zero."),
+                response_fragments=(
+                    ResponseFragment(
+                        kind="warning",
+                        message_id="harness.environment.positive_number_required",
+                        source=__name__,
+                    ),
+                ),
                 pending_question=question,
                 completion="blocked",
             )
@@ -1127,7 +1216,6 @@ def apply_environment_answer(state: AgentGraphState, question: dict[str, Any], v
 
 
 def _disk_question(state: AgentGraphState, *, prefix: str, device_key: str, group: str) -> dict[str, Any] | None:
-    language = str(state.get("language") or "en")
     confirmed = state.get("confirmed_config") or {}
     if not confirmed.get(device_key):
         candidates = _disk_candidates(state)
@@ -1135,18 +1223,35 @@ def _disk_question(state: AgentGraphState, *, prefix: str, device_key: str, grou
             return choice_question(
                 group,
                 device_key,
-                localized(language, f"请选择 {device_key}，或直接输入设备名。", f"Choose {device_key}, or type the device name."),
+                question_text(
+                    "question.environment.disk_device.prompt",
+                    device_key=device_key,
+                ),
                 field=device_key,
                 kind="device",
                 manual_input_allowed=True,
                 structured_config_key=device_key,
                 validation={"value_type": "scalar_token"},
-                options=[{"label": f"{item['name']} ({item.get('size') or '?'}, {item.get('type') or '?'})", "value": item["name"]} for item in candidates],
+                options=[
+                    {
+                        "label": question_text(
+                            "question.environment.disk_device.option",
+                            name=item["name"],
+                            size=str(item.get("size") or "?"),
+                            device_type=str(item.get("type") or "?"),
+                        ),
+                        "value": item["name"],
+                    }
+                    for item in candidates
+                ],
             )
         return manual_question(
             group,
             device_key,
-            localized(language, f"请输入 {device_key}。", f"Enter {device_key}."),
+            question_text(
+                "question.environment.disk_device_manual.prompt",
+                device_key=device_key,
+            ),
             field=device_key,
             kind="device",
             structured_config_key=device_key,
@@ -1168,16 +1273,23 @@ def _disk_question(state: AgentGraphState, *, prefix: str, device_key: str, grou
                 return choice_question(
                     group,
                     env_key,
-                    localized(language, f"检测到 {env_key} 为 `{inferred}` GiB，是否使用？", f"Detected {env_key}: `{inferred}` GiB. Use it?"),
+                    question_text(
+                        "question.environment.detected_disk_size.prompt",
+                        field=env_key,
+                        value=inferred,
+                    ),
                     field=env_key,
                     kind="yes_no",
                     manual_input_allowed=True,
                     structured_config_key=env_key,
                     validation={"value_type": "positive_number"},
                     options=[
-                        {"label": "Y", "value": inferred},
                         {
-                            "label": "N",
+                            "label": question_text("question.common.option.yes"),
+                            "value": inferred,
+                        },
+                        {
+                            "label": question_text("question.common.option.no"),
                             "value": "__manual__",
                             "manual_entry": True,
                             "expected_patch": {f"inferred_config.{env_key}_manual_required": True},
@@ -1188,7 +1300,7 @@ def _disk_question(state: AgentGraphState, *, prefix: str, device_key: str, grou
         return manual_question(
             group,
             env_key,
-            question_prompts.text_for(prompt_key, language=language),
+            question_text(f"question.environment.{prompt_key}.prompt"),
             field=env_key,
             structured_config_key=env_key,
             validation={"value_type": value_type},

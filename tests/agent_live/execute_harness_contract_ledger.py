@@ -37,7 +37,10 @@ from tests.agent_live.generate_harness_coverage_ledger import (
     execution_exit_code,
     refresh_ledger_status,
 )
-from tests.agent_live.graph_turn import invoke_product_graph_turn
+from tests.agent_live.graph_turn import (
+    invoke_product_graph_turn,
+    reviewed_execution_planner,
+)
 from tests.agent_live.harness_contract_scenarios import QuestionScenario
 from tests.agent_live.reviewed_execution_cases import reviewed_execution_case
 
@@ -76,13 +79,18 @@ def execute_ledger(
         error = ""
         with capture_coverage_events() as events:
             try:
-                observation = observe_compiled_graph_turn(
-                    invoke_product_graph_turn,
-                    before_state,
-                    edge_key=str(edge["edge_key"]),
-                    input_value=input_value,
-                    component=COMPILED_GRAPH_RUNNER,
-                )
+                with reviewed_execution_planner(
+                    expected_input=input_value,
+                    expected_admitted=expected_admitted,
+                    reviewed_value=execution_case.expected_value,
+                ):
+                    observation = observe_compiled_graph_turn(
+                        invoke_product_graph_turn,
+                        before_state,
+                        edge_key=str(edge["edge_key"]),
+                        input_value=input_value,
+                        component=COMPILED_GRAPH_RUNNER,
+                    )
                 after_state = observation.after
                 validate_state(dict(after_state))
                 _verify_postcondition(

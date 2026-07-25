@@ -54,6 +54,7 @@ class MethodDraft(TypedDict, total=False):
     request_confirmed: bool
     response_confirmed: bool
     response_summary: str
+    response_json_type: str
     response_fields: list[dict[str, Any]]
     response_sample: Any
     evidence: list[EvidenceFragment]

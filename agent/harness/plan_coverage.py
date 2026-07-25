@@ -336,7 +336,15 @@ def _entry_intake_exclusivity_errors(actions: Sequence[Any]) -> list[str]:
         spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
         if spec is None or not spec.entry_intake:
             continue
-        if any(action.get(key) != value for key, value in spec.entry_intake_arguments):
+        if any(
+            action.get(key) != value
+            for key, value in spec.entry_intake_fixed_arguments
+        ):
+            continue
+        if (
+            spec.entry_intake_value_arguments
+            and not any(bool(action.get(key)) for key in spec.entry_intake_value_arguments)
+        ):
             continue
         target = resolve_action_target_group(action)
         if target:

@@ -30,7 +30,7 @@ from tests.agent_live.product_chaos_journey_provider import (
     build_product_chaos_journey_definition,
     build_product_chaos_journey_manifest,
     build_product_chaos_target_payloads,
-    convert_completed_journey_to_product_evidence,
+    convert_completed_journey_to_product_evidence as _convert_completed_journey_to_product_evidence,
     freeze_product_chaos_batch,
     load_frozen_product_chaos_catalog,
     main,
@@ -52,6 +52,11 @@ from tests.agent_live.product_obligation_evidence import (
 
 
 REVISION = {"commit": "abc123", "worktree_hash": "frozen-tree"}
+
+
+def convert_completed_journey_to_product_evidence(*args, **kwargs):
+    kwargs.setdefault("round_id", "round-1")
+    return _convert_completed_journey_to_product_evidence(*args, **kwargs)
 
 
 class ProductChaosJourneyProviderTest(unittest.TestCase):

@@ -35,17 +35,30 @@ The LangGraph Harness is the single conversation and workflow authority:
 
 ```text
 complete terminal turn
--> exact active option or typed literal fast path when deterministic
--> otherwise hierarchical semantic partition and bounded owner compilation
--> admission and dependency-safe ordering
+-> prepare and adjudicate
+   -> deterministic branch: exact declared option/Y-N or trusted
+      command/transport -> trusted local contract admission
+   -> semantic branch: partition
+      -> compile exactly one scheduled owner per graph transition
+      -> independent whole-plan semantic admission in review_plan
+      -> deterministic action validation and dependency-safe ordering in admit
 -> select exactly one durable action
 -> route exactly one owning domain
 -> commit one typed result
 -> persist/invoke/receipt when the action has an external side effect
 -> repeat selection through graph transitions while admitted work remains
 -> canonical fallback and one response with at most one blocking question
--> validate and checkpoint schema version 14
+-> validate and checkpoint schema version 18
 ```
+
+The deterministic fast path does not include arbitrary manually entered typed
+values. Only exact values declared by the active option contract, including
+declared Y/N and numbered choices, plus trusted terminal commands,
+evidence-transport framing, and empty input may bypass semantic planning.
+Manual values, semantic alternatives, multi-intent prose, and structured input
+requiring ownership pass through `partition`, one or more `compile_owner`
+transitions, and `review_plan`; their owning pending/domain contracts still
+validate the values deterministically in `admit`.
 
 The single metadata authority is
 `agent/workflows/group_registry.py::GROUPS`. It currently defines 20 groups,
@@ -88,6 +101,10 @@ The eight owners are:
 - `recovery`: actionable failure recovery
 - `analysis`: pasted evidence and report/artifact analysis
 
+The graph also contains a `coordinator` control owner for typed pending-answer
+dispatch and graph-control actions. It owns no `GroupSpec`; the authoritative
+workflow remains 20 groups with exactly eight domain owners.
+
 Important implementation files:
 
 - `agent/harness/graph.py`: LangGraph/checkpoint runtime
@@ -101,15 +118,20 @@ Important implementation files:
   coverage validation
 - `agent/harness/queue.py`: dependency ordering and pending-barrier eligibility
 - `agent/harness/routing.py`: navigation and canonical fallback authority
-- `agent/harness/response.py`: single response-composition authority
+- `agent/harness/response.py`: single terminal-response assembler and
+  `visible_response` writer; domains and the coordinator emit only registered
+  semantic fragments, while `response_catalog.py` and `response_messages/`
+  are the sole localized product-prose authority
 - `agent/harness/contracts.py`: durable action/result/effect/turn contracts
 - `agent/harness/checkpoint_migrations.py`: isolated historical checkpoint
   migration boundary only
 - `agent/harness/questions.py`: typed question/option contracts
 - `agent/harness/transitions.py`: invalidation and reconfiguration state
 - `agent/harness/invariants.py`: state and expected-patch enforcement
-- `agent/harness/intent.py`: focused adjudication and schema/admission helpers,
-  not a second product planner
+- `agent/harness/semantic_admission.py`: immutable semantic-document
+  preparation and admission helpers with no planner entry
+- `agent/harness/advisory.py`: non-controlling model-backed chain/RPC/evidence
+  analysis
 - `agent/harness/domains/`: the eight product domain owners
 - `agent/terminal/repl.py`: product terminal shell only
 - `agent/runners/benchmark_pipeline.py`: plan materialization and submission
@@ -124,9 +146,16 @@ a second uncheckpointed turn graph or drain the complete durable queue inside
 one Python node. Current-version turns must not invoke checkpoint compatibility
 code. Version 12 crosses the isolated adapter once and is persisted through the
 current schema; version 13 additionally migrates deferred-queue retention into
-the typed `pending_question.resume_action_queue` contract before persistence as
-version 14. Older state is quarantined and only allowlisted environment facts
-may be offered for reconfirmation.
+the typed `pending_question.resume_action_queue` contract; version 14
+initializes typed response fragments before persistence as version 15; version
+16 materializes the explicit pending-question owner and typed Chain/RPC case
+context; and version 17 introduces checkpointed semantic-planning state.
+Version 18 retires persisted turn-local response text/manifests in favor of the
+central response authority. Migration to version 18 clears historical
+in-flight semantic-planning and response scratch rather than resuming a
+partially compiled owner schedule or stale prose from an older contract. Older
+state is quarantined and only allowlisted environment facts may be offered for
+reconfirmation.
 
 ## Migrated Historical Findings
 
@@ -223,13 +252,23 @@ before choosing the next turn. A prewritten prompt sequence is not dual-AI
 Chaos.
 
 `tests/agent_live/run_product_acceptance.py` is the sole authority that may
-advance phases or close G0-G6. Phase 6 closes only deterministic gate G2.
-Retained real-user replay, real CLI, response-driven dual-AI Chaos, and real
-execution belong to Phase 8 and close G3-G6 only after the controller admits
-their revision-bound evidence. Ledger, matrix, PTY, simulator, and execution
-scripts are subordinate evidence providers; their direct exit codes never
-declare product readiness. Until Phase 8 is implemented and passes, the
-product status remains not ready.
+admit evidence and report whether G0-G6 are closed. Phase 6 closes only
+deterministic gate G2. Phase 8 is implemented as an evidence-admission
+controller: it generates revision-bound obligation catalogs and validates
+artifacts supplied by retained-regression, real-CLI, response-driven dual-AI
+Chaos, and real-execution providers. It does not itself conduct those
+conversations or jobs. Ledger, matrix, PTY, simulator, and execution scripts
+remain subordinate evidence providers; their direct exit codes never declare product
+readiness. G3-G6 are not closed, so the product status remains not ready.
+
+Fixed denominators:
+
+- G3: 60 retained-regression obligations;
+- G4: 625 response-driven dynamic Chaos obligations per complete round, with
+  two consecutive rounds using distinct round/session/request/execution/evidence
+  identities and no new S1/S2 root class;
+- G5: 4 real-execution lanes;
+- G6: 9 revision-bound product-review artifact classes.
 
 Generate the registry ledger first:
 
@@ -293,6 +332,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
   tests.test_agent_runtime_contract \
   tests.test_agent_langgraph_harness \
   tests.test_agent_harness_architecture \
+  tests.test_agent_response_authority \
   tests.test_agent_legacy_issue_map \
   tests.test_agent_failure_recovery \
   tests.test_agent_benchmark_pipeline

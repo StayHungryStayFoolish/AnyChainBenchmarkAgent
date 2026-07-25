@@ -199,7 +199,7 @@ def _domain_commit(
         "consumed_action_ids": ["action-1"],
         "invalidated_groups": [],
         "invalidated_fields": [],
-        "response_fragment_hashes": [],
+        "response_fragments": [],
         "reconfigured_groups": [],
         "group_state_transitions": list(group_state_transitions),
         "material_delta": [

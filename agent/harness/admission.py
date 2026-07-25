@@ -8,22 +8,17 @@ from typing import Any, Mapping
 from .action_registry import (
     ACTION_BY_TYPE,
     lifecycle_rejected_action_indexes,
-    normalize_action_relations,
     validate_action_contract,
     validate_action_transaction_contract,
     validate_field_intake_admission_receipt,
     validate_proposal_field_receipts,
 )
-from .domains.chain_rpc_support import is_existing_family_lifecycle
-from .input_values import normalize_target_mode, target_mode_evidence_matches
+from .contracts import AdmissionRejection, AdmissionResult
 from .invariants import StateInvariantError
 from .questions import (
-    action_for_value,
-    exact_answer as contract_exact_answer,
     pending_option_value_exists as _pending_option_value_exists,
     value_satisfies_pending_contract as _value_satisfies_pending_contract,
 )
-from .routing import chain_identity_confirmed
 from .state import AgentGraphState
 from agent.workflows.group_registry import invalidation_targets
 
@@ -99,7 +94,7 @@ def _normalized_action_queue(payload: dict[str, Any]) -> list[dict[str, Any]]:
             action = validate_action_contract(raw, trusted_metadata=True)
         except ValueError as exc:
             action = {"type": "unknown", "reason": str(exc), "confidence": "low"}
-        action_type = str(action.get("type") or action.get("intent") or "unknown").strip()
+        action_type = str(action.get("type") or "unknown").strip()
         action["type"] = action_type
         action["confidence"] = str(action.get("confidence") or "medium").strip().lower()
         output.append(action)
@@ -156,242 +151,120 @@ def _bypasses_canonical_pending_choice(
     return False
 
 
-def _validate_action_plan(state: AgentGraphState, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Validate typed plan semantics without reinterpreting user language."""
+def validate_action_plan(
+    state: AgentGraphState,
+    actions: list[dict[str, Any]],
+) -> AdmissionResult:
+    """Validate one immutable planner transaction without repairing it."""
+
     if not actions:
-        return actions
-    prepared = normalize_action_relations([dict(item) for item in actions])
+        return AdmissionResult(status="accepted")
+    proposed = tuple(dict(item) for item in actions)
     try:
-        validate_action_transaction_contract(prepared)
-    except ValueError:
-        # The semantic resolver normally repairs this before admission. Keep a
-        # fail-closed boundary for stale checkpoints or invalid integrations:
-        # clarification is atomic, so no sibling may mutate state.
-        prepared = [
-            item
-            for item in prepared
-            if str(item.get("type") or "") == "clarify_unresolved"
-        ]
-    prepared = [
-        item
-        for item in prepared
-        if not _bypasses_canonical_pending_choice(state, item)
-    ]
-    for item in prepared:
-        if item.get("pending_option_semantic_verified") is True and _canonical_pending_choice_matches(state, item):
-            item["selection_contract_verified"] = True
-    prepared = _resolve_pending_answer_invalidation_conflicts(state, prepared)
-    lifecycle_rejected = lifecycle_rejected_action_indexes(state, prepared)
-    if lifecycle_rejected:
-        rejected_types = ", ".join(
-            str(prepared[index].get("type") or "unknown")
-            for index in lifecycle_rejected
+        validate_action_transaction_contract(list(proposed))
+    except ValueError as exc:
+        return AdmissionResult(
+            status="rejected",
+            rejections=(AdmissionRejection("transaction_invalid", str(exc)),),
         )
-        raise StateInvariantError(
-            f"actions incompatible with current typed lifecycle state: {rejected_types}"
+    unknown = tuple(
+        index
+        for index, item in enumerate(proposed)
+        if str(item.get("type") or "") not in ACTION_BY_TYPE
+        or str(item.get("type") or "") == "unknown"
+    )
+    if unknown:
+        return AdmissionResult(
+            status="rejected",
+            rejections=(
+                AdmissionRejection(
+                    "unknown_action",
+                    "the proposed transaction contains an unregistered action",
+                    unknown,
+                ),
+            ),
         )
-    identity = state.get("chain_identity") or {}
-    if identity.get("case") == "case3" and identity.get("adapter_family") == "unsupported":
-        # An unsupported-family handoff cannot also mutate the RPC catalog.
-        # The user must explicitly leave Case 3 by changing chain/family first.
-        changes_case = any(
-            str(item.get("type") or "") in {"choose_chain", "change_chain", "choose_adapter_family"}
-            for item in prepared
+    bypasses = tuple(
+        index
+        for index, item in enumerate(proposed)
+        if _bypasses_canonical_pending_choice(state, item)
+    )
+    if bypasses:
+        return AdmissionResult(
+            status="rejected",
+            rejections=(
+                AdmissionRejection(
+                    "pending_choice_bypass",
+                    "a declared pending option bypassed its canonical contract",
+                    bypasses,
+                ),
+            ),
         )
-        if not changes_case:
-            prepared = [
-                item for item in prepared
-                if str(item.get("type") or "") not in {"rpc_catalog_command", "rpc_workload_command"}
-            ]
-    if any(str(item.get("type") or "") != "unknown" for item in prepared):
-        # ``unknown`` is the whole-turn fallback, not an executable sibling.
-        # A provider may emit one invalid proposal and other valid actions in
-        # the same plan; retaining the normalized fallback would block those
-        # valid actions and surface a false "no safe action" response.
-        prepared = [item for item in prepared if str(item.get("type") or "") != "unknown"]
-    prepared = _drop_conflicting_answer_actions(state, prepared)
-    if state.get("target_mode"):
-        # A free-standing model request cannot reopen replacement of a
-        # confirmed mode. Declared menu choices have already been rebound to
-        # answer_pending; explicit user navigation uses change_group.
-        prepared = [
-            item
-            for item in prepared
-            if str(item.get("type") or "") != "request_target_mode_selection"
-        ]
-    admitted: list[dict[str, Any]] = []
-    current_answer_checked = False
-    for item in prepared:
-        if str(item.get("type") or "") != "answer_pending":
-            admitted.append(item)
-            continue
-        # A user turn can answer only the question that existed when the turn
-        # began. Future decisions must be represented by domain actions, not by
-        # speculative answer_pending entries for questions that do not exist.
-        if not current_answer_checked:
-            current_answer_checked = True
-            if _action_answers_pending_contract(state, item):
-                admitted.append(item)
-            continue
-        continue
-    prepared = admitted
-    pending_id = str((state.get("pending_question") or {}).get("id") or "")
-    # A model plan cannot answer a domain question that does not exist yet.
-    # Protocol selection is intentionally a separate user-confirmed decision
-    # after an unknown-chain identity choice. Exact menu answers are applied
-    # locally and never need this speculative domain action.
-    if pending_id not in {"adapter_family_confirm", "custom_rpc_adapter_family_confirm"}:
-        prepared = [
-            item for item in prepared
-            if str(item.get("type") or "") != "choose_adapter_family"
-        ]
-    pending_answers = [
-        item for item in prepared
+    pending_answers = tuple(
+        index
+        for index, item in enumerate(proposed)
         if str(item.get("type") or "") == "answer_pending"
-    ]
-    if pending_answers:
-        # One turn may express the current answer both as answer_pending and as
-        # its declared domain effect. Drop only that exact duplicate effect.
-        # Another operation owned by the same action type (for example a
-        # custom-RPC method supplied beside an endpoint answer) is independent
-        # durable work and must survive the newly created question barrier.
-        prepared = [
-            item for item in prepared
-            if str(item.get("type") or "") == "answer_pending"
-            or not any(
-                _action_duplicates_pending_answer_effect(state, item, answer)
-                for answer in pending_answers
-            )
-        ]
-    prepared = [
-        item
-        for item in prepared
-        if str(item.get("type") or "") != "choose_target_mode"
-        or (
-            bool(normalize_target_mode(item.get("target_mode")))
-            and (
-                item.get("selection_contract_verified") is True
-                or item.get("target_mode_semantic_verified") is True
-                or target_mode_evidence_matches(
-                    item.get("target_mode"),
-                    item.get("source_evidence"),
-                    state.get("last_user_input"),
-                )
-            )
-        )
-    ]
-    prepared = [
-        item
-        for item in prepared
-        if str(item.get("type") or "") != "queue_workflow_goal"
-        or (
-            bool(normalize_target_mode(item.get("target_mode")))
-            and bool(str(item.get("goal") or "").strip())
-            and bool(str(item.get("source_evidence") or "").strip())
-            and str(item.get("source_evidence") or "").strip() in str(state.get("last_user_input") or "")
-        )
-    ]
-    normalized_partial_actions: list[dict[str, Any]] = []
-    for item in prepared:
-        if str(item.get("type") or "") == "set_qps_override" and not isinstance(item.get("qps_overrides"), dict):
-            item = {
-                **item,
-                "type": "request_qps_customization",
-                "qps_fields": item.get("qps_fields") or [],
-            }
-            item.pop("qps_overrides", None)
-        normalized_partial_actions.append(item)
-    prepared = normalized_partial_actions
-    prepared = [
-        item
-        for item in prepared
-        if str(item.get("type") or "") != "change_group"
-        or item.get("selection_contract_verified") is True
-        or (
-            item.get("navigation_explicit") is True
-            and bool(str(item.get("source_evidence") or "").strip())
-            and str(item.get("source_evidence") or "").strip() in str(state.get("last_user_input") or "")
-        )
-    ]
-    extension_consultation = any(
-        str(item.get("type") or "") == "answer_opening_question"
-        and str(item.get("topic") or "").strip().lower() == "extension"
-        for item in prepared
     )
-    if extension_consultation:
-        prepared = [
-            item
-            for item in prepared
-            if str(item.get("type") or "") != "rpc_catalog_command"
-            or str(item.get("catalog_command") or "") != "enter"
-        ]
-    mutation_types = {
-        "choose_chain", "change_chain", "set_rpc_mode", "set_qps_mode", "request_qps_customization",
-        "set_qps_override", "set_observability", "rpc_catalog_command", "rpc_workload_command",
-    }
-    has_benchmark_mutation = any(str(item.get("type") or "") in mutation_types for item in prepared)
-    chooses_mode = any(
-        str(item.get("type") or "") == "choose_target_mode"
-        or (
-            str(item.get("type") or "") == "answer_pending"
-            and _pending_answer_declared_action_type(state, item) == "choose_target_mode"
-        )
-        for item in prepared
+    prepared = tuple(
+        _attach_canonical_admission_metadata(state, item)
+        for item in proposed
     )
-    requests_mode = any(str(item.get("type") or "") == "request_target_mode_selection" for item in prepared)
-    if has_benchmark_mutation and not state.get("target_mode") and not chooses_mode and not requests_mode:
-        prepared.append({
-            "type": "request_target_mode_selection",
-            "source_evidence": str(state.get("last_user_input") or ""),
-            "confidence": "high",
-            "reason": "benchmark actions require an explicit target mode",
-        })
-    prepared = _drop_redundant_group_navigation(state, prepared)
-    return _ensure_action_prerequisites(state, prepared)
+    if len(pending_answers) > 1 or any(
+        not _action_answers_pending_contract(state, dict(prepared[index]))
+        for index in pending_answers
+    ):
+        return AdmissionResult(
+            status="rejected",
+            rejections=(
+                AdmissionRejection(
+                    "pending_contract_mismatch",
+                    "the proposed pending answer does not match the active contract",
+                    pending_answers,
+                ),
+            ),
+        )
+    if _pending_answer_is_invalidated(state, prepared):
+        return AdmissionResult(
+            status="rejected",
+            rejections=(
+                AdmissionRejection(
+                    "pending_answer_invalidated",
+                    "a sibling mutation invalidates the active pending answer",
+                    pending_answers,
+                ),
+            ),
+        )
+    lifecycle_rejected = lifecycle_rejected_action_indexes(state, list(prepared))
+    if lifecycle_rejected:
+        return AdmissionResult(
+            status="rejected",
+            rejections=(
+                AdmissionRejection(
+                    "lifecycle_incompatible",
+                    "the proposed transaction is incompatible with current lifecycle state",
+                    lifecycle_rejected,
+                ),
+            ),
+        )
+    return AdmissionResult(
+        status="accepted",
+        actions=prepared,
+    )
 
 
-def _action_duplicates_pending_answer_effect(
+def _attach_canonical_admission_metadata(
     state: AgentGraphState,
     action: Mapping[str, Any],
-    pending_answer: Mapping[str, Any],
-) -> bool:
-    """Match a sibling action to the current answer's declared exact effect."""
+) -> Mapping[str, Any]:
+    """Attach only contract-derived metadata without changing action meaning."""
 
-    pending = dict(state.get("pending_question") or {})
-    selected = pending_answer.get("selected_value")
-    declared = action_for_value(pending, selected)
-    if not declared and pending.get("manual_input_allowed") is True:
-        manual = pending.get("manual_action")
-        if isinstance(manual, Mapping):
-            declared = {
-                str(key): value
-                for key, value in manual.items()
-                if str(key) not in {"value_argument", "use_complete_turn"}
-            }
-            value_argument = str(manual.get("value_argument") or "").strip()
-            answer_value = (
-                selected
-                if selected not in (None, "")
-                else pending_answer.get("answer")
-            )
-            if value_argument and answer_value not in (None, ""):
-                declared[value_argument] = answer_value
-    if not declared or str(action.get("type") or "") != str(declared.get("type") or ""):
-        return False
-    effect_fields = {
-        key: value
-        for key, value in declared.items()
-        if key != "type"
-        and key != "source_evidence"
-        and not key.endswith("_explicit")
-        and key not in {"selection_contract_verified", "semantic_purpose_verified"}
-    }
-    if not effect_fields:
-        return False
-    return all(
-        action.get(key) == value
-        for key, value in effect_fields.items()
-    )
+    canonical = dict(action)
+    if (
+        canonical.get("pending_option_semantic_verified") is True
+        and _canonical_pending_choice_matches(state, canonical)
+    ):
+        canonical["selection_contract_verified"] = True
+    return canonical
 
 
 def _action_satisfies_pending_manual_effect(
@@ -416,16 +289,15 @@ def _action_satisfies_pending_manual_effect(
     return bool(value_argument and action.get(value_argument) not in (None, ""))
 
 
-def _resolve_pending_answer_invalidation_conflicts(
+def _pending_answer_is_invalidated(
     state: AgentGraphState,
-    actions: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Resolve pending answers against invalidating sibling mutations."""
+    actions: tuple[Mapping[str, Any], ...],
+) -> bool:
+    """Return whether a sibling mutation invalidates a pending answer."""
 
     pending_group = str((state.get("pending_question") or {}).get("group") or "").strip()
     if not pending_group:
-        return actions
-    invalidating: list[dict[str, Any]] = []
+        return False
     for action in actions:
         if str(action.get("type") or "") == "answer_pending":
             continue
@@ -434,65 +306,8 @@ def _resolve_pending_answer_invalidation_conflicts(
             continue
         source_group = str(spec.target_group or spec.mutation_dimension).strip()
         if pending_group in set(invalidation_targets(source_group)):
-            invalidating.append(action)
-    if invalidating:
-        return [
-            item for item in actions
-            if str(item.get("type") or "") != "answer_pending"
-        ]
-    return actions
-
-
-def _drop_redundant_group_navigation(state: AgentGraphState, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Remove navigation when a concrete action already owns that destination."""
-
-    concrete_groups = {
-        "chain_identity": {"choose_chain", "change_chain", "request_chain_selection"},
-        "workload_rpc": {"set_rpc_mode", "rpc_catalog_command", "rpc_workload_command", "use_default_workload", "configure_workload_weights"},
-        "qps_profile": {"set_qps_mode", "request_qps_customization", "set_qps_override"},
-        "observability": {"set_observability"},
-        "sync_observe": {
-            "set_sync_observe_source",
-            "clear_sync_observe_source",
-            "set_sync_observe_options",
-        },
-    }
-    action_types = {str(item.get("type") or "") for item in actions}
-    output: list[dict[str, Any]] = []
-    for item in actions:
-        if str(item.get("type") or "") == "change_group":
-            group = str(item.get("group") or "")
-            if action_types & concrete_groups.get(group, set()):
-                continue
-            if "answer_pending" in action_types and group == str(state.get("active_group") or ""):
-                continue
-        output.append(item)
-    return output
-
-
-def _ensure_action_prerequisites(state: AgentGraphState, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Add typed prerequisite questions without inventing user choices."""
-
-    output = list(actions)
-    action_types = {str(item.get("type") or "") for item in output}
-    chain_required = {"set_rpc_mode", "rpc_workload_command", "use_default_workload", "configure_workload_weights"}
-    chain_confirmed = chain_identity_confirmed(state)
-    identity = state.get("chain_identity") or {}
-    catalog_continues_case2 = is_existing_family_lifecycle(identity)
-    needs_chain_prerequisite = bool(action_types & chain_required) or (
-        "rpc_catalog_command" in action_types and not catalog_continues_case2
-    )
-    chain_planned = bool(action_types & {"choose_chain", "change_chain", "request_chain_selection"})
-    if needs_chain_prerequisite and not chain_confirmed and not chain_planned:
-        output.insert(0, {
-            "type": "change_group",
-            "group": "workload_rpc",
-            "navigation_explicit": True,
-            "source_evidence": str(state.get("last_user_input") or ""),
-            "confidence": "high",
-            "reason": "workload actions require confirmed chain identity",
-        })
-    return output
+            return True
+    return False
 
 
 def _action_answers_pending_contract(state: AgentGraphState, action: dict[str, Any]) -> bool:
@@ -552,158 +367,6 @@ def _action_answers_pending_contract(state: AgentGraphState, action: dict[str, A
             or _value_satisfies_pending_contract(raw_answer, pending)
         )
     )
-
-
-def _pending_answer_declared_action_type(state: AgentGraphState, action: dict[str, Any]) -> str:
-    pending = state.get("pending_question") or {}
-    selected = action.get("selected_value")
-    declared = action_for_value(pending, selected)
-    return str(declared.get("type") or "")
-
-
-def _drop_conflicting_answer_actions(state: AgentGraphState, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    user_text = str(state.get("last_user_input") or "")
-    pending = dict(state.get("pending_question") or {})
-    evidenced_consultation_topics = {
-        str(item.get("topic") or "").strip().lower()
-        for item in actions
-        if str(item.get("type") or "") == "answer_opening_question"
-        and bool(str(item.get("source_evidence") or "").strip())
-        and str(item.get("source_evidence") or "").strip() in user_text
-    }
-    if evidenced_consultation_topics:
-        actions = [
-            item
-            for item in actions
-            if not (
-                str(item.get("type") or "") == "answer_opening_question"
-                and str(item.get("topic") or "").strip().lower() in evidenced_consultation_topics
-                and not (
-                    bool(str(item.get("source_evidence") or "").strip())
-                    and str(item.get("source_evidence") or "").strip() in user_text
-                )
-            )
-        ]
-        raw_selects_pending, _selected_value = contract_exact_answer(user_text, pending)
-        if pending and not raw_selects_pending:
-            # A read-only consultation is an overlay on the active workflow.
-            # The model may not turn that prose into a menu value and thereby
-            # consume the pending contract. Exact option selection is owned by
-            # the raw-input contract matcher above.
-            actions = [
-                item
-                for item in actions
-                if str(item.get("type") or "") != "answer_pending"
-                or item.get("pending_option_semantic_verified") is True
-            ]
-    requests_target_mode = any(
-        str(item.get("type") or "") == "request_target_mode_selection"
-        for item in actions
-    )
-    if requests_target_mode and str((state.get("pending_question") or {}).get("id") or "") == "opening_next_action":
-        actions = [
-            item
-            for item in actions
-            if str(item.get("type") or "") != "answer_pending"
-        ]
-    if any(str(item.get("type") or "") == "change_group" for item in actions):
-        actions = [item for item in actions if str(item.get("type") or "") != "go_back"]
-    if any(str(item.get("type") or "") == "analyze_report" for item in actions):
-        actions = [
-            item
-            for item in actions
-            if not (
-                str(item.get("type") or "") in {"ask_capabilities", "answer_opening_question"}
-                and str(item.get("topic") or "capabilities").strip().lower()
-                in {"capabilities", "current_job", "job_status", "execution_status", "evidence_help", "log_help"}
-            )
-        ]
-    consultation_topics = {
-        str(item.get("topic") or "").strip().lower()
-        for item in actions
-        if str(item.get("type") or "") == "answer_opening_question"
-    }
-    if "workload_config" in consultation_topics:
-        workload_will_be_rendered_by_mutation = any(
-            str(item.get("type") or "") in {
-                "set_rpc_mode",
-                "use_default_workload",
-                "configure_workload_weights",
-                "rpc_catalog_command",
-                "rpc_workload_command",
-            }
-            for item in actions
-        )
-        actions = [
-            item
-            for item in actions
-            if not (
-                str(item.get("type") or "") == "answer_opening_question"
-                and (
-                    str(item.get("topic") or "").strip().lower()
-                    in {"current_config", "config_explanation"}
-                    or (
-                        workload_will_be_rendered_by_mutation
-                        and str(item.get("topic") or "").strip().lower() == "workload_config"
-                    )
-                )
-            )
-        ]
-        consultation_topics = {
-            str(item.get("topic") or "").strip().lower()
-            for item in actions
-            if str(item.get("type") or "") == "answer_opening_question"
-        }
-    if "current_config" in consultation_topics:
-        # The current-config renderer owns current context and includes the
-        # computed next blocker. These two topics are proven output subsets,
-        # unlike requirements/workflow questions which must remain independent.
-        actions = [
-            item
-            for item in actions
-            if not (
-                str(item.get("type") or "") == "answer_opening_question"
-                and str(item.get("topic") or "").strip().lower() in {"current_context", "next_action"}
-            )
-        ]
-    topics = {
-        str(item.get("topic") or "").strip().lower()
-        for item in actions
-        if str(item.get("type") or "") == "answer_opening_question"
-    }
-    specific_chain_consultation = any(
-        str(item.get("type") or "") == "answer_opening_question"
-        and str(item.get("topic") or "").strip().lower() == "supported_chains"
-        and bool(str(item.get("subject") or "").strip())
-        for item in actions
-    )
-    if specific_chain_consultation:
-        actions = [
-            item
-            for item in actions
-            if not (
-                str(item.get("type") or "") in {"ask_capabilities", "answer_opening_question"}
-                and str(item.get("topic") or "capabilities").strip().lower() in {"identity", "capabilities", "agent_capability"}
-            )
-        ]
-        topics = {
-            str(item.get("topic") or "").strip().lower()
-            for item in actions
-            if str(item.get("type") or "") == "answer_opening_question"
-        }
-    if not (topics & {"performance_benchmark_guidance", "mode_comparison"}):
-        return actions
-    pruned: list[dict[str, Any]] = []
-    for item in actions:
-        action_type = str(item.get("type") or "").strip()
-        topic = str(item.get("topic") or "").strip().lower()
-        target_mode = normalize_target_mode(item.get("target_mode"))
-        if action_type == "answer_opening_question" and topic in {"recommendation", "recommend_start"}:
-            continue
-        if "performance_benchmark_guidance" in topics and action_type == "choose_target_mode" and target_mode == "fake-node":
-            continue
-        pruned.append(item)
-    return pruned
 
 
 def _has_meaningful_queue(actions: list[dict[str, Any]]) -> bool:

@@ -1,0 +1,32 @@
+"""Owner-scoped source data for the central response catalog."""
+
+from .analysis import MESSAGES as ANALYSIS_MESSAGES
+from .chain_rpc import MESSAGES as CHAIN_RPC_MESSAGES
+from .core import MESSAGES as CORE_MESSAGES
+from .environment import MESSAGES as ENVIRONMENT_MESSAGES
+from .execution import MESSAGES as EXECUTION_MESSAGES
+from .orientation import MESSAGES as ORIENTATION_MESSAGES
+from .performance import MESSAGES as PERFORMANCE_MESSAGES
+from .questions_chain_rpc import MESSAGES as CHAIN_RPC_QUESTION_MESSAGES
+from .questions_control import MESSAGES as CONTROL_QUESTION_MESSAGES
+from .questions_core import MESSAGES as CORE_QUESTION_MESSAGES
+from .questions_environment import MESSAGES as ENVIRONMENT_QUESTION_MESSAGES
+from .recovery import MESSAGES as RECOVERY_MESSAGES
+from .sync_observe import MESSAGES as SYNC_OBSERVE_MESSAGES
+
+
+MESSAGE_SETS = (
+    CORE_MESSAGES,
+    ORIENTATION_MESSAGES,
+    ENVIRONMENT_MESSAGES,
+    CHAIN_RPC_MESSAGES,
+    PERFORMANCE_MESSAGES,
+    SYNC_OBSERVE_MESSAGES,
+    EXECUTION_MESSAGES,
+    RECOVERY_MESSAGES,
+    ANALYSIS_MESSAGES,
+    CORE_QUESTION_MESSAGES,
+    CONTROL_QUESTION_MESSAGES,
+    ENVIRONMENT_QUESTION_MESSAGES,
+    CHAIN_RPC_QUESTION_MESSAGES,
+)

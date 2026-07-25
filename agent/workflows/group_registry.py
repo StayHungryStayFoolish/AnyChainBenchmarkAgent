@@ -11,10 +11,30 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any, Iterable, Literal
+from typing import Any, Iterable, Literal, Mapping
 
 
 NavigationEntry = Literal["question_or_status", "action_only"]
+RPC_EXTENSION_ENDPOINT_STATUSES = frozenset({
+    "needs_endpoint",
+    "needs_method",
+    "needs_schema_evidence",
+    "schema_needs_confirmation",
+    "needs_adapter_family_confirmation",
+    "needs_scope",
+    "needs_single_method",
+    "needs_weights",
+    "probe_failed",
+})
+NEW_CHAIN_ENDPOINT_STATUSES = frozenset({
+    "existing_family_needs_endpoint",
+    "existing_family_needs_method",
+    "existing_family_needs_schema_evidence",
+    "existing_family_schema_needs_confirmation",
+    "existing_family_needs_workload_scope",
+    "existing_family_needs_single_method",
+    "existing_family_needs_weights",
+})
 
 
 @dataclass(frozen=True)
@@ -595,14 +615,37 @@ def group_registry_contract_hash() -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def fallback_groups_for_workflow(workflow_mode: str) -> tuple[GroupSpec, ...]:
-    """Return the registry-ordered prerequisites applicable to one product path."""
+def group_applicable(state: Mapping[str, Any], spec: GroupSpec) -> bool:
+    """Return whether one group belongs to the state's selected product path."""
 
-    mode = str(workflow_mode or "").strip()
+    workflow_mode = str(state.get("workflow_mode") or "").strip()
+    target_mode = str(state.get("target_mode") or "").strip()
+    if spec.name == "endpoint_process" and target_mode == "fake-node":
+        identity_status = str(
+            (state.get("chain_identity") or {}).get("status") or ""
+        )
+        custom_status = str((state.get("custom_rpc") or {}).get("status") or "")
+        return (
+            workflow_mode == "rpc_benchmark"
+            and (
+                identity_status in NEW_CHAIN_ENDPOINT_STATUSES
+                or custom_status in RPC_EXTENSION_ENDPOINT_STATUSES
+            )
+        )
+    if spec.workflow_modes and workflow_mode not in spec.workflow_modes:
+        return False
+    if spec.target_modes and target_mode not in spec.target_modes:
+        return False
+    return True
+
+
+def fallback_groups_for_state(state: Mapping[str, Any]) -> tuple[GroupSpec, ...]:
+    """Return registry-ordered fallback groups for the selected product path."""
+
     return tuple(
         group
         for group in GROUPS
-        if group.fallback and (not group.workflow_modes or mode in group.workflow_modes)
+        if group.fallback and group_applicable(state, group)
     )
 
 

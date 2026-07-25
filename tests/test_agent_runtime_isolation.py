@@ -40,15 +40,22 @@ class AgentRuntimeIsolationTests(unittest.TestCase):
 
     def test_runtime_emits_committed_turn_fingerprint_without_exposing_config(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
+        from tests.agent_live.graph_turn import (
+            reviewed_action_plan,
+            reviewed_stage_planner,
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             event_file = root / "turn-events.jsonl"
             with (
                 patch.dict(os.environ, {"ANYCHAIN_AGENT_TURN_EVENT_FILE": str(event_file)}),
-                patch(
-                    "agent.harness.coordinator.resolve_action_queue",
-                    return_value={"actions": [{"type": "greeting", "confidence": "high"}]},
+                reviewed_stage_planner(
+                    lambda state, text: reviewed_action_plan(
+                        state,
+                        text,
+                        [{"type": "greeting", "confidence": "high"}],
+                    )
                 ),
                 AnyChainGraphRuntime(
                     "event-runtime",

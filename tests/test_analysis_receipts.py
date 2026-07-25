@@ -16,10 +16,12 @@ from agent.harness.domains.analysis import (
     start_evidence_collection,
 )
 from agent.harness.domains.analysis_receipts import (
+    ANALYSIS_RECEIPT_VERSION,
     analysis_hash,
     evidence_block_id,
     validate_analysis_receipt,
 )
+from agent.harness.response_catalog import render_fragment
 from agent.harness.state import new_state
 
 
@@ -81,6 +83,18 @@ class AnalysisOwnerReceiptTest(unittest.TestCase):
         receipts = self._receipts(result, "analysis_invocation")
         self.assertEqual(len(receipts), 1)
         self.assertTrue(validate_analysis_receipt(receipts[0])[0])
+        response_manifest = (
+            (result.get("turn_context") or {}).get("response_manifest") or []
+        )
+        self.assertEqual(len(response_manifest), 1)
+        self.assertEqual(
+            receipts[0]["response_semantic_hash"],
+            response_manifest[0]["semantic_hash"],
+        )
+        self.assertEqual(
+            receipts[0]["response_render_hash"],
+            response_manifest[0]["render_hash"],
+        )
         self.assertTrue(
             any(
                 item.get("receipt_type") == "domain_commit"
@@ -126,14 +140,19 @@ class AnalysisOwnerReceiptTest(unittest.TestCase):
         self.assertEqual(finish_receipt["operation"], "finish")
         self.assertEqual(finish_receipt["status"], "saved")
         self.assertEqual(finish_receipt["block_id"], block_id)
+        rendered = render_fragment(finished.result.response_fragments[0], "en")
         self.assertEqual(
-            finish_receipt["visible_result_hash"],
-            analysis_hash(finished.result.visible_result),
+            finish_receipt["response_semantic_hash"],
+            rendered.semantic_hash,
+        )
+        self.assertEqual(
+            finish_receipt["response_render_hash"],
+            rendered.render_hash,
         )
         self.assertTrue(validate_analysis_receipt(finish_receipt)[0])
         self.assertNotIn(secret, json.dumps(finish_receipt, ensure_ascii=False))
 
-    def test_blank_collection_input_is_ignored_and_bound_to_visible_result(self) -> None:
+    def test_blank_collection_input_is_ignored_and_bound_to_response_identity(self) -> None:
         state = self._state("blank-evidence")
         question = {"id": "freeform_evidence", "kind": "log_evidence"}
         lines = ["Traceback (most recent call last):"]
@@ -155,13 +174,18 @@ class AnalysisOwnerReceiptTest(unittest.TestCase):
         self.assertEqual(receipt["input_disposition"], "blank_ignored")
         self.assertEqual(receipt["input_non_empty_line_count"], 0)
         self.assertEqual(receipt["block_id"], block_id)
+        rendered = render_fragment(outcome.result.response_fragments[0], "en")
         self.assertEqual(
-            receipt["visible_result_hash"],
-            analysis_hash(outcome.result.visible_result),
+            receipt["response_semantic_hash"],
+            rendered.semantic_hash,
+        )
+        self.assertEqual(
+            receipt["response_render_hash"],
+            rendered.render_hash,
         )
         self.assertTrue(validate_analysis_receipt(receipt)[0])
 
-    def test_analysis_invocation_binds_block_question_and_visible_result(self) -> None:
+    def test_analysis_invocation_binds_block_question_and_response_identity(self) -> None:
         state = self._state("analysis-call")
         question = {"id": "freeform_evidence", "kind": "log_evidence"}
         lines = ["RuntimeError: endpoint probe failed"]
@@ -197,7 +221,19 @@ class AnalysisOwnerReceiptTest(unittest.TestCase):
         self.assertTrue(receipt["invoked"])
         self.assertEqual(receipt["evidence_hash"], analysis_hash("\n".join(lines)))
         self.assertEqual(receipt["question_hash"], analysis_hash("What failed?"))
-        self.assertEqual(receipt["visible_result_hash"], analysis_hash(result.visible_result))
+        rendered = render_fragment(result.response_fragments[0], "en")
+        self.assertEqual(
+            receipt["response_message_ids"],
+            ["analysis.model_document"],
+        )
+        self.assertEqual(
+            receipt["response_semantic_hash"],
+            rendered.semantic_hash,
+        )
+        self.assertEqual(
+            receipt["response_render_hash"],
+            rendered.render_hash,
+        )
         self.assertTrue(validate_analysis_receipt(receipt)[0])
         self.assertNotIn("endpoint probe failed", json.dumps(receipt))
 
@@ -217,17 +253,25 @@ class AnalysisOwnerReceiptTest(unittest.TestCase):
         receipt = self._receipts(state, "analysis_invocation")[-1]
         self.assertEqual(receipt["source_kind"], "missing")
         self.assertFalse(receipt["invoked"])
-        self.assertEqual(receipt["visible_result_hash"], analysis_hash(result.visible_result))
+        rendered = render_fragment(result.response_fragments[0], "en")
+        self.assertEqual(
+            receipt["response_semantic_hash"],
+            rendered.semantic_hash,
+        )
+        self.assertEqual(
+            receipt["response_render_hash"],
+            rendered.render_hash,
+        )
         self.assertTrue(validate_analysis_receipt(receipt)[0])
 
-    def test_report_receipt_binds_requested_job_resolved_job_and_visible_result(self) -> None:
+    def test_report_receipt_binds_requested_job_resolved_job_and_response_identity(self) -> None:
         state = self._state("report-analysis")
         state["report_context"] = {"requested_job_id": "job_20260724000000_deadbeef"}
         persisted = self._verified_job("job_20260724000000_deadbeef")
 
         with patch(
             "agent.harness.domains.analysis._report_artifact_entry",
-            return_value=("Persisted report facts.", persisted),
+            return_value=("Persisted report facts.", persisted, "report", {}),
         ):
             result = report_artifact_entry_result(state)
 
@@ -244,7 +288,19 @@ class AnalysisOwnerReceiptTest(unittest.TestCase):
         )
         self.assertEqual(receipt["resolved_job_hash"], receipt["requested_job_hash"])
         self.assertEqual(receipt["resolved_status_hash"], analysis_hash("completed"))
-        self.assertEqual(receipt["visible_result_hash"], analysis_hash(result.visible_result))
+        rendered = render_fragment(result.response_fragments[0], "en")
+        self.assertEqual(
+            receipt["response_message_ids"],
+            ["analysis.model_document"],
+        )
+        self.assertEqual(
+            receipt["response_semantic_hash"],
+            rendered.semantic_hash,
+        )
+        self.assertEqual(
+            receipt["response_render_hash"],
+            rendered.render_hash,
+        )
         self.assertTrue(validate_analysis_receipt(receipt)[0])
 
     def test_report_action_emits_receipt_on_authoritative_state_not_temporary_view(self) -> None:
@@ -259,7 +315,7 @@ class AnalysisOwnerReceiptTest(unittest.TestCase):
 
         with patch(
             "agent.harness.domains.analysis._report_artifact_entry",
-            return_value=("Persisted report facts.", persisted),
+            return_value=("Persisted report facts.", persisted, "report", {}),
         ):
             result = apply_analysis_action(state, action)
 
@@ -269,8 +325,89 @@ class AnalysisOwnerReceiptTest(unittest.TestCase):
             receipt["resolved_job_hash"],
             analysis_hash("job_20260724000000_cafebabe"),
         )
-        self.assertEqual(receipt["visible_result_hash"], analysis_hash(result.visible_result))
+        rendered = render_fragment(result.response_fragments[0], "en")
+        self.assertEqual(
+            receipt["response_semantic_hash"],
+            rendered.semantic_hash,
+        )
+        self.assertEqual(
+            receipt["response_render_hash"],
+            rendered.render_hash,
+        )
         self.assertTrue(validate_analysis_receipt(receipt)[0])
+
+    def test_static_response_semantic_identity_is_language_independent(self) -> None:
+        question = {"id": "freeform_evidence", "kind": "log_evidence"}
+        receipts = []
+        for language in ("en", "zh"):
+            state = new_state(f"language-{language}", language=language)
+            state["turn_index"] = 7
+            state["turn_context"] = {
+                "turn_id": f"language-{language}-turn",
+                "control_receipts": [],
+            }
+            collecting = {
+                "question": question,
+                "lines": ["Traceback"],
+                "language": language,
+                "status": "active",
+                "block_id": evidence_block_id(question, ["Traceback"]),
+            }
+            continue_evidence_collection(state, "", collecting)
+            receipts.append(self._receipts(state, "analysis_evidence_block")[-1])
+
+        self.assertEqual(
+            receipts[0]["response_message_ids"],
+            ["analysis.response.waiting_logs"],
+        )
+        self.assertEqual(
+            receipts[0]["response_semantic_hash"],
+            receipts[1]["response_semantic_hash"],
+        )
+        self.assertNotEqual(
+            receipts[0]["response_render_hash"],
+            receipts[1]["response_render_hash"],
+        )
+
+    def test_version_one_receipt_fails_closed(self) -> None:
+        state = self._state("old-analysis-receipt")
+        action = ActionProposal(
+            action_id="analysis-help",
+            action_type="analyze_evidence",
+            arguments={},
+            confidence="high",
+        )
+        apply_analysis_action(state, action)
+        receipt = deepcopy(self._receipts(state, "analysis_invocation")[-1])
+        receipt["receipt_version"] = ANALYSIS_RECEIPT_VERSION - 1
+        receipt["receipt_id"] = analysis_hash({
+            key: value for key, value in receipt.items() if key != "receipt_id"
+        })
+
+        valid, reason = validate_analysis_receipt(receipt)
+
+        self.assertFalse(valid)
+        self.assertEqual(reason, "unsupported receipt version")
+
+    def test_rehashed_render_identity_mismatch_fails_closed(self) -> None:
+        state = self._state("render-identity-mismatch")
+        action = ActionProposal(
+            action_id="analysis-help",
+            action_type="analyze_evidence",
+            arguments={},
+            confidence="high",
+        )
+        apply_analysis_action(state, action)
+        receipt = deepcopy(self._receipts(state, "analysis_invocation")[-1])
+        receipt["response_rendered"] = False
+        receipt["receipt_id"] = analysis_hash({
+            key: value for key, value in receipt.items() if key != "receipt_id"
+        })
+
+        valid, reason = validate_analysis_receipt(receipt)
+
+        self.assertFalse(valid)
+        self.assertEqual(reason, "inconsistent response render identity")
 
     def test_report_fallback_is_marked_unverified_without_manager_read_receipt(
         self,
@@ -285,7 +422,7 @@ class AnalysisOwnerReceiptTest(unittest.TestCase):
         }
         with patch(
             "agent.harness.domains.analysis._report_artifact_entry",
-            return_value=("Last-known report summary.", fallback),
+            return_value=("Last-known report summary.", fallback, "report", {}),
         ):
             report_artifact_entry_result(state)
 
@@ -344,13 +481,19 @@ class AnalysisOwnerReceiptTest(unittest.TestCase):
             "status": "active",
         }
         state["last_user_input"] = "Hello, who are you?"
-        with patch(
-            "agent.harness.coordinator.resolve_action_queue",
-            return_value={"actions": [{
-                "type": "greeting",
-                "source_evidence": state["last_user_input"],
-                "confidence": "high",
-            }]},
+        with (
+            patch(
+                "tests.agent_live.graph_turn.TEST_SEMANTIC_PLANNER",
+                return_value={"actions": [{
+                    "type": "greeting",
+                    "source_evidence": state["last_user_input"],
+                    "confidence": "high",
+                }]},
+            ),
+            patch(
+                "agent.harness.domains.orientation.opening_question",
+                return_value=None,
+            ),
         ):
             result = invoke_product_graph_turn(state)
 

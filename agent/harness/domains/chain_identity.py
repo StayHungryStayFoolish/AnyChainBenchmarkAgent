@@ -6,14 +6,11 @@ from copy import deepcopy
 from typing import Any, Mapping
 
 from ..input_values import (
-    adapter_family_hint,
     normalize_scalar,
     normalize_target_mode,
-    target_mode_evidence_matches,
 )
-from ..intent import resolve_unknown_chain_identity
-from ..localization import localized
-from ..questions import render_question
+from ..advisory import resolve_unknown_chain_identity
+from ..questions import question_text
 from ..state import AgentGraphState
 from ..transitions import (
     invalidate_for_chain_change,
@@ -26,6 +23,7 @@ from agent.onboarding.families import SUPPORTED_FAMILIES
 from .chain_rpc_questions import _adapter_family_question, _answer_option, _choice
 from .chain_rpc_questions import _endpoint_validation_question
 from .chain_identity_receipts import emit_chain_identity_resolution_receipt
+from .response_fragments import ResponseCollector, emit
 
 SUPPORTED_ADAPTER_FAMILIES = frozenset(SUPPORTED_FAMILIES)
 
@@ -34,17 +32,9 @@ def _origin_text(state: AgentGraphState, arguments: Mapping[str, Any]) -> str:
 
 
 def _target_mode_is_explicit(state: AgentGraphState, mode: str, arguments: Mapping[str, Any]) -> bool:
-    if (
+    return bool(
         arguments.get("selection_contract_verified") is True
         or arguments.get("target_mode_semantic_verified") is True
-    ):
-        return True
-    if arguments.get("target_mode_explicit") is not True:
-        return False
-    return target_mode_evidence_matches(
-        mode,
-        arguments.get("source_evidence"),
-        _origin_text(state, arguments),
     )
 
 
@@ -110,7 +100,6 @@ def _identity_confirmation_question(state: AgentGraphState) -> dict[str, Any] | 
     status = normalize_scalar(identity.get("status"))
     if status not in {"needs_known_chain_confirmation", "needs_identity_confirmation"}:
         return None
-    language = state.get("language", "en")
     raw = normalize_scalar(identity.get("raw"))
     resolved = identity.get("llm_resolution") if isinstance(identity.get("llm_resolution"), Mapping) else {}
     if status == "needs_known_chain_confirmation":
@@ -123,46 +112,62 @@ def _identity_confirmation_question(state: AgentGraphState) -> dict[str, Any] | 
         return _choice(
             "chain_identity",
             "unknown_chain_identity_confirm",
-            localized(
-                language,
-                f"`{raw}` 不在当前模板中。模型认为你可能想输入 `{proposal}`。是否确认使用这个链？",
-                f"`{raw}` is not a configured template. The model thinks you may mean `{proposal}`. Use this chain?",
+            question_text(
+                "question.chain_rpc.unknown_chain.known_proposal.prompt",
+                raw=raw,
+                proposal=proposal,
             ),
             "unknown_chain_decision",
             [
-                _answer_option("known", localized(language, f"使用 `{proposal}`", f"Use `{proposal}`"), "confirm_known_chain", {"chain_identity.status": "confirmed"}),
-                _answer_option("reenter", localized(language, "不是，重新输入链名", "No, re-enter chain name"), "reenter_chain", {"chain_identity": {}}),
-                _answer_option("protocol", localized(language, "这是另一条真实链，继续确认协议", "This is another real chain; choose protocol"), "choose_protocol", {"chain_identity.status": "needs_protocol_confirmation"}),
+                _answer_option("known", question_text("question.chain_rpc.option.use_known_chain", chain=proposal), "confirm_known_chain", {"chain_identity.status": "confirmed"}),
+                _answer_option("reenter", question_text("question.chain_rpc.option.reenter_chain"), "reenter_chain", {"chain_identity": {}}),
+                _answer_option("protocol", question_text("question.chain_rpc.option.other_real_chain_protocol"), "choose_protocol", {"chain_identity.status": "needs_protocol_confirmation"}),
             ],
             queue_barrier=True,
         )
 
     adapter_family = normalize_scalar(identity.get("adapter_family") or "unknown")
     proposed_name = normalize_scalar(identity.get("proposed_canonical_name") or resolved.get("canonical_chain_name") or raw)
+    summary = _verified_search_summary(resolved)
     if resolved.get("chain_exists") and adapter_family in SUPPORTED_ADAPTER_FAMILIES:
-        prompt = localized(
-            language,
-            f"`{raw}` 不在当前 36 条已配置链中。模型建议的名称是 `{proposed_name}`，协议族为 `{adapter_family}`。是否保留你输入的链名 `{raw}`，并按该协议继续 endpoint/RPC 验证？",
-            f"`{raw}` is not one of the configured 36 chains. The model proposes the name `{proposed_name}` and adapter family `{adapter_family}`. Keep your entered chain name `{raw}` and continue endpoint/RPC validation with that family?",
+        prompt = (
+            question_text(
+                "question.chain_rpc.unknown_chain.supported_family_grounded.prompt",
+                raw=raw,
+                proposed_name=proposed_name,
+                adapter_family=adapter_family,
+                search_summary=summary,
+            )
+            if summary
+            else question_text(
+                "question.chain_rpc.unknown_chain.supported_family.prompt",
+                raw=raw,
+                proposed_name=proposed_name,
+                adapter_family=adapter_family,
+            )
         )
         options = [
-            _answer_option("confirm", localized(language, "确认，继续 endpoint/RPC 验证", "Yes, continue endpoint/RPC validation"), "confirm_proposed_protocol", {"chain_identity.status": "existing_family_needs_endpoint"}),
-            _answer_option("protocol", localized(language, "我来选择协议族", "I will choose the adapter family"), "choose_protocol", {"chain_identity.status": "needs_protocol_confirmation"}),
-            _answer_option("reenter", localized(language, "我要重新输入链名", "I want to re-enter the chain name"), "reenter_chain", {"chain_identity": {}}),
+            _answer_option("confirm", question_text("question.chain_rpc.option.continue_endpoint_validation"), "confirm_proposed_protocol", {"chain_identity.status": "existing_family_needs_endpoint"}),
+            _answer_option("protocol", question_text("question.chain_rpc.option.choose_adapter_family"), "choose_protocol", {"chain_identity.status": "needs_protocol_confirmation"}),
+            _answer_option("reenter", question_text("question.chain_rpc.option.reenter_chain"), "reenter_chain", {"chain_identity": {}}),
         ]
     else:
-        prompt = localized(
-            language,
-            f"`{raw}` 不在当前 36 条已配置链或已知别名中。模型没有可靠确认它是已支持协议链。它是一个真实链名，还是你想更正输入？",
-            f"`{raw}` is not one of the configured 36 chains or known aliases. The model could not reliably confirm it as a supported-family chain. Is it a real chain name, or do you want to correct it?",
+        prompt = (
+            question_text(
+                "question.chain_rpc.unknown_chain.unresolved_grounded.prompt",
+                raw=raw,
+                search_summary=summary,
+            )
+            if summary
+            else question_text(
+                "question.chain_rpc.unknown_chain.unresolved.prompt",
+                raw=raw,
+            )
         )
         options = [
-            _answer_option("protocol", localized(language, "真实链，继续确认协议", "Real chain; continue to protocol confirmation"), "choose_protocol", {"chain_identity.status": "needs_protocol_confirmation"}),
-            _answer_option("reenter", localized(language, "我要重新输入链名", "I want to re-enter the chain name"), "reenter_chain", {"chain_identity": {}}),
+            _answer_option("protocol", question_text("question.chain_rpc.option.real_chain_protocol"), "choose_protocol", {"chain_identity.status": "needs_protocol_confirmation"}),
+            _answer_option("reenter", question_text("question.chain_rpc.option.reenter_chain"), "reenter_chain", {"chain_identity": {}}),
         ]
-    summary = _verified_search_summary(resolved)
-    if summary:
-        prompt += localized(language, f" 已用 google_search 核实：{summary}", f" Verified via google_search: {summary}")
     return _choice(
         "chain_identity",
         "unknown_chain_identity_confirm",
@@ -173,7 +178,13 @@ def _identity_confirmation_question(state: AgentGraphState) -> dict[str, Any] | 
     )
 
 
-def _apply_chain_candidate(state: AgentGraphState, raw: str, resolution: dict[str, Any] | None = None) -> None:
+def _apply_chain_candidate(
+    state: AgentGraphState,
+    raw: str,
+    resolution: dict[str, Any] | None = None,
+    *,
+    responses: ResponseCollector,
+) -> None:
     known = set(repo_chain_names())
     canonical = canonicalize_chain_scalar(raw, known_chains=known)
     state['pending_question'] = {}
@@ -184,9 +195,12 @@ def _apply_chain_candidate(state: AgentGraphState, raw: str, resolution: dict[st
         state["chain_identity"] = {"raw": raw, "canonical": canonical, "status": "confirmed", "case": "known"}
         state.setdefault("confirmed_config", {})["BLOCKCHAIN_NODE"] = canonical
         state['active_group'] = "chain_identity"
-        state['visible_response'] = list(state.get("visible_response") or []) + [
-            localized(state.get("language", "en"), f"已确认链为 `{canonical}`。", f"Confirmed chain: `{canonical}`.")
-        ]
+        emit(
+            responses,
+            "chain_rpc.response.chain_confirmed",
+            arguments={"chain": canonical},
+            source=__name__,
+        )
         return
     resolved = research_chain_identity(state, raw, resolution)
     emit_chain_identity_resolution_receipt(
@@ -210,7 +224,6 @@ def _apply_chain_candidate(state: AgentGraphState, raw: str, resolution: dict[st
         }
         state['active_group'] = "chain_identity"
         state['pending_question'] = _identity_confirmation_question(state) or {}
-        state['visible_response'] = [render_question(state["pending_question"], state.get("language", "en"))]
         return
     state["chain_identity"] = {
         "raw": raw,
@@ -224,22 +237,25 @@ def _apply_chain_candidate(state: AgentGraphState, raw: str, resolution: dict[st
     }
     state['active_group'] = "chain_identity"
     state['pending_question'] = _identity_confirmation_question(state) or {}
-    state['visible_response'] = [render_question(state["pending_question"], state.get("language", "en"))]
 
 
-def _preserve_same_chain(state: AgentGraphState, chain: str) -> None:
+def _preserve_same_chain(
+    state: AgentGraphState,
+    chain: str,
+    *,
+    responses: ResponseCollector,
+) -> None:
     identity = state.setdefault("chain_identity", {})
     newly_confirmed = identity.get("status") != "confirmed"
     if newly_confirmed:
         identity.update({"canonical": chain, "status": "confirmed", "case": "known"})
         state.setdefault("confirmed_config", {})["BLOCKCHAIN_NODE"] = chain
-    message = localized(
-        state.get("language", "en"),
-        f"当前链已经是 `{chain}`。我会继续当前配置流程。",
-        f"The current chain is already `{chain}`. I will continue the current configuration flow.",
+    emit(
+        responses,
+        "chain_rpc.response.same_chain",
+        arguments={"chain": chain},
+        source=__name__,
     )
-    pending = {} if newly_confirmed else (state.get("pending_question") or {})
-    state['visible_response'] = [message] + ([render_question(pending, state.get("language", "en"))] if pending else [])
     if newly_confirmed:
         state['active_group'] = "provider_deployment"
         state['pending_question'] = {}
@@ -251,6 +267,7 @@ def _request_chain_change(
     arguments: Mapping[str, Any],
     *,
     resolution: dict[str, Any] | None = None,
+    responses: ResponseCollector,
 ) -> None:
     known = set(repo_chain_names())
     canonical = canonicalize_chain_scalar(raw, known_chains=known)
@@ -258,10 +275,10 @@ def _request_chain_change(
     requested_mode = normalize_target_mode(arguments.get("target_mode"))
     mode_changed = bool(requested_mode and requested_mode != state.get("target_mode"))
     if not previous:
-        _apply_chain_candidate(state, raw, resolution)
+        _apply_chain_candidate(state, raw, resolution, responses=responses)
         return
     if canonical == previous and not mode_changed:
-        _preserve_same_chain(state, previous)
+        _preserve_same_chain(state, previous, responses=responses)
         return
     resolved = None if canonical else research_chain_identity(state, raw, resolution)
     if resolved is not None:
@@ -275,10 +292,19 @@ def _request_chain_change(
             confirmation_required=True,
         )
     candidate_label = canonical or raw
-    prompt = localized(
-        state.get("language", "en"),
-        f"是否确认从 `{previous}` 切换到 `{candidate_label}`" + (f"，并使用 `{requested_mode}` 模式" if requested_mode else "") + "？",
-        f"Confirm switching from `{previous}` to `{candidate_label}`" + (f" and using `{requested_mode}` mode" if requested_mode else "") + "?",
+    prompt = (
+        question_text(
+            "question.chain_rpc.chain_change.known_with_mode.prompt",
+            previous=previous,
+            candidate=candidate_label,
+            target_mode=requested_mode,
+        )
+        if requested_mode
+        else question_text(
+            "question.chain_rpc.chain_change.known.prompt",
+            previous=previous,
+            candidate=candidate_label,
+        )
     )
     candidate = {
         "raw": raw,
@@ -291,42 +317,104 @@ def _request_chain_change(
     state['active_group'] = "chain_identity"
     if canonical:
         options = [
-            _answer_option("yes", "Y", True, {"chain_identity.canonical": canonical}),
-            _answer_option("no", "N", False, {"chain_identity.canonical": previous}),
+            _answer_option("yes", question_text("question.chain_rpc.option.yes"), True, {"chain_identity.canonical": canonical}),
+            _answer_option("no", question_text("question.chain_rpc.option.no"), False, {"chain_identity.canonical": previous}),
         ]
         kind = "yes_no"
     else:
         possible_known = _known_chain_proposal(resolved or {}, known)
         family = normalize_scalar((resolved or {}).get("adapter_family") or "unknown")
+        summary = _verified_search_summary(resolved or {})
         if possible_known:
             if possible_known == previous:
-                prompt = localized(state.get("language", "en"), f"`{raw}` 不在当前模板中。模型认为你可能想输入当前链 `{possible_known}`。要保持当前链，还是把 `{raw}` 当作另一条真实链继续确认协议？", f"`{raw}` is not a configured template. The model thinks you may mean the current chain `{possible_known}`. Keep the current chain, or treat `{raw}` as another real chain and choose protocol?")
-                known_label = localized(state.get("language", "en"), f"保持当前链 `{possible_known}`", f"Keep current chain `{possible_known}`")
+                prompt = (
+                    question_text(
+                        "question.chain_rpc.chain_change.possible_current_grounded.prompt",
+                        raw=raw,
+                        possible_known=possible_known,
+                        search_summary=summary,
+                    )
+                    if summary
+                    else question_text(
+                        "question.chain_rpc.chain_change.possible_current.prompt",
+                        raw=raw,
+                        possible_known=possible_known,
+                    )
+                )
+                known_label = question_text(
+                    "question.chain_rpc.option.keep_known_chain",
+                    chain=possible_known,
+                )
             else:
-                prompt = localized(state.get("language", "en"), f"`{raw}` 不在当前模板中。模型认为你可能想输入 `{possible_known}`。你要从 `{previous}` 切换到 `{possible_known}`，还是把 `{raw}` 当作另一条真实链继续确认协议？", f"`{raw}` is not a configured template. The model thinks you may mean `{possible_known}`. Switch from `{previous}` to `{possible_known}`, or treat `{raw}` as another real chain and choose protocol?")
-                known_label = localized(state.get("language", "en"), f"切换到 `{possible_known}`", f"Switch to `{possible_known}`")
+                prompt = (
+                    question_text(
+                        "question.chain_rpc.chain_change.possible_known_grounded.prompt",
+                        raw=raw,
+                        previous=previous,
+                        possible_known=possible_known,
+                        search_summary=summary,
+                    )
+                    if summary
+                    else question_text(
+                        "question.chain_rpc.chain_change.possible_known.prompt",
+                        raw=raw,
+                        previous=previous,
+                        possible_known=possible_known,
+                    )
+                )
+                known_label = question_text(
+                    "question.chain_rpc.option.switch_known_chain",
+                    chain=possible_known,
+                )
             options = [
                 _answer_option("known", known_label, "confirm_known_chain", {"chain_identity.canonical": possible_known}),
-                _answer_option("protocol", localized(state.get("language", "en"), f"`{raw}` 是另一条真实链，继续确认协议", f"`{raw}` is another real chain; choose protocol"), "choose_protocol", {"chain_identity.status": "needs_protocol_confirmation"}),
-                _answer_option("no", "N", False, {"chain_identity.canonical": previous}),
+                _answer_option("protocol", question_text("question.chain_rpc.option.raw_is_other_chain", raw=raw), "choose_protocol", {"chain_identity.status": "needs_protocol_confirmation"}),
+                _answer_option("no", question_text("question.chain_rpc.option.no"), False, {"chain_identity.canonical": previous}),
             ]
         elif (resolved or {}).get("chain_exists") and family in SUPPORTED_ADAPTER_FAMILIES:
             proposed_name = normalize_scalar((resolved or {}).get("canonical_chain_name") or raw)
-            prompt = localized(state.get("language", "en"), f"`{raw}` 不在当前 36 条已配置链中。模型建议的名称是 `{proposed_name}`，协议族为 `{family}`。是否从 `{previous}` 切换到你输入的链 `{raw}`，并按该协议继续 endpoint/RPC 验证？", f"`{raw}` is not one of the configured 36 chains. The model proposes the name `{proposed_name}` and adapter family `{family}`. Switch from `{previous}` to your entered chain `{raw}` and continue endpoint/RPC validation with that family?")
+            prompt = (
+                question_text(
+                    "question.chain_rpc.chain_change.supported_family_grounded.prompt",
+                    raw=raw,
+                    previous=previous,
+                    proposed_name=proposed_name,
+                    adapter_family=family,
+                    search_summary=summary,
+                )
+                if summary
+                else question_text(
+                    "question.chain_rpc.chain_change.supported_family.prompt",
+                    raw=raw,
+                    previous=previous,
+                    proposed_name=proposed_name,
+                    adapter_family=family,
+                )
+            )
             options = [
-                _answer_option("confirm", localized(state.get("language", "en"), "确认，继续 endpoint/RPC 验证", "Yes, continue endpoint/RPC validation"), "confirm_proposed_protocol", {"chain_identity.status": "existing_family_needs_endpoint"}),
-                _answer_option("protocol", localized(state.get("language", "en"), "我来选择协议族", "I will choose the adapter family"), "choose_protocol", {"chain_identity.status": "needs_protocol_confirmation"}),
-                _answer_option("no", "N", False, {"chain_identity.canonical": previous}),
+                _answer_option("confirm", question_text("question.chain_rpc.option.continue_endpoint_validation"), "confirm_proposed_protocol", {"chain_identity.status": "existing_family_needs_endpoint"}),
+                _answer_option("protocol", question_text("question.chain_rpc.option.choose_adapter_family"), "choose_protocol", {"chain_identity.status": "needs_protocol_confirmation"}),
+                _answer_option("no", question_text("question.chain_rpc.option.no"), False, {"chain_identity.canonical": previous}),
             ]
         else:
-            prompt = localized(state.get("language", "en"), f"`{raw}` 不在当前 36 条已配置链或已知别名中。模型没有可靠确认它是已支持协议链。要从 `{previous}` 切换到这条真实链并继续确认协议，还是取消？", f"`{raw}` is not one of the configured 36 chains or known aliases. The model could not reliably confirm it as a supported-family chain. Switch from `{previous}` to this real chain and choose protocol, or cancel?")
+            prompt = (
+                question_text(
+                    "question.chain_rpc.chain_change.unresolved_grounded.prompt",
+                    raw=raw,
+                    previous=previous,
+                    search_summary=summary,
+                )
+                if summary
+                else question_text(
+                    "question.chain_rpc.chain_change.unresolved.prompt",
+                    raw=raw,
+                    previous=previous,
+                )
+            )
             options = [
-                _answer_option("protocol", localized(state.get("language", "en"), "真实链，继续确认协议", "Real chain; continue to protocol confirmation"), "choose_protocol", {"chain_identity.status": "needs_protocol_confirmation"}),
-                _answer_option("no", "N", False, {"chain_identity.canonical": previous}),
+                _answer_option("protocol", question_text("question.chain_rpc.option.real_chain_protocol"), "choose_protocol", {"chain_identity.status": "needs_protocol_confirmation"}),
+                _answer_option("no", question_text("question.chain_rpc.option.no"), False, {"chain_identity.canonical": previous}),
             ]
-        summary = _verified_search_summary(resolved or {})
-        if summary:
-            prompt += localized(state.get("language", "en"), f" 已用 google_search 核实：{summary}", f" Verified via google_search: {summary}")
         kind = "numbered_choice"
     state['pending_question'] = _choice(
         "chain_identity",
@@ -339,10 +427,15 @@ def _request_chain_change(
     )
     state["pending_question"]["interrupted_group"] = candidate["interrupted_group"]
     state["pending_question"]["supersedes_action_types"] = ["choose_chain", "change_chain"]
-    state['visible_response'] = [render_question(state["pending_question"], state.get("language", "en"))]
 
 
-def _apply_chain_change_decision(state: AgentGraphState, question: Mapping[str, Any], value: Any) -> None:
+def _apply_chain_change_decision(
+    state: AgentGraphState,
+    question: Mapping[str, Any],
+    value: Any,
+    *,
+    responses: ResponseCollector,
+) -> None:
     current_identity = state.setdefault("chain_identity", {})
     candidate = current_identity.get("change_candidate") or {}
     if value is False:
@@ -363,13 +456,23 @@ def _apply_chain_change_decision(state: AgentGraphState, question: Mapping[str, 
         if possible and possible == current:
             current_identity.pop("change_candidate", None)
             state['active_group'] = normalize_scalar(candidate.get("interrupted_group")) or "chain_identity"
-            state['visible_response'] = [localized(state.get("language", "en"), f"保持当前链 `{possible}`，已确认的链相关配置未更改。", f"Keeping the current chain `{possible}`; confirmed chain-dependent configuration is unchanged.")]
+            emit(
+                responses,
+                "chain_rpc.response.chain_kept",
+                arguments={"chain": possible},
+                source=__name__,
+            )
         else:
             invalidate_for_chain_change(state)
             state["chain_identity"] = {"raw": raw, "canonical": possible, "status": "confirmed", "case": "known"}
             state.setdefault("confirmed_config", {})["BLOCKCHAIN_NODE"] = possible
             state['active_group'] = "chain_identity"
-            state['visible_response'] = [localized(state.get("language", "en"), f"已确认链为 `{possible}`。", f"Confirmed chain: `{possible}`.")]
+            emit(
+                responses,
+                "chain_rpc.response.chain_confirmed",
+                arguments={"chain": possible},
+                source=__name__,
+            )
         return
     invalidate_for_chain_change(state)
     if value in {"confirm_proposed_protocol", "choose_protocol"}:
@@ -384,16 +487,25 @@ def _apply_chain_change_decision(state: AgentGraphState, question: Mapping[str, 
             "llm_resolution": resolution,
         }
         if value == "confirm_proposed_protocol":
-            _enter_case_for_adapter_family(state, normalize_scalar(resolution.get("adapter_family") or "unknown"))
+            _enter_case_for_adapter_family(
+                state,
+                normalize_scalar(resolution.get("adapter_family") or "unknown"),
+                responses=responses,
+            )
         else:
             state['active_group'] = "chain_identity"
             state['pending_question'] = _adapter_family_question(state)
-            state['visible_response'] = [render_question(state["pending_question"], state.get("language", "en"))]
         return
-    _apply_chain_candidate(state, raw, resolution)
+    _apply_chain_candidate(state, raw, resolution, responses=responses)
 
 
-def _apply_unknown_chain_decision(state: AgentGraphState, value: Any, user_text: str) -> None:
+def _apply_unknown_chain_decision(
+    state: AgentGraphState,
+    value: Any,
+    user_text: str,
+    *,
+    responses: ResponseCollector,
+) -> None:
     family = ""
     if isinstance(value, dict):
         family = normalize_scalar(value.get("choose_protocol_family"))
@@ -402,7 +514,7 @@ def _apply_unknown_chain_decision(state: AgentGraphState, value: Any, user_text:
         _convert_known_candidate_to_unknown(state)
         identity = state.setdefault("chain_identity", {})
         identity["identity_confirmed"] = True
-        _enter_case_for_adapter_family(state, family)
+        _enter_case_for_adapter_family(state, family, responses=responses)
         return
     if value == "reenter_chain":
         state["chain_identity"] = {}
@@ -423,10 +535,13 @@ def _apply_unknown_chain_decision(state: AgentGraphState, value: Any, user_text:
         state["chain_identity"]["identity_confirmed"] = True
         state['active_group'] = "chain_identity"
         state['pending_question'] = _adapter_family_question(state)
-        state['visible_response'] = [render_question(state["pending_question"], state.get("language", "en"))]
         return
     if value == "confirm_proposed_protocol":
-        _enter_case_for_adapter_family(state, normalize_scalar(identity.get("adapter_family")))
+        _enter_case_for_adapter_family(
+            state,
+            normalize_scalar(identity.get("adapter_family")),
+            responses=responses,
+        )
 
 
 def _convert_known_candidate_to_unknown(state: AgentGraphState) -> None:
@@ -450,32 +565,50 @@ def _convert_known_candidate_to_unknown(state: AgentGraphState) -> None:
     )
 
 
-def _enter_case_for_adapter_family(state: AgentGraphState, family: str) -> None:
+def _enter_case_for_adapter_family(
+    state: AgentGraphState,
+    family: str,
+    *,
+    responses: ResponseCollector,
+) -> None:
     identity = state.setdefault("chain_identity", {})
     family = normalize_scalar(family)
     identity["adapter_family"] = family
     if family not in SUPPORTED_ADAPTER_FAMILIES:
-        _route_unsupported_family(state)
+        _route_unsupported_family(state, responses=responses)
         return
     identity.update({"status": "existing_family_needs_endpoint", "case": "case2", "identity_confirmed": True})
     state['active_group'] = "endpoint_process"
     state['pending_question'] = _endpoint_validation_question(state) or {}
-    state['visible_response'] = [render_question(state["pending_question"], state.get("language", "en"))] if state["pending_question"] else []
 
 
-def _confirm_custom_rpc_family(state: AgentGraphState, family: str) -> None:
+def _confirm_custom_rpc_family(
+    state: AgentGraphState,
+    family: str,
+    *,
+    responses: ResponseCollector,
+) -> None:
     identity = state.setdefault("chain_identity", {})
     identity["adapter_family"] = family
     if family not in SUPPORTED_ADAPTER_FAMILIES:
-        _route_unsupported_family(state)
+        _route_unsupported_family(state, responses=responses)
         return
     custom = state.setdefault("custom_rpc", {})
     custom.update({"status": "needs_endpoint", "endpoint_ready": False, "job_local_override": True})
     state['active_group'] = "endpoint_process"
-    state['visible_response'] = [localized(state.get("language", "en"), f"已更新协议族为 `{family}`。请重新提供可访问的 RPC endpoint 用于验证。", f"Adapter family updated to `{family}`. Provide a reachable RPC endpoint to validate again.")]
+    emit(
+        responses,
+        "chain_rpc.response.adapter_family_updated",
+        arguments={"adapter_family": family},
+        source=__name__,
+    )
 
 
-def _route_unsupported_family(state: AgentGraphState) -> None:
+def _route_unsupported_family(
+    state: AgentGraphState,
+    *,
+    responses: ResponseCollector,
+) -> None:
     identity = state.setdefault("chain_identity", {})
     identity.update({"status": "unsupported_family_handoff", "case": "case3"})
     handoff = state.setdefault("secondary_handoff", {})
@@ -490,38 +623,48 @@ def _route_unsupported_family(state: AgentGraphState) -> None:
     )
     state['active_group'] = "chain_identity"
     state['pending_question'] = {}
-    state['visible_response'] = [localized(state.get("language", "en"), "该链目前不属于已支持协议族。请提供官方协议/RPC 文档、endpoint 文档、request/response 示例；我会生成二次开发交接文档。", "This chain is outside the supported adapter families. Provide official protocol/RPC docs, endpoint docs, and request/response examples; I will generate a secondary-development handoff.")]
+    emit(
+        responses,
+        "chain_rpc.response.unsupported_family_handoff",
+        source=__name__,
+    )
 
 
 def _request_target_mode_change(state: AgentGraphState, mode: str) -> None:
     previous = normalize_target_mode(state.get("target_mode"))
     interrupted = normalize_scalar(state.get("active_group"))
     chain = normalize_scalar((state.get("chain_identity") or {}).get("canonical"))
-    chain_zh = f"链 `{chain}` 会保留（如需更换请直接说明要测哪条链）；" if chain else ""
-    chain_en = f"Chain `{chain}` will be kept (say which chain you want if it should change); " if chain else ""
     if mode == "sync-observe":
-        impact_zh = "环境/机器/磁盘/网络证据会保留；RPC workload、自定义 method/fixture 和 QPS profile 会清空，因为 sync-observe 不走 Vegeta；同步 endpoint、进程和 metrics source 会重新验证。"
-        impact_en = "Environment, machine, disk, and network evidence is kept. RPC workload, custom methods/fixtures, and the QPS profile are cleared because sync-observe does not use Vegeta. Its sync endpoint, process, and metrics source are validated separately."
+        prompt = question_text(
+            "question.chain_rpc.target_mode_change.to_sync_observe.prompt",
+            previous=previous or "<unset>",
+            target_mode=mode,
+            retained_chain=chain or "<none>",
+        )
     elif previous == "sync-observe":
-        impact_zh = "环境/机器/磁盘/网络证据会保留；sync-observe 专用状态会清空；RPC endpoint、workload 和 QPS 会按新的 benchmark 模式重新确认。"
-        impact_en = "Environment, machine, disk, and network evidence is kept. Sync-observe-only state is cleared; the RPC endpoint, workload, and QPS profile are confirmed for the new benchmark mode."
+        prompt = question_text(
+            "question.chain_rpc.target_mode_change.from_sync_observe.prompt",
+            previous=previous or "<unset>",
+            target_mode=mode,
+            retained_chain=chain or "<none>",
+        )
     else:
-        impact_zh = "环境/机器/磁盘/网络证据会保留；endpoint、进程和执行证据会按新模式重新确认，避免复用不适用的运行状态。"
-        impact_en = "Environment, machine, disk, and network evidence is kept. Endpoint, process, and execution evidence is re-confirmed for the new mode so incompatible runtime state is not reused."
+        prompt = question_text(
+            "question.chain_rpc.target_mode_change.benchmark.prompt",
+            previous=previous or "<unset>",
+            target_mode=mode,
+            retained_chain=chain or "<none>",
+        )
     state["target_mode_change_candidate"] = mode
     state['active_group'] = "target_mode"
     state['pending_question'] = _choice(
         "target_mode",
         "target_mode_change_confirm",
-        localized(
-            state.get("language", "en"),
-            f"是否确认从 `{previous or '<unset>'}` 切换到 `{mode}`？{chain_zh}{impact_zh}",
-            f"Confirm switching from `{previous or '<unset>'}` to `{mode}`? {chain_en}{impact_en}",
-        ),
+        prompt,
         "target_mode_change_confirmed",
         [
-            _answer_option("yes", "Y", True, {"target_mode": mode}),
-            _answer_option("no", "N", False, {"target_mode": previous}),
+            _answer_option("yes", question_text("question.chain_rpc.option.yes"), True, {"target_mode": mode}),
+            _answer_option("no", question_text("question.chain_rpc.option.no"), False, {"target_mode": previous}),
         ],
         kind="yes_no",
         queue_barrier=True,
@@ -529,7 +672,6 @@ def _request_target_mode_change(state: AgentGraphState, mode: str) -> None:
     state["pending_question"]["interrupted_group"] = interrupted
     state["pending_question"]["previous_mode"] = previous
     state["pending_question"]["supersedes_action_types"] = ["choose_target_mode"]
-    state['visible_response'] = [render_question(state["pending_question"], state.get("language", "en"))]
 
 
 def _chain_ambiguity_question(
@@ -560,16 +702,38 @@ def _chain_ambiguity_question(
             continue
         seen.add(key)
         if normalized:
-            options.append(_answer_option(normalized, localized(state.get("language", "en"), f"使用已支持链 `{normalized}`（来自 `{raw}`）", f"Use configured chain `{normalized}` from `{raw}`"), {"chain_choice": normalized}, {"chain_identity.canonical": normalized}))
+            options.append(_answer_option(
+                normalized,
+                question_text(
+                    "question.chain_rpc.option.ambiguity_known_chain",
+                    chain=normalized,
+                    raw=raw,
+                ),
+                {"chain_choice": normalized},
+                {"chain_identity.canonical": normalized},
+            ))
         else:
-            options.append(_answer_option(raw, localized(state.get("language", "en"), f"`{raw}` 是另一条真实链，进入新链确认", f"`{raw}` is another real chain; enter new-chain confirmation"), {"unknown_chain_choice": raw}, {"chain_identity.raw": raw}))
-    options.append(_answer_option("reenter", localized(state.get("language", "en"), "我重新输入链名", "I will re-enter the chain name"), "reenter_chain", {"chain_identity": {}}))
+            options.append(_answer_option(
+                raw,
+                question_text(
+                    "question.chain_rpc.option.ambiguity_unknown_chain",
+                    raw=raw,
+                ),
+                {"unknown_chain_choice": raw},
+                {"chain_identity.raw": raw},
+            ))
+    options.append(_answer_option(
+        "reenter",
+        question_text("question.chain_rpc.option.reenter_chain"),
+        "reenter_chain",
+        {"chain_identity": {}},
+    ))
     if len(options) < 2:
         return None
     question = _choice(
         "chain_identity",
         "chain_ambiguity_confirm",
-        localized(state.get("language", "en"), "你这句话里有链名不确定或多个候选。请先确认要测试哪条链。", "Your turn contains an uncertain or multiple chain candidates. Confirm which chain to test first."),
+        question_text("question.chain_rpc.ambiguity.prompt"),
         "chain_ambiguity_choice",
         options,
         queue_barrier=True,

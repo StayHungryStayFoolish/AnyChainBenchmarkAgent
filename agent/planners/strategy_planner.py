@@ -14,6 +14,10 @@ from .chain_template_requirements import inspect_chain_template
 from .config_checklist import build_configuration_checklist, missing_required_from_checklist
 from .risk import score_plan_risk
 from ..knowledge.entry_contract import field_specs_for
+from ..knowledge.qps_profiles import (
+    STRATEGY_BENCHMARK_MODE,
+    strategy_qps_defaults,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -30,12 +34,8 @@ GOAL_TO_STRATEGY = {
 
 
 DEFAULT_QPS = {
-    "smoke": {"initial": 1000, "max": 1500, "step": 500, "duration_seconds": 60},
-    "baseline": {"initial": 2000, "max": 50000, "step": 500, "duration_seconds": 600},
-    "ramp": {"initial": 2000, "max": 50000, "step": 500, "duration_seconds": 600},
-    "stress": {"initial": 50000, "max": 9999999, "step": 250, "duration_seconds": 600},
-    "bottleneck-confirmation": {"initial": 2000, "max": 50000, "step": 500, "duration_seconds": 600},
-    "regression": {"initial": 2000, "max": 50000, "step": 500, "duration_seconds": 600},
+    strategy: strategy_qps_defaults(strategy)
+    for strategy in STRATEGY_BENCHMARK_MODE
 }
 
 

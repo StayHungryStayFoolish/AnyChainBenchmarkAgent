@@ -286,7 +286,8 @@ class ExecutionReceiptPropagationTest(unittest.TestCase):
         self.assertEqual(action.job_read_receipt, {})
 
     def test_job_consultation_rejects_tampered_live_status(self) -> None:
-        from agent.harness.domains.orientation import _job_status
+        from agent.harness.domains.orientation import consultation_fragment
+        from agent.harness.response_catalog import render_fragment
         from agent.runners.job_manager import get_job, submit_job
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -298,13 +299,15 @@ class ExecutionReceiptPropagationTest(unittest.TestCase):
 
         state = {"job": {"job_id": submitted["job_id"], "status": "running"}}
         with patch("agent.harness.domains.orientation.get_job", return_value=persisted):
-            message = _job_status(state, "en")
-        self.assertIn("status: `completed`", message)
+            fragment = consultation_fragment(state, {"topic": "job_status"})
+            message = render_fragment(fragment, "en").text
+        self.assertIn("verified status: `completed`", message)
 
         tampered = dict(persisted)
         tampered["status"] = "failed"
         with patch("agent.harness.domains.orientation.get_job", return_value=tampered):
-            message = _job_status(state, "en")
+            fragment = consultation_fragment(state, {"topic": "job_status"})
+            message = render_fragment(fragment, "en").text
         self.assertIn("cannot be verified", message)
         self.assertIn("last-known status is `running`", message)
 

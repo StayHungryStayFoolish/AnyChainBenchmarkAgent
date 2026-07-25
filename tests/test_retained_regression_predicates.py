@@ -37,6 +37,7 @@ def _event(
     turn_index: int = 1,
     pending_transition: dict | None = None,
     turn_receipt: dict | None = None,
+    admitted_actions: tuple[dict, ...] = (),
     material_diffs: dict | None = None,
     execution: dict | None = None,
 ) -> RuntimeTurnEvent:
@@ -62,6 +63,7 @@ def _event(
         pending_question_id=str(transition.get("after_id") or ""),
         action_queue_types=(),
         revision={"commit": "test", "worktree_hash": "5" * 64},
+        admitted_action_provenance=admitted_actions,
         turn_receipt_summary=turn_receipt or {},
         pending_transition=transition,
         control_receipts=tuple(receipts),
@@ -632,6 +634,279 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
         self.assertFalse(satisfied)
         self.assertEqual(details["matched_receipt_count"], 0)
 
+    def test_mode_change_journey_is_verified_at_its_source_turns(self) -> None:
+        turns = tuple(
+            _turn_and_decision(message, turn_index=index)[0]
+            for index, message in enumerate(
+                ("2", "compare modes", "use fake-node", "2"),
+                start=1,
+            )
+        )
+        planner = _hashed({
+            "receipt_type": "semantic_planner",
+            "turn_index": 3,
+            "input_hash": "1" * 64,
+            "pending_contract_hash": "2" * 64,
+            "resolver_invoked": True,
+            "result_reason_hash": "3" * 64,
+            "planned_action_types": ["choose_target_mode"],
+            "semantic_units": [
+                {"unit_id": "unit-1", "disposition": "action"},
+            ],
+            "planner_metrics": {"unit_count": 1},
+        })
+        routed = _event(
+            planner,
+            turn_index=3,
+            pending_transition={
+                "transition": "replaced",
+                "before_id": "chain",
+                "before_group": "chain_identity",
+                "before_hash": "2" * 64,
+                "after_id": "target_mode_change_confirm",
+                "after_group": "target_mode",
+                "after_hash": "4" * 64,
+                "consumer_action_ids": ["action-3"],
+            },
+            turn_receipt={
+                "owner_bindings": {"action-3": "chain_rpc"},
+                "admitted_action_ids": ["action-3"],
+                "execution_order": ["action-3"],
+            },
+            admitted_actions=({
+                "type": "choose_target_mode",
+                "action_id": "action-3",
+                "owner": "chain_rpc",
+                "effect": "configuration_mutation",
+                "group": "target_mode",
+                "argument_value_hashes": {
+                    "target_mode": hashlib.sha256(
+                        json.dumps(
+                            "fake-node",
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                },
+            },),
+        )
+        resolution = _pending_receipt(
+            turn_index=4,
+            pending_id="target_mode_change_confirm",
+            pending_group="target_mode",
+            pending_contract_hash="4" * 64,
+            selected_option_id="no",
+            resolved_action_id="action-4",
+        )
+        resumed = _event(
+            resolution,
+            turn_index=4,
+            pending_transition={
+                "transition": "replaced",
+                "before_id": "target_mode_change_confirm",
+                "before_group": "target_mode",
+                "before_hash": "4" * 64,
+                "after_id": "chain",
+                "after_group": "chain_identity",
+                "after_hash": "5" * 64,
+                "consumer_action_ids": ["action-4"],
+            },
+            turn_receipt={
+                "execution_order": ["action-4"],
+                "admitted_action_ids": ["action-4"],
+            },
+        )
+        context = _context(routed, resumed, turns=turns)
+
+        satisfied, details = POSTCONDITION_EVALUATORS[
+            "mode_change_request_routed_from_chain_pending"
+        ](context)
+        self.assertTrue(satisfied, details)
+        resumed_ok, details = POSTCONDITION_EVALUATORS[
+            "declined_mode_change_resumes_chain_pending"
+        ](context)
+        self.assertTrue(resumed_ok, details)
+        misrouted, details = POSTCONDITION_EVALUATORS[
+            "mode_request_consumed_as_chain_identity"
+        ](context)
+        self.assertFalse(misrouted, details)
+
+        wrong_planner = _hashed({
+            **{
+                key: value
+                for key, value in planner.items()
+                if key != "receipt_id"
+            },
+            "planned_action_types": ["answer_pending"],
+        })
+        wrong = _event(
+            wrong_planner,
+            turn_index=3,
+            pending_transition={
+                "transition": "replaced",
+                "before_id": "chain",
+                "before_group": "chain_identity",
+                "before_hash": "2" * 64,
+                "after_id": "unknown_chain_identity_confirm",
+                "after_group": "chain_identity",
+                "after_hash": "6" * 64,
+                "consumer_action_ids": ["action-3"],
+            },
+            turn_receipt={
+                "owner_bindings": {"action-3": "chain_rpc"},
+            },
+            material_diffs={
+                "chain_identity.raw": {
+                    "before": "",
+                    "after": "7" * 64,
+                },
+            },
+        )
+        wrong_context = _context(wrong, resumed, turns=turns)
+        satisfied, _ = POSTCONDITION_EVALUATORS[
+            "mode_change_request_routed_from_chain_pending"
+        ](wrong_context)
+        self.assertFalse(satisfied)
+        misrouted, details = POSTCONDITION_EVALUATORS[
+            "mode_request_consumed_as_chain_identity"
+        ](wrong_context)
+        self.assertTrue(misrouted, details)
+
+    def test_mode_change_open_variant_uses_attested_source_turns_after_clarification(
+        self,
+    ) -> None:
+        contract = _verifier_input(
+            "isomorphic",
+            ("select real", "compare", "request fake", "decline"),
+            semantic_roles=(
+                "select_real_node",
+                "mode_comparison_consultation",
+                "request_fake_node_change",
+                "decline_mode_change",
+            ),
+        )
+        pairs = [
+            _turn_and_decision(message, turn_index=index)
+            for index, message in enumerate(
+                (
+                    "select real",
+                    "compare",
+                    "please clarify",
+                    "request fake",
+                    "decline",
+                ),
+                start=1,
+            )
+        ]
+        for source_step_id, semantic_role, actual_index in (
+            ("source-3", "request_fake_node_change", 4),
+            ("source-4", "decline_mode_change", 5),
+        ):
+            turn, decision = pairs[actual_index - 1]
+            attestation = build_variant_attestation(
+                actor=decision.simulator_attestation["actor"],
+                verifier_input_contract=contract,
+                execution_binding=_execution_binding(decision),
+                source_step_id=source_step_id,
+                semantic_role=semantic_role,
+                turn_index=actual_index,
+                previous_response_hash=decision.previous_response_hash,
+                user_message_hash=decision.user_message_hash,
+                selected_at_ns=decision.selected_at_ns,
+                declared_at_ns=decision.submitted_at_ns,
+            )
+            pairs[actual_index - 1] = (
+                turn,
+                _with_attestation(decision, attestation),
+            )
+        planner = _hashed({
+            "receipt_type": "semantic_planner",
+            "turn_index": 4,
+            "input_hash": "1" * 64,
+            "pending_contract_hash": "2" * 64,
+            "resolver_invoked": True,
+            "result_reason_hash": "3" * 64,
+            "planned_action_types": ["choose_target_mode"],
+            "semantic_units": [{"unit_id": "unit-1", "disposition": "action"}],
+            "planner_metrics": {"unit_count": 1},
+        })
+        routed = _event(
+            planner,
+            turn_index=4,
+            pending_transition={
+                "transition": "replaced",
+                "before_id": "chain",
+                "before_group": "chain_identity",
+                "before_hash": "2" * 64,
+                "after_id": "target_mode_change_confirm",
+                "after_group": "target_mode",
+                "after_hash": "4" * 64,
+                "consumer_action_ids": ["action-4"],
+            },
+            turn_receipt={
+                "owner_bindings": {"action-4": "chain_rpc"},
+                "admitted_action_ids": ["action-4"],
+                "execution_order": ["action-4"],
+            },
+            admitted_actions=({
+                "type": "choose_target_mode",
+                "action_id": "action-4",
+                "owner": "chain_rpc",
+                "effect": "configuration_mutation",
+                "group": "target_mode",
+                "argument_value_hashes": {
+                    "target_mode": hashlib.sha256(
+                        json.dumps(
+                            "fake-node",
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                },
+            },),
+        )
+        resolution = _pending_receipt(
+            turn_index=5,
+            pending_id="target_mode_change_confirm",
+            pending_group="target_mode",
+            pending_contract_hash="4" * 64,
+            selected_option_id="no",
+            resolved_action_id="action-5",
+        )
+        resumed = _event(
+            resolution,
+            turn_index=5,
+            pending_transition={
+                "transition": "replaced",
+                "before_id": "target_mode_change_confirm",
+                "before_group": "target_mode",
+                "before_hash": "4" * 64,
+                "after_id": "chain",
+                "after_group": "chain_identity",
+                "after_hash": "5" * 64,
+                "consumer_action_ids": ["action-5"],
+            },
+            turn_receipt={
+                "execution_order": ["action-5"],
+                "admitted_action_ids": ["action-5"],
+            },
+        )
+        context = _context(
+            routed,
+            resumed,
+            turns=tuple(pair[0] for pair in pairs),
+            decisions=tuple(pair[1] for pair in pairs),
+            verifier_input_contract=contract,
+        )
+
+        routed_ok, routed_details = POSTCONDITION_EVALUATORS[
+            "mode_change_request_routed_from_chain_pending"
+        ](context)
+        resumed_ok, resumed_details = POSTCONDITION_EVALUATORS[
+            "declined_mode_change_resumes_chain_pending"
+        ](context)
+
+        self.assertTrue(routed_ok, routed_details)
+        self.assertTrue(resumed_ok, resumed_details)
+
     def test_workload_predicate_requires_semantically_valid_replacement_receipt(
         self,
     ) -> None:
@@ -902,7 +1177,7 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
         }
         evidence_body = {
             "receipt_type": "analysis_evidence_block",
-            "receipt_version": 1,
+            "receipt_version": 2,
             "turn_index": 1,
             "owner": "analysis",
             "operation": "start",
@@ -915,7 +1190,10 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
             "input_non_empty_line_count": 1,
             "input_hash": "8" * 64,
             "status": "active",
-            "visible_result_hash": "9" * 64,
+            "response_message_ids": [],
+            "response_render_hash": "",
+            "response_rendered": False,
+            "response_semantic_hash": "",
         }
         evidence_receipt = {
             **evidence_body,

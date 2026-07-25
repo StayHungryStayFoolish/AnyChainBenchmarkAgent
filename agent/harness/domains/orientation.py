@@ -6,22 +6,32 @@ mutates benchmark configuration.
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any
 
 from agent.knowledge.entry_contract import ALL_RUNTIME_FIELDS
 from agent.knowledge.chain_identity import canonicalize_chain_scalar, repo_chain_names
-from agent.workflows.group_registry import GROUPS
+from agent.workflows.group_registry import GROUPS, group_applicable
 from agent.validators.rpc_workload import default_workload
 from agent.runners.job_manager import get_job, list_jobs, verify_job_receipt
+from agent.utils.redaction import redact
 from ..action_registry import canonical_consultation_topic
-from ..contracts import ActionProposal, CheckpointCommand, HandlerResult, StateDelta
-from ..failures import render_failure_summary, unresolved_recovery
-from ..localization import localized
-from ..oracle import format_current_context, format_current_state, format_startup_discovery, queued_configuration_summary
-from ..questions import choice_question
+from ..contracts import (
+    ActionProposal,
+    CheckpointCommand,
+    FailureDescriptor,
+    HandlerResult,
+    ResponseFragment,
+    StateDelta,
+)
+from ..failures import failure_record_response_fragment, unresolved_recovery
+from ..oracle import compute_next_action
+from ..questions import choice_question as _choice_question, question_text
 from ..state import AgentGraphState
 from .chain_identity import research_chain_identity
 from .orientation_receipts import build_orientation_response_receipt
+
+choice_question = partial(_choice_question, owner="orientation")
 
 
 def has_resumable_configuration(state: AgentGraphState) -> bool:
@@ -45,21 +55,49 @@ def has_resumable_configuration(state: AgentGraphState) -> bool:
 
 
 def resume_question(state: AgentGraphState) -> dict[str, Any]:
-    language = str(state.get("language") or "en")
-    summary = resume_summary(state)
     recovery = state.get("checkpoint_recovery") or {}
     if recovery.get("status") == "quarantined":
-        prompt = localized(
-            language,
-            "检测到不完整或不一致的旧配置，已隔离，尚未恢复到当前会话。\n1. 查看隔离原因和安全字段\n2. 仅保留可安全识别的确认值\n3. 清空旧配置重新开始",
-            "An incomplete or inconsistent legacy configuration was quarantined and has not been resumed.\n1. Inspect the reason and safe fields\n2. Retain only safely identified confirmed values\n3. Clear the legacy configuration and start over",
-        )
+        prompt = question_text("question.orientation.resume_quarantined.prompt")
         values = ("inspect_quarantine", "retain_safe", "reset")
     else:
-        prompt = localized(
-        language,
-        f"检测到之前的 Agent 配置会话：\n{summary}\n1. 继续之前的配置\n2. 保留已确认值并修改\n3. 清空配置重新开始",
-        f"Found a previous Agent configuration session:\n{summary}\n1. Continue previous configuration\n2. Keep confirmed values and modify\n3. Clear configuration and start over",
+        identity = state.get("chain_identity") or {}
+        confirmed = state.get("confirmed_config") or {}
+        qps = state.get("qps_profile") or {}
+        observability = state.get("observability") or {}
+        prompt = question_text(
+            "question.orientation.resume.prompt",
+            target_mode=str(state.get("target_mode") or "<not selected>"),
+            workflow_mode=str(state.get("workflow_mode") or "<not selected>"),
+            chain=str(
+                identity.get("canonical")
+                or identity.get("raw")
+                or "<not selected>"
+            ),
+            rpc_mode=str(state.get("rpc_mode") or "<not selected>"),
+            qps=str(qps.get("mode") or "<not selected>"),
+            observability=str(observability.get("mode") or "<not selected>"),
+            confirmed_fields=(
+                ", ".join(sorted(str(key) for key in confirmed))
+                if confirmed
+                else "<none>"
+            ),
+            deferred_request_count=len(state.get("action_queue") or []),
+            saved_workflow_goals=(
+                "; ".join(
+                    ": ".join(
+                        part
+                        for part in (
+                            str(item.get("target_mode") or "").strip(),
+                            str(item.get("goal") or "").strip(),
+                        )
+                        if part
+                    )
+                    or "<unspecified>"
+                    for item in state.get("workflow_goals") or []
+                    if isinstance(item, dict)
+                )
+                or "<none>"
+            ),
         )
         values = ("continue", "modify", "reset")
     question = choice_question(
@@ -70,7 +108,7 @@ def resume_question(state: AgentGraphState) -> dict[str, Any]:
         options=[
             {
                 "id": "1",
-                "label": "1",
+                "label": _resume_option_label(values[0]),
                 "value": values[0],
                 **(
                     {"semantic_action": "continue_current_flow"}
@@ -82,14 +120,28 @@ def resume_question(state: AgentGraphState) -> dict[str, Any]:
                 else {"resume_context": {}},
                 "return_policy": "stop_after_response" if values[0] == "inspect_quarantine" else "fallback",
             },
-            {"id": "2", "label": "2", "value": values[1], "expected_patch": {"resume_context": {}}},
-            {"id": "3", "label": "3", "value": values[2], "expected_patch": {"confirmed_config": {}}},
+            {
+                "id": "2",
+                "label": _resume_option_label(values[1]),
+                "value": values[1],
+                "expected_patch": {"resume_context": {}},
+            },
+            {
+                "id": "3",
+                "label": _resume_option_label(values[2]),
+                "value": values[2],
+                "expected_patch": {"confirmed_config": {}},
+            },
         ],
         queue_barrier=True,
     )
     if state.get("action_queue"):
         question["resume_action_queue"] = True
     return question
+
+
+def _resume_option_label(value: str):
+    return question_text(f"question.orientation.resume.option.{value}")
 
 
 def resume_modify_group_question(state: AgentGraphState) -> dict[str, Any]:
@@ -100,34 +152,34 @@ def resume_modify_group_question(state: AgentGraphState) -> dict[str, Any]:
     ``change_group`` action, preserving one navigation authority.
     """
 
-    language = str(state.get("language") or "en")
-    workflow_mode = str(state.get("workflow_mode") or "").strip()
-    target_mode = str(state.get("target_mode") or "").strip()
     destinations = [
         spec
         for spec in GROUPS
         if spec.name != "opening"
         and spec.navigation_entry == "question_or_status"
         and spec.resume_selector
-        and (not spec.workflow_modes or not workflow_mode or workflow_mode in spec.workflow_modes)
-        and (not spec.target_modes or not target_mode or target_mode in spec.target_modes)
+        and group_applicable(state, spec)
     ]
-    prompt = localized(
-        language,
-        "已保留确认值。请选择要修改的配置组，也可以用自然语言说明要修改什么。",
-        "Confirmed values were kept. Choose the configuration group to modify, or describe the change in natural language.",
-    )
     return choice_question(
         "opening",
         "resume_modify_group",
-        prompt,
+        question_text("question.orientation.resume_modify.prompt"),
         field="resume_modify_group",
         options=[
             {
                 "id": str(index),
-                "label": spec.name,
-                "description": ", ".join(
-                    field for field in spec.fields if field not in spec.immutable_fields
+                "label": question_text(
+                    "question.orientation.group.option",
+                    group=spec.name,
+                ),
+                "description": question_text(
+                    "question.orientation.group.description",
+                    fields=", ".join(
+                        field
+                        for field in spec.fields
+                        if field not in spec.immutable_fields
+                    )
+                    or "<none>",
                 ),
                 "value": spec.name,
                 "action": {
@@ -135,8 +187,9 @@ def resume_modify_group_question(state: AgentGraphState) -> dict[str, Any]:
                     "group": spec.name,
                     "navigation_explicit": True,
                 },
-                "completion_effect": (
-                    f"Delegate navigation to the registered {spec.name} workflow group."
+                "completion_effect": question_text(
+                    "question.orientation.group.completion",
+                    group=spec.name,
                 ),
                 "expected_patch": {},
                 "return_policy": "fallback",
@@ -183,7 +236,12 @@ def apply_orientation_action(state: AgentGraphState, action: ActionProposal) -> 
     if action_type == "set_response_language":
         language = str(action.arguments.get("language") or "").strip().lower()
         if language not in {"zh", "en"}:
-            return HandlerResult(blocker="response language must be zh or en")
+            return HandlerResult(
+                blocker=FailureDescriptor(
+                    code="harness.orientation.failure.invalid_language",
+                    source=__name__,
+                )
+            )
         return HandlerResult(
             delta=StateDelta.set_values({"language": language}),
             consumed_action_ids=(action.action_id,),
@@ -194,19 +252,19 @@ def apply_orientation_action(state: AgentGraphState, action: ActionProposal) -> 
         question = None
         if not state.get("pending_question") and not has_resumable_configuration(state):
             question = opening_question(state)
-        response = localized(
-            language,
-            "你好，我是 AnyChain Benchmark Agent。你可以直接说明测试目标、询问当前状态，或粘贴配置、日志和报告。",
-            "Hi, I am AnyChain Benchmark Agent. State a test goal, ask about current state, or paste configuration, logs, or reports.",
+        fragment = ResponseFragment(
+            kind="message",
+            message_id="harness.orientation.greeting",
+            source=__name__,
         )
         return HandlerResult(
-            visible_result=response,
+            response_fragments=(fragment,),
             control_receipts=(
                 build_orientation_response_receipt(
                     state,
                     action,
                     topic="identity",
-                    response=response,
+                    response=fragment.message_id,
                 ),
             ),
             pending_question=question,
@@ -221,14 +279,21 @@ def apply_orientation_action(state: AgentGraphState, action: ActionProposal) -> 
             if str(item).strip()
         ]
         if not clauses:
-            return HandlerResult(blocker="clarify_unresolved requires unresolved clauses")
-        language = str(state.get("language") or "en")
+            return HandlerResult(
+                blocker=FailureDescriptor(
+                    code="harness.orientation.failure.unresolved_clauses_required",
+                    source=__name__,
+                )
+            )
         details = "\n".join(f"- {item}" for item in clauses)
         return HandlerResult(
-            visible_result=localized(
-                language,
-                f"为了避免只应用你这一轮的部分需求，请先澄清以下尚未安全映射的内容：\n{details}",
-                f"To avoid applying only part of this turn, clarify the following items that were not mapped safely:\n{details}",
+            response_fragments=(
+                ResponseFragment(
+                    kind="message",
+                    message_id="harness.orientation.clarify_unresolved",
+                    arguments={"details": details},
+                    source=__name__,
+                ),
             ),
             pending_question=dict(state.get("pending_question") or {}) or None,
             consumed_action_ids=(action.action_id,),
@@ -239,10 +304,12 @@ def apply_orientation_action(state: AgentGraphState, action: ActionProposal) -> 
         return HandlerResult(
             checkpoint_command=CheckpointCommand("reset"),
             consumed_action_ids=(action.action_id,),
-            visible_result=localized(
-                state.get("language", "en"),
-                "已清空之前的 Agent 配置。启动环境推断和历史 job 已保留。请告诉我这次要测试什么。",
-                "Cleared the previous Agent configuration. Startup discovery and historical jobs were preserved. Tell me what to test.",
+            response_fragments=(
+                ResponseFragment(
+                    kind="message",
+                    message_id="harness.orientation.session_reset",
+                    source=__name__,
+                ),
             ),
             completion="completed",
             stop_after_response=True,
@@ -253,15 +320,23 @@ def apply_orientation_action(state: AgentGraphState, action: ActionProposal) -> 
         pending = dict(state.get("pending_question") or {})
         if topic == "recommendation" and not pending and not state.get("target_mode"):
             pending = recommendation_question(state)
-        response = answer_consultation(state, raw)
+        fragment = consultation_fragment(state, raw)
+        fragments = [fragment]
+        active_failure = _active_failure_record(state)
+        if topic == "current_config" and active_failure:
+            fragments.insert(0, failure_record_response_fragment(active_failure))
         return HandlerResult(
-            visible_result=response,
+            response_fragments=tuple(fragments),
             control_receipts=(
                 build_orientation_response_receipt(
                     state,
                     action,
                     topic=topic or "capabilities",
-                    response=response,
+                    response=(
+                        f"{fragment.message_id}:"
+                        f"{sorted(fragment.arguments.items())}:"
+                        f"{sorted(fragment.payload.items())}"
+                    ),
                 ),
             ),
             pending_question=pending or None,
@@ -271,14 +346,431 @@ def apply_orientation_action(state: AgentGraphState, action: ActionProposal) -> 
     if action_type == "answer_pending":
         return HandlerResult(
             consumed_action_ids=(action.action_id,),
-            blocker="answer_pending must be resolved against the active question contract",
+            blocker=FailureDescriptor(
+                code="harness.orientation.failure.answer_pending_not_resolved",
+                source=__name__,
+            ),
         )
     if action_type == "unknown":
         return HandlerResult(
             consumed_action_ids=(action.action_id,),
-            blocker="no safe typed action was resolved",
+            blocker=FailureDescriptor(
+                code="harness.orientation.failure.no_safe_action",
+                source=__name__,
+            ),
         )
-    return HandlerResult(blocker=f"unsupported orientation action: {action_type}")
+    return HandlerResult(
+        blocker=FailureDescriptor(
+            code="harness.orientation.failure.unsupported_action",
+            arguments={"action_type": action_type},
+            source=__name__,
+        )
+    )
+
+
+def consultation_fragment(
+    state: AgentGraphState,
+    action: dict[str, Any],
+) -> ResponseFragment:
+    """Translate a consultation topic into one registered response contract."""
+
+    topic = canonical_consultation_topic(action.get("topic"))
+    subject = str(action.get("subject") or "").strip()
+    facts = state.get("framework_summary") or {}
+    static_ids = {
+        "identity": "identity",
+        "execution_preflight_smoke": "preflight_smoke",
+        "recommendation": "recommendation",
+        "reset_help": "reset_help",
+        "reset": "reset_help",
+        "evidence_help": "evidence_help",
+        "log_help": "evidence_help",
+    }
+    if topic in static_ids:
+        return ResponseFragment(
+            kind="message",
+            message_id=f"harness.orientation.consultation.{static_ids[topic]}",
+            source=__name__,
+        )
+    if topic in {"capabilities", "agent_capability"}:
+        return ResponseFragment(
+            kind="message",
+            message_id="harness.orientation.consultation.capabilities",
+            arguments={
+                "chain_count": str(facts.get("chain_count", "?")),
+                "family_count": str(facts.get("family_count", "?")),
+                "method_count": str(facts.get("unique_rpc_method_count", "?")),
+            },
+            source=__name__,
+        )
+    if topic == "extension":
+        current_chain = str((state.get("chain_identity") or {}).get("canonical") or "")
+        chain = (
+            canonicalize_chain_scalar(
+                subject or current_chain,
+                known_chains=set(repo_chain_names()),
+            )
+            or "<not selected>"
+        )
+        defaults = ", ".join(default_workload(chain).get("methods") or []) or "<none>"
+        return ResponseFragment(
+            kind="message",
+            message_id="harness.orientation.consultation.extension",
+            arguments={"chain": chain, "defaults": defaults},
+            source=__name__,
+        )
+    if topic == "supported_chains":
+        configured = sorted(repo_chain_names())
+        chain = canonicalize_chain_scalar(
+            subject,
+            known_chains=set(configured),
+        ) if subject else ""
+        if chain:
+            defaults = default_workload(chain)
+            return ResponseFragment(
+                kind="message",
+                message_id="harness.orientation.consultation.supported_chain",
+                arguments={
+                    "chain": chain,
+                    "single": str(defaults.get("single") or "<none>"),
+                    "mixed": ", ".join(
+                        f"{row.get('method')}={row.get('weight')}"
+                        for row in defaults.get("mixed_weighted") or []
+                        if isinstance(row, dict) and row.get("method")
+                    ) or "<none>",
+                    "methods": ", ".join(defaults.get("methods") or []) or "<none>",
+                },
+                source=__name__,
+            )
+        if subject:
+            resolution = research_chain_identity(state, subject)
+            web = resolution.get("web_grounding") or {}
+            if not isinstance(web, dict):
+                web = {}
+            exists = resolution.get("chain_exists")
+            return ResponseFragment(
+                kind="message",
+                message_id=(
+                    "harness.orientation.consultation.chain_research_grounded"
+                    if web.get("used")
+                    else "harness.orientation.consultation.chain_research_ungrounded"
+                ),
+                arguments={
+                    "subject": subject,
+                    "exists": (
+                        "yes" if exists is True else "no" if exists is False else "unconfirmed"
+                    ),
+                    "chain": str(
+                        resolution.get("canonical_chain_name") or subject
+                    ),
+                    "protocol": str(
+                        resolution.get("protocol_or_api") or "<unconfirmed>"
+                    ),
+                    "adapter_family": str(
+                        resolution.get("adapter_family") or "<unconfirmed>"
+                    ),
+                    "confidence": str(
+                        resolution.get("confidence") or "unknown"
+                    ),
+                    "evidence": str(
+                        resolution.get("evidence_summary") or "<none>"
+                    ),
+                    **(
+                        {"grounding": str(web.get("summary") or "<none>")}
+                        if web.get("used")
+                        else {}
+                    ),
+                },
+                source=__name__,
+            )
+        return ResponseFragment(
+            kind="message",
+            message_id="harness.orientation.consultation.supported_chains",
+            arguments={"chains": ", ".join(configured)},
+            source=__name__,
+        )
+    if topic in {"requirements", "workflow"}:
+        return ResponseFragment(
+            kind="message",
+            message_id=(
+                "harness.orientation.consultation.requirements_with_recommendation"
+                if not state.get("target_mode")
+                else "harness.orientation.consultation.requirements"
+            ),
+            source=__name__,
+        )
+    if topic in {"mode_comparison", "performance_benchmark_guidance"}:
+        return ResponseFragment(
+            kind="message",
+            message_id=(
+                "harness.orientation.consultation.performance_guidance"
+                if topic == "performance_benchmark_guidance"
+                else "harness.orientation.consultation.mode_comparison"
+            ),
+            source=__name__,
+        )
+    if topic in {"correction", "clarification"} and not _active_failure_record(state):
+        return ResponseFragment(
+            kind="message",
+            message_id="harness.orientation.consultation.clarification",
+            source=__name__,
+        )
+    if topic in {"correction", "clarification"}:
+        return failure_record_response_fragment(_active_failure_record(state) or {})
+    identity = state.get("chain_identity") or {}
+    confirmed = state.get("confirmed_config") or {}
+    pending = state.get("pending_question") or {}
+    if topic == "current_config":
+        return ResponseFragment(
+            kind="message",
+            message_id="harness.orientation.consultation.current_config",
+            arguments={
+                "target_mode": str(state.get("target_mode") or "<not selected>"),
+                "workflow_mode": str(state.get("workflow_mode") or "<not selected>"),
+                "chain": str(identity.get("canonical") or identity.get("raw") or "<not selected>"),
+                "rpc_mode": str(state.get("rpc_mode") or "<not selected>"),
+                "qps_mode": str((state.get("qps_profile") or {}).get("mode") or "<not selected>"),
+                "observability": str((state.get("observability") or {}).get("mode") or "<not selected>"),
+                "confirmed_fields": ", ".join(sorted(confirmed)) or "<none>",
+                "pending_question": str(pending.get("id") or "<none>"),
+                "pending_field": str(pending.get("field") or "<none>"),
+            },
+            source=__name__,
+        )
+    if topic == "workload_config":
+        workload = state.get("workload") or {}
+        chain = str(identity.get("canonical") or identity.get("raw") or "<not selected>")
+        if workload.get("confirmed") and workload.get("methods"):
+            return ResponseFragment(
+                kind="message",
+                message_id="harness.orientation.consultation.workload_effective",
+                arguments={
+                    "chain": chain,
+                    "rpc_mode": str(state.get("rpc_mode") or "<not selected>"),
+                    "methods": ", ".join(str(item) for item in workload.get("methods") or []) or "<none>",
+                    "weights": ", ".join(
+                        f"{method}={weight}"
+                        for method, weight in (workload.get("weights") or {}).items()
+                    ) or "<not applicable>",
+                },
+                source=__name__,
+            )
+        defaults = default_workload(chain) if chain != "<not selected>" else {}
+        return ResponseFragment(
+            kind="message",
+            message_id="harness.orientation.consultation.workload_template",
+            arguments={
+                "chain": chain,
+                "single": str(defaults.get("single") or "<none>"),
+                "mixed": ", ".join(
+                    f"{row.get('method')}={row.get('weight')}"
+                    for row in defaults.get("mixed_weighted") or []
+                    if isinstance(row, dict) and row.get("method")
+                ) or "<none>",
+            },
+            source=__name__,
+        )
+    if topic in {"current_context", "next_action"}:
+        next_action = compute_next_action(state)
+        collection = state.get("evidence_collection") or {}
+        evidence_lines = (
+            list(collection.get("lines") or [])
+            if isinstance(collection, dict)
+            else []
+        )
+        if evidence_lines:
+            return ResponseFragment(
+                kind="message",
+                message_id="harness.orientation.consultation.current_context_evidence",
+                arguments={
+                    "evidence_lines": len(evidence_lines),
+                    "preview": str(redact(evidence_lines)),
+                },
+                source=__name__,
+            )
+        common_arguments = {
+            "active_group": str(state.get("active_group") or "<none>"),
+            "execution_status": str((state.get("execution_state") or {}).get("status") or "not_requested"),
+            "evidence_lines": 0,
+        }
+        if pending:
+            return ResponseFragment(
+                kind="message",
+                message_id="harness.orientation.consultation.current_context_pending",
+                arguments={
+                    **common_arguments,
+                    "pending_question": str(pending.get("id") or "<none>"),
+                    "pending_field": str(pending.get("field") or "<none>"),
+                },
+                source=__name__,
+            )
+        if next_action.next_blocking_group == "preflight_smoke_execution":
+            return ResponseFragment(
+                kind="message",
+                message_id="harness.orientation.consultation.current_context_preflight",
+                source=__name__,
+            )
+        return ResponseFragment(
+            kind="message",
+            message_id="harness.orientation.consultation.current_context_next_group",
+            arguments={
+                **common_arguments,
+                "next_group": str(next_action.next_blocking_group or "<none>"),
+            },
+            source=__name__,
+        )
+    if topic in {"startup_discovery", "environment_inference", "environment_readiness"}:
+        discovery = state.get("discovery") or {}
+        cloud = discovery.get("cloud") or {}
+        deployment = discovery.get("deployment") or {}
+        host = discovery.get("host") or {}
+        network = discovery.get("network") or {}
+        disks = discovery.get("disks") or {}
+        dependencies = discovery.get("dependencies") or {}
+        return ResponseFragment(
+            kind="message",
+            message_id=(
+                "harness.orientation.consultation.environment_snapshot_blocked"
+                if dependencies.get("missing_required")
+                else "harness.orientation.consultation.environment_snapshot_ready"
+            ),
+            arguments={
+                "cloud": str(cloud.get("provider") or "other"),
+                "deployment": str(cloud.get("platform") or deployment.get("type") or "<unknown>"),
+                "region": str(cloud.get("region") or "<not detected>"),
+                "zone": str(cloud.get("zone") or "<not detected>"),
+                "machine": str(cloud.get("machine_type") or host.get("machine_type") or host.get("hostname") or "<unknown>"),
+                "cpu": str(host.get("cpu_count") or host.get("cpu") or "<unknown>"),
+                "memory": str(host.get("memory_gib") or host.get("memory") or "<unknown>"),
+                "network": str(network.get("default_interface") or "<none>"),
+                "ledger": str(disks.get("proposed_ledger_device") or "<none>"),
+                "accounts": str(disks.get("proposed_accounts_device") or "<none detected>"),
+                "missing_required": ", ".join(
+                    str(item) for item in dependencies.get("missing_required") or []
+                )
+                or "<none>",
+                "missing_optional": ", ".join(
+                    str(item) for item in dependencies.get("missing_optional") or []
+                )
+                or "<none>",
+            },
+            source=__name__,
+        )
+    if topic == "config_explanation":
+        identifier = subject or str(pending.get("field") or pending.get("id") or "")
+        field = _runtime_field(identifier)
+        if field is not None:
+            return ResponseFragment(
+                kind="message",
+                message_id=(
+                    "harness.orientation.consultation.config_field_required"
+                    if field.required
+                    else "harness.orientation.consultation.config_field_optional"
+                ),
+                arguments={
+                    "field": str(field.env or field.key),
+                    "label": str(field.label),
+                    "purpose": str(field.description or field.reason),
+                    "modes": ", ".join(mode.replace("_", "-") for mode in field.applies_to),
+                },
+                source=__name__,
+            )
+        if identifier in {"new_chain_endpoint", "custom_rpc_endpoint"}:
+            return ResponseFragment(
+                kind="message",
+                message_id=f"harness.orientation.consultation.{identifier}",
+                source=__name__,
+            )
+        if identifier == "custom_rpc_fixture_choice":
+            workload = state.get("workload") or {}
+            return ResponseFragment(
+                kind="message",
+                message_id="harness.orientation.consultation.custom_rpc_fixture_choice",
+                arguments={
+                    "methods": ", ".join(
+                        str(item) for item in workload.get("methods") or []
+                    )
+                    or "<none>",
+                    "preserved_fields": ", ".join(sorted(confirmed)) or "<none>",
+                },
+                source=__name__,
+            )
+    if topic in {"current_job", "job_status", "execution_status"}:
+        job_id, status, verified = _job_status_facts(state)
+        return ResponseFragment(
+            kind="message",
+            message_id=(
+                "harness.orientation.consultation.job_verified"
+                if verified
+                else "harness.orientation.consultation.job_unverified"
+                if job_id
+                else "harness.orientation.consultation.job_none"
+            ),
+            arguments=(
+                {"job_id": job_id, "status": status}
+                if job_id
+                else {}
+            ),
+            source=__name__,
+        )
+    return ResponseFragment(
+        kind="message",
+        message_id="harness.orientation.consultation.general",
+        source=__name__,
+    )
+
+
+def _runtime_field(identifier: str):
+    normalized = str(identifier or "").strip().lower().replace("_", "").replace("-", "").replace(" ", "").rstrip("s")
+    if not normalized:
+        return None
+    return next(
+        (
+            field
+            for field in ALL_RUNTIME_FIELDS
+            if normalized
+            in {
+                str(field.env).lower().replace("_", ""),
+                str(field.key).lower().replace("_", "").replace("-", ""),
+                str(field.label).lower().replace(" ", "").rstrip("s"),
+            }
+        ),
+        None,
+    )
+
+
+def _job_status_facts(state: AgentGraphState) -> tuple[str, str, bool]:
+    job = dict(state.get("job") or {})
+    job_id = str(job.get("job_id") or "").strip()
+    if not job_id:
+        try:
+            jobs = list_jobs(limit=1)
+            job = dict(jobs[0]) if jobs else {}
+            job_id = str(job.get("job_id") or "").strip()
+        except Exception:
+            return "", "", False
+    if not job_id:
+        return "", "", False
+    try:
+        persisted = get_job(job_id)
+    except (FileNotFoundError, OSError, ValueError):
+        return job_id, str(job.get("status") or "unknown"), False
+    receipts = persisted.get("execution_receipts") or {}
+    receipt = dict(receipts.get("last_read") or {}) if isinstance(receipts, dict) else {}
+    verified = bool(
+        verify_job_receipt(receipt)
+        and receipt.get("job_id") == job_id
+        and receipt.get("observed_status") == persisted.get("status")
+    )
+    return (
+        job_id,
+        str(
+            receipt.get("observed_status")
+            if verified
+            else job.get("status") or persisted.get("status") or "unknown"
+        ),
+        verified,
+    )
 
 
 def apply_orientation_answer(
@@ -290,16 +782,21 @@ def apply_orientation_answer(
     """Apply opening/session answers without performing global routing."""
 
     question_id = str(question.get("id") or "")
-    language = str(state.get("language") or "en")
     if question_id == "resume_harness_session":
         recovery = state.get("checkpoint_recovery") or {}
         if value == "inspect_quarantine":
             safe = recovery.get("safe_confirmed_config") or {}
             return HandlerResult(
-                visible_result=localized(
-                    language,
-                    f"隔离原因：{recovery.get('error_type') or 'unknown'}。可安全识别的确认值：{safe or '<无>'}。请选择保留安全值或清空重新开始。",
-                    f"Quarantine reason: {recovery.get('error_type') or 'unknown'}. Safely identified confirmed values: {safe or '<none>'}. Choose retain-safe or clear-and-restart.",
+                response_fragments=(
+                    ResponseFragment(
+                        kind="warning",
+                        message_id="harness.orientation.quarantine_inspection",
+                        arguments={
+                            "reason": str(recovery.get("error_type") or "unknown"),
+                            "safe_values": str(safe or "<none>"),
+                        },
+                        source=__name__,
+                    ),
                 ),
                 pending_question=question,
                 completion="blocked",
@@ -311,10 +808,12 @@ def apply_orientation_answer(
                     "retain_safe",
                     confirmed_config=dict(recovery.get("safe_confirmed_config") or {}),
                 ),
-                visible_result=localized(
-                    language,
-                    "仅保留了可安全识别的确认值。请说明要继续或修改什么。",
-                    "Retained only safely identified confirmed values. Say what to continue or modify.",
+                response_fragments=(
+                    ResponseFragment(
+                        kind="message",
+                        message_id="harness.orientation.safe_values_retained",
+                        source=__name__,
+                    ),
                 ),
                 clear_pending=True,
                 next_group="opening",
@@ -324,10 +823,12 @@ def apply_orientation_answer(
         if value == "reset":
             return HandlerResult(
                 checkpoint_command=CheckpointCommand("reset"),
-                visible_result=localized(
-                    language,
-                    "已清空之前的 Agent 配置。启动环境推断和历史 job 已保留。请告诉我这次要测试什么。",
-                    "Cleared the previous Agent configuration. Startup discovery and job history were preserved. Tell me what to test.",
+                response_fragments=(
+                    ResponseFragment(
+                        kind="message",
+                        message_id="harness.orientation.session_reset",
+                        source=__name__,
+                    ),
                 ),
                 completion="completed",
                 stop_after_response=True,
@@ -348,17 +849,25 @@ def apply_orientation_answer(
             pending_question=restored_pending or None,
             clear_pending=not restored_pending,
             next_group=str(resume_context.get("active_group") or restored_pending.get("group") or "opening"),
-            visible_result=localized(language, "已继续之前的配置。", "Continuing the previous configuration."),
+            response_fragments=(
+                ResponseFragment(
+                    kind="message",
+                    message_id="harness.orientation.session_resumed",
+                    source=__name__,
+                ),
+            ),
             completion="blocked" if restored_pending else "completed",
             stop_after_response=True,
         )
     if question_id == "accept_recommendation":
         if not value:
             return HandlerResult(
-                visible_result=localized(
-                    language,
-                    "好的，不按推荐。你可以直接说要测哪条链、用哪种模式（fake-node / real-node / sync-observe）。",
-                    "OK, not using the recommendation. Tell me which chain and mode (fake-node / real-node / sync-observe) you want.",
+                response_fragments=(
+                    ResponseFragment(
+                        kind="message",
+                        message_id="harness.orientation.recommendation_declined",
+                        source=__name__,
+                    ),
                 ),
                 clear_pending=True,
                 next_group="opening",
@@ -377,65 +886,66 @@ def apply_orientation_answer(
                     "confidence": "high",
                 },
             ),
-            visible_result=localized(
-                language,
-                f"好的，按推荐进入 `{mode}`。下一步请选择要验证的链，我会逐项确认缺失配置。",
-                f"Starting the recommended `{mode}` path. Next choose the chain to validate; I will confirm the remaining configuration item by item.",
+            response_fragments=(
+                ResponseFragment(
+                    kind="message",
+                    message_id="harness.orientation.recommendation_accepted",
+                    arguments={"mode": mode},
+                    source=__name__,
+                ),
             ),
             clear_pending=True,
             completion="completed",
         )
-    return HandlerResult(blocker=f"unsupported orientation question: {question_id}")
+    return HandlerResult(
+        blocker=FailureDescriptor(
+            code="harness.orientation.failure.unsupported_question",
+            arguments={"question_id": question_id},
+            source=__name__,
+        )
+    )
 
 
 def opening_question(state: AgentGraphState) -> dict[str, Any]:
-    language = str(state.get("language") or "en")
-    zh = language.startswith("zh")
     return choice_question(
         "opening",
         "opening_next_action",
-        localized(language, "你想让我帮你做什么？", "What would you like me to help with?"),
+        question_text("question.orientation.opening.prompt"),
         field="target_mode",
         options=[
             {
-                "label": "启动 fake-node 测试" if zh else "Start a fake-node benchmark",
-                "description": localized(
-                    language,
-                    "使用预录 fixtures 做最快的低风险框架闭环验证；不测量真实节点性能。",
-                    "Fast, low-risk framework validation with recorded fixtures; it does not measure real-node performance.",
+                "label": question_text("question.orientation.opening.fake_node.label"),
+                "description": question_text(
+                    "question.orientation.opening.fake_node.description"
                 ),
                 "value": "fake-node",
                 "action": {"type": "choose_target_mode", "target_mode": "fake-node", "target_mode_explicit": True},
                 "expected_patch": {"target_mode": "fake-node", "workflow_mode": "rpc_benchmark"},
             },
             {
-                "label": "启动 real-node 测试" if zh else "Start a real-node benchmark",
-                "description": localized(
-                    language,
-                    "对可访问的真实节点 RPC endpoint 进行负载测试并分析性能瓶颈。",
-                    "Load-test a reachable real-node RPC endpoint and analyze performance bottlenecks.",
+                "label": question_text("question.orientation.opening.real_node.label"),
+                "description": question_text(
+                    "question.orientation.opening.real_node.description"
                 ),
                 "value": "real-node",
                 "action": {"type": "choose_target_mode", "target_mode": "real-node", "target_mode_explicit": True},
                 "expected_patch": {"target_mode": "real-node", "workflow_mode": "rpc_benchmark"},
             },
             {
-                "label": "启动 sync-observe（观察真实节点同步）" if zh else "Start sync-observe (real-node synchronization)",
-                "description": localized(
-                    language,
-                    "观察真实节点追块、资源与可用 MGas/s 指标；不运行 Vegeta 压测。",
-                    "Observe real-node synchronization, resources, and available MGas/s metrics without Vegeta load.",
+                "label": question_text(
+                    "question.orientation.opening.sync_observe.label"
+                ),
+                "description": question_text(
+                    "question.orientation.opening.sync_observe.description"
                 ),
                 "value": "sync-observe",
                 "action": {"type": "choose_target_mode", "target_mode": "sync-observe", "target_mode_explicit": True},
                 "expected_patch": {"target_mode": "sync-observe", "workflow_mode": "sync_observe"},
             },
             {
-                "label": "了解支持的链、RPC method 和二次开发方式" if zh else "Learn supported chains, RPC methods, and extension paths",
-                "description": localized(
-                    language,
-                    "只读查看框架能力、默认 workload 与扩展路径，不修改测试配置。",
-                    "Read-only guidance about capabilities, default workloads, and extension paths without changing test configuration.",
+                "label": question_text("question.orientation.opening.info.label"),
+                "description": question_text(
+                    "question.orientation.opening.info.description"
                 ),
                 "value": "info",
                 "action": {"type": "answer_opening_question", "topic": "capabilities"},
@@ -449,25 +959,20 @@ def opening_question(state: AgentGraphState) -> dict[str, Any]:
 def recommendation_question(state: AgentGraphState) -> dict[str, Any]:
     """Create the executable contract for the low-risk validation recommendation."""
 
-    language = str(state.get("language") or "en")
     question = choice_question(
         "opening",
         "accept_recommendation",
-        localized(
-            language,
-            "是否先进入 fake-node smoke，再选择要验证的链？",
-            "Start with fake-node smoke, then choose the chain to validate?",
-        ),
+        question_text("question.orientation.recommendation.prompt"),
         field="accept_recommendation",
         kind="yes_no",
         options=[
             {
-                "label": "Y",
+                "label": question_text("question.control.option.yes"),
                 "value": True,
                 "expected_patch": {"active_group": "opening"},
             },
             {
-                "label": "N",
+                "label": question_text("question.control.option.no"),
                 "value": False,
                 "expected_patch": {"active_group": "opening"},
             },
@@ -478,455 +983,12 @@ def recommendation_question(state: AgentGraphState) -> dict[str, Any]:
     return question
 
 
-def resume_summary(state: AgentGraphState) -> str:
-    identity = state.get("chain_identity") or {}
-    confirmed = state.get("confirmed_config") or {}
-    qps = state.get("qps_profile") or {}
-    observability = state.get("observability") or {}
-    language = str(state.get("language") or "en")
-    return "\n".join(
-        (
-            f"- target_mode: {state.get('target_mode') or '<not selected>'}",
-            f"- workflow_mode: {state.get('workflow_mode') or '<not selected>'}",
-            f"- chain: {identity.get('canonical') or identity.get('raw') or '<not selected>'}",
-            f"- rpc_mode: {state.get('rpc_mode') or '<not selected>'}",
-            f"- qps: {qps.get('mode') or '<not selected>'}",
-            f"- observability: {observability.get('mode') or '<not selected>'}",
-            f"- confirmed fields: {', '.join(sorted(confirmed)) if confirmed else '<none>'}",
-            f"- deferred requests: {queued_configuration_summary(state, language)}",
-        )
-    )
-
-
-def answer_consultation(state: AgentGraphState, action: dict[str, Any]) -> str:
-    language = str(state.get("language") or "en")
-    topic = canonical_consultation_topic(action.get("topic"))
-    subject = str(action.get("subject") or "").strip()
-
-    if topic == "identity":
-        return localized(
-            language,
-            "我是 AnyChain Benchmark Agent，运行在当前 AnyChain Benchmark 工程中，负责区块链节点测试的配置、校验、执行和报告分析。你可以直接提出测试目标、询问当前状态，或粘贴配置、日志和报告。",
-            "I am AnyChain Benchmark Agent, running in the current AnyChain Benchmark project. I configure, validate, execute, and analyze blockchain-node benchmarks and reports. State a goal, ask about current state, or paste configuration, logs, or reports.",
-        )
-    if topic in {"capabilities", "agent_capability"}:
-        return _capabilities(state)
-    if topic == "supported_chains":
-        return _supported_chains(state, subject)
-    if topic == "extension":
-        current_chain = str((state.get("chain_identity") or {}).get("canonical") or "")
-        chain = canonicalize_chain_scalar(subject or current_chain, known_chains=set(repo_chain_names())) or ""
-        defaults = ""
-        if chain:
-            defaults = ", ".join(default_workload(chain).get("methods") or []) or "<none>"
-        return localized(
-            language,
-            (
-                "扩展分三类：已支持链的自定义 RPC、现有协议族的新链，以及未支持协议族的二次开发。\n"
-                f"已支持链 `{chain}` 的自定义 RPC 流程：提供用于真实验证的 endpoint，再提供 method 名、params/request、response 或官方文档。"
-                f"我会抽取并校验 schema，让你确认是保留、追加还是替换默认 methods，然后确认 single/mixed 和总和为 100 的权重。"
-                f"模板默认 methods: {defaults or '<select a supported chain>'}。运行时配置不会修改 `config/chains` 默认模板。"
-            ),
-            (
-                "There are three extension cases: custom RPC for a supported chain, a new chain in an existing adapter family, and secondary development for an unsupported family. "
-                f"Custom RPC flow for supported chain `{chain}`: provide the endpoint selected for real validation, then the method name, params/request, response, or official documentation. "
-                f"I extract and validate the schema, confirm whether defaults are retained, augmented, or replaced, then confirm single/mixed mode and weights totaling 100. "
-                f"Template defaults: {defaults or '<select a supported chain>'}. Runtime configuration never mutates `config/chains` defaults."
-            ),
-        )
-    if topic == "config_explanation":
-        explanation = config_field_explanation(state, subject)
-        if explanation:
-            return _with_active_failure_context(state, explanation)
-        pending = state.get("pending_question") or {}
-        if pending and subject in {
-            str(pending.get("id") or ""),
-            str(pending.get("field") or ""),
-        }:
-            return _with_active_failure_context(
-                state,
-                pending_context_response(state, pending),
-            )
-        if subject:
-            return _with_active_failure_context(
-                state,
-                pending_context_response(state, {"id": subject}),
-            )
-        if state.get("pending_question"):
-            return _with_active_failure_context(
-                state,
-                pending_context_response(state, state.get("pending_question") or {}),
-            )
-    if topic == "current_config":
-        return _with_active_failure_context(state, format_current_state(state, language))
-    if topic == "workload_config":
-        return _workload_config(state, language)
-    if topic in {"current_context", "next_action"}:
-        return _with_active_failure_context(state, format_current_context(state, language))
-    if topic in {"startup_discovery", "environment_inference"}:
-        return format_startup_discovery(state, language)
-    if topic == "environment_readiness":
-        discovery = state.get("discovery") or {}
-        host = discovery.get("host") or {}
-        dependencies = discovery.get("dependencies") or {}
-        machine = (
-            (discovery.get("cloud") or {}).get("machine_type")
-            or host.get("machine_type")
-            or host.get("hostname")
-            or "<unknown>"
-        )
-        status = "ready" if not dependencies.get("missing_required") else "blocked"
-        return localized(
-            language,
-            f"环境就绪状态：{status}。检测到的机器/host：{machine}。\n" + format_startup_discovery(state, language),
-            f"Environment readiness: {status}. Detected machine/host: {machine}.\n" + format_startup_discovery(state, language),
-        )
-    if topic in {"requirements", "workflow"}:
-        return _requirements(state, language)
-    if topic in {"mode_comparison", "performance_benchmark_guidance"}:
-        return _mode_comparison(language, performance_goal=topic == "performance_benchmark_guidance")
-    if topic == "execution_preflight_smoke":
-        return localized(
-            language,
-            "preflight（预检）在执行前校验依赖、配置、endpoint 和运行前置条件；smoke（冒烟测试）以安全的小流量执行完整链路，验证请求、日志、产物和报告能够闭环。smoke 不是正式性能结论。",
-            "Preflight validates dependencies, configuration, endpoints, and execution prerequisites. Smoke runs the complete path at safe low traffic to verify requests, logs, artifacts, and reports. Smoke is not a production performance conclusion.",
-        )
-    if topic == "recommendation":
-        return localized(
-            language,
-            "如果只想快速确认 Agent 和工具链能否闭环，建议先用 fake-node smoke；它不需要真实节点，但不代表真实节点性能。可以从 `solana` 开始，也可以直接说出目标链。",
-            "For a quick end-to-end Agent/toolchain check, start with fake-node smoke. It needs no real node but does not represent real-node performance. Start with `solana`, or name the target chain.",
-        )
-    if topic in {"reset_help", "reset"}:
-        return localized(
-            language,
-            "可以完全清空当前配置并完全重新开始，也可以保留已确认值并修改任意配置组。重置不会删除启动环境推断和历史 job。请直接说明“清空配置”或要修改的项目。",
-            "You can clear the current workflow and start over, or keep confirmed values and modify any configuration group. Reset preserves startup discovery and job history. Say `clear configuration` or name the item to change.",
-        )
-    if topic in {"evidence_help", "log_help"}:
-        return localized(
-            language,
-            "可以。粘贴日志、错误栈或命令输出；多行内容会作为一个证据块接收。也可以指定 job id，让我读取已有日志和产物后分析。",
-            "Yes. Paste logs, a stack trace, or command output; multiline input is collected as one evidence block. You may also name a job id so I can read its existing logs and artifacts.",
-        )
-    if topic in {"correction", "clarification"}:
-        failure_context = _active_failure_context(state)
-        if failure_context:
-            return failure_context
-        return localized(
-            language,
-            "我理解，刚才的回答没有解决你的问题。请继续原问题；我会结合当前状态回答，不会把它当作配置确认或推进流程。",
-            "I understand: my previous answer did not resolve your question. Continue with the original question; I will answer from current state without treating it as configuration confirmation or advancing the workflow.",
-        )
-    if topic in {"current_job", "job_status", "execution_status"}:
-        return _job_status(state, language)
-    return localized(
-        language,
-        "我可以解释产品能力、测试模式、配置要求、当前状态、历史 job、错误日志和报告，也可以继续当前配置流程。请直接说明问题。",
-        "I can explain product capabilities, test modes, requirements, current state, historical jobs, errors, and reports, or continue the current setup. Ask the question directly.",
-    )
-
-
-def _workload_config(state: AgentGraphState, language: str) -> str:
-    identity = state.get("chain_identity") or {}
-    chain = str(identity.get("canonical") or identity.get("raw") or "").strip()
-    rpc_mode = str(state.get("rpc_mode") or "").strip()
-    effective = state.get("workload") or {}
-    if effective.get("confirmed") and effective.get("methods"):
-        methods = ", ".join(str(item) for item in effective.get("methods") or [])
-        weights = effective.get("weights") if isinstance(effective.get("weights"), dict) else {}
-        weight_text = ", ".join(f"{method}={weight}" for method, weight in weights.items()) or "<not applicable>"
-        return localized(
-            language,
-            f"当前有效 RPC workload：链 `{chain or '<未选择>'}`，模式 `{rpc_mode or '<未选择>'}`，methods：{methods}，mixed 权重：{weight_text}。",
-            f"Effective RPC workload: chain `{chain or '<not selected>'}`, mode `{rpc_mode or '<not selected>'}`, methods: {methods}, mixed weights: {weight_text}.",
-        )
-    defaults = default_workload(chain) if chain else {}
-    single = str(defaults.get("single") or "<none>")
-    mixed = ", ".join(
-        f"{item.get('method')}={item.get('weight')}"
-        for item in defaults.get("mixed_weighted") or []
-        if isinstance(item, dict) and item.get("method")
-    ) or "<none>"
-    return localized(
-        language,
-        f"链 `{chain or '<未选择>'}` 的模板 workload：single 默认 method 为 `{single}`；mixed 默认权重为 {mixed}。这些值尚未确认，不会修改原始 chain template。",
-        f"Template workload for `{chain or '<not selected>'}`: default single method `{single}`; default mixed weights: {mixed}. These values are not confirmed yet and do not modify the original chain template.",
-    )
-
-
-def _active_failure_context(state: AgentGraphState) -> str:
+def _active_failure_record(state: AgentGraphState) -> dict[str, Any]:
     recovery = state.get("failure_recovery") or {}
     record = recovery.get("record") if unresolved_recovery(recovery) else None
     if not isinstance(record, dict):
         endpoint_record = (state.get("endpoint_evidence") or {}).get("last_failure_record")
         record = endpoint_record if isinstance(endpoint_record, dict) else None
     if not record:
-        return ""
-    language = str(state.get("language") or "en")
-    pending = state.get("pending_question") or {}
-    field = str(pending.get("field") or pending.get("id") or "").strip()
-    if field:
-        correction = localized(
-            language,
-            f"- 当前应修正：在 `{record.get('affected_group') or '<unknown>'}` 组重新提供 `{field}`；其他已确认配置保持不变。",
-            f"- Correct now: provide `{field}` again in `{record.get('affected_group') or '<unknown>'}`; other confirmed configuration remains unchanged.",
-        )
-        return f"{render_failure_summary(record, language)}\n{correction}"
-    return render_failure_summary(record, language)
-
-
-def _with_active_failure_context(state: AgentGraphState, response: str) -> str:
-    context = _active_failure_context(state)
-    return f"{response}\n{context}" if context else response
-
-
-def pending_context_response(state: AgentGraphState, question: dict[str, Any]) -> str:
-    """Explain the active question without advancing workflow state."""
-
-    language = str(state.get("language") or "en")
-    question_id = str(question.get("id") or "").strip()
-    help_text = str(question.get("help_text") or "").strip()
-    completion_effect = str(question.get("completion_effect") or "").strip()
-    if help_text:
-        if completion_effect:
-            return f"{help_text}\n{completion_effect}"
-        return help_text
-    if question_id in {"LOCAL_RPC_URL", "SYNC_OBSERVE_RPC_URL"}:
-        explanation = config_field_explanation(state, question_id, language)
-        if explanation:
-            return explanation
-    if question_id == "new_chain_endpoint":
-        return localized(
-            language,
-            "这里是在验证未内置的新链能否使用现有协议族。请提供可访问的 HTTP RPC endpoint、至少一个 RPC method 及参数/响应示例；官方文档也可以作为证据。该 endpoint 只作为验证证据，不会自动成为最终被测 endpoint。",
-            "This validates whether a non-template chain can use an existing adapter family. Provide a reachable HTTP RPC endpoint, at least one RPC method with params/response samples, and official docs when available. The validation endpoint does not automatically become the final benchmark endpoint.",
-        )
-    if question_id == "custom_rpc_endpoint":
-        return localized(
-            language,
-            "这里是在验证自定义 RPC method。请提供可访问的验证 endpoint，以及 method、params、response 示例或官方文档；mixed workload 的启用 method 权重最终必须合计 100。验证 endpoint 不会覆盖最终 `LOCAL_RPC_URL`，也不会修改原始 chain template。",
-            "This validates a custom RPC method. Provide a reachable validation endpoint plus method, params, response samples, or official docs; enabled mixed-workload weights must ultimately total 100. The validation endpoint does not replace the final `LOCAL_RPC_URL` or modify the original chain template.",
-        )
-    if question_id == "custom_rpc_fixture_choice":
-        workload = state.get("workload") or {}
-        methods = ", ".join(str(item) for item in workload.get("methods") or []) or "<unknown>"
-        preserved = ", ".join(sorted((state.get("confirmed_config") or {}).keys())) or "<none>"
-        return localized(
-            language,
-            (
-                f"自定义 workload `{methods}` 的 endpoint 和 schema 已验证，但 fake-node 缺少对应 fixture，因此不能提交 smoke。"
-                "你可以改用链模板默认 workload、保留自定义 workload 并切换到 real-node，或生成 fixture 录制交接。"
-                f"无论选择哪条路径，已确认的硬件、网络和 QPS 配置都会保留：{preserved}。"
-            ),
-            (
-                f"The endpoint and schema for custom workload `{methods}` are validated, but fake-node lacks the required fixture, so smoke cannot be submitted. "
-                "You can use the chain-template defaults, preserve the custom workload and switch to real-node, or generate a fixture-recording handoff. "
-                f"Confirmed hardware, network, and QPS configuration is preserved across these choices: {preserved}."
-            ),
-        )
-    return format_current_context(state, language)
-
-
-def capability_summary(state: AgentGraphState) -> str:
-    return _capabilities(state)
-
-
-def completed_group_status(state: AgentGraphState, group: str) -> str:
-    """Explain an already-complete group without changing workflow state."""
-
-    language = state.get("language", "en")
-    if group == "observability":
-        mode = str((state.get("observability") or {}).get("mode") or "").strip()
-        if mode:
-            return localized(
-                language,
-                f"当前可观测性模式已设置为 `{mode}`。如需修改，请选择本地 Prometheus/Grafana、exporter-only 或 disabled。",
-                f"Observability is set to `{mode}`. To change it, choose local Prometheus/Grafana, exporter-only, or disabled.",
-            )
-    if group == "qps_profile":
-        qps = state.get("qps_profile") or {}
-        if qps.get("mode") and qps.get("confirmed"):
-            overrides = qps.get("overrides") or {}
-            detail = ", ".join(f"{key}={value}" for key, value in sorted(overrides.items())) or "default profile"
-            return localized(
-                language,
-                f"当前 QPS profile 为 `{qps.get('mode')}`，配置：{detail}。可修改 INITIAL_QPS、MAX_QPS、QPS_STEP 或 DURATION。",
-                f"The current QPS profile is `{qps.get('mode')}` with {detail}. You can change INITIAL_QPS, MAX_QPS, QPS_STEP, or DURATION.",
-            )
-    if group == "workload_rpc":
-        workload = state.get("workload") or {}
-        if state.get("rpc_mode") and workload.get("confirmed"):
-            return localized(
-                language,
-                f"当前 RPC workload 已确认：mode=`{state.get('rpc_mode')}`。可切换 single/mixed、添加自定义 RPC method 或调整 mixed 权重。",
-                f"The RPC workload is confirmed with mode=`{state.get('rpc_mode')}`. You can switch single/mixed, add a custom RPC method, or adjust mixed weights.",
-            )
-    return ""
-
-
-def config_field_explanation(state: AgentGraphState, subject: str, language: str = "") -> str:
-    language = str(language or state.get("language") or "en")
-    identifier = subject or str((state.get("pending_question") or {}).get("field") or "")
-
-    def normalize(value: str) -> str:
-        return value.strip().lower().replace("_", "").replace("-", "").replace(" ", "").rstrip("s")
-
-    wanted = normalize(identifier)
-    if not wanted:
-        return ""
-    field = next(
-        (
-            candidate
-            for candidate in ALL_RUNTIME_FIELDS
-            if wanted in {normalize(candidate.env), normalize(candidate.key), normalize(candidate.label)}
-        ),
-        None,
-    )
-    if field is None:
-        return ""
-    display_id = field.env or field.key
-    modes = ", ".join(mode.replace("_", "-") for mode in field.applies_to)
-    return localized(
-        language,
-        f"`{display_id}`（{field.label}）\n作用：{field.description or field.reason}\n属性：{'必填' if field.required else '可选'}；适用模式：{modes}。\n如果启动检测给出候选值，可以确认该值；否则需要手动输入。",
-        f"`{display_id}` ({field.label})\nPurpose: {field.description or field.reason}\nIt is {'required' if field.required else 'optional'} and applies to: {modes}.\nAccept a detected candidate when available; otherwise enter it manually.",
-    )
-
-
-def _capabilities(state: AgentGraphState) -> str:
-    language = str(state.get("language") or "en")
-    facts = state.get("framework_summary") or {}
-    prefix = localized(
-        language,
-        "我是 AnyChain Benchmark Agent。我支持 fake-node 闭环验证、real-node RPC 压测、sync-observe 同步观察、自定义 RPC、新链协议适配、preflight/smoke、job 跟踪，以及日志和报告分析。",
-        "I am AnyChain Benchmark Agent. I support fake-node closed-loop validation, real-node RPC load tests, sync-observe, custom RPC methods, new-chain onboarding, preflight/smoke, job tracking, and log/report analysis.",
-    )
-    return (
-        f"{prefix}\n"
-        f"{localized(language, '当前框架事实', 'Current framework facts')}: "
-        f"{facts.get('chain_count', '?')} chains, {facts.get('family_count', '?')} adapter families, "
-        f"{facts.get('unique_rpc_method_count', '?')} RPC methods."
-    )
-
-
-def _supported_chains(state: AgentGraphState, subject: str) -> str:
-    language = str(state.get("language") or "en")
-    facts = state.get("framework_summary") or {}
-    chains = []
-    for item in facts.get("chains") or []:
-        value = str(item.get("chain") if isinstance(item, dict) else item).strip()
-        if value:
-            chains.append(value)
-    if subject:
-        chain = canonicalize_chain_scalar(subject, known_chains=set(repo_chain_names())) or ""
-        if chain:
-            workload = default_workload(chain)
-            if workload.get("exists"):
-                single = str(workload.get("single") or "<none>")
-                mixed = ", ".join(
-                    f"{row.get('method')}={row.get('weight')}"
-                    for row in workload.get("mixed_weighted") or []
-                    if row.get("method")
-                ) or "<none>"
-                methods = ", ".join(workload.get("methods") or []) or "<none>"
-                return localized(
-                    language,
-                    f"链 `{chain}` 的默认 RPC workload：\n- single: {single}\n- mixed: {mixed}\n- methods: {methods}",
-                    f"Default RPC workload for `{chain}`:\n- single: {single}\n- mixed: {mixed}\n- methods: {methods}",
-                )
-        resolution = research_chain_identity(state, subject)
-        canonical_name = str(resolution.get("canonical_chain_name") or subject).strip()
-        family = str(resolution.get("adapter_family") or "unknown").strip()
-        protocol = str(resolution.get("protocol_or_api") or "").strip()
-        search_result = resolution.get("search_result")
-        grounded = isinstance(search_result, dict) and search_result.get("available") is True
-        if resolution.get("chain_exists") is True:
-            source = localized(
-                language,
-                "google_search 官方资料核实" if grounded else "当前模型知识判断（未进行互联网核实）",
-                "official google_search grounding" if grounded else "current model knowledge (not web-grounded)",
-            )
-            return localized(
-                language,
-                f"`{canonical_name}` 不在当前已配置链模板中。{source}：协议/API 为 `{protocol or '<unknown>'}`，协议族判断为 `{family}`。如要测试，需要先由你确认链名和协议，再进入 endpoint/RPC 验证流程。",
-                f"`{canonical_name}` is not a configured chain template. Based on {source}, its protocol/API is `{protocol or '<unknown>'}` and the proposed adapter family is `{family}`. To test it, confirm the chain identity and protocol before endpoint/RPC validation.",
-            )
-        return localized(
-            language,
-            f"`{subject}` 不在当前已配置链模板中，当前模型也无法可靠确认它的链身份或协议。若要继续，请确认它是真实链并提供官方协议/RPC 资料；之后会进入 Case 2 或 Case 3。",
-            f"`{subject}` is not a configured chain template, and the current model could not reliably confirm its identity or protocol. To continue, confirm that it is a real chain and provide official protocol/RPC evidence; the flow will then enter Case 2 or Case 3.",
-        )
-    return localized(language, "已配置链：", "Configured chains: ") + ", ".join(chains)
-
-
-def _requirements(state: AgentGraphState, language: str) -> str:
-    requirements = localized(
-        language,
-        "测试前会逐组确认：1. 测试类型和链；2. 云和机器（`CLOUD_REGION`、`CLOUD_ZONE`、`MACHINE_TYPE`）；3. Ledger/data、可选 accounts/state 磁盘和网络；4. endpoint 和节点进程；5. RPC workload、自定义 method、权重和 fixtures；6. QPS profile；7. 可观测性和高级配置；8. preflight/smoke、job 和报告。用户可以随时跳转或回退，完成后从状态重新计算下一个缺失项。real-node 需要 `LOCAL_RPC_URL`；sync-observe 需要真实节点来源，不配置 RPC workload/QPS，也不走 Vegeta。",
-        "Before testing, the Agent confirms: 1. test type and chain; 2. cloud and machine (`CLOUD_REGION`, `CLOUD_ZONE`, `MACHINE_TYPE`); 3. Ledger/data disk, optional accounts/state disk, and network; 4. endpoint and node process; 5. RPC workload, custom methods, weights, and fixtures; 6. QPS profile; 7. observability and advanced settings; 8. preflight/smoke, jobs, and reports. Users may jump or go back at any time; the next missing group is recomputed from state. real-node requires `LOCAL_RPC_URL`; sync-observe requires a real-node source and does not configure RPC workload/QPS or run Vegeta.",
-    )
-    if not state.get("target_mode"):
-        requirements += localized(
-            language,
-            "\n如果目标只是低成本确认整个工具链能否闭环，先选择 fake-node smoke；它不需要真实 endpoint，但不能代表真实节点性能。",
-            "\nFor the lowest-cost end-to-end toolchain check, start with fake-node smoke. It needs no real endpoint but does not represent real-node performance.",
-        )
-    return requirements
-
-
-def _mode_comparison(language: str, *, performance_goal: bool = False) -> str:
-    comparison = localized(
-        language,
-        "fake-node 的作用是使用 fixtures 验证框架闭环，不代表真实节点性能，也不能回答真实节点支持多少 QPS；real-node benchmark 使用 `LOCAL_RPC_URL` 对真实 endpoint 执行 RPC 压测，用于 QPS、延迟和瓶颈分析；sync-observe 观察真实节点追块、进程 CPU/内存、磁盘、网络及客户端可用的 MGas/s，不走 Vegeta。",
-        "fake-node only validates the framework loop with fixtures; it does not represent real-node performance or answer real-node QPS capacity. real-node benchmark uses `LOCAL_RPC_URL` to load a real endpoint for QPS, latency, and bottleneck analysis. sync-observe watches real-node catch-up, process CPU/memory, disk, network, and client-native MGas/s when available, without Vegeta.",
-    )
-    if performance_goal:
-        return comparison + localized(
-            language,
-            "\n因此，如果目标是测试可支持的 QPS 和瓶颈，应选择 real-node benchmark。",
-            "\nTherefore, choose real-node benchmark when the goal is QPS capacity and bottleneck discovery.",
-        )
-    return comparison
-
-
-def _job_status(state: AgentGraphState, language: str) -> str:
-    job = state.get("job") or {}
-    job_id = str(job.get("job_id") or "").strip()
-    if not job_id:
-        try:
-            jobs = list_jobs(limit=1)
-            job = dict(jobs[0]) if jobs else {}
-            job_id = str(job.get("job_id") or "").strip()
-        except Exception:
-            job = {}
-    if not job_id:
-        return localized(language, "当前没有历史 job。", "No historical job is available.")
-    try:
-        persisted = get_job(job_id)
-    except (FileNotFoundError, OSError, ValueError):
-        persisted = {}
-    receipts = persisted.get("execution_receipts") or {}
-    read_receipt = (
-        dict(receipts.get("last_read") or {})
-        if isinstance(receipts, dict)
-        else {}
-    )
-    if (
-        verify_job_receipt(read_receipt)
-        and read_receipt.get("job_id") == job_id
-        and read_receipt.get("observed_status") == persisted.get("status")
-    ):
-        status = str(read_receipt.get("observed_status") or "unknown")
-        return localized(
-            language,
-            f"当前 job：`{job_id}`，状态：`{status}`。",
-            f"Current job: `{job_id}`, status: `{status}`.",
-        )
-    else:
-        last_known = str(job.get("status") or "unknown")
-        return localized(
-            language,
-            f"当前无法验证 job `{job_id}` 的实时状态；checkpoint 中最后记录为 `{last_known}`。请检查 job 产物是否仍可访问。",
-            f"The live status of job `{job_id}` cannot be verified; the checkpoint's last-known status is `{last_known}`. Check whether the job artifacts are still accessible.",
-        )
+        return {}
+    return dict(record)

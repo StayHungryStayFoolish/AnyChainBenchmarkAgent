@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import os
 import tempfile
@@ -84,6 +85,16 @@ RETAINED_REGRESSION_OPEN_COUNT = 45
 DEFAULT_PROVIDER = "deepseek"
 DEFAULT_MODEL = "deepseek-chat"
 
+
+def _is_sha256(value: Any) -> bool:
+    text = str(value or "")
+    return (
+        len(text) == 64
+        and text == text.lower()
+        and all(character in "0123456789abcdef" for character in text)
+    )
+
+
 _AUDITABLE_ACTOR_ATTESTATION_POLICY = {
     "required": True,
     "identity_strength": "auditable_declaration_only",
@@ -114,6 +125,7 @@ _RULE_CLASSES: Mapping[str, tuple[str, ...]] = {
         "current_menu_binding_preserved",
         "consultation_preserved_pending_work",
         "unresolved_units_preserved",
+        "declined_mode_change_resumes_chain_pending",
     ),
     "pending_advanced": (
         "detected_size_confirmed",
@@ -124,6 +136,7 @@ _RULE_CLASSES: Mapping[str, tuple[str, ...]] = {
     ),
     "action_provenance": (
         "visible_option_action_executed",
+        "mode_change_request_routed_from_chain_pending",
         "unknown_chain_identity_resolution_started",
         "chain_mode_change_confirmed",
         "new_chain_request_routed",
@@ -170,6 +183,7 @@ _RULE_CLASSES: Mapping[str, tuple[str, ...]] = {
         "sync_observe_ran_rpc_load",
         "ambiguous_change_silently_committed",
         "semantic_unit_dropped",
+        "mode_request_consumed_as_chain_identity",
     ),
 }
 
@@ -903,6 +917,10 @@ def build_product_obligation_evidence_artifact(
         statuses.append(status)
         normalized_results.append({
             "verifier_id": verifier_id,
+            "verifier_version": 1,
+            "implementation_hash": (
+                _current_evaluator_implementation_hash(verifier_id)
+            ),
             "status": status,
             "details": details,
             "evidence_sha256s": list(artifact_hashes),
@@ -914,10 +932,18 @@ def build_product_obligation_evidence_artifact(
         if "externally_blocked" in statuses
         else "passed"
     )
+    round_id = "g3-retained-regression"
+    session_id = execution_payload["execution_id"]
+    request_ids = [
+        f"retained-regression:{obligation_id}:{execution_payload['execution_id']}"
+    ]
     identity = {
         "obligation_id": obligation_id,
         "obligation_contract_hash": obligation["contract_hash"],
         "revision_binding": active_revision,
+        "round_id": round_id,
+        "session_id": session_id,
+        "request_ids": request_ids,
         "execution_id": execution_payload["execution_id"],
         "artifact_sha256s": sorted(artifact_hashes),
     }
@@ -927,6 +953,9 @@ def build_product_obligation_evidence_artifact(
         "obligation_id": obligation_id,
         "obligation_contract_hash": obligation["contract_hash"],
         "revision_binding": active_revision,
+        "round_id": round_id,
+        "session_id": session_id,
+        "request_ids": request_ids,
         "outcome": outcome,
         "execution": execution_payload,
         "artifacts": artifacts,
@@ -1707,12 +1736,33 @@ def _build_verifier_rules() -> dict[str, dict[str, Any]]:
             ],
             "natural_language_expected_is_verifier": False,
             "keyword_matching_forbidden": True,
+            "evaluator_implementation_hash": (
+                _current_evaluator_implementation_hash(postcondition_id)
+            ),
         }
         rules[postcondition_id] = {
             **unsigned,
             "rule_hash": content_hash(unsigned),
         }
     return rules
+
+
+def _current_evaluator_implementation_hash(postcondition_id: str) -> str:
+    evaluator = _IMPLEMENTED_POSTCONDITION_EVALUATORS.get(postcondition_id)
+    if evaluator is None:
+        identity: dict[str, Any] = {"status": "not_implemented"}
+    elif inspect.isfunction(evaluator):
+        identity = {
+            "module": evaluator.__module__,
+            "qualname": evaluator.__qualname__,
+            "source": inspect.getsource(evaluator),
+        }
+    else:
+        identity = {
+            "status": "invalid_evaluator_object",
+            "type": type(evaluator).__qualname__,
+        }
+    return content_hash(identity)
 
 
 def _validate_verifier_rules(
@@ -1750,6 +1800,9 @@ def _validate_verifier_rules(
             or rule.get("required_artifact_roles") != list(REQUIRED_ARTIFACT_ROLES)
             or rule.get("natural_language_expected_is_verifier") is not False
             or rule.get("keyword_matching_forbidden") is not True
+            or not _is_sha256(rule.get("evaluator_implementation_hash"))
+            or rule.get("evaluator_implementation_hash")
+            != _current_evaluator_implementation_hash(postcondition_id)
             or not isinstance(assertions, Sequence)
             or isinstance(assertions, (str, bytes))
             or not assertions

@@ -27,6 +27,32 @@ Verify that `./bin/anychain-agent` behaves like a product Agent:
 - uses Gemini-only ADK `google_search` only for unknown-chain/protocol,
   custom-RPC schema, and sync-observe client-setup evidence.
 
+The workflow metadata authority is
+`agent/workflows/group_registry.py::GROUPS`: 20 `GroupSpec` entries, each with
+exactly one of eight domain owners. The graph has an additional `coordinator`
+control owner for typed pending-answer and graph-control actions; it owns no
+group.
+
+The current semantic graph is split into observable checkpoint transitions:
+
+```text
+prepare -> adjudicate
+  -> partition
+  -> compile_owner (one scheduled owner per transition; repeat as required)
+  -> review_plan (independent whole-plan semantic admission)
+  -> admit (deterministic action validation)
+  -> select_action -> owner -> commit_action
+  -> side-effect intent/invoke/receipt when required
+  -> fallback -> compose -> validate
+```
+
+Only exact declared options, including declared numbered and Y/N choices, exact
+terminal commands, evidence-transport framing, and empty input use the local
+deterministic path. A manual typed value, natural-language alternative,
+multi-intent turn, or structured block requiring semantic ownership must pass
+through the split semantic path before deterministic pending/domain
+validation.
+
 ## Required Reading
 
 Read these files before testing or changing code:
@@ -98,10 +124,29 @@ explain what it will install and verify it requests approval before invoking
 Run before any fix and again after any fix:
 
 ```bash
-python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract tests.test_agent_langgraph_harness
+python3 -m unittest \
+  tests.test_agent_product_terminal \
+  tests.test_agent_runtime_contract \
+  tests.test_agent_langgraph_harness \
+  tests.test_agent_harness_architecture \
+  tests.test_agent_response_authority
 python3 tools/check_agent_boundaries.py --root .
 git diff --check
 ```
+
+Run these commands inside the Linux `bench` service. Checkpoint schema version
+18 is the current contract. Migration coverage must prove the version-16
+pending-owner/Chain-RPC context boundary, the version-17
+`semantic_planning` boundary, and the version-18 response-authority boundary,
+including safe removal of historical in-flight planning and response scratch.
+
+Passing domain behavior through a test adapter that directly constructs
+`review_plan` state does not prove the graph split. Split-stage evidence must
+execute real `partition`, every scheduled `compile_owner`, `review_plan`, and
+`admit` transitions. It must verify checkpoint recovery before and after each
+stage, owner cursor/document consistency, multi-owner semantic order, planner
+failure behavior, and that a completed owner is not invoked again after
+resume.
 
 Then run the LangGraph CLI matrix with the configured model. It drives the same
 `./bin/anychain-agent` entrypoint users run, isolates terminal/checkpoint state
@@ -114,6 +159,13 @@ python3 tests/agent_live/run_langgraph_cli_matrix.py
 Use `provider=gemini` only when Gemini credentials are configured. Use another
 repository-supported provider for non-search live validation, but do not claim
 Google Search coverage unless Gemini ADK `google_search` is actually available.
+
+`tests/agent_live/run_product_acceptance.py` is the sole Phase 8
+evidence-admission controller. It generates revision-bound catalogs and admits
+evidence created by subordinate retained-regression, real-CLI, dynamic Chaos,
+and real-execution providers; it does not run those conversations or jobs
+itself. Phase 8 is implemented, but G3-G6 remain open until all required
+provider evidence and product-review evidence are admitted.
 
 ## Dual-AI Chaos Verification
 
@@ -217,7 +269,8 @@ If a failure appears in this session, classify it before changing code:
   rendering, dependency prompt;
 - Harness state problem: group completion, fallback order, interruption stack,
   invalidation, resume;
-- intent problem: LLM action extraction or unsupported ambiguity handling;
+- semantic-planning problem: LLM partition/compilation or unsupported ambiguity
+  handling;
 - validator/tool problem: endpoint probe, custom RPC schema, fixture, QPS,
   observability, preflight/smoke;
 - documentation drift.
@@ -580,7 +633,9 @@ Expected:
 If a scenario fails twice, inspect the redacted logs and fix the smallest
 responsible code path:
 
-- ambiguous-intent resolver issue: `agent/harness/intent.py`;
+- semantic planning issue: `agent/harness/hierarchical_planner.py`;
+- semantic document/admission issue:
+  `agent/harness/semantic_admission.py`;
 - deterministic guard or tool issue: `agent/validators/` or
   `agent/tools/executor.py`;
 - terminal UX issue: `agent/terminal/`;
@@ -589,9 +644,10 @@ responsible code path:
 - documentation drift: update the relevant README or docs page.
 
 Do not fix business behavior by adding keyword lists, fuzzy matching, or regex
-intent routing in terminal code. Ambiguous intent understanding must remain
-model-driven through the LangGraph Harness intent resolver, with deterministic
-group workflows used as validation and execution gates.
+intent routing in terminal code. Ambiguous semantic understanding must remain
+model-driven through the LangGraph hierarchical planner and whole-plan
+admission boundary, with deterministic group workflows used as validation and
+execution gates.
 
 ## Evidence To Return
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import ast
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -20,6 +21,66 @@ class ActionContractAuthorityTest(unittest.TestCase):
             "def _match_option(",
         ):
             self.assertNotIn(forbidden, source)
+        self.assertNotIn('"inferred_config_review"', source)
+
+    def test_coordinator_preplanner_only_admits_declared_exact_choices(self) -> None:
+        from agent.harness.coordinator import adjudicate_turn_step
+        from agent.harness.state import new_state
+
+        state = new_state("exact-choice-only", language="en")
+        state["pending_question"] = {
+            "contract_version": 2,
+            "id": "mode",
+            "group": "target_mode",
+            "owner": "chain_rpc",
+            "kind": "numbered_choice",
+            "prompt": "Choose.",
+            "options": [
+                {
+                    "id": "1",
+                    "label": "fake-node",
+                    "value": "fake-node",
+                    "action": {"type": "choose_target_mode"},
+                },
+            ],
+            "manual_input_allowed": False,
+            "accepted_action_types": ["answer_pending", "choose_target_mode"],
+        }
+        for text, expected_phase in (
+            ("1", "execute"),
+            ("fake-node", "execute"),
+            ("please use fake-node", "plan"),
+            ("2", "plan"),
+        ):
+            with self.subTest(text=text):
+                candidate = dict(state)
+                candidate["turn_context"] = {
+                    "text": text,
+                    "kind": "free_text",
+                    "input_shape": "prose",
+                }
+                candidate["turn_receipt"] = {"clauses": []}
+                result = adjudicate_turn_step(candidate)
+                self.assertEqual(result["control"]["phase"], expected_phase)
+
+    def test_admission_is_atomic_and_cannot_rewrite_action_semantics(self) -> None:
+        import agent.harness.admission as admission
+        import agent.harness.semantic_admission as semantic_admission
+
+        source = inspect.getsource(admission.validate_action_plan)
+        tree = ast.parse(source)
+        forbidden_calls = {"append", "extend", "insert", "pop", "remove"}
+        self.assertFalse(
+            any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in forbidden_calls
+                for node in ast.walk(tree)
+            )
+        )
+        self.assertNotIn('["type"] =', source)
+        self.assertNotIn("['type'] =", source)
+        self.assertFalse(hasattr(semantic_admission, "_apply_state_plan_policy"))
 
     def test_action_schema_is_generated_from_specs(self) -> None:
         from agent.harness.action_registry import ACTION_SPECS
@@ -106,7 +167,7 @@ class ActionContractAuthorityTest(unittest.TestCase):
         )
 
     def test_parser_rejects_invalid_action_instead_of_leaking_arguments(self) -> None:
-        from agent.harness.intent import _parse_action_queue
+        from agent.harness.semantic_admission import _parse_action_queue
 
         parsed = _parse_action_queue(
             '{"actions":[{"type":"set_qps_override","qps_overrides":{"initial":1},"extra":true}]}'
@@ -116,7 +177,7 @@ class ActionContractAuthorityTest(unittest.TestCase):
         self.assertNotIn("extra", parsed["actions"][0])
 
     def test_model_cannot_forge_semantic_admission_receipt(self) -> None:
-        from agent.harness.intent import _parse_action_queue
+        from agent.harness.semantic_admission import _parse_action_queue
 
         parsed = _parse_action_queue(
             '{"actions":[{"type":"choose_target_mode","target_mode":"fake-node",'
@@ -196,13 +257,31 @@ class ActionContractAuthorityTest(unittest.TestCase):
                 "arguments": {"topic": "current_config"},
             })
 
-    def test_prompt_defers_field_requirements_to_action_schema(self) -> None:
-        from agent.harness.context import build_action_resolver_prompt
+    def test_production_prompts_defer_routing_and_fields_to_typed_schemas(
+        self,
+    ) -> None:
+        import agent.harness.context as context
+        from agent.harness.hierarchical_planner import (
+            _stage_a_prompt,
+            _stage_b_prompt,
+        )
 
-        prompt = build_action_resolver_prompt()
-        self.assertIn("Follow action_schema exactly", prompt)
-        self.assertNotIn("Always include source_evidence", prompt)
-        self.assertNotIn("confidence:'low'|'medium'|'high'", prompt)
+        self.assertFalse(hasattr(context, "build_action_resolver_prompt"))
+        stage_a = _stage_a_prompt()
+        stage_b = _stage_b_prompt("performance")
+        self.assertIn(
+            "structured_candidates describe terminal syntax only",
+            stage_a,
+        )
+        self.assertIn("do not classify intent", stage_a)
+        self.assertIn("do not guess, omit, or repair a route", stage_a)
+        self.assertIn("Follow owner_action_schema exactly", stage_b)
+        self.assertIn(
+            "emit source_evidence only when that action declares it",
+            stage_b,
+        )
+        self.assertNotIn("Always include source_evidence", stage_b)
+        self.assertNotIn("confidence:'low'|'medium'|'high'", stage_b)
 
     def test_whole_plan_admission_cannot_reassign_context_ownership(self) -> None:
         from agent.harness.semantic_compiler import whole_plan_admission_prompt
@@ -231,20 +310,6 @@ class ActionContractAuthorityTest(unittest.TestCase):
             PENDING_CANDIDATE_SEMANTIC_POLICY,
         )
 
-    def test_focused_pending_prompt_owns_option_effect_navigation(self) -> None:
-        from agent.harness.intent import _pending_contract_adjudication_prompt
-
-        prompt = _pending_contract_adjudication_prompt()
-
-        self.assertIn("flow named by one declared option", prompt)
-        self.assertIn("Emit answer_pending for its exact value", prompt)
-        self.assertIn("never replace that selection with change_group", prompt)
-        self.assertIn(
-            "top-level keys are exactly actions and semantic_units",
-            prompt,
-        )
-        self.assertIn("never wrap it in action_plan", prompt)
-        self.assertIn("Never place action arguments inside an arguments object", prompt)
 
     def test_r36_turn_local_lifetime_contract_is_preserved(self) -> None:
         from agent.harness.action_registry import action_is_turn_local

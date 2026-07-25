@@ -374,7 +374,7 @@ class BenchmarkPipelineTest(unittest.TestCase):
         from agent.harness.state import new_state
 
         state = new_state("blocked-execution")
-        from agent.harness.contracts import HandlerResult, StateDelta
+        from agent.harness.contracts import FailureDescriptor, HandlerResult, StateDelta
 
         blocked_state = dict(state)
         blocked_state["preflight"] = {"approved": True, "status": "blocked"}
@@ -383,12 +383,24 @@ class BenchmarkPipelineTest(unittest.TestCase):
             return_value=HandlerResult(
                 delta=StateDelta.between(state, blocked_state),
                 completion="blocked",
-                blocker="preflight blocked",
+                blocker=FailureDescriptor(
+                    code="harness.failure.internal_contract_violation",
+                    arguments={"reason": "preflight blocked"},
+                    source=__name__,
+                ),
             ),
         ):
             result = apply_execution_answer(state, True)
         self.assertEqual(result.completion, "blocked")
-        self.assertEqual(result.blocker, "preflight blocked")
+        self.assertIsNotNone(result.blocker)
+        self.assertEqual(
+            result.blocker.code,
+            "harness.failure.internal_contract_violation",
+        )
+        self.assertEqual(
+            result.blocker.arguments,
+            {"reason": "preflight blocked"},
+        )
 
     def test_custom_single_fake_node_routes_to_fixture_gate_when_fixture_is_missing(self) -> None:
         from agent.harness.domains.chain_rpc import question_for_chain_rpc
@@ -404,7 +416,14 @@ class BenchmarkPipelineTest(unittest.TestCase):
             "custom_rpc": {"status": "needs_scope", "method": "eth_accounts"},
         })
         state = deepcopy(state)
-        _set_single_workload(state, "eth_accounts", "custom_rpc")
+        responses = []
+        _set_single_workload(
+            state,
+            "eth_accounts",
+            "custom_rpc",
+            responses=responses,
+        )
+        self.assertEqual(responses, [])
         self.assertEqual(state["fixture_evidence"]["status"], "missing")
         group, _reason = next_group_and_reason(state)
         self.assertEqual(group, "provider_deployment")
@@ -446,7 +465,14 @@ class BenchmarkPipelineTest(unittest.TestCase):
             "custom_rpc": {"status": "needs_scope", "method": "eth_blockNumber"},
         })
         state = deepcopy(state)
-        _set_single_workload(state, "eth_blockNumber", "custom_rpc")
+        responses = []
+        _set_single_workload(
+            state,
+            "eth_blockNumber",
+            "custom_rpc",
+            responses=responses,
+        )
+        self.assertEqual(responses, [])
         self.assertEqual(state["fixture_evidence"]["status"], "validated")
         self.assertEqual(state["active_group"], "workload_rpc")
 
@@ -624,7 +650,8 @@ class BenchmarkPipelineTest(unittest.TestCase):
         never the list `_smoke_message` defaulted to.
         """
 
-        from agent.harness.domains.execution_runtime import _smoke_message
+        from agent.harness.domains.execution_runtime import _job_fragment
+        from agent.harness.response_catalog import render_fragment
 
         smoke = {
             "status": "ok",
@@ -638,7 +665,13 @@ class BenchmarkPipelineTest(unittest.TestCase):
                 },
             },
         }
-        message = _smoke_message(smoke)
+        message = render_fragment(
+            _job_fragment(
+                smoke,
+                message_id="execution.response.fake_node_smoke_submitted",
+            ),
+            "en",
+        ).text
         self.assertIn("status job-123", message)
         self.assertIn("logs job-123", message)
         self.assertNotIn("Use: status; logs; follow; analyze", message)
@@ -777,7 +810,19 @@ class RealNodeExecutionStateMachineTest(unittest.TestCase):
         state = apply_state_delta(state, reconciled.delta, owner="execution")
         question = question_for_execution(state, "job_monitoring")
         self.assertEqual(question["id"], "real_node_final_benchmark_confirm")
-        self.assertIn("preserve the successful smoke evidence", question["options"][1]["completion_effect"])
+        from agent.harness.contracts import text_ref_from_dict
+        from agent.harness.response_catalog import render_text_ref
+
+        self.assertIn(
+            "preserve the successful smoke evidence",
+            render_text_ref(
+                text_ref_from_dict(
+                    question["options"][1]["completion_effect_ref"]
+                ),
+                "en",
+                kind="completion_effect",
+            ),
+        )
 
         final_state = dict(state)
         final_state.update({

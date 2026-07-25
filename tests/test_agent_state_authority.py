@@ -112,7 +112,7 @@ class InvocationContextAuthorityTest(unittest.TestCase):
         ]
         self.assertEqual(len(migration_events), 1)
 
-    def test_v13_checkpoint_materializes_implicit_queue_resume_contract(self) -> None:
+    def test_v13_checkpoint_queue_is_quarantined_after_v3_contract_boundary(self) -> None:
         from agent.harness.state import STATE_SCHEMA_VERSION, migrate_state, new_state
 
         old = new_state("v13-queue-owner", language="en")
@@ -137,31 +137,49 @@ class InvocationContextAuthorityTest(unittest.TestCase):
         )
 
         self.assertEqual(migrated["schema_version"], STATE_SCHEMA_VERSION)
-        self.assertTrue(migrated["pending_question"]["resume_action_queue"])
+        self.assertEqual(migrated["pending_question"], {})
+        self.assertEqual(migrated["action_queue"], [])
+        events = migrated.get("audit_events") or []
+        self.assertTrue(any(
+            event.get("event") == "checkpoint_v13_queue_ownership_migrated"
+            for event in events
+        ))
+        self.assertTrue(any(
+            event.get("event") == "checkpoint_pending_actions_quarantined"
+            and "contract_version 3" in str(event.get("contract_error") or "")
+            for event in events
+        ))
         self.assertEqual(
-            [
-                event.get("event")
-                for event in migrated.get("audit_events") or []
-                if event.get("event") == "checkpoint_v13_queue_ownership_migrated"
-            ],
-            ["checkpoint_v13_queue_ownership_migrated"],
+            migrated["checkpoint_recovery"]["status"],
+            "quarantined",
         )
 
     def test_current_pending_question_id_cannot_retain_queue_without_typed_contract(self) -> None:
         from agent.harness.coordinator import adjudicate_turn_step
+        from agent.harness.questions import choice_question, question_text
         from agent.harness.state import new_state
 
         state = new_state("typed-queue-owner", language="en")
-        state["pending_question"] = {
-            "contract_version": 2,
-            "id": "chain_change_confirm",
-            "group": "chain_identity",
-            "kind": "yes_no",
-            "manual_input_allowed": False,
-            "accepted_action_types": ["answer_pending"],
-            "options": [],
-            "validation": {},
-        }
+        state["pending_question"] = choice_question(
+            "chain_identity",
+            "chain_change_confirm",
+            question_text("question.chain_rpc.chain_change.prompt"),
+            owner="chain_rpc",
+            field="chain_change_confirm",
+            kind="yes_no",
+            options=[
+                {
+                    "id": "yes",
+                    "label": question_text("question.chain_rpc.option.yes"),
+                    "value": True,
+                },
+                {
+                    "id": "no",
+                    "label": question_text("question.chain_rpc.option.no"),
+                    "value": False,
+                },
+            ],
+        )
         state["action_queue"] = [{"action_type": "set_qps_mode"}]
         state["last_user_input"] = "Y"
         state["turn_context"] = {
@@ -558,7 +576,12 @@ class HistoricalAnalysisAuthorityTest(unittest.TestCase):
         historical = {"job_id": "job_historical", "status": "completed"}
         with patch(
             "agent.harness.domains.analysis._report_artifact_entry",
-            return_value=("historical analysis", historical),
+            return_value=(
+                "historical analysis",
+                historical,
+                "report",
+                {},
+            ),
         ):
             result = report_artifact_entry_result(state)
 

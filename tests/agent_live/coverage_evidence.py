@@ -1512,6 +1512,20 @@ def _validate_runtime_event(event: RuntimeTurnEvent) -> None:
             for field_name in ("arguments_hash", "source_hash"):
                 if not _is_sha256(str(action.get(field_name) or "")):
                     raise ValueError("runtime action provenance hash is invalid")
+            value_hashes = action.get("argument_value_hashes")
+            if (
+                not isinstance(value_hashes, Mapping)
+                or set(value_hashes)
+                != set(action.get("argument_names") or ())
+                or any(
+                    not str(key)
+                    or not _is_sha256(str(value))
+                    for key, value in value_hashes.items()
+                )
+            ):
+                raise ValueError(
+                    "runtime action argument-value provenance is invalid"
+                )
         transition = dict(event.pending_transition or {})
         for field_name in ("before_hash", "after_hash"):
             if not _is_sha256(str(transition.get(field_name) or "")):

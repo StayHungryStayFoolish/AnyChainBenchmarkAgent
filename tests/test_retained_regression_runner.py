@@ -254,6 +254,24 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
                 revision=REVISION,
             )
 
+    def test_provider_rejects_rehashed_stale_evaluator_implementation(self) -> None:
+        provider = deepcopy(self.provider)
+        rule = provider["verifier_registry"]["rules"][0]
+        rule["evaluator_implementation_hash"] = "f" * 64
+        unsigned_rule = dict(rule)
+        unsigned_rule.pop("rule_hash")
+        rule["rule_hash"] = content_hash(unsigned_rule)
+        unsigned_provider = dict(provider)
+        unsigned_provider.pop("provider_hash")
+        provider["provider_hash"] = content_hash(unsigned_provider)
+
+        with self.assertRaisesRegex(ValueError, "rule contract is incomplete"):
+            validate_retained_regression_runner_provider(
+                provider,
+                obligations=self.obligations,
+                revision=REVISION,
+            )
+
     def test_exact_adapter_reconstructs_immutable_fixture_from_artifacts(self) -> None:
         obligation = next(
             row for row in self.obligations
@@ -572,8 +590,8 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
             "consumed_action_ids": [],
             "invalidated_groups": [],
             "invalidated_fields": [],
-            "response_fragment_hashes": [],
-            "blocker_hash": "6" * 64,
+            "response_fragments": [],
+            "blocker_semantic_hash": "6" * 64,
         }
         rejected["receipt_id"] = content_hash(rejected)
         rejection_event = replace(

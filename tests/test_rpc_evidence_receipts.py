@@ -116,7 +116,7 @@ class RpcEvidenceReceiptTest(unittest.TestCase):
     def test_coordinator_preserves_valid_blocker_receipt_and_rejects_owner_spoofing(
         self,
     ) -> None:
-        from agent.harness.contracts import HandlerResult
+        from agent.harness.contracts import FailureDescriptor, HandlerResult
         from agent.harness.coordinator import _apply_handler_result
         from agent.harness.domains.rpc_receipts import emit_endpoint_role_receipt
         from agent.harness.invariants import StateInvariantError
@@ -140,7 +140,11 @@ class RpcEvidenceReceiptTest(unittest.TestCase):
             base,
             HandlerResult(
                 control_receipts=(receipt,),
-                blocker="endpoint probe failed",
+                blocker=FailureDescriptor(
+                    code="chain_rpc.failure.endpoint_invalid",
+                    arguments={"field": "custom_rpc_endpoint"},
+                    source=__name__,
+                ),
             ),
             owner="chain_rpc",
         )
@@ -206,7 +210,7 @@ class RpcEvidenceReceiptTest(unittest.TestCase):
             }
         )
 
-        promoted = _promote_case2_endpoint(state)
+        promoted = _promote_case2_endpoint(state, responses=[])
 
         self.assertFalse(promoted)
         self.assertEqual(state["target_mode"], "fake-node")
@@ -237,8 +241,13 @@ class RpcEvidenceReceiptTest(unittest.TestCase):
         ):
             _apply_endpoint_answer(
                 state,
-                "custom_rpc_endpoint",
+                {
+                    "endpoint_role": "validation",
+                    "rpc_case": "custom_rpc",
+                    "config_field": "",
+                },
                 secret_validation_endpoint,
+                responses=[],
             )
 
         validation = _receipts(state, "rpc_endpoint_role")[-1]
@@ -269,7 +278,16 @@ class RpcEvidenceReceiptTest(unittest.TestCase):
                 "evidence_file": "/tmp/bearer-secret/final.json",
             },
         ):
-            _apply_endpoint_answer(state, "LOCAL_RPC_URL", secret_final_endpoint)
+            _apply_endpoint_answer(
+                state,
+                {
+                    "endpoint_role": "final_benchmark",
+                    "rpc_case": "runtime",
+                    "config_field": "LOCAL_RPC_URL",
+                },
+                secret_final_endpoint,
+                responses=[],
+            )
 
         final = _receipts(state, "rpc_endpoint_role")[-1]
         self.assertEqual(final["role"], "final_benchmark")
@@ -357,6 +375,7 @@ class RpcEvidenceReceiptTest(unittest.TestCase):
                     state,
                     case="custom_rpc",
                     evidence=request,
+                    responses=[],
                 )
             )
 
@@ -402,7 +421,12 @@ class RpcEvidenceReceiptTest(unittest.TestCase):
             **_catalog([{"method": "demo_lookup", "params": []}], chain="bsc"),
         }
 
-        _apply_scope(state, "custom_rpc_scope", "single_replace")
+        _apply_scope(
+            state,
+            "custom_rpc_scope",
+            "single_replace",
+            responses=[],
+        )
 
         receipt = _receipts(state, "rpc_workload_commit")[-1]
         self.assertEqual(receipt["owner"], "rpc_workload")

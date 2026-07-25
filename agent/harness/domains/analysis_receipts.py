@@ -9,10 +9,12 @@ from typing import Any, Mapping, Sequence
 
 from agent.utils.redaction import redact
 
+from ..contracts import ResponseFragment
+from ..response_catalog import MESSAGE_CATALOG, render_fragment, render_hash, semantic_hash
 from ..state import AgentGraphState
 
 
-ANALYSIS_RECEIPT_VERSION = 1
+ANALYSIS_RECEIPT_VERSION = 2
 _HASH_FIELDS = frozenset(
     {
         "block_content_hash",
@@ -25,7 +27,16 @@ _HASH_FIELDS = frozenset(
         "requested_job_hash",
         "resolved_job_hash",
         "resolved_status_hash",
-        "visible_result_hash",
+        "response_render_hash",
+        "response_semantic_hash",
+    }
+)
+_RESPONSE_IDENTITY_FIELDS = frozenset(
+    {
+        "response_message_ids",
+        "response_render_hash",
+        "response_rendered",
+        "response_semantic_hash",
     }
 )
 _RECEIPT_FIELDS = {
@@ -45,7 +56,7 @@ _RECEIPT_FIELDS = {
             "input_non_empty_line_count",
             "input_hash",
             "status",
-            "visible_result_hash",
+            *_RESPONSE_IDENTITY_FIELDS,
             "receipt_id",
         }
     ),
@@ -61,7 +72,7 @@ _RECEIPT_FIELDS = {
             "question_hash",
             "analysis_engine",
             "invoked",
-            "visible_result_hash",
+            *_RESPONSE_IDENTITY_FIELDS,
             "receipt_id",
         }
     ),
@@ -78,7 +89,7 @@ _RECEIPT_FIELDS = {
             "evidence_verified",
             "analysis_engine",
             "invoked",
-            "visible_result_hash",
+            *_RESPONSE_IDENTITY_FIELDS,
             "receipt_id",
         }
     ),
@@ -136,7 +147,9 @@ def emit_evidence_block_receipt(
     input_text: str = "",
     input_disposition: str,
     status: str,
-    visible_result: str = "",
+    response_fragments: Sequence[ResponseFragment] = (),
+    language: str = "en",
+    terminal_rendered: bool = False,
     block_id: str = "",
 ) -> None:
     normalized_lines = [str(line) for line in lines if str(line).strip()]
@@ -157,7 +170,11 @@ def emit_evidence_block_receipt(
             ),
             "input_hash": analysis_hash(str(input_text or "")),
             "status": status,
-            "visible_result_hash": analysis_hash(str(visible_result or "")),
+            **_response_identity(
+                response_fragments,
+                language=language,
+                terminal_rendered=terminal_rendered,
+            ),
         },
     )
 
@@ -168,7 +185,9 @@ def emit_analysis_invocation_receipt(
     source_kind: str,
     evidence: str,
     question: str,
-    visible_result: str,
+    response_fragments: Sequence[ResponseFragment],
+    language: str,
+    terminal_rendered: bool,
     invoked: bool,
     block_id: str = "",
 ) -> None:
@@ -183,7 +202,11 @@ def emit_analysis_invocation_receipt(
             "question_hash": analysis_hash(str(question or "")),
             "analysis_engine": "configured_llm",
             "invoked": bool(invoked),
-            "visible_result_hash": analysis_hash(str(visible_result or "")),
+            **_response_identity(
+                response_fragments,
+                language=language,
+                terminal_rendered=terminal_rendered,
+            ),
         },
     )
 
@@ -194,7 +217,9 @@ def emit_report_analysis_receipt(
     requested_job_id: str,
     resolved_job_id: str,
     resolved_status: str,
-    visible_result: str,
+    response_fragments: Sequence[ResponseFragment],
+    language: str,
+    terminal_rendered: bool,
     invoked: bool,
     job_read_receipt_id: str = "",
     evidence_verified: bool = False,
@@ -211,7 +236,11 @@ def emit_report_analysis_receipt(
             "evidence_verified": bool(evidence_verified),
             "analysis_engine": "persisted_job_analyzer",
             "invoked": bool(invoked),
-            "visible_result_hash": analysis_hash(str(visible_result or "")),
+            **_response_identity(
+                response_fragments,
+                language=language,
+                terminal_rendered=terminal_rendered,
+            ),
         },
     )
 
@@ -231,6 +260,23 @@ def validate_analysis_receipt(receipt: Mapping[str, Any]) -> tuple[bool, str]:
         return False, "invalid receipt owner"
     if not _is_nonnegative_int(receipt.get("turn_index")):
         return False, "invalid turn index"
+    message_ids = receipt.get("response_message_ids")
+    if not isinstance(message_ids, list):
+        return False, "invalid response message ids"
+    if any(
+        not isinstance(message_id, str) or message_id not in MESSAGE_CATALOG
+        for message_id in message_ids
+    ):
+        return False, "unknown response message id"
+    semantic_identity = str(receipt.get("response_semantic_hash") or "")
+    render_identity = str(receipt.get("response_render_hash") or "")
+    response_rendered = receipt.get("response_rendered")
+    if not isinstance(response_rendered, bool):
+        return False, "invalid response rendered flag"
+    if bool(message_ids) != bool(semantic_identity):
+        return False, "inconsistent response semantic identity"
+    if bool(render_identity) != bool(response_rendered and message_ids):
+        return False, "inconsistent response render identity"
     for field in expected_fields & _HASH_FIELDS:
         value = receipt.get(field)
         if value and (not isinstance(value, str) or len(value) != 64):
@@ -305,6 +351,48 @@ def validate_analysis_receipt(receipt: Mapping[str, Any]) -> tuple[bool, str]:
         if receipt.get("evidence_verified") and receipt.get("resolved_job_hash") == empty_hash:
             return False, "verified report has no resolved job"
     return True, ""
+
+
+def _response_identity(
+    fragments: Sequence[ResponseFragment],
+    *,
+    language: str,
+    terminal_rendered: bool,
+) -> dict[str, Any]:
+    typed_fragments = tuple(fragments)
+    if not typed_fragments:
+        if terminal_rendered:
+            raise ValueError("terminal response identity requires response fragments")
+        return {
+            "response_message_ids": [],
+            "response_semantic_hash": "",
+            "response_render_hash": "",
+            "response_rendered": False,
+        }
+    rendered_items = []
+    seen_semantics: set[str] = set()
+    for fragment in typed_fragments:
+        item = render_fragment(fragment, language)
+        if item.semantic_hash in seen_semantics:
+            continue
+        seen_semantics.add(item.semantic_hash)
+        rendered_items.append(item)
+    rendered = tuple(rendered_items)
+    semantic_identity = (
+        rendered[0].semantic_hash
+        if len(rendered) == 1
+        else semantic_hash([item.semantic_hash for item in rendered])
+    )
+    return {
+        "response_message_ids": [item.message_id for item in rendered],
+        "response_semantic_hash": semantic_identity,
+        "response_render_hash": (
+            render_hash("\n".join(item.text for item in rendered).strip())
+            if terminal_rendered
+            else ""
+        ),
+        "response_rendered": terminal_rendered,
+    }
 
 
 def _is_nonnegative_int(value: Any) -> bool:

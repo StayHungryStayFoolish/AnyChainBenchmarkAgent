@@ -15,7 +15,8 @@ from agent.workflows.group_registry import (
     GROUPS,
     GroupSpec,
     USER_NAVIGABLE_GROUPS,
-    fallback_groups_for_workflow,
+    fallback_groups_for_state,
+    group_applicable,
     group_for_field,
     validate_action_group_requirements,
     validate_group_registry,
@@ -148,14 +149,55 @@ class GroupRegistryAuthorityTests(unittest.TestCase):
         self.assertEqual(observability.depends_on, ("target_mode",))
 
     def test_workflow_metadata_preserves_order_and_excludes_rpc_groups_from_sync(self) -> None:
-        rpc = [group.name for group in fallback_groups_for_workflow("rpc_benchmark")]
-        sync = [group.name for group in fallback_groups_for_workflow("sync_observe")]
+        rpc_state = {
+            "workflow_mode": "rpc_benchmark",
+            "target_mode": "fake-node",
+        }
+        sync_state = {
+            "workflow_mode": "sync_observe",
+            "target_mode": "sync-observe",
+        }
+        rpc = [group.name for group in fallback_groups_for_state(rpc_state)]
+        sync = [group.name for group in fallback_groups_for_state(sync_state)]
 
-        self.assertEqual(rpc, [group.name for group in GROUPS if group.fallback and group.name != "sync_observe"])
+        self.assertEqual(
+            rpc,
+            [
+                group.name
+                for group in GROUPS
+                if group.fallback and group_applicable(rpc_state, group)
+            ],
+        )
         self.assertNotIn("sync_observe", rpc)
         self.assertIn("sync_observe", sync)
         for rpc_only in ("workload_rpc", "target_samples_fixtures", "qps_profile"):
             self.assertNotIn(rpc_only, sync)
+
+    def test_one_applicability_contract_covers_fake_node_custom_rpc(self) -> None:
+        by_name = {group.name: group for group in GROUPS}
+        fake_state = {
+            "workflow_mode": "rpc_benchmark",
+            "target_mode": "fake-node",
+            "custom_rpc": {"status": "needs_endpoint"},
+        }
+        sync_state = {
+            "workflow_mode": "sync_observe",
+            "target_mode": "sync-observe",
+        }
+
+        self.assertTrue(group_applicable(fake_state, by_name["endpoint_process"]))
+        self.assertTrue(group_applicable(fake_state, by_name["workload_rpc"]))
+        self.assertFalse(group_applicable(fake_state, by_name["sync_observe"]))
+        self.assertTrue(group_applicable(sync_state, by_name["endpoint_process"]))
+        self.assertTrue(group_applicable(sync_state, by_name["sync_observe"]))
+        self.assertFalse(group_applicable(sync_state, by_name["qps_profile"]))
+        self.assertFalse(group_applicable(
+            {
+                "workflow_mode": "rpc_benchmark",
+                "target_mode": "fake-node",
+            },
+            by_name["endpoint_process"],
+        ))
 
 
 class SyncObservePublicContractTests(unittest.TestCase):

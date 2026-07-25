@@ -56,7 +56,7 @@ class FilesystemDecisionBrokerTest(unittest.TestCase):
             "source_steps": [{
                 "step_id": "source-1",
                 "turn_index": 1,
-                "semantic_role": "request_capabilities",
+                "semantic_role": "capability_consultation",
             }],
         })
         variant = build_variant_contract(
@@ -303,7 +303,7 @@ class FilesystemDecisionBrokerTest(unittest.TestCase):
                 actor_task_id="task-retained",
                 actor_model="gpt-test",
                 source_step_id="source-1",
-                semantic_role="request_capabilities",
+                semantic_role="capability_consultation",
             )
             thread.join(timeout=2)
             self.assertFalse(thread.is_alive())
@@ -317,7 +317,7 @@ class FilesystemDecisionBrokerTest(unittest.TestCase):
                 normalized["variant_binding"],
                 {
                     "source_step_id": "source-1",
-                    "semantic_role": "request_capabilities",
+                    "semantic_role": "capability_consultation",
                 },
             )
             wrong = dict(normalized)

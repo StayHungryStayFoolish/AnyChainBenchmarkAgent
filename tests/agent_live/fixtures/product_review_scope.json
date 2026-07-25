@@ -1,0 +1,126 @@
+{
+  "schema_version": 2,
+  "scope_id": "anychain-g6-product-review-scope-v2",
+  "documentation": {
+    "english_root": "docs/en",
+    "chinese_root": "docs/zh",
+    "paired_basenames": [
+      "README.md",
+      "adk-agent-architecture.md",
+      "agent-cli-verification-guide.md",
+      "agent-handoff-product-verification.md",
+      "anychain-agent-ai-work-gate.md",
+      "framework-flow.md",
+      "framework-reference.md",
+      "github-pr-gates.md",
+      "github-pr-workflow.md",
+      "how-to-add-chain.md",
+      "local-closed-loop-testing.md",
+      "module-guide.md",
+      "secondary-development-guide.md"
+    ],
+    "reviewed_exemptions": [],
+    "required_facts": [
+      {
+        "fact_id": "architecture.semantic-planner-authority",
+        "basename": "adk-agent-architecture.md",
+        "en_marker": "`hierarchical_planner.py` is the sole product semantic-planning entry.",
+        "zh_marker": "`hierarchical_planner.py` 是唯一产品语义规划入口"
+      },
+      {
+        "fact_id": "architecture.response-authority",
+        "basename": "adk-agent-architecture.md",
+        "en_marker": "`response_catalog.py` and `response_messages/` are the sole localized",
+        "zh_marker": "`response_catalog.py` 与"
+      },
+      {
+        "fact_id": "architecture.group-owner-denominator",
+        "basename": "adk-agent-architecture.md",
+        "en_marker": "there remain 20 groups with exactly eight domain owners.",
+        "zh_marker": "框架仍然是 20 个 group、8 个"
+      },
+      {
+        "fact_id": "architecture.checkpoint-schema",
+        "basename": "adk-agent-architecture.md",
+        "en_marker": "Checkpoint state uses schema version 18.",
+        "zh_marker": "checkpoint state 当前使用 schema version 18"
+      },
+      {
+        "fact_id": "architecture.sync-observe-workflow",
+        "basename": "adk-agent-architecture.md",
+        "en_marker": "`sync-observe` is a first-class workflow",
+        "zh_marker": "`sync-observe` 是节点同步/资源观察的一等 workflow"
+      },
+      {
+        "fact_id": "chain-rpc.case-1",
+        "basename": "agent-handoff-product-verification.md",
+        "en_marker": "### Case 1: configured chain, custom RPC",
+        "zh_marker": "### Case 1：已配置链增加自定义 RPC"
+      },
+      {
+        "fact_id": "chain-rpc.case-2",
+        "basename": "agent-handoff-product-verification.md",
+        "en_marker": "### Case 2: unconfigured chain, existing adapter family",
+        "zh_marker": "### Case 2：未配置链，但属于已有 adapter family"
+      },
+      {
+        "fact_id": "chain-rpc.case-3",
+        "basename": "agent-handoff-product-verification.md",
+        "en_marker": "### Case 3: unsupported or uncertain adapter family",
+        "zh_marker": "### Case 3：不支持或无法确认 adapter family"
+      },
+      {
+        "fact_id": "acceptance.g3-denominator",
+        "basename": "agent-handoff-product-verification.md",
+        "en_marker": "- G3: 60 retained-regression obligations;",
+        "zh_marker": "- G3：60 个 retained-regression obligation；"
+      },
+      {
+        "fact_id": "acceptance.g4-denominator",
+        "basename": "agent-handoff-product-verification.md",
+        "en_marker": "- G4: 625 response-driven dynamic Chaos obligations",
+        "zh_marker": "- G4：625 个 response-driven dynamic Chaos obligation"
+      },
+      {
+        "fact_id": "acceptance.g5-denominator",
+        "basename": "agent-handoff-product-verification.md",
+        "en_marker": "- G5: 4 real-execution lanes;",
+        "zh_marker": "- G5：4 个真实执行 lane；"
+      },
+      {
+        "fact_id": "acceptance.g6-denominator",
+        "basename": "agent-handoff-product-verification.md",
+        "en_marker": "- G6: 9 revision-bound product-review artifact classes.",
+        "zh_marker": "- G6：9 类 revision-bound product-review artifact。"
+      }
+    ]
+  },
+  "migration": {
+    "current_schema_version": 18,
+    "quarantine_versions": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+    "migrate_versions": [12, 13, 14, 15, 16, 17],
+    "current_versions": [18],
+    "future_version_probe": 19
+  },
+  "external_capabilities": [
+    {
+      "capability_id": "gemini.google_search",
+      "required_state": "available_or_externally_blocked"
+    }
+  ],
+  "severity_sources": [
+    "legacy_issue_map",
+    "g3_retained_regressions",
+    "g4_dynamic_chaos_rounds",
+    "g5_real_executions",
+    "g6_product_review"
+  ],
+  "shell_gate_manifest": "tests/agent_live/fixtures/linux_shell_gate_manifest.json",
+  "fixture_policy": {
+    "fixture_root": "tools/fake-node/fixtures",
+    "chain_template_root": "config/chains",
+    "workload_membership": "all_single_and_mixed_weighted_methods",
+    "non_workload_classification": "auxiliary",
+    "strict_authenticity_without_capture_provenance": "scoped_limitation"
+  }
+}

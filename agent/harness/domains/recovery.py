@@ -3,18 +3,35 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from functools import partial
 import json
 from typing import Any
 
-from ..contracts import ActionProposal, HandlerResult, StateDelta
-from ..failures import RECOVERY_POLICIES, render_failure_summary, unresolved_recovery
-from ..intent import analyze_evidence_with_model
+from ..contracts import ActionProposal, HandlerResult, ResponseFragment, StateDelta
+from ..failures import (
+    RECOVERY_POLICIES,
+    failure_record_response_fragment,
+    unresolved_recovery,
+)
+from ..advisory import analyze_evidence_with_model
 from ..localization import localized
-from ..questions import choice_question
+from ..questions import choice_question as _choice_question, question_text
 from ..state import AgentGraphState
+from .analysis_receipts import analysis_hash
+from .response_fragments import failure
+
+choice_question = partial(_choice_question, owner="recovery")
 
 
 RECOVERY_GROUPS = {"failure_recovery"}
+
+
+def _fragment(message_id: str, *, kind: str = "status") -> ResponseFragment:
+    return ResponseFragment(
+        kind=kind,  # type: ignore[arg-type]
+        message_id=message_id,
+        source=__name__,
+    )
 
 
 def question_for_recovery(
@@ -27,17 +44,16 @@ def question_for_recovery(
     record = dict(recovery.get("record") or {})
     if group != "failure_recovery" or not unresolved_recovery(recovery):
         return None
-    language = str(state.get("language") or "en")
     options: list[dict[str, Any]] = []
     if "correct_failure" in set(record.get("allowed_actions") or []):
         options.append({
-            "label": localized(language, "修正受影响的配置并重新验证", "Correct the affected configuration and revalidate"),
+            "label": question_text("question.recovery.option.correct"),
             "value": "correct",
             "action": {"type": "correct_failure"},
             "expected_patch": {"failure_recovery.status": "correcting"},
         })
     options.append({
-        "label": localized(language, "查看错误证据和诊断信息", "Inspect failure evidence and diagnostics"),
+        "label": question_text("question.recovery.option.inspect"),
         "value": "inspect",
         "action": {"type": "inspect_failure"},
         "expected_patch": {"failure_recovery.status": recovery.get("status") or "pending"},
@@ -45,27 +61,45 @@ def question_for_recovery(
     })
     if "retry_failure" in set(record.get("allowed_actions") or []):
         options.append({
-            "label": localized(language, "恢复外部服务后重试当前请求", "Retry the current request after restoring the external service"),
+            "label": question_text("question.recovery.option.retry"),
             "value": "retry",
             "action": {"type": "retry_failure"},
             "expected_patch": {"failure_recovery.status": "resolved"},
         })
     options.append({
-        "label": localized(language, "暂不修复，保留证据和配置", "Pause recovery and preserve evidence/configuration"),
+        "label": question_text("question.recovery.option.cancel"),
         "value": "cancel",
         "action": {"type": "cancel_failure_recovery"},
         "expected_patch": {"failure_recovery.status": "cancelled"},
         "return_policy": "stop_after_response",
     })
-    decision_prompt = localized(
-        language,
-        "请选择下一步。修正完成后，Agent 会重新运行相关校验并回到正常配置流程。",
-        "Choose the next step. After correction, the Agent will rerun the relevant validation and resume the normal configuration flow.",
-    )
-    prompt = (
-        render_failure_summary(record, language) + "\n" + decision_prompt
-        if include_summary
-        else decision_prompt
+    prompt = question_text(
+        (
+            "question.recovery.action_with_summary.prompt"
+            if include_summary
+            else "question.recovery.action.prompt"
+        ),
+        **(
+            {
+                "severity": str(record.get("severity") or "blocking"),
+                "code": str(record.get("code") or "UNKNOWN"),
+                "failure_id": str(record.get("failure_id") or "<unknown>"),
+                "facts": json.dumps(
+                    record.get("facts") or [],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                ),
+                "evidence_paths": json.dumps(
+                    record.get("evidence_paths") or [],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                ),
+            }
+            if include_summary
+            else {}
+        ),
     )
     return choice_question(
         "failure_recovery",
@@ -83,18 +117,20 @@ def apply_recovery_action(state: AgentGraphState, action: ActionProposal) -> Han
     if action.action_type == "activate_harness_recovery":
         failure_record = action.arguments.get("failure_record")
         if not isinstance(failure_record, dict) or not failure_record.get("code"):
-            return HandlerResult(
-                blocker="Harness recovery activation requires a typed failure record"
-            )
+            return HandlerResult(blocker=failure(
+                "recovery.failure.activation_record_required",
+                source=__name__,
+            ))
         next_state["failure_recovery"] = {
             "status": "pending",
             "record": deepcopy(failure_record),
         }
         pending = question_for_recovery(next_state, "failure_recovery")
         if pending is None:
-            return HandlerResult(
-                blocker="Harness recovery record has no executable recovery contract"
-            )
+            return HandlerResult(blocker=failure(
+                "recovery.failure.contract_unavailable",
+                source=__name__,
+            ))
         return HandlerResult(
             delta=StateDelta.between(state, next_state),
             consumed_action_ids=(action.action_id,),
@@ -106,17 +142,25 @@ def apply_recovery_action(state: AgentGraphState, action: ActionProposal) -> Han
     record = dict(recovery.get("record") or {})
     allowed = set(record.get("allowed_actions") or [])
     if not record:
-        return HandlerResult(blocker="no active failure record is available")
+        return HandlerResult(blocker=failure(
+            "recovery.failure.record_required",
+            source=__name__,
+        ))
     if action.action_type not in allowed:
-        return HandlerResult(blocker=f"recovery action is not allowed for {record.get('code')}: {action.action_type}")
+        return HandlerResult(blocker=failure(
+            "recovery.failure.action_not_allowed",
+            arguments={
+                "action_type": action.action_type,
+                "code": str(record.get("code") or ""),
+            },
+            source=__name__,
+        ))
 
     if action.action_type == "inspect_failure":
         recovery["selected_action"] = "inspect_failure"
         active_question = deepcopy(state.get("pending_question") or {})
-        responses = (
-            []
-            if active_question
-            else [render_failure_summary(record, str(next_state.get("language") or "en"))]
+        responses: list[ResponseFragment] = (
+            [] if active_question else [failure_record_response_fragment(record)]
         )
         if record.get("llm_analysis_useful"):
             advisory = analyze_evidence_with_model(
@@ -128,7 +172,21 @@ def apply_recovery_action(state: AgentGraphState, action: ActionProposal) -> Han
                     "Add only likely causes and validation steps. Do not repeat the failure heading, observed facts, preserved configuration, or evidence paths; recommend only actions allowed by the failure record.",
                 ),
             )
-            responses.append(advisory)
+            evidence_paths = [
+                str(path) for path in record.get("evidence_paths") or []
+            ]
+            responses.append(ResponseFragment(
+                kind="evidence",
+                message_id="analysis.model_document",
+                payload={
+                    "text": advisory,
+                    "source_kind": "failure_record",
+                    "language": str(next_state.get("language") or "en"),
+                    "evidence_hash": analysis_hash(record),
+                    "evidence_paths": evidence_paths,
+                },
+                source=__name__,
+            ))
         next_question = (
             active_question
             if active_question
@@ -137,7 +195,7 @@ def apply_recovery_action(state: AgentGraphState, action: ActionProposal) -> Han
         return HandlerResult(
             delta=StateDelta.between(state, next_state),
             consumed_action_ids=(action.action_id,),
-            visible_results=tuple(responses),
+            response_fragments=tuple(responses),
             clear_pending=False,
             pending_question=next_question,
             next_group="failure_recovery",
@@ -151,11 +209,7 @@ def apply_recovery_action(state: AgentGraphState, action: ActionProposal) -> Han
         return HandlerResult(
             delta=StateDelta.between(state, next_state),
             consumed_action_ids=(action.action_id,),
-            visible_result=localized(
-                next_state.get("language", "en"),
-                "已暂停恢复；错误证据和当前配置仍保留。你可以稍后查看 job、日志或重新开始修正。",
-                "Recovery is paused; failure evidence and the current configuration remain available. You can inspect the job/logs or resume correction later.",
-            ),
+            response_fragments=(_fragment("recovery.response.paused"),),
             clear_pending=True,
             next_group="failure_recovery",
             completion="completed",
@@ -168,11 +222,7 @@ def apply_recovery_action(state: AgentGraphState, action: ActionProposal) -> Han
         return HandlerResult(
             delta=StateDelta.between(state, next_state),
             consumed_action_ids=(action.action_id,),
-            visible_result=localized(
-                next_state.get("language", "en"),
-                "已解除本次外部服务错误状态。请重新提交刚才的请求；本次操作没有修改 benchmark 配置或重复提交 job。",
-                "The external-service failure state is cleared. Retry your previous request; this action did not change benchmark configuration or resubmit a job.",
-            ),
+            response_fragments=(_fragment("recovery.response.retry_ready"),),
             clear_pending=True,
             next_group="opening",
             completion="completed",
@@ -182,7 +232,11 @@ def apply_recovery_action(state: AgentGraphState, action: ActionProposal) -> Han
     if action.action_type == "correct_failure":
         policy = RECOVERY_POLICIES.get(str(record.get("code") or ""))
         if policy is None or not policy.allow_correction:
-            return HandlerResult(blocker=f"failure does not support configuration correction: {record.get('code')}")
+            return HandlerResult(blocker=failure(
+                "recovery.failure.correction_not_supported",
+                arguments={"code": str(record.get("code") or "")},
+                source=__name__,
+            ))
         recovery["status"] = "correcting"
         recovery["selected_action"] = "correct_failure"
         return HandlerResult(
@@ -195,4 +249,8 @@ def apply_recovery_action(state: AgentGraphState, action: ActionProposal) -> Han
             completion="completed",
         )
 
-    return HandlerResult(blocker=f"unsupported recovery action: {action.action_type}")
+    return HandlerResult(blocker=failure(
+        "recovery.failure.unsupported_action",
+        arguments={"action_type": action.action_type},
+        source=__name__,
+    ))

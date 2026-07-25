@@ -36,7 +36,7 @@ flowchart TD
   T --> D["Startup diagnostics<br/>framework context, environment, dependencies, jobs"]
   T --> H["LangGraph Harness<br/>agent/harness"]
 
-  H --> I["Typed intent resolver<br/>configured LLM"]
+  H --> I["分层语义 planner<br/>configured LLM"]
   H --> G["20 个 group / 8 个 domain owner<br/>由 registry 定义唯一所有权"]
   H --> S["Persistent checkpoint<br/>ANYCHAIN_AGENT_CHECKPOINT_PATH"]
   H --> VAL["Deterministic validators<br/>config, workload, onboarding, execution gate"]
@@ -70,12 +70,16 @@ flowchart TD
 flowchart LR
   A["prepare"] --> B["adjudicate"]
   B --> C{"input authority"}
-  C -- "deterministic option / typed value / command" --> D["admit"]
-  C -- "semantic natural language" --> P["hierarchical plan"]
-  P --> D
+  C -- "精确声明的选项 / Y-N / 可信命令或传输语法" --> X["可信本地 contract admission"]
+  C -- "手工值 / 语义或结构化输入" --> P["partition"]
+  P --> O["compile_owner<br/>每次一个已调度 owner"]
+  O -- "仍有 owner" --> O
+  O -- "全部 owner 已 checkpoint" --> R["review_plan<br/>独立语义 admission"]
+  R --> D["admit<br/>确定性校验"]
+  X --> E
+  D --> E
   C -- "empty / no-op" --> L["fallback"]
-  D --> E["select one action"]
-  E --> F["route one owner"]
+  E["select one action"] --> F["route one owner"]
   F --> G["commit typed result"]
   G --> H{"side effect?"}
   H -- "yes" --> I["persist intent"]
@@ -95,6 +99,18 @@ flowchart LR
 `SideEffectReceipt`。每一轮还会生成 `TurnReceipt`，绑定 semantic units、admitted
 actions、执行顺序、未解析单元和最终问题。
 
+deterministic fast path 的范围必须保持狭窄：只接受当前问题明确声明的
+option id/value/label/编号（包括声明的 Y/N）、精确 terminal command、
+evidence transport framing 和空输入。用户手工输入的 typed value 不是精确
+option；它必须先进入 semantic partition，由模型确定 ownership，然后仍由
+pending-question contract 和所属 domain 执行确定性值校验。
+
+`partition`、每一次独立的 `compile_owner`、以及 `review_plan` 都是可
+checkpoint 的独立 transition。`review_plan` 对不可变 owner documents 执行独立的
+whole-plan semantic admission。其后的 `admit` 是不同的信任边界：在 action
+进入 durable queue 前，确定性校验 action schema、provenance、冲突、前置条件、
+pending-question contract 和 queue eligibility。
+
 控制平面的职责被明确拆分：
 
 - `admission.py` 在 action 持久化前校验 proposal、冲突、前置条件和 semantic
@@ -102,12 +118,18 @@ actions、执行顺序、未解析单元和最终问题。
 - `hierarchical_planner.py` 是唯一产品语义规划入口；Stage A 对完整 turn
   分区并分配受限 owner/group route，Stage B 使用 owner-scoped schema 编译
   action，随后执行 whole-plan admission；
-- `intent.py` 提供 focused adjudication、schema 校验和 admission 辅助，不是第二个
-  产品 planner；
+- `semantic_admission.py` 在 owner-scoped 编译后准备并校验不可变的 semantic
+  document；它不暴露 planner 入口，也不选择 provider；checkpointed
+  `review_plan` transition 会为受限的 whole-plan semantic review 提供当前配置的
+  provider；
+- `advisory.py` 负责链身份、RPC schema 提取和证据分析等 model-backed advisory
+  能力；这些能力不能修改状态或选择 graph transition；
 - `queue.py` 负责满足依赖的排序和 pending barrier 下的执行资格；
 - `routing.py` 负责 navigation prerequisite、return policy 和 canonical fallback；
-- `response.py` 是唯一 response composer，每轮最多输出一个可执行 blocking
-  question；
+- `response.py` 是唯一 terminal-response assembler 和 `visible_response`
+  writer，每轮最多输出一个可执行 blocking question。domain 和 coordinator
+  只能发出已注册的 semantic fragment；`response_catalog.py` 与
+  `response_messages/` 是唯一的本地化产品文案权威；
 - `coordinator.py` 只实现 graph node transition 和唯一的类型化 commit 边界，
   不解释自然语言、不解析 terminal 输入，也不持有 domain 业务规则。
 
@@ -115,6 +137,10 @@ actions、执行顺序、未解析单元和最终问题。
 20 个 group 及其字段、问题、依赖、失效关系和 owner。
 `agent/harness/state.py::DEFAULT_GROUP_ORDER` 与
 `agent/harness/domains/registry.py` 都是派生的 runtime view，不是额外权威来源。
+
+graph 还会把类型化控制 action 路由到 `coordinator` owner。它不拥有任何
+`GroupSpec`，也不会增加 domain owner 数量：框架仍然是 20 个 group、8 个
+domain owner。
 
 | 顺序 | Group | Owner |
 |---:|---|---|
@@ -187,10 +213,17 @@ flowchart TD
 先前答案，Harness 必须更新或失效受影响的 group state，并通过确定性工具重新
 生成下游 runtime 产物。
 
-checkpoint state 当前使用 schema version 14。当前版本的新 turn 绝不调用 legacy
+checkpoint state 当前使用 schema version 18。当前版本的新 turn 绝不调用 legacy
 action compiler。version 12 checkpoint 只通过明确的 migration boundary；version 13
-还会把 deferred queue 保留语义迁移到 typed pending-question contract，然后持久化为
-version 14。更老的 checkpoint 必须进入 quarantine：仅允许列入白名单的环境事实供
+会把 deferred queue 保留语义迁移到 typed pending-question contract；version 14
+初始化 typed response fragments，并持久化为 version 15；version 16 物化显式的
+pending-question owner 与类型化 Chain/RPC case context；version 17 引入可
+checkpoint 的 `semantic_planning` contract；version 18 则淘汰持久化的 turn-local
+response 文本与 manifest，统一由当前 response authority 负责。迁移到 version 18
+时，不会恢复使用旧 contract 编译到一半的 owner cursor 或 response contract，而是
+清除不兼容的 in-flight planning/response scratch，同时保留兼容的 durable
+workflow state。
+更老的 checkpoint 必须进入 quarantine：仅允许列入白名单的环境事实供
 用户重新确认，旧 pending action 或通过文件路径猜测出的 plan 绝不能恢复为可执行任务。
 
 ## Google Search 边界
@@ -269,13 +302,24 @@ proxy workload 产物。
 随后运行相关检查：
 
 ```bash
-python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract tests.test_agent_langgraph_harness
+python3 -m unittest \
+  tests.test_agent_product_terminal \
+  tests.test_agent_runtime_contract \
+  tests.test_agent_langgraph_harness \
+  tests.test_agent_harness_architecture \
+  tests.test_agent_response_authority
 python3 tools/check_agent_boundaries.py --root .
 git diff --check
 ```
 
 对模型交互行为，必须运行当前产品 Harness。底层 live/PTY 脚本只能作为 provider
 driver 或开发辅助，不能替代真实 CLI 场景和确定性断言。
+
+`tests/agent_live/run_product_acceptance.py` 是 Phase 8 evidence-admission
+controller，不是 user simulator 或 real-execution provider。它生成 revision-bound
+obligation catalog，并接纳 subordinate provider 生成的 evidence。Phase 8 已经实现，
+但在 retained real-CLI regression、response-driven 双 AI Chaos、全部必需 real
+execution 和最终 product review 分别生成合格证据前，G3-G6 仍未关闭。
 
 固定 CLI matrix 不足以作为产品验收。按照 `tests/agent_live/README.md` 执行：
 DeepSeek 运行真实 Docker/Linux CLI，Codex 必须读取上一轮实际回复后再决定下一条用户

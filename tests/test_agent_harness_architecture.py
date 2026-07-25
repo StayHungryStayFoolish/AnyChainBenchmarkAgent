@@ -324,8 +324,36 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
         self.assertIn("one consistency contract", prompt)
         self.assertIn("Never return complete for a support-cited unit", prompt)
 
+    def test_typed_option_can_reopen_completed_intake_without_weakening_lifecycle(self) -> None:
+        from agent.harness.action_registry import lifecycle_rejected_action_indexes
+        from agent.harness.state import new_state
+
+        state = new_state("typed-replacement-lifecycle", language="en")
+        state["target_mode"] = "fake-node"
+        state["chain_identity"] = {
+            "canonical": "bsc",
+            "status": "confirmed",
+        }
+        ungrounded = {
+            "type": "request_chain_selection",
+            "source_evidence": "choose a chain",
+        }
+        declared_option = {
+            **ungrounded,
+            "selection_contract_verified": True,
+        }
+
+        self.assertEqual(
+            lifecycle_rejected_action_indexes(state, [ungrounded]),
+            (0,),
+        )
+        self.assertEqual(
+            lifecycle_rejected_action_indexes(state, [declared_option]),
+            (),
+        )
+
     def _validate(self, payload: dict[str, Any] | str):
-        from agent.harness.intent import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
         from agent.harness.semantic_compiler import validate_whole_plan_admission
 
         plan, _valid = _immutable_admission_fixture()
@@ -427,7 +455,7 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
         self.assertIn("neither complete nor support", "; ".join(result.errors))
 
     def test_registered_support_unit_is_admitted_without_becoming_context(self) -> None:
-        from agent.harness.intent import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
         from agent.harness.semantic_compiler import (
             freeze_semantic_plan,
             validate_whole_plan_admission,
@@ -555,7 +583,7 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
         )
 
     def test_required_value_grounding_has_exact_argument_cardinality(self) -> None:
-        from agent.harness.intent import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
         from agent.harness.semantic_compiler import (
             freeze_semantic_plan,
             validate_whole_plan_admission,
@@ -677,7 +705,7 @@ def _admitted_proposal_action(
     *,
     source_format: str = "prose",
 ) -> dict[str, Any]:
-    from agent.harness.intent import _attach_semantic_admission_receipts
+    from agent.harness.semantic_admission import _attach_semantic_admission_receipts
 
     document = {
         "actions": [{
@@ -762,7 +790,7 @@ def _admitted_field_intake_action(
 
 class HarnessArchitectureTest(unittest.TestCase):
     def test_pending_admission_requires_complete_turn_candidate_receipts(self) -> None:
-        from agent.harness.intent import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
         from agent.harness.semantic_compiler import (
             freeze_semantic_plan,
             validate_whole_plan_admission,
@@ -966,7 +994,7 @@ class HarnessArchitectureTest(unittest.TestCase):
 
     def test_exact_reviewer_quote_must_bind_the_selected_rpc_value(self) -> None:
         from agent.harness.semantic_compiler import freeze_semantic_plan, validate_whole_plan_admission
-        from agent.harness.intent import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
 
         source = "Use https://first.example/rpc for reference but test https://second.example/rpc."
         action = {
@@ -1200,7 +1228,7 @@ class HarnessArchitectureTest(unittest.TestCase):
         events = migrated["audit_events"]
         self.assertEqual(events[-1]["event"], "checkpoint_schema_migrated")
 
-    def test_checkpoint_migration_preserves_current_pending_action_contracts(self) -> None:
+    def test_checkpoint_migration_quarantines_pre_v3_pending_action_contracts(self) -> None:
         from agent.harness.state import migrate_state
 
         pending = {
@@ -1232,7 +1260,16 @@ class HarnessArchitectureTest(unittest.TestCase):
             session_purpose="user",
         )
 
-        self.assertEqual(migrated["pending_question"], pending)
+        self.assertEqual(migrated["pending_question"], {})
+        self.assertEqual(
+            migrated["checkpoint_recovery"]["status"],
+            "quarantined",
+        )
+        self.assertTrue(any(
+            event.get("event") == "checkpoint_pending_actions_quarantined"
+            and "contract_version 3" in str(event.get("contract_error") or "")
+            for event in migrated["audit_events"]
+        ))
 
     def test_checkpoint_migration_quarantines_retired_resume_context_contract(self) -> None:
         from agent.harness.state import migrate_state
@@ -1276,51 +1313,29 @@ class HarnessArchitectureTest(unittest.TestCase):
             session_purpose="user",
         )
 
-        self.assertEqual(migrated["pending_question"]["id"], "resume_harness_session")
+        self.assertEqual(migrated["pending_question"], {})
         self.assertEqual(migrated["resume_context"]["pending_question"], {})
-        event = next(
+        events = [
             row
             for row in migrated["audit_events"]
             if row.get("event") == "checkpoint_pending_actions_quarantined"
+        ]
+        self.assertEqual(
+            {event["location"] for event in events},
+            {"top_level", "resume_context"},
         )
-        self.assertEqual(event["location"], "resume_context")
-
-    def test_state_policy_removes_inapplicable_evidence_pause_without_losing_navigation(self) -> None:
-        from agent.harness.intent import _apply_state_plan_policy
-        from agent.harness.state import new_state
-
-        source = "Pause this method setup and take me to observability settings."
-        payload = {
-            "actions": [
-                {"type": "pause_evidence_collection", "source_evidence": source},
-                {
-                    "type": "change_group",
-                    "group": "observability",
-                    "navigation_explicit": True,
-                    "source_evidence": source,
-                },
-            ],
-            "semantic_units": [{
-                "unit_id": "unit-1",
-                "clause_id": "clause-1",
-                "source_text": source,
-                "disposition": "action",
-                "action_indexes": [0, 1],
-                "reason": "temporary workflow detour",
-            }],
-        }
-
-        result = json.loads(_apply_state_plan_policy(
-            json.dumps(payload),
-            new_state("no-evidence-pause", language="en"),
+        self.assertTrue(all(
+            "contract_version 3" in str(event.get("contract_error") or "")
+            for event in events
         ))
 
-        self.assertEqual([row["type"] for row in result["actions"]], ["change_group"])
-        self.assertEqual(result["semantic_units"][0]["action_indexes"], [0])
-        self.assertEqual(result["semantic_units"][0]["disposition"], "action")
+    def test_semantic_planner_has_no_state_policy_repair_authority(self) -> None:
+        from agent.harness import semantic_admission
+
+        self.assertFalse(hasattr(semantic_admission, "_apply_state_plan_policy"))
 
     def test_generic_navigation_purpose_excludes_registered_typed_entry(self) -> None:
-        from agent.harness.intent import _semantic_action_purpose
+        from agent.harness.semantic_admission import _semantic_action_purpose
 
         purpose = _semantic_action_purpose(
             {"type": "change_group", "group": "endpoint_process"},
@@ -1331,7 +1346,7 @@ class HarnessArchitectureTest(unittest.TestCase):
         self.assertIn("Enter custom RPC method catalog setup", purpose)
 
     def test_go_back_purpose_is_bound_to_recoverable_state(self) -> None:
-        from agent.harness.intent import _semantic_action_purpose
+        from agent.harness.semantic_admission import _semantic_action_purpose
 
         unavailable = _semantic_action_purpose(
             {"type": "go_back"},
@@ -1348,7 +1363,7 @@ class HarnessArchitectureTest(unittest.TestCase):
         self.assertIn("['network']", available)
 
     def test_go_back_without_recoverable_state_fails_plan_validation(self) -> None:
-        from agent.harness.intent import _validate_action_document
+        from agent.harness.semantic_admission import _validate_action_document
         from agent.harness.plan_coverage import TurnClause
         from agent.harness.state import new_state
 
@@ -1376,7 +1391,7 @@ class HarnessArchitectureTest(unittest.TestCase):
         self.assertIn("go_back has no recoverable", "; ".join(result.errors))
 
     def test_rpc_catalog_payload_must_exist_in_its_mapped_source_unit(self) -> None:
-        from agent.harness.intent import _validate_action_document
+        from agent.harness.semantic_admission import _validate_action_document
         from agent.harness.plan_coverage import TurnClause
         from agent.harness.state import new_state
 
@@ -1408,7 +1423,7 @@ class HarnessArchitectureTest(unittest.TestCase):
         self.assertIn("rpc_method is not present", "; ".join(result.errors))
 
     def test_rpc_catalog_wire_payload_requires_exact_source_evidence(self) -> None:
-        from agent.harness.intent import _validate_action_document
+        from agent.harness.semantic_admission import _validate_action_document
         from agent.harness.plan_coverage import TurnClause
         from agent.harness.state import new_state
 
@@ -1471,28 +1486,6 @@ class HarnessArchitectureTest(unittest.TestCase):
                 "config_field": "qps_profile",
                 "source_evidence": "change QPS",
             })
-
-    def test_scalar_reconfiguration_supersedes_same_group_navigation(self) -> None:
-        from agent.harness.action_registry import normalize_action_relations
-
-        actions = normalize_action_relations([
-            {
-                "type": "change_group",
-                "group": "provider_deployment",
-                "navigation_explicit": True,
-                "source_evidence": "go to provider and change the region",
-            },
-            {
-                "type": "request_config_field_input",
-                "config_field": "CLOUD_REGION",
-                "source_evidence": "change the region",
-            },
-        ])
-        self.assertEqual(
-            [item["type"] for item in actions],
-            ["request_config_field_input"],
-        )
-
 
     def test_scalar_reconfiguration_opens_exact_question_without_copying_state(self) -> None:
         from tests.agent_live.graph_turn import invoke_action
@@ -1611,8 +1604,60 @@ class HarnessArchitectureTest(unittest.TestCase):
                 "Enter custom RPC method catalog setup and collect its endpoint, "
                 "method, and schema evidence."
             ),
-            "arguments": {"catalog_command": "enter"},
+            "fixed_arguments": {"catalog_command": "enter"},
+            "value_arguments": [],
         }])
+        target_mode = next(
+            item for item in group_schema() if item["name"] == "target_mode"
+        )
+        self.assertEqual(
+            target_mode["entry_actions"][0]["fixed_arguments"],
+            {"target_mode_explicit": True},
+        )
+        self.assertEqual(
+            target_mode["entry_actions"][0]["value_arguments"],
+            ["target_mode"],
+        )
+        self.assertNotIn(
+            "target_mode",
+            target_mode["entry_actions"][0]["fixed_arguments"],
+        )
+        chain_identity = next(
+            item for item in group_schema() if item["name"] == "chain_identity"
+        )
+        choose_chain = next(
+            item
+            for item in chain_identity["entry_actions"]
+            if item["type"] == "choose_chain"
+        )
+        self.assertEqual(
+            choose_chain["value_arguments"],
+            ["chain_text", "chain_candidates"],
+        )
+
+    def test_entry_metadata_participates_in_action_registry_identity(self) -> None:
+        from dataclasses import replace
+        from unittest.mock import patch
+
+        from agent.harness import action_registry
+
+        original = action_registry.ACTION_SPECS
+        choose_chain = next(
+            spec for spec in original if spec.action_type == "choose_chain"
+        )
+        modified = tuple(
+            replace(
+                spec,
+                entry_intake_value_arguments=("chain_text",),
+            )
+            if spec is choose_chain
+            else spec
+            for spec in original
+        )
+        baseline = action_registry.action_registry_contract_hash()
+        with patch.object(action_registry, "ACTION_SPECS", modified):
+            changed = action_registry.action_registry_contract_hash()
+        self.assertNotEqual(baseline, changed)
 
     def test_chain_rpc_invalidations_commit_cross_domain_state_once_at_coordinator(self) -> None:
         from agent.harness.contracts import HandlerResult, StateDelta
@@ -1699,7 +1744,10 @@ class HarnessArchitectureTest(unittest.TestCase):
 
     def test_endpoint_and_qps_changes_use_registry_invalidation_at_commit_boundary(self) -> None:
         from agent.harness.contracts import ActionProposal
-        from agent.harness.domains.chain_rpc import apply_chain_rpc_answer
+        from agent.harness.domains.chain_rpc import (
+            apply_chain_rpc_answer,
+            question_for_chain_rpc,
+        )
         from agent.harness.domains.performance import apply_performance_action
 
         execution = {
@@ -1720,11 +1768,19 @@ class HarnessArchitectureTest(unittest.TestCase):
             },
             **execution,
         )
-        endpoint_question = {
-            "id": "LOCAL_RPC_URL",
-            "group": "endpoint_process",
-            "field": "LOCAL_RPC_URL",
-        }
+        endpoint_question = question_for_chain_rpc(
+            endpoint_state,
+            "endpoint_process",
+        )
+        self.assertEqual(
+            endpoint_question["domain_context"],
+            {
+                "contract_type": "rpc_endpoint",
+                "endpoint_role": "final_benchmark",
+                "rpc_case": "runtime",
+                "config_field": "LOCAL_RPC_URL",
+            },
+        )
         probe = {"ready": True, "status": "ready", "evidence_file": "/tmp/probe.json"}
         with patch("agent.harness.domains.rpc_endpoint.validate_rpc_endpoint", return_value=probe):
             endpoint_result = apply_chain_rpc_answer(
@@ -1780,7 +1836,7 @@ class HarnessArchitectureTest(unittest.TestCase):
         self.assertEqual(action["source_format"], "prose")
 
     def test_rejected_semantic_plan_cannot_commit_structured_config_side_channel(self) -> None:
-        from agent.harness.coordinator import plan_turn_step
+        from agent.harness.coordinator import _consume_planner_queue
 
         text = 'use BNB fake-node and {"CLOUD_REGION":"asia-east1"}'
         state = _state(
@@ -1796,8 +1852,7 @@ class HarnessArchitectureTest(unittest.TestCase):
             "reason": "plan coverage rejected partial mapping",
         }
 
-        with patch("agent.harness.coordinator.resolve_action_queue", return_value=rejected):
-            result = plan_turn_step(state)
+        result = _consume_planner_queue(state, rejected)
 
         self.assertEqual(
             [item.get("type") for item in result.get("proposed_actions") or []],
@@ -1806,7 +1861,7 @@ class HarnessArchitectureTest(unittest.TestCase):
 
     def test_clarification_is_a_whole_turn_transaction_barrier(self) -> None:
         from agent.harness.action_registry import validate_action_transaction_contract
-        from agent.harness.admission import _validate_action_plan
+        from agent.harness.admission import validate_action_plan
 
         with self.assertRaisesRegex(ValueError, "whole-turn transaction barrier"):
             validate_action_transaction_contract([
@@ -1832,7 +1887,7 @@ class HarnessArchitectureTest(unittest.TestCase):
             },
         ])
 
-        admitted = _validate_action_plan(_state(), [
+        result = validate_action_plan(_state(), [
             {
                 "type": "clarify_unresolved",
                 "clauses": ["Clarify the unresolved request."],
@@ -1843,9 +1898,10 @@ class HarnessArchitectureTest(unittest.TestCase):
                 "source_evidence": "http://fake-node:19000",
             },
         ])
+        self.assertEqual(result.status, "rejected")
         self.assertEqual(
-            [action["type"] for action in admitted],
-            ["clarify_unresolved"],
+            [item.code for item in result.rejections],
+            ["transaction_invalid"],
         )
 
     def test_durable_config_proposals_merge_independent_fields_across_turns(self) -> None:
@@ -1888,8 +1944,31 @@ class HarnessArchitectureTest(unittest.TestCase):
         self.assertEqual(len(merged[0]["_proposal_transaction_hashes"]), 2)
         self.assertEqual(merged[0]["_merged_origin_texts"], [first_source, second_source])
 
+    def test_durable_scalar_supersession_does_not_inherit_old_metadata(self) -> None:
+        from agent.harness.coordinator import _merge_durable_action_queue
+
+        merged = _merge_durable_action_queue(
+            [{
+                "type": "set_qps_mode",
+                "qps_mode": "quick",
+                "source_evidence": "old quick",
+                "_plan_transaction_hash": "old-transaction",
+            }],
+            [{
+                "type": "set_qps_mode",
+                "qps_mode": "standard",
+                "source_evidence": "new standard",
+            }],
+        )
+
+        self.assertEqual(merged, [{
+            "type": "set_qps_mode",
+            "qps_mode": "standard",
+            "source_evidence": "new standard",
+        }])
+
     def test_upstream_mutation_rejects_answer_bound_to_stale_pending_group(self) -> None:
-        from agent.harness.admission import _validate_action_plan
+        from agent.harness.admission import validate_action_plan
 
         state = _state(
             target_mode="fake-node",
@@ -1909,7 +1988,7 @@ class HarnessArchitectureTest(unittest.TestCase):
                 "keep the environment values."
             ),
         )
-        actions = _validate_action_plan(state, [
+        result = validate_action_plan(state, [
             {
                 "type": "answer_pending",
                 "answer": "http://geth-dev:8545",
@@ -1938,10 +2017,9 @@ class HarnessArchitectureTest(unittest.TestCase):
             },
         ])
 
-        self.assertNotIn("answer_pending", [item.get("type") for item in actions])
-        self.assertIn("choose_target_mode", [item.get("type") for item in actions])
-        self.assertIn("change_chain", [item.get("type") for item in actions])
-        self.assertIn("propose_config_values", [item.get("type") for item in actions])
+        self.assertEqual(result.status, "rejected")
+        self.assertFalse(result.actions)
+        self.assertTrue(result.rejections)
 
     def test_model_action_envelope_normalizes_nested_arguments_at_boundary(self) -> None:
         from agent.harness.checkpoint_migrations import normalize_v12_action_envelope
@@ -1986,13 +2064,17 @@ class HarnessArchitectureTest(unittest.TestCase):
         self.assertNotIn("arguments", normalized)
 
     def test_workload_consultation_is_specific_and_non_mutating(self) -> None:
-        from agent.harness.domains.orientation import answer_consultation
+        from agent.harness.domains.orientation import consultation_fragment
+        from agent.harness.response_catalog import render_fragment
 
         state = _state(
             chain_identity={"canonical": "bsc", "status": "confirmed"},
             rpc_mode="mixed",
         )
-        response = answer_consultation(state, {"topic": "workload_config"})
+        response = render_fragment(
+            consultation_fragment(state, {"topic": "workload_config"}),
+            "en",
+        ).text
 
         self.assertIn("eth_getBalance=25", response)
         self.assertNotIn("Current state:", response)
@@ -2093,11 +2175,91 @@ class HarnessArchitectureTest(unittest.TestCase):
                 offenders.append(str(path.relative_to(REPO_ROOT)))
         self.assertEqual(offenders, [])
 
-    def test_free_form_intent_has_one_llm_entry_point(self) -> None:
-        from agent.harness import intent
+    def test_harness_exposes_only_checkpointed_semantic_planner_stages(self) -> None:
+        import importlib.util
 
-        self.assertTrue(callable(intent.resolve_action_queue))
-        self.assertFalse(hasattr(intent, "resolve_pending_choice"))
+        from agent.harness import hierarchical_planner, semantic_admission
+
+        self.assertTrue(callable(hierarchical_planner.begin_semantic_partition))
+        self.assertTrue(callable(hierarchical_planner.compile_next_owner))
+        self.assertTrue(callable(hierarchical_planner.review_semantic_plan))
+        self.assertFalse(
+            hasattr(hierarchical_planner, "resolve_product_action_queue")
+        )
+        self.assertIsNone(importlib.util.find_spec("agent.harness.intent"))
+        self.assertFalse(hasattr(semantic_admission, "resolve_action_queue"))
+        self.assertFalse(
+            hasattr(
+                semantic_admission,
+                "adjudicate_active_pending_contract",
+            )
+        )
+
+    def test_static_call_graph_rejects_retired_planner_authorities(
+        self,
+    ) -> None:
+        import ast
+
+        harness_root = REPO_ROOT / "agent" / "harness"
+        planner_definitions: list[tuple[str, str]] = []
+        retired_definitions: list[tuple[str, str]] = []
+        forbidden_imports: list[tuple[str, str]] = []
+        retired_names = {
+            "resolve_action_queue",
+            "adjudicate_active_pending_contract",
+            "_focused_pending_request_payload",
+            "_pending_contract_adjudication_prompt",
+            "_action_queue_prompt",
+            "_action_queue_payload",
+        }
+        planner_modules = {
+            "agent.harness.hierarchical_planner",
+            "agent.harness.semantic_admission",
+        }
+        for path in sorted(harness_root.rglob("*.py")):
+            relative = str(path.relative_to(REPO_ROOT))
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(
+                    node,
+                    (ast.FunctionDef, ast.AsyncFunctionDef),
+                ):
+                    if node.name in {
+                        "begin_semantic_partition",
+                        "compile_next_owner",
+                        "review_semantic_plan",
+                    }:
+                        planner_definitions.append((relative, node.name))
+                    if node.name in retired_names:
+                        retired_definitions.append((relative, node.name))
+                if not isinstance(node, ast.ImportFrom):
+                    continue
+                module = str(node.module or "")
+                if (
+                    (
+                        module in planner_modules
+                        or any(
+                            module.endswith(name.rsplit(".", 1)[-1])
+                            for name in planner_modules
+                        )
+                    )
+                    and (
+                        "/terminal/" in f"/{relative}"
+                        or "/domains/" in f"/{relative}"
+                    )
+                ):
+                    forbidden_imports.append((relative, module))
+
+        self.assertEqual(
+            planner_definitions,
+            [
+                ("agent/harness/hierarchical_planner.py", "begin_semantic_partition"),
+                ("agent/harness/hierarchical_planner.py", "compile_next_owner"),
+                ("agent/harness/hierarchical_planner.py", "review_semantic_plan"),
+            ],
+        )
+        self.assertEqual(retired_definitions, [])
+        self.assertEqual(forbidden_imports, [])
 
     def test_coordinator_cannot_bypass_the_compiled_product_graph(self) -> None:
         from agent.harness import coordinator
@@ -2105,6 +2267,7 @@ class HarnessArchitectureTest(unittest.TestCase):
         self.assertFalse(hasattr(coordinator, "process_turn"))
         self.assertFalse(hasattr(coordinator, "_process_turn"))
         self.assertFalse(hasattr(coordinator, "_route_free_text"))
+        self.assertFalse(hasattr(coordinator, "_action_answers_pending_contract"))
 
     def test_graph_runtime_exposes_only_typed_state_mutations(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
@@ -2170,7 +2333,12 @@ class HarnessArchitectureTest(unittest.TestCase):
             "answer_pending": {"answer": "value"},
             "unknown": {"reason": "unresolved"},
         }
-        with patch("agent.harness.domains.execution_runtime.execution_service.execute"):
+        with patch(
+            "agent.harness.domains.execution_runtime.execution_service.execute"
+        ), patch(
+            "agent.harness.domains.analysis.analyze_evidence_with_model",
+            return_value="reviewed deterministic evidence analysis",
+        ):
             for spec in ACTION_SPECS:
                 with self.subTest(action_type=spec.action_type, owner=spec.owner):
                     handler = runtimes[spec.owner].apply_action
@@ -2190,7 +2358,14 @@ class HarnessArchitectureTest(unittest.TestCase):
                         ),
                     )
                     self.assertIsInstance(result, HandlerResult)
-                    self.assertNotIn("unsupported", result.blocker.casefold())
+                    if result.blocker is not None:
+                        self.assertFalse(
+                            result.blocker.code.endswith(".unsupported_action"),
+                            (
+                                f"{spec.action_type} routed to {spec.owner} but "
+                                f"returned {result.blocker.code}"
+                            ),
+                        )
 
     def test_langgraph_has_explicit_control_plane_nodes(self) -> None:
         from agent.harness import graph as graph_module
@@ -2199,7 +2374,9 @@ class HarnessArchitectureTest(unittest.TestCase):
         for node in (
             "prepare",
             "adjudicate",
-            "plan",
+            "partition",
+            "compile_owner",
+            "review_plan",
             "admit",
             "select_action",
             "commit_action",
@@ -2214,18 +2391,23 @@ class HarnessArchitectureTest(unittest.TestCase):
         self.assertNotIn('graph.add_node("turn"', source)
         self.assertFalse(hasattr(graph_module, "process_turn"))
 
-    def test_single_planner_contract_keeps_consultations_independent_of_pending(self) -> None:
-        from agent.harness.context import build_action_resolver_prompt
+    def test_hierarchical_planner_contract_keeps_stage_authority_separate(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _stage_a_prompt,
+            _stage_b_prompt,
+        )
 
-        prompt = build_action_resolver_prompt()
-        self.assertIn("classify every unit independently", prompt)
-        self.assertIn("the Harness derives them", prompt)
-        self.assertIn("must not omit prose", prompt)
-        self.assertIn("consultation_only", prompt)
-        self.assertIn("no_configuration_mutation", prompt)
-        self.assertIn("action_schema.effect", prompt)
-        self.assertIn("A pending question never takes precedence", prompt)
-        self.assertIn("current_config/current_context/next_action", prompt)
+        stage_a = _stage_a_prompt()
+        stage_b = _stage_b_prompt("orientation")
+        self.assertIn("Do not choose product actions", stage_a)
+        self.assertIn("every sibling demand separately", stage_a)
+        self.assertIn("do not classify intent", stage_a)
+        self.assertIn("mark the unit unresolved", stage_a)
+        self.assertIn("Use only actions and arguments in owner_action_schema", stage_b)
+        self.assertIn("owned by another domain", stage_b)
+        self.assertIn("mark that binding unresolved", stage_b)
 
     def test_group_specs_own_dependencies_and_invalidation_metadata(self) -> None:
         from agent.workflows.group_registry import GROUP_SPEC_BY_NAME
@@ -2235,7 +2417,7 @@ class HarnessArchitectureTest(unittest.TestCase):
         self.assertIn("preflight_smoke_execution", GROUP_SPEC_BY_NAME["qps_profile"].invalidates)
 
     def test_rpc_catalog_semantic_purpose_describes_the_selected_operation(self) -> None:
-        from agent.harness.intent import _semantic_action_purpose
+        from agent.harness.semantic_admission import _semantic_action_purpose
 
         purpose = _semantic_action_purpose(
             {
@@ -2251,6 +2433,7 @@ class HarnessArchitectureTest(unittest.TestCase):
 
     def test_unresolved_known_chain_proposal_rebuilds_after_group_barrier(self) -> None:
         from agent.harness.domains.chain_rpc import question_for_chain_rpc
+        from agent.harness.questions import render_question
 
         state = _state(
             active_group="chain_identity",
@@ -2268,8 +2451,9 @@ class HarnessArchitectureTest(unittest.TestCase):
         question = question_for_chain_rpc(state, "chain_identity")
 
         self.assertEqual(question["id"], "unknown_chain_identity_confirm")
-        self.assertIn("LocalEvmDemo", question["prompt"])
-        self.assertIn("ethereum", question["prompt"])
+        rendered = render_question(question, "en")
+        self.assertIn("LocalEvmDemo", rendered)
+        self.assertIn("ethereum", rendered)
 
     def test_structured_configuration_has_no_pre_planner_admission_path(self) -> None:
         from agent.harness.coordinator import adjudicate_turn_step
@@ -2328,7 +2512,7 @@ class HarnessQuestionContractTest(unittest.TestCase):
         self.assertFalse(answer_fits_pending("please explain this field", question))
         self.assertEqual(manual_literal_violation("please explain this field", question), {})
 
-    def test_overlimit_scalar_is_rejected_without_semantic_planning(self) -> None:
+    def test_overlimit_scalar_routes_semantic_planning_without_mutating_field(self) -> None:
         from agent.harness.domains.chain_rpc import question_for_chain_rpc
         from agent.harness.state import new_state
         from tests.agent_live.graph_turn import invoke_product_graph_turn
@@ -2343,11 +2527,12 @@ class HarnessQuestionContractTest(unittest.TestCase):
         state["last_user_input"] = "x" * 181
 
         with patch(
-            "agent.harness.coordinator.resolve_action_queue",
-            side_effect=AssertionError("semantic planner must not receive an invalid scalar"),
-        ):
+            "tests.agent_live.graph_turn.TEST_SEMANTIC_PLANNER",
+            return_value={"actions": []},
+        ) as resolver:
             result = invoke_product_graph_turn(state)
 
+        resolver.assert_called_once()
         self.assertEqual(result["pending_question"]["id"], "RPC_API_KEY")
         self.assertNotIn("RPC_API_KEY", result.get("confirmed_config") or {})
         self.assertNotIn(
@@ -2356,19 +2541,34 @@ class HarnessQuestionContractTest(unittest.TestCase):
         )
 
     def test_manual_numeric_choice_rejects_invalid_replacement_without_planning(self) -> None:
-        from agent.harness.questions import choice_question, manual_literal_violation
+        from agent.harness.questions import (
+            choice_question,
+            manual_literal_violation,
+            question_text,
+        )
 
         question = choice_question(
             "ledger_disk",
             "DATA_VOL_SIZE",
-            "Use the detected size?",
+            question_text(
+                "question.environment.detected_disk_size.prompt",
+                field="DATA_VOL_SIZE",
+                value="926",
+            ),
+            owner="environment",
             field="DATA_VOL_SIZE",
             kind="yes_no",
             manual_input_allowed=True,
             validation={"value_type": "positive_number"},
             options=[
-                {"label": "Y", "value": "926"},
-                {"label": "N", "value": "__manual__"},
+                {
+                    "label": question_text("question.common.option.yes"),
+                    "value": "926",
+                },
+                {
+                    "label": question_text("question.common.option.no"),
+                    "value": "__manual__",
+                },
             ],
         )
 
@@ -2430,13 +2630,15 @@ class HarnessQuestionContractTest(unittest.TestCase):
         from agent.harness.questions import (
             answer_fits_pending,
             manual_question,
+            question_text,
             value_satisfies_pending_contract,
         )
 
         question = manual_question(
             "chain_identity",
             "protocol_evidence",
-            "Provide protocol evidence.",
+            question_text("question.chain_rpc.case3_protocol_evidence.prompt"),
+            owner="chain_rpc",
             field="protocol_evidence",
             kind="evidence",
         )
@@ -2453,20 +2655,33 @@ class HarnessQuestionContractTest(unittest.TestCase):
         )
 
     def test_turn_finalizer_removes_superseded_barrier_question_only(self) -> None:
+        from agent.harness.contracts import (
+            ResponseFragment,
+            response_fragment_to_dict,
+        )
         from agent.harness.coordinator import _finalize_turn_response
-        from agent.harness.questions import manual_question, render_question
+        from agent.harness.questions import (
+            manual_question,
+            question_text,
+            render_question,
+        )
 
         endpoint = manual_question(
             "endpoint_process",
             "new_chain_endpoint",
-            "Provide a reachable validation endpoint.",
+            question_text("question.chain_rpc.new_chain_endpoint.prompt"),
+            owner="chain_rpc",
             field="new_chain_endpoint",
             kind="url",
         )
         schema = manual_question(
             "endpoint_process",
             "new_chain_schema_confirm",
-            "Confirm the extracted request contract.",
+            question_text(
+                "question.chain_rpc.schema_evidence.prompt",
+                method="eth_chainId",
+            ),
+            owner="chain_rpc",
             field="new_chain_schema_confirm",
             kind="yes_no",
         )
@@ -2476,15 +2691,26 @@ class HarnessQuestionContractTest(unittest.TestCase):
             "installed_questions": [endpoint, schema],
         }
         state["pending_question"] = schema
-        state["visible_response"] = [
-            "Endpoint validation passed. Evidence: probe.json.",
-            render_question(endpoint, "en"),
-            render_question(schema, "en"),
+        state["response_fragments"] = [
+            response_fragment_to_dict(
+                ResponseFragment(
+                    kind="evidence",
+                    message_id="analysis.model_document",
+                    payload={
+                        "text": "Endpoint validation passed. Evidence: probe.json.",
+                        "source_kind": "test",
+                        "language": "en",
+                        "evidence_hash": "a" * 64,
+                        "evidence_paths": ["probe.json"],
+                    },
+                    source=__name__,
+                )
+            )
         ]
 
         result = _finalize_turn_response(state)
 
-        rendered = result["visible_response"]
+        rendered = "\n".join(result["visible_response"])
         self.assertIn("Endpoint validation passed. Evidence: probe.json.", rendered)
         self.assertNotIn(render_question(endpoint, "en"), rendered)
         self.assertEqual(rendered.count(render_question(schema, "en")), 1)
@@ -2493,6 +2719,7 @@ class HarnessQuestionContractTest(unittest.TestCase):
         from agent.harness.coordinator import _ask_next_blocking_question
         from agent.harness.domains.chain_rpc import question_for_chain_rpc
         from agent.harness.domains.performance import question_for_performance
+        from agent.harness.response import finalize_turn_response
 
         state = _state(
             "en",
@@ -2516,12 +2743,8 @@ class HarnessQuestionContractTest(unittest.TestCase):
             "question_id": "adapter_family_confirm",
             "reason": "same_turn_action_queue",
         }]
-        state["visible_response"] = [
-            question_for_performance(state, "qps_profile")["prompt"]
-            + "\n1. Y\n2. N",
-        ]
-
         result = _ask_next_blocking_question(state)
+        result = finalize_turn_response(result)
 
         self.assertEqual(result["active_group"], "chain_identity")
         self.assertEqual(result["pending_question"]["id"], "adapter_family_confirm")
@@ -2530,12 +2753,17 @@ class HarnessQuestionContractTest(unittest.TestCase):
         self.assertNotIn("Default QPS profile", rendered)
 
     def test_generic_manual_question_has_bounded_scalar_contract(self) -> None:
-        from agent.harness.questions import literal_matches_validation, manual_question
+        from agent.harness.questions import (
+            literal_matches_validation,
+            manual_question,
+            question_text,
+        )
 
         question = manual_question(
             "endpoint_process",
             "process_name",
-            "Enter process name.",
+            question_text("question.chain_rpc.real_node_process.prompt"),
+            owner="chain_rpc",
             field="BLOCKCHAIN_PROCESS_NAMES",
         )
 
@@ -2668,7 +2896,7 @@ class HarnessQuestionContractTest(unittest.TestCase):
         }])
 
     def test_model_pending_admission_uses_extracted_value_contract(self) -> None:
-        from agent.harness.coordinator import (
+        from agent.harness.admission import (
             _action_answers_pending_contract,
         )
         from tests.agent_live.graph_turn import invoke_action
@@ -2988,11 +3216,9 @@ class HarnessQuestionContractTest(unittest.TestCase):
                             "choose_chain",
                             {
                                 "chain_text": "sola",
-                                "resolution": {
-                                    "chain_exists": False,
-                                    "possible_known_chain": "solana",
-                                    "confidence": "high",
-                                },
+                                "chain_exists": False,
+                                "possible_known_chain": "solana",
+                                "confidence": "high",
                             },
                             "high",
                         ),
@@ -3355,7 +3581,9 @@ class HarnessQuestionContractTest(unittest.TestCase):
 
     def test_domain_choice_questions_are_typed_executable_and_renderable(self) -> None:
         from agent.harness.action_registry import ACTION_BY_TYPE
+        from agent.harness.contracts import text_ref_from_dict
         from agent.harness.questions import render_question
+        from agent.harness.response_catalog import render_text_ref
 
         for case_name, factory in self._question_cases():
             with self.subTest(case=case_name):
@@ -3374,7 +3602,7 @@ class HarnessQuestionContractTest(unittest.TestCase):
                 self.assertEqual(english.get("id"), chinese.get("id"))
                 for language, question in questions.items():
                     assert question is not None
-                    self.assertEqual(question.get("contract_version"), 2)
+                    self.assertEqual(question.get("contract_version"), 3)
                     self.assertTrue(question.get("options"))
                     for option in question["options"]:
                         action = option.get("action") or {}
@@ -3387,20 +3615,30 @@ class HarnessQuestionContractTest(unittest.TestCase):
                         )
                     rendered = render_question(question, language)
                     self.assertTrue(rendered.strip())
-                    self.assertIn(str(question.get("prompt") or ""), rendered)
+                    prompt = render_text_ref(
+                        text_ref_from_dict(question["prompt_ref"]),
+                        language,
+                        kind="question_prompt",
+                    )
+                    self.assertIn(prompt, rendered)
                     for option in question["options"]:
-                        self.assertIn(str(option.get("label") or option.get("value")), rendered)
+                        label = render_text_ref(
+                            text_ref_from_dict(option["label_ref"]),
+                            language,
+                            kind="option_label",
+                        )
+                        self.assertIn(label, rendered)
                     if question.get("manual_input_allowed"):
                         expected_instruction = (
-                            "你可以回复编号，也可以直接输入自定义值。"
+                            "请回复选项编号或名称，也可以直接输入自定义值。"
                             if language == "zh"
-                            else "Reply with a number, or type a custom value directly."
+                            else "Reply with an option number or name, or enter a custom value."
                         )
                     else:
                         expected_instruction = (
-                            "请回复选项编号或选项名称。"
+                            "请回复选项编号或名称。"
                             if language == "zh"
-                            else "Reply with an option number or option name."
+                            else "Reply with an option number or name."
                         )
                     self.assertIn(expected_instruction, rendered)
                     if language == "zh":
@@ -3411,51 +3649,83 @@ class HarnessQuestionContractTest(unittest.TestCase):
                 self.assertNotEqual(render_question(english, "en"), render_question(chinese, "zh"))
 
     def test_question_renderer_requires_explicit_language(self) -> None:
-        from agent.harness.questions import choice_question, render_question
+        from agent.harness.questions import (
+            choice_question,
+            question_text,
+            render_question,
+        )
 
         question = choice_question(
             "opening",
             "explicit_language_contract",
-            "Choose one.",
+            question_text("question.orientation.opening.prompt"),
+            owner="orientation",
             field="choice",
-            options=[{"id": "one", "label": "one", "value": "one"}],
+            options=[{
+                "id": "one",
+                "label": question_text(
+                    "question.orientation.resume.option.continue"
+                ),
+                "value": "one",
+            }],
         )
 
         with self.assertRaises(TypeError):
             render_question(question)  # type: ignore[call-arg]
 
     def test_option_description_is_visible_semantic_context_not_an_exact_alias(self) -> None:
-        from agent.harness.questions import choice_question, exact_answer, render_question
+        from agent.harness.contracts import text_ref_from_dict
+        from agent.harness.questions import (
+            choice_question,
+            exact_answer,
+            question_text,
+            render_question,
+        )
+        from agent.harness.response_catalog import render_text_ref
 
-        description = "Fast framework validation with recorded fixtures."
         question = choice_question(
             "opening",
             "described_option_contract",
-            "Choose one.",
+            question_text("question.orientation.opening.prompt"),
+            owner="orientation",
             field="target_mode",
             options=[{
                 "id": "fake-node",
-                "label": "Start fake-node",
-                "description": description,
+                "label": question_text(
+                    "question.orientation.opening.fake_node.label"
+                ),
+                "description": question_text(
+                    "question.orientation.opening.fake_node.description"
+                ),
                 "value": "fake-node",
                 "action": {"type": "choose_target_mode", "target_mode": "fake-node"},
             }],
         )
 
-        self.assertEqual(question["options"][0]["description"], description)
+        description = render_text_ref(
+            text_ref_from_dict(question["options"][0]["description_ref"]),
+            "en",
+            kind="option_description",
+        )
         self.assertIn(description, render_question(question, "en"))
         self.assertEqual(exact_answer("fake-node", question), (True, "fake-node"))
         self.assertEqual(exact_answer(description, question), (False, None))
 
     def test_opening_options_explain_product_effect_in_both_languages(self) -> None:
         from agent.harness.domains.orientation import opening_question
+        from agent.harness.contracts import text_ref_from_dict
         from agent.harness.questions import render_question
+        from agent.harness.response_catalog import render_text_ref
 
         for language in ("en", "zh"):
             with self.subTest(language=language):
                 question = opening_question(_state(language))
                 descriptions = [
-                    str(option.get("description") or "").strip()
+                    render_text_ref(
+                        text_ref_from_dict(option["description_ref"]),
+                        language,
+                        kind="option_description",
+                    ).strip()
                     for option in question["options"]
                 ]
                 self.assertEqual(len(descriptions), 4)
@@ -3465,16 +3735,27 @@ class HarnessQuestionContractTest(unittest.TestCase):
                     self.assertIn(description, rendered)
 
     def test_manual_choice_question_has_complete_validation_at_construction(self) -> None:
-        from agent.harness.questions import choice_question
+        from agent.harness.questions import choice_question, question_text
 
         question = choice_question(
             "chain_auxiliary_endpoints",
             "RPC_API_KEY",
-            "Provide the API key or skip.",
+            question_text(
+                "question.chain_rpc.auxiliary_endpoint.prompt",
+                chain="ethereum",
+                field="RPC_API_KEY",
+            ),
+            owner="chain_rpc",
             field="RPC_API_KEY",
             kind="manual_value",
             manual_input_allowed=True,
-            options=[{"id": "skip", "label": "Skip", "value": "none"}],
+            options=[{
+                "id": "skip",
+                "label": question_text(
+                    "question.chain_rpc.option.skip_unconfigured"
+                ),
+                "value": "none",
+            }],
         )
 
         self.assertEqual(
@@ -3504,513 +3785,6 @@ class HarnessQuestionContractTest(unittest.TestCase):
 
 
 class HarnessStateInvariantTest(unittest.TestCase):
-    def test_free_form_planner_uses_exactly_two_provider_calls(self) -> None:
-        from agent.harness.intent import resolve_action_queue
-
-        text = "What can you do?"
-        provider = _bounded_intent_provider([
-            _single_action_document(
-                {
-                    "type": "answer_opening_question",
-                    "topic": "capabilities",
-                    "source_evidence": text,
-                    "confidence": "high",
-                },
-                text,
-            ),
-        ], candidate_selector=_select_unique_operation_candidate)
-        with patch("agent.harness.intent.provider_from_config", return_value=provider):
-            result = resolve_action_queue(_state(), text)
-
-        self.assertEqual(provider.complete.call_count, 2)
-        self.assertEqual(result["actions"][0]["type"], "answer_opening_question")
-        reviewer_request = provider.complete.call_args_list[1].args[0]
-        immutable = json.loads(reviewer_request.messages[1].content)
-        self.assertEqual(immutable["immutable_document"]["actions"][0]["type"], "answer_opening_question")
-        self.assertTrue(immutable["plan_hash"])
-
-    def test_structural_failure_uses_one_repair_and_stays_below_four_calls(self) -> None:
-        from agent.harness.intent import resolve_action_queue
-
-        text = "What can you do?"
-        provider = _bounded_intent_provider([
-            _single_action_document({"type": "not_registered"}, text),
-            _single_action_document(
-                {
-                    "type": "answer_opening_question",
-                    "topic": "capabilities",
-                    "source_evidence": text,
-                },
-                text,
-            ),
-        ])
-        with patch("agent.harness.intent.provider_from_config", return_value=provider):
-            result = resolve_action_queue(_state(), text)
-
-        self.assertEqual(provider.complete.call_count, 3)
-        self.assertLessEqual(provider.complete.call_count, 4)
-        system_prompts = [
-            call.args[0].messages[0].content
-            for call in provider.complete.call_args_list
-        ]
-        self.assertEqual(
-            sum(prompt.startswith("Repair one malformed AnyChain typed action-plan response") for prompt in system_prompts),
-            1,
-        )
-        self.assertEqual(result["actions"][0]["type"], "answer_opening_question")
-
-    def test_rejected_admission_uses_one_repair_and_exactly_four_calls(self) -> None:
-        from agent.harness.intent import resolve_action_queue
-
-        text = "Before I paste evidence, summarize which chain and custom method you retained."
-        invalid = _single_action_document(
-            {
-                "type": "rpc_catalog_command",
-                "catalog_command": "append_evidence",
-                "rpc_schema_evidence": text,
-                "source_evidence": text,
-            },
-            text,
-        )
-        repaired = _single_action_document(
-            {
-                "type": "answer_opening_question",
-                "topic": "current_config",
-                "source_evidence": text,
-            },
-            text,
-        )
-
-        def reject(request: Any) -> SimpleNamespace:
-            payload = _whole_plan_admission_payload(request)
-            payload["action_verdicts"][0]["verdict"] = "reject"
-            payload["action_verdicts"][0]["reason"] = "the immutable mutation does not answer the consultation"
-            payload["unit_verdicts"][0].update({
-                "verdict": "omitted",
-                "omitted_action_type": "answer_opening_question",
-                "reason": "a registry-expressible consultation is omitted",
-            })
-            return SimpleNamespace(text=json.dumps(payload, sort_keys=True))
-
-        provider = _bounded_intent_provider(
-            [invalid, repaired],
-            [reject, _whole_plan_admission_response],
-        )
-        with patch("agent.harness.intent.provider_from_config", return_value=provider):
-            result = resolve_action_queue(_state(), text)
-
-        self.assertEqual(provider.complete.call_count, 4)
-        self.assertEqual(result["actions"][0]["type"], "answer_opening_question")
-        self.assertEqual(result["actions"][0]["topic"], "current_config")
-
-    def test_final_malformed_admission_stops_at_four_calls(self) -> None:
-        from agent.harness.intent import resolve_action_queue
-
-        text = "Explain the current configuration."
-        document = _single_action_document(
-            {
-                "type": "answer_opening_question",
-                "topic": "current_config",
-                "source_evidence": text,
-            },
-            text,
-        )
-
-        def reject(request: Any) -> SimpleNamespace:
-            payload = _whole_plan_admission_payload(request)
-            payload["action_verdicts"][0]["verdict"] = "reject"
-            payload["action_verdicts"][0]["reason"] = "force the one bounded repair"
-            return SimpleNamespace(text=json.dumps(payload, sort_keys=True))
-
-        provider = _bounded_intent_provider(
-            [document, document],
-            [reject, lambda _request: SimpleNamespace(text='{"plan_hash":"forged"}')],
-        )
-        with patch("agent.harness.intent.provider_from_config", return_value=provider):
-            result = resolve_action_queue(_state(), text)
-
-        self.assertEqual(provider.complete.call_count, 4)
-        self.assertEqual(result["actions"][0]["type"], "clarify_unresolved")
-
-    def test_pending_option_keeps_single_rpc_effect_behind_canonical_contract(self) -> None:
-        from agent.harness.domains.chain_rpc import question_for_chain_rpc
-        from agent.harness.intent import resolve_action_queue
-
-        state = _state(
-            active_group="workload_rpc",
-            target_mode="fake-node",
-            workflow_mode="rpc_benchmark",
-            chain_identity={"raw": "bsc", "canonical": "bsc", "status": "confirmed", "case": "case1"},
-            confirmed_config={"BLOCKCHAIN_NODE": "bsc"},
-        )
-        state["pending_question"] = question_for_chain_rpc(state, "workload_rpc") or {}
-        text = "I only need one RPC method."
-        provider = _bounded_intent_provider([
-            _single_action_document(
-                {
-                    "type": "answer_pending",
-                    "answer": "single",
-                    "selected_value": "single",
-                    "source_evidence": text,
-                },
-                text,
-            ),
-        ])
-        with patch("agent.harness.intent.provider_from_config", return_value=provider):
-            result = resolve_action_queue(state, text)
-
-        self.assertEqual(provider.complete.call_count, 2)
-        self.assertEqual(result["actions"][0]["type"], "answer_pending")
-        self.assertEqual(result["actions"][0]["selected_value"], "single")
-        self.assertTrue(result["actions"][0]["pending_option_semantic_verified"])
-        self.assertEqual(result["pending_choice_contracts"][0]["option"]["selected_value"], "single")
-
-    def test_pending_owner_action_is_normalized_to_canonical_mixed_choice(self) -> None:
-        from agent.harness.domains.chain_rpc import question_for_chain_rpc
-        from agent.harness.intent import resolve_action_queue
-
-        state = _state(
-            active_group="workload_rpc",
-            target_mode="fake-node",
-            workflow_mode="rpc_benchmark",
-            chain_identity={"raw": "bsc", "canonical": "bsc", "status": "confirmed", "case": "case1"},
-            confirmed_config={"BLOCKCHAIN_NODE": "bsc"},
-        )
-        state["pending_question"] = question_for_chain_rpc(state, "workload_rpc") or {}
-        text = "Use several weighted RPC methods."
-        provider = _bounded_intent_provider([
-            _single_action_document(
-                {
-                    "type": "set_rpc_mode",
-                    "rpc_mode": "mixed",
-                    "mutation_explicit": True,
-                    "source_evidence": text,
-                },
-                text,
-            ),
-        ])
-        with patch("agent.harness.intent.provider_from_config", return_value=provider):
-            result = resolve_action_queue(state, text)
-
-        self.assertEqual(provider.complete.call_count, 2)
-        self.assertEqual(result["actions"][0]["type"], "answer_pending")
-        self.assertEqual(result["actions"][0]["selected_value"], "mixed")
-        self.assertTrue(result["actions"][0]["pending_option_semantic_verified"])
-        self.assertEqual(result["pending_choice_contracts"][0]["option"]["selected_value"], "mixed")
-
-    def test_pending_manual_value_is_typed_grounded_and_admitted(self) -> None:
-        from agent.harness.intent import resolve_action_queue
-
-        state = _state(
-            active_group="provider_deployment",
-            pending_question={
-                "id": "CLOUD_REGION",
-                "group": "provider_deployment",
-                "kind": "manual_value",
-                "field": "CLOUD_REGION",
-                "manual_input_allowed": True,
-                "options": [],
-                "accepted_action_types": ["answer_pending"],
-                "validation": {"value_type": "scalar_token"},
-            },
-        )
-        text = "Use us-east1 for this run."
-        provider = _bounded_intent_provider([
-            _single_action_document(
-                {
-                    "type": "answer_pending",
-                    "answer": "us-east1",
-                    "source_evidence": "us-east1",
-                },
-                text,
-            ),
-        ], candidate_selector=_select_unique_operation_candidate)
-        with patch("agent.harness.intent.provider_from_config", return_value=provider):
-            result = resolve_action_queue(state, text)
-
-        self.assertEqual(provider.complete.call_count, 2)
-        self.assertEqual(result["actions"][0]["type"], "answer_pending")
-        self.assertEqual(result["actions"][0]["answer"], "us-east1")
-        self.assertTrue(result["actions"][0]["pending_option_semantic_verified"])
-        self.assertTrue(result["actions"][0]["semantic_purpose_verified"])
-
-    def test_unresolved_candidate_fails_closed_without_unit_retries(self) -> None:
-        from agent.harness.intent import resolve_action_queue
-
-        text = "Choose whichever workload is suitable."
-        unresolved = _single_action_document(
-            {
-                "type": "clarify_unresolved",
-                "clauses": [text],
-            },
-            text,
-            disposition="unresolved",
-        )
-        provider = _bounded_intent_provider([unresolved, unresolved])
-        with patch("agent.harness.intent.provider_from_config", return_value=provider):
-            result = resolve_action_queue(_state(), text)
-
-        self.assertEqual(provider.complete.call_count, 2)
-        self.assertEqual(result["actions"][0]["type"], "clarify_unresolved")
-
-    def test_rpc_mode_comparison_remains_read_only(self) -> None:
-        from agent.harness.domains.chain_rpc import question_for_chain_rpc
-        from agent.harness.intent import resolve_action_queue
-
-        state = _state(
-            active_group="workload_rpc",
-            target_mode="fake-node",
-            workflow_mode="rpc_benchmark",
-            chain_identity={"raw": "bsc", "canonical": "bsc", "status": "confirmed", "case": "case1"},
-            confirmed_config={"BLOCKCHAIN_NODE": "bsc"},
-        )
-        state["pending_question"] = question_for_chain_rpc(state, "workload_rpc") or {}
-        text = "How do single and mixed differ?"
-        provider = _bounded_intent_provider([
-            _single_action_document(
-                {
-                    "type": "answer_opening_question",
-                    "topic": "mode_comparison",
-                    "source_evidence": text,
-                },
-                text,
-            ),
-        ])
-        with patch("agent.harness.intent.provider_from_config", return_value=provider):
-            result = resolve_action_queue(state, text)
-
-        self.assertEqual(provider.complete.call_count, 2)
-        self.assertEqual(result["actions"][0]["type"], "answer_opening_question")
-        self.assertFalse(any(action.get("type") == "set_rpc_mode" for action in result["actions"]))
-
-    def test_payload_free_custom_rpc_entry_uses_two_calls(self) -> None:
-        from agent.harness.intent import resolve_action_queue
-
-        text = "I need to supply my own RPC method instead of the template defaults."
-        provider = _bounded_intent_provider([
-            _single_action_document(
-                {
-                    "type": "rpc_catalog_command",
-                    "catalog_command": "enter",
-                    "source_evidence": text,
-                },
-                text,
-            ),
-        ])
-        with patch("agent.harness.intent.provider_from_config", return_value=provider):
-            result = resolve_action_queue(_state(), text)
-
-        self.assertEqual(provider.complete.call_count, 2)
-        self.assertEqual(result["actions"][0]["type"], "rpc_catalog_command")
-        self.assertEqual(result["actions"][0]["catalog_command"], "enter")
-
-    def test_provider_call_count_is_constant_for_one_through_twenty_units(self) -> None:
-        from agent.harness.intent import resolve_action_queue
-        from agent.harness.plan_coverage import segment_user_turn
-
-        for count in range(1, 21):
-            with self.subTest(unit_count=count):
-                text = " ".join(f"Question {index}?" for index in range(1, count + 1))
-                clauses = segment_user_turn(text)
-                self.assertEqual(len(clauses), count)
-                document = {
-                    "actions": [{
-                        "type": "answer_opening_question",
-                        "topic": "capabilities",
-                        "source_evidence": clauses[0].text,
-                    }],
-                    "semantic_units": [
-                        {
-                            "unit_id": f"unit-{index}",
-                            "clause_id": clause.clause_id,
-                            "source_text": clause.text,
-                            "disposition": "action",
-                            "action_indexes": [0],
-                            "reason": "one complete consultation",
-                        }
-                        for index, clause in enumerate(clauses, start=1)
-                    ],
-                }
-                provider = _bounded_intent_provider([document])
-                with patch("agent.harness.intent.provider_from_config", return_value=provider):
-                    result = resolve_action_queue(_state(), text)
-                self.assertEqual(provider.complete.call_count, 2)
-                self.assertEqual(result["actions"][0]["type"], "answer_opening_question")
-
-    def test_provider_call_count_is_constant_for_one_through_twenty_actions(self) -> None:
-        from agent.harness.intent import resolve_action_queue
-        from agent.harness.plan_coverage import segment_user_turn
-
-        for count in range(1, 21):
-            with self.subTest(action_count=count):
-                text = " ".join(f"Question {index}?" for index in range(1, count + 1))
-                clauses = segment_user_turn(text)
-                document = {
-                    "actions": [
-                        {
-                            "type": "answer_opening_question",
-                            "topic": "capabilities",
-                            "subject": f"question-{index}",
-                            "source_evidence": clause.text,
-                        }
-                        for index, clause in enumerate(clauses, start=1)
-                    ],
-                    "semantic_units": [
-                        {
-                            "unit_id": f"unit-{index}",
-                            "clause_id": clause.clause_id,
-                            "source_text": clause.text,
-                            "disposition": "action",
-                            "action_indexes": [index - 1],
-                            "reason": "one independently owned consultation",
-                        }
-                        for index, clause in enumerate(clauses, start=1)
-                    ],
-                }
-                provider = _bounded_intent_provider([document])
-                with patch("agent.harness.intent.provider_from_config", return_value=provider):
-                    result = resolve_action_queue(_state(), text)
-                self.assertEqual(provider.complete.call_count, 2)
-                self.assertEqual(len(result["actions"]), count)
-
-    def test_runtime_resolver_has_no_old_serial_adjudicator_path(self) -> None:
-        import inspect
-
-        from agent.harness.intent import resolve_action_queue
-
-        source = inspect.getsource(resolve_action_queue)
-        obsolete_runtime_calls = {
-            "_recover_omitted_chain_selection",
-            "_recover_declared_pending_option_semantics",
-            "_adjudicate_pending_action_ownership",
-            "_adjudicate_group_navigation_actions",
-            "_adjudicate_chain_selection_actions",
-            "_adjudicate_target_mode_actions",
-            "_adjudicate_consultation_actions",
-            "_reconstruct_missing_semantic_units",
-            "_validate_semantic_fulfillment",
-            "_challenge_and_validate_registry_inventory",
-            "_finalize_structured_syntax_authority",
-        }
-        for name in obsolete_runtime_calls:
-            with self.subTest(helper=name):
-                self.assertNotIn(name, source)
-
-    def test_multiline_structured_and_prose_units_share_one_whole_plan_review(self) -> None:
-        from agent.harness.intent import resolve_action_queue
-
-        text = (
-            "Apply these values:\n"
-            "CLOUD_REGION=us-east1\n"
-            "MACHINE_TYPE=n2-standard-8\n"
-            "Then tell me what remains?"
-        )
-        provider = Mock()
-
-        def complete(request: Any) -> SimpleNamespace:
-            payload = json.loads(request.messages[1].content)
-            if "plan_hash" in payload:
-                return _whole_plan_admission_response(request)
-            structured = payload["structured_candidates"][0]
-            structured_clause_id = structured["clause_id"]
-            actions = [
-                {
-                    "type": "propose_config_values",
-                    "config_values": structured["config_values"],
-                    "unmapped_values": structured.get("unmapped_values") or {},
-                    "conflicts": [],
-                    "source_format": structured["source_format"],
-                    "source_evidence": next(
-                        clause["text"]
-                        for clause in payload["clauses"]
-                        if clause["clause_id"] == structured_clause_id
-                    ),
-                },
-                {
-                    "type": "answer_opening_question",
-                    "topic": "next_action",
-                    "source_evidence": "Then tell me what remains?",
-                },
-            ]
-            units = [
-                {
-                    "unit_id": f"unit-{index}",
-                    "clause_id": clause["clause_id"],
-                    "source_text": clause["text"],
-                    "disposition": "action",
-                    "action_indexes": [0] if clause["input_shape"] == "structured" else [1],
-                    "reason": "structured configuration or follow-up consultation",
-                }
-                for index, clause in enumerate(payload["clauses"], start=1)
-            ]
-            return SimpleNamespace(text=json.dumps({
-                "actions": actions,
-                "semantic_units": units,
-            }, sort_keys=True))
-
-        provider.complete.side_effect = complete
-        with patch("agent.harness.intent.provider_from_config", return_value=provider):
-            result = resolve_action_queue(_state(), text)
-
-        self.assertEqual(provider.complete.call_count, 2)
-        self.assertEqual(
-            [action["type"] for action in result["actions"]],
-            ["propose_config_values", "answer_opening_question"],
-        )
-        self.assertEqual(
-            result["actions"][0]["config_values"],
-            {"CLOUD_REGION": "us-east1", "MACHINE_TYPE": "n2-standard-8"},
-        )
-
-    def test_group_jump_and_field_mutation_remain_one_immutable_ordered_plan(self) -> None:
-        from agent.harness.intent import resolve_action_queue
-
-        first = "Open the QPS configuration."
-        second = "I also need to replace CLOUD_REGION."
-        text = f"{first} {second}"
-        provider = _bounded_intent_provider([{
-            "actions": [
-                {
-                    "type": "change_group",
-                    "group": "qps_profile",
-                    "navigation_explicit": True,
-                    "source_evidence": first,
-                },
-                {
-                    "type": "request_config_field_input",
-                    "config_field": "CLOUD_REGION",
-                    "source_evidence": second,
-                },
-            ],
-            "semantic_units": [
-                {
-                    "unit_id": "unit-1",
-                    "clause_id": "clause-1",
-                    "source_text": first,
-                    "disposition": "action",
-                    "action_indexes": [0],
-                    "reason": "explicit group jump",
-                },
-                {
-                    "unit_id": "unit-2",
-                    "clause_id": "clause-2",
-                    "source_text": second,
-                    "disposition": "action",
-                    "action_indexes": [1],
-                    "reason": "registered field mutation intake",
-                },
-            ],
-        }])
-        with patch("agent.harness.intent.provider_from_config", return_value=provider):
-            result = resolve_action_queue(_state(), text)
-
-        self.assertEqual(provider.complete.call_count, 2)
-        self.assertEqual(
-            [action["type"] for action in result["actions"]],
-            ["change_group", "request_config_field_input"],
-        )
-        self.assertTrue(result["actions"][0]["group_navigation_semantic_verified"])
-        self.assertTrue(result["actions"][1]["semantic_purpose_verified"])
 
 
     def test_harness_replaces_duplicate_model_action_ids(self) -> None:
@@ -4082,22 +3856,6 @@ class HarnessStateInvariantTest(unittest.TestCase):
 
         self.assertFalse(_action_answers_pending_contract(state, invented))
 
-    def test_distinct_consultation_topics_are_not_dropped_after_coverage(self) -> None:
-        from agent.harness.admission import _drop_conflicting_answer_actions
-
-        actions = [
-            {"type": "answer_opening_question", "topic": "current_config"},
-            {"type": "answer_opening_question", "topic": "requirements"},
-            {"type": "answer_opening_question", "topic": "workflow"},
-            {"type": "answer_opening_question", "topic": "mode_comparison"},
-        ]
-
-        filtered = _drop_conflicting_answer_actions(_state(), actions)
-        self.assertEqual(
-            [item["topic"] for item in filtered],
-            ["current_config", "requirements", "workflow", "mode_comparison"],
-        )
-
     def test_config_review_overlay_restores_the_interrupted_typed_question(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
 
@@ -4105,6 +3863,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
             "contract_version": 1,
             "id": "custom_rpc_endpoint",
             "group": "endpoint_process",
+            "owner": "chain_rpc",
             "kind": "url",
             "prompt": "Provide validation endpoint.",
             "field": "custom_rpc_endpoint",
@@ -4129,7 +3888,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
                 source,
             )]}
 
-        with patch("agent.harness.coordinator.resolve_action_queue", side_effect=resolved):
+        with patch("tests.agent_live.graph_turn.TEST_SEMANTIC_PLANNER", side_effect=resolved):
             review = process_turn(state)
 
         self.assertEqual(review["pending_question"]["id"], "inferred_config_review")
@@ -4215,6 +3974,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
                 pending_question={
                     "id": "region",
                     "group": "provider_deployment",
+                    "owner": "environment",
                     "kind": "manual_value",
                 },
             ),
@@ -4242,7 +4002,11 @@ class HarnessStateInvariantTest(unittest.TestCase):
             ),
             _state(
                 active_group="network",
-                pending_question={"id": "interface", "group": "network"},
+                pending_question={
+                    "id": "interface",
+                    "group": "network",
+                    "owner": "environment",
+                },
                 invalidated_groups=["network"],
                 group_states={"network": {"status": "reconfiguring"}},
             ),
@@ -4308,6 +4072,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
             pending_question={
                 "id": "case3_protocol_evidence",
                 "group": "chain_identity",
+                "owner": "chain_rpc",
             },
         )
 
@@ -4354,61 +4119,6 @@ class HarnessStateInvariantTest(unittest.TestCase):
         self.assertTrue((override_state.get("custom_rpc") or {}).get("job_local_override"))
         self.assertEqual(default_workload("bsc"), defaults_before)
         self.assertEqual(template_path.read_bytes(), file_before)
-
-    def test_report_analysis_owns_job_status_and_evidence_help_for_the_turn(self) -> None:
-        from agent.harness.admission import _drop_conflicting_answer_actions
-
-        actions = [
-            {"type": "answer_opening_question", "topic": "current_job"},
-            {"type": "answer_opening_question", "topic": "evidence_help"},
-            {"type": "answer_opening_question", "topic": "extension"},
-            {"type": "analyze_report", "subject": "what ran and what cannot be inferred"},
-        ]
-        pruned = _drop_conflicting_answer_actions(_state(), actions)
-        topics = {str(item.get("topic") or "") for item in pruned}
-        self.assertNotIn("current_job", topics)
-        self.assertNotIn("evidence_help", topics)
-        self.assertIn("extension", topics)
-        self.assertTrue(any(item.get("type") == "analyze_report" for item in pruned))
-
-    def test_case3_plan_admission_removes_rpc_catalog_sibling_and_preserves_coverage(self) -> None:
-        import json
-
-        from agent.harness.intent import _apply_state_plan_policy
-
-        source = "Official docs: request envelope contains method_id."
-        payload = {
-            "actions": [
-                {
-                    "type": "secondary_handoff_command",
-                    "handoff_command": "append_evidence",
-                    "handoff_evidence": source,
-                },
-                {
-                    "type": "rpc_catalog_command",
-                    "catalog_command": "set_method",
-                    "rpc_method": "method_id",
-                },
-            ],
-            "semantic_units": [{
-                "unit_id": "unit-1",
-                "clause_id": "clause-1",
-                "source_text": source,
-                "disposition": "action",
-                "action_indexes": [0, 1],
-            }],
-        }
-        state = _state(chain_identity={
-            "canonical": "WeirdP2PChain",
-            "adapter_family": "unsupported",
-            "case": "case3",
-        })
-
-        admitted = json.loads(_apply_state_plan_policy(json.dumps(payload), state))
-
-        self.assertEqual([item["type"] for item in admitted["actions"]], ["secondary_handoff_command"])
-        self.assertEqual(admitted["semantic_units"][0]["action_indexes"], [0])
-        self.assertEqual(admitted["semantic_units"][0]["disposition"], "action")
 
     def test_planner_snapshot_includes_rpc_draft_and_secondary_handoff(self) -> None:
         from agent.harness.context import workflow_snapshot
@@ -4479,7 +4189,12 @@ class HarnessStateInvariantTest(unittest.TestCase):
             ),
         )
 
-        self.assertIn("supported adapter family", result.blocker)
+        self.assertIsNotNone(result.blocker)
+        self.assertEqual(result.blocker.code, "chain_rpc.failure.invalid_operation")
+        self.assertEqual(
+            result.blocker.arguments,
+            {"operation": "rpc_catalog_for_unsupported_family"},
+        )
         self.assertEqual(state["chain_identity"]["case"], "case3")
 
     def test_chain_selection_rejects_status_word_not_present_in_evidence(self) -> None:
@@ -4527,8 +4242,7 @@ class HarnessStateInvariantTest(unittest.TestCase):
         self.assertEqual(lifecycle_rejected_action_indexes(state, reversed_order), (0,))
 
     def test_sync_observe_catalog_plan_fails_closed_before_dispatch(self) -> None:
-        from agent.harness.admission import _validate_action_plan
-        from agent.harness.invariants import StateInvariantError
+        from agent.harness.admission import validate_action_plan
         from agent.harness.state import new_state
 
         state = new_state("sync-catalog-boundary", language="en")
@@ -4545,46 +4259,17 @@ class HarnessStateInvariantTest(unittest.TestCase):
             "options": [],
             "validation": {},
         }
-        with self.assertRaisesRegex(StateInvariantError, "typed lifecycle state"):
-            _validate_action_plan(state, [{
+        result = validate_action_plan(state, [{
                 "type": "rpc_catalog_command",
                 "catalog_command": "set_endpoint",
                 "rpc_endpoint": "http://geth-dev:8545",
                 "source_evidence": "http://geth-dev:8545",
-            }])
-
-    def test_intent_policy_removes_sync_observe_catalog_mutation_for_repair(self) -> None:
-        import json
-
-        from agent.harness.intent import _apply_state_plan_policy
-        from agent.harness.state import new_state
-
-        state = new_state("sync-intent-boundary", language="en")
-        state["target_mode"] = "sync-observe"
-        state["workflow_mode"] = "sync_observe"
-        payload = {
-            "actions": [{
-                "type": "rpc_catalog_command",
-                "catalog_command": "set_endpoint",
-                "rpc_endpoint": "http://geth-dev:8545",
-                "source_evidence": "Use http://geth-dev:8545 for sync observation.",
-            }],
-            "semantic_units": [{
-                "unit_id": "u1",
-                "clause_id": "c1",
-                "source_text": "Use http://geth-dev:8545 for sync observation.",
-                "disposition": "action",
-                "action_indexes": [0],
-                "reason": "endpoint selection",
-            }],
-        }
-
-        result = json.loads(_apply_state_plan_policy(json.dumps(payload), state))
-
-        self.assertEqual(result["actions"], [])
-        self.assertEqual(result["semantic_units"][0]["disposition"], "unresolved")
-        self.assertIn("typed lifecycle state", result["semantic_units"][0]["reason"])
-
+        }])
+        self.assertEqual(result.status, "rejected")
+        self.assertEqual(
+            [item.code for item in result.rejections],
+            ["lifecycle_incompatible"],
+        )
 
 if __name__ == "__main__":
     unittest.main()

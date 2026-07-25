@@ -17,7 +17,7 @@ from ...planners.strategy_planner import (
 
 from ..state import AgentGraphState
 from ..sync_observe_contract import SyncObserveRequest
-from ..contracts import HandlerResult, RecoveryCommand, StateDelta
+from ..contracts import HandlerResult, RecoveryCommand, ResponseFragment, StateDelta
 from ..failures import failure_record_from_job, failure_record_from_preflight
 from .rpc_catalog import validated_contracts_view
 from .rpc_receipts import emit_materialization_receipt
@@ -71,7 +71,10 @@ def execute_approved_preflight_and_smoke(state: AgentGraphState) -> HandlerResul
         return _execution_result(
             state,
             output,
-            visible=_job_message(job_result, prefix="Sync-observe job submitted"),
+            response_fragment=_job_fragment(
+                job_result,
+                message_id="execution.response.sync_observe_submitted",
+            ),
             recovery_command=recovery_command,
         )
 
@@ -120,7 +123,10 @@ def execute_approved_preflight_and_smoke(state: AgentGraphState) -> HandlerResul
         return _execution_result(
             state,
             output,
-            visible=_smoke_message(smoke),
+            response_fragment=_job_fragment(
+                smoke,
+                message_id="execution.response.fake_node_smoke_submitted",
+            ),
             recovery_command=recovery_command,
         )
 
@@ -152,7 +158,10 @@ def execute_approved_preflight_and_smoke(state: AgentGraphState) -> HandlerResul
     return _execution_result(
         state,
         output,
-        visible=_job_message(smoke, prefix="Real-node isolated smoke submitted"),
+        response_fragment=_job_fragment(
+            smoke,
+            message_id="execution.response.real_node_smoke_submitted",
+        ),
         recovery_command=recovery_command,
     )
 
@@ -181,7 +190,12 @@ def execute_approved_final_benchmark(state: AgentGraphState) -> HandlerResult:
         return _execution_result(
             state,
             output,
-            visible=f"Final real-node benchmark was not submitted: {final['error']}",
+            response_fragment=ResponseFragment(
+                kind="warning",
+                message_id="execution.response.final_not_submitted",
+                arguments={"reason": str(final["error"])},
+                source=__name__,
+            ),
             completion="blocked",
         )
     output["job"] = job
@@ -201,7 +215,10 @@ def execute_approved_final_benchmark(state: AgentGraphState) -> HandlerResult:
     return _execution_result(
         state,
         output,
-        visible=_job_message(result, prefix="Final real-node benchmark submitted"),
+        response_fragment=_job_fragment(
+            result,
+            message_id="execution.response.final_benchmark_submitted",
+        ),
     )
 
 
@@ -210,7 +227,7 @@ def _execution_result(
     output: AgentGraphState,
     *,
     recovery_command: RecoveryCommand | None = None,
-    visible: str = "",
+    response_fragment: ResponseFragment | None = None,
     completion: str = "completed",
 ) -> HandlerResult:
     previous_receipt_ids = {
@@ -228,7 +245,7 @@ def _execution_result(
         ),
         recovery_command=recovery_command,
         clear_pending=recovery_command is None,
-        visible_result=visible,
+        response_fragments=(response_fragment,) if response_fragment else (),
         completion=completion,  # type: ignore[arg-type]
         stop_after_response=True,
     )
@@ -468,23 +485,18 @@ def _resolved_recovery_command(
     return RecoveryCommand(operation="resolve", validation_receipt=validation_receipt)
 
 
-def _smoke_message(smoke: dict[str, Any]) -> str:
-    data = smoke.get("data") or {}
-    job = data.get("job") or {}
-    commands = data.get("terminal_commands") or {}
-    command_text = "; ".join(str(value) for value in commands.values())
-    return (
-        f"Fake-node smoke submitted: status={smoke.get('status')}, job_id={job.get('job_id', '<unknown>')}. "
-        f"Use: {command_text or 'jobs/status/logs'}"
-    )
-
-
-def _job_message(result: dict[str, Any], *, prefix: str) -> str:
+def _job_fragment(result: dict[str, Any], *, message_id: str) -> ResponseFragment:
     data = result.get("data") or {}
     job = data.get("job") or {}
     commands = data.get("terminal_commands") or {}
     command_text = "; ".join(str(value) for value in commands.values())
-    return (
-        f"{prefix}: status={result.get('status')}, job_id={job.get('job_id', '<unknown>')}. "
-        f"Use: {command_text or 'jobs/status/logs'}"
+    return ResponseFragment(
+        kind="status",
+        message_id=message_id,
+        arguments={
+            "status": str(result.get("status") or "unknown"),
+            "job_id": str(job.get("job_id") or "<unknown>"),
+            "commands": command_text or "jobs/status/logs",
+        },
+        source=__name__,
     )

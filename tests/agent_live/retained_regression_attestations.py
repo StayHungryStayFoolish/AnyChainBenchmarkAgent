@@ -19,6 +19,53 @@ RELATION_BY_VARIANT = {
 }
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
+_ROLE_EXPECTATIONS: dict[str, tuple[str, str, str]] = {
+    "source_intent": ("unresolved", "unresolved", "unresolved"),
+    "greeting": ("orientation", "read_only", "pending_preserved"),
+    "language_switch_greeting": ("orientation", "read_only", "pending_preserved"),
+    "agent_identity_consultation": ("orientation", "read_only", "pending_preserved"),
+    "agent_origin_consultation": ("orientation", "read_only", "pending_preserved"),
+    "capability_consultation": ("orientation", "read_only", "pending_preserved"),
+    "next_step_consultation": ("orientation", "read_only", "pending_preserved"),
+    "mode_comparison_consultation": ("orientation", "read_only", "pending_preserved"),
+    "workload_consultation": ("orientation", "read_only", "pending_preserved"),
+    "retained_state_consultation": ("orientation", "read_only", "pending_preserved"),
+    "restart_consultation": ("orientation", "read_only", "pending_preserved"),
+    "execution_stage_consultation": ("orientation", "read_only", "pending_preserved"),
+    "execution_evidence_consultation": ("orientation", "read_only", "pending_preserved"),
+    "job_status_consultation": ("orientation", "read_only", "pending_preserved"),
+    "select_real_node": ("chain_rpc", "configuration_mutation", "target_mode_changed"),
+    "request_fake_node_change": ("chain_rpc", "configuration_mutation", "pending_replaced"),
+    "decline_mode_change": ("coordinator", "workflow_state_mutation", "pending_resumed"),
+    "unknown_chain_candidate": ("chain_rpc", "configuration_mutation", "chain_research_started"),
+    "confirm_distinct_chain": ("coordinator", "workflow_state_mutation", "pending_consumed"),
+    "protocol_uncertainty": ("chain_rpc", "workflow_state_mutation", "protocol_intake_started"),
+    "chain_change_request": ("chain_rpc", "configuration_mutation", "chain_changed"),
+    "chain_mode_change_request": ("chain_rpc", "configuration_mutation", "target_mode_changed"),
+    "confirmation": ("coordinator", "workflow_state_mutation", "pending_consumed"),
+    "select_detected_ledger_device": ("environment", "configuration_mutation", "field_confirmed"),
+    "provide_disk_type": ("environment", "configuration_mutation", "field_confirmed"),
+    "confirm_detected_disk_size": ("coordinator", "workflow_state_mutation", "field_confirmed"),
+    "provide_disk_iops": ("environment", "configuration_mutation", "field_confirmed"),
+    "provide_disk_throughput": ("environment", "configuration_mutation", "field_confirmed"),
+    "confirm_detected_network_interface": ("coordinator", "workflow_state_mutation", "field_confirmed"),
+    "backtrack_one_step": ("coordinator", "workflow_navigation", "group_resumed"),
+    "navigate_to_rpc_group": ("coordinator", "workflow_navigation", "group_changed"),
+    "confirm_custom_method": ("coordinator", "workflow_state_mutation", "pending_consumed"),
+    "finish_method_collection": ("chain_rpc", "workflow_state_mutation", "catalog_completed"),
+    "select_single_workload": ("chain_rpc", "configuration_mutation", "workload_changed"),
+    "replace_template_methods": ("chain_rpc", "configuration_mutation", "workload_changed"),
+    "rpc_request_evidence": ("chain_rpc", "configuration_mutation", "evidence_appended"),
+    "rpc_response_evidence": ("chain_rpc", "configuration_mutation", "evidence_appended"),
+    "request_log_analysis": ("analysis", "read_only", "evidence_collection_started"),
+    "multiline_log_evidence": ("analysis", "read_only", "evidence_appended"),
+    "approve_execution": ("coordinator", "workflow_state_mutation", "execution_approved"),
+    "switch_to_sync_observe": ("chain_rpc", "configuration_mutation", "workflow_mode_changed"),
+    "set_sync_observe_duration": ("performance", "configuration_mutation", "duration_changed"),
+    "switch_to_real_node": ("chain_rpc", "configuration_mutation", "workflow_mode_changed"),
+    "multi_group_compound_turn": ("coordinator", "configuration_mutation", "multi_group_committed"),
+}
+
 
 def build_source_contract(case_contract: Mapping[str, Any]) -> dict[str, Any]:
     source_steps = [
@@ -26,6 +73,18 @@ def build_source_contract(case_contract: Mapping[str, Any]) -> dict[str, Any]:
             "step_id": str(step.get("step_id") or ""),
             "turn_index": int(step.get("turn_index") or 0),
             "semantic_role": str(step.get("semantic_role") or ""),
+            "expected_owner": _ROLE_EXPECTATIONS.get(
+                str(step.get("semantic_role") or ""),
+                ("", "", ""),
+            )[0],
+            "expected_effect": _ROLE_EXPECTATIONS.get(
+                str(step.get("semantic_role") or ""),
+                ("", "", ""),
+            )[1],
+            "expected_transition_class": _ROLE_EXPECTATIONS.get(
+                str(step.get("semantic_role") or ""),
+                ("", "", ""),
+            )[2],
         }
         for step in case_contract.get("source_steps") or ()
         if isinstance(step, Mapping)
@@ -98,9 +157,19 @@ def validate_source_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
     for step in steps:
         if (
             not isinstance(step, Mapping)
-            or set(step) != {"step_id", "turn_index", "semantic_role"}
+            or set(step) != {
+                "step_id",
+                "turn_index",
+                "semantic_role",
+                "expected_owner",
+                "expected_effect",
+                "expected_transition_class",
+            }
             or not str(step.get("step_id") or "")
             or not str(step.get("semantic_role") or "")
+            or not str(step.get("expected_owner") or "")
+            or not str(step.get("expected_effect") or "")
+            or not str(step.get("expected_transition_class") or "")
             or isinstance(step.get("turn_index"), bool)
             or not isinstance(step.get("turn_index"), int)
             or int(step["turn_index"]) <= 0

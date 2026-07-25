@@ -13,8 +13,8 @@ from .action_registry import (
     action_merge_key,
     action_execution_phase,
     action_is_turn_local,
+    state_has_capability,
 )
-from .input_values import normalize_target_mode
 from .state import AgentGraphState
 
 
@@ -318,15 +318,6 @@ def action_provisions(action: dict) -> set[str]:
     return set(spec.provides_capabilities if spec else ())
 
 
-def state_has_capability(state: AgentGraphState, capability: str) -> bool:
-    if capability == "chain_identity":
-        identity = state.get("chain_identity") or {}
-        return bool(str(identity.get("canonical") or identity.get("raw") or "").strip())
-    if capability == "target_mode":
-        return bool(normalize_target_mode(state.get("target_mode")))
-    return False
-
-
 def action_can_run_while_pending(
     state: AgentGraphState,
     action: dict,
@@ -363,9 +354,13 @@ def action_can_run_while_pending(
         and (spec.incomplete_mutation_intake or spec.entry_intake)
         and source_is_grounded
     )
+    trusted_runtime_control = bool(
+        spec is not None
+        and spec.internal_only
+    )
     administrative_detour = bool(
         declared_intake_detour
-        or (spec is not None and spec.internal_only)
+        or trusted_runtime_control
         or action_type in {"reset_session", "go_back"}
     )
     explicit_administrative_detour = action_type in {
@@ -387,7 +382,10 @@ def action_can_run_while_pending(
         )
         if barrier_policy == "exclusive_owner":
             if pending_created_this_turn:
-                return action_is_turn_local(action)
+                return bool(
+                    action_is_turn_local(action)
+                    or trusted_runtime_control
+                )
             return bool(
                 action_is_turn_local(action)
                 or explicit_navigation
@@ -398,12 +396,14 @@ def action_can_run_while_pending(
                 action_is_turn_local(action)
                 or explicit_navigation
                 or explicit_administrative_detour
+                or trusted_runtime_control
             )
         if pending_created_this_turn:
             return bool(
                 action_is_turn_local(action)
                 or explicit_navigation
                 or user_grounded_detour
+                or trusted_runtime_control
             )
         return (
             action_is_turn_local(action)

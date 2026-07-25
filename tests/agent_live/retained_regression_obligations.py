@@ -9,6 +9,7 @@ independently verified evidence later.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,9 @@ from tests.agent_live.retained_regression_attestations import (
     validate_variant_contract,
 )
 from tests.agent_live.runtime_checkpoint import reviewed_scenario
+from tests.agent_live.retained_regression_predicates import (
+    POSTCONDITION_EVALUATORS,
+)
 
 
 RETAINED_REGRESSION_SCHEMA_VERSION = 2
@@ -34,6 +38,20 @@ RETAINED_REGRESSION_VARIANTS = (
     "negative",
     "neighboring",
 )
+
+
+def _verifier_binding(postcondition_id: str) -> dict[str, Any]:
+    evaluator = POSTCONDITION_EVALUATORS[postcondition_id]
+    identity = {
+        "module": evaluator.__module__,
+        "qualname": evaluator.__qualname__,
+        "source": inspect.getsource(evaluator),
+    }
+    return {
+        "postcondition_id": postcondition_id,
+        "verifier_version": 1,
+        "implementation_hash": content_hash(identity),
+    }
 RETAINED_REGRESSION_FIXTURE = Path(
     "tests/agent_live/fixtures/real_user_regressions/cases.json"
 )
@@ -71,8 +89,17 @@ _CASE_CONTRACTS: Mapping[str, _CaseContract] = {
     "RR-003": _CaseContract(
         "opening",
         "S1",
-        ("visible_option_action_executed", "current_menu_binding_preserved"),
-        ("unhandled_visible_option", "stale_menu_choice_applied"),
+        (
+            "visible_option_action_executed",
+            "current_menu_binding_preserved",
+            "mode_change_request_routed_from_chain_pending",
+            "declined_mode_change_resumes_chain_pending",
+        ),
+        (
+            "unhandled_visible_option",
+            "stale_menu_choice_applied",
+            "mode_request_consumed_as_chain_identity",
+        ),
     ),
     "RR-004": _CaseContract(
         "chain_manual",
@@ -459,6 +486,14 @@ def _build_obligation(
             "registry_id": POSTCONDITION_REGISTRY_ID,
             "required_postcondition_ids": required,
             "forbidden_postcondition_ids": list(contract.forbidden_postcondition_ids),
+            "required_bindings": [
+                _verifier_binding(postcondition_id)
+                for postcondition_id in required
+            ],
+            "forbidden_bindings": [
+                _verifier_binding(postcondition_id)
+                for postcondition_id in contract.forbidden_postcondition_ids
+            ],
             "required_evidence": [
                 "runtime_turn_events",
                 "checkpoint_state_diff",
@@ -592,6 +627,16 @@ def _validate_verifier_contract(
         raise ValueError(f"case postconditions are missing: {obligation_id}")
     if tuple(contract.forbidden_postcondition_ids) != forbidden:
         raise ValueError(f"case forbidden postconditions changed: {obligation_id}")
+    if verifier.get("required_bindings") != [
+        _verifier_binding(postcondition_id)
+        for postcondition_id in required
+    ]:
+        raise ValueError(f"required verifier bindings changed: {obligation_id}")
+    if verifier.get("forbidden_bindings") != [
+        _verifier_binding(postcondition_id)
+        for postcondition_id in forbidden
+    ]:
+        raise ValueError(f"forbidden verifier bindings changed: {obligation_id}")
     if variant != "exact" and "response_driven_selection_observed" not in required:
         raise ValueError(f"response-driven verifier is missing: {obligation_id}")
     if verifier.get("fixture_expected_text_is_verifier") is not False:

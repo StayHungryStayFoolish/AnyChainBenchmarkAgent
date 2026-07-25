@@ -185,7 +185,7 @@ def _compiled_action_state(
     prepared = deepcopy(dict(state))
     prepared["last_user_input"] = user_text
     with patch(
-        "agent.harness.coordinator.resolve_action_queue",
+        "tests.agent_live.graph_turn.TEST_SEMANTIC_PLANNER",
         return_value={"actions": [dict(action)]},
     ):
         result = invoke_product_graph_turn(prepared)
@@ -1245,7 +1245,12 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
     })
     state = _compiled_action_state(
         state,
-        {"type": "request_chain_selection", "source_evidence": "change chain"},
+        {
+            "type": "change_group",
+            "group": "chain_identity",
+            "navigation_explicit": True,
+            "source_evidence": "change chain",
+        },
         user_text="change chain",
     )
     catalog(

@@ -238,7 +238,6 @@ def _retain_turn_failure(
                 key: state.get(key)
                 for key in (
                     "active_group",
-                    "active_intent",
                     "pending_question",
                     "proposed_actions",
                     "action_queue",

@@ -2,54 +2,44 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict, is_dataclass
+from typing import Mapping
+
+from .contracts import ResponseFragment, response_fragment_from_dict
 from .invariants import validate_state
 from .questions import render_question
-from .state import AgentGraphState, PendingQuestion
+from .response_catalog import render_fragment, render_hash, semantic_hash
+from .state import AgentGraphState
 
 
-def append_active_question_once(state: AgentGraphState) -> None:
-    pending = state.get("pending_question") or {}
-    if not pending:
-        return
-    rendered = render_question(pending, state.get("language", "en"))
-    responses = list(state.get("visible_response") or [])
-    if rendered not in responses and not question_is_actionable_in_responses(responses, pending):
-        responses.append(rendered)
-    state["visible_response"] = responses
+def reset_turn_response(state: AgentGraphState) -> None:
+    """Clear prior terminal output at the start of a new graph turn."""
 
-
-def question_is_actionable_in_responses(
-    responses: list[str],
-    pending: PendingQuestion,
-) -> bool:
-    """Recognize one rendered question across equivalent presenter formats."""
-
-    prompt = str(pending.get("prompt") or "").strip()
-    if not prompt:
-        return False
-    option_labels = [
-        str(option.get("label") or "").strip()
-        for option in pending.get("options") or []
-        if str(option.get("label") or "").strip()
-    ]
-    return any(
-        prompt in response
-        and (not option_labels or all(label in response for label in option_labels))
-        for response in responses
-    )
+    state["visible_response"] = []
+    state["response_fragments"] = []
 
 
 def finalize_turn_response(state: AgentGraphState) -> AgentGraphState:
     """Compose one deduplicated result with at most one actionable question."""
 
     responses: list[str] = []
-    seen: set[str] = set()
-    for item in state.get("visible_response") or []:
-        rendered = str(item or "").strip()
-        if not rendered or rendered in seen:
+    response_manifest: list[dict[str, str]] = []
+    seen_semantics: set[str] = set()
+    for item in state.get("response_fragments") or []:
+        fragment = _response_fragment_from_state(item)
+        rendered_fragment = render_fragment(fragment, state.get("language", "en"))
+        if rendered_fragment.semantic_hash in seen_semantics:
             continue
-        seen.add(rendered)
-        responses.append(rendered)
+        seen_semantics.add(rendered_fragment.semantic_hash)
+        responses.append(rendered_fragment.text)
+        response_manifest.append(
+            {
+                "semantic_hash": rendered_fragment.semantic_hash,
+                "render_hash": rendered_fragment.render_hash,
+                "role": rendered_fragment.kind,
+                "message_id": rendered_fragment.message_id,
+            }
+        )
 
     turn_context = dict(state.get("turn_context") or {})
     pending = state.get("pending_question") or {}
@@ -58,54 +48,59 @@ def finalize_turn_response(state: AgentGraphState) -> AgentGraphState:
         if pending
         else ""
     )
-    for installed in turn_context.get("installed_questions") or []:
-        if not isinstance(installed, dict):
-            continue
-        installed_rendered = render_question(
-            installed,
-            state.get("language", "en"),
-        ).strip()
-        if not installed_rendered or installed_rendered == active_rendered:
-            continue
-        responses = without_superseded_question(
-            responses,
-            installed,
-            state.get("language", "en"),
-        )
     suppress_pending_render = bool(turn_context.pop("suppress_pending_render", False))
     state["turn_context"] = turn_context
     if pending and not suppress_pending_render:
-        actionable = [
-            index
-            for index, response in enumerate(responses)
-            if question_is_actionable_in_responses([response], pending)
-        ]
-        if not actionable:
-            responses.append(render_question(pending, state.get("language", "en")))
-        elif len(actionable) > 1:
-            keep = actionable[0]
-            responses = [
-                response
-                for index, response in enumerate(responses)
-                if index == keep or index not in actionable
-            ]
-    state["visible_response"] = responses
+        pending_semantic_hash = semantic_hash(
+            {
+                "kind": "pending_question",
+                "question": _plain_value(pending),
+            }
+        )
+        if pending_semantic_hash not in seen_semantics:
+            seen_semantics.add(pending_semantic_hash)
+            responses.append(active_rendered)
+            response_manifest.append(
+                {
+                    "semantic_hash": pending_semantic_hash,
+                    "render_hash": render_hash(active_rendered),
+                    "role": "pending_question",
+                    "message_id": str(pending.get("id") or ""),
+                }
+            )
+    terminal_response = "\n".join(responses).strip()
+    state["visible_response"] = [terminal_response] if terminal_response else []
+    state["response_fragments"] = []
+    turn_context = dict(state.get("turn_context") or {})
+    turn_context["response_manifest"] = response_manifest
+    turn_context["terminal_semantic_hash"] = (
+        semantic_hash(
+            [item["semantic_hash"] for item in response_manifest]
+        )
+        if response_manifest
+        else ""
+    )
+    turn_context["terminal_response_hash"] = (
+        render_hash(terminal_response) if terminal_response else ""
+    )
+    state["turn_context"] = turn_context
     validate_state(state)
     return state
 
 
-def without_superseded_question(
-    responses: list[str],
-    previous_pending: PendingQuestion,
-    language: str,
-) -> list[str]:
-    """Remove only a superseded question while retaining domain evidence."""
+def _response_fragment_from_state(item: object) -> ResponseFragment:
+    if isinstance(item, ResponseFragment):
+        return item
+    if not isinstance(item, Mapping):
+        raise TypeError("response_fragments entries must be typed mappings")
+    return response_fragment_from_dict(item)
 
-    if not previous_pending:
-        return responses
-    candidates = {
-        str(previous_pending.get("prompt") or "").strip(),
-        render_question(previous_pending, language).strip(),
-    }
-    candidates.discard("")
-    return [response for response in responses if str(response).strip() not in candidates]
+
+def _plain_value(value: object) -> object:
+    if is_dataclass(value):
+        return asdict(value)
+    if isinstance(value, Mapping):
+        return {str(key): _plain_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_value(item) for item in value]
+    return value

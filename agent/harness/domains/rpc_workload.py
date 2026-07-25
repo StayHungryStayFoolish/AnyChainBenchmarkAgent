@@ -8,8 +8,8 @@ from ..input_values import (
     normalize_scalar,
     parse_weight_spec_for_methods,
 )
-from ..localization import localized
 from ..state import AgentGraphState
+from .response_fragments import ResponseCollector, emit
 
 from agent.validators.rpc_workload import default_workload
 from agent.validators.fixture_checks import validate_effective_fake_node_workload
@@ -17,8 +17,13 @@ from .chain_rpc_support import _case_dict, _format_weights, _invalidate_executio
 from .rpc_catalog import catalog_method_names, finish_catalog, reset_draft
 from .rpc_receipts import emit_workload_commit_receipt
 
-def _apply_continue(state: AgentGraphState, question_id: str, value: Any) -> None:
-    case = "new_chain" if question_id.startswith("new_chain") else "custom_rpc"
+def _apply_continue(
+    state: AgentGraphState,
+    case: str,
+    value: Any,
+    *,
+    responses: ResponseCollector,
+) -> None:
     case_dict = _case_dict(state, case)
     if value == "add_another":
         reset_draft(state)
@@ -44,8 +49,13 @@ def _apply_continue(state: AgentGraphState, question_id: str, value: Any) -> Non
     state['active_group'] = "endpoint_process"
 
 
-def _apply_scope(state: AgentGraphState, question_id: str, value: Any) -> None:
-    case = "new_chain" if question_id.startswith("new_chain") else "custom_rpc"
+def _apply_scope(
+    state: AgentGraphState,
+    case: str,
+    value: Any,
+    *,
+    responses: ResponseCollector,
+) -> None:
     case_dict = _case_dict(state, case)
     state['active_group'] = "endpoint_process"
     scope_key = "workload_scope" if case == "new_chain" else "scope"
@@ -55,12 +65,18 @@ def _apply_scope(state: AgentGraphState, question_id: str, value: Any) -> None:
         if len(methods) > 1:
             case_dict["status"] = "existing_family_needs_single_method" if case == "new_chain" else "needs_single_method"
         elif methods:
-            _set_single_workload(state, methods[0], case)
+            _set_single_workload(state, methods[0], case, responses=responses)
         return
     case_dict["status"] = "existing_family_needs_weights" if case == "new_chain" else "needs_weights"
 
 
-def _set_single_workload(state: AgentGraphState, method: str, case: str) -> None:
+def _set_single_workload(
+    state: AgentGraphState,
+    method: str,
+    case: str,
+    *,
+    responses: ResponseCollector,
+) -> None:
     case_dict = _case_dict(state, case)
     state["rpc_mode"] = "single"
     state["workload"] = {
@@ -79,8 +95,13 @@ def _set_single_workload(state: AgentGraphState, method: str, case: str) -> None
     _invalidate_execution(state)
 
 
-def _apply_weights(state: AgentGraphState, question_id: str, value: Any) -> None:
-    case = "new_chain" if question_id.startswith("new_chain") else "custom_rpc"
+def _apply_weights(
+    state: AgentGraphState,
+    case: str,
+    value: Any,
+    *,
+    responses: ResponseCollector,
+) -> None:
     case_dict = _case_dict(state, case)
     validated = catalog_method_names(state)
     parse_methods = validated
@@ -88,10 +109,13 @@ def _apply_weights(state: AgentGraphState, question_id: str, value: Any) -> None
         chain = normalize_scalar((state.get("chain_identity") or {}).get("canonical"))
         parse_methods = list(default_workload(chain).get("methods") or []) if chain else []
     weights = parse_weight_spec_for_methods(value, parse_methods)
-    language = state.get("language", "en")
     if not weights:
         case_dict["status"] = "existing_family_needs_weights" if case == "new_chain" else "needs_weights"
-        state['visible_response'] = [localized(language, "没有识别到唯一且有效的权重映射。请使用 JSON/YAML 映射或 `method=weight,method2=weight2`，并确保没有相互冲突的多份映射。", "No unique valid weight mapping was found. Use a JSON/YAML mapping or `method=weight,method2=weight2`, and do not provide conflicting mappings.")]
+        emit(
+            responses,
+            "chain_rpc.response.weights_unrecognized",
+            source=__name__,
+        )
         return
     total = sum(weights.values())
     missing, unknown, invalid = _weight_contract_violations(
@@ -104,16 +128,15 @@ def _apply_weights(state: AgentGraphState, question_id: str, value: Any) -> None
     if case == "new_chain":
         if missing or unknown or invalid or total != 100:
             case_dict.update({"status": "existing_family_needs_weights", "weights": weights})
-            details = []
-            if missing:
-                details.append(localized(language, f"缺少已验证 method：{', '.join(missing)}", f"Missing validated method: {', '.join(missing)}"))
-            if unknown:
-                details.append(localized(language, f"包含未验证 method：{', '.join(unknown)}", f"Contains unverified method: {', '.join(unknown)}"))
-            if invalid:
-                details.append(localized(language, f"权重必须是正整数：{', '.join(invalid)}", f"Weights must be positive integers: {', '.join(invalid)}"))
-            if total != 100:
-                details.append(localized(language, f"权重总和为 {total}，必须等于 100", f"Weight total is {total}; it must equal 100"))
-            state['visible_response'] = [localized(language, f"新链 mixed 权重需要调整：{'; '.join(details)}。当前配置：{_format_weights(weights)}。请重新输入。", f"New-chain mixed weights need adjustment: {'; '.join(details)}. Current weights: {_format_weights(weights)}. Enter the weights again.")]
+            _emit_weight_error(
+                responses,
+                case_label="New-chain",
+                missing=missing,
+                unknown=unknown,
+                invalid=invalid,
+                total=total,
+                weights=weights,
+            )
             return
         replace_defaults = True
         choice = "new_chain_verified_methods"
@@ -121,16 +144,15 @@ def _apply_weights(state: AgentGraphState, question_id: str, value: Any) -> None
         scope = normalize_scalar(case_dict.get("scope"))
         if missing or unknown or invalid or total != 100:
             case_dict.update({"status": "needs_weights", "weights": weights})
-            details = []
-            if missing:
-                details.append(localized(language, f"缺少 workload method：{', '.join(sorted(missing))}", f"Missing workload method: {', '.join(sorted(missing))}"))
-            if unknown:
-                details.append(localized(language, f"未知 method（既不是已验证自定义 method，也不是模板默认 method）：{', '.join(unknown)}", f"Unknown method (neither a validated custom method nor a template default): {', '.join(unknown)}"))
-            if invalid:
-                details.append(localized(language, f"权重必须是正整数：{', '.join(invalid)}", f"Weights must be positive integers: {', '.join(invalid)}"))
-            if total != 100:
-                details.append(localized(language, f"权重总和为 {total}，必须等于 100", f"Weight total is {total}; it must equal 100"))
-            state['visible_response'] = [localized(language, f"自定义 RPC mixed 权重需要调整：{'; '.join(details)}。当前配置：{_format_weights(weights)}。请重新输入。", f"Custom RPC mixed weights need adjustment: {'; '.join(details)}. Current weights: {_format_weights(weights)}. Enter the weights again.")]
+            _emit_weight_error(
+                responses,
+                case_label="Custom RPC",
+                missing=missing,
+                unknown=unknown,
+                invalid=invalid,
+                total=total,
+                weights=weights,
+            )
             return
         replace_defaults = scope == "mixed_replace"
         choice = "custom_rpc"
@@ -151,10 +173,24 @@ def _apply_weights(state: AgentGraphState, question_id: str, value: Any) -> None
     state['active_group'] = _completed_workload_group(state, case)
     _invalidate_execution(state)
     if case == "custom_rpc":
-        state['visible_response'] = list(state.get("visible_response") or []) + [localized(language, f"自定义 RPC mixed workload 已确认：{_format_weights(weights)}；模板默认 methods {'会被替换' if replace_defaults else '会被保留并追加'}。", f"Custom RPC mixed workload confirmed: {_format_weights(weights)}; template default methods will be {'replaced' if replace_defaults else 'kept and appended'}.")]
+        emit(
+            responses,
+            (
+                "chain_rpc.response.custom_mixed_workload_replaced"
+                if replace_defaults
+                else "chain_rpc.response.custom_mixed_workload_merged"
+            ),
+            arguments={"weights": _format_weights(weights)},
+            payload={"replace_defaults": replace_defaults},
+            source=__name__,
+        )
 
 
-def _apply_requested_workload(state: AgentGraphState) -> bool:
+def _apply_requested_workload(
+    state: AgentGraphState,
+    *,
+    responses: ResponseCollector,
+) -> bool:
     custom = state.setdefault("custom_rpc", {})
     request = custom.get("requested_workload")
     if not isinstance(request, dict) or not request.get("finish_methods"):
@@ -170,8 +206,18 @@ def _apply_requested_workload(state: AgentGraphState) -> bool:
         if len(methods) > 1:
             custom["status"] = "needs_single_method"
             return True
-        _set_single_workload(state, methods[0], "custom_rpc")
-        state['visible_response'] = list(state.get("visible_response") or []) + [localized(state.get("language", "en"), f"自定义 RPC single workload 已确认：{methods[0]}；模板默认 method 会被替换。", f"Custom RPC single workload confirmed: {methods[0]}; the template default method will be replaced.")]
+        _set_single_workload(
+            state,
+            methods[0],
+            "custom_rpc",
+            responses=responses,
+        )
+        emit(
+            responses,
+            "chain_rpc.response.custom_single_workload_confirmed",
+            arguments={"method": methods[0]},
+            source=__name__,
+        )
         return True
     if scope in {"mixed_replace", "mixed_add"} and isinstance(request.get("weights"), dict):
         raw_weights = request["weights"]
@@ -198,13 +244,54 @@ def _apply_requested_workload(state: AgentGraphState) -> bool:
         state['active_group'] = "target_samples_fixtures" if _fixtures_block(state) else "workload_rpc"
         _invalidate_execution(state)
         replaced = scope == "mixed_replace"
-        state['visible_response'] = list(state.get("visible_response") or []) + [localized(state.get("language", "en"), f"自定义 RPC mixed workload 已确认：{_format_weights(weights)}；模板默认 methods {'会被替换' if replaced else '已合并到最终权重'}。", f"Custom RPC mixed workload confirmed: {_format_weights(weights)}; template default methods were {'replaced' if replaced else 'merged into the final weights'}.")]
+        emit(
+            responses,
+            (
+                "chain_rpc.response.custom_mixed_workload_replaced"
+                if replaced
+                else "chain_rpc.response.custom_mixed_workload_merged"
+            ),
+            arguments={"weights": _format_weights(weights)},
+            payload={"replace_defaults": replaced},
+            source=__name__,
+        )
         return True
     if scope in {"mixed_replace", "mixed_add"}:
         custom.update({"scope": scope, "status": "needs_weights"})
         return True
     custom["status"] = "needs_scope"
     return True
+
+
+def _emit_weight_error(
+    responses: ResponseCollector,
+    *,
+    case_label: str,
+    missing: list[str],
+    unknown: list[str],
+    invalid: list[str],
+    total: int,
+    weights: dict[str, int],
+) -> None:
+    emit(
+        responses,
+        "chain_rpc.response.weights_invalid",
+        arguments={
+            "case_label": case_label,
+            "missing": ", ".join(missing) or "<none>",
+            "unknown": ", ".join(unknown) or "<none>",
+            "invalid": ", ".join(invalid) or "<none>",
+            "total": total,
+            "weights": _format_weights(weights),
+        },
+        payload={
+            "missing": missing,
+            "unknown": unknown,
+            "invalid": invalid,
+            "weights": weights,
+        },
+        source=__name__,
+    )
 
 
 def _refresh_fixture_evidence(state: AgentGraphState, case: str) -> None:

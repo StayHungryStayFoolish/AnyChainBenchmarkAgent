@@ -7,7 +7,7 @@ import re
 from copy import deepcopy
 from typing import Any, Mapping
 
-from ..contracts import ActionProposal, HandlerResult, StateDelta
+from ..contracts import ActionProposal, HandlerResult, ResponseFragment, StateDelta
 from ..input_values import (
     looks_like_url_value,
     normalize_scalar,
@@ -18,8 +18,6 @@ from ..state import AgentGraphState
 from ..transitions import record_group_invalidations
 
 from agent.knowledge.framework_capabilities import load_framework_capabilities
-from agent.planners import question_prompts
-from agent.validators.rpc_workload import default_workload
 
 
 def _adapter_family(state: AgentGraphState) -> str:
@@ -170,6 +168,26 @@ def _merge_rpc_schema_draft(
     draft["params"] = _normalize_parameter_descriptors(draft.get("params"), params_json)
     if not draft.get("response_summary"):
         draft["response_summary"] = previous.get("response_summary") or "unknown"
+    response_json_type = normalize_scalar(draft.get("response_json_type")).casefold()
+    previous_response_json_type = normalize_scalar(
+        previous.get("response_json_type")
+    ).casefold()
+    allowed_response_types = {
+        "unknown",
+        "null",
+        "boolean",
+        "string",
+        "number",
+        "array",
+        "object",
+    }
+    draft["response_json_type"] = (
+        response_json_type
+        if response_json_type in allowed_response_types
+        else previous_response_json_type
+        if previous_response_json_type in allowed_response_types
+        else "unknown"
+    )
     if not isinstance(draft.get("response_fields"), list):
         draft["response_fields"] = list(previous.get("response_fields") or [])
     return draft
@@ -213,7 +231,6 @@ def _looks_like_rest_method(value: str) -> bool:
     return bool(
         re.match(r"^(?:GET|POST|PUT|PATCH|DELETE)\s+/", text, re.IGNORECASE)
         or text.startswith("/")
-        or any(token in text.casefold() for token in (" path parameter", "query parameter", "get blocks by", "post ", "rest api"))
     )
 
 
@@ -266,17 +283,6 @@ def _schema_confirmation_prompt(language: str, draft: dict[str, Any]) -> str:
     )
 
 
-def _workload_default_prompt(state: AgentGraphState) -> str:
-    language = str(state.get("language") or "en")
-    chain = normalize_scalar((state.get("chain_identity") or {}).get("canonical"))
-    rpc_mode = normalize_scalar(state.get("rpc_mode"))
-    defaults = default_workload(chain) if chain else {}
-    single = normalize_scalar(defaults.get("single")) or "<none>"
-    mixed = ", ".join(f"{row.get('method')}={row.get('weight')}" for row in defaults.get("mixed_weighted") or [] if isinstance(row, dict) and row.get("method")) or "<none>"
-    summary = question_prompts.workload_defaults_summary(chain, rpc_mode, single, mixed, language=language)
-    return localized(language, f"{summary}\n请选择使用默认 workload、添加自定义 RPC method、调整 mixed 权重，或更换链/目标模式。", f"{summary}\nChoose the default workload, add a custom RPC method, adjust mixed weights, or change chain/target mode.")
-
-
 def _weight_example(methods: list[str]) -> str:
     unique = [method for method in dict.fromkeys(normalize_scalar(item) for item in methods) if method]
     if not unique:
@@ -323,13 +329,13 @@ def _result(
     *,
     completion: str = "completed",
     stop: bool = False,
+    response_fragments: tuple[ResponseFragment, ...] = (),
 ) -> HandlerResult:
     _assert_external_state_unchanged(original, state)
     pending = deepcopy(state.get("pending_question") or {})
     previous_pending = deepcopy(original.get("pending_question") or {})
     previous_invalidated = set(original.get("invalidated_groups") or [])
     current_invalidated = set(state.get("invalidated_groups") or [])
-    previous_responses = list(original.get("visible_response") or [])
     previous_errors = list(original.get("action_errors") or [])
     previous_receipt_ids = {
         str(item.get("receipt_id") or "")
@@ -352,11 +358,7 @@ def _result(
             for item in state.get("action_errors") or []
             if item not in previous_errors
         ),
-        visible_results=tuple(
-            str(item)
-            for item in state.get("visible_response") or []
-            if str(item) and item not in previous_responses
-        ),
+        response_fragments=response_fragments,
         pending_question=pending or None,
         clear_pending=bool(previous_pending and not pending),
         next_group=normalize_scalar(pending.get("group") or state.get("active_group")),
@@ -371,12 +373,14 @@ def _answer_result(
     *,
     completion: str = "completed",
     stop: bool = False,
+    response_fragments: tuple[ResponseFragment, ...] = (),
 ) -> HandlerResult:
     return _result(
         original,
         state,
         completion=completion,
         stop=stop,
+        response_fragments=response_fragments,
     )
 
 

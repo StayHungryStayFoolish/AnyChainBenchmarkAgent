@@ -10,7 +10,7 @@
     },
     {
       "path": "tests/agent_live/fixtures/real_user_regressions/variant_contracts.json",
-      "sha256": "4ff3fa50288137ce0697d5c947d0813b39c3f75145a60b8b71e9b8577e046b69",
+      "sha256": "822b56c3d19706f30d8bf1f6a66d69924836ee62540b1c43580e73a9321fa432",
       "case_count": 15,
       "sanitized": true
     }

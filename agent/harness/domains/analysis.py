@@ -23,20 +23,68 @@ from agent.runners.job_manager import (
     tail_job_log,
     verify_job_receipt,
 )
-from ..contracts import ActionProposal, HandlerResult, StateDelta
-from ..intent import analyze_evidence_with_model
+from ..contracts import ActionProposal, HandlerResult, ResponseFragment, StateDelta
+from ..advisory import analyze_evidence_with_model
+from ..input_values import extract_rpc_params_or_request
 from ..localization import localized
 from ..state import AgentGraphState, PendingQuestion
 from .analysis_receipts import (
     emit_analysis_invocation_receipt,
     emit_evidence_block_receipt,
     emit_report_analysis_receipt,
+    analysis_hash,
     evidence_block_id,
 )
+from .response_fragments import failure
 
 
 ANALYSIS_GROUPS = {"error_evidence_analysis", "report_artifact_analysis"}
 JOB_ID_RE = re.compile(r"\bjob_\d{8,}_[0-9a-f]{4,}\b", re.IGNORECASE)
+
+
+def _fragment(
+    message_id: str,
+    *,
+    arguments: Mapping[str, str | int | float | bool | None] | None = None,
+    kind: Literal["message", "status", "evidence", "warning", "error"] = "message",
+    payload: Mapping[str, Any] | None = None,
+) -> ResponseFragment:
+    return ResponseFragment(
+        kind=kind,
+        message_id=message_id,
+        arguments=dict(arguments or {}),
+        payload=dict(payload or {}),
+        source=__name__,
+    )
+
+
+def _analysis_document(
+    text: str,
+    *,
+    source_kind: str,
+    language: str,
+    evidence_hash: str,
+    evidence_paths: list[str] | None = None,
+) -> ResponseFragment:
+    return _fragment(
+        "analysis.model_document",
+        kind="evidence",
+        payload={
+            "text": str(text).strip(),
+            "source_kind": str(source_kind).strip(),
+            "language": str(language).strip(),
+            "evidence_hash": str(evidence_hash).strip(),
+            "evidence_paths": list(evidence_paths or []),
+        },
+    )
+
+
+def _collection_failure(operation: str, required_state: str):
+    return failure(
+        "analysis.failure.collection_state_required",
+        arguments={"operation": operation, "required_state": required_state},
+        source=__name__,
+    )
 
 __all__ = [
     "ANALYSIS_GROUPS",
@@ -99,7 +147,7 @@ def _apply_analysis_action(state: AgentGraphState, action: ActionProposal) -> Ha
     if action.action_type == "start_evidence_collection":
         pending = dict(state.get("pending_question") or {})
         if not pending or str(pending.get("kind") or "") != "evidence":
-            return HandlerResult(blocker="start evidence requires an active evidence question")
+            return HandlerResult(blocker=_collection_failure("start", "active_question"))
         return _collection_result(
             start_evidence_collection(
                 state,
@@ -109,7 +157,7 @@ def _apply_analysis_action(state: AgentGraphState, action: ActionProposal) -> Ha
         )
     if action.action_type == "append_evidence_collection":
         if not state.get("evidence_collection"):
-            return HandlerResult(blocker="append evidence requires an active evidence collection")
+            return HandlerResult(blocker=_collection_failure("append", "active"))
         return _collection_result(
             continue_evidence_collection(
                 state,
@@ -119,7 +167,7 @@ def _apply_analysis_action(state: AgentGraphState, action: ActionProposal) -> Ha
         )
     if action.action_type == "finish_evidence_collection":
         if not state.get("evidence_collection"):
-            return HandlerResult(blocker="finish evidence requires an active evidence collection")
+            return HandlerResult(blocker=_collection_failure("finish", "active"))
         outcome = finish_evidence_collection(
             state,
             state.get("evidence_collection") or {},
@@ -147,8 +195,7 @@ def _apply_analysis_action(state: AgentGraphState, action: ActionProposal) -> Ha
             delta=result.delta,
             consumed_action_ids=(action.action_id,),
             evidence=result.evidence,
-            visible_result=result.visible_result,
-            visible_results=result.visible_results,
+            response_fragments=result.response_fragments,
             clear_pending=result.clear_pending,
             next_group=result.next_group,
             completion=result.completion,
@@ -160,18 +207,20 @@ def _apply_analysis_action(state: AgentGraphState, action: ActionProposal) -> Ha
         if collecting:
             evidence = "\n".join(str(item) for item in collecting.get("lines") or [] if str(item).strip())
         if not evidence:
-            response = evidence_help_response(state)
+            response_fragment = _fragment("analysis.response.evidence_help")
             emit_analysis_invocation_receipt(
                 state,
                 source_kind="missing",
                 evidence="",
                 question=str(action.arguments.get("question") or state.get("last_user_input") or ""),
-                visible_result=response,
+                response_fragments=(response_fragment,),
+                language=str(state.get("language") or "en"),
+                terminal_rendered=True,
                 invoked=False,
             )
             return HandlerResult(
                 consumed_action_ids=(action.action_id,),
-                visible_result=response,
+                response_fragments=(response_fragment,),
                 completion="in_progress",
                 stop_after_response=True,
             )
@@ -180,12 +229,21 @@ def _apply_analysis_action(state: AgentGraphState, action: ActionProposal) -> Ha
             evidence_buffer.append({"text": evidence})
         question = str(action.arguments.get("question") or state.get("last_user_input") or evidence)
         response = analyze_evidence_with_model(state, evidence, question)
+        language = str(state.get("language") or "en")
+        response_fragment = _analysis_document(
+            response,
+            source_kind="active_block" if collecting else "action_argument",
+            language=language,
+            evidence_hash=analysis_hash(evidence),
+        )
         emit_analysis_invocation_receipt(
             state,
             source_kind="active_block" if collecting else "action_argument",
             evidence=evidence,
             question=question,
-            visible_result=response,
+            response_fragments=(response_fragment,),
+            language=language,
+            terminal_rendered=True,
             invoked=True,
             block_id=(
                 evidence_block_id(
@@ -199,11 +257,15 @@ def _apply_analysis_action(state: AgentGraphState, action: ActionProposal) -> Ha
         return HandlerResult(
             delta=StateDelta.set_values({"evidence_buffer": evidence_buffer}) if not collecting else StateDelta(),
             consumed_action_ids=(action.action_id,),
-            visible_result=response,
+            response_fragments=(response_fragment,),
             completion="completed",
             stop_after_response=True,
         )
-    return HandlerResult(blocker=f"unsupported analysis action: {action.action_type}")
+    return HandlerResult(blocker=failure(
+        "analysis.failure.unsupported_action",
+        arguments={"action_type": action.action_type},
+        source=__name__,
+    ))
 
 
 def _collection_result(outcome: EvidenceCollectionOutcome) -> HandlerResult:
@@ -234,7 +296,7 @@ def should_start_evidence_collection(text: str) -> bool:
     if "\n" in raw or "\r" in raw:
         return False
     lowered = raw.lower()
-    if _parse_rpc_params_or_request(raw)[1] is not None:
+    if extract_rpc_params_or_request(raw)[1] is not None:
         return False
     return (
         raw.endswith("\\")
@@ -261,6 +323,7 @@ def start_evidence_collection(
     }
     block_id = evidence_block_id(dict(pending), lines)
     collecting["block_id"] = block_id
+    response_fragment = _fragment("analysis.response.collection_started")
     emit_evidence_block_receipt(
         state,
         operation="start",
@@ -269,6 +332,13 @@ def start_evidence_collection(
         input_text=text,
         input_disposition="accepted",
         status="active",
+        response_fragments=(
+            ()
+            if evidence_collection_complete(lines)
+            else (response_fragment,)
+        ),
+        language=str(state.get("language") or "en"),
+        terminal_rendered=not evidence_collection_complete(lines),
         block_id=block_id,
     )
     if evidence_collection_complete(lines):
@@ -277,11 +347,7 @@ def start_evidence_collection(
         result=HandlerResult(
             delta=StateDelta.set_values({"evidence_collection": collecting}),
             clear_pending=True,
-            visible_result=localized(
-                collecting["language"],
-                "已开始接收多行 RPC 证据。请继续粘贴 request/response/docs；完成后输入 `END`。我会在完整证据后再解析，不会用半截内容改变协议。",
-                "Started collecting multi-line RPC evidence. Continue pasting request/response/docs; type `END` when done. I will parse only complete evidence and will not change protocol from a partial line.",
-            ),
+            response_fragments=(response_fragment,),
             completion="in_progress",
             stop_after_response=True,
         ),
@@ -324,7 +390,7 @@ def continue_evidence_collection(
         return finish_evidence_collection(state, normalized)
 
     if not raw.strip():
-        response = _evidence_waiting_response(language, question)
+        response_fragment = _fragment(_evidence_waiting_message_id(question))
         emit_evidence_block_receipt(
             state,
             operation="ignore",
@@ -333,13 +399,15 @@ def continue_evidence_collection(
             input_text=raw,
             input_disposition="blank_ignored",
             status="active",
-            visible_result=response,
+            response_fragments=(response_fragment,),
+            language=language,
+            terminal_rendered=True,
             block_id=block_id,
         )
         return EvidenceCollectionOutcome(
             result=HandlerResult(
                 delta=StateDelta.set_values({"evidence_collection": normalized}),
-                visible_result=response,
+                response_fragments=(response_fragment,),
                 completion="in_progress",
                 stop_after_response=True,
             ),
@@ -348,6 +416,12 @@ def continue_evidence_collection(
 
     lines.append(raw)
     normalized["lines"] = lines
+    collection_complete = evidence_collection_complete(lines)
+    response_fragment = _fragment(
+        "analysis.response.line_recorded",
+        arguments={"count": len(lines)},
+        kind="status",
+    )
     emit_evidence_block_receipt(
         state,
         operation="append",
@@ -356,18 +430,17 @@ def continue_evidence_collection(
         input_text=raw,
         input_disposition="accepted",
         status="active",
+        response_fragments=() if collection_complete else (response_fragment,),
+        language=language,
+        terminal_rendered=not collection_complete,
         block_id=block_id,
     )
-    if evidence_collection_complete(lines):
+    if collection_complete:
         return finish_evidence_collection(state, normalized)
     return EvidenceCollectionOutcome(
         result=HandlerResult(
             delta=StateDelta.set_values({"evidence_collection": normalized}),
-            visible_result=localized(
-                language,
-                f"已记录第 {len(lines)} 行证据。请继续粘贴，完成后输入 `END`。",
-                f"Recorded evidence line {len(lines)}. Continue pasting, or type `END` when done.",
-            ),
+            response_fragments=(response_fragment,),
             completion="in_progress",
             stop_after_response=True,
         ),
@@ -388,7 +461,7 @@ def prompt_evidence_collection_waiting(
     normalized = {"question": dict(question), "lines": lines, "language": language, "status": "active"}
     block_id = str(active.get("block_id") or "") or evidence_block_id(question, lines)
     normalized["block_id"] = block_id
-    response = _evidence_waiting_response(language, question)
+    response_fragment = _fragment(_evidence_waiting_message_id(question))
     previous_ids = _control_receipt_ids(state)
     emit_evidence_block_receipt(
         state,
@@ -397,13 +470,15 @@ def prompt_evidence_collection_waiting(
         lines=lines,
         input_disposition="blank_ignored",
         status="active",
-        visible_result=response,
+        response_fragments=(response_fragment,),
+        language=language,
+        terminal_rendered=True,
         block_id=block_id,
     )
     return HandlerResult(
         delta=StateDelta.set_values({"evidence_collection": normalized}),
         control_receipts=_control_receipts_since(state, previous_ids),
-        visible_result=response,
+        response_fragments=(response_fragment,),
         completion="in_progress",
         stop_after_response=True,
     )
@@ -426,10 +501,9 @@ def finish_evidence_collection(
         "evidence_collection": {},
     }
     if not question or not lines:
-        response = localized(
-            language,
-            "没有可解析的多行证据。请重新提供 request/response/docs，或直接输入 params JSON。",
-            "No parseable multi-line evidence was collected. Provide request/response/docs again, or enter params JSON directly.",
+        response_fragment = _fragment(
+            "analysis.response.collection_empty",
+            kind="warning",
         )
         emit_evidence_block_receipt(
             state,
@@ -438,14 +512,16 @@ def finish_evidence_collection(
             lines=lines,
             input_disposition="completion",
             status="empty",
-            visible_result=response,
+            response_fragments=(response_fragment,),
+            language=language,
+            terminal_rendered=True,
             block_id=block_id,
         )
         return EvidenceCollectionOutcome(
             result=HandlerResult(
                 delta=StateDelta.set_values(values),
                 clear_pending=True,
-                visible_result=response,
+                response_fragments=(response_fragment,),
                 completion="blocked",
                 stop_after_response=True,
             ),
@@ -457,17 +533,18 @@ def finish_evidence_collection(
         evidence_buffer = [dict(item) for item in list(state.get("evidence_buffer") or [])]
         evidence_buffer.append({"text": collected_text})
         values["evidence_buffer"] = evidence_buffer
-        response = localized(
-            language,
-            f"已保存 {len(lines)} 行错误/日志证据。你可以继续问我分析原因，或让我基于这些证据生成修复/重试建议。",
-            f"Saved {len(lines)} lines of error/log evidence. You can ask me to analyze the cause or generate a fix/retry plan from it.",
-        )
-        if analysis_requested:
-            response += "\n" + localized(
-                language,
-                "这类内容会作为错误/日志证据分析；如果你希望继续配置 benchmark，也可以直接说明要回到哪个配置项。",
-                "I will analyze this as error/log evidence. If you want to continue benchmark configuration instead, name the configuration area.",
-            )
+        response_fragments = tuple([
+            _fragment(
+                "analysis.response.logs_saved",
+                arguments={"count": len(lines)},
+                kind="evidence",
+            ),
+            *(
+                [_fragment("analysis.response.analysis_hint")]
+                if analysis_requested
+                else []
+            ),
+        ])
         emit_evidence_block_receipt(
             state,
             operation="finish",
@@ -475,14 +552,16 @@ def finish_evidence_collection(
             lines=lines,
             input_disposition="completion",
             status="saved",
-            visible_result=response,
+            response_fragments=response_fragments,
+            language=language,
+            terminal_rendered=True,
             block_id=block_id,
         )
         return EvidenceCollectionOutcome(
             result=HandlerResult(
                 delta=StateDelta.set_values(values),
                 clear_pending=True,
-                visible_result=response,
+                response_fragments=response_fragments,
                 completion="completed",
                 stop_after_response=True,
             ),
@@ -537,7 +616,7 @@ def pause_evidence_collection(state: AgentGraphState) -> HandlerResult:
 
     collecting = dict(state.get("evidence_collection") or {})
     if not collecting:
-        return HandlerResult(blocker="pause evidence requires an active evidence collection")
+        return HandlerResult(blocker=_collection_failure("pause", "active"))
     collecting["status"] = "paused"
     question = collecting.get("question") if isinstance(collecting.get("question"), Mapping) else {}
     lines = [str(item) for item in collecting.get("lines") or () if str(item).strip()]
@@ -563,17 +642,17 @@ def resume_evidence_collection(state: AgentGraphState) -> HandlerResult:
 
     collecting = dict(state.get("evidence_collection") or {})
     if not collecting or str(collecting.get("status") or "active") != "paused":
-        return HandlerResult(blocker="resume evidence requires a paused evidence collection")
+        return HandlerResult(blocker=_collection_failure("resume", "paused"))
     collecting["status"] = "active"
     language = str(collecting.get("language") or state.get("language") or "en")
     lines = [str(item) for item in collecting.get("lines") or []]
     question = collecting.get("question") if isinstance(collecting.get("question"), Mapping) else {}
     block_id = str(collecting.get("block_id") or "") or evidence_block_id(question, lines)
     collecting["block_id"] = block_id
-    response = localized(
-        language,
-        f"已恢复证据收集，当前保留 {len(lines)} 行。请继续粘贴，完成后输入 `END`。",
-        f"Resumed evidence collection with {len(lines)} saved line(s). Continue pasting, or type `END` when done.",
+    response_fragment = _fragment(
+        "analysis.response.collection_resumed",
+        arguments={"count": len(lines)},
+        kind="status",
     )
     emit_evidence_block_receipt(
         state,
@@ -582,12 +661,14 @@ def resume_evidence_collection(state: AgentGraphState) -> HandlerResult:
         lines=lines,
         input_disposition="resume",
         status="active",
-        visible_result=response,
+        response_fragments=(response_fragment,),
+        language=language,
+        terminal_rendered=True,
         block_id=block_id,
     )
     return HandlerResult(
         delta=StateDelta.set_values({"evidence_collection": collecting}),
-        visible_result=response,
+        response_fragments=(response_fragment,),
         completion="in_progress",
         stop_after_response=True,
     )
@@ -623,17 +704,26 @@ def analyze_inline_evidence_result(state: AgentGraphState, text: str) -> Handler
     evidence_buffer = [dict(item) for item in list(state.get("evidence_buffer") or [])]
     evidence_buffer.append({"text": evidence})
     response = analyze_evidence_with_model(state, evidence, evidence)
+    language = str(state.get("language") or "en")
+    response_fragment = _analysis_document(
+        response,
+        source_kind="inline",
+        language=language,
+        evidence_hash=analysis_hash(evidence),
+    )
     emit_analysis_invocation_receipt(
         state,
         source_kind="inline",
         evidence=evidence,
         question=evidence,
-        visible_result=response,
+        response_fragments=(response_fragment,),
+        language=language,
+        terminal_rendered=True,
         invoked=True,
     )
     return HandlerResult(
         delta=StateDelta.set_values({"evidence_buffer": evidence_buffer}),
-        visible_result=response,
+        response_fragments=(response_fragment,),
         next_group="" if state.get("pending_question") else "error_evidence_analysis",
         completion="completed",
         stop_after_response=True,
@@ -654,18 +744,27 @@ def analyze_saved_evidence_result(state: AgentGraphState, user_question: str) ->
     evidence_items = list(state.get("evidence_buffer") or [])
     evidence = str((evidence_items[-1] if evidence_items else {}).get("text") or "").strip()
     response = analyze_evidence_with_model(state, evidence, user_question)
+    language = str(state.get("language") or "en")
+    response_fragment = _analysis_document(
+        response,
+        source_kind="saved_buffer",
+        language=language,
+        evidence_hash=analysis_hash(evidence),
+    )
     emit_analysis_invocation_receipt(
         state,
         source_kind="saved_buffer",
         evidence=evidence,
         question=user_question,
-        visible_result=response,
+        response_fragments=(response_fragment,),
+        language=language,
+        terminal_rendered=True,
         invoked=True,
     )
     return HandlerResult(
         clear_pending=True,
         next_group="error_evidence_analysis",
-        visible_result=response,
+        response_fragments=(response_fragment,),
         completion="completed",
         stop_after_response=True,
     )
@@ -677,7 +776,9 @@ def report_artifact_entry_response(state: AgentGraphState) -> str:
     return _report_artifact_entry(state)[0]
 
 
-def _report_artifact_entry(state: AgentGraphState) -> tuple[str, dict[str, Any]]:
+def _report_artifact_entry(
+    state: AgentGraphState,
+) -> tuple[str, dict[str, Any], str, dict[str, str]]:
     language = state.get("language", "en")
     report_context = state.get("report_context") or {}
     job_id = str(report_context.get("requested_job_id") or "").strip()
@@ -697,7 +798,7 @@ def _report_artifact_entry(state: AgentGraphState) -> tuple[str, dict[str, Any]]
             language,
             "没有找到历史 job。请先运行 fake-node smoke、real-node benchmark 或 sync-observe，再分析报告。",
             "No historical job was found. Run fake-node smoke, real-node benchmark, or sync-observe before analyzing a report.",
-        ), {}
+        ), {}, "no_job", {}
     try:
         summary = resume_job(job_id)
     except Exception as exc:
@@ -705,7 +806,10 @@ def _report_artifact_entry(state: AgentGraphState) -> tuple[str, dict[str, Any]]
             language,
             f"无法读取 job `{job_id}`：{type(exc).__name__}。请用 `jobs` 查看可用任务，或提供正确的 job_id。",
             f"Could not read job `{job_id}`: {type(exc).__name__}. Use `jobs` to list available jobs, or provide the correct job_id.",
-        ), {}
+        ), {}, "read_failed", {
+            "job_id": job_id,
+            "error_type": type(exc).__name__,
+        }
     try:
         job = get_job(job_id)
     except (FileNotFoundError, OSError, ValueError):
@@ -720,7 +824,7 @@ def _report_artifact_entry(state: AgentGraphState) -> tuple[str, dict[str, Any]]
         }
     facts = _persisted_job_facts(job, summary)
     response = _render_persisted_job_facts(facts, str(language))
-    return response, job
+    return response, job, "report", {}
 
 
 def report_artifact_entry_result(
@@ -733,7 +837,9 @@ def report_artifact_entry_result(
     report_context = dict(state.get("report_context") or {})
     state_view: AgentGraphState = dict(state)
     state_view["report_context"] = report_context
-    response, persisted_job = _report_artifact_entry(state_view)
+    response, persisted_job, response_kind, response_arguments = _report_artifact_entry(
+        state_view
+    )
     execution_receipts = (
         persisted_job.get("execution_receipts")
         if isinstance(persisted_job.get("execution_receipts"), Mapping)
@@ -753,12 +859,31 @@ def report_artifact_entry_result(
     if persisted_job:
         report_context["analyzed_job_id"] = str(persisted_job.get("job_id") or "")
         report_context["analyzed_job_status"] = str(persisted_job.get("status") or "unknown")
+    if response_kind == "no_job":
+        fragments = (_fragment("analysis.response.no_job", kind="warning"),)
+    elif response_kind == "read_failed":
+        fragments = (_fragment(
+            "analysis.response.job_read_failed",
+            arguments=response_arguments,
+            kind="warning",
+        ),)
+    else:
+        evidence_paths = _job_evidence_paths(persisted_job)
+        fragments = (_analysis_document(
+            response,
+            source_kind="persisted_job",
+            language=str(state.get("language") or "en"),
+            evidence_hash=analysis_hash(evidence_paths),
+            evidence_paths=evidence_paths,
+        ),)
     emit_report_analysis_receipt(
         receipt_state if receipt_state is not None else state,
         requested_job_id=str(report_context.get("requested_job_id") or ""),
         resolved_job_id=str(persisted_job.get("job_id") or ""),
         resolved_status=str(persisted_job.get("status") or ""),
-        visible_result=response,
+        response_fragments=fragments,
+        language=str(state.get("language") or "en"),
+        terminal_rendered=True,
         invoked=bool(persisted_job) and evidence_verified,
         job_read_receipt_id=(
             str(read_receipt.get("receipt_id") or "")
@@ -771,7 +896,7 @@ def report_artifact_entry_result(
         delta=StateDelta.set_values({"report_context": report_context}),
         clear_pending=True,
         next_group="report_artifact_analysis",
-        visible_result=response,
+        response_fragments=fragments,
         completion="completed",
         stop_after_response=True,
     )
@@ -789,6 +914,30 @@ def _evidence_waiting_response(language: str, question: Mapping[str, Any]) -> st
         "还没有收到新的 RPC 证据。请继续粘贴 request/response/docs，完成后输入 `END`；如果要退出，请直接说明要回到哪个配置项。",
         "No new RPC evidence was received. Continue pasting request/response/docs and type `END` when done; to leave this flow, name the configuration area to return to.",
     )
+
+
+def _evidence_waiting_message_id(question: Mapping[str, Any]) -> str:
+    return (
+        "analysis.response.waiting_logs"
+        if str(question.get("id") or "") == "freeform_evidence"
+        else "analysis.response.waiting_rpc"
+    )
+
+
+def _job_evidence_paths(job: Mapping[str, Any]) -> list[str]:
+    candidates: list[str] = []
+    for key in ("run_dir", "plan_file", "artifact_index", "runtime_env_file"):
+        value = str(job.get(key) or "").strip()
+        if value:
+            candidates.append(value)
+    artifacts = job.get("artifacts")
+    if isinstance(artifacts, Mapping):
+        candidates.extend(
+            str(value).strip()
+            for value in artifacts.values()
+            if isinstance(value, str) and value.strip()
+        )
+    return list(dict.fromkeys(candidates))
 
 
 def _control_receipt_ids(state: Mapping[str, Any]) -> set[str]:
@@ -930,75 +1079,6 @@ def _read_json_file(path_value: Any) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
-
-
-def _parse_rpc_params_or_request(value: str) -> tuple[str, Any | None]:
-    """Parse only enough request structure to avoid starting partial collection."""
-
-    text = str(value or "").strip()
-    if not text:
-        return "", None
-    if _declares_no_rpc_params(text):
-        return "", []
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        parsed = None
-        for candidate in _json_objects_or_arrays_in_text(text):
-            if isinstance(candidate, dict) and "params" in candidate and ("method" in candidate or "jsonrpc" in candidate):
-                parsed = candidate
-                break
-            if isinstance(candidate, list):
-                parsed = candidate
-                break
-        if parsed is None:
-            return "", None
-    if isinstance(parsed, dict) and "params" in parsed and ("method" in parsed or "jsonrpc" in parsed):
-        params = parsed.get("params")
-        return str(parsed.get("method") or "").strip(), params if isinstance(params, (list, dict)) else None
-    if isinstance(parsed, list):
-        return "", parsed
-    if isinstance(parsed, dict) and set(parsed).issubset({"params", "arguments", "args"}):
-        params = parsed.get("params", parsed.get("arguments", parsed.get("args")))
-        return "", params if isinstance(params, (list, dict)) else None
-    return "", None
-
-
-def _declares_no_rpc_params(value: str) -> bool:
-    text = str(value or "").strip().lower()
-    if not text:
-        return False
-    return any(
-        marker in text
-        for marker in (
-            "no parameters",
-            "no params",
-            "without parameters",
-            "without params",
-            "params: none",
-            "params none",
-            "没有参数",
-            "无参数",
-            "不需要参数",
-            "参数为空",
-        )
-    )
-
-
-def _json_objects_or_arrays_in_text(text: str) -> list[Any]:
-    decoder = json.JSONDecoder()
-    output: list[Any] = []
-    raw = str(text or "")
-    for index, char in enumerate(raw):
-        if char not in "{[":
-            continue
-        try:
-            parsed, _ = decoder.raw_decode(raw[index:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, (dict, list)):
-            output.append(parsed)
-    return output
 
 
 def _report_log_highlights(job_id: str, status: str, *, max_lines: int = 6) -> str:

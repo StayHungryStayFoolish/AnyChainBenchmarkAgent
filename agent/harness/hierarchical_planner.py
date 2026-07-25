@@ -9,9 +9,9 @@ the graph owns the complete turn receipt in Phase 3.
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -19,15 +19,12 @@ from ..llm.providers import provider_from_config
 from ..llm.types import (
     LLMProviderError,
     LLMTurnTimeoutError,
-    cancel_active_llm_turn,
-    copy_llm_turn_context,
-    run_in_llm_turn_context,
 )
 from .action_registry import (
     ACTION_BY_TYPE,
     ACTION_SPECS,
     SEMANTIC_OPERATIONS,
-    resolve_action_target_group,
+    registered_closed_value_domains,
     validate_action_contract,
 )
 from .context import (
@@ -37,13 +34,11 @@ from .context import (
     workflow_snapshot,
 )
 from .domains.environment import extract_structured_input_candidates
-from .intent import (
+from .semantic_admission import (
     _admitted_action_queue,
-    _admitted_plan_requires_pending_contract_adjudication,
     _review_bounded_semantic_candidate,
     _semantic_fulfillment_prompt,
     _unresolved_action_queue,
-    adjudicate_active_pending_contract,
     prepare_hierarchical_candidate,
 )
 from .plan_coverage import TurnClause, segment_user_turn, validate_semantic_partition
@@ -109,387 +104,325 @@ class HierarchicalPlannerMetrics:
         }
 
 
-def resolve_product_action_queue(
+def begin_semantic_partition(
     state: AgentGraphState,
     text: str,
 ) -> dict[str, Any]:
-    """Compile one current turn without exposing the flat action registry."""
+    """Run Stage A and persist an immutable owner-compilation schedule."""
 
     started = time.monotonic()
     clauses = _turn_clauses(state, text)
+    document: dict[str, Any] = {
+        "contract_version": 1,
+        "status": "partition",
+        "started_monotonic": started,
+        "clauses": [clause.as_dict() for clause in clauses],
+        "source_partition": [],
+        "routed_partition": [],
+        "owner_requests": [],
+        "owner_cursor": 0,
+        "owner_documents": {},
+        "request_sizes": [],
+        "stage_a_calls": 0,
+        "stage_b_calls": 0,
+        "admission_calls": 0,
+        "errors": [],
+    }
     if not clauses:
-        return _unresolved_action_queue(clauses, ("empty semantic turn",))
-    request_sizes: list[int] = []
-    stage_a_calls = 0
-    stage_b_calls = 0
-    admission_calls = 0
+        document["status"] = "failed"
+        document["errors"] = ["empty semantic turn"]
+        return document
     try:
         provider = provider_from_config()
-        pending = dict(state.get("pending_question") or {})
-        focused_types = _active_pending_action_types(pending)
-        if focused_types:
-            (
-                focused_result,
-                _focused_errors,
-                focused_sizes,
-                focused_compiler_calls,
-                focused_admission_calls,
-                focused_seed,
-            ) = adjudicate_active_pending_contract(
-                provider,
-                state,
-                text,
-                clauses,
-                invalid_candidate=json.dumps(
-                    {"actions": [], "semantic_units": []},
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
-                validation_errors=(
-                    "Resolve the complete active typed-question transaction. "
-                    "Fail closed when the turn contains an independently owned "
-                    "sibling demand outside the supplied action schema.",
-                ),
-                allowed_action_types=focused_types,
-            )
-            request_sizes.extend(focused_sizes)
-            stage_b_calls += focused_compiler_calls
-            admission_calls += focused_admission_calls
-            if focused_result is not None:
-                return _with_metrics(
-                    focused_result,
-                    started,
-                    request_sizes=request_sizes,
-                    stage_a_calls=stage_a_calls,
-                    stage_b_calls=stage_b_calls,
-                    admission_calls=admission_calls,
-                    owner_count=1,
-                    unit_count=len(clauses),
-                )
         stage_a_payload = _stage_a_payload(state, text, clauses)
         partition: list[dict[str, Any]] = []
-        owner_documents: dict[str, dict[str, Any]] = {}
-        if focused_types and focused_seed:
-            partition, coordinator_document, _seed_errors = (
-                _focused_global_seed(
-                    focused_seed,
-                    state,
-                    clauses,
-                    allowed_action_types=focused_types,
-                )
-            )
-            if partition and coordinator_document:
-                owner_documents["coordinator"] = coordinator_document
         partition_errors: tuple[str, ...] = ()
-        if not partition:
-            stage_a_prompt = _stage_a_prompt()
-            previous_output = ""
-            for attempt in range(2):
-                request_payload = dict(stage_a_payload)
-                request_prompt = stage_a_prompt
-                if attempt:
-                    request_payload["contract_repair"] = {
-                        "prior_invalid_output": previous_output,
-                        "validation_errors": list(partition_errors),
-                        "instruction": (
-                            "Return a complete replacement document. Correct every "
-                            "validation error without dropping or paraphrasing source text."
-                        ),
-                    }
-                    request_prompt = (
-                        f"{stage_a_prompt} This is a contract-repair attempt. The prior "
-                        f"document was rejected for: {'; '.join(partition_errors)}. "
-                        "Return a new full document that satisfies those errors exactly."
-                    )
-                request_sizes.append(_wire_size(request_prompt, request_payload))
-                stage_a_calls += 1
-                previous_output = request_semantic_compilation(
-                    provider,
-                    system_prompt=request_prompt,
-                    request_payload=request_payload,
-                    max_tokens=2600,
+        stage_a_prompt = _stage_a_prompt()
+        previous_output = ""
+        for attempt in range(2):
+            request_payload = dict(stage_a_payload)
+            request_prompt = stage_a_prompt
+            if attempt:
+                request_payload["contract_repair"] = {
+                    "prior_invalid_output": previous_output,
+                    "validation_errors": list(partition_errors),
+                    "instruction": (
+                        "Return a complete replacement document. Correct every "
+                        "validation error without dropping or paraphrasing source text."
+                    ),
+                }
+                request_prompt = (
+                    f"{stage_a_prompt} This is a contract-repair attempt. The prior "
+                    f"document was rejected for: {'; '.join(partition_errors)}. "
+                    "Return a new full document that satisfies those errors exactly."
                 )
-                partition, partition_errors = _validate_partition_document(
-                    previous_output,
-                    clauses,
-                )
-                if not partition_errors:
-                    break
-        if partition_errors:
-            return _with_metrics(
-                _unresolved_action_queue(clauses, partition_errors),
-                started,
-                request_sizes=request_sizes,
-                stage_a_calls=stage_a_calls,
-                stage_b_calls=stage_b_calls,
-                admission_calls=admission_calls,
-                owner_count=0,
-                unit_count=len(partition),
+            document["request_sizes"].append(
+                _wire_size(request_prompt, request_payload)
             )
-        if _partition_requires_focused_pending_adjudication(
-            state,
-            stage_a_payload,
-            partition,
-        ):
-            allowed_types = _focused_action_types_for_partition(partition)
-            (
-                focused_result,
-                focused_errors,
-                focused_sizes,
-                focused_compiler_calls,
-                focused_admission_calls,
-                _focused_seed,
-            ) = adjudicate_active_pending_contract(
+            document["stage_a_calls"] += 1
+            previous_output = request_semantic_compilation(
                 provider,
-                state,
-                text,
+                system_prompt=request_prompt,
+                request_payload=request_payload,
+                max_tokens=2600,
+            )
+            partition, partition_errors = _validate_partition_document(
+                previous_output,
                 clauses,
-                invalid_candidate=json.dumps(
-                    {
-                        "actions": [],
-                        "semantic_units": partition,
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
-                validation_errors=(
-                    "Stage A exposed competing representations of the active "
-                    "typed-question transaction",
-                ),
-                allowed_action_types=allowed_types,
             )
-            request_sizes.extend(focused_sizes)
-            stage_b_calls += focused_compiler_calls
-            admission_calls += focused_admission_calls
-            if focused_result is not None:
-                return _with_metrics(
-                    focused_result,
-                    started,
-                    request_sizes=request_sizes,
-                    stage_a_calls=stage_a_calls,
-                    stage_b_calls=stage_b_calls,
-                    admission_calls=admission_calls,
-                    owner_count=1,
-                    unit_count=len(partition),
-                )
-            return _with_metrics(
-                _unresolved_action_queue(clauses, focused_errors),
-                started,
-                request_sizes=request_sizes,
-                stage_a_calls=stage_a_calls,
-                stage_b_calls=stage_b_calls,
-                admission_calls=admission_calls,
-                owner_count=1,
-                unit_count=len(partition),
-            )
+            partition_errors = tuple(dict.fromkeys((
+                *partition_errors,
+                *_cross_domain_pending_errors(partition, state),
+            )))
+            if not partition_errors:
+                break
+        if partition_errors:
+            document["status"] = "failed"
+            document["errors"] = list(partition_errors)
+            document["unit_count"] = len(partition)
+            return document
         source_partition, compilation_partition = (
-            _partition_after_stage_a_admission(
-                partition,
-                frozenset(),
-            )
+            _partition_after_stage_a_admission(partition, frozenset())
         )
         source_partition, compilation_partition = (
             _canonicalize_atomic_evidence_partition(
-                state,
-                clauses,
-                source_partition,
-                compilation_partition,
-            )
-        )
-        source_partition, compilation_partition = (
-            _canonicalize_structured_config_partition(
-                state,
-                clauses,
-                stage_a_payload,
-                source_partition,
-                compilation_partition,
+                state, clauses, source_partition, compilation_partition
             )
         )
         source_partition, compilation_partition = (
             _canonicalize_unique_manual_pending_partition(
-                state,
-                clauses,
-                source_partition,
-                compilation_partition,
+                state, clauses, source_partition, compilation_partition
             )
         )
-        partition = _expand_partition_routes(compilation_partition)
-
-        requests = _owner_requests(partition)
-        owner_inputs: list[tuple[str, tuple[str, ...], frozenset[str]]] = []
-        for owner, unit_ids in requests.items():
-            owner_groups = frozenset(
-                route["group"]
-                for unit in partition
+        routed_partition = _expand_partition_routes(compilation_partition)
+        owner_requests = []
+        for owner, unit_ids in _owner_requests(routed_partition).items():
+            groups = sorted({
+                str(route["group"])
+                for unit in routed_partition
                 if unit["unit_id"] in unit_ids
                 for route in unit["owner_routes"]
                 if route["owner"] == owner and route["group"]
-            )
-            owner_inputs.append((owner, unit_ids, owner_groups))
-        for owner, unit_ids in requests.items():
-            if owner not in owner_documents:
-                continue
-            bound_ids = tuple(
-                str(binding.get("unit_id") or "")
-                for binding in owner_documents[owner].get("bindings") or ()
-            )
-            if bound_ids != unit_ids:
-                owner_documents = {}
-                partition = []
-                return _with_metrics(
-                    _unresolved_action_queue(
-                        clauses,
-                        ("focused seed owner bindings differ from routed partition",),
-                    ),
-                    started,
-                    request_sizes=request_sizes,
-                    stage_a_calls=stage_a_calls,
-                    stage_b_calls=stage_b_calls,
-                    admission_calls=admission_calls,
-                    owner_count=len(requests),
-                    unit_count=len(compilation_partition),
-                )
-        owner_inputs = [
-            item for item in owner_inputs if item[0] not in owner_documents
+            })
+            owner_requests.append({
+                "owner": owner,
+                "unit_ids": list(unit_ids),
+                "groups": groups,
+            })
+        document.update({
+            "status": "compile_owner" if owner_requests else "review_plan",
+            "source_partition": source_partition,
+            "routed_partition": routed_partition,
+            "owner_requests": owner_requests,
+            "owner_count": len(owner_requests),
+            "unit_count": len(routed_partition),
+        })
+        return document
+    except (LLMTurnTimeoutError, LLMProviderError):
+        raise
+    except Exception as exc:
+        document["status"] = "failed"
+        document["errors"] = [
+            f"hierarchical planner failed: {type(exc).__name__}"
         ]
-        executor = ThreadPoolExecutor(max_workers=max(1, len(owner_inputs)))
-        futures = []
-        try:
-            futures = [
-                executor.submit(
-                    run_in_llm_turn_context,
-                    copy_llm_turn_context(),
-                    _compile_owner_document,
-                    state,
-                    owner,
-                    owner_groups,
-                    partition,
-                    unit_ids,
-                )
-                for owner, unit_ids, owner_groups in owner_inputs
-            ]
-            owner_results = [
-                (owner, unit_ids, future.result())
-                for (owner, unit_ids, _groups), future in zip(owner_inputs, futures)
-            ]
-        except BaseException:
-            cancel_active_llm_turn()
-            for future in futures:
-                future.cancel()
-            executor.shutdown(wait=False, cancel_futures=True)
-            raise
-        else:
-            executor.shutdown(wait=True)
-        for owner, _unit_ids, (document, errors, owner_request_sizes) in owner_results:
-            stage_b_calls += len(owner_request_sizes)
-            request_sizes.extend(owner_request_sizes)
-            if errors:
-                return _with_metrics(
-                    _unresolved_action_queue(clauses, errors),
-                    started,
-                    request_sizes=request_sizes,
-                    stage_a_calls=stage_a_calls,
-                    stage_b_calls=stage_b_calls,
-                    admission_calls=admission_calls,
-                    owner_count=len(requests),
-                    unit_count=len(partition),
-                )
-            owner_documents[owner] = document
+        return document
 
-        candidate = _merge_owner_documents(
-            source_partition,
-            partition,
-            owner_documents,
-        )
-        candidate_text, validation = prepare_hierarchical_candidate(
-            json.dumps(candidate, ensure_ascii=False, sort_keys=True),
+
+def compile_next_owner(
+    state: AgentGraphState,
+    document: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Compile exactly one owner document and advance the persisted cursor."""
+
+    output = dict(document)
+    if output.get("status") != "compile_owner":
+        return output
+    requests = [
+        dict(item)
+        for item in output.get("owner_requests") or []
+        if isinstance(item, Mapping)
+    ]
+    cursor = int(output.get("owner_cursor") or 0)
+    if cursor >= len(requests):
+        output["status"] = "review_plan"
+        return output
+    request = requests[cursor]
+    owner = str(request.get("owner") or "")
+    try:
+        owner_document, errors, request_sizes = _compile_owner_document(
             state,
-            clauses,
-            pending_choice_unit_ids=frozenset(
-                str(unit["unit_id"])
-                for unit in source_partition
-                if str(unit.get("operation") or "") == "pending_answer"
-            ),
-        )
-        if not validation.valid:
-            return _with_metrics(
-                _unresolved_action_queue(clauses, validation.errors),
-                started,
-                request_sizes=request_sizes,
-                stage_a_calls=stage_a_calls,
-                stage_b_calls=stage_b_calls,
-                admission_calls=admission_calls,
-                owner_count=len(requests),
-                unit_count=len(partition),
-            )
-        allowed_types = _allowed_action_types_for_partition(partition)
-        plan, admission, admission_errors = _review_bounded_semantic_candidate(
-            provider,
-            candidate_text,
-            validation,
-            state,
-            clauses,
-            allowed_action_types=allowed_types,
-            whole_plan_contract_repair=True,
-        )
-        admission_calls = (
-            int(getattr(admission, "request_count", 1))
-            if admission is not None
-            else 0
-        )
-        if admission is not None and getattr(admission, "request_sizes", ()):
-            request_sizes.extend(admission.request_sizes)
-        elif plan is not None:
-            request_sizes.append(
-                len(
-                    whole_plan_admission_prompt(
-                        _semantic_fulfillment_prompt()
-                    ).encode("utf-8")
-                )
-                + len(plan.request_json.encode("utf-8"))
-            )
-        if (
-            admission is None
-            or not admission.valid
-            or plan is None
-        ):
-            return _with_metrics(
-                _unresolved_action_queue(clauses, admission_errors),
-                started,
-                request_sizes=request_sizes,
-                stage_a_calls=stage_a_calls,
-                stage_b_calls=stage_b_calls,
-                admission_calls=admission_calls,
-                owner_count=len(requests),
-                unit_count=len(partition),
-            )
-        result = _admitted_action_queue(plan, admission, state)
-        return _with_metrics(
-            result,
-            started,
-            request_sizes=request_sizes,
-            stage_a_calls=stage_a_calls,
-            stage_b_calls=stage_b_calls,
-            admission_calls=admission_calls,
-            owner_count=len(requests),
-            unit_count=len(partition),
+            owner,
+            frozenset(str(item) for item in request.get("groups") or []),
+            [
+                dict(item)
+                for item in output.get("routed_partition") or []
+                if isinstance(item, Mapping)
+            ],
+            tuple(str(item) for item in request.get("unit_ids") or []),
         )
     except (LLMTurnTimeoutError, LLMProviderError):
         raise
     except Exception as exc:
+        errors = (f"Stage B {owner} failed: {type(exc).__name__}",)
+        owner_document = {}
+        request_sizes = ()
+    output["request_sizes"] = [
+        *[int(value) for value in output.get("request_sizes") or []],
+        *[int(value) for value in request_sizes],
+    ]
+    output["stage_b_calls"] = int(output.get("stage_b_calls") or 0) + len(
+        request_sizes
+    )
+    if errors:
+        output["status"] = "failed"
+        output["errors"] = list(errors)
+        return output
+    owner_documents = {
+        str(key): dict(value)
+        for key, value in dict(output.get("owner_documents") or {}).items()
+        if isinstance(value, Mapping)
+    }
+    owner_documents[owner] = owner_document
+    output["owner_documents"] = owner_documents
+    output["owner_cursor"] = cursor + 1
+    output["status"] = (
+        "compile_owner" if cursor + 1 < len(requests) else "review_plan"
+    )
+    return output
+
+
+def review_semantic_plan(
+    state: AgentGraphState,
+    document: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Run whole-plan admission after every owner document is checkpointed."""
+
+    output = dict(document)
+    clauses = tuple(
+        TurnClause(
+            str(item.get("clause_id") or ""),
+            str(item.get("text") or ""),
+            str(item.get("input_shape") or "prose"),
+        )
+        for item in output.get("clauses") or []
+        if isinstance(item, Mapping)
+    )
+    started = float(output.get("started_monotonic") or time.monotonic())
+    request_sizes = [int(value) for value in output.get("request_sizes") or []]
+    stage_a_calls = int(output.get("stage_a_calls") or 0)
+    stage_b_calls = int(output.get("stage_b_calls") or 0)
+    admission_calls = int(output.get("admission_calls") or 0)
+    owner_count = int(output.get("owner_count") or 0)
+    unit_count = int(output.get("unit_count") or 0)
+    if output.get("status") == "failed":
+        return _with_metrics(
+            _unresolved_action_queue(clauses, tuple(output.get("errors") or [])),
+            started,
+            request_sizes=request_sizes,
+            stage_a_calls=stage_a_calls,
+            stage_b_calls=stage_b_calls,
+            admission_calls=admission_calls,
+            owner_count=owner_count,
+            unit_count=unit_count,
+        )
+    if output.get("status") != "review_plan":
         return _with_metrics(
             _unresolved_action_queue(
                 clauses,
-                (f"hierarchical planner failed: {type(exc).__name__}",),
+                ("semantic plan reached review before owner compilation completed",),
             ),
             started,
             request_sizes=request_sizes,
             stage_a_calls=stage_a_calls,
             stage_b_calls=stage_b_calls,
             admission_calls=admission_calls,
-            owner_count=0,
-            unit_count=0,
+            owner_count=owner_count,
+            unit_count=unit_count,
         )
+    source_partition = [
+        dict(item)
+        for item in output.get("source_partition") or []
+        if isinstance(item, Mapping)
+    ]
+    routed_partition = [
+        dict(item)
+        for item in output.get("routed_partition") or []
+        if isinstance(item, Mapping)
+    ]
+    owner_documents = {
+        str(key): dict(value)
+        for key, value in dict(output.get("owner_documents") or {}).items()
+        if isinstance(value, Mapping)
+    }
+    candidate = _merge_owner_documents(
+        source_partition,
+        routed_partition,
+        owner_documents,
+    )
+    candidate_text, validation = prepare_hierarchical_candidate(
+        json.dumps(candidate, ensure_ascii=False, sort_keys=True),
+        state,
+        clauses,
+        pending_choice_unit_ids=frozenset(
+            str(unit["unit_id"])
+            for unit in source_partition
+            if str(unit.get("operation") or "") == "pending_answer"
+        ),
+    )
+    if not validation.valid:
+        return _with_metrics(
+            _unresolved_action_queue(clauses, validation.errors),
+            started,
+            request_sizes=request_sizes,
+            stage_a_calls=stage_a_calls,
+            stage_b_calls=stage_b_calls,
+            admission_calls=admission_calls,
+            owner_count=owner_count,
+            unit_count=unit_count,
+        )
+    provider = provider_from_config()
+    plan, admission, admission_errors = _review_bounded_semantic_candidate(
+        provider,
+        candidate_text,
+        validation,
+        state,
+        clauses,
+        allowed_action_types=_allowed_action_types_for_partition(
+            routed_partition
+        ),
+        whole_plan_contract_repair=True,
+    )
+    admission_calls = (
+        int(getattr(admission, "request_count", 1))
+        if admission is not None
+        else 0
+    )
+    if admission is not None and getattr(admission, "request_sizes", ()):
+        request_sizes.extend(admission.request_sizes)
+    elif plan is not None:
+        request_sizes.append(
+            len(
+                whole_plan_admission_prompt(
+                    _semantic_fulfillment_prompt()
+                ).encode("utf-8")
+            )
+            + len(plan.request_json.encode("utf-8"))
+        )
+    result = (
+        _admitted_action_queue(plan, admission, state)
+        if admission is not None and admission.valid and plan is not None
+        else _unresolved_action_queue(clauses, admission_errors)
+    )
+    return _with_metrics(
+        result,
+        started,
+        request_sizes=request_sizes,
+        stage_a_calls=stage_a_calls,
+        stage_b_calls=stage_b_calls,
+        admission_calls=admission_calls,
+        owner_count=owner_count,
+        unit_count=unit_count,
+    )
 
 
 def _turn_clauses(
@@ -522,11 +455,23 @@ def _stage_a_prompt() -> str:
         "or unresolved. A unit may route to several owners when one atomic structured block "
         "contains independently owned values. Preserve questions, corrections, contradictions, "
         "pending answers, navigation, multiline evidence, and every sibling demand separately. "
+        "input_shape and structured_candidates describe terminal syntax only; they do not classify "
+        "intent, authorize an action, or assign an owner. Treat each parser candidate as a read-only "
+        "structural fact. Route the user's actual semantic request using the supplied owner/group "
+        "registries and routing purposes, including several immutable owner routes when one structured "
+        "block supplies independently owned values. Never route every structured value to one default "
+        "owner. If the semantic operation or any required owner/group route is uncertain, mark the "
+        "unit unresolved; do not guess, omit, or repair a route. "
         "When a turn answers the active pending question and also supplies sibling configuration, "
         "emit the exact answer excerpt as one pending_answer unit routed only to coordinator, using "
         "the active pending_question.group as that route's group, and "
         "emit every sibling as separate domain_request units. Never label a normal domain_request "
         "as a pending answer, and never combine a pending answer with a sibling mutation. "
+        "Respect pending_question.value_domain and registered_closed_value_domains. A value "
+        "owned by another registered closed dimension is routed to that dimension's owner; it "
+        "is not consumed as an open researched identity merely because such a question is pending. "
+        "If the source explicitly claims that a closed-domain token is instead a new identity, "
+        "mark that unit unresolved so the user can disambiguate. "
         "A semantic option selection and adjacent prose that only explains the reason, uncertainty, "
         "basis, referential application, or declared completion effect for that same selection form "
         "one pending_answer operation even when punctuation or line breaks create several clauses. "
@@ -577,6 +522,9 @@ def _stage_a_payload(
         "language": state.get("language") or "en",
         "active_group": state.get("active_group") or "opening",
         "pending_question": pending,
+        "registered_closed_value_domains": list(
+            registered_closed_value_domains()
+        ),
         "pending_typed_candidates": [
             value
             for clause in clauses
@@ -610,263 +558,35 @@ def _stage_a_payload(
     }
 
 
-def _focused_global_seed(
-    candidate: str,
+def _cross_domain_pending_errors(
+    partition: Sequence[Mapping[str, Any]],
     state: AgentGraphState,
-    clauses: Sequence[TurnClause],
-    *,
-    allowed_action_types: frozenset[str],
-) -> tuple[list[dict[str, Any]], dict[str, Any], tuple[str, ...]]:
-    """Promote one focused result into the global partition when fully routed.
+) -> tuple[str, ...]:
+    """Reject a closed-domain value consumed by an open pending identity."""
 
-    The focused compiler may identify both the active pending answer and
-    independent sibling units. This boundary reuses only source-exact units,
-    one registry-valid pending action, and explicit registry routes. Any
-    ambiguity falls back to normal Stage A planning.
-    """
-
-    try:
-        payload = json.loads(candidate)
-    except json.JSONDecodeError:
-        return [], {}, ("focused global seed is not strict JSON",)
-    if not isinstance(payload, Mapping):
-        return [], {}, ("focused global seed is not an object",)
-    actions = payload.get("actions")
-    units = payload.get("semantic_units")
-    if not isinstance(actions, list) or len(actions) != 1:
-        return [], {}, ("focused global seed requires exactly one action",)
-    if not isinstance(units, list) or not units:
-        return [], {}, ("focused global seed requires semantic units",)
-    try:
-        pending_action = validate_action_contract(actions[0])
-    except (TypeError, ValueError) as exc:
-        return [], {}, (f"focused global seed pending action is invalid: {exc}",)
-    action_type = str(pending_action.get("type") or "")
-    if action_type not in allowed_action_types:
-        return [], {}, ("focused global seed action is outside pending contract",)
-    action_spec = ACTION_BY_TYPE.get(action_type)
-    if action_spec is None or action_spec.owner != "coordinator":
-        return [], {}, ("focused global seed action is not coordinator-owned",)
-
-    pending_group = str(
-        dict(state.get("pending_question") or {}).get("group") or ""
-    )
-    if pending_group not in GROUP_SPEC_BY_NAME:
-        return [], {}, ("focused global seed has no registered pending group",)
-
-    normalized_units, normalization_errors = _normalize_focused_seed_units(
-        units,
-        clauses,
-        pending_action,
-    )
-    if normalization_errors:
-        return [], {}, normalization_errors
-
-    partition_rows: list[dict[str, Any]] = []
-    pending_unit_ids: list[str] = []
-    for index, raw in enumerate(normalized_units, start=1):
-        if not isinstance(raw, Mapping):
-            return [], {}, ("focused global seed contains a non-object unit",)
-        disposition = str(raw.get("disposition") or "")
-        indexes = raw.get("action_indexes")
-        indexes = list(indexes) if isinstance(indexes, list) else []
-        unit_id = f"focused-unit-{index}"
-        row = {
-            "unit_id": unit_id,
-            "clause_id": str(raw.get("clause_id") or ""),
-            "source_text": str(raw.get("source_text") or ""),
-            "reason": str(raw.get("reason") or "focused global seed"),
-        }
-        if disposition == "action":
-            if indexes != [0] or raw.get("owner_routes"):
-                return [], {}, (
-                    "focused global seed pending unit has invalid ownership",
-                )
-            row["operation"] = "pending_answer"
-            row["owner_routes"] = [{
-                "owner": "coordinator",
-                "group": pending_group,
-            }]
-            pending_unit_ids.append(unit_id)
-        elif disposition == "context":
-            if indexes or raw.get("owner_routes"):
-                return [], {}, (
-                    "focused global seed context unit has invalid ownership",
-                )
-            row["operation"] = "context"
-            row["owner_routes"] = []
-        elif disposition == "unresolved":
-            if indexes:
-                return [], {}, (
-                    "focused global seed unresolved unit has action indexes",
-                )
-            operation = str(raw.get("operation") or "")
-            routes = raw.get("owner_routes")
-            if operation not in _UNIVERSAL_OPERATIONS or operation in {
-                "pending_answer",
-                "context",
-                "unresolved",
-            }:
-                return [], {}, (
-                    "focused global seed unresolved unit has no valid operation",
-                )
-            if not isinstance(routes, list) or not routes:
-                return [], {}, (
-                    "focused global seed unresolved unit has no exact route",
-                )
-            normalized_routes: list[dict[str, str]] = []
-            for route in routes:
-                if not isinstance(route, Mapping):
-                    return [], {}, (
-                        "focused global seed route is not an object",
-                    )
-                owner = str(route.get("owner") or "")
-                group = str(route.get("group") or "")
-                group_spec = GROUP_SPEC_BY_NAME.get(group)
-                if (
-                    owner == "coordinator"
-                    or owner not in _OWNERS
-                    or group_spec is None
-                    or (
-                        owner not in {"orientation", "analysis"}
-                        and group_spec.owner != owner
-                    )
-                    or (
-                        operation in _UNIVERSAL_OPERATION_OWNER
-                        and _UNIVERSAL_OPERATION_OWNER[operation] != owner
-                    )
-                ):
-                    return [], {}, (
-                        "focused global seed route is outside the registry",
-                    )
-                normalized_routes.append({"owner": owner, "group": group})
-            row["operation"] = operation
-            row["owner_routes"] = normalized_routes
-        else:
-            return [], {}, ("focused global seed unit disposition is invalid",)
-        partition_rows.append(row)
-    if not pending_unit_ids:
-        return [], {}, ("focused global seed does not bind the pending action",)
-
-    partition, errors = _validate_partition_document(
-        json.dumps(
-            {"semantic_units": partition_rows},
-            ensure_ascii=False,
-            sort_keys=True,
-        ),
-        clauses,
-    )
-    if errors:
-        return [], {}, errors
-    coordinator_document = {
-        "actions": [pending_action],
-        "bindings": [
-            {
-                "unit_id": unit_id,
-                "action_indexes": [0],
-                "disposition": "action",
-                "reason": "focused pending action retained by Harness",
-            }
-            for unit_id in pending_unit_ids
-        ],
-    }
-    return partition, coordinator_document, ()
-
-
-def _normalize_focused_seed_units(
-    units: Sequence[Any],
-    clauses: Sequence[TurnClause],
-    pending_action: Mapping[str, Any],
-) -> tuple[list[dict[str, Any]], tuple[str, ...]]:
-    """Resolve only source overlap proven by the pending action's evidence."""
-
-    if not all(isinstance(unit, Mapping) for unit in units):
-        return [], ("focused global seed contains a non-object unit",)
-    rows = [dict(unit) for unit in units]
-    clause_by_id = {clause.clause_id: clause for clause in clauses}
-    evidence = str(pending_action.get("source_evidence") or "")
-    for row in rows:
-        if (
-            str(row.get("disposition") or "") != "action"
-            or list(row.get("action_indexes") or []) != [0]
-        ):
+    pending = dict(state.get("pending_question") or {})
+    if str(pending.get("value_domain") or "") != "researched_identity":
+        return ()
+    pending_group = str(pending.get("group") or "")
+    records = registered_closed_value_domains()
+    errors: list[str] = []
+    for unit in partition:
+        if str(unit.get("operation") or "") != "pending_answer":
             continue
-        clause = clause_by_id.get(str(row.get("clause_id") or ""))
-        if clause is None or not evidence or evidence not in clause.text:
-            return [], (
-                "focused global seed pending evidence has no exact clause anchor",
-            )
-        row["source_text"] = evidence
-
-    for clause_id, clause in clause_by_id.items():
-        clause_rows = [
-            row for row in rows
-            if str(row.get("clause_id") or "") == clause_id
-        ]
-        unresolved = [
-            row for row in clause_rows
-            if str(row.get("disposition") or "") == "unresolved"
-        ]
-        if (
-            len(unresolved) != 1
-            or str(unresolved[0].get("source_text") or "") != clause.text
-        ):
-            continue
-        anchors = [
-            str(row.get("source_text") or "")
-            for row in clause_rows
-            if row is not unresolved[0]
-        ]
-        if not anchors:
-            continue
-        placements: list[tuple[int, int]] = []
-        cursor = 0
-        for anchor in anchors:
-            start = clause.text.find(anchor, cursor)
-            if start < 0:
-                return [], (
-                    "focused global seed source anchors are ambiguous",
+        source = str(unit.get("source_text") or "")
+        for record in records:
+            target_group = str(record.get("target_group") or "")
+            if not target_group or target_group == pending_group:
+                continue
+            value = str(record.get("value") or "")
+            pattern = rf"(?<![\w-]){re.escape(value)}(?![\w-])"
+            if re.search(pattern, source, flags=re.IGNORECASE):
+                errors.append(
+                    "Stage A assigned a registered closed-domain value to an "
+                    "open researched pending identity: "
+                    f"{unit.get('unit_id')}/{record.get('action_type')}/{value}"
                 )
-            placements.append((start, start + len(anchor)))
-            cursor = start + len(anchor)
-        gaps: list[tuple[int, int]] = []
-        cursor = 0
-        for start, end in placements:
-            if cursor < start and not _separator_text(clause.text[cursor:start]):
-                gaps.append((cursor, start))
-            cursor = max(cursor, end)
-        if cursor < len(clause.text) and not _separator_text(clause.text[cursor:]):
-            gaps.append((cursor, len(clause.text)))
-        if len(gaps) != 1:
-            return [], (
-                "focused global seed cannot derive one unique sibling source span",
-            )
-        start, end = gaps[0]
-        unresolved[0]["source_text"] = clause.text[start:end]
-
-    clause_order = {
-        clause.clause_id: index for index, clause in enumerate(clauses)
-    }
-    try:
-        rows.sort(
-            key=lambda row: (
-                clause_order[str(row.get("clause_id") or "")],
-                clause_by_id[str(row.get("clause_id") or "")].text.index(
-                    str(row.get("source_text") or "")
-                ),
-            )
-        )
-    except (KeyError, ValueError):
-        return [], ("focused global seed source anchors are invalid",)
-    return rows, ()
-
-
-def _separator_text(value: str) -> bool:
-    return all(
-        character.isspace()
-        or not character.isalnum()
-        for character in str(value or "")
-    )
+    return tuple(dict.fromkeys(errors))
 
 
 def _validate_partition_document(
@@ -1025,51 +745,6 @@ def _partition_after_stage_a_admission(
     return source_partition, compilation_partition
 
 
-def _partition_requires_focused_pending_adjudication(
-    state: AgentGraphState,
-    stage_a_payload: Mapping[str, Any],
-    partition: Sequence[Mapping[str, Any]],
-) -> bool:
-    """Detect unresolved representation conflicts at the typed-question boundary."""
-
-    pending = dict(state.get("pending_question") or {})
-    if not pending:
-        return False
-    pending_units = [
-        unit
-        for unit in partition
-        if str(unit.get("operation") or "") == "pending_answer"
-    ]
-    typed_candidate_identities = {
-        pending_value_identity(value, pending)
-        for value in stage_a_payload.get("pending_typed_candidates") or []
-    }
-    typed_candidate_identities.discard("")
-    if len(typed_candidate_identities) == 1:
-        return (
-            len(pending_units) != 1
-            or any(
-                str(unit.get("operation") or "")
-                not in {"context", "pending_answer"}
-                for unit in partition
-            )
-        )
-    if len(pending_units) > 1:
-        return True
-    if not pending_units:
-        return False
-    structured_clause_ids = {
-        str(candidate.get("clause_id") or "")
-        for candidate in stage_a_payload.get("structured_candidates") or []
-        if isinstance(candidate, Mapping)
-        and candidate.get("config_values")
-    }
-    return any(
-        str(unit.get("clause_id") or "") in structured_clause_ids
-        for unit in pending_units
-    )
-
-
 def _canonicalize_atomic_evidence_partition(
     state: AgentGraphState,
     clauses: Sequence[TurnClause],
@@ -1120,94 +795,6 @@ def _canonicalize_atomic_evidence_partition(
         ),
     }
     return [atomic], [dict(atomic)]
-
-
-def _canonicalize_structured_config_partition(
-    state: AgentGraphState,
-    clauses: Sequence[TurnClause],
-    stage_a_payload: Mapping[str, Any],
-    source_partition: Sequence[Mapping[str, Any]],
-    compilation_partition: Sequence[Mapping[str, Any]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Route parsed structured configuration through its review owner."""
-
-    candidate_clause_ids = {
-        str(candidate.get("clause_id") or "")
-        for candidate in stage_a_payload.get("structured_candidates") or []
-        if isinstance(candidate, Mapping)
-        and candidate.get("config_values")
-    }
-    if not candidate_clause_ids:
-        return (
-            [dict(unit) for unit in source_partition],
-            [dict(unit) for unit in compilation_partition],
-        )
-    clause_by_id = {clause.clause_id: clause for clause in clauses}
-    replaceable_clause_ids = {
-        clause_id
-        for clause_id in candidate_clause_ids
-        if clause_id in clause_by_id
-        and all(
-            str(unit.get("operation") or "") in {"pending_answer", "context"}
-            for unit in source_partition
-            if str(unit.get("clause_id") or "") == clause_id
-        )
-        and any(
-            str(unit.get("operation") or "") == "pending_answer"
-            for unit in source_partition
-            if str(unit.get("clause_id") or "") == clause_id
-        )
-    }
-    if not replaceable_clause_ids:
-        return (
-            [dict(unit) for unit in source_partition],
-            [dict(unit) for unit in compilation_partition],
-        )
-    replacement_by_clause: dict[str, dict[str, Any]] = {}
-    for clause_id in replaceable_clause_ids:
-        existing = next(
-            unit
-            for unit in source_partition
-            if str(unit.get("clause_id") or "") == clause_id
-        )
-        replacement_by_clause[clause_id] = {
-            "unit_id": str(existing.get("unit_id") or f"config-{clause_id}"),
-            "clause_id": clause_id,
-            "source_text": clause_by_id[clause_id].text,
-            "operation": "domain_request",
-            "owner_routes": [{
-                "owner": "environment",
-                "group": str(
-                    (state.get("pending_question") or {}).get("group")
-                    or state.get("active_group")
-                    or ""
-                ),
-            }],
-            "reason": (
-                "Parsed structured config_values require the environment "
-                "proposal-and-review transaction."
-            ),
-        }
-
-    def replace(
-        partition: Sequence[Mapping[str, Any]],
-    ) -> list[dict[str, Any]]:
-        result: list[dict[str, Any]] = []
-        emitted: set[str] = set()
-        for unit in partition:
-            clause_id = str(unit.get("clause_id") or "")
-            replacement = replacement_by_clause.get(clause_id)
-            if replacement is None:
-                result.append(dict(unit))
-                continue
-            if clause_id not in emitted:
-                result.append(dict(replacement))
-                emitted.add(clause_id)
-        for clause_id in replaceable_clause_ids - emitted:
-            result.append(dict(replacement_by_clause[clause_id]))
-        return result
-
-    return replace(source_partition), replace(compilation_partition)
 
 
 def _canonicalize_unique_manual_pending_partition(
@@ -1680,8 +1267,11 @@ def _stage_b_prompt(owner: str) -> str:
         "{\"type\":\"declared_type\",\"arguments\":{...}}. Copy only keys explicitly listed "
         "in that action's allowed_arguments. When allowed_arguments is empty, the complete "
         "valid action object is {\"type\":\"declared_type\"}; source provenance remains in "
-        "the binding and semantic unit and is not an action argument. source_evidence must be one exact substring of "
-        "a supplied semantic unit, never a paraphrase. Do not copy a value from owner_state "
+        "the binding and semantic unit and is not an action argument. Follow owner_action_schema "
+        "exactly: never add an undeclared argument, and emit source_evidence only when that action "
+        "declares it. Any emitted source_evidence must be one exact substring of a supplied semantic "
+        "unit, never a paraphrase. Configuration values remain proposals until the owning workflow "
+        "validates and confirms them. Do not copy a value from owner_state "
         "unless the source unit explicitly supplies or confirms it. Do not add inferred "
         "identity, existence, protocol, canonical-name, or evidence-summary arguments to a "
         "selection action; downstream domain validation owns those facts. Questions and "
@@ -1705,7 +1295,9 @@ def _stage_b_prompt(owner: str) -> str:
         "natural-language paraphrase, rejection of all listed alternatives, or stated "
         "uncertainty may select the corresponding declared option. If zero or several options "
         "fit, keep the unit unresolved. Never invent an option, and never consume an "
-        "independent sibling request as rationale for the pending answer."
+        "independent sibling request as rationale for the pending answer. Respect the pending "
+        "question's value_domain: an open researched identity cannot consume a value declared "
+        "by another registered closed domain."
     )
 
 
@@ -1775,38 +1367,6 @@ def _allowed_action_types_for_partition(
     )
 
 
-def _focused_action_types_for_partition(
-    partition: Sequence[Mapping[str, Any]],
-) -> frozenset[str]:
-    """Allow universal-label correction without reopening domain ownership."""
-
-    partition_types = _allowed_action_types_for_partition(partition)
-    universal_operations = frozenset(_UNIVERSAL_OPERATION_OWNER)
-    universal_types = frozenset(
-        spec.action_type
-        for spec in ACTION_SPECS
-        if universal_operations.intersection(spec.semantic_operations)
-    )
-    return partition_types | universal_types
-
-
-def _active_pending_action_types(
-    pending: Mapping[str, Any],
-) -> frozenset[str]:
-    """Return only action types explicitly declared by the active question."""
-
-    if not pending:
-        return frozenset()
-    accepted = {
-        str(value)
-        for value in pending.get("accepted_action_types") or ()
-        if str(value) in ACTION_BY_TYPE
-    }
-    if "answer_pending" in ACTION_BY_TYPE:
-        accepted.add("answer_pending")
-    return frozenset(accepted)
-
-
 def _stage_b_payload(
     state: AgentGraphState,
     owner: str,
@@ -1854,6 +1414,9 @@ def _stage_b_payload(
             for row in group_schema()
             if row["name"] in groups
         ],
+        "registered_closed_value_domains": list(
+            registered_closed_value_domains()
+        ),
         "owner_state": owner_workflow_snapshot(state, owner, groups=groups),
     }
 
@@ -2106,6 +1669,8 @@ def _merge_owner_documents(
         semantic_units.append({
             "unit_id": unit_id,
             "clause_id": str(unit["clause_id"]),
+            "start": unit.get("start"),
+            "end": unit.get("end"),
             "source_text": str(unit["source_text"]),
             "disposition": disposition,
             "action_indexes": indexes if disposition == "action" else [],

@@ -423,7 +423,7 @@ def probe_provider_readiness(
                 temperature=0.0,
                 max_tokens=256,
             ))
-    except LLMTurnTimeoutError as exc:
+    except LLMTurnTimeoutError:
         return LLMProviderError(
             "provider readiness probe timed out",
             provider=config.provider,

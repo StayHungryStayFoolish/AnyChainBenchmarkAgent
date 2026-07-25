@@ -9,6 +9,118 @@ from unittest.mock import patch
 
 
 class HierarchicalPlannerContractTest(unittest.TestCase):
+    def test_open_chain_pending_rejects_registered_closed_domain_value(self) -> None:
+        from agent.harness.hierarchical_planner import _cross_domain_pending_errors
+
+        state = {
+            "pending_question": {
+                "group": "chain_identity",
+                "value_domain": "researched_identity",
+            },
+        }
+        partition = [{
+            "unit_id": "unit-1",
+            "source_text": "fake-node test",
+            "operation": "pending_answer",
+        }]
+
+        errors = _cross_domain_pending_errors(partition, state)
+
+        self.assertTrue(errors)
+        self.assertIn("choose_target_mode", errors[0])
+
+    def test_open_chain_pending_allows_unregistered_identity_candidate(self) -> None:
+        from agent.harness.hierarchical_planner import _cross_domain_pending_errors
+
+        state = {
+            "pending_question": {
+                "group": "chain_identity",
+                "value_domain": "researched_identity",
+            },
+        }
+        partition = [{
+            "unit_id": "unit-1",
+            "source_text": "AlphaChain",
+            "operation": "pending_answer",
+        }]
+
+        self.assertEqual(_cross_domain_pending_errors(partition, state), ())
+
+    def test_final_admission_rejects_closed_domain_value_as_chain_identity(self) -> None:
+        from agent.harness.domains.chain_rpc_questions import _chain_question
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.semantic_admission import prepare_hierarchical_candidate
+        from agent.harness.state import new_state
+
+        text = "fake-node"
+        clauses = segment_user_turn(text)
+        state = new_state("closed-domain-final-admission", language="en")
+        state["pending_question"] = _chain_question(state)
+        candidate = {
+            "actions": [{
+                "type": "choose_chain",
+                "chain_text": text,
+                "source_evidence": text,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": text,
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "claimed chain answer",
+            }],
+        }
+
+        _prepared, validation = prepare_hierarchical_candidate(
+            json.dumps(candidate),
+            state,
+            clauses,
+            pending_choice_unit_ids=frozenset({"unit-1"}),
+        )
+
+        self.assertFalse(validation.valid)
+        self.assertTrue(
+            any("registered closed-domain value" in error for error in validation.errors),
+            validation.errors,
+        )
+
+    def test_final_admission_allows_open_chain_identity_candidate(self) -> None:
+        from agent.harness.domains.chain_rpc_questions import _chain_question
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.semantic_admission import prepare_hierarchical_candidate
+        from agent.harness.state import new_state
+
+        text = "AlphaChain"
+        clauses = segment_user_turn(text)
+        state = new_state("open-domain-final-admission", language="en")
+        state["pending_question"] = _chain_question(state)
+        candidate = {
+            "actions": [{
+                "type": "choose_chain",
+                "chain_text": text,
+                "source_evidence": text,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": text,
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "open chain identity",
+            }],
+        }
+
+        prepared, validation = prepare_hierarchical_candidate(
+            json.dumps(candidate),
+            state,
+            clauses,
+            pending_choice_unit_ids=frozenset({"unit-1"}),
+        )
+
+        self.assertTrue(validation.valid, validation.errors)
+        self.assertEqual(json.loads(prepared)["actions"][0]["answer"], text)
+
     def test_stage_b_pending_answer_contract_exposes_complete_typed_options(
         self,
     ) -> None:
@@ -153,246 +265,11 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertIn("non-executable duplicate", source[1]["reason"])
         self.assertEqual(partition[1]["operation"], "domain_request")
 
-    def test_focused_pending_adjudication_recompiles_once_before_admission(
-        self,
-    ) -> None:
-        from agent.harness.intent import adjudicate_active_pending_contract
-        from agent.harness.plan_coverage import PlanCoverageResult, TurnClause
-        from agent.harness.semantic_compiler import WholePlanAdmission
+    def test_active_pending_lane_cannot_bypass_global_partition(self) -> None:
+        from tests.agent_live.graph_turn import resolve_product_action_queue_for_test as resolve_product_action_queue
         from agent.harness.state import new_state
 
-        state = new_state("focused-pending-repair", language="en")
-        state["pending_question"] = {
-            "id": "workload_confirm",
-            "group": "workload_rpc",
-            "kind": "numbered_choice",
-            "prompt": "Choose the next workload step.",
-            "field": "workload_confirm",
-            "manual_input_allowed": False,
-            "options": [{
-                "id": "change_target",
-                "label": "Change chain or target mode",
-                "value": "change_target",
-            }],
-            "accepted_action_types": ["answer_pending"],
-        }
-        clauses = (
-            TurnClause(
-                "clause-1",
-                "Take me to the chain or target-mode change flow.",
-            ),
-        )
-        invalid = PlanCoverageResult(
-            False,
-            ("answer_pending contains retired nested arguments",),
-            ("clause-1",),
-        )
-        valid = PlanCoverageResult(True, (), ())
-        compile_responses = [
-            ("first-invalid", ()),
-            ("second-valid", ()),
-        ]
-
-        with (
-            patch(
-                "agent.harness.intent._compile_semantic_candidate",
-                side_effect=compile_responses,
-            ) as compiler,
-            patch(
-                "agent.harness.intent._prepare_bounded_semantic_candidate",
-                side_effect=[("{}", invalid), ("{}", valid)],
-            ),
-            patch(
-                "agent.harness.intent._review_bounded_semantic_candidate",
-                return_value=(
-                    SimpleNamespace(request_json="{}"),
-                    WholePlanAdmission(
-                        valid=True,
-                        errors=(),
-                        request_count=1,
-                        request_sizes=(101,),
-                    ),
-                    (),
-                ),
-            ) as reviewer,
-            patch(
-                "agent.harness.intent._admitted_plan_requires_pending_contract_adjudication",
-                return_value=False,
-            ),
-            patch(
-                "agent.harness.intent._admitted_action_queue",
-                return_value={"actions": [{"type": "answer_pending"}]},
-            ),
-        ):
-            result, errors, sizes, compiler_calls, admission_calls, seed = (
-                adjudicate_active_pending_contract(
-                    object(),
-                    state,
-                    clauses[0].text,
-                    clauses,
-                    invalid_candidate="{}",
-                    validation_errors=("broad plan is ambiguous",),
-                    allowed_action_types=frozenset({"answer_pending"}),
-                )
-            )
-
-        self.assertEqual(result["actions"], [{"type": "answer_pending"}])
-        self.assertEqual(errors, ())
-        self.assertEqual(compiler_calls, 2)
-        self.assertEqual(admission_calls, 1)
-        self.assertEqual(seed, "")
-        self.assertEqual(len(sizes), 3)
-        self.assertEqual(compiler.call_count, 2)
-        second_request = compiler.call_args_list[1].kwargs["request_payload"]
-        self.assertEqual(
-            second_request["validation_errors"],
-            ["answer_pending contains retired nested arguments"],
-        )
-        self.assertEqual(
-            [
-                row["type"]
-                for row in second_request["action_schema"]
-            ],
-            ["answer_pending"],
-        )
-        self.assertEqual(
-            [
-                row["type"]
-                for row in second_request["original_request"]["action_schema"]
-            ],
-            ["answer_pending"],
-        )
-        reviewer.assert_called_once()
-
-    def test_focused_pending_yields_to_global_scope_without_repairing_sibling(
-        self,
-    ) -> None:
-        from agent.harness.intent import adjudicate_active_pending_contract
-        from agent.harness.plan_coverage import PlanCoverageResult, TurnClause
-        from agent.harness.state import new_state
-
-        state = new_state("focused-pending-global-yield", language="en")
-        state["pending_question"] = {
-            "id": "generic_choice",
-            "group": "opening",
-            "kind": "numbered_choice",
-            "field": "target_mode",
-            "manual_input_allowed": False,
-            "options": [{"id": "one", "label": "First", "value": "alpha"}],
-            "accepted_action_types": ["answer_pending"],
-        }
-        clauses = (TurnClause("clause-1", "Select the first choice and revise tuning."),)
-        candidate = json.dumps({
-            "actions": [{
-                "type": "answer_pending",
-                "selected_value": "alpha",
-            }],
-            "semantic_units": [
-                {
-                    "unit_id": "unit-1",
-                    "clause_id": "clause-1",
-                    "source_text": "Select the first choice",
-                    "disposition": "action",
-                    "action_indexes": [0],
-                    "reason": "pending selection",
-                },
-                {
-                    "unit_id": "unit-2",
-                    "clause_id": "clause-1",
-                    "source_text": "revise tuning",
-                    "disposition": "unresolved",
-                    "action_indexes": [],
-                    "reason": "outside focused action schema",
-                },
-            ],
-        })
-        invalid = PlanCoverageResult(
-            False,
-            ("unresolved independent semantic unit",),
-            ("revise tuning",),
-        )
-
-        with (
-            patch(
-                "agent.harness.intent._compile_semantic_candidate",
-                return_value=("scoped-output", ()),
-            ) as compiler,
-            patch(
-                "agent.harness.intent._prepare_bounded_semantic_candidate",
-                return_value=(candidate, invalid),
-            ),
-            patch(
-                "agent.harness.intent._review_bounded_semantic_candidate",
-            ) as reviewer,
-        ):
-            result, errors, _sizes, compiler_calls, admission_calls, seed = (
-                adjudicate_active_pending_contract(
-                    object(),
-                    state,
-                    clauses[0].text,
-                    clauses,
-                    invalid_candidate="{}",
-                    validation_errors=("focused scope",),
-                    allowed_action_types=frozenset({"answer_pending"}),
-                )
-            )
-
-        self.assertIsNone(result)
-        self.assertIn("global planning is required", " ".join(errors))
-        self.assertEqual(compiler_calls, 1)
-        self.assertEqual(admission_calls, 0)
-        self.assertEqual(seed, candidate)
-        compiler.assert_called_once()
-        reviewer.assert_not_called()
-
-    def test_active_pending_lane_returns_before_global_partition(self) -> None:
-        from agent.harness.hierarchical_planner import resolve_product_action_queue
-        from agent.harness.state import new_state
-
-        state = new_state("focused-pending-short-circuit", language="en")
-        state["pending_question"] = {
-            "id": "generic_choice",
-            "group": "opening",
-            "kind": "numbered_choice",
-            "field": "target_mode",
-            "manual_input_allowed": False,
-            "options": [{"id": "one", "label": "First", "value": "alpha"}],
-            "accepted_action_types": ["answer_pending"],
-        }
-        focused = {"actions": [{"type": "answer_pending", "selected_value": "alpha"}]}
-
-        with (
-            patch(
-                "agent.harness.hierarchical_planner.provider_from_config",
-                return_value=object(),
-            ),
-            patch(
-                "agent.harness.hierarchical_planner.adjudicate_active_pending_contract",
-                return_value=(focused, (), (101, 202), 1, 1, ""),
-            ) as adjudicator,
-            patch(
-                "agent.harness.hierarchical_planner.request_semantic_compilation",
-            ) as global_compiler,
-        ):
-            result = resolve_product_action_queue(
-                state,
-                "The first choice fits the outcome I described.",
-            )
-
-        self.assertEqual(result["actions"], focused["actions"])
-        self.assertEqual(result["planner_metrics"]["stage_a_calls"], 0)
-        self.assertEqual(result["planner_metrics"]["stage_b_calls"], 1)
-        self.assertEqual(result["planner_metrics"]["admission_calls"], 1)
-        adjudicator.assert_called_once()
-        global_compiler.assert_not_called()
-
-    def test_rejected_active_pending_lane_falls_back_to_global_partition(
-        self,
-    ) -> None:
-        from agent.harness.hierarchical_planner import resolve_product_action_queue
-        from agent.harness.state import new_state
-
-        state = new_state("focused-pending-sibling-fallback", language="en")
+        state = new_state("pending-route-first", language="en")
         state["pending_question"] = {
             "id": "generic_choice",
             "group": "opening",
@@ -408,17 +285,6 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                 "agent.harness.hierarchical_planner.provider_from_config",
                 return_value=object(),
             ),
-            patch(
-                "agent.harness.hierarchical_planner.adjudicate_active_pending_contract",
-                return_value=(
-                    None,
-                    ("independent sibling demand",),
-                    (101,),
-                    1,
-                    0,
-                    "",
-                ),
-            ) as adjudicator,
             patch(
                 "agent.harness.hierarchical_planner.request_semantic_compilation",
                 return_value="{}",
@@ -426,265 +292,21 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         ):
             result = resolve_product_action_queue(
                 state,
-                "Use the first choice, and also change an unrelated setting.",
+                "Switch to a different workflow instead.",
             )
 
-        self.assertEqual(adjudicator.call_count, 1)
         self.assertEqual(global_compiler.call_count, 2)
         self.assertEqual(result["planner_metrics"]["stage_a_calls"], 2)
-        self.assertEqual(result["planner_metrics"]["stage_b_calls"], 1)
+        self.assertEqual(result["planner_metrics"]["stage_b_calls"], 0)
         self.assertTrue(result["actions"])
 
-    def test_focused_pending_payload_is_scoped_and_lossless(self) -> None:
-        from agent.harness.intent import _focused_pending_request_payload
-        from agent.harness.state import new_state
-
-        state = new_state("focused-pending-projection", language="en")
-        state["active_group"] = "opening"
-        state["target_mode"] = ""
-        state["workflow_mode"] = ""
-        state["confirmed_config"] = {"UNRELATED_SECRET": "must-not-be-projected"}
-        state["group_states"]["qps_profile"] = {"status": "complete"}
-        state["pending_question"] = {
-            "id": "generic_choice",
-            "group": "opening",
-            "kind": "numbered_choice",
-            "field": "target_mode",
-            "manual_input_allowed": False,
-            "options": [{"id": "one", "label": "First", "value": "alpha"}],
-            "accepted_action_types": ["answer_pending"],
-        }
-        original = "Use the first choice.\nThis rationale must remain verbatim."
-
-        payload = _focused_pending_request_payload(
-            state,
-            original,
-            allowed_action_types=frozenset({"answer_pending"}),
-        )
-
-        self.assertEqual(payload["user_text"], original)
-        self.assertEqual(
-            {row["type"] for row in payload["action_schema"]},
-            {"answer_pending"},
-        )
-        self.assertEqual(
-            {row["name"] for row in payload["group_schema"]},
-            {"opening"},
-        )
-        self.assertEqual(
-            set(payload["workflow_state"]),
-            {
-                "active_group",
-                "language",
-                "target_mode",
-                "workflow_mode",
-                "pending_question",
-            },
-        )
-        self.assertNotIn("confirmed_config", payload["workflow_state"])
-        self.assertNotIn("qps_profile", payload["workflow_state"])
-
-    def test_focused_global_seed_promotes_pending_and_routed_sibling(self) -> None:
-        from agent.harness.hierarchical_planner import _focused_global_seed
-        from agent.harness.plan_coverage import TurnClause
-        from agent.harness.state import new_state
-
-        state = new_state("focused-global-seed", language="en")
-        state["pending_question"] = {
-            "id": "generic_choice",
-            "group": "opening",
-            "kind": "numbered_choice",
-            "field": "target_mode",
-            "manual_input_allowed": False,
-            "options": [{"id": "one", "label": "First", "value": "alpha"}],
-            "accepted_action_types": ["answer_pending"],
-        }
-        clauses = (
-            TurnClause("clause-1", "Use the first choice."),
-            TurnClause("clause-2", "Set the QPS profile to quick."),
-        )
-        candidate = json.dumps({
-            "actions": [{
-                "type": "answer_pending",
-                "selected_value": "alpha",
-                "source_evidence": "Use the first choice.",
-            }],
-            "semantic_units": [
-                {
-                    "unit_id": 7,
-                    "clause_id": "clause-1",
-                    "source_text": "Use the first choice.",
-                    "disposition": "action",
-                    "action_indexes": [0],
-                    "reason": "pending selection",
-                },
-                {
-                    "unit_id": 8,
-                    "clause_id": "clause-2",
-                    "source_text": "Set the QPS profile to quick.",
-                    "disposition": "unresolved",
-                    "action_indexes": [],
-                    "operation": "domain_request",
-                    "owner_routes": [{
-                        "owner": "performance",
-                        "group": "qps_profile",
-                    }],
-                    "reason": "independent sibling",
-                },
-            ],
-        })
-
-        partition, coordinator, errors = _focused_global_seed(
-            candidate,
-            state,
-            clauses,
-            allowed_action_types=frozenset({"answer_pending"}),
-        )
-
-        self.assertEqual(errors, ())
-        self.assertEqual(
-            [row["unit_id"] for row in partition],
-            ["focused-unit-1", "focused-unit-2"],
-        )
-        self.assertEqual(
-            [row["operation"] for row in partition],
-            ["pending_answer", "domain_request"],
-        )
-        self.assertEqual(coordinator["actions"][0]["type"], "answer_pending")
-        self.assertEqual(
-            [row["unit_id"] for row in coordinator["bindings"]],
-            ["focused-unit-1"],
-        )
-
-    def test_focused_global_seed_rejects_unregistered_sibling_route(self) -> None:
-        from agent.harness.hierarchical_planner import _focused_global_seed
-        from agent.harness.plan_coverage import TurnClause
-        from agent.harness.state import new_state
-
-        state = new_state("focused-global-seed-reject", language="en")
-        state["pending_question"] = {
-            "id": "generic_choice",
-            "group": "opening",
-            "kind": "numbered_choice",
-            "field": "target_mode",
-            "manual_input_allowed": False,
-            "options": [{"id": "one", "label": "First", "value": "alpha"}],
-            "accepted_action_types": ["answer_pending"],
-        }
-        candidate = json.dumps({
-            "actions": [{
-                "type": "answer_pending",
-                "selected_value": "alpha",
-                "source_evidence": "Use the first choice.",
-            }],
-            "semantic_units": [
-                {
-                    "unit_id": "one",
-                    "clause_id": "clause-1",
-                    "source_text": "Use the first choice.",
-                    "disposition": "action",
-                    "action_indexes": [0],
-                    "reason": "pending selection",
-                },
-                {
-                    "unit_id": "two",
-                    "clause_id": "clause-2",
-                    "source_text": "Change another setting.",
-                    "disposition": "unresolved",
-                    "action_indexes": [],
-                    "operation": "domain_request",
-                    "owner_routes": [{
-                        "owner": "performance",
-                        "group": "not_registered",
-                    }],
-                    "reason": "independent sibling",
-                },
-            ],
-        })
-
-        partition, coordinator, errors = _focused_global_seed(
-            candidate,
-            state,
-            (
-                TurnClause("clause-1", "Use the first choice."),
-                TurnClause("clause-2", "Change another setting."),
-            ),
-            allowed_action_types=frozenset({"answer_pending"}),
-        )
-
-        self.assertEqual(partition, [])
-        self.assertEqual(coordinator, {})
-        self.assertIn("outside the registry", " ".join(errors))
-
-    def test_focused_global_seed_resolves_one_proven_compound_overlap(self) -> None:
-        from agent.harness.hierarchical_planner import _focused_global_seed
-        from agent.harness.plan_coverage import TurnClause
-        from agent.harness.state import new_state
-
-        state = new_state("focused-global-overlap", language="en")
-        state["pending_question"] = {
-            "id": "generic_choice",
-            "group": "opening",
-            "kind": "numbered_choice",
-            "field": "target_mode",
-            "manual_input_allowed": False,
-            "options": [{"id": "one", "label": "First", "value": "alpha"}],
-            "accepted_action_types": ["answer_pending"],
-        }
-        text = "Use the first choice, and set the QPS profile to quick."
-        candidate = json.dumps({
-            "actions": [{
-                "type": "answer_pending",
-                "selected_value": "alpha",
-                "source_evidence": "Use the first choice",
-            }],
-            "semantic_units": [
-                {
-                    "unit_id": "one",
-                    "clause_id": "clause-1",
-                    "source_text": text,
-                    "disposition": "action",
-                    "action_indexes": [0],
-                    "reason": "pending selection",
-                },
-                {
-                    "unit_id": "two",
-                    "clause_id": "clause-1",
-                    "source_text": text,
-                    "disposition": "unresolved",
-                    "action_indexes": [],
-                    "operation": "domain_request",
-                    "owner_routes": [{
-                        "owner": "performance",
-                        "group": "qps_profile",
-                    }],
-                    "reason": "independent sibling",
-                },
-            ],
-        })
-
-        partition, _coordinator, errors = _focused_global_seed(
-            candidate,
-            state,
-            (TurnClause("clause-1", text),),
-            allowed_action_types=frozenset({"answer_pending"}),
-        )
-
-        self.assertEqual(errors, ())
-        self.assertEqual(
-            [row["source_text"] for row in partition],
-            ["Use the first choice", ", and set the QPS profile to quick."],
-        )
-
-    def test_focused_seed_skips_global_partition_and_coordinator_compile(
+    def test_stage_a_partition_does_not_return_to_focused_pending_authority(
         self,
     ) -> None:
-        from agent.harness.hierarchical_planner import resolve_product_action_queue
-        from agent.harness.plan_coverage import PlanCoverageResult
-        from agent.harness.semantic_compiler import WholePlanAdmission
+        from tests.agent_live.graph_turn import resolve_product_action_queue_for_test as resolve_product_action_queue
         from agent.harness.state import new_state
 
-        state = new_state("focused-seed-routing", language="en")
+        state = new_state("stage-a-before-focused", language="en")
         state["pending_question"] = {
             "id": "generic_choice",
             "group": "opening",
@@ -715,271 +337,27 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                 "reason": "independent sibling",
             },
         ]
-        coordinator = {
-            "actions": [{
-                "type": "answer_pending",
-                "selected_value": "alpha",
-                "source_evidence": "Use the first choice.",
-            }],
-            "bindings": [{
-                "unit_id": "focused-unit-1",
-                "action_indexes": [0],
-                "disposition": "action",
-                "reason": "focused pending action",
-            }],
-        }
-        performance = {
-            "actions": [{
-                "type": "set_qps_mode",
-                "qps_mode": "quick",
-                "mutation_explicit": True,
-                "source_evidence": "Set the QPS profile to quick.",
-            }],
-            "bindings": [{
-                "unit_id": "focused-unit-2",
-                "action_indexes": [0],
-                "disposition": "action",
-                "reason": "QPS selection",
-            }],
-        }
-
         with (
             patch(
                 "agent.harness.hierarchical_planner.provider_from_config",
                 return_value=object(),
             ),
             patch(
-                "agent.harness.hierarchical_planner.adjudicate_active_pending_contract",
-                return_value=(None, (), (101,), 1, 0, "seed"),
-            ),
-            patch(
-                "agent.harness.hierarchical_planner._focused_global_seed",
-                return_value=(partition, coordinator, ()),
-            ),
-            patch(
                 "agent.harness.hierarchical_planner.request_semantic_compilation",
+                return_value=json.dumps({"semantic_units": partition}),
             ) as stage_a,
             patch(
                 "agent.harness.hierarchical_planner._compile_owner_document",
-                return_value=(performance, (), (202,)),
             ) as owner_compiler,
-            patch(
-                "agent.harness.hierarchical_planner.prepare_hierarchical_candidate",
-                return_value=("candidate", PlanCoverageResult(True, (), ())),
-            ),
-            patch(
-                "agent.harness.hierarchical_planner._review_bounded_semantic_candidate",
-                return_value=(
-                    SimpleNamespace(request_json="candidate"),
-                    WholePlanAdmission(
-                        valid=True,
-                        errors=(),
-                        request_count=1,
-                        request_sizes=(303,),
-                    ),
-                    (),
-                ),
-            ),
-            patch(
-                "agent.harness.hierarchical_planner._admitted_action_queue",
-                return_value={
-                    "actions": [
-                        {"type": "answer_pending"},
-                        {"type": "set_qps_mode"},
-                    ],
-                },
-            ),
         ):
             result = resolve_product_action_queue(
                 state,
                 "Use the first choice. Set the QPS profile to quick.",
             )
 
-        self.assertEqual(result["planner_metrics"]["stage_a_calls"], 0)
-        self.assertEqual(result["planner_metrics"]["stage_b_calls"], 2)
-        self.assertEqual(result["planner_metrics"]["admission_calls"], 1)
-        stage_a.assert_not_called()
-        owner_compiler.assert_called_once()
-        self.assertEqual(owner_compiler.call_args.args[1], "performance")
-
-    def test_stage_a_routes_competing_pending_units_to_focused_authority(
-        self,
-    ) -> None:
-        from agent.harness.hierarchical_planner import (
-            _partition_requires_focused_pending_adjudication,
-        )
-        from agent.harness.state import new_state
-
-        state = new_state("focused-multi-unit", language="en")
-        state["pending_question"] = {
-            "id": "detected_value",
-            "group": "environment",
-        }
-        partition = [
-            {
-                "unit_id": "unit-1",
-                "clause_id": "clause-1",
-                "operation": "pending_answer",
-            },
-            {
-                "unit_id": "unit-2",
-                "clause_id": "clause-2",
-                "operation": "pending_answer",
-            },
-        ]
-
-        self.assertTrue(
-            _partition_requires_focused_pending_adjudication(
-                state,
-                {"structured_candidates": []},
-                partition,
-            )
-        )
-        self.assertFalse(
-            _partition_requires_focused_pending_adjudication(
-                {**state, "pending_question": {}},
-                {"structured_candidates": []},
-                partition,
-            )
-        )
-
-    def test_stage_a_routes_typed_candidate_with_executable_sibling_to_focused_authority(
-        self,
-    ) -> None:
-        from agent.harness.hierarchical_planner import (
-            _partition_requires_focused_pending_adjudication,
-        )
-        from agent.harness.state import new_state
-
-        state = new_state("focused-manual-sibling", language="en")
-        state["pending_question"] = {
-            "id": "generic_manual_value",
-            "group": "endpoint_process",
-            "kind": "url",
-            "manual_input_allowed": True,
-            "options": [],
-        }
-        partition = [
-            {
-                "unit_id": "unit-1",
-                "clause_id": "clause-1",
-                "operation": "domain_request",
-            },
-            {
-                "unit_id": "unit-2",
-                "clause_id": "clause-2",
-                "operation": "pending_answer",
-            },
-        ]
-
-        self.assertTrue(
-            _partition_requires_focused_pending_adjudication(
-                state,
-                {
-                    "pending_typed_candidates": [
-                        "https://example.invalid/rpc",
-                    ],
-                    "structured_candidates": [],
-                },
-                partition,
-            )
-        )
-        self.assertTrue(
-            _partition_requires_focused_pending_adjudication(
-                state,
-                {
-                    "pending_typed_candidates": [
-                        "https://example.invalid/rpc",
-                    ],
-                    "structured_candidates": [],
-                },
-                [{
-                    "unit_id": "unit-1",
-                    "clause_id": "clause-1",
-                    "operation": "domain_request",
-                }],
-            )
-        )
-        self.assertFalse(
-            _partition_requires_focused_pending_adjudication(
-                state,
-                {
-                    "pending_typed_candidates": [
-                        "https://one.invalid/rpc",
-                        "https://two.invalid/rpc",
-                    ],
-                    "structured_candidates": [],
-                },
-                partition,
-            )
-        )
-
-    def test_focused_partition_schema_can_correct_universal_labels_only(
-        self,
-    ) -> None:
-        from agent.harness.hierarchical_planner import (
-            _focused_action_types_for_partition,
-        )
-
-        allowed = _focused_action_types_for_partition([{
-            "unit_id": "unit-1",
-            "clause_id": "clause-1",
-            "operation": "domain_request",
-            "owner_routes": [{
-                "owner": "chain_rpc",
-                "group": "endpoint_process",
-            }],
-        }])
-
-        self.assertIn("rpc_catalog_command", allowed)
-        self.assertIn("answer_pending", allowed)
-        self.assertIn("answer_opening_question", allowed)
-        self.assertIn("change_group", allowed)
-        self.assertNotIn("set_qps_mode", allowed)
-
-    def test_stage_a_routes_structured_pending_conflict_to_focused_authority(
-        self,
-    ) -> None:
-        from agent.harness.hierarchical_planner import (
-            _partition_requires_focused_pending_adjudication,
-        )
-        from agent.harness.state import new_state
-
-        state = new_state("focused-structured", language="en")
-        state["pending_question"] = {
-            "id": "throughput",
-            "group": "environment",
-        }
-        partition = [{
-            "unit_id": "unit-1",
-            "clause_id": "clause-2",
-            "operation": "pending_answer",
-        }]
-
-        self.assertTrue(
-            _partition_requires_focused_pending_adjudication(
-                state,
-                {
-                    "structured_candidates": [{
-                        "clause_id": "clause-2",
-                        "config_values": {"THROUGHPUT": "1200"},
-                    }],
-                },
-                partition,
-            )
-        )
-        self.assertFalse(
-            _partition_requires_focused_pending_adjudication(
-                state,
-                {
-                    "structured_candidates": [{
-                        "clause_id": "clause-1",
-                        "config_values": {"THROUGHPUT": "1200"},
-                    }],
-                },
-                partition,
-            )
-        )
+        self.assertEqual(result["planner_metrics"]["stage_a_calls"], 1)
+        stage_a.assert_called_once()
+        owner_compiler.assert_called()
 
     def test_stage_a_keeps_typed_evidence_contribution_atomic(
         self,
@@ -1044,52 +422,93 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         )
         self.assertEqual(source[0]["operation"], "pending_answer")
 
-    def test_stage_a_routes_structured_config_to_environment_review(
-        self,
-    ) -> None:
+    def test_stage_a_preserves_valid_structured_route(self) -> None:
         from agent.harness.hierarchical_planner import (
-            _canonicalize_structured_config_partition,
+            _validate_partition_document,
         )
         from agent.harness.plan_coverage import TurnClause
-        from agent.harness.state import new_state
 
-        state = new_state("structured-review", language="en")
-        state["active_group"] = "accounts_disk"
-        state["pending_question"] = {
-            "id": "throughput",
-            "group": "accounts_disk",
-        }
+        clauses = (
+            TurnClause("clause-1", "QPS_MODE: quick", "structured"),
+        )
         unit = {
             "unit_id": "unit-1",
             "clause_id": "clause-1",
-            "source_text": "THROUGHPUT=1200",
-            "operation": "pending_answer",
+            "source_text": "QPS_MODE: quick",
+            "operation": "domain_request",
             "owner_routes": [{
-                "owner": "coordinator",
-                "group": "accounts_disk",
+                "owner": "performance",
+                "group": "qps_profile",
             }],
-            "reason": "candidate answer",
+            "reason": "structured workflow value",
         }
-        source, compilation = _canonicalize_structured_config_partition(
-            state,
-            (TurnClause("clause-1", "Use this:\nTHROUGHPUT=1200", "structured"),),
-            {
-                "structured_candidates": [{
-                    "clause_id": "clause-1",
-                    "config_values": {"THROUGHPUT": "1200"},
-                }],
-            },
-            [unit],
-            [unit],
+        partition, errors = _validate_partition_document(
+            json.dumps({"semantic_units": [unit], "reason": "complete"}),
+            clauses,
         )
 
-        self.assertEqual(source, compilation)
-        self.assertEqual(source[0]["operation"], "domain_request")
         self.assertEqual(
-            source[0]["owner_routes"],
-            [{"owner": "environment", "group": "accounts_disk"}],
+            partition[0]["owner_routes"],
+            [{"owner": "performance", "group": "qps_profile"}],
         )
-        self.assertEqual(source[0]["source_text"], "Use this:\nTHROUGHPUT=1200")
+        self.assertEqual(errors, ())
+
+    def test_stage_a_rejects_invalid_structured_route_without_reassigning_owner(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _validate_partition_document,
+        )
+        from agent.harness.plan_coverage import TurnClause
+
+        unit = {
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": "QPS_MODE: quick",
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "environment",
+                "group": "qps_profile",
+            }],
+            "reason": "invalid owner claim",
+        }
+        partition, errors = _validate_partition_document(
+            json.dumps({"semantic_units": [unit], "reason": "invalid"}),
+            (TurnClause("clause-1", "QPS_MODE: quick", "structured"),),
+        )
+
+        self.assertEqual(
+            partition[0]["owner_routes"],
+            [{"owner": "environment", "group": "qps_profile"}],
+        )
+        self.assertTrue(
+            any("owner/group mismatch" in error for error in errors),
+            errors,
+        )
+
+    def test_stage_a_rejects_incomplete_structured_route(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _validate_partition_document,
+        )
+        from agent.harness.plan_coverage import TurnClause
+
+        unit = {
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": "QPS_MODE: quick",
+            "operation": "domain_request",
+            "owner_routes": [],
+            "reason": "missing route",
+        }
+        _partition, errors = _validate_partition_document(
+            json.dumps({"semantic_units": [unit], "reason": "invalid"}),
+            (TurnClause("clause-1", "QPS_MODE: quick", "structured"),),
+        )
+
+        self.assertTrue(
+            any("actionable unit has no route" in error for error in errors),
+            errors,
+        )
 
     def test_unique_manual_candidate_keeps_wrapper_as_source_context(self) -> None:
         from agent.harness.hierarchical_planner import (
@@ -1231,7 +650,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
     def test_product_resolver_end_to_end_contract_without_internal_boundary_mocks(
         self,
     ) -> None:
-        from agent.harness.hierarchical_planner import resolve_product_action_queue
+        from tests.agent_live.graph_turn import resolve_product_action_queue_for_test as resolve_product_action_queue
         from agent.harness.state import new_state
 
         class ContractProvider:
@@ -2719,7 +2138,9 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
 
     def test_consultation_cannot_claim_a_pending_option_by_action_type(self) -> None:
         from agent.harness.domains.orientation import opening_question
-        from agent.harness.intent import prepare_hierarchical_candidate
+        from agent.harness.semantic_admission import (
+            prepare_hierarchical_candidate,
+        )
         from agent.harness.plan_coverage import segment_user_turn
         from agent.harness.state import new_state
 
@@ -2758,7 +2179,9 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
 
     def test_domain_request_cannot_claim_a_pending_option(self) -> None:
         from agent.harness.domains.orientation import opening_question
-        from agent.harness.intent import prepare_hierarchical_candidate
+        from agent.harness.semantic_admission import (
+            prepare_hierarchical_candidate,
+        )
         from agent.harness.plan_coverage import segment_user_turn
         from agent.harness.state import new_state
 
@@ -2797,7 +2220,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertNotIn("pending_answer_admissions", payload)
 
     def test_product_resolver_runs_partition_then_owner_compilers(self) -> None:
-        from agent.harness.hierarchical_planner import resolve_product_action_queue
+        from tests.agent_live.graph_turn import resolve_product_action_queue_for_test as resolve_product_action_queue
         from agent.harness.plan_coverage import PlanCoverageResult
 
         text = "Switch to bsc. Use quick."
@@ -2881,10 +2304,6 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                 side_effect=review,
             ),
             patch(
-                "agent.harness.hierarchical_planner._admitted_plan_requires_pending_contract_adjudication",
-                return_value=False,
-            ),
-            patch(
                 "agent.harness.hierarchical_planner._admitted_action_queue",
                 return_value={"actions": captured},
             ),
@@ -2917,7 +2336,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
     def test_parallel_owner_compilers_inherit_one_absolute_turn_deadline(
         self,
     ) -> None:
-        from agent.harness.hierarchical_planner import resolve_product_action_queue
+        from tests.agent_live.graph_turn import resolve_product_action_queue_for_test as resolve_product_action_queue
         from agent.harness.plan_coverage import PlanCoverageResult
         from agent.llm.types import llm_turn_scope, remaining_turn_seconds
 
@@ -3035,7 +2454,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertLess(max(observed) - min(observed), 0.05)
 
     def test_provider_failure_is_not_converted_to_user_clarification(self) -> None:
-        from agent.harness.hierarchical_planner import resolve_product_action_queue
+        from tests.agent_live.graph_turn import resolve_product_action_queue_for_test as resolve_product_action_queue
         from agent.llm.types import LLMProviderError
 
         provider_error = LLMProviderError(
@@ -3056,7 +2475,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
     def test_parallel_owner_response_failure_is_not_converted_to_clarification(
         self,
     ) -> None:
-        from agent.harness.hierarchical_planner import resolve_product_action_queue
+        from tests.agent_live.graph_turn import resolve_product_action_queue_for_test as resolve_product_action_queue
         from agent.llm.types import LLMProviderError, llm_turn_scope
 
         stage_a = {
@@ -3101,9 +2520,13 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
 
     def test_coordinator_product_path_uses_hierarchical_resolver(self) -> None:
         import agent.harness.coordinator as coordinator
-        from agent.harness.hierarchical_planner import resolve_product_action_queue
+        from agent.harness import hierarchical_planner
 
-        self.assertIs(coordinator.resolve_action_queue, resolve_product_action_queue)
+        self.assertFalse(hasattr(coordinator, "resolve_action_queue"))
+        self.assertIs(
+            coordinator.hierarchical_planner,
+            hierarchical_planner,
+        )
 
 
 if __name__ == "__main__":

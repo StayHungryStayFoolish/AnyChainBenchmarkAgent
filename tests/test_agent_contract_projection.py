@@ -85,6 +85,10 @@ class AgentContractProjectionTest(unittest.TestCase):
                 return_value={"gate": "G0", "status": "passed"},
             ),
             patch(
+                "tests.agent_live.run_product_acceptance._phase1_source",
+                return_value=passed_phase,
+            ),
+            patch(
                 "tests.agent_live.run_product_acceptance._phase2_source",
                 return_value=passed_phase,
             ),
@@ -159,26 +163,50 @@ class AgentContractProjectionTest(unittest.TestCase):
             "observed_domain_owners": {"one", "two"},
             "expected_domain_owners": {"one", "two"},
             "regressions": {"status": "passed"},
+            "shell_gates": {"status": "passed"},
             "checks": [{"passed": True}],
         }
         self.assertTrue(_phase6_complete(**arguments))
         arguments["closure"]["open_required"] = 1
         self.assertFalse(_phase6_complete(**arguments))
 
-    def test_product_acceptance_uses_declared_unittest_runtime(self) -> None:
+    def test_product_acceptance_uses_offline_isolation_runner(self) -> None:
         from tests.agent_live.run_product_acceptance import FULL_PYTHON_SUITE_COMMAND
 
         self.assertEqual(
             FULL_PYTHON_SUITE_COMMAND[1:],
-            (
-                "-m",
-                "unittest",
-                "discover",
-                "-s",
-                "tests",
-                "-p",
-                "test_*.py",
-            ),
+            ("tests/run_offline_python_suite.py",),
+        )
+
+    def test_phase_one_runs_real_contract_checks(self) -> None:
+        from tests.agent_live.run_product_acceptance import _phase1_source
+
+        with patch(
+            "tests.agent_live.run_product_acceptance._checked_phase",
+            return_value={"phase": 1, "status": "passed", "checks": ["real"]},
+        ) as checked:
+            result = _phase1_source()
+
+        self.assertEqual(result["checks"], ["real"])
+        checked.assert_called_once_with(
+            1,
+            "tests.test_agent_contract_projection",
+            "tests.test_agent_question_prompts",
+        )
+
+    def test_revision_identity_distinguishes_dirty_diagnostic_reports(self) -> None:
+        from tests.agent_live.run_product_acceptance import (
+            EMPTY_WORKTREE_HASH,
+            _revision_id,
+        )
+
+        self.assertEqual(
+            _revision_id({"commit": "abc", "worktree_hash": EMPTY_WORKTREE_HASH}),
+            "abc",
+        )
+        self.assertEqual(
+            _revision_id({"commit": "abc", "worktree_hash": "f" * 64}),
+            "abc-ffffffffffffffff",
         )
 
 

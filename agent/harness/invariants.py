@@ -160,6 +160,64 @@ def validate_state(state: AgentGraphState) -> None:
             + ", ".join(undeclared_roots)
         )
 
+    planning = state.get("semantic_planning") or {}
+    if planning:
+        if int(planning.get("contract_version") or 0) != 1:
+            raise StateInvariantError(
+                "semantic planning document has an unsupported contract version"
+            )
+        status = str(planning.get("status") or "")
+        if status not in {
+            "partition",
+            "compile_owner",
+            "review_plan",
+            "reviewed",
+            "failed",
+        }:
+            raise StateInvariantError(
+                f"semantic planning document has invalid status: {status!r}"
+            )
+        requests = planning.get("owner_requests") or []
+        if not isinstance(requests, list):
+            raise StateInvariantError(
+                "semantic planning owner requests must be a list"
+            )
+        cursor = int(planning.get("owner_cursor") or 0)
+        if cursor < 0 or cursor > len(requests):
+            raise StateInvariantError(
+                "semantic planning owner cursor is outside its schedule"
+            )
+        owners: list[str] = []
+        for request in requests:
+            if not isinstance(request, Mapping):
+                raise StateInvariantError(
+                    "semantic planning owner request must be an object"
+                )
+            owner = str(request.get("owner") or "")
+            if owner not in OWNER_PATH_POLICY:
+                raise StateInvariantError(
+                    f"semantic planning request has unknown owner: {owner!r}"
+                )
+            if owner in owners:
+                raise StateInvariantError(
+                    f"semantic planning schedule repeats owner: {owner}"
+                )
+            owners.append(owner)
+        documents = planning.get("owner_documents") or {}
+        if not isinstance(documents, Mapping):
+            raise StateInvariantError(
+                "semantic planning owner documents must be an object"
+            )
+        expected_documents = set(owners[:cursor])
+        if set(documents) != expected_documents:
+            raise StateInvariantError(
+                "semantic planning documents do not match the compiled cursor"
+            )
+        if status == "review_plan" and cursor != len(requests):
+            raise StateInvariantError(
+                "semantic planning reached review before every owner compiled"
+            )
+
     active_group = str(state.get("active_group") or "opening")
     if active_group not in GROUP_OWNER:
         raise StateInvariantError(f"unknown active group: {active_group}")
@@ -167,8 +225,15 @@ def validate_state(state: AgentGraphState) -> None:
     pending = state.get("pending_question") or {}
     if pending:
         pending_group = str(pending.get("group") or "")
+        pending_owner = str(pending.get("owner") or "")
         if pending_group not in GROUP_OWNER:
             raise StateInvariantError(f"pending question has unknown group: {pending_group}")
+        if not pending_owner:
+            raise StateInvariantError("pending question is missing its explicit owner")
+        if pending_owner not in set(GROUP_OWNER.values()):
+            raise StateInvariantError(
+                f"pending question has unknown owner: {pending_owner!r}"
+            )
         if pending_group != active_group:
             raise StateInvariantError(
                 f"pending question owner {pending_group} differs from active group {active_group}"

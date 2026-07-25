@@ -639,7 +639,6 @@ def validate_whole_plan_admission(
                     f"whole-plan turn candidate verdict is invalid: {action_id}/{candidate_id}"
                 )
             evidence_quote = str(turn_row.get("evidence_quote") or "")
-            candidate_value = candidate.get("value") if candidate is not None else None
             candidate_source_units = (
                 [
                     str(value)
@@ -881,11 +880,6 @@ def _canonicalize_admission_receipts(
         record = action_records.get(action_id)
         if not isinstance(record, Mapping):
             continue
-        immutable_action = (
-            record.get("action")
-            if isinstance(record.get("action"), Mapping)
-            else {}
-        )
         evidence_rows = [
             item
             for item in raw_row.get("evidence") or []

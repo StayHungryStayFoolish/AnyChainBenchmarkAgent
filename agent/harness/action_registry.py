@@ -83,6 +83,18 @@ def answer_pending_representation_conflict(action: Mapping[str, Any]) -> bool:
     return len(identities) > 1
 
 
+def state_has_capability(state: Mapping[str, Any], capability: str) -> bool:
+    """Return whether authoritative state already satisfies a registry capability."""
+
+    if capability == "chain_identity":
+        from .routing import group_readiness
+
+        return group_readiness(dict(state), "chain_identity").ready
+    if capability == "target_mode":
+        return bool(normalize_target_mode(state.get("target_mode")))
+    return False
+
+
 SEMANTIC_SCOPE_POLICIES: dict[str, dict[str, Any]] = {
     "consultation_only": {
         "description": "Permit read-only answers only; workflow navigation is not authorized.",
@@ -260,7 +272,8 @@ class ActionSpec:
     state_transition_resolver: StateTransitionResolver | None = None
     entry_intake: bool = False
     entry_intake_purpose: str = ""
-    entry_intake_arguments: tuple[tuple[str, Any], ...] = ()
+    entry_intake_fixed_arguments: tuple[tuple[str, Any], ...] = ()
+    entry_intake_value_arguments: tuple[str, ...] = ()
     internal_only: bool = False
     validator: ActionValidator | None = None
 
@@ -352,10 +365,8 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         semantic_value_grounding_arguments=("target_mode",),
         entry_intake=True,
         entry_intake_purpose="Enter target-mode selection from any active workflow group.",
-        entry_intake_arguments=(
-            ("target_mode", "fake-node"),
-            ("target_mode_explicit", True),
-        ),
+        entry_intake_fixed_arguments=(("target_mode_explicit", True),),
+        entry_intake_value_arguments=("target_mode",),
     ),
     ActionSpec(
         "choose_chain",
@@ -372,7 +383,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
         entry_intake=True,
         entry_intake_purpose="Enter initial chain identity selection from any active workflow group.",
-        entry_intake_arguments=(("chain_text", "registry"),),
+        entry_intake_value_arguments=("chain_text", "chain_candidates"),
         validator=_validate_chain_selection,
     ),
     ActionSpec(
@@ -390,7 +401,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
         entry_intake=True,
         entry_intake_purpose="Enter chain replacement from any active workflow group.",
-        entry_intake_arguments=(("chain_text", "registry"),),
+        entry_intake_value_arguments=("chain_text", "chain_candidates"),
         validator=_validate_chain_selection,
     ),
     ActionSpec(
@@ -572,7 +583,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         ),
         entry_intake=True,
         entry_intake_purpose="Enter custom RPC method catalog setup and collect its endpoint, method, and schema evidence.",
-        entry_intake_arguments=(("catalog_command", "enter"),),
+        entry_intake_fixed_arguments=(("catalog_command", "enter"),),
         incompatible_target_modes=("sync-observe",),
         semantic_support_relations=EVIDENCE_OPERATION_SUPPORT_RELATIONS,
         semantic_value_grounding_arguments=("rpc_endpoint", "rpc_method", "rpc_schema_evidence"),
@@ -955,6 +966,12 @@ def lifecycle_rejected_action_indexes(
     """
 
     target_mode = normalize_target_mode(state.get("target_mode"))
+    projected_capabilities = {
+        capability
+        for spec in ACTION_SPECS
+        for capability in spec.provides_capabilities
+        if state_has_capability(state, capability)
+    }
     projected_state_values: dict[tuple[str, ...], Any] = {}
     rejected: list[int] = []
     for index, action in enumerate(actions):
@@ -963,9 +980,22 @@ def lifecycle_rejected_action_indexes(
             replacement = normalize_target_mode(action.get("target_mode"))
             if replacement:
                 target_mode = replacement
+                projected_capabilities.add("target_mode")
             continue
         spec = ACTION_BY_TYPE.get(action_type)
         if spec is None:
+            continue
+        if (
+            spec.incomplete_mutation_intake
+            and spec.provides_capabilities
+            and bool(str(action.get("source_evidence") or "").strip())
+            and action.get("selection_contract_verified") is not True
+            and all(
+                capability in projected_capabilities
+                for capability in spec.provides_capabilities
+            )
+        ):
+            rejected.append(index)
             continue
         incompatible_mode = target_mode in spec.incompatible_target_modes
         current: Any = projected_state_values.get(spec.required_state_path)
@@ -991,6 +1021,8 @@ def lifecycle_rejected_action_indexes(
         )
         if transition is not None:
             projected_state_values[transition[0]] = transition[1]
+        if not spec.incomplete_mutation_intake:
+            projected_capabilities.update(spec.provides_capabilities)
     return tuple(rejected)
 
 
@@ -1010,65 +1042,6 @@ def resolve_action_target_group(action: Mapping[str, Any]) -> str:
         str(action.get(spec.target_field_argument) or "").strip()
     )
 
-
-def normalize_action_relations(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Apply registry-declared relations across one proposed transaction.
-
-    Relations operate on typed actions only. They never inspect user prose or
-    infer a replacement action. This keeps transaction semantics centralized
-    while allowing an explicit navigation to own its existing interruption
-    frame instead of competing with a same-turn generic resume action.
-    """
-
-    action_types = {
-        str(action.get("type") or "").strip()
-        for action in actions
-        if isinstance(action, dict)
-    }
-    interruption_owner_present = any(
-        action_preserves_pending(action)
-        for action in actions
-        if isinstance(action, dict)
-    )
-    intake_groups = {
-        resolve_action_target_group(action)
-        for action in actions
-        if bool(
-            getattr(
-                ACTION_BY_TYPE.get(str(action.get("type") or "")),
-                "incomplete_mutation_intake",
-                False,
-            )
-        )
-    }
-    intake_groups.discard("")
-    output: list[dict[str, Any]] = []
-    merge_indexes: dict[tuple[Any, ...], int] = {}
-    for action in actions:
-        spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
-        if (
-            str(action.get("type") or "") == "change_group"
-            and str(action.get("group") or "") in intake_groups
-        ):
-            continue
-        if str(action.get("type") or "") == "resume_current_flow" and interruption_owner_present:
-            continue
-        if spec is not None and set(spec.suppressed_by).intersection(action_types):
-            continue
-        if spec is not None and spec.merge_identity:
-            merge_key = action_merge_key(action)
-            prior_index = merge_indexes.get(merge_key)
-            if prior_index is not None:
-                prior = output[prior_index]
-                for field_name in TRUSTED_ACTION_METADATA_FIELDS:
-                    if action.get(field_name) is True:
-                        prior[field_name] = True
-                if action.get("navigation_explicit") is True:
-                    prior["navigation_explicit"] = True
-                continue
-            merge_indexes[merge_key] = len(output)
-        output.append(action)
-    return output
 
 ACTION_METADATA_FIELDS = frozenset({"type", "confidence", "reason", "action_id"})
 TRUSTED_ACTION_METADATA_FIELDS = frozenset({
@@ -1124,6 +1097,15 @@ def action_registry_contract_hash() -> str:
             "crosses_pending_barrier": spec.crosses_pending_barrier,
             "requires_specific_change": spec.requires_specific_change,
             "incomplete_mutation_intake": spec.incomplete_mutation_intake,
+            "entry_intake": spec.entry_intake,
+            "entry_intake_purpose": spec.entry_intake_purpose,
+            "entry_intake_fixed_arguments": [
+                [key, value]
+                for key, value in spec.entry_intake_fixed_arguments
+            ],
+            "entry_intake_value_arguments": list(
+                spec.entry_intake_value_arguments
+            ),
             "required_arguments": list(spec.required_arguments),
             "constraints": list(spec.constraints),
             "suppressed_by": list(spec.suppressed_by),
@@ -1157,6 +1139,34 @@ def action_registry_contract_hash() -> str:
         "semantic_scope_policies": SEMANTIC_SCOPE_POLICIES,
         "consultation_topics": sorted(CONSULTATION_TOPICS),
     })
+
+
+def registered_closed_value_domains() -> tuple[dict[str, Any], ...]:
+    """Expose registry-derived closed values for cross-domain admission.
+
+    These records come only from enum-backed action arguments. They let the
+    planner distinguish a researched open identity from a value that belongs
+    to another registered closed dimension without maintaining phrase lists.
+    """
+
+    records: list[dict[str, Any]] = []
+    for spec in ACTION_SPECS:
+        for argument in spec.semantic_value_grounding_arguments:
+            schema = ACTION_ARGUMENT_SCHEMAS.get(argument) or {}
+            enum = schema.get("enum")
+            if not isinstance(enum, list):
+                continue
+            for value in enum:
+                canonical = str(value).strip()
+                if not canonical:
+                    continue
+                records.append({
+                    "action_type": spec.action_type,
+                    "argument": argument,
+                    "target_group": spec.target_group,
+                    "value": canonical,
+                })
+    return tuple(records)
 
 
 def admission_contract_hash() -> str:
@@ -1567,9 +1577,8 @@ def normalize_current_action_envelope(raw: Mapping[str, Any]) -> dict[str, Any]:
     action = dict(raw)
     if "arguments" in action:
         raise ValueError("arguments.v1 is retired for current-turn actions")
-    if "type" not in action and "intent" in action:
-        action["type"] = action["intent"]
-    action.pop("intent", None)
+    if "intent" in action:
+        raise ValueError("intent.v1 is retired for current-turn actions")
     return action
 
 
@@ -1799,13 +1808,6 @@ def action_crosses_pending_barrier(action: dict[str, Any]) -> bool:
     )
 
 
-def action_preserves_pending(action: Mapping[str, Any]) -> bool:
-    """Return whether one action owns restoration of an interrupted question."""
-
-    spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
-    return bool(spec and spec.preserve_pending)
-
-
 def action_merge_key(action: dict[str, Any]) -> tuple[Any, ...]:
     """Return the registry-declared semantic identity used across planner passes."""
 
@@ -1823,17 +1825,19 @@ def action_merge_key(action: dict[str, Any]) -> tuple[Any, ...]:
 def merge_semantic_actions(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
     """Apply the action registry's durable merge contract.
 
-    Incoming scalar decisions supersede older values. Registry-declared
-    mapping fields merge by key and sequence fields retain unique evidence in
-    encounter order. Actions without a merge declaration keep normal
-    supersede semantics.
+    Actions without an explicit merge declaration are replaced wholesale by
+    the incoming reviewed action. Registry-declared mapping fields merge by key
+    and sequence fields retain unique evidence in encounter order.
     """
 
-    merged = dict(existing)
-    merged.update(incoming)
     spec = ACTION_BY_TYPE.get(str(incoming.get("type") or ""))
-    if spec is None:
-        return merged
+    if (
+        spec is None
+        or not spec.merge_mapping_fields
+        and not spec.merge_sequence_fields
+    ):
+        return dict(incoming)
+    merged = dict(incoming)
     for field_name in spec.merge_mapping_fields:
         values: dict[str, Any] = {}
         old_value = existing.get(field_name)
@@ -1880,6 +1884,39 @@ def merge_semantic_actions(existing: dict[str, Any], incoming: dict[str, Any]) -
                     origins.append(text)
         merged["_merged_origin_texts"] = origins
     return merged
+
+
+def _entry_intake_probe_value(schema: Mapping[str, Any]) -> Any:
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum:
+        return enum[0]
+    value_type = str(schema.get("type") or "")
+    if value_type == "boolean":
+        return True
+    if value_type == "integer":
+        return max(1, int(schema.get("minimum") or 1))
+    if value_type == "number":
+        return max(1.0, float(schema.get("minimum") or 1.0))
+    if value_type == "array":
+        item_schema = schema.get("items")
+        return [
+            _entry_intake_probe_value(
+                item_schema if isinstance(item_schema, Mapping) else {"type": "string"}
+            )
+        ]
+    if value_type == "object":
+        return {}
+    return "entry-value"
+
+
+def _entry_intake_probe_tokens(action: Mapping[str, Any]) -> tuple[str, ...]:
+    tokens: list[str] = []
+    for key, value in action.items():
+        if key in {"type", "source_evidence"}:
+            continue
+        values = value if isinstance(value, list) else [value]
+        tokens.extend(str(item) for item in values if str(item))
+    return tuple(tokens) or ("entry",)
 
 
 def validate_action_registry() -> None:
@@ -1951,20 +1988,60 @@ def validate_action_registry() -> None:
                 f"{spec.action_type}"
             )
         if spec.entry_intake:
-            entry_arguments = dict(spec.entry_intake_arguments)
+            fixed_arguments = dict(spec.entry_intake_fixed_arguments)
+            value_arguments = set(spec.entry_intake_value_arguments)
             if not spec.target_group or not spec.entry_intake_purpose.strip():
                 raise RuntimeError(
                     f"entry intake requires a target group and purpose: {spec.action_type}"
                 )
-            if set(entry_arguments) - set(spec.allowed_arguments):
+            if set(fixed_arguments) - set(spec.allowed_arguments):
                 raise RuntimeError(
-                    f"entry intake arguments must be allowed: {spec.action_type}"
+                    f"entry intake fixed arguments must be allowed: {spec.action_type}"
                 )
-            probe = {"type": spec.action_type, **entry_arguments}
-            if "source_evidence" in spec.required_arguments:
-                probe["source_evidence"] = "registry entry intake"
-            validate_action_contract(probe)
-        elif spec.entry_intake_purpose or spec.entry_intake_arguments:
+            if value_arguments - set(spec.allowed_arguments):
+                raise RuntimeError(
+                    f"entry intake value arguments must be allowed: {spec.action_type}"
+                )
+            if set(fixed_arguments).intersection(value_arguments):
+                raise RuntimeError(
+                    f"entry intake argument ownership overlaps: {spec.action_type}"
+                )
+            uncovered_required = (
+                set(spec.required_arguments)
+                - set(fixed_arguments)
+                - value_arguments
+                - {"source_evidence"}
+            )
+            if uncovered_required:
+                raise RuntimeError(
+                    "entry intake metadata does not cover required arguments for "
+                    f"{spec.action_type}: {sorted(uncovered_required)}"
+                )
+            alternatives = spec.entry_intake_value_arguments or ("",)
+            for value_argument in alternatives:
+                probe: dict[str, Any] = {
+                    "type": spec.action_type,
+                    **fixed_arguments,
+                }
+                if value_argument:
+                    probe[value_argument] = _entry_intake_probe_value(
+                        ACTION_ARGUMENT_SCHEMAS[value_argument]
+                    )
+                if "source_evidence" in spec.required_arguments:
+                    probe["source_evidence"] = " ".join(
+                        _entry_intake_probe_tokens(probe)
+                    )
+                try:
+                    validate_action_contract(probe)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"invalid entry intake metadata for {spec.action_type}: {exc}"
+                    ) from exc
+        elif (
+            spec.entry_intake_purpose
+            or spec.entry_intake_fixed_arguments
+            or spec.entry_intake_value_arguments
+        ):
             raise RuntimeError(
                 f"entry intake metadata requires entry_intake=true: {spec.action_type}"
             )

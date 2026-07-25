@@ -7,7 +7,9 @@ from typing import Protocol
 from ..contracts import ActionProposal, HandlerResult
 from ..state import AgentGraphState, DEFAULT_GROUP_ORDER
 
-from agent.workflows.group_registry import GROUPS, GROUP_OWNER
+from agent.workflows.group_registry import GROUPS, GROUP_OWNER as _GROUP_OWNER
+
+GROUP_OWNER = _GROUP_OWNER
 DOMAIN_GROUPS: dict[str, tuple[str, ...]] = {}
 for spec in GROUPS:
     DOMAIN_GROUPS.setdefault(spec.owner, ())

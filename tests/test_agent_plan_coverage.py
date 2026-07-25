@@ -77,6 +77,43 @@ class PlanCoverageTest(unittest.TestCase):
             for error in result.errors
         ))
 
+    def test_alternative_chain_candidate_entry_excludes_generic_navigation(self) -> None:
+        from agent.harness.plan_coverage import TurnClause, validate_plan_coverage
+
+        text = "Use either AlphaChain or BetaChain."
+        payload = {
+            "actions": [
+                {
+                    "type": "change_group",
+                    "group": "chain_identity",
+                    "navigation_explicit": True,
+                    "source_evidence": text,
+                },
+                {
+                    "type": "choose_chain",
+                    "chain_candidates": ["AlphaChain", "BetaChain"],
+                    "source_evidence": text,
+                },
+            ],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": text,
+                "disposition": "action",
+                "action_indexes": [0, 1],
+                "reason": "duplicate entry owners",
+            }],
+        }
+
+        result = validate_plan_coverage(payload, (TurnClause("clause-1", text),))
+
+        self.assertFalse(result.valid)
+        self.assertTrue(any(
+            error.startswith(
+                "generic navigation competes with registered typed entry: chain_identity"
+            )
+            for error in result.errors
+        ))
 
 
     def test_single_structured_assignment_is_not_downgraded_to_prose(self) -> None:
@@ -110,9 +147,6 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertEqual(clauses[-1].text, "http://fake-node:19000")
 
 
-
-
-
     def test_detected_value_question_declares_manual_entry_transition(self) -> None:
         from agent.harness.domains.environment import question_for_environment
         from agent.harness.state import new_state
@@ -127,7 +161,7 @@ class PlanCoverageTest(unittest.TestCase):
 
 
     def test_canonical_pending_choice_receipt_authorizes_exact_typed_value(self) -> None:
-        from agent.harness.admission import _validate_action_plan
+        from agent.harness.admission import validate_action_plan
         from agent.harness.state import new_state
 
         state = new_state("verified-option-reference", language="en")
@@ -144,39 +178,30 @@ class PlanCoverageTest(unittest.TestCase):
             "manual_input_allowed": True,
             "validation": {"value_type": "positive_number"},
         }
-        actions = [{
+        proposed = [{
             "type": "answer_pending",
             "answer": "100",
             "selected_value": "100",
             "source_evidence": state["last_user_input"],
-            "pending_option_semantic_verified": True,
-            "semantic_purpose_verified": True,
-            "_admission_action_id": "admitted-choice-1",
         }]
-        state["turn_context"] = {"pending_choice_contracts": [{
-            "action_index": 0,
-            "admission_action_id": "admitted-choice-1",
-            "question": {
-                "id": "detected-size",
-                "group": "ledger_disk",
-                "contract_version": 1,
-            },
-            "option": {"id": "1", "selected_value": "100"},
-            "semantic_units": [{
-                "unit_id": "unit-1",
-                "clause_id": "clause-1",
-                "source_text": state["last_user_input"],
-            }],
-        }]}
+        from tests.agent_live.graph_turn import reviewed_action_plan
 
-        prepared = _validate_action_plan(state, actions)
+        plan = reviewed_action_plan(state, state["last_user_input"], proposed)
+        actions = list(plan["actions"])
+        state["turn_context"] = {
+            "pending_choice_contracts": plan["pending_choice_contracts"]
+        }
 
+        result = validate_action_plan(state, actions)
+        prepared = list(result.actions)
+
+        self.assertEqual(result.status, "accepted")
         self.assertEqual(prepared[0]["selected_value"], "100")
         self.assertEqual(prepared[0]["answer"], "100")
         self.assertIs(prepared[0]["selection_contract_verified"], True)
 
     def test_pending_choice_without_exact_canonical_receipt_is_rejected(self) -> None:
-        from agent.harness.admission import _validate_action_plan
+        from agent.harness.admission import validate_action_plan
         from agent.harness.state import new_state
 
         state = new_state("missing-pending-choice-receipt", language="en")
@@ -214,7 +239,12 @@ class PlanCoverageTest(unittest.TestCase):
         for contracts in ([], [forged]):
             with self.subTest(contracts=contracts):
                 state["turn_context"] = {"pending_choice_contracts": contracts}
-                self.assertEqual(_validate_action_plan(state, [action]), [])
+                result = validate_action_plan(state, [action])
+                self.assertEqual(result.status, "rejected")
+                self.assertEqual(
+                    [item.code for item in result.rejections],
+                    ["pending_contract_mismatch"],
+                )
 
     def test_rpc_mode_coverage_scenario_has_required_workflow_prerequisites(self) -> None:
         from tests.agent_live.harness_contract_scenarios import question_scenarios
@@ -225,12 +255,15 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertEqual(scenario.seed_state["workflow_mode"], "rpc_benchmark")
 
     def test_sync_observe_endpoint_question_explains_process_and_rpc_roles(self) -> None:
+        from agent.harness.contracts import text_ref_from_dict
         from agent.harness.domains.chain_rpc import question_for_chain_rpc
+        from agent.harness.questions import render_question
+        from agent.harness.response_catalog import render_text_ref
         from agent.harness.state import new_state
 
         for language, expected in (
-            ("en", ("resource attribution", "sync height and health")),
-            ("zh", ("资源归因", "同步高度和健康状态")),
+            ("en", ("CPU/thread attribution", "sync height and health")),
+            ("zh", ("CPU/线程归因", "同步高度和健康状态")),
         ):
             state = new_state(f"sync-endpoint-{language}", language=language)
             state.update({
@@ -241,17 +274,24 @@ class PlanCoverageTest(unittest.TestCase):
             })
 
             question = question_for_chain_rpc(state, "endpoint_process")
+            rendered = render_question(question, language)
 
             self.assertEqual(question["id"], "SYNC_OBSERVE_RPC_URL")
             for fragment in expected:
-                self.assertIn(fragment, question["prompt"])
-            self.assertTrue(question["completion_effect"])
+                self.assertIn(fragment, rendered)
+            self.assertTrue(question["completion_effect_ref"])
             self.assertIn(
                 "探测" if language == "zh" else "probe",
-                question["completion_effect"],
+                render_text_ref(
+                    text_ref_from_dict(question["completion_effect_ref"]),
+                    language,
+                    kind="completion_effect",
+                ),
             )
 
     def test_every_probe_owned_endpoint_question_declares_completion_effect(self) -> None:
+        from agent.harness.contracts import text_ref_from_dict
+        from agent.harness.response_catalog import render_text_ref
         from tests.agent_live.harness_contract_scenarios import question_scenarios
 
         expected = {
@@ -269,20 +309,18 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertEqual(set(questions), expected)
         for question_id, question in questions.items():
             with self.subTest(question_id=question_id):
-                self.assertIn("probe", str(question.get("completion_effect") or ""))
-
-
-
-
-
-
-
-
-
+                self.assertIn(
+                    "probe",
+                    render_text_ref(
+                        text_ref_from_dict(question["completion_effect_ref"]),
+                        "en",
+                        kind="completion_effect",
+                    ),
+                )
 
 
     def test_same_group_navigation_cannot_replace_the_active_pending_answer(self) -> None:
-        from agent.harness.intent import _validate_action_document
+        from agent.harness.semantic_admission import _validate_action_document
         from agent.harness.state import new_state
 
         source = "先测币安智能链，Ethereum 后面再说。"
@@ -313,12 +351,6 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertFalse(result.valid)
         self.assertEqual(result.rejected_action_indexes, (0,))
         self.assertIn("without answering it", " ".join(result.errors))
-
-
-
-
-
-
 
 
     def test_prose_context_can_coexist_with_an_owned_action(self) -> None:
@@ -396,72 +428,10 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertIn("context semantic unit is not prose", "\n".join(result.errors))
 
 
-
-
-    def test_explicit_navigation_suppresses_same_transaction_generic_resume(self) -> None:
-        from agent.harness.action_registry import normalize_action_relations
-
-        actions = [
-            {
-                "type": "change_group",
-                "group": "qps_profile",
-                "navigation_explicit": True,
-                "source_evidence": "configure QPS first",
-            },
-            {
-                "type": "resume_current_flow",
-                "source_evidence": "return afterward",
-            },
-        ]
-
-        self.assertEqual(
-            [item["type"] for item in normalize_action_relations(actions)],
-            ["change_group"],
-        )
-
-    def test_generic_resume_remains_when_no_navigation_is_present(self) -> None:
-        from agent.harness.action_registry import normalize_action_relations
-
-        actions = [{
-            "type": "resume_current_flow",
-            "source_evidence": "resume the current setup",
-        }]
-
-        self.assertEqual(normalize_action_relations(actions), actions)
-
-    def test_equivalent_group_navigation_is_deduplicated_before_queueing(self) -> None:
-        from agent.harness.action_registry import normalize_action_relations
-
-        actions = [
-            {
-                "type": "change_group",
-                "group": "qps_profile",
-                "navigation_explicit": True,
-                "source_evidence": "configure QPS first before the rest",
-            },
-            {
-                "type": "change_group",
-                "group": "qps_profile",
-                "navigation_explicit": True,
-                "semantic_purpose_verified": True,
-                "source_evidence": "QPS",
-            },
-        ]
-
-        normalized = normalize_action_relations(actions)
-
-        self.assertEqual(len(normalized), 1)
-        self.assertEqual(normalized[0]["group"], "qps_profile")
-        self.assertEqual(
-            normalized[0]["source_evidence"],
-            "configure QPS first before the rest",
-        )
-        self.assertIs(normalized[0]["semantic_purpose_verified"], True)
-
-    def test_trusted_action_queue_exposes_one_equivalent_navigation_owner(self) -> None:
+    def test_trusted_action_queue_preserves_distinct_navigation_evidence(self) -> None:
         import json
 
-        from agent.harness.intent import _parse_action_queue
+        from agent.harness.semantic_admission import _parse_action_queue
 
         result = _parse_action_queue(json.dumps({
             "actions": [
@@ -482,56 +452,9 @@ class PlanCoverageTest(unittest.TestCase):
             ],
         }), trusted_metadata=True)
 
-        self.assertEqual(len(result["actions"]), 1)
+        self.assertEqual(len(result["actions"]), 2)
         self.assertEqual(result["actions"][0]["group"], "accounts_disk")
         self.assertIs(result["actions"][0]["group_navigation_semantic_verified"], True)
-
-    def test_distinct_group_navigation_is_preserved(self) -> None:
-        from agent.harness.action_registry import normalize_action_relations
-
-        actions = [
-            {"type": "change_group", "group": "qps_profile"},
-            {"type": "change_group", "group": "observability"},
-        ]
-
-        self.assertEqual(normalize_action_relations(actions), actions)
-
-    def test_distinct_same_group_owner_mutations_are_not_navigation_deduplicated(self) -> None:
-        from agent.harness.action_registry import normalize_action_relations
-
-        actions = [
-            {
-                "type": "set_qps_override",
-                "qps_overrides": {"INITIAL_QPS": 5},
-                "source_evidence": "start at 5",
-            },
-            {
-                "type": "set_qps_override",
-                "qps_overrides": {"MAX_QPS": 20},
-                "source_evidence": "cap at 20",
-            },
-        ]
-
-        self.assertEqual(normalize_action_relations(actions), actions)
-
-    def test_pending_preserving_domain_action_owns_same_transaction_return(self) -> None:
-        from agent.harness.action_registry import normalize_action_relations
-
-        actions = [
-            {
-                "type": "request_qps_customization",
-                "source_evidence": "adjust QPS first",
-            },
-            {
-                "type": "resume_current_flow",
-                "source_evidence": "then return",
-            },
-        ]
-
-        self.assertEqual(
-            [item["type"] for item in normalize_action_relations(actions)],
-            ["request_qps_customization"],
-        )
 
     def test_one_replacement_action_can_own_negative_and_positive_clauses(self) -> None:
         text = "I do not want RPC load now; observe node sync instead"
@@ -556,7 +479,7 @@ class PlanCoverageTest(unittest.TestCase):
     def test_semantic_receipt_is_attached_only_after_admission(self) -> None:
         import json
 
-        from agent.harness.intent import _attach_semantic_admission_receipts, _parse_action_queue
+        from agent.harness.semantic_admission import _attach_semantic_admission_receipts, _parse_action_queue
 
         raw = json.dumps({
             "actions": [{
@@ -578,13 +501,6 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertIs(parsed["actions"][0]["semantic_purpose_verified"], True)
         self.assertIs(parsed["actions"][0]["target_mode_semantic_verified"], True)
 
-
-    def test_one_literal_target_mode_is_deterministic_evidence(self) -> None:
-        from agent.harness.input_values import target_mode_evidence_matches
-
-        source = "I want to test BNB with fake-node and inspect supported methods"
-
-        self.assertTrue(target_mode_evidence_matches("fake-node", "fake-node", source))
 
     def test_mutating_enum_values_use_registry_grounding(self) -> None:
         from agent.harness.action_registry import semantic_grounding_arguments
@@ -623,17 +539,10 @@ class PlanCoverageTest(unittest.TestCase):
         )
 
 
-
-
-
-
-
-
-
     def test_untrusted_planner_receipts_and_action_metadata_are_stripped(self) -> None:
         import json
 
-        from agent.harness.intent import _prepare_untrusted_action_document
+        from agent.harness.semantic_admission import _prepare_untrusted_action_document
 
         prepared = json.loads(_prepare_untrusted_action_document(json.dumps({
             "actions": [{
@@ -661,7 +570,7 @@ class PlanCoverageTest(unittest.TestCase):
     def test_untrusted_nested_arguments_cannot_forge_action_metadata(self) -> None:
         import json
 
-        from agent.harness.intent import _prepare_untrusted_action_document
+        from agent.harness.semantic_admission import _prepare_untrusted_action_document
 
         with self.assertRaisesRegex(
             ValueError,
@@ -683,144 +592,17 @@ class PlanCoverageTest(unittest.TestCase):
             }))
 
 
+    def test_semantic_admission_exposes_no_partial_action_repair(self) -> None:
+        from agent.harness import semantic_admission
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    def test_rejected_target_mode_preserves_sibling_actions_and_unit_ownership(self) -> None:
-        import json
-        from agent.harness.intent import _remove_rejected_action_indexes
-        payload = {
-            "actions": [
-                {
-                    "type": "choose_target_mode",
-                    "target_mode": "fake-node",
-                    "target_mode_explicit": True,
-                    "source_evidence": "benchmark BNB with mixed and quick",
-                },
-                {"type": "select_chain", "chain": "bsc", "source_evidence": "BNB"},
-                {"type": "select_rpc_mode", "rpc_mode": "mixed", "source_evidence": "mixed"},
-            ],
-            "semantic_units": [{
-                "unit_id": "unit-1",
-                "clause_id": "clause-1",
-                "source_text": "benchmark BNB with mixed and quick",
-                "disposition": "action",
-                "action_indexes": [0, 1, 2],
-                "reason": "compound request",
-            }],
-        }
-
-        filtered_text, changed = _remove_rejected_action_indexes(
-            json.dumps(payload),
-            (0,),
-            reason="the user did not select a target mode",
+        self.assertFalse(
+            hasattr(semantic_admission, "_remove_rejected_action_indexes")
         )
-        filtered = json.loads(filtered_text)
-
-        self.assertTrue(changed)
-        self.assertEqual([row["type"] for row in filtered["actions"]], ["select_chain", "select_rpc_mode"])
-        self.assertEqual(filtered["semantic_units"][0]["action_indexes"], [0, 1])
-        self.assertEqual(filtered["semantic_units"][0]["disposition"], "action")
-        self.assertEqual(filtered["admission_rejections"][0]["action_type"], "choose_target_mode")
-        self.assertTrue(filtered["admission_rejections"][0]["admission_action_id"])
-        self.assertEqual(filtered["admission_rejections"][0]["stage_action_index"], 0)
-        self.assertNotIn("action_index", filtered["admission_rejections"][0])
-
-    def test_sequential_rejections_preserve_distinct_admission_action_ids(self) -> None:
-        import json
-
-        from agent.harness.intent import _remove_rejected_action_indexes
-
-        payload = json.dumps({
-            "actions": [
-                {"type": "choose_target_mode", "target_mode": "fake-node"},
-                {"type": "select_chain", "chain": "bsc"},
-                {"type": "select_rpc_mode", "rpc_mode": "single"},
-            ],
-        })
-        after_first, _ = _remove_rejected_action_indexes(payload, (0,), reason="first gate")
-        first = json.loads(after_first)
-        retained_id = first["admission_action_ids"][0]
-        after_second, _ = _remove_rejected_action_indexes(after_first, (0,), reason="second gate")
-        second = json.loads(after_second)
-
-        self.assertNotEqual(
-            second["admission_rejections"][0]["admission_action_id"],
-            second["admission_rejections"][1]["admission_action_id"],
-        )
-        self.assertEqual(second["admission_rejections"][1]["admission_action_id"], retained_id)
-        self.assertEqual([row["stage_action_index"] for row in second["admission_rejections"]], [0, 0])
-
-    def test_readded_identical_action_does_not_reuse_rejected_admission_id(self) -> None:
-        import json
-
-        from agent.harness.intent import _remove_rejected_action_indexes
-
-        action = {"type": "choose_target_mode", "target_mode": "fake-node"}
-        first_text, _ = _remove_rejected_action_indexes(
-            json.dumps({"actions": [action]}),
-            (0,),
-            reason="first attempt",
-        )
-        first = json.loads(first_text)
-        first_id = first["admission_rejections"][0]["admission_action_id"]
-        first["actions"] = [action]
-        second_text, _ = _remove_rejected_action_indexes(
-            json.dumps(first),
-            (0,),
-            reason="second attempt",
-        )
-        second = json.loads(second_text)
-
-        self.assertNotEqual(
-            first_id,
-            second["admission_rejections"][1]["admission_action_id"],
-        )
-
-
-
-
+        self.assertFalse(hasattr(semantic_admission, "_remove_action_indexes"))
 
 
     def test_malformed_navigation_receipt_is_not_authoritative(self) -> None:
-        from agent.harness.intent import _valid_group_navigation_admissions
+        from agent.harness.semantic_admission import _valid_group_navigation_admissions
 
         actions = [{
             "type": "change_group",
@@ -836,26 +618,8 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertEqual(_valid_group_navigation_admissions(payload, actions), {})
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     def test_explicit_selected_value_remains_authoritative_over_answer_fallback(self) -> None:
-        from agent.harness.intent import _declared_option_for_pending_answer
+        from agent.harness.semantic_admission import _declared_option_for_pending_answer
 
         pending = {
             "options": [
@@ -870,22 +634,6 @@ class PlanCoverageTest(unittest.TestCase):
         }, pending)
 
         self.assertEqual(option["id"], "bsc")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
     @unittest.skipUnless(sys.version_info >= (3, 10), "Harness runtime requires Python 3.10+")
@@ -914,131 +662,6 @@ class PlanCoverageTest(unittest.TestCase):
             ["request_target_mode_selection", "request_chain_selection"],
         )
 
-    def test_structured_config_owner_recovers_an_unmapped_assignment(self) -> None:
-        import json
-        from agent.harness.intent import _reconcile_structured_candidate_ownership
-        from agent.harness.plan_coverage import segment_user_turn
-
-        source = (
-            "Apply this copied config:\n"
-            "CLOUD_REGION=asia-east1\n"
-            "unrelated_ticket=INC-12345"
-        )
-        payload = {
-            "actions": [{
-                "type": "propose_config_values",
-                "config_values": {"CLOUD_REGION": "asia-east1"},
-                "unmapped_values": {},
-                "source_format": "env",
-                "source_evidence": "CLOUD_REGION=asia-east1",
-            }],
-            "semantic_units": [
-                {
-                    "unit_id": "unit-1",
-                    "clause_id": "clause-1",
-                    "source_text": "Apply this copied config:\nCLOUD_REGION=asia-east1\n",
-                    "disposition": "action",
-                    "action_indexes": [0],
-                },
-                {
-                    "unit_id": "unit-2",
-                    "clause_id": "clause-1",
-                    "source_text": "unrelated_ticket=INC-12345",
-                    "disposition": "unresolved",
-                    "action_indexes": [],
-                },
-            ],
-        }
-
-        reconciled = json.loads(_reconcile_structured_candidate_ownership(
-            json.dumps(payload),
-            segment_user_turn(source),
-        ))
-
-        self.assertEqual(
-            reconciled["actions"][0]["unmapped_values"],
-            {"UNRELATED_TICKET": "INC-12345"},
-        )
-        self.assertEqual(len(reconciled["semantic_units"]), 2)
-        self.assertEqual(reconciled["semantic_units"][0]["disposition"], "action")
-        self.assertEqual(reconciled["semantic_units"][0]["action_indexes"], [0])
-        self.assertEqual(reconciled["semantic_units"][1]["disposition"], "unresolved")
-        self.assertEqual(reconciled["semantic_units"][1]["action_indexes"], [])
-
-
-
-
-
-
-
-
-
-
-
-
-
-    def test_structured_block_without_config_action_is_not_reclassified(self) -> None:
-        import json
-        from agent.harness.intent import _reconcile_structured_candidate_ownership
-        from agent.harness.plan_coverage import segment_user_turn
-
-        source = "Example only:\nCLOUD_REGION=asia-east1"
-        payload = {
-            "actions": [{"type": "analyze_evidence", "evidence": source}],
-            "semantic_units": [{
-                "unit_id": "unit-1",
-                "clause_id": "clause-1",
-                "source_text": source,
-                "disposition": "action",
-                "action_indexes": [0],
-            }],
-        }
-        original = json.dumps(payload)
-
-        self.assertEqual(
-            _reconcile_structured_candidate_ownership(original, segment_user_turn(source)),
-            original,
-        )
-
-    def test_structured_workflow_value_requires_its_typed_owner(self) -> None:
-        import json
-        from agent.harness.intent import _reconcile_structured_candidate_ownership
-        from agent.harness.plan_coverage import segment_user_turn
-
-        source = "Apply this config:\nCLOUD_REGION=asia-east1\nRPC_MODE=single"
-        payload = {
-            "actions": [{
-                "type": "propose_config_values",
-                "config_values": {"CLOUD_REGION": "asia-east1"},
-                "unmapped_values": {},
-                "source_format": "env",
-                "source_evidence": "CLOUD_REGION=asia-east1",
-            }],
-            "semantic_units": [
-                {
-                    "unit_id": "unit-1",
-                    "clause_id": "clause-1",
-                    "source_text": "Apply this config:\nCLOUD_REGION=asia-east1\n",
-                    "disposition": "action",
-                    "action_indexes": [0],
-                },
-                {
-                    "unit_id": "unit-2",
-                    "clause_id": "clause-1",
-                    "source_text": "RPC_MODE=single",
-                    "disposition": "unresolved",
-                    "action_indexes": [],
-                },
-            ],
-        }
-
-        reconciled = json.loads(_reconcile_structured_candidate_ownership(
-            json.dumps(payload),
-            segment_user_turn(source),
-        ))
-
-        self.assertEqual(len(reconciled["semantic_units"]), 2)
-        self.assertEqual(reconciled["semantic_units"][1]["disposition"], "unresolved")
 
     def test_response_language_is_a_typed_admission_action(self) -> None:
         from agent.harness.action_registry import ACTION_BY_TYPE, validate_action_contract
@@ -1063,7 +686,7 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertNotIn("Ask for a replacement target mode", purpose)
 
     def test_consultation_and_analysis_actions_require_source_purpose_review(self) -> None:
-        from agent.harness.intent import _requires_semantic_fulfillment_review
+        from agent.harness.semantic_admission import _requires_semantic_fulfillment_review
 
         for action in (
             {"type": "answer_opening_question", "topic": "config_explanation"},
@@ -1074,16 +697,8 @@ class PlanCoverageTest(unittest.TestCase):
                 self.assertTrue(_requires_semantic_fulfillment_review(action))
 
 
-
-
-
-
-
-
-
-
     def test_pending_choice_rejects_semantic_sentence_as_answer(self) -> None:
-        from agent.harness.intent import _validate_action_document
+        from agent.harness.semantic_admission import _validate_action_document
         from agent.harness.state import new_state
 
         text = "I want to adjust QPS before choosing workload defaults"
@@ -1108,20 +723,35 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertTrue(any("does not select an exact declared option" in error for error in result.errors))
 
     def test_pending_choice_accepts_exact_declared_label(self) -> None:
-        from agent.harness.intent import (
+        from agent.harness.contracts import text_ref_from_dict
+        from agent.harness.domains.chain_rpc import question_for_chain_rpc
+        from agent.harness.response_catalog import render_text_ref
+        from agent.harness.semantic_admission import (
             _canonicalize_pending_choice_actions,
             _validate_action_document,
         )
         from agent.harness.state import new_state
 
-        text = "Use defaults"
-        clauses = segment_user_turn(text)
         state = new_state("unit-thread", language="en")
-        state["pending_question"] = {
-            "id": "workload_confirm",
-            "kind": "numbered_choice",
-            "options": [{"id": "1", "label": "Use defaults", "value": "default"}],
+        state["target_mode"] = "fake-node"
+        state["workflow_mode"] = "rpc_benchmark"
+        state["chain_identity"] = {
+            "raw": "bsc",
+            "canonical": "bsc",
+            "status": "confirmed",
         }
+        state["rpc_mode"] = "single"
+        state["pending_question"] = question_for_chain_rpc(
+            state, "workload_rpc"
+        )
+        text = render_text_ref(
+            text_ref_from_dict(
+                state["pending_question"]["options"][0]["label_ref"]
+            ),
+            "en",
+            kind="option_label",
+        )
+        clauses = segment_user_turn(text)
         payload = {
             "actions": [{"type": "answer_pending", "answer": text, "source_evidence": text}],
             "semantic_units": [_unit(clauses[0], 1, [0])],
@@ -1136,7 +766,7 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertTrue(result.valid, result.errors)
 
     def test_action_contract_error_is_not_reported_as_missing_semantic_units(self) -> None:
-        from agent.harness.intent import _validate_action_document
+        from agent.harness.semantic_admission import _validate_action_document
 
         clauses = segment_user_turn("use quick")
         payload = {
@@ -1282,7 +912,6 @@ class PlanCoverageTest(unittest.TestCase):
         )
 
         self.assertTrue(result.valid, result.errors)
-
 
 
     def test_environment_yaml_keys_are_not_rpc_wire_methods(self) -> None:
@@ -1698,10 +1327,6 @@ class PlanCoverageTest(unittest.TestCase):
         self.assertTrue(result.valid, result.errors)
 
 
-
-
-
-
 class UnresolvedSemanticInventoryTest(unittest.TestCase):
     @staticmethod
     def _unresolved_plan(clause):
@@ -1718,67 +1343,7 @@ class UnresolvedSemanticInventoryTest(unittest.TestCase):
         }
 
 
-
-
-
-
-
-
-
-
-
 class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
-
-    def test_absent_unit_table_is_restored_for_independent_admission(self) -> None:
-        from agent.harness.intent import _materialize_absent_semantic_units
-
-        clauses = tuple(segment_user_turn(
-            "Take me to observability; I want to decide among its options."
-        ))
-        candidate = _materialize_absent_semantic_units(
-            json.dumps({
-                "actions": [{
-                    "type": "change_group",
-                    "group": "observability",
-                    "navigation_explicit": True,
-                    "source_evidence": "Take me to observability",
-                }]
-            }),
-            clauses,
-        )
-        payload = json.loads(candidate)
-
-        self.assertEqual(
-            [row["source_text"] for row in payload["semantic_units"]],
-            [clause.text for clause in clauses],
-        )
-        self.assertTrue(all(
-            row["action_indexes"] == [0] for row in payload["semantic_units"]
-        ))
-
-    def test_group_navigation_contract_owns_value_less_revision_purpose(self) -> None:
-        from agent.harness.action_registry import ACTION_BY_TYPE
-        from agent.harness.intent import (
-            GROUP_NAVIGATION_SEMANTIC_POLICY,
-            _action_queue_prompt,
-            _semantic_fulfillment_prompt,
-        )
-
-        self.assertIn("value-less statement", GROUP_NAVIGATION_SEMANTIC_POLICY)
-        self.assertIn("without a concrete setting or value", GROUP_NAVIGATION_SEMANTIC_POLICY)
-        self.assertIn("decide among that group's later typed options", GROUP_NAVIGATION_SEMANTIC_POLICY)
-        self.assertIn(GROUP_NAVIGATION_SEMANTIC_POLICY, _action_queue_prompt())
-        self.assertIn(
-            GROUP_NAVIGATION_SEMANTIC_POLICY,
-            _semantic_fulfillment_prompt(review_kind="units"),
-        )
-        self.assertIn(
-            "operation_restatement",
-            ACTION_BY_TYPE["change_group"].semantic_support_relations,
-        )
-
-
-
 
 
     @staticmethod
@@ -1805,10 +1370,6 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         }
 
 
-
-
-
-
     def test_lifecycle_registry_declares_shared_restatement_contract(self) -> None:
         from agent.harness.action_registry import ACTION_BY_TYPE
 
@@ -1823,96 +1384,6 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
             )
 
 
-
-
-
-
-
-
-
-    def test_empty_config_proposal_cannot_steal_direct_pending_answer(self) -> None:
-        from agent.harness.intent import _remove_empty_config_proposals
-
-        payload = {
-            "actions": [
-                {
-                    "type": "answer_pending",
-                    "answer": "run-secret-4821",
-                    "source_evidence": "run-secret-4821",
-                },
-                {
-                    "type": "propose_config_values",
-                    "config_values": {},
-                    "unmapped_values": {},
-                    "conflicts": [],
-                    "source_evidence": "Use it only for this run.",
-                },
-            ],
-            "semantic_units": [
-                {
-                    "unit_id": "clause-1",
-                    "clause_id": "clause-1",
-                    "source_text": "The credential is run-secret-4821.",
-                    "disposition": "action",
-                    "action_indexes": [0],
-                    "reason": "answers the pending field",
-                },
-                {
-                    "unit_id": "clause-2",
-                    "clause_id": "clause-2",
-                    "source_text": "Use it only for this run.",
-                    "disposition": "action",
-                    "action_indexes": [1],
-                    "reason": "planner attached an empty proposal",
-                },
-            ],
-        }
-
-        normalized = json.loads(_remove_empty_config_proposals(json.dumps(payload)))
-
-        self.assertEqual(normalized["actions"], [payload["actions"][0]])
-        self.assertEqual(normalized["semantic_units"][0]["action_indexes"], [0])
-        self.assertEqual(normalized["semantic_units"][1]["action_indexes"], [])
-        self.assertEqual(normalized["semantic_units"][1]["disposition"], "unresolved")
-
-    def test_nonempty_config_proposal_is_not_removed(self) -> None:
-        from agent.harness.intent import _remove_empty_config_proposals
-
-        payload = {
-            "actions": [{
-                "type": "propose_config_values",
-                "config_values": {"NETWORK_INTERFACE": "eth0"},
-                "unmapped_values": {},
-                "conflicts": [],
-            }],
-            "semantic_units": [],
-        }
-
-        self.assertEqual(
-            json.loads(_remove_empty_config_proposals(json.dumps(payload))),
-            payload,
-        )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     def test_read_only_consultation_registry_contract_supports_pending_selection_scope(self) -> None:
         from agent.harness.action_registry import ACTION_BY_TYPE
 
@@ -1922,7 +1393,7 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
 
     def test_untrusted_scope_schema_row_is_canonicalized_only_by_exact_registry_identity(self) -> None:
         from agent.harness.action_registry import semantic_scope_schema
-        from agent.harness.intent import _prepare_untrusted_action_document
+        from agent.harness.semantic_admission import _prepare_untrusted_action_document
 
         registered = next(
             row for row in semantic_scope_schema() if row["name"] == "consultation_only"
@@ -1951,17 +1422,6 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         payload["semantic_units"][0]["scope_constraint"] = altered
         preserved = json.loads(_prepare_untrusted_action_document(json.dumps(payload)))
         self.assertEqual(preserved["semantic_units"][0]["scope_constraint"], altered)
-
-
-
-
-
-
-
-
-
-
-
 
 
     def test_pending_owner_receipt_can_bind_structured_support_context(self) -> None:
@@ -2002,279 +1462,6 @@ class RegistryBoundedSemanticRecoveryTest(unittest.TestCase):
         self.assertTrue(admitted.valid, admitted.errors)
         self.assertFalse(unowned.valid)
         self.assertIn("context semantic unit is not prose", "\n".join(unowned.errors))
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    def test_structured_parser_does_not_replace_compiler_answer_action(self) -> None:
-        import json
-        from agent.harness.intent import _reconcile_structured_candidate_ownership
-
-        source = '{"ACCOUNTS_DEVICE":"/dev/nvme1n1"}'
-        clause = segment_user_turn(source)[0]
-        payload = {
-            "actions": [{
-                "type": "answer_pending",
-                "answer": "/dev/nvme1n1",
-                "source_evidence": source,
-            }],
-            "semantic_units": [_unit(clause, 1, [0])],
-        }
-
-        reconciled = json.loads(_reconcile_structured_candidate_ownership(
-            json.dumps(payload),
-            (clause,),
-        ))
-
-        self.assertEqual(reconciled, payload)
-
-    def test_structured_parser_hydrates_only_declared_proposal_owner(self) -> None:
-        import json
-        from agent.harness.intent import _reconcile_structured_candidate_ownership
-
-        source = "CLOUD_REGION=asia-east1\nunrelated_ticket=INC-12345"
-        clause = segment_user_turn(source)[0]
-        payload = {
-            "actions": [{
-                "type": "propose_config_values",
-                "config_values": {},
-                "unmapped_values": {},
-                "source_format": "env",
-                "source_evidence": source,
-            }],
-            "semantic_units": [_unit(clause, 1, [0])],
-        }
-
-        reconciled = json.loads(_reconcile_structured_candidate_ownership(
-            json.dumps(payload),
-            (clause,),
-        ))
-
-        self.assertEqual(
-            reconciled["actions"][0]["config_values"],
-            {"CLOUD_REGION": "asia-east1"},
-        )
-        self.assertEqual(
-            reconciled["actions"][0]["unmapped_values"],
-            {"UNRELATED_TICKET": "INC-12345"},
-        )
-        self.assertEqual(reconciled["semantic_units"], payload["semantic_units"])
-
-    def test_cross_clause_structured_assignment_without_pending_intent_is_not_claimed(self) -> None:
-        from agent.harness.intent import _reconcile_structured_candidate_ownership
-        from agent.harness.state import new_state
-
-        source = "```env\nCLOUD_REGION=asia-east1\n```\nWhat does this setting mean?"
-        clauses = segment_user_turn(source)
-        payload = {
-            "actions": [{
-                "type": "answer_capability_question",
-                "topic": "configuration",
-                "source_evidence": clauses[1].text,
-            }],
-            "semantic_units": [
-                _unit(clauses[0], 1, [], disposition="unresolved"),
-                _unit(clauses[1], 2, [0]),
-            ],
-        }
-        state = new_state("structured-pending-consultation", language="en")
-        state["pending_question"] = {
-            "id": "CLOUD_REGION",
-            "group": "provider_deployment",
-            "field": "CLOUD_REGION",
-            "kind": "manual_value",
-            "manual_input_allowed": True,
-            "validation": {"value_type": "scalar_token"},
-            "options": [],
-        }
-
-        reconciled = json.loads(_reconcile_structured_candidate_ownership(
-            json.dumps(payload),
-            clauses,
-            state,
-        ))
-
-        self.assertEqual(reconciled, payload)
-
-    def test_cross_clause_structured_assignment_does_not_override_a_different_pending_value(self) -> None:
-        from agent.harness.intent import _reconcile_structured_candidate_ownership
-        from agent.harness.state import new_state
-
-        source = "```env\nNETWORK_MAX_BANDWIDTH_GBPS=25\n```\nActually use 30 instead."
-        clauses = segment_user_turn(source)
-        payload = {
-            "actions": [{
-                "type": "answer_pending",
-                "answer": "30",
-                "selected_value": "30",
-                "source_evidence": clauses[1].text,
-            }],
-            "semantic_units": [
-                _unit(clauses[0], 1, [], disposition="unresolved"),
-                _unit(clauses[1], 2, [0]),
-            ],
-        }
-        state = new_state("structured-pending-conflict", language="en")
-        state["pending_question"] = {
-            "id": "NETWORK_MAX_BANDWIDTH_GBPS",
-            "group": "network",
-            "field": "NETWORK_MAX_BANDWIDTH_GBPS",
-            "kind": "manual_value",
-            "manual_input_allowed": True,
-            "validation": {"value_type": "positive_number"},
-            "options": [],
-        }
-
-        reconciled = json.loads(_reconcile_structured_candidate_ownership(
-            json.dumps(payload),
-            clauses,
-            state,
-        ))
-
-        self.assertEqual(reconciled, payload)
-
-    def test_exact_structured_pending_assignment_stays_out_of_direct_pending_candidates(self) -> None:
-        from agent.harness.intent import _action_queue_payload
-        from agent.harness.state import new_state
-
-        source = "NETWORK_MAX_BANDWIDTH_GBPS: 25"
-        state = new_state("structured-pending-clarification", language="en")
-        state["pending_question"] = {
-            "id": "NETWORK_MAX_BANDWIDTH_GBPS",
-            "group": "network",
-            "field": "NETWORK_MAX_BANDWIDTH_GBPS",
-            "kind": "manual_value",
-            "manual_input_allowed": True,
-            "validation": {"value_type": "positive_number"},
-            "options": [],
-        }
-
-        request = _action_queue_payload(state, source)
-
-        self.assertEqual(request["pending_typed_candidates"], [])
-        self.assertEqual(
-            request["structured_candidates"][0]["config_values"],
-            {"NETWORK_MAX_BANDWIDTH_GBPS": "25"},
-        )
-        self.assertEqual(
-            request["structured_candidates"][0]["config_values"],
-            {"NETWORK_MAX_BANDWIDTH_GBPS": "25"},
-        )
-
-    def test_structured_candidate_for_another_group_does_not_answer_pending_field(self) -> None:
-        from agent.harness.intent import _action_queue_payload
-        from agent.harness.state import new_state
-
-        state = new_state("structured-cross-group", language="en")
-        state["pending_question"] = {
-            "id": "CLOUD_ZONE",
-            "group": "provider_deployment",
-            "field": "CLOUD_ZONE",
-            "kind": "manual_value",
-            "manual_input_allowed": True,
-            "validation": {"value_type": "scalar_token"},
-            "options": [],
-        }
-
-        request = _action_queue_payload(
-            state,
-            "NETWORK_MAX_BANDWIDTH_GBPS: 25\nThen tell me what remains.",
-        )
-
-        self.assertEqual(request["pending_typed_candidates"], [])
-        self.assertEqual(
-            request["structured_candidates"][0]["config_values"],
-            {"NETWORK_MAX_BANDWIDTH_GBPS": "25"},
-        )
-        self.assertEqual(len(request["clauses"]), 2)
-
-    def test_case3_policy_does_not_reassign_removed_demands_to_handoff_owner(self) -> None:
-        from agent.harness.intent import _apply_state_plan_policy
-        from agent.harness.state import new_state
-
-        state = new_state("case3-evidence-policy", language="en")
-        state["chain_identity"] = {
-            "case": "case3",
-            "adapter_family": "unsupported",
-        }
-        payload = {
-            "actions": [
-                {"type": "rpc_catalog_command", "catalog_command": "enter"},
-                {
-                    "type": "rpc_catalog_command",
-                    "catalog_command": "set_method",
-                    "rpc_method": "getLatestBlock",
-                },
-                {
-                    "type": "secondary_handoff_command",
-                    "handoff_command": "append_evidence",
-                    "handoff_evidence": (
-                        'POST /rpc\n{"jsonrpc":"2.0","method":"getLatestBlock","params":[]}'
-                    ),
-                    "source_evidence": (
-                        'POST /rpc\n{"jsonrpc":"2.0","method":"getLatestBlock","params":[]}'
-                    ),
-                },
-            ],
-            "semantic_units": [
-                {
-                    "unit_id": "unit-1",
-                    "clause_id": "clause-1",
-                    "source_text": "I only have the request example so far:",
-                    "disposition": "action",
-                    "action_indexes": [0],
-                    "reason": "request framing",
-                },
-                {
-                    "unit_id": "unit-2",
-                    "clause_id": "clause-2",
-                    "source_text": "POST /rpc",
-                    "disposition": "action",
-                    "action_indexes": [0],
-                    "reason": "request transport",
-                },
-                {
-                    "unit_id": "unit-3",
-                    "clause_id": "clause-3",
-                    "source_text": '{"jsonrpc":"2.0","method":"getLatestBlock","params":[]}',
-                    "disposition": "action",
-                    "action_indexes": [1, 2],
-                    "reason": "request payload",
-                },
-            ],
-        }
-
-        normalized = json.loads(_apply_state_plan_policy(json.dumps(payload), state))
-
-        self.assertEqual(
-            [action["type"] for action in normalized["actions"]],
-            ["secondary_handoff_command"],
-        )
-        self.assertEqual(normalized["semantic_units"][0]["action_indexes"], [])
-        self.assertEqual(normalized["semantic_units"][0]["disposition"], "unresolved")
-        self.assertEqual(normalized["semantic_units"][1]["action_indexes"], [])
-        self.assertEqual(normalized["semantic_units"][1]["disposition"], "unresolved")
-        self.assertEqual(normalized["semantic_units"][2]["action_indexes"], [0])
-        self.assertEqual(normalized["semantic_units"][2]["disposition"], "action")
-        self.assertEqual(
-            normalized["actions"][0]["source_evidence"],
-            'POST /rpc\n{"jsonrpc":"2.0","method":"getLatestBlock","params":[]}',
-        )
-
-
 
 
 if __name__ == "__main__":

@@ -51,7 +51,11 @@ python3 tools/check_agent_boundaries.py --root .
 User message
 -> terminal shell for I/O, startup checks, dependency consent, and job commands
 -> LangGraph Harness checkpointed workflow
--> LLM intent resolver only for ambiguous natural language
+-> prepare and deterministic adjudication
+-> semantic partition when exact local handling is insufficient
+-> one-owner-at-a-time compilation through checkpointed transitions
+-> independent whole-plan semantic review
+-> deterministic action admission
 -> deterministic group workflow and validators
 -> preflight, smoke, benchmark execution, or job/artifact analysis
 ```
@@ -85,21 +89,45 @@ Core groups:
 - `error_evidence_analysis`
 - `report_artifact_analysis`
 
-LLM output is never executed directly. Repository tools own validation,
-configuration materialization, execution, monitoring, and evidence-backed
-analysis.
+`agent/workflows/group_registry.py::GROUPS` is the sole workflow metadata
+authority. It defines 20 `GroupSpec` entries and exactly one domain owner for
+each group. The graph also has a `coordinator` control owner for typed
+pending-answer dispatch and other graph control actions; it is not a ninth
+`GroupSpec` owner.
 
-The product compiles one checkpointer-backed graph. Each transition admits,
+Only an exact option id/value/label/number declared by the active question,
+including declared Y/N choices, exact terminal commands, evidence-transport
+framing, and empty input may use the deterministic local path. Manually entered
+typed values, natural-language alternatives, multi-intent prose, and structured
+content that requires semantic ownership enter the hierarchical planner before
+the pending contract and owning domain validate them.
+
+LLM output is never executed directly. The semantic path checkpoints
+`partition`, repeats `compile_owner` once per scheduled owner, checkpoints
+`review_plan` for independent whole-plan semantic admission, and then enters
+`admit` for deterministic schema, provenance, conflict, prerequisite, and
+pending-contract validation. Repository tools own configuration
+materialization, execution, monitoring, and evidence-backed analysis.
+
+The product compiles one checkpointer-backed graph. Each execution transition
 selects, routes, and commits at most one durable action. Side effects are
 persisted as an intent before invocation and as a receipt afterward. Checkpoint
-schema version 14 is the current contract. Version 12 crosses the isolated
-migration boundary, and version 13 additionally migrates deferred-queue
-retention into the typed pending-question contract. Older state is quarantined
-for explicit reconfirmation.
+schema version 18 is the current contract. Version 12 crosses the isolated
+migration boundary; version 13 migrates deferred-queue retention into the typed
+pending-question contract; version 14 initializes typed response fragments
+before persistence as version 15; version 16 materializes the explicit
+pending-question owner and typed Chain/RPC case context; version 17 introduces
+checkpointed semantic-planning state; and version 18 retires persisted
+turn-local response text/manifests in favor of the current response authority.
+Migration to version 18 clears incompatible turn-local response and planning
+scratch while retaining compatible durable workflow state. Older state is
+quarantined for explicit reconfirmation.
 
 ## Main Modules
 
-- `harness/graph.py`: LangGraph runtime and checkpoint wiring.
+- `harness/graph.py`: the single LangGraph runtime and checkpoint wiring,
+  including distinct `partition`, `compile_owner`, `review_plan`, `admit`,
+  owner, commit, side-effect, fallback, composition, and validation nodes.
 - `harness/coordinator.py`: graph-node transitions and the sole typed commit
   boundary; it does not interpret natural language or own terminal/domain
   business rules.
@@ -112,13 +140,18 @@ for explicit reconfirmation.
   barrier eligibility.
 - `harness/routing.py`: navigation prerequisites, return policy, and canonical
   fallback selection.
-- `harness/response.py`: the single response-composition authority.
+- `harness/response.py`: the single terminal-response assembler and
+  `visible_response` writer. Domains and the coordinator emit only registered
+  semantic fragments; `harness/response_catalog.py` and
+  `harness/response_messages/` are the sole localized product-prose authority.
 - `harness/contracts.py`: typed actions, domain results, side-effect
   intent/receipt, navigation commands, and turn receipts.
 - `harness/checkpoint_migrations.py`: the isolated version-12 checkpoint
   adapter; current turns must not import it.
-- `harness/intent.py`: focused adjudication plus schema/admission helpers; it is
-  not a second product planner.
+- `harness/semantic_admission.py`: immutable semantic-document preparation and
+  admission after owner-scoped compilation; it exposes no planner entry.
+- `harness/advisory.py`: model-backed chain/RPC/evidence analysis with no state
+  mutation or graph-transition authority.
 - `workflows/group_registry.py`: the single metadata authority for group order,
   fields, questions, dependencies, invalidations, and ownership.
 - `harness/state.py`: product workflow state schema; its default group order is
@@ -145,6 +178,7 @@ Retired files must not return:
 - `agent/workflows/transition_executor.py`
 - `agent/terminal/input_classifier.py`
 - `agent/terminal/pending_answers.py`
+- `agent/harness/intent.py`
 - `agent/adk_app/` (the entire package — an ADK-native `Agent`/`Runner`
   tool-calling surface that duplicated the Harness's conversation loop and
   was never the shipped product's entrypoint; its two genuinely-needed pieces
@@ -243,11 +277,15 @@ The live matrix drives `./bin/anychain-agent` through the same CLI path users
 run and inspects LangGraph checkpoint state. It must not read or create legacy
 `.agent/sessions/*/conversation_state.json` workflow files.
 
-The fixed matrix is not product acceptance. The sole authority that can close
-G0-G6 is `tests/agent_live/run_product_acceptance.py`. Phase 6 closes only the
-deterministic G2 gate. Retained real-user regression replay, real CLI,
-response-driven dual-AI Chaos, and real execution belong to Phase 8 and close
-G3-G6 only after the controller admits their revision-bound evidence. Follow
+The fixed matrix is not product acceptance. The sole authority that can admit
+evidence and report G0-G6 status is
+`tests/agent_live/run_product_acceptance.py`. Phase 6 closes only the
+deterministic G2 gate. Phase 8 is implemented as an evidence-admission
+controller: it creates revision-bound obligation catalogs and validates
+evidence produced by subordinate real-CLI, dynamic Chaos, and real-execution
+providers; it does not itself conduct those conversations or jobs. G3-G6 remain
+open until all required external provider evidence is produced and admitted.
+Follow
 `tests/agent_live/README.md` and
 `docs/en/agent-handoff-product-verification.md` for dynamic
 dual-AI Chaos: DeepSeek runs the real CLI while Codex chooses each next user

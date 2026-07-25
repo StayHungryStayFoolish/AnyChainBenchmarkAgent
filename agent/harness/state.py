@@ -16,6 +16,7 @@ class PendingQuestion(TypedDict, total=False):
     contract_version: int
     id: str
     group: str
+    owner: str
     subgroup: str
     kind: str
     prompt: str
@@ -26,6 +27,7 @@ class PendingQuestion(TypedDict, total=False):
     next_on_valid: str
     next_on_invalid: str
     manual_input_allowed: bool
+    value_domain: str
     structured_input_owner: bool
     structured_config_key: str
     candidate_bindings: list[dict[str, Any]]
@@ -48,11 +50,10 @@ class AgentGraphState(TypedDict, total=False):
     turn_index: int
     turn_context: dict[str, Any]
     control: dict[str, Any]
+    semantic_planning: dict[str, Any]
     proposed_actions: list[dict[str, Any]]
     input_shape: str
-    active_intent: str
     active_group: str
-    active_subgroup: str
     discovery: dict[str, Any]
     framework_summary: dict[str, Any]
     web_research: dict[str, Any]
@@ -97,6 +98,7 @@ class AgentGraphState(TypedDict, total=False):
     failure_recovery: dict[str, Any]
     evidence_buffer: list[dict[str, Any]]
     evidence_collection: dict[str, Any]
+    response_fragments: list[dict[str, Any]]
     visible_response: list[str]
     audit_events: list[dict[str, Any]]
     checkpoint_recovery: dict[str, Any]
@@ -128,7 +130,7 @@ RESET_PRESERVED_KEYS = (
 
 DEFAULT_GROUP_ORDER = list(GROUP_ORDER)
 
-STATE_SCHEMA_VERSION = 14
+STATE_SCHEMA_VERSION = 18
 
 
 _V13_IMPLICIT_QUEUE_RESUME_QUESTION_IDS = frozenset({
@@ -198,7 +200,6 @@ def migrate_state(
             fresh[key] = value  # type: ignore[literal-required]
     for key, value in INVOCATION_CONTEXT_DEFAULTS.items():
         fresh[key] = value.copy() if isinstance(value, dict) else value  # type: ignore[literal-required]
-    _quarantine_unsupported_pending_actions(fresh)
     if raw_version == 12:
         _migrate_v12_action_queue_contract(fresh)
         _migrate_v12_mode_exclusive_state(fresh)
@@ -213,6 +214,18 @@ def migrate_state(
         fresh["control"] = control
     if raw_version <= 13:
         _migrate_v13_pending_queue_ownership(fresh)
+    if raw_version <= 14:
+        fresh["response_fragments"] = []
+    if raw_version <= 15:
+        _migrate_v15_pending_question_owner(fresh)
+    if raw_version <= 16:
+        fresh["semantic_planning"] = {}
+    if raw_version <= 17:
+        _migrate_v18_response_contract(fresh)
+    # Version migrations first separate compatible durable work from state
+    # owned by a retired mode. Only then may an invalid pending contract
+    # quarantine the queue that still depends on it.
+    _quarantine_unsupported_pending_actions(fresh)
     if raw_version < STATE_SCHEMA_VERSION:
         fresh.setdefault("audit_events", []).append({
             "event": "checkpoint_schema_migrated",
@@ -222,6 +235,21 @@ def migrate_state(
         })
     fresh["schema_version"] = STATE_SCHEMA_VERSION
     return ensure_session_metadata(fresh, thread_id, session_purpose, touch=False)
+
+
+def _migrate_v18_response_contract(state: AgentGraphState) -> None:
+    """Discard turn-local text and manifests owned by the retired response schema."""
+
+    state["response_fragments"] = []
+    state["visible_response"] = []
+    turn_context = dict(state.get("turn_context") or {})
+    for key in (
+        "response_manifest",
+        "terminal_response_hash",
+        "terminal_semantic_hash",
+    ):
+        turn_context.pop(key, None)
+    state["turn_context"] = turn_context
 
 
 _PRE_V12_RECONFIRM_FIELDS = frozenset({
@@ -356,7 +384,9 @@ def _migrate_v12_action_queue_contract(state: AgentGraphState) -> None:
         f"{int(state.get('turn_index') or 0)}"
     )
     enveloped: list[dict[str, Any]] = []
-    pending_group = str((state.get("pending_question") or {}).get("group") or "")
+    pending = state.get("pending_question") or {}
+    pending_group = str(pending.get("group") or "")
+    pending_owner = str(pending.get("owner") or GROUP_OWNER.get(pending_group, ""))
     for index, action in enumerate(migrated):
         if str(action.get("action_type") or ""):
             enveloped.append(action)
@@ -364,7 +394,7 @@ def _migrate_v12_action_queue_contract(state: AgentGraphState) -> None:
         action_type = str(action.get("type") or "")
         spec = ACTION_BY_TYPE[action_type]
         owner = (
-            GROUP_OWNER.get(pending_group, spec.owner)
+            pending_owner or spec.owner
             if action_type == "answer_pending"
             else spec.owner
         )
@@ -461,6 +491,82 @@ def _migrate_v13_pending_queue_ownership(state: AgentGraphState) -> None:
     })
 
 
+def _migrate_v15_pending_question_owner(state: AgentGraphState) -> None:
+    """Materialize the retired implicit group-to-owner relation once."""
+
+    from .domains.registry import GROUP_OWNER
+
+    migrated: list[tuple[str, str]] = []
+    custom_rpc_questions = {
+        "custom_rpc_adapter_family_confirm",
+        "custom_rpc_endpoint",
+        "custom_rpc_method",
+        "custom_rpc_schema_evidence",
+        "custom_rpc_schema_confirm",
+        "custom_rpc_parameter_confirm",
+        "custom_rpc_response_confirm",
+        "custom_rpc_probe_confirm",
+        "custom_rpc_continue",
+        "custom_rpc_scope",
+        "custom_rpc_single_method",
+        "custom_rpc_weights",
+        "custom_rpc_fixture_choice",
+    }
+    new_chain_questions = {
+        "new_chain_endpoint",
+        "new_chain_method",
+        "new_chain_schema_evidence",
+        "new_chain_schema_confirm",
+        "new_chain_parameter_confirm",
+        "new_chain_response_confirm",
+        "new_chain_probe_confirm",
+        "new_chain_method_continue",
+        "new_chain_workload_scope",
+        "new_chain_single_method",
+        "new_chain_custom_weights",
+        "new_chain_runtime_choice",
+    }
+
+    def migrate_question(question: dict[str, Any], location: str) -> None:
+        question_id = str(question.get("id") or "")
+        group = str(question.get("group") or "")
+        if not str(question.get("owner") or ""):
+            owner = (
+                "environment"
+                if question_id == "inferred_config_review"
+                else GROUP_OWNER.get(group, "")
+            )
+            if owner:
+                question["owner"] = owner
+                migrated.append((location, question_id))
+        if not question.get("domain_context"):
+            rpc_case = (
+                "custom_rpc"
+                if question_id in custom_rpc_questions
+                else "new_chain"
+                if question_id in new_chain_questions
+                else ""
+            )
+            question["domain_context"] = (
+                {"rpc_case": rpc_case} if rpc_case else {}
+            )
+
+    pending = state.get("pending_question")
+    if isinstance(pending, dict) and pending:
+        migrate_question(pending, "top_level")
+    resume_context = state.get("resume_context")
+    if isinstance(resume_context, dict):
+        resumed = resume_context.get("pending_question")
+        if isinstance(resumed, dict) and resumed:
+            migrate_question(resumed, "resume_context")
+    for location, question_id in migrated:
+        state.setdefault("audit_events", []).append({
+            "event": "checkpoint_v15_pending_owner_migrated",
+            "location": location,
+            "question_id": question_id,
+        })
+
+
 def _quarantine_unsupported_pending_actions(state: AgentGraphState) -> None:
     """Drop persisted questions that fail the current complete contract."""
 
@@ -484,6 +590,9 @@ def _quarantine_unsupported_pending_actions(state: AgentGraphState) -> None:
             continue
         if location == "top_level":
             state[key] = {}
+            quarantined_queue = len(state.get("action_queue") or [])
+            state["action_queue"] = []
+            state["selected_action"] = {}
             state["checkpoint_recovery"] = {
                 "status": "quarantined",
                 "error_type": "PendingQuestionContractError",
@@ -500,6 +609,11 @@ def _quarantine_unsupported_pending_actions(state: AgentGraphState) -> None:
             "location": location,
             "question_id": str(candidate.get("id") or ""),
             "contract_error": contract_error,
+            **(
+                {"quarantined_action_count": quarantined_queue}
+                if location == "top_level"
+                else {}
+            ),
         })
 
 
@@ -571,11 +685,10 @@ def new_state(thread_id: str, language: str = "en", session_purpose: str = "user
         "turn_index": 0,
         "turn_context": {},
         "control": {},
+        "semantic_planning": {},
         "proposed_actions": [],
         "input_shape": "",
-        "active_intent": "",
         "active_group": "opening",
-        "active_subgroup": "",
         "discovery": {},
         "framework_summary": {},
         "web_research": {},
@@ -620,6 +733,7 @@ def new_state(thread_id: str, language: str = "en", session_purpose: str = "user
         "failure_recovery": {},
         "evidence_buffer": [],
         "evidence_collection": {},
+        "response_fragments": [],
         "visible_response": [],
         "audit_events": [],
         "checkpoint_recovery": {},

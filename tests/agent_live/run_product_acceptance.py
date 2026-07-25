@@ -12,6 +12,7 @@ import json
 import platform
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -22,14 +23,35 @@ if str(REPO_ROOT) not in sys.path:
 from tests.agent_live.generate_harness_coverage_ledger import build_ledger
 from tests.agent_live.generate_harness_coverage_ledger import ingest_evidence_artifacts
 from tests.agent_live.execute_harness_contract_ledger import execute_ledger
+from tests.agent_live.coverage_evidence import (
+    validate_real_execution_ledger_artifacts,
+)
 from tests.agent_live.product_chaos_obligations import (
     build_product_chaos_obligations,
 )
 from tests.agent_live.product_obligation_evidence import (
-    admit_product_obligation_evidence,
+    admit_product_chaos_rounds,
+)
+from tests.agent_live.generate_product_review_evidence import (
+    generate_product_review_evidence,
+)
+from tests.agent_live.product_review_contract import (
+    PRODUCT_REVIEW_SCHEMA_VERSION,
+    content_hash as product_review_content_hash,
+)
+from tests.agent_live.product_review_scope import DEFAULT_SCOPE_MANIFEST
+from tests.agent_live.linux_shell_gates import (
+    execute_required_linux_shell_gates,
+    load_linux_shell_gate_manifest,
+)
+from tests.agent_live.retained_regression_evidence_set import (
+    load_retained_regression_evidence_set,
 )
 from tests.agent_live.retained_regression_obligations import (
     build_retained_regression_obligations,
+)
+from tests.agent_live.validate_product_review_evidence import (
+    validate_product_review_evidence,
 )
 
 
@@ -38,13 +60,7 @@ IMPLEMENTED_THROUGH_PHASE = 8
 EMPTY_WORKTREE_HASH = hashlib.sha256(b"").hexdigest()
 FULL_PYTHON_SUITE_COMMAND = (
     sys.executable,
-    "-m",
-    "unittest",
-    "discover",
-    "-s",
-    "tests",
-    "-p",
-    "test_*.py",
+    "tests/run_offline_python_suite.py",
 )
 
 
@@ -99,6 +115,24 @@ def _write_json(path: Path, payload: Any) -> Path:
     return path
 
 
+def _load_json_object(path: Path, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} is not valid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must contain one JSON object")
+    return value
+
+
+def _display_path(path: Path) -> str:
+    resolved = path.resolve()
+    try:
+        return str(resolved.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(resolved)
+
+
 def _g0_source() -> dict[str, Any]:
     checks = [
         _run((sys.executable, "tools/check_agent_boundaries.py", "--root", ".")),
@@ -132,8 +166,7 @@ def _g0_source() -> dict[str, Any]:
 
 
 def _phase2_source() -> dict[str, Any]:
-    from agent.harness import coordinator
-    from agent.harness.hierarchical_planner import resolve_product_action_queue
+    from agent.harness import coordinator, hierarchical_planner
 
     checks = [
         _run((
@@ -147,7 +180,17 @@ def _phase2_source() -> dict[str, Any]:
         )),
     ]
     product_entry_is_hierarchical = (
-        coordinator.resolve_action_queue is resolve_product_action_queue
+        not hasattr(coordinator, "resolve_action_queue")
+        and not hasattr(coordinator, "plan_turn_step")
+        and not hasattr(hierarchical_planner, "resolve_product_action_queue")
+        and all(
+            callable(getattr(hierarchical_planner, name, None))
+            for name in (
+                "begin_semantic_partition",
+                "compile_next_owner",
+                "review_semantic_plan",
+            )
+        )
     )
     return {
         "phase": 2,
@@ -172,6 +215,14 @@ def _checked_phase(phase: int, *test_modules: str) -> dict[str, Any]:
         "checks": checks,
         "status": "passed" if all(check["passed"] for check in checks) else "failed",
     }
+
+
+def _phase1_source() -> dict[str, Any]:
+    return _checked_phase(
+        1,
+        "tests.test_agent_contract_projection",
+        "tests.test_agent_question_prompts",
+    )
 
 
 def _phase3_source() -> dict[str, Any]:
@@ -258,6 +309,7 @@ def _phase6_complete(
     observed_domain_owners: set[str],
     expected_domain_owners: set[str],
     regressions: dict[str, Any],
+    shell_gates: dict[str, Any],
     checks: list[dict[str, Any]],
 ) -> bool:
     return (
@@ -268,6 +320,7 @@ def _phase6_complete(
         and observed_domain_owners == expected_domain_owners
         and not ledger.get("uncataloged_questions")
         and regressions["status"] == "passed"
+        and shell_gates.get("status") == "passed"
         and all(check["passed"] for check in checks)
     )
 
@@ -313,6 +366,37 @@ def _phase6_source(inventory: dict[str, Any]) -> dict[str, Any]:
         if str(action.get("owner") or "")
     }
     regressions = _retained_regression_inventory()
+    try:
+        shell_manifest = load_linux_shell_gate_manifest(REPO_ROOT)
+        shell_gates = execute_required_linux_shell_gates(
+            REPO_ROOT,
+            shell_manifest,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        shell_gates = {
+            "status": "failed",
+            "reason": str(exc),
+            "classified_denominator": 0,
+            "required_denominator": 0,
+            "passed": 0,
+            "failed": 0,
+            "results": [],
+        }
+    shell_receipt_unsigned = {
+        "schema_version": PRODUCT_REVIEW_SCHEMA_VERSION,
+        "source_type": "linux_shell_gate_receipt",
+        "revision": revision,
+        "execution": shell_gates,
+    }
+    shell_receipt_path = _write_json(
+        phase_root / "linux-shell-gates.json",
+        {
+            **shell_receipt_unsigned,
+            "source_hash": product_review_content_hash(
+                shell_receipt_unsigned
+            ),
+        },
+    )
     checks = [
         _run(FULL_PYTHON_SUITE_COMMAND),
         _run((sys.executable, "tools/check_agent_boundaries.py", "--root", ".")),
@@ -323,6 +407,7 @@ def _phase6_source(inventory: dict[str, Any]) -> dict[str, Any]:
         observed_domain_owners=observed_domain_owners,
         expected_domain_owners=expected_domain_owners,
         regressions=regressions,
+        shell_gates=shell_gates,
         checks=checks,
     )
     return {
@@ -333,6 +418,10 @@ def _phase6_source(inventory: dict[str, Any]) -> dict[str, Any]:
         "domain_owners": sorted(observed_domain_owners),
         "action_owners": sorted(action_owners),
         "retained_regressions": regressions,
+        "linux_shell_gates": shell_gates,
+        "linux_shell_gate_receipt": str(
+            shell_receipt_path.relative_to(REPO_ROOT)
+        ),
         "checks": checks,
         "status": "passed" if complete else "failed",
     }
@@ -344,6 +433,62 @@ def _phase7_source() -> dict[str, Any]:
         "tests.test_agent_dependency_and_docs_contract",
         "tests.test_agent_legacy_issue_map",
     )
+
+
+def _phase8_g3_gate(
+    *,
+    phase_root: Path,
+    obligations: Sequence[dict[str, Any]],
+    revision: dict[str, str],
+) -> dict[str, Any]:
+    provider_path = phase_root / "g3" / "provider.json"
+    manifest_path = phase_root / "g3" / "evidence-set" / "manifest.json"
+    missing = [
+        _display_path(path)
+        for path in (provider_path, manifest_path)
+        if not path.is_file()
+    ]
+    if missing:
+        return {
+            "status": "incomplete",
+            "complete": False,
+            "reason": "immutable G3 evidence set is not available",
+            "missing": missing,
+        }
+    try:
+        provider = _load_json_object(
+            provider_path,
+            "G3 retained-regression provider",
+        )
+        manifest = load_retained_regression_evidence_set(
+            manifest_path,
+            provider=provider,
+            obligations=obligations,
+            revision=revision,
+        )
+        passed = int(manifest["obligation_count"])
+        exact_count = int(manifest["exact_count"])
+        open_count = int(manifest["open_count"])
+        manifest_hash = str(manifest["manifest_hash"])
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        return {
+            "status": "failed",
+            "complete": False,
+            "reason": f"immutable G3 evidence set was rejected: {exc}",
+            "manifest": _display_path(manifest_path),
+        }
+    return {
+        "status": "passed",
+        "complete": True,
+        "passed": passed,
+        "failed": 0,
+        "external": 0,
+        "not_run": 0,
+        "exact_count": exact_count,
+        "open_count": open_count,
+        "manifest": _display_path(manifest_path),
+        "manifest_hash": manifest_hash,
+    }
 
 
 def _phase8_source(inventory: dict[str, Any]) -> dict[str, Any]:
@@ -370,14 +515,19 @@ def _phase8_source(inventory: dict[str, Any]) -> dict[str, Any]:
         phase_root / "g4" / "obligations.json",
         {"revision": revision, "obligations": g4_obligations},
     )
-    g3_summary = admit_product_obligation_evidence(
+    g3_summary = _phase8_g3_gate(
+        phase_root=phase_root,
         obligations=g3_obligations,
-        evidence_paths=_json_files(phase_root / "g3" / "evidence"),
         revision=revision,
     )
-    g4_summary = admit_product_obligation_evidence(
+    g4_summary = admit_product_chaos_rounds(
         obligations=g4_obligations,
-        evidence_paths=_json_files(phase_root / "g4" / "evidence"),
+        evidence_by_round={
+            round_id: _json_files(
+                phase_root / "g4" / round_id / "evidence"
+            )
+            for round_id in ("round-1", "round-2")
+        },
         revision=revision,
     )
 
@@ -390,17 +540,44 @@ def _phase8_source(inventory: dict[str, Any]) -> dict[str, Any]:
         .get("execution_closure", {})
         .get("real_execution", {})
     )
+    g5_globally_valid = False
+    g5_global_reason = "real execution ledger is incomplete"
+    if (
+        g5_summary.get("status") == "complete"
+        and int(g5_summary.get("required_denominator") or 0) == 4
+        and int(g5_summary.get("open_required", -1)) == 0
+    ):
+        g5_artifacts = [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in g5_paths
+        ]
+        g5_artifacts.sort(
+            key=lambda artifact: int(
+                ((artifact.get("request") or {}).get("ledger_sequence") or 0)
+            )
+        )
+        g5_globally_valid, g5_global_reason = (
+            validate_real_execution_ledger_artifacts(
+                g5_artifacts,
+                revision=revision,
+            )
+        )
     _write_json(phase_root / "g5" / "execution-ledger.json", execution_ledger)
 
-    g3_status = "passed" if g3_summary["complete"] else g3_summary["status"]
+    g3_status = str(g3_summary["status"])
     g4_status = "passed" if g4_summary["complete"] else g4_summary["status"]
     g5_status = (
         "passed"
         if g5_summary.get("status") == "complete"
         and int(g5_summary.get("required_denominator") or 0) == 4
         and int(g5_summary.get("open_required", -1)) == 0
+        and g5_globally_valid
         else "failed"
         if g5_summary.get("status") == "failed"
+        or (
+            g5_summary.get("status") == "complete"
+            and not g5_globally_valid
+        )
         else "incomplete"
     )
     prerequisites_passed = all(
@@ -428,7 +605,12 @@ def _phase8_source(inventory: dict[str, Any]) -> dict[str, Any]:
         "gates": {
             "G3": {**g3_summary, "status": g3_status},
             "G4": {**g4_summary, "status": g4_status},
-            "G5": {**g5_summary, "status": g5_status},
+            "G5": {
+                **g5_summary,
+                "status": g5_status,
+                "global_ledger_valid": g5_globally_valid,
+                "global_ledger_reason": g5_global_reason,
+            },
             "G6": g6,
         },
         "status": phase_status,
@@ -446,93 +628,128 @@ def _phase8_product_review(
             "status": "not_run",
             "reason": "G3-G5 must pass before final product review",
         }
-    checks = [
-        _run((
-            sys.executable,
-            "-m",
-            "unittest",
-            "tests.test_agent_dependency_and_docs_contract",
-            "tests.test_agent_legacy_issue_map",
-            "tests.test_agent_state_authority",
-        )),
-        _run((sys.executable, "tools/check_agent_boundaries.py", "--root", ".")),
-        _run(("git", "diff", "--check")),
-    ]
-    tracked = _git_output("ls-files").splitlines()
-    forbidden_tracked = sorted(
-        path
-        for path in tracked
-        if "/__pycache__/" in f"/{path}"
-        or path.endswith(".pyc")
-        or path.startswith(".agent/")
-    )
-    review_path = phase_root / "g6" / "product-review.json"
-    if not review_path.is_file():
+    config_path = phase_root / "g6" / "generator-config.json"
+    if not config_path.is_file():
         return {
             "status": "incomplete",
-            "reason": "revision-bound product review artifact is missing",
-            "checks": checks,
-            "forbidden_tracked_files": forbidden_tracked,
+            "reason": "typed G6 generator config is missing",
+            "config": _display_path(config_path),
         }
     try:
-        review = json.loads(review_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        config = _load_g6_generator_config(config_path, revision=revision)
+        output_dir = (
+            phase_root
+            / "g6"
+            / "generated"
+            / f"review-{uuid.uuid4().hex}"
+        )
+        manifest_path = generate_product_review_evidence(
+            output_dir=output_dir,
+            revision=revision,
+            planner_receipt_paths=config["planner_receipt_paths"],
+            migration_cutoff_path=config["migration_cutoff_path"],
+            bilingual_docs_path=config["bilingual_docs_path"],
+            runtime_hygiene_path=config["runtime_hygiene_path"],
+            external_capability_paths=config["external_capability_paths"],
+            severity_ledger_path=config["severity_ledger_path"],
+            shell_gate_receipt_path=(
+                phase_root.parent / "phase6" / "linux-shell-gates.json"
+            ),
+            scope_repo_root=REPO_ROOT,
+            scope_manifest_path=DEFAULT_SCOPE_MANIFEST,
+        )
+        decision = validate_product_review_evidence(
+            manifest_path,
+            revision=revision,
+        )
+        if (
+            not isinstance(decision, dict)
+            or decision.get("gate") != "G6"
+            or decision.get("status") not in {"passed", "failed"}
+        ):
+            raise ValueError("independent G6 validator returned an invalid decision")
+    except (
+        KeyError,
+        OSError,
+        RuntimeError,
+        subprocess.SubprocessError,
+        TypeError,
+        ValueError,
+    ) as exc:
         return {
             "status": "failed",
-            "reason": f"product review artifact is invalid: {exc}",
-            "checks": checks,
-            "forbidden_tracked_files": forbidden_tracked,
+            "reason": f"typed G6 evidence was rejected: {exc}",
+            "config": _display_path(config_path),
         }
-    expected_fields = {
-        "schema_version",
-        "revision",
-        "open_findings",
-        "planner_metrics",
-        "migration_cutoff_verified",
-        "bilingual_docs_verified",
-        "external_capabilities",
-        "review_hash",
-    }
-    unsigned = dict(review)
-    review_hash = str(unsigned.pop("review_hash", "") or "")
-    review_valid = (
-        set(review) == expected_fields
-        and review.get("schema_version") == 1
-        and review.get("revision") == revision
-        and review_hash == hashlib.sha256(
-            json.dumps(
-                unsigned,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
-        and dict(review.get("open_findings") or {}).get("S0") == 0
-        and dict(review.get("open_findings") or {}).get("S1") == 0
-        and bool(review.get("planner_metrics"))
-        and review.get("migration_cutoff_verified") is True
-        and review.get("bilingual_docs_verified") is True
-        and bool(review.get("external_capabilities"))
-    )
-    passed = (
-        review_valid
-        and not forbidden_tracked
-        and all(check["passed"] for check in checks)
-    )
     return {
-        "status": "passed" if passed else "failed",
-        "review_artifact": str(review_path.relative_to(REPO_ROOT)),
-        "review_valid": review_valid,
-        "checks": checks,
-        "forbidden_tracked_files": forbidden_tracked,
+        **decision,
+        "config": _display_path(config_path),
+        "manifest": _display_path(manifest_path),
+        "generation": "generated",
     }
+
+
+def _load_g6_generator_config(
+    path: Path,
+    *,
+    revision: dict[str, str],
+) -> dict[str, Any]:
+    config = _load_json_object(path, "G6 generator config")
+    expected_fields = {
+        "revision",
+        "planner_receipt_paths",
+        "migration_cutoff_path",
+        "bilingual_docs_path",
+        "runtime_hygiene_path",
+        "external_capability_paths",
+        "severity_ledger_path",
+    }
+    if set(config) != expected_fields:
+        raise ValueError("G6 generator config schema is invalid")
+    if config.get("revision") != revision:
+        raise ValueError("G6 generator config is bound to a stale revision")
+    for field in ("planner_receipt_paths", "external_capability_paths"):
+        values = config.get(field)
+        if not isinstance(values, list) or not values or any(
+            not isinstance(value, str) or not value.strip() for value in values
+        ):
+            raise ValueError(f"G6 generator config {field} is invalid")
+    for field in (
+        "migration_cutoff_path",
+        "bilingual_docs_path",
+        "runtime_hygiene_path",
+        "severity_ledger_path",
+    ):
+        value = config.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"G6 generator config {field} is invalid")
+    return config
+
+
+def _aggregate_status(
+    *,
+    requested_supported: bool,
+    g0_status: str,
+    phase_statuses: Sequence[str],
+) -> str:
+    """Preserve hard failures before representing unfinished later work."""
+
+    statuses = tuple(str(status) for status in phase_statuses)
+    if g0_status == "failed" or "failed" in statuses:
+        return "failed"
+    if (
+        not requested_supported
+        or any(status in {"incomplete", "not_run"} for status in statuses)
+    ):
+        return "incomplete"
+    return "passed"
 
 
 def build_report(through_phase: int) -> dict[str, Any]:
     inventory = build_ledger(None)
     g0 = _g0_source()
     phase_sources = {
-        1: lambda: {"phase": 1, "status": "passed", "checks": []},
+        1: _phase1_source,
         2: _phase2_source,
         3: _phase3_source,
         4: _phase4_source,
@@ -546,10 +763,6 @@ def build_report(through_phase: int) -> dict[str, Any]:
         for phase in range(1, min(through_phase, IMPLEMENTED_THROUGH_PHASE) + 1)
     }
     requested_supported = through_phase <= IMPLEMENTED_THROUGH_PHASE
-    requested_phase_checks_pass = all(
-        phase_checks[str(phase)]["status"] == "passed"
-        for phase in range(1, min(through_phase, IMPLEMENTED_THROUGH_PHASE) + 1)
-    )
     return {
         "schema_version": SCHEMA_VERSION,
         "authority": "tests/agent_live/run_product_acceptance.py",
@@ -610,18 +823,16 @@ def build_report(through_phase: int) -> dict[str, Any]:
                 "owning_phase": 8,
             },
         },
-        "status": (
-            "passed"
-            if requested_supported
-            and g0["status"] == "passed"
-            and requested_phase_checks_pass
-            else "incomplete"
-            if not requested_supported
-            or any(
-                check.get("status") in {"incomplete", "not_run"}
-                for check in phase_checks.values()
-            )
-            else "failed"
+        "status": _aggregate_status(
+            requested_supported=requested_supported,
+            g0_status=str(g0.get("status") or "failed"),
+            phase_statuses=tuple(
+                str(phase_checks[str(phase)].get("status") or "failed")
+                for phase in range(
+                    1,
+                    min(through_phase, IMPLEMENTED_THROUGH_PHASE) + 1,
+                )
+            ),
         ),
     }
 
@@ -637,7 +848,7 @@ def main() -> int:
         / ".agent"
         / "evidence"
         / "control-plane"
-        / str(report["inventory"]["revision"].get("commit") or "unknown")
+        / _revision_id(dict(report["inventory"]["revision"] or {}))
         / f"phase{args.through_phase}"
         / "product-acceptance.json"
     )
@@ -646,7 +857,7 @@ def main() -> int:
     print(json.dumps({
         "status": report["status"],
         "through_phase": args.through_phase,
-        "output": str(output.relative_to(REPO_ROOT)),
+        "output": _display_path(output),
     }, sort_keys=True))
     if report["status"] == "passed":
         return 0

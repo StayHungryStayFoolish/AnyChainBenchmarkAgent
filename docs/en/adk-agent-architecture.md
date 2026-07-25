@@ -39,7 +39,7 @@ flowchart TD
   T --> D["Startup diagnostics<br/>framework context, environment, dependencies, jobs"]
   T --> H["LangGraph Harness<br/>agent/harness"]
 
-  H --> I["Typed intent resolver<br/>configured LLM"]
+  H --> I["Hierarchical semantic planner<br/>configured LLM"]
   H --> G["20 group workflows / 8 domain owners<br/>registry-owned state transitions"]
   H --> S["Persistent checkpoint<br/>ANYCHAIN_AGENT_CHECKPOINT_PATH"]
   H --> VAL["Deterministic validators<br/>config, workload, onboarding, execution gate"]
@@ -73,12 +73,16 @@ flowchart TD
 flowchart LR
   A["prepare"] --> B["adjudicate"]
   B --> C{"input authority"}
-  C -- "deterministic option / typed value / command" --> D["admit"]
-  C -- "semantic natural language" --> P["hierarchical plan"]
-  P --> D
+  C -- "exact declared option / Y-N / trusted command or transport" --> X["trusted local contract admission"]
+  C -- "manual value / semantic or structured input" --> P["partition"]
+  P --> O["compile_owner<br/>one scheduled owner"]
+  O -- "owners remain" --> O
+  O -- "all owners checkpointed" --> R["review_plan<br/>independent semantic admission"]
+  R --> D["admit<br/>deterministic validation"]
+  X --> E
+  D --> E
   C -- "empty / no-op" --> L["fallback"]
-  D --> E["select one action"]
-  E --> F["route one owner"]
+  E["select one action"] --> F["route one owner"]
   F --> G["commit typed result"]
   G --> H{"side effect?"}
   H -- "yes" --> I["persist intent"]
@@ -99,6 +103,21 @@ and completed by a `SideEffectReceipt`. Every turn records a `TurnReceipt`
 that binds semantic units, admitted actions, execution order, unresolved
 units, and the resulting question.
 
+The deterministic fast path is deliberately narrow. It accepts only an exact
+option id/value/label/number declared by the active question, including
+declared Y/N choices, exact terminal commands, evidence-transport framing, and
+empty input. A manually entered typed value is not an exact option: it enters
+semantic partitioning so the model can assign ownership, after which the
+pending-question contract and owning domain still perform deterministic value
+validation.
+
+`partition`, every individual `compile_owner`, and `review_plan` are separate
+checkpointed transitions. `review_plan` performs independent whole-plan
+semantic admission over the immutable owner documents. The following `admit`
+node is a different trust boundary: it deterministically validates action
+schema, provenance, conflicts, prerequisites, pending-question contracts, and
+queue eligibility before actions become durable.
+
 Control-plane responsibilities are deliberately separate:
 
 - `admission.py` validates proposals, conflicts, prerequisites, and semantic
@@ -107,13 +126,20 @@ Control-plane responsibilities are deliberately separate:
   Stage A partitions the complete turn and assigns bounded owner/group routes;
   Stage B compiles actions with owner-scoped schemas before whole-plan
   admission;
-- `intent.py` supplies focused adjudication and schema/admission helpers. It is
-  not a second product planner;
+- `semantic_admission.py` prepares and validates immutable semantic documents
+  after owner-scoped compilation. It has no planner entry and does not select a
+  provider; the checkpointed `review_plan` transition supplies the configured
+  provider for bounded whole-plan semantic review;
+- `advisory.py` owns model-backed chain identity, RPC-schema extraction, and
+  evidence analysis that cannot mutate state or choose a graph transition;
 - `queue.py` owns dependency-safe ordering and pending-barrier eligibility;
 - `routing.py` owns navigation prerequisites, return policy, and canonical
   fallback;
-- `response.py` is the only response composer and emits at most one actionable
-  blocking question;
+- `response.py` is the only terminal-response assembler and
+  `visible_response` writer and emits at most one actionable blocking question.
+  Domains and the coordinator emit only registered semantic fragments;
+  `response_catalog.py` and `response_messages/` are the sole localized
+  product-prose authority;
 - `coordinator.py` implements graph-node transitions and the sole typed commit
   boundary; it does not interpret natural language, parse terminal input, or
   own domain business rules.
@@ -123,6 +149,10 @@ defines the 20 groups, their fields, questions, dependencies, invalidations,
 and owner. `agent/harness/state.py::DEFAULT_GROUP_ORDER` and
 `agent/harness/domains/registry.py` are derived runtime views. They are not
 additional authorities.
+
+The graph additionally routes typed control actions through a `coordinator`
+owner. It owns no `GroupSpec` and does not increase the domain-owner count:
+there remain 20 groups with exactly eight domain owners.
 
 | Order | Group | Owner |
 |---:|---|---|
@@ -198,10 +228,18 @@ edit it manually. If a user changes an earlier answer, the Harness must update
 or invalidate the affected group state and regenerate downstream runtime
 artifacts through deterministic tools.
 
-Checkpoint state uses schema version 14. Current-version turns never invoke a
+Checkpoint state uses schema version 18. Current-version turns never invoke a
 legacy action compiler. Version 12 checkpoints cross the explicit migration
 boundary; version 13 checkpoints additionally migrate deferred-queue retention
-into the typed pending-question contract before being persisted as version 14.
+into the typed pending-question contract; version 14 initializes typed response
+fragments before persistence as version 15; version 16 materializes the
+explicit pending-question owner and typed Chain/RPC case context; and version
+17 introduces the checkpointed `semantic_planning` contract; version 18
+retires persisted turn-local response text and manifests in favor of the
+current response authority. Migration to version 18 discards incompatible
+in-flight planning and response scratch rather than resuming an owner cursor
+or response contract compiled under an older schema, while retaining
+compatible durable workflow state.
 Older checkpoints are quarantined: only an allowlisted set of environment
 facts is exposed for reconfirmation, and old pending actions or guessed plan
 files are never resumed as executable work.
@@ -290,7 +328,12 @@ Before changing Agent code, read:
 Then run relevant checks:
 
 ```bash
-python3 -m unittest tests.test_agent_product_terminal tests.test_agent_runtime_contract tests.test_agent_langgraph_harness
+python3 -m unittest \
+  tests.test_agent_product_terminal \
+  tests.test_agent_runtime_contract \
+  tests.test_agent_langgraph_harness \
+  tests.test_agent_harness_architecture \
+  tests.test_agent_response_authority
 python3 tools/check_agent_boundaries.py --root .
 git diff --check
 ```
@@ -299,6 +342,14 @@ For model-facing behavior, run the current product Harness defined by the
 reviewed task/design document. Lower-level live/PTY scripts can be provider
 drivers or developer helpers, but product readiness requires realistic CLI
 scenarios and deterministic assertions.
+
+`tests/agent_live/run_product_acceptance.py` is the Phase 8
+evidence-admission controller, not the user simulator or real-execution
+provider. It generates revision-bound obligation catalogs and admits evidence
+produced by subordinate providers. Phase 8 is implemented, but G3-G6 remain
+open until retained real-CLI regressions, response-driven dual-AI Chaos, all
+required real executions, and the final product review have independently
+produced qualifying evidence.
 
 The fixed CLI matrix is not sufficient for product acceptance. Follow
 `tests/agent_live/README.md`: DeepSeek runs the real Docker/Linux CLI and Codex

@@ -12,7 +12,10 @@ from typing import Any, Callable
 from agent.planners.chain_template_requirements import inspect_chain_template
 from agent.workflows.group_registry import (
     GROUP_SPEC_BY_NAME,
-    fallback_groups_for_workflow,
+    NEW_CHAIN_ENDPOINT_STATUSES,
+    RPC_EXTENSION_ENDPOINT_STATUSES,
+    fallback_groups_for_state,
+    group_applicable,
     is_user_navigable_group,
 )
 
@@ -135,16 +138,7 @@ def _network_readiness(state: dict[str, Any]) -> GroupReadiness:
 
 def _endpoint_readiness(state: dict[str, Any]) -> GroupReadiness:
     identity_status = str((state.get("chain_identity") or {}).get("status") or "")
-    continuation_statuses = {
-        "existing_family_needs_endpoint",
-        "existing_family_needs_method",
-        "existing_family_needs_schema_evidence",
-        "existing_family_schema_needs_confirmation",
-        "existing_family_needs_workload_scope",
-        "existing_family_needs_single_method",
-        "existing_family_needs_weights",
-    }
-    if identity_status in continuation_statuses:
+    if identity_status in NEW_CHAIN_ENDPOINT_STATUSES:
         return _missing(
             f"continue new-chain validation: {identity_status}", continuation=True
         )
@@ -164,17 +158,10 @@ def _endpoint_readiness(state: dict[str, Any]) -> GroupReadiness:
         return _missing(sync_blocker.reason)
 
     custom_status = str((state.get("custom_rpc") or {}).get("status") or "")
-    if str(state.get("workflow_mode") or "") == "rpc_benchmark" and custom_status in {
-        "needs_endpoint",
-        "needs_method",
-        "needs_schema_evidence",
-        "schema_needs_confirmation",
-        "needs_adapter_family_confirmation",
-        "needs_scope",
-        "needs_single_method",
-        "needs_weights",
-        "probe_failed",
-    }:
+    if (
+        str(state.get("workflow_mode") or "") == "rpc_benchmark"
+        and custom_status in RPC_EXTENSION_ENDPOINT_STATUSES
+    ):
         return _missing(f"continue custom RPC workflow: {custom_status}")
     return _ready()
 
@@ -274,7 +261,7 @@ def next_group_and_reason(state: dict[str, Any]) -> tuple[str, str]:
     if unresolved_recovery(state.get("failure_recovery")):
         return "failure_recovery", "resolve the current execution failure"
 
-    specs = fallback_groups_for_workflow(str(state.get("workflow_mode") or ""))
+    specs = fallback_groups_for_state(state)
     facts = [(spec.name, group_readiness(state, spec.name)) for spec in specs]
     for group, fact in facts:
         if not fact.ready and fact.continuation:
@@ -296,8 +283,7 @@ def navigation_prerequisite(state: dict[str, Any], group: str) -> str:
     spec = GROUP_SPEC_BY_NAME.get(group)
     if spec is None or not is_user_navigable_group(group):
         return ""
-    workflow_mode = str(state.get("workflow_mode") or "").strip()
-    if spec.workflow_modes and workflow_mode not in spec.workflow_modes:
+    if not group_applicable(state, spec):
         return "target_mode"
     for dependency in spec.depends_on:
         if dependency == "target_mode" and not str(state.get("target_mode") or "").strip():

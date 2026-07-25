@@ -8,11 +8,19 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from agent.knowledge.chain_identity import canonicalize_chain_scalar, repo_chain_names
+from agent.workflows.group_registry import GROUP_OWNER
 from .action_registry import (
     ACTION_BY_TYPE,
     validate_candidate_binding_contract,
 )
-from .contracts import ActionProposal, OptionContract, QuestionContract
+from .contracts import (
+    ActionProposal,
+    OptionContract,
+    QuestionContract,
+    TextRef,
+    text_ref_from_dict,
+    text_ref_to_dict,
+)
 from .input_values import (
     extract_rpc_method_token_candidates,
     extract_url_candidates,
@@ -20,7 +28,43 @@ from .input_values import (
     looks_like_wire_method_identity,
     parse_weight_spec,
 )
-from .localization import localized
+from .response_catalog import render_text_ref
+
+
+QUESTION_CONTRACT_VERSION = 3
+
+_DOMAIN_CONTEXT_KEYS = {
+    "config_field",
+    "contract_type",
+    "endpoint_role",
+    "rpc_case",
+}
+_RPC_ENDPOINT_CONTRACTS = {
+    ("final_benchmark", "runtime", "LOCAL_RPC_URL"),
+    ("sync_observe", "runtime", "SYNC_OBSERVE_RPC_URL"),
+    ("validation", "custom_rpc", ""),
+    ("validation", "new_chain", ""),
+}
+
+
+def question_text(message_id: str, **arguments: Any) -> TextRef:
+    """Build a language-independent reference to registered question text."""
+
+    return TextRef(message_id=message_id, arguments=arguments)
+
+
+def _optional_text_ref(value: TextRef | None, *, field: str) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, TextRef):
+        raise TypeError(f"{field} must be a TextRef")
+    return text_ref_to_dict(value)
+
+
+def _validated_text_ref_mapping(value: Any, *, field: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"pending question {field} must be a typed mapping")
+    return text_ref_to_dict(text_ref_from_dict(value))
 
 
 def _question_validation(kind: str, validation: dict[str, Any] | None) -> dict[str, Any]:
@@ -91,8 +135,79 @@ def _candidate_binding_contract(
 def validate_pending_question_contract(question: dict[str, Any]) -> dict[str, Any]:
     """Validate one complete pending-question contract at every trust boundary."""
 
-    if int(question.get("contract_version") or 0) != 2:
-        raise ValueError("pending question requires contract_version 2")
+    if int(question.get("contract_version") or 0) != QUESTION_CONTRACT_VERSION:
+        raise ValueError(
+            f"pending question requires contract_version {QUESTION_CONTRACT_VERSION}"
+        )
+    retired_text_keys = {"prompt", "help_text", "completion_effect"}
+    present_retired = sorted(retired_text_keys & set(question))
+    if present_retired:
+        raise ValueError(
+            "pending question contains retired rendered text fields: "
+            + ", ".join(present_retired)
+        )
+    prompt_ref = _validated_text_ref_mapping(
+        question.get("prompt_ref"),
+        field="prompt_ref",
+    )
+    help_ref = (
+        _validated_text_ref_mapping(question.get("help_ref"), field="help_ref")
+        if question.get("help_ref") is not None
+        else None
+    )
+    completion_effect_ref = (
+        _validated_text_ref_mapping(
+            question.get("completion_effect_ref"),
+            field="completion_effect_ref",
+        )
+        if question.get("completion_effect_ref") is not None
+        else None
+    )
+    group = str(question.get("group") or "").strip()
+    owner = str(question.get("owner") or "").strip()
+    if group not in GROUP_OWNER:
+        raise ValueError(f"pending question has unknown group: {group or '<missing>'}")
+    if not owner:
+        raise ValueError("pending question requires an explicit owner")
+    if owner not in set(GROUP_OWNER.values()):
+        raise ValueError(f"pending question has unknown owner: {owner!r}")
+    domain_context = question.get("domain_context") or {}
+    if not isinstance(domain_context, dict):
+        raise ValueError("pending question domain_context must be an object")
+    unknown_context = set(domain_context) - _DOMAIN_CONTEXT_KEYS
+    if unknown_context:
+        raise ValueError(
+            "pending question has unknown domain_context keys: "
+            + ", ".join(sorted(unknown_context))
+        )
+    contract_type = str(domain_context.get("contract_type") or "")
+    endpoint_role = str(domain_context.get("endpoint_role") or "")
+    config_field = str(domain_context.get("config_field") or "")
+    rpc_case = str(domain_context.get("rpc_case") or "")
+    allowed_rpc_cases = (
+        {"runtime", "custom_rpc", "new_chain"}
+        if contract_type == "rpc_endpoint"
+        else {"custom_rpc", "new_chain"}
+    )
+    if rpc_case and (owner != "chain_rpc" or rpc_case not in allowed_rpc_cases):
+        raise ValueError(
+            "pending question rpc_case is not valid for its declared domain contract"
+        )
+    if contract_type:
+        if contract_type != "rpc_endpoint":
+            raise ValueError(
+                f"pending question has unknown domain contract type: {contract_type!r}"
+            )
+        if owner != "chain_rpc" or group != "endpoint_process":
+            raise ValueError(
+                "rpc_endpoint domain contract requires the Chain/RPC endpoint owner"
+            )
+        if (endpoint_role, rpc_case, config_field) not in _RPC_ENDPOINT_CONTRACTS:
+            raise ValueError("pending question has an invalid rpc_endpoint domain contract")
+    elif endpoint_role or config_field:
+        raise ValueError(
+            "endpoint_role and config_field require contract_type=rpc_endpoint"
+        )
     candidate_bindings = tuple(
         dict(value)
         for value in question.get("candidate_bindings") or []
@@ -125,6 +240,24 @@ def validate_pending_question_contract(question: dict[str, Any]) -> dict[str, An
     for option in question.get("options") or []:
         if not isinstance(option, dict):
             raise ValueError("question options must contain only objects")
+        option_retired = sorted(
+            {"label", "description", "completion_effect"} & set(option)
+        )
+        if option_retired:
+            raise ValueError(
+                "question option contains retired rendered text fields: "
+                + ", ".join(option_retired)
+            )
+        option["label_ref"] = _validated_text_ref_mapping(
+            option.get("label_ref"),
+            field="option.label_ref",
+        )
+        for ref_key in ("description_ref", "completion_effect_ref"):
+            if option.get(ref_key) is not None:
+                option[ref_key] = _validated_text_ref_mapping(
+                    option.get(ref_key),
+                    field=f"option.{ref_key}",
+                )
         action = option.get("action")
         if isinstance(action, dict):
             declared_types.add(str(action.get("type") or ""))
@@ -150,6 +283,31 @@ def validate_pending_question_contract(question: dict[str, Any]) -> dict[str, An
             + ", ".join(missing)
         )
     normalized = dict(question)
+    normalized["prompt_ref"] = prompt_ref
+    if help_ref is not None:
+        normalized["help_ref"] = help_ref
+    if completion_effect_ref is not None:
+        normalized["completion_effect_ref"] = completion_effect_ref
+    normalized["owner"] = owner
+    normalized["domain_context"] = dict(domain_context)
+    options = list(question.get("options") or [])
+    if options and question.get("manual_input_allowed") is not True:
+        value_domain = "closed_options"
+    elif options:
+        value_domain = "options_or_typed_value"
+    elif str(declared_manual.get("type") or "") in {
+        "choose_chain",
+        "change_chain",
+    }:
+        value_domain = "researched_identity"
+    else:
+        value_domain = "typed_value"
+    declared_value_domain = str(question.get("value_domain") or value_domain)
+    if declared_value_domain != value_domain:
+        raise ValueError(
+            "pending question value_domain conflicts with its typed contract"
+        )
+    normalized["value_domain"] = value_domain
     if declared_bindings:
         normalized["candidate_bindings"] = declared_bindings
     if declared_manual:
@@ -160,8 +318,9 @@ def validate_pending_question_contract(question: dict[str, Any]) -> dict[str, An
 def manual_question(
     group: str,
     question_id: str,
-    prompt: str,
+    prompt: TextRef,
     *,
+    owner: str,
     field: str,
     kind: str = "manual_value",
     accepted_action_types: tuple[str, ...] = (),
@@ -170,14 +329,17 @@ def manual_question(
     barrier_policy: str = "",
     validation: dict[str, Any] | None = None,
     requires_capabilities: tuple[str, ...] = (),
-    help_text: str = "",
-    completion_effect: str = "",
+    help_text: TextRef | None = None,
+    completion_effect: TextRef | None = None,
+    domain_context: dict[str, Any] | None = None,
     evidence_path: str = "",
     rejection_evidence_value: Any = None,
     structured_input_owner: bool = False,
     structured_config_key: str = "",
     candidate_bindings: tuple[dict[str, Any], ...] = (),
 ) -> dict[str, Any]:
+    if not isinstance(prompt, TextRef):
+        raise TypeError("manual_question prompt must be a TextRef")
     field_validation = _question_validation(kind, validation)
     effective_barrier_policy = (
         str(barrier_policy or "").strip()
@@ -197,11 +359,12 @@ def manual_question(
     }
     structured_key = str(structured_config_key or "").strip()
     return validate_pending_question_contract({
-        "contract_version": 2,
+        "contract_version": QUESTION_CONTRACT_VERSION,
         "id": question_id,
         "group": group,
+        "owner": owner,
         "kind": kind,
-        "prompt": prompt,
+        "prompt_ref": text_ref_to_dict(prompt),
         "field": field,
         "manual_input_allowed": True,
         **({"structured_input_owner": True} if structured_input_owner else {}),
@@ -225,8 +388,22 @@ def manual_question(
         ),
         "validation": field_validation,
         "requires_capabilities": list(requires_capabilities),
-        "help_text": str(help_text or "").strip(),
-        "completion_effect": str(completion_effect or "").strip(),
+        "domain_context": dict(domain_context or {}),
+        **(
+            {"help_ref": _optional_text_ref(help_text, field="help_text")}
+            if help_text is not None
+            else {}
+        ),
+        **(
+            {
+                "completion_effect_ref": _optional_text_ref(
+                    completion_effect,
+                    field="completion_effect",
+                )
+            }
+            if completion_effect is not None
+            else {}
+        ),
         "evidence_path": str(evidence_path or "").strip(),
         **(
             {"rejection_evidence_value": rejection_evidence_value}
@@ -239,8 +416,9 @@ def manual_question(
 def choice_question(
     group: str,
     question_id: str,
-    prompt: str,
+    prompt: TextRef,
     *,
+    owner: str,
     field: str,
     options: list[dict[str, Any]],
     kind: str = "numbered_choice",
@@ -251,13 +429,16 @@ def choice_question(
     barrier_policy: str = "",
     validation: dict[str, Any] | None = None,
     requires_capabilities: tuple[str, ...] = (),
-    help_text: str = "",
-    completion_effect: str = "",
+    help_text: TextRef | None = None,
+    completion_effect: TextRef | None = None,
+    domain_context: dict[str, Any] | None = None,
     evidence_path: str = "",
     rejection_evidence_value: Any = None,
     structured_config_key: str = "",
     candidate_bindings: tuple[dict[str, Any], ...] = (),
 ) -> dict[str, Any]:
+    if not isinstance(prompt, TextRef):
+        raise TypeError("choice_question prompt must be a TextRef")
     effective_barrier_policy = (
         str(barrier_policy or "").strip()
         or ("exclusive_owner" if queue_barrier else "")
@@ -282,6 +463,24 @@ def choice_question(
     for index, raw in enumerate(options, start=1):
         option_id = str(raw.get("id") or index)
         value = raw.get("value")
+        label_ref = raw.get("label")
+        if not isinstance(label_ref, TextRef):
+            raise TypeError(
+                f"choice_question option {option_id} label must be a TextRef"
+            )
+        description_ref = raw.get("description")
+        if description_ref is not None and not isinstance(description_ref, TextRef):
+            raise TypeError(
+                f"choice_question option {option_id} description must be a TextRef"
+            )
+        option_completion_ref = raw.get("completion_effect")
+        if (
+            option_completion_ref is not None
+            and not isinstance(option_completion_ref, TextRef)
+        ):
+            raise TypeError(
+                f"choice_question option {option_id} completion_effect must be a TextRef"
+            )
         expected = (
             dict(raw["expected_patch"])
             if "expected_patch" in raw
@@ -304,8 +503,9 @@ def choice_question(
                 value=value,
                 action=action,
                 expected_patch=expected,
-                description=str(raw.get("description") or "").strip(),
-                completion_effect=str(raw.get("completion_effect") or "").strip(),
+                label=label_ref,
+                description=description_ref,
+                completion_effect=option_completion_ref,
                 manual_entry=raw.get("manual_entry") is True,
                 return_policy=str(raw.get("return_policy") or "fallback"),  # type: ignore[arg-type]
             )
@@ -313,11 +513,15 @@ def choice_question(
         rendered.append(
             {
                 "id": option_id,
-                "label": str(raw.get("label") or value),
-                "description": str(raw.get("description") or "").strip(),
+                "label_ref": text_ref_to_dict(label_ref),
                 **(
-                    {"completion_effect": str(raw.get("completion_effect") or "").strip()}
-                    if str(raw.get("completion_effect") or "").strip()
+                    {"description_ref": text_ref_to_dict(description_ref)}
+                    if description_ref is not None
+                    else {}
+                ),
+                **(
+                    {"completion_effect_ref": text_ref_to_dict(option_completion_ref)}
+                    if option_completion_ref is not None
                     else {}
                 ),
                 "manual_entry": raw.get("manual_entry") is True,
@@ -336,18 +540,23 @@ def choice_question(
         question_id=question_id,
         group=group,
         kind=kind,
-        prompt_key=question_id,
+        prompt=prompt,
+        owner=owner,
         field=field,
         options=tuple(contracts),
         manual_input_allowed=manual_input_allowed,
         requires_capabilities=requires_capabilities,
+        domain_context=dict(domain_context or {}),
+        help_text=help_text,
+        completion_effect=completion_effect,
     )
     return validate_pending_question_contract({
-        "contract_version": 2,
+        "contract_version": QUESTION_CONTRACT_VERSION,
         "id": question_id,
         "group": group,
+        "owner": owner,
         "kind": kind,
-        "prompt": prompt,
+        "prompt_ref": text_ref_to_dict(prompt),
         "field": field,
         "manual_input_allowed": manual_input_allowed,
         **({"structured_config_key": structured_key} if structured_key else {}),
@@ -373,8 +582,22 @@ def choice_question(
         ),
         "validation": _question_validation(kind, validation),
         "requires_capabilities": list(requires_capabilities),
-        "help_text": str(help_text or "").strip(),
-        "completion_effect": str(completion_effect or "").strip(),
+        "domain_context": dict(domain_context or {}),
+        **(
+            {"help_ref": _optional_text_ref(help_text, field="help_text")}
+            if help_text is not None
+            else {}
+        ),
+        **(
+            {
+                "completion_effect_ref": _optional_text_ref(
+                    completion_effect,
+                    field="completion_effect",
+                )
+            }
+            if completion_effect is not None
+            else {}
+        ),
         "evidence_path": str(evidence_path or "").strip(),
         **(
             {"rejection_evidence_value": rejection_evidence_value}
@@ -384,7 +607,9 @@ def choice_question(
     })
 
 
-def exact_answer(text: str, question: dict[str, Any]) -> tuple[bool, Any]:
+def exact_option_answer(text: str, question: dict[str, Any]) -> tuple[bool, Any]:
+    """Match only an option explicitly declared by the active question."""
+
     raw = str(text or "").strip()
     if not raw:
         return False, None
@@ -395,9 +620,19 @@ def exact_answer(text: str, question: dict[str, Any]) -> tuple[bool, Any]:
             candidates = {
                 str(index).casefold(),
                 str(option.get("id") or "").strip().casefold(),
-                str(option.get("label") or "").strip().casefold(),
                 str(option.get("value") or "").strip().casefold(),
             }
+            label_ref = option.get("label_ref")
+            if isinstance(label_ref, dict):
+                reference = text_ref_from_dict(label_ref)
+                candidates.update(
+                    render_text_ref(
+                        reference,
+                        language,
+                        kind="option_label",
+                    ).strip().casefold()
+                    for language in ("en", "zh")
+                )
             if normalized in candidates:
                 return True, option.get("value")
         if question.get("kind") == "yes_no":
@@ -405,6 +640,16 @@ def exact_answer(text: str, question: dict[str, Any]) -> tuple[bool, Any]:
                 return True, options[0].get("value")
             if normalized in {"n", "no"} and len(options) > 1:
                 return True, options[1].get("value")
+    return False, None
+
+
+def exact_answer(text: str, question: dict[str, Any]) -> tuple[bool, Any]:
+    """Match a declared option or a complete typed manual contract value."""
+
+    matched, value = exact_option_answer(text, question)
+    if matched:
+        return True, value
+    raw = str(text or "").strip()
     if question.get("manual_input_allowed") and answer_fits_pending(raw, question):
         return True, coerce_pending_answer(raw, question)
     return False, None
@@ -463,6 +708,8 @@ def literal_matches_validation(value: str, validation: dict[str, Any] | None) ->
             return isinstance(json.loads(raw), (dict, list))
         except json.JSONDecodeError:
             return False
+    if value_type == "url":
+        return bool(_extract_url_candidate(raw))
     if value_type == "enum":
         return raw.casefold() in {
             str(item).strip().casefold() for item in contract.get("values") or []
@@ -512,6 +759,7 @@ def value_satisfies_pending_contract(value: Any, question: dict[str, Any]) -> bo
         "positive_number",
         "positive_integer",
         "json",
+        "url",
         "enum",
     }:
         return literal_matches_validation(raw, validation)
@@ -634,7 +882,6 @@ def manual_literal_violation(value: str, question: dict[str, Any]) -> dict[str, 
         candidates = {
             str(index).casefold(),
             str(option.get("id") or "").strip().casefold(),
-            str(option.get("label") or "").strip().casefold(),
             str(option.get("value") or "").strip().casefold(),
         }
         if normalized in candidates:
@@ -674,20 +921,13 @@ def answer_fits_pending(text: str, question: dict[str, Any]) -> bool:
         return True
     if kind == "yes_no":
         return raw.casefold() in {"y", "yes", "n", "no"} or matches_numbered_option(raw, question)
-    if kind == "numbered_choice" and question.get("id") == "unknown_chain_identity_confirm":
-        candidate = _chain_from_option_label(str((question.get("options") or [{}])[0].get("label") or ""))
-        raw_chain = canonicalize_chain_scalar(raw, known_chains=set(repo_chain_names()))
-        if (candidate and raw_chain and candidate == raw_chain) or raw.casefold() in {"y", "yes", "n", "no"}:
-            return True
     if kind == "confirm_or_value":
         if raw.casefold() in {"y", "yes", "n", "no"} or matches_numbered_option(raw, question):
             return True
-        field = str(question.get("field") or "")
-        if field in {"DATA_VOL_SIZE", "ACCOUNTS_VOL_SIZE"}:
-            return bool(re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", raw))
-        if field == "MAINNET_RPC_URL_REVIEWED":
-            return bool(_extract_url_candidate(raw))
-        return _is_plain_scalar_answer(raw)
+        return bool(
+            question.get("manual_input_allowed")
+            and literal_matches_validation(raw, validation)
+        )
     if kind == "numbered_choice":
         return matches_numbered_option(raw, question)
     if kind == "device" and raw.casefold() in {"y", "yes"}:
@@ -761,15 +1001,6 @@ def coerce_pending_answer(text: str, question: dict[str, Any]) -> Any:
     lowered = raw.casefold()
     if question.get("kind") == "device" and lowered in {"y", "yes"} and len(options) == 1:
         return options[0].get("value")
-    if question.get("kind") == "numbered_choice" and question.get("id") == "unknown_chain_identity_confirm":
-        candidate = _chain_from_option_label(str((options[0].get("label") if options else "") or ""))
-        raw_chain = canonicalize_chain_scalar(raw, known_chains=set(repo_chain_names()))
-        if candidate and raw_chain and candidate == raw_chain and options:
-            return options[0].get("value")
-        if lowered in {"y", "yes"} and options:
-            return options[0].get("value")
-        if lowered in {"n", "no"} and len(options) > 1:
-            return options[1].get("value")
     if question.get("kind") == "yes_no":
         if lowered in {"y", "yes"}:
             return options[0].get("value") if options else True
@@ -778,7 +1009,6 @@ def coerce_pending_answer(text: str, question: dict[str, Any]) -> Any:
     for option in options:
         candidates = {
             _stringify_option_field(option.get("value")).casefold(),
-            _stringify_option_field(option.get("label")).casefold(),
             _stringify_option_field(option.get("id")).casefold(),
         }
         if lowered in candidates:
@@ -791,36 +1021,71 @@ def pending_option_value_exists(value: Any, question: dict[str, Any]) -> bool:
 
 
 def render_question(question: dict[str, Any], language: str) -> str:
-    lines = [str(question.get("prompt") or "").strip()]
-    for index, option in enumerate(question.get("options") or [], start=1):
-        label = option.get("label") or option.get("value")
-        description = str(option.get("description") or "").strip()
-        lines.append(f"{index}. {label}{f' — {description}' if description else ''}")
-    options = question.get("options") or []
-    if question.get("manual_input_allowed"):
-        lines.append(localized(
+    validated = validate_pending_question_contract(question)
+    lines = [
+        render_text_ref(
+            text_ref_from_dict(validated["prompt_ref"]),
             language,
-            "你可以回复编号，也可以直接输入自定义值。" if options else "请直接输入值。",
-            "Reply with a number, or type a custom value directly." if options else "Type the value directly.",
+            kind="question_prompt",
+        )
+    ]
+    for index, option in enumerate(validated.get("options") or [], start=1):
+        label = render_text_ref(
+            text_ref_from_dict(option["label_ref"]),
+            language,
+            kind="option_label",
+        )
+        description = (
+            render_text_ref(
+                text_ref_from_dict(option["description_ref"]),
+                language,
+                kind="option_description",
+            )
+            if option.get("description_ref")
+            else ""
+        )
+        lines.append(f"{index}. {label}{f' — {description}' if description else ''}")
+    options = validated.get("options") or []
+    if validated.get("manual_input_allowed"):
+        instruction_id = (
+            "question.instruction.options_or_value"
+            if options
+            else "question.instruction.value"
+        )
+        lines.append(render_text_ref(
+            TextRef(instruction_id),
+            language,
+            kind="question_instruction",
         ))
     elif options:
-        lines.append(localized(language, "请回复选项编号或选项名称。", "Reply with an option number or option name."))
+        lines.append(render_text_ref(
+            TextRef("question.instruction.option"),
+            language,
+            kind="question_instruction",
+        ))
     return "\n".join(line for line in lines if line)
+
+
+def render_question_context(question: dict[str, Any], language: str) -> str:
+    """Render registered help and completion text for consultation responses."""
+
+    validated = validate_pending_question_contract(question)
+    lines: list[str] = []
+    for key, kind in (
+        ("help_ref", "question_help"),
+        ("completion_effect_ref", "completion_effect"),
+    ):
+        if validated.get(key):
+            lines.append(render_text_ref(
+                text_ref_from_dict(validated[key]),
+                language,
+                kind=kind,
+            ))
+    return "\n".join(lines)
 
 
 def _stringify_option_field(value: Any) -> str:
     return "" if value is None else str(value)
-
-
-def _chain_from_option_label(label: str) -> str:
-    known = set(repo_chain_names())
-    raw = str(label or "")
-    for token in re.findall(r"`([^`]+)`|([A-Za-z0-9][A-Za-z0-9_-]{1,40})", raw):
-        candidate_text = next((part for part in token if part), "")
-        candidate = canonicalize_chain_scalar(candidate_text, known_chains=known)
-        if candidate:
-            return candidate
-    return canonicalize_chain_scalar(raw, known_chains=known)
 
 
 def matches_numbered_option(raw: str, question: dict[str, Any]) -> bool:
@@ -830,7 +1095,6 @@ def matches_numbered_option(raw: str, question: dict[str, Any]) -> bool:
     lowered = raw.casefold()
     for option in options:
         values = {
-            str(option.get("label") or "").strip().casefold(),
             str(option.get("id") or "").strip().casefold(),
         }
         value = option.get("value")

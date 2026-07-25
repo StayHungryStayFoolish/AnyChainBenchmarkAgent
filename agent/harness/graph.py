@@ -18,11 +18,13 @@ from .coordinator import (
     admit_turn_step,
     adjudicate_turn_step,
     compose_turn_step,
+    compile_owner_turn_step,
     commit_selected_action_step,
     commit_side_effect_receipt_step,
     fallback_turn_step,
-    plan_turn_step,
+    partition_turn_step,
     prepare_turn_step,
+    review_plan_turn_step,
     invoke_idempotent_side_effect_step,
     mark_side_effect_invoking_step,
     select_action_step,
@@ -31,7 +33,7 @@ from .coordinator import (
 from .failures import build_failure_record
 from .invariants import StateInvariantError, validate_state
 from .domains.recovery import question_for_recovery
-from .questions import render_question
+from .response import finalize_turn_response, reset_turn_response
 from .runtime_identity import repository_revision
 from .state import AgentGraphState, RESET_PRESERVED_KEYS, ensure_session_metadata, migrate_state, new_state, project_checkpoint_state
 
@@ -79,6 +81,10 @@ class AnyChainGraphRuntime:
             key: deepcopy((context or {}).get(key) or {})
             for key in _INVOCATION_CONTEXT_KEYS
         }
+        # Runtime commands are invocation-scoped capabilities. Explicitly
+        # clear the field for user turns so a checkpointer/runtime cannot carry
+        # a prior startup command into the next graph invocation.
+        invocation_context["runtime_action"] = {}
         state = ensure_session_metadata(state, self.thread_id, self.session_purpose)
         config = {"configurable": {"thread_id": self.thread_id}}
         with llm_turn_scope(load_llm_config().turn_timeout_seconds):
@@ -145,12 +151,8 @@ class AnyChainGraphRuntime:
             recovered["pending_question"] = (
                 question_for_recovery(recovered, "failure_recovery") or {}
             )
-            recovered["visible_response"] = [
-                render_question(
-                    recovered["pending_question"],
-                    recovered.get("language", "en"),
-                )
-            ]
+            reset_turn_response(recovered)
+            recovered = finalize_turn_response(recovered)
             validate_state(recovered)
             return self._persist_state(recovered)
 
@@ -354,6 +356,7 @@ def _admitted_action_provenance(state: Mapping[str, Any]) -> list[dict[str, Any]
         "group",
         "argument_names",
         "arguments_hash",
+        "argument_value_hashes",
         "source_unit_ids",
         "source_hash",
         "admission_receipt_id",
@@ -646,7 +649,6 @@ def _state_diff_hashes(
 
 _MATERIAL_STATE_ROOTS = frozenset({
     "active_group",
-    "active_subgroup",
     "confirmed_config",
     "inferred_config",
     "group_states",
@@ -782,7 +784,11 @@ def _prepare_graph_step(
     for key in _INVOCATION_CONTEXT_KEYS:
         contextual[key] = deepcopy(invocation_context.get(key) or {})
     result = prepare_turn_step(contextual)
-    runtime_action = dict(invocation_context.get("runtime_action") or {})
+    runtime_action = (
+        dict(invocation_context.get("runtime_action") or {})
+        if not str((result.get("turn_context") or {}).get("text") or "").strip()
+        else {}
+    )
     if (
         runtime_action
         and str((result.get("control") or {}).get("phase") or "")
@@ -817,7 +823,9 @@ def build_graph(checkpointer: Any) -> Any:
     graph = StateGraph(AgentGraphState, context_schema=InvocationContext)
     graph.add_node("prepare", _prepare_graph_step)
     graph.add_node("adjudicate", _contextual_step(adjudicate_turn_step))
-    graph.add_node("plan", _contextual_step(plan_turn_step))
+    graph.add_node("partition", _contextual_step(partition_turn_step))
+    graph.add_node("compile_owner", _contextual_step(compile_owner_turn_step))
+    graph.add_node("review_plan", _contextual_step(review_plan_turn_step))
     graph.add_node("admit", _contextual_step(admit_turn_step))
     graph.add_node("select_action", _contextual_step(select_action_step))
     for owner in _OWNER_NODE:
@@ -833,7 +841,9 @@ def build_graph(checkpointer: Any) -> Any:
     graph.add_edge(START, "prepare")
     graph.add_conditional_edges("prepare", _next_phase, _PHASE_NODE)
     graph.add_conditional_edges("adjudicate", _next_phase, _PHASE_NODE)
-    graph.add_conditional_edges("plan", _next_phase, _PHASE_NODE)
+    graph.add_conditional_edges("partition", _next_phase, _PHASE_NODE)
+    graph.add_conditional_edges("compile_owner", _next_phase, _PHASE_NODE)
+    graph.add_conditional_edges("review_plan", _next_phase, _PHASE_NODE)
     graph.add_conditional_edges("admit", _next_phase, _PHASE_NODE)
     graph.add_conditional_edges(
         "select_action",
@@ -859,7 +869,9 @@ def build_graph(checkpointer: Any) -> Any:
 
 _PHASE_NODE = {
     "adjudicate": "adjudicate",
-    "plan": "plan",
+    "plan": "partition",
+    "compile_owner": "compile_owner",
+    "review_plan": "review_plan",
     "admit": "admit",
     "execute": "select_action",
     "commit": "commit_action",

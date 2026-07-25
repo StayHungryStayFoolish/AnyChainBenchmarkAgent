@@ -5,16 +5,23 @@ from __future__ import annotations
 import uuid
 from copy import deepcopy
 from dataclasses import replace
+from functools import partial
 from typing import Any
 
 from agent.runners.job_manager import get_job, verify_job_receipt
 
-from ..contracts import ActionProposal, HandlerResult, RecoveryCommand, StateDelta
-from ..localization import localized
+from ..contracts import ActionProposal, HandlerResult, RecoveryCommand, ResponseFragment, StateDelta
 from .execution_runtime import execute_approved_final_benchmark, execute_approved_preflight_and_smoke
-from ..questions import choice_question
+from ..questions import choice_question as _choice_question, question_text
 from ..routing import next_group_and_reason
 from ..state import AgentGraphState
+from .response_fragments import failure
+
+choice_question = partial(_choice_question, owner="execution")
+
+
+def _fragment(message_id: str) -> ResponseFragment:
+    return ResponseFragment(kind="message", message_id=message_id, source=__name__)
 
 
 EXECUTION_GROUPS = {"preflight_smoke_execution", "job_monitoring"}
@@ -22,38 +29,29 @@ EXECUTION_GROUPS = {"preflight_smoke_execution", "job_monitoring"}
 
 def question_for_execution(state: AgentGraphState, group: str) -> dict[str, Any] | None:
     if group == "job_monitoring" and _needs_real_node_smoke(state):
-        language = str(state.get("language") or "en")
         question = choice_question(
             group,
             "real_node_smoke_confirm",
-            localized(
-                language,
-                "preflight 已通过，但还没有执行隔离的 real-node smoke。现在重新校验并提交安全小流量 smoke？",
-                "Preflight passed, but no isolated real-node smoke has run. Revalidate and submit the safe low-traffic smoke now?",
-            ),
+            question_text("question.execution.real_node_smoke.prompt"),
             field="real_node_smoke_confirmed",
             kind="yes_no",
             options=[
                 {
-                    "label": "Y",
+                    "label": question_text("question.control.option.yes"),
                     "value": True,
                     "action": {"type": "approve_preflight_smoke"},
                     "expected_patch": {"preflight.approved": True},
-                    "completion_effect": localized(
-                        language,
-                        "重新校验已确认的 endpoint、自定义 RPC method/schema 和执行前置条件，然后提交一次隔离的安全小流量 real-node smoke。",
-                        "Revalidate the confirmed endpoint, custom RPC method/schema, and execution prerequisites, then submit one isolated safe low-traffic real-node smoke.",
+                    "completion_effect": question_text(
+                        "question.execution.real_node_smoke.approve.completion"
                     ),
                 },
                 {
-                    "label": "N",
+                    "label": question_text("question.control.option.no"),
                     "value": False,
                     "action": {"type": "reject_preflight_smoke"},
                     "expected_patch": {"preflight.approved": False},
-                    "completion_effect": localized(
-                        language,
-                        "不重新校验或提交 real-node smoke，并返回配置流程。",
-                        "Do not revalidate or submit the real-node smoke; return to configuration.",
+                    "completion_effect": question_text(
+                        "question.execution.real_node_smoke.reject.completion"
                     ),
                 },
             ],
@@ -62,38 +60,29 @@ def question_for_execution(state: AgentGraphState, group: str) -> dict[str, Any]
         question["execution_request_id"] = str((state.get("preflight") or {}).get("execution_request_id") or uuid.uuid4().hex)
         return question
     if group == "job_monitoring" and _ready_for_final_benchmark(state):
-        language = str(state.get("language") or "en")
         return choice_question(
             group,
             "real_node_final_benchmark_confirm",
-            localized(
-                language,
-                "隔离的 real-node smoke 已成功完成。是否按已确认的 QPS profile 提交正式 benchmark？",
-                "The isolated real-node smoke completed successfully. Submit the final benchmark with the confirmed QPS profile?",
-            ),
+            question_text("question.execution.final_benchmark.prompt"),
             field="final_benchmark_confirmed",
             kind="yes_no",
             options=[
                 {
-                    "label": "Y",
+                    "label": question_text("question.control.option.yes"),
                     "value": True,
                     "action": {"type": "approve_final_benchmark"},
                     "expected_patch": {"final_benchmark.approved": True},
-                    "completion_effect": localized(
-                        language,
-                        "提交正式 benchmark，并沿用已经确认的 QPS profile。",
-                        "Submit the final benchmark with the already confirmed QPS profile.",
+                    "completion_effect": question_text(
+                        "question.execution.final_benchmark.approve.completion"
                     ),
                 },
                 {
-                    "label": "N",
+                    "label": question_text("question.control.option.no"),
                     "value": False,
                     "action": {"type": "reject_final_benchmark"},
                     "expected_patch": {"final_benchmark.approved": False},
-                    "completion_effect": localized(
-                        language,
-                        "不提交正式 benchmark，并保留已经成功完成的 smoke 证据。",
-                        "Do not submit the final benchmark and preserve the successful smoke evidence.",
+                    "completion_effect": question_text(
+                        "question.execution.final_benchmark.reject.completion"
                     ),
                 },
             ],
@@ -104,16 +93,25 @@ def question_for_execution(state: AgentGraphState, group: str) -> dict[str, Any]
     next_group, _reason = next_group_and_reason(state)
     if next_group != "preflight_smoke_execution":
         return None
-    language = str(state.get("language") or "en")
     question = choice_question(
         group,
         "preflight_smoke_confirm",
-        localized(language, "配置已收集。是否运行 preflight 和 smoke？", "Configuration is collected. Run preflight and smoke?"),
+        question_text("question.execution.preflight_smoke.prompt"),
         field="preflight_smoke_confirmed",
         kind="yes_no",
         options=[
-            {"label": "Y", "value": True, "action": {"type": "approve_preflight_smoke"}, "expected_patch": {"preflight.approved": True}},
-            {"label": "N", "value": False, "action": {"type": "reject_preflight_smoke"}, "expected_patch": {"preflight.approved": False}},
+            {
+                "label": question_text("question.control.option.yes"),
+                "value": True,
+                "action": {"type": "approve_preflight_smoke"},
+                "expected_patch": {"preflight.approved": True},
+            },
+            {
+                "label": question_text("question.control.option.no"),
+                "value": False,
+                "action": {"type": "reject_preflight_smoke"},
+                "expected_patch": {"preflight.approved": False},
+            },
         ],
         queue_barrier=True,
     )
@@ -145,11 +143,7 @@ def apply_execution_answer(
         )
     return HandlerResult(
         delta=StateDelta.between(state, next_state),
-        visible_result=localized(
-            next_state.get("language", "en"),
-            "已暂停 preflight/smoke。可以继续修改链、RPC、QPS、磁盘或可观测性；准备好后再批准执行。",
-            "Preflight/smoke is paused. You can change chain, RPC, QPS, disk, or observability and approve execution when ready.",
-        ),
+        response_fragments=(_fragment("execution.response.preflight_paused"),),
         clear_pending=True,
         completion="blocked",
         stop_after_response=True,
@@ -166,7 +160,11 @@ def apply_execution_action(state: AgentGraphState, action: ActionProposal) -> Ha
     elif action.action_type == "reject_final_benchmark":
         result = _apply_final_benchmark_answer(deepcopy(state), False)
     else:
-        return HandlerResult(blocker=f"unsupported execution action: {action.action_type}")
+        return HandlerResult(blocker=failure(
+            "execution.failure.unsupported_action",
+            arguments={"action_type": action.action_type},
+            source=__name__,
+        ))
     return replace(result, consumed_action_ids=(action.action_id,))
 
 
@@ -193,7 +191,10 @@ def reconcile_execution_state(state: AgentGraphState) -> HandlerResult:
         or read_receipt.get("job_id") != job_id
         or read_receipt.get("observed_status") != persisted.get("status")
     ):
-        return HandlerResult(blocker="job-manager read receipt is invalid")
+        return HandlerResult(blocker=failure(
+            "execution.failure.invalid_job_receipt",
+            source=__name__,
+        ))
     next_state["job"] = persisted
     status = str(persisted.get("status") or "unknown")
 
@@ -263,17 +264,16 @@ def _apply_final_benchmark_answer(state: AgentGraphState, approved: bool) -> Han
         final["decision"] = "declined"
         return HandlerResult(
             delta=StateDelta.between(original, state),
-            visible_result=localized(
-                state.get("language", "en"),
-                "已暂停正式 benchmark。隔离 smoke 的结果和当前配置仍保留；你可以修改配置，或稍后明确要求提交正式 benchmark。",
-                "The final benchmark is paused. The isolated-smoke result and current configuration are preserved; change the configuration or explicitly request final submission later.",
-            ),
+            response_fragments=(_fragment("execution.response.final_paused"),),
             clear_pending=True,
             completion="blocked",
             stop_after_response=True,
         )
     if not _ready_for_final_benchmark(state):
-        return HandlerResult(blocker="final benchmark requires a completed isolated real-node smoke")
+        return HandlerResult(blocker=failure(
+            "execution.failure.real_smoke_required",
+            source=__name__,
+        ))
     runtime_result = execute_approved_final_benchmark(state)
     return replace(
         runtime_result,

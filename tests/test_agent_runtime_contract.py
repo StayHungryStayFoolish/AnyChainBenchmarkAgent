@@ -54,20 +54,27 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertEqual(set(GROUP_OWNER), set(DEFAULT_GROUP_ORDER))
 
     def test_visible_choice_requires_action_and_postcondition(self) -> None:
-        from agent.harness.contracts import ActionProposal, OptionContract, QuestionContract
+        from agent.harness.contracts import (
+            ActionProposal,
+            OptionContract,
+            QuestionContract,
+            TextRef,
+        )
 
         with self.assertRaises(ValueError):
             QuestionContract(
                 question_id="broken",
                 group="opening",
+                owner="orientation",
                 kind="numbered_choice",
-                prompt_key="broken",
+                prompt=TextRef("question.instruction.option"),
                 options=(
                     OptionContract(
                         option_id="1",
                         value="noop",
                         action=ActionProposal(action_id="a1", action_type="answer_pending"),
                         expected_patch={},
+                        label=TextRef("question.common.option.yes"),
                     ),
                 ),
             )
@@ -157,7 +164,12 @@ class AgentRuntimeContractTest(unittest.TestCase):
         self.assertTrue(result.delta.is_empty())
         self.assertEqual(state["active_group"], "provider_deployment")
         self.assertEqual(state["pending_question"]["id"], "CLOUD_REGION")
-        self.assertIn("AnyChain Benchmark Agent", result.visible_result)
+        from agent.harness.response_catalog import render_fragment
+
+        self.assertIn(
+            "AnyChain Benchmark Agent",
+            render_fragment(result.response_fragments[0], "en").text,
+        )
 
 
 if __name__ == "__main__":

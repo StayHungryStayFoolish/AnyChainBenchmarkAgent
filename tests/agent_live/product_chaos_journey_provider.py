@@ -636,6 +636,7 @@ def convert_completed_journey_to_product_evidence(
     obligation: Mapping[str, Any],
     *,
     revision: Mapping[str, str],
+    round_id: str,
     runtime_root: str | Path,
     evidence_path: str | Path,
     checkpoint_diff_path: str | Path | None = None,
@@ -649,6 +650,9 @@ def convert_completed_journey_to_product_evidence(
     """
 
     row = _validated_obligation(obligation, revision=revision)
+    normalized_round_id = str(round_id).strip()
+    if not normalized_round_id:
+        raise ValueError("G4 product evidence requires an explicit round identity")
     if provider != DEFAULT_PROVIDER or not str(model).strip():
         raise ValueError("G4 product evidence requires an explicit DeepSeek provider/model")
     root = Path(runtime_root).resolve()
@@ -710,6 +714,24 @@ def convert_completed_journey_to_product_evidence(
         obligation=row,
         schedule_payload=expected_schedule_payload,
     )
+    session_id = str(source_evidence.get("session_id") or "").strip()
+    request_ids = [
+        str(
+            dict(turn.get("decision_provenance") or {}).get(
+                "broker_request_id"
+            )
+            or ""
+        ).strip()
+        for turn in tuple(source_evidence.get("turns") or ())
+        if isinstance(turn, Mapping)
+    ]
+    if (
+        not session_id
+        or not request_ids
+        or any(not request_id for request_id in request_ids)
+        or len(request_ids) != len(set(request_ids))
+    ):
+        raise ValueError("G4 Journey has incomplete session/request identities")
 
     events = _load_runtime_events(source_paths["runtime_events"])
     rerun_observations = _rerun_journey_verifiers(
@@ -777,6 +799,9 @@ def convert_completed_journey_to_product_evidence(
         "obligation_id": row["obligation_id"],
         "obligation_contract_hash": row["contract_hash"],
         "revision_binding": dict(revision),
+        "round_id": normalized_round_id,
+        "session_id": session_id,
+        "request_ids": request_ids,
         "execution_id": execution["execution_id"],
         "artifact_sha256s": sorted(artifact_hashes),
     }
@@ -786,6 +811,9 @@ def convert_completed_journey_to_product_evidence(
         "obligation_id": row["obligation_id"],
         "obligation_contract_hash": row["contract_hash"],
         "revision_binding": dict(revision),
+        "round_id": normalized_round_id,
+        "session_id": session_id,
+        "request_ids": request_ids,
         "outcome": outcome,
         "execution": execution,
         "artifacts": artifact_descriptors,
@@ -1363,6 +1391,13 @@ def _product_verifier_results(
     verifier = dict(obligation["verifier_contract"])
     required = tuple(verifier["required_postcondition_ids"])
     forbidden = tuple(verifier["forbidden_postcondition_ids"])
+    verifier_bindings = {
+        str(item["postcondition_id"]): dict(item)
+        for item in (
+            *(verifier.get("required_bindings") or ()),
+            *(verifier.get("forbidden_bindings") or ()),
+        )
+    }
     recorded_observations = _latest_postcondition_observations(source_evidence)
     results: list[dict[str, Any]] = []
     for postcondition_id in (*required, *forbidden):
@@ -1402,6 +1437,12 @@ def _product_verifier_results(
         }, ensure_ascii=False, sort_keys=True)
         results.append({
             "verifier_id": postcondition_id,
+            "verifier_version": verifier_bindings[postcondition_id][
+                "verifier_version"
+            ],
+            "implementation_hash": verifier_bindings[postcondition_id][
+                "implementation_hash"
+            ],
             "status": status,
             "details": details,
             "evidence_sha256s": list(artifact_hashes),
@@ -1638,6 +1679,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     evidence.add_argument("--catalog", required=True, type=Path)
     evidence.add_argument("--obligation-id", required=True)
+    evidence.add_argument("--round-id", required=True)
     evidence.add_argument("--runtime-root", required=True, type=Path)
     evidence.add_argument("--output", required=True, type=Path)
     evidence.add_argument("--checkpoint-diff", type=Path)
@@ -1703,6 +1745,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     convert_completed_journey_to_product_evidence(
         matches[0],
         revision=revision,
+        round_id=args.round_id,
         runtime_root=args.runtime_root,
         evidence_path=args.output,
         checkpoint_diff_path=args.checkpoint_diff,

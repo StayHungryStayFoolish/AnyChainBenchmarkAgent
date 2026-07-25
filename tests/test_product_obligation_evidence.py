@@ -10,11 +10,15 @@ from typing import Any
 
 from tests.agent_live.coverage_evidence import content_hash
 from tests.agent_live.product_obligation_evidence import (
+    PRODUCT_OBLIGATION_EVIDENCE_SCHEMA_VERSION,
+    admit_product_chaos_rounds,
     admit_product_obligation_evidence,
 )
 
 
 REVISION = {"commit": "abc123", "worktree_hash": "frozen-tree"}
+REQUIRED_IMPLEMENTATION_HASH = "1" * 64
+FORBIDDEN_IMPLEMENTATION_HASH = "2" * 64
 
 
 def _obligation(name: str, *, nested_revision: bool = False) -> dict[str, Any]:
@@ -29,6 +33,16 @@ def _obligation(name: str, *, nested_revision: bool = False) -> dict[str, Any]:
         "verifier_contract": {
             "required_postcondition_ids": ["required_result"],
             "forbidden_postcondition_ids": ["forbidden_absent"],
+            "required_bindings": [{
+                "postcondition_id": "required_result",
+                "verifier_version": 1,
+                "implementation_hash": REQUIRED_IMPLEMENTATION_HASH,
+            }],
+            "forbidden_bindings": [{
+                "postcondition_id": "forbidden_absent",
+                "verifier_version": 1,
+                "implementation_hash": FORBIDDEN_IMPLEMENTATION_HASH,
+            }],
         },
     }
     return {**unsigned, "contract_hash": content_hash(unsigned)}
@@ -61,6 +75,7 @@ class ProductObligationEvidenceTest(unittest.TestCase):
         *,
         outcome: str = "passed",
         suffix: str = "one",
+        round_id: str = "round-1",
     ) -> tuple[Path, dict[str, Any]]:
         artifacts = [
             self._artifact("transcript", suffix),
@@ -82,31 +97,43 @@ class ProductObligationEvidenceTest(unittest.TestCase):
             "started_at": "2026-07-24T00:00:00Z",
             "finished_at": "2026-07-24T00:01:00Z",
         }
+        session_id = f"session-{round_id}-{suffix}"
+        request_ids = [f"request-{round_id}-{suffix}"]
         identity = {
             "obligation_id": obligation["obligation_id"],
             "obligation_contract_hash": obligation["contract_hash"],
             "revision_binding": dict(REVISION),
+            "round_id": round_id,
+            "session_id": session_id,
+            "request_ids": request_ids,
             "execution_id": execution["execution_id"],
             "artifact_sha256s": sorted(artifact_hashes),
         }
         unsigned = {
-            "schema_version": 1,
+            "schema_version": PRODUCT_OBLIGATION_EVIDENCE_SCHEMA_VERSION,
             "evidence_id": content_hash(identity),
             "obligation_id": obligation["obligation_id"],
             "obligation_contract_hash": obligation["contract_hash"],
             "revision_binding": dict(REVISION),
+            "round_id": round_id,
+            "session_id": session_id,
+            "request_ids": request_ids,
             "outcome": outcome,
             "execution": execution,
             "artifacts": artifacts,
             "verifier_results": [
                 {
                     "verifier_id": "required_result",
+                    "verifier_version": 1,
+                    "implementation_hash": REQUIRED_IMPLEMENTATION_HASH,
                     "status": statuses[0],
                     "details": "checked against runtime events and state diff",
                     "evidence_sha256s": artifact_hashes,
                 },
                 {
                     "verifier_id": "forbidden_absent",
+                    "verifier_version": 1,
+                    "implementation_hash": FORBIDDEN_IMPLEMENTATION_HASH,
                     "status": statuses[1],
                     "details": "forbidden behavior was independently checked",
                     "evidence_sha256s": artifact_hashes,
@@ -117,6 +144,77 @@ class ProductObligationEvidenceTest(unittest.TestCase):
         path = self.root / f"evidence-{suffix}.json"
         path.write_text(json.dumps(payload), encoding="utf-8")
         return path, payload
+
+    def test_two_round_admission_requires_complete_unique_identity_sets(self) -> None:
+        evidence_by_round: dict[str, list[Path]] = {}
+        for round_id in ("round-1", "round-2"):
+            evidence_by_round[round_id] = [
+                self._evidence(
+                    obligation,
+                    suffix=f"{round_id}-{index}",
+                    round_id=round_id,
+                )[0]
+                for index, obligation in enumerate(self.obligations)
+            ]
+        summary = admit_product_chaos_rounds(
+            obligations=self.obligations,
+            evidence_by_round=evidence_by_round,
+            revision=REVISION,
+        )
+        self.assertTrue(summary["complete"])
+        self.assertEqual(summary["total_denominator"], 4)
+        self.assertEqual(
+            summary["new_s1_s2_root_classes"],
+            {"round-1": [], "round-2": []},
+        )
+
+    def test_two_round_admission_rejects_wrong_round_and_cross_round_reuse(self) -> None:
+        first = self._evidence(
+            self.obligations[0],
+            suffix="first",
+            round_id="round-1",
+        )[0]
+        second = self._evidence(
+            self.obligations[0],
+            suffix="second",
+            round_id="round-2",
+        )[0]
+        with self.assertRaisesRegex(ValueError, "round mismatch"):
+            admit_product_chaos_rounds(
+                obligations=[self.obligations[0]],
+                evidence_by_round={
+                    "round-1": [first],
+                    "round-2": [first],
+                },
+                revision=REVISION,
+            )
+
+        first_payload = json.loads(first.read_text(encoding="utf-8"))
+        second_payload = json.loads(second.read_text(encoding="utf-8"))
+        second_payload["session_id"] = first_payload["session_id"]
+        identity = {
+            "obligation_id": second_payload["obligation_id"],
+            "obligation_contract_hash": second_payload["obligation_contract_hash"],
+            "revision_binding": second_payload["revision_binding"],
+            "round_id": second_payload["round_id"],
+            "session_id": second_payload["session_id"],
+            "request_ids": second_payload["request_ids"],
+            "execution_id": second_payload["execution"]["execution_id"],
+            "artifact_sha256s": sorted(
+                item["sha256"] for item in second_payload["artifacts"]
+            ),
+        }
+        second_payload["evidence_id"] = content_hash(identity)
+        self._rewrite(second, second_payload)
+        with self.assertRaisesRegex(ValueError, "cross-round identity reuse"):
+            admit_product_chaos_rounds(
+                obligations=[self.obligations[0]],
+                evidence_by_round={
+                    "round-1": [first],
+                    "round-2": [second],
+                },
+                revision=REVISION,
+            )
 
     def _rewrite(self, path: Path, payload: dict[str, Any], *, rehash: bool = True) -> None:
         if rehash:
@@ -347,6 +445,21 @@ class ProductObligationEvidenceTest(unittest.TestCase):
         payload["verifier_results"][0]["evidence_sha256s"] = ["f" * 64]
         self._rewrite(path, payload)
         with self.assertRaisesRegex(ValueError, "invalid artifact references"):
+            admit_product_obligation_evidence(
+                obligations=self.obligations,
+                evidence_paths=[path],
+                revision=REVISION,
+            )
+
+    def test_rehashed_pass_with_stale_verifier_implementation_fails_closed(self) -> None:
+        path, payload = self._evidence(
+            self.obligations[0],
+            suffix="stale-verifier",
+        )
+        payload["verifier_results"][0]["implementation_hash"] = "f" * 64
+        self._rewrite(path, payload)
+
+        with self.assertRaisesRegex(ValueError, "implementation binding is stale"):
             admit_product_obligation_evidence(
                 obligations=self.obligations,
                 evidence_paths=[path],

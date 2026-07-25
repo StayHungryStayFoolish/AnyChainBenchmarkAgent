@@ -71,6 +71,32 @@ def _valid_string_list(value: Any, *, unique: bool = False) -> bool:
     return not unique or len(value) == len(set(value))
 
 
+def _valid_response_fragment_manifest(
+    value: Any,
+    *,
+    allow_pending_question: bool,
+) -> bool:
+    if not isinstance(value, list):
+        return False
+    allowed_roles = {"message", "status", "evidence", "warning", "error"}
+    if allow_pending_question:
+        allowed_roles.add("pending_question")
+    semantic_hashes: list[str] = []
+    for fragment in value:
+        if (
+            not isinstance(fragment, Mapping)
+            or set(fragment)
+            != {"semantic_hash", "render_hash", "message_id", "role"}
+            or not _valid_hash(fragment.get("semantic_hash"))
+            or not _valid_hash(fragment.get("render_hash"))
+            or not str(fragment.get("message_id") or "")
+            or fragment.get("role") not in allowed_roles
+        ):
+            return False
+        semantic_hashes.append(str(fragment["semantic_hash"]))
+    return len(semantic_hashes) == len(set(semantic_hashes))
+
+
 def _valid_receipt_identity(
     receipt: Mapping[str, Any],
     *,
@@ -234,17 +260,12 @@ def _validate_response_composition(
         not str(receipt.get("language") or "")
         or not _valid_string_list(receipt.get("source_action_ids"), unique=True)
         or not _valid_hash(receipt.get("pending_contract_hash"))
-        or not isinstance(fragments, list)
+        or not _valid_response_fragment_manifest(
+            fragments,
+            allow_pending_question=True,
+        )
     ):
         return False, "response-composition receipt semantics are invalid"
-    for fragment in fragments:
-        if (
-            not isinstance(fragment, Mapping)
-            or set(fragment) != {"fragment_hash", "role"}
-            or not _valid_hash(fragment.get("fragment_hash"))
-            or fragment.get("role") not in {"pending_question", "visible_result"}
-        ):
-            return False, "response-composition fragment is invalid"
     return True, ""
 
 
@@ -262,9 +283,9 @@ def _validate_domain_commit(
         "consumed_action_ids",
         "invalidated_groups",
         "invalidated_fields",
-        "response_fragment_hashes",
+        "response_fragments",
     }
-    rejected = {*common, "blocker_hash"}
+    rejected = {*common, "blocker_semantic_hash"}
     committed = {
         *common,
         "reconfigured_groups",
@@ -292,18 +313,17 @@ def _validate_domain_commit(
         "consumed_action_ids",
         "invalidated_groups",
         "invalidated_fields",
-        "response_fragment_hashes",
     ):
         if not _valid_string_list(receipt.get(field), unique=True):
             return False, f"domain-commit {field} is invalid"
-    if not all(
-        _valid_hash(item)
-        for item in receipt.get("response_fragment_hashes") or ()
+    if not _valid_response_fragment_manifest(
+        receipt.get("response_fragments"),
+        allow_pending_question=False,
     ):
-        return False, "domain-commit response hashes are invalid"
+        return False, "domain-commit response fragments are invalid"
     if completion == "rejected":
         if (
-            not _valid_hash(receipt.get("blocker_hash"))
+            not _valid_hash(receipt.get("blocker_semantic_hash"))
             or receipt.get("consumed_action_ids")
             or receipt.get("invalidated_groups")
             or receipt.get("invalidated_fields")

@@ -5,39 +5,39 @@
       "case_id": "RR-001",
       "source_turns_hash": "32e4c1ada8a5684475bbe897fcbbdcde8bf2cb3b48d018889c59790723462b8b",
       "source_steps": [
-        {"step_id": "source-1", "turn_index": 1, "semantic_role": "source_intent"},
-        {"step_id": "source-2", "turn_index": 2, "semantic_role": "source_intent"},
-        {"step_id": "source-3", "turn_index": 3, "semantic_role": "source_intent"},
-        {"step_id": "source-4", "turn_index": 4, "semantic_role": "source_intent"},
-        {"step_id": "source-5", "turn_index": 5, "semantic_role": "source_intent"}
+        {"step_id": "source-1", "turn_index": 1, "semantic_role": "greeting"},
+        {"step_id": "source-2", "turn_index": 2, "semantic_role": "language_switch_greeting"},
+        {"step_id": "source-3", "turn_index": 3, "semantic_role": "agent_identity_consultation"},
+        {"step_id": "source-4", "turn_index": 4, "semantic_role": "capability_consultation"},
+        {"step_id": "source-5", "turn_index": 5, "semantic_role": "next_step_consultation"}
       ]
     },
     {
       "case_id": "RR-002",
       "source_turns_hash": "912315d2872e8662ec0bd78176a4ae6c24d9740646b2331cfdc51cc984f93e8b",
       "source_steps": [
-        {"step_id": "source-1", "turn_index": 1, "semantic_role": "source_intent"},
-        {"step_id": "source-2", "turn_index": 2, "semantic_role": "source_intent"},
-        {"step_id": "source-3", "turn_index": 3, "semantic_role": "source_intent"}
+        {"step_id": "source-1", "turn_index": 1, "semantic_role": "agent_identity_consultation"},
+        {"step_id": "source-2", "turn_index": 2, "semantic_role": "agent_origin_consultation"},
+        {"step_id": "source-3", "turn_index": 3, "semantic_role": "capability_consultation"}
       ]
     },
     {
       "case_id": "RR-003",
       "source_turns_hash": "1a12a5ab99fde53a8c901f8c75bdab73d14877319a11db330b601257614080e3",
       "source_steps": [
-        {"step_id": "source-1", "turn_index": 1, "semantic_role": "source_intent"},
-        {"step_id": "source-2", "turn_index": 2, "semantic_role": "source_intent"},
-        {"step_id": "source-3", "turn_index": 3, "semantic_role": "source_intent"},
-        {"step_id": "source-4", "turn_index": 4, "semantic_role": "source_intent"}
+        {"step_id": "source-1", "turn_index": 1, "semantic_role": "select_real_node"},
+        {"step_id": "source-2", "turn_index": 2, "semantic_role": "mode_comparison_consultation"},
+        {"step_id": "source-3", "turn_index": 3, "semantic_role": "request_fake_node_change"},
+        {"step_id": "source-4", "turn_index": 4, "semantic_role": "decline_mode_change"}
       ]
     },
     {
       "case_id": "RR-004",
       "source_turns_hash": "1bec145863fe70d4617b455a4d78239d717b47b0a9d47d23ff6f00ad5c0f3081",
       "source_steps": [
-        {"step_id": "source-1", "turn_index": 1, "semantic_role": "source_intent"},
-        {"step_id": "source-2", "turn_index": 2, "semantic_role": "source_intent"},
-        {"step_id": "source-3", "turn_index": 3, "semantic_role": "source_intent"}
+        {"step_id": "source-1", "turn_index": 1, "semantic_role": "unknown_chain_candidate"},
+        {"step_id": "source-2", "turn_index": 2, "semantic_role": "confirm_distinct_chain"},
+        {"step_id": "source-3", "turn_index": 3, "semantic_role": "protocol_uncertainty"}
       ]
     },
     {
@@ -54,35 +54,35 @@
       "case_id": "RR-006",
       "source_turns_hash": "024d47666ab1d3bbf3ae7182da839e87e26cf20204339663de601c76a1271c5a",
       "source_steps": [
-        {"step_id": "source-1", "turn_index": 1, "semantic_role": "source_intent"},
-        {"step_id": "source-2", "turn_index": 2, "semantic_role": "source_intent"},
-        {"step_id": "source-3", "turn_index": 3, "semantic_role": "source_intent"},
-        {"step_id": "source-4", "turn_index": 4, "semantic_role": "source_intent"},
-        {"step_id": "source-5", "turn_index": 5, "semantic_role": "source_intent"}
+        {"step_id": "source-1", "turn_index": 1, "semantic_role": "select_detected_ledger_device"},
+        {"step_id": "source-2", "turn_index": 2, "semantic_role": "provide_disk_type"},
+        {"step_id": "source-3", "turn_index": 3, "semantic_role": "confirm_detected_disk_size"},
+        {"step_id": "source-4", "turn_index": 4, "semantic_role": "provide_disk_iops"},
+        {"step_id": "source-5", "turn_index": 5, "semantic_role": "provide_disk_throughput"}
       ]
     },
     {
       "case_id": "RR-007",
       "source_turns_hash": "cc1b51c3e4ecc3acc0e6166d074d9d66a452bc476b88b657b3d6b5ffa306bf45",
       "source_steps": [
-        {"step_id": "source-1", "turn_index": 1, "semantic_role": "source_intent"}
+        {"step_id": "source-1", "turn_index": 1, "semantic_role": "confirm_detected_network_interface"}
       ]
     },
     {
       "case_id": "RR-008",
       "source_turns_hash": "7e6d1358af2dd555a4f3b1a1dfc7d85591d845fd0896924c81f3eedb36b1a8d0",
       "source_steps": [
-        {"step_id": "source-1", "turn_index": 1, "semantic_role": "source_intent"},
-        {"step_id": "source-2", "turn_index": 2, "semantic_role": "source_intent"},
-        {"step_id": "source-3", "turn_index": 3, "semantic_role": "source_intent"}
+        {"step_id": "source-1", "turn_index": 1, "semantic_role": "backtrack_one_step"},
+        {"step_id": "source-2", "turn_index": 2, "semantic_role": "navigate_to_rpc_group"},
+        {"step_id": "source-3", "turn_index": 3, "semantic_role": "workload_consultation"}
       ]
     },
     {
       "case_id": "RR-009",
       "source_turns_hash": "7958146f1f8663dba41ea08c81a1b16d1db7f56e3ee8932506e3ccf434e626aa",
       "source_steps": [
-        {"step_id": "source-1", "turn_index": 1, "semantic_role": "source_intent"},
-        {"step_id": "source-2", "turn_index": 2, "semantic_role": "source_intent"},
+        {"step_id": "source-1", "turn_index": 1, "semantic_role": "retained_state_consultation"},
+        {"step_id": "source-2", "turn_index": 2, "semantic_role": "restart_consultation"},
         {"step_id": "source-3", "turn_index": 3, "semantic_role": "chain_change_request"}
       ]
     },
@@ -90,52 +90,52 @@
       "case_id": "RR-010",
       "source_turns_hash": "3bd66161de4808c4c6ec6efe830f112f0995c1faa5bbfc74528e99bbbab31ce6",
       "source_steps": [
-        {"step_id": "source-1", "turn_index": 1, "semantic_role": "source_intent"},
-        {"step_id": "source-2", "turn_index": 2, "semantic_role": "source_intent"},
-        {"step_id": "source-3", "turn_index": 3, "semantic_role": "source_intent"},
-        {"step_id": "source-4", "turn_index": 4, "semantic_role": "source_intent"}
+        {"step_id": "source-1", "turn_index": 1, "semantic_role": "confirm_custom_method"},
+        {"step_id": "source-2", "turn_index": 2, "semantic_role": "finish_method_collection"},
+        {"step_id": "source-3", "turn_index": 3, "semantic_role": "select_single_workload"},
+        {"step_id": "source-4", "turn_index": 4, "semantic_role": "replace_template_methods"}
       ]
     },
     {
       "case_id": "RR-011",
       "source_turns_hash": "6675c8366a1401cdc9a912c0d57f5b87616e12c4d29da491cbe43c9d2a076b93",
       "source_steps": [
-        {"step_id": "source-1", "turn_index": 1, "semantic_role": "source_intent"},
-        {"step_id": "source-2", "turn_index": 2, "semantic_role": "source_intent"}
+        {"step_id": "source-1", "turn_index": 1, "semantic_role": "rpc_request_evidence"},
+        {"step_id": "source-2", "turn_index": 2, "semantic_role": "rpc_response_evidence"}
       ]
     },
     {
       "case_id": "RR-012",
       "source_turns_hash": "a826fd5145c257ac227880c0daa785e61c056941beb5245f98f44bd53d35c400",
       "source_steps": [
-        {"step_id": "source-1", "turn_index": 1, "semantic_role": "source_intent"},
-        {"step_id": "source-2", "turn_index": 2, "semantic_role": "source_intent"}
+        {"step_id": "source-1", "turn_index": 1, "semantic_role": "request_log_analysis"},
+        {"step_id": "source-2", "turn_index": 2, "semantic_role": "multiline_log_evidence"}
       ]
     },
     {
       "case_id": "RR-013",
       "source_turns_hash": "9d764d4e2177b1890c9219d89624212caa1b6def02335f01345949e71d028c72",
       "source_steps": [
-        {"step_id": "source-1", "turn_index": 1, "semantic_role": "source_intent"},
-        {"step_id": "source-2", "turn_index": 2, "semantic_role": "source_intent"},
-        {"step_id": "source-3", "turn_index": 3, "semantic_role": "source_intent"},
-        {"step_id": "source-4", "turn_index": 4, "semantic_role": "source_intent"}
+        {"step_id": "source-1", "turn_index": 1, "semantic_role": "execution_stage_consultation"},
+        {"step_id": "source-2", "turn_index": 2, "semantic_role": "approve_execution"},
+        {"step_id": "source-3", "turn_index": 3, "semantic_role": "execution_evidence_consultation"},
+        {"step_id": "source-4", "turn_index": 4, "semantic_role": "job_status_consultation"}
       ]
     },
     {
       "case_id": "RR-014",
       "source_turns_hash": "9e1c959201b5fa64c34f4dfb81fd5fce17d620a606f2863d3d9add17306e2112",
       "source_steps": [
-        {"step_id": "source-1", "turn_index": 1, "semantic_role": "source_intent"},
-        {"step_id": "source-2", "turn_index": 2, "semantic_role": "source_intent"},
-        {"step_id": "source-3", "turn_index": 3, "semantic_role": "source_intent"}
+        {"step_id": "source-1", "turn_index": 1, "semantic_role": "switch_to_sync_observe"},
+        {"step_id": "source-2", "turn_index": 2, "semantic_role": "set_sync_observe_duration"},
+        {"step_id": "source-3", "turn_index": 3, "semantic_role": "switch_to_real_node"}
       ]
     },
     {
       "case_id": "RR-015",
       "source_turns_hash": "8f47d9e6b9e7770c2c9f62ff4d6d291998f07e8e5572b088053c8ce0e6f2f265",
       "source_steps": [
-        {"step_id": "source-1", "turn_index": 1, "semantic_role": "source_intent"}
+        {"step_id": "source-1", "turn_index": 1, "semantic_role": "multi_group_compound_turn"}
       ]
     }
   ],

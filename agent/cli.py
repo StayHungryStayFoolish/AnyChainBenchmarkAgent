@@ -122,11 +122,6 @@ def main(argv: list[str] | None = None) -> int:
     submit = sub.add_parser("submit", help="Submit a benchmark job")
     submit.add_argument("--plan", required=True)
     submit.add_argument("--jobs-dir")
-    submit.add_argument(
-        "--dev-lifecycle-mock",
-        action="store_true",
-        help="Developer-only: complete a lifecycle metadata job without benchmark execution",
-    )
     submit.add_argument("--approved", action="store_true", help="Confirm approval checkpoints for real execution")
 
     status = sub.add_parser("status", help="Show job status")
@@ -295,7 +290,6 @@ def main(argv: list[str] | None = None) -> int:
             "operation": ExecutionOperation.FINAL_BENCHMARK,
             "plan_file": args.plan,
             "approved": args.approved,
-            "mock": args.dev_lifecycle_mock,
         }
         if args.jobs_dir:
             request_kwargs["jobs_dir"] = args.jobs_dir

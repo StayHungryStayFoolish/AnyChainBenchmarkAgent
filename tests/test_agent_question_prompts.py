@@ -102,6 +102,7 @@ class QuestionProtocolRemovalTest(unittest.TestCase):
 
     def test_live_harness_remains_question_authority(self) -> None:
         from agent.harness.coordinator import _ask_next_blocking_question
+        from agent.harness.questions import render_question
         from agent.harness.state import new_state
 
         state = new_state("unit-thread", language="en")
@@ -112,24 +113,27 @@ class QuestionProtocolRemovalTest(unittest.TestCase):
 
         self.assertEqual(result["pending_question"]["group"], "provider_deployment")
         self.assertEqual(
-            result["pending_question"]["prompt"],
+            render_question(result["pending_question"], "en").splitlines()[0],
             "Confirm CLOUD_REGION; use the detected value or enter a custom region.",
         )
 
-    def test_question_prompts_registry_covers_canonical_fields(self) -> None:
-        from agent.knowledge.entry_contract import field_specs_for
-        from agent.planners import question_prompts
+    def test_qps_defaults_have_one_shared_authority(self) -> None:
+        from agent.knowledge.qps_profiles import (
+            STRATEGY_BENCHMARK_MODE,
+            qps_profile_defaults,
+            strategy_qps_defaults,
+        )
 
-        for mode in ("fake_node", "real_node", "sync_observe"):
-            for field in field_specs_for(mode):
-                self.assertNotEqual(question_prompts.text_for(field.key), f"Provide required value: {field.key}")
-
-    def test_qps_profile_prompt_sanitizes_unknown_mode(self) -> None:
-        from agent.planners.question_prompts import qps_profile_prompt
-
-        garbage = qps_profile_prompt("bogus_mode", fake_node=False)
-        self.assertIn("`selected`", garbage)
-        self.assertNotIn("bogus_mode", garbage)
+        for strategy, mode in STRATEGY_BENCHMARK_MODE.items():
+            runtime = qps_profile_defaults(mode)
+            planner = strategy_qps_defaults(strategy)
+            self.assertEqual(planner["initial"], int(runtime["INITIAL_QPS"]))
+            self.assertEqual(planner["max"], int(runtime["MAX_QPS"]))
+            self.assertEqual(planner["step"], int(runtime["QPS_STEP"]))
+            self.assertEqual(
+                planner["duration_seconds"],
+                int(runtime["DURATION"]),
+            )
 
 
 if __name__ == "__main__":

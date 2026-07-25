@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field as dataclass_field, is_dataclass
+import math
 from typing import Any, Literal, Mapping
 
 
@@ -25,6 +26,10 @@ ActionEnvelopeStatus = Literal[
     "blocked",
     "failed",
 ]
+AdmissionStatus = Literal["accepted", "rejected"]
+ResponseFragmentKind = Literal["message", "status", "evidence", "warning", "error"]
+ResponseArgument = str | int | float | bool | None
+FailureSeverity = Literal["info", "warning", "blocking", "critical"]
 SideEffectStatus = Literal["prepared", "invoking", "succeeded", "reused", "blocked", "failed"]
 TurnReceiptStatus = Literal["prepared", "planned", "executing", "completed", "blocked", "failed"]
 StatePath = tuple[str, ...]
@@ -33,7 +38,6 @@ StatePath = tuple[str, ...]
 DOMAIN_CONTROL_ROOTS = frozenset(
     {
         "active_group",
-        "active_subgroup",
         "action_errors",
         "action_queue",
         "applied_action_ids",
@@ -47,6 +51,7 @@ DOMAIN_CONTROL_ROOTS = frozenset(
         "invalidated_groups",
         "pending_question",
         "proposed_actions",
+        "response_fragments",
         "turn_context",
         "visible_response",
     }
@@ -195,6 +200,32 @@ class ActionProposal:
 
 
 @dataclass(frozen=True)
+class AdmissionRejection:
+    """One stable reason an immutable proposed transaction was rejected."""
+
+    code: str
+    message: str
+    action_indexes: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class AdmissionResult:
+    """Pure validation result for one complete proposed action transaction."""
+
+    status: AdmissionStatus
+    actions: tuple[Mapping[str, Any], ...] = ()
+    rejections: tuple[AdmissionRejection, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.status == "accepted" and self.rejections:
+            raise ValueError("accepted admission result cannot contain rejections")
+        if self.status == "rejected" and not self.rejections:
+            raise ValueError("rejected admission result requires a reason")
+        if self.status == "rejected" and self.actions:
+            raise ValueError("rejected admission result cannot contain actions")
+
+
+@dataclass(frozen=True)
 class OptionContract:
     """Executable behavior attached to one rendered option."""
 
@@ -202,8 +233,9 @@ class OptionContract:
     value: Any
     action: ActionProposal
     expected_patch: Mapping[str, Any]
-    description: str = ""
-    completion_effect: str = ""
+    label: TextRef
+    description: TextRef | None = None
+    completion_effect: TextRef | None = None
     manual_entry: bool = False
     return_policy: ReturnPolicy = "fallback"
     preconditions: Mapping[str, Any] = dataclass_field(default_factory=dict)
@@ -215,15 +247,17 @@ class QuestionContract:
 
     question_id: str
     group: str
+    owner: str
     kind: str
-    prompt_key: str
+    prompt: TextRef
     field: str = ""
     options: tuple[OptionContract, ...] = ()
     manual_input_allowed: bool = False
     validation: Mapping[str, Any] = dataclass_field(default_factory=dict)
     requires_capabilities: tuple[str, ...] = ()
-    help_text: str = ""
-    completion_effect: str = ""
+    domain_context: Mapping[str, Any] = dataclass_field(default_factory=dict)
+    help_text: TextRef | None = None
+    completion_effect: TextRef | None = None
 
     def __post_init__(self) -> None:
         option_ids = [option.option_id for option in self.options]
@@ -245,6 +279,103 @@ class QuestionContract:
                 raise ValueError(f"{self.question_id}/{option.option_id} has no postcondition")
 
 
+def _validate_response_arguments(arguments: Mapping[str, ResponseArgument]) -> None:
+    if not isinstance(arguments, Mapping):
+        raise TypeError("response arguments must be a mapping")
+    for key, value in arguments.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError("response argument names must be non-empty strings")
+        if value is not None and not isinstance(value, (str, int, float, bool)):
+            raise TypeError(f"response argument {key!r} must be a scalar value")
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(f"response argument {key!r} must be finite")
+
+
+@dataclass(frozen=True)
+class TextRef:
+    """Language-independent reference to one centrally registered message."""
+
+    message_id: str
+    arguments: Mapping[str, ResponseArgument] = dataclass_field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.message_id.strip():
+            raise ValueError("text reference message_id cannot be empty")
+        _validate_response_arguments(self.arguments)
+
+
+def text_ref_to_dict(reference: TextRef) -> dict[str, Any]:
+    """Serialize one registered text reference without rendered prose."""
+
+    if not isinstance(reference, TextRef):
+        raise TypeError("question text must be a TextRef")
+    return {
+        "message_id": reference.message_id,
+        "arguments": dict(reference.arguments),
+    }
+
+
+def text_ref_from_dict(value: Mapping[str, Any]) -> TextRef:
+    """Deserialize a strict TextRef mapping and reject compatibility prose."""
+
+    if not isinstance(value, Mapping):
+        raise TypeError("question text reference must be a mapping")
+    if set(value) != {"message_id", "arguments"}:
+        raise ValueError(
+            "question text reference requires exactly message_id and arguments"
+        )
+    arguments = value.get("arguments")
+    if not isinstance(arguments, Mapping):
+        raise TypeError("question text reference arguments must be a mapping")
+    return TextRef(
+        message_id=str(value.get("message_id") or ""),
+        arguments=dict(arguments),
+    )
+
+
+@dataclass(frozen=True)
+class ResponseFragment:
+    """Typed semantic output rendered only by the central response catalog."""
+
+    kind: ResponseFragmentKind
+    message_id: str
+    arguments: Mapping[str, ResponseArgument] = dataclass_field(default_factory=dict)
+    payload: Mapping[str, Any] = dataclass_field(default_factory=dict)
+    source: str = ""
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"message", "status", "evidence", "warning", "error"}:
+            raise ValueError(f"unsupported response fragment kind: {self.kind}")
+        TextRef(self.message_id, self.arguments)
+        if not isinstance(self.payload, Mapping):
+            raise TypeError("response fragment payload must be a mapping")
+
+    @property
+    def text_ref(self) -> TextRef:
+        return TextRef(self.message_id, self.arguments)
+
+
+@dataclass(frozen=True)
+class FailureDescriptor:
+    """Language-independent failure facts rendered by the response authority."""
+
+    code: str
+    arguments: Mapping[str, ResponseArgument] = dataclass_field(default_factory=dict)
+    payload: Mapping[str, Any] = dataclass_field(default_factory=dict)
+    source: str = ""
+    retryable: bool = False
+    severity: FailureSeverity = "blocking"
+
+    def __post_init__(self) -> None:
+        if not self.code.strip():
+            raise ValueError("failure descriptor code cannot be empty")
+        _validate_response_arguments(self.arguments)
+        if not isinstance(self.payload, Mapping):
+            raise TypeError("failure descriptor payload must be a mapping")
+        if self.severity not in {"info", "warning", "blocking", "critical"}:
+            raise ValueError(f"unsupported failure severity: {self.severity}")
+
+
 @dataclass(frozen=True)
 class HandlerResult:
     """The only result a domain handler may return to the coordinator."""
@@ -257,8 +388,7 @@ class HandlerResult:
     invalidated_fields: tuple[str, ...] = ()
     evidence: tuple[Mapping[str, Any], ...] = ()
     action_errors: tuple[Mapping[str, Any], ...] = ()
-    visible_result: str = ""
-    visible_results: tuple[str, ...] = ()
+    response_fragments: tuple[ResponseFragment, ...] = ()
     pending_question: QuestionContract | Mapping[str, Any] | None = None
     clear_pending: bool = False
     next_group: str = ""
@@ -270,8 +400,21 @@ class HandlerResult:
     field_reconfiguration_command: FieldReconfigurationCommand | None = None
     workflow_goal_command: WorkflowGoalCommand | None = None
     completion: CompletionStatus = "unchanged"
-    blocker: str = ""
+    blocker: FailureDescriptor | None = None
     stop_after_response: bool = False
+
+    def __post_init__(self) -> None:
+        if not all(
+            isinstance(fragment, ResponseFragment)
+            for fragment in self.response_fragments
+        ):
+            raise TypeError(
+                "handler result response_fragments must contain ResponseFragment values"
+            )
+        if self.blocker is not None and not isinstance(
+            self.blocker, FailureDescriptor
+        ):
+            raise TypeError("handler result blocker must be a FailureDescriptor")
 
 
 @dataclass(frozen=True)
@@ -417,6 +560,67 @@ def action_envelope_from_dict(payload: Mapping[str, Any]) -> ActionEnvelope:
     )
 
 
+def response_fragment_to_dict(fragment: ResponseFragment) -> dict[str, Any]:
+    return {
+        "kind": fragment.kind,
+        "message_id": fragment.message_id,
+        "arguments": deepcopy(dict(fragment.arguments)),
+        "payload": deepcopy(dict(fragment.payload)),
+        "source": fragment.source,
+    }
+
+
+def response_fragment_from_dict(payload: Mapping[str, Any]) -> ResponseFragment:
+    expected_keys = {"kind", "message_id", "arguments", "payload", "source"}
+    if set(payload) != expected_keys:
+        raise ValueError(
+            "response fragment mapping must contain exactly "
+            "kind, message_id, arguments, payload, and source"
+        )
+    return ResponseFragment(
+        kind=str(payload.get("kind") or ""),  # type: ignore[arg-type]
+        message_id=str(payload.get("message_id") or ""),
+        arguments=deepcopy(dict(payload.get("arguments") or {})),
+        payload=deepcopy(dict(payload.get("payload") or {})),
+        source=str(payload.get("source") or ""),
+    )
+
+
+def failure_descriptor_to_dict(failure: FailureDescriptor) -> dict[str, Any]:
+    return {
+        "code": failure.code,
+        "arguments": deepcopy(dict(failure.arguments)),
+        "payload": deepcopy(dict(failure.payload)),
+        "source": failure.source,
+        "retryable": failure.retryable,
+        "severity": failure.severity,
+    }
+
+
+def failure_descriptor_from_dict(payload: Mapping[str, Any]) -> FailureDescriptor:
+    expected_keys = {
+        "code",
+        "arguments",
+        "payload",
+        "source",
+        "retryable",
+        "severity",
+    }
+    if set(payload) != expected_keys:
+        raise ValueError(
+            "failure descriptor mapping must contain exactly "
+            "code, arguments, payload, source, retryable, and severity"
+        )
+    return FailureDescriptor(
+        code=str(payload.get("code") or ""),
+        arguments=deepcopy(dict(payload.get("arguments") or {})),
+        payload=deepcopy(dict(payload.get("payload") or {})),
+        source=str(payload.get("source") or ""),
+        retryable=bool(payload.get("retryable")),
+        severity=str(payload.get("severity") or ""),  # type: ignore[arg-type]
+    )
+
+
 def handler_result_to_dict(result: HandlerResult) -> dict[str, Any]:
     return {
         "delta": {
@@ -435,8 +639,9 @@ def handler_result_to_dict(result: HandlerResult) -> dict[str, Any]:
         "invalidated_fields": list(result.invalidated_fields),
         "evidence": [deepcopy(dict(item)) for item in result.evidence],
         "action_errors": [deepcopy(dict(item)) for item in result.action_errors],
-        "visible_result": result.visible_result,
-        "visible_results": list(result.visible_results),
+        "response_fragments": [
+            response_fragment_to_dict(item) for item in result.response_fragments
+        ],
         "pending_question": (
             deepcopy(dict(result.pending_question))
             if isinstance(result.pending_question, Mapping)
@@ -496,7 +701,9 @@ def handler_result_to_dict(result: HandlerResult) -> dict[str, Any]:
             else None
         ),
         "completion": result.completion,
-        "blocker": result.blocker,
+        "blocker": (
+            failure_descriptor_to_dict(result.blocker) if result.blocker else None
+        ),
         "stop_after_response": result.stop_after_response,
     }
 
@@ -521,6 +728,16 @@ def handler_result_from_dict(payload: Mapping[str, Any]) -> HandlerResult:
     navigation = payload.get("navigation_command")
     field_reconfiguration = payload.get("field_reconfiguration_command")
     workflow_goal = payload.get("workflow_goal_command")
+    raw_response_fragments = tuple(payload.get("response_fragments") or ())
+    if not all(isinstance(item, Mapping) for item in raw_response_fragments):
+        raise TypeError("handler result response_fragments must contain mappings")
+    response_fragments = tuple(
+        response_fragment_from_dict(item)
+        for item in raw_response_fragments
+    )
+    blocker = payload.get("blocker")
+    if blocker is not None and not isinstance(blocker, Mapping):
+        raise TypeError("handler result blocker must be a FailureDescriptor mapping")
     return HandlerResult(
         delta=delta,
         control_receipts=tuple(
@@ -534,8 +751,7 @@ def handler_result_from_dict(payload: Mapping[str, Any]) -> HandlerResult:
         invalidated_fields=tuple(str(item) for item in payload.get("invalidated_fields") or ()),
         evidence=tuple(deepcopy(dict(item)) for item in payload.get("evidence") or ()),
         action_errors=tuple(deepcopy(dict(item)) for item in payload.get("action_errors") or ()),
-        visible_result=str(payload.get("visible_result") or ""),
-        visible_results=tuple(str(item) for item in payload.get("visible_results") or ()),
+        response_fragments=response_fragments,
         pending_question=deepcopy(payload.get("pending_question")),
         clear_pending=bool(payload.get("clear_pending")),
         next_group=str(payload.get("next_group") or ""),
@@ -585,7 +801,11 @@ def handler_result_from_dict(payload: Mapping[str, Any]) -> HandlerResult:
             else None
         ),
         completion=str(payload.get("completion") or "unchanged"),  # type: ignore[arg-type]
-        blocker=str(payload.get("blocker") or ""),
+        blocker=(
+            failure_descriptor_from_dict(blocker)
+            if isinstance(blocker, Mapping)
+            else None
+        ),
         stop_after_response=bool(payload.get("stop_after_response")),
     )
 

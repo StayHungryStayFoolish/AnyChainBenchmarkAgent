@@ -19,7 +19,7 @@ from tests.agent_live.container_process_guard import (
 )
 
 
-PRODUCT_OBLIGATION_EVIDENCE_SCHEMA_VERSION = 1
+PRODUCT_OBLIGATION_EVIDENCE_SCHEMA_VERSION = 2
 EVIDENCE_OUTCOMES = frozenset({"passed", "failed", "externally_blocked"})
 VERIFIER_STATUSES = EVIDENCE_OUTCOMES
 REQUIRED_ARTIFACT_ROLES = frozenset({
@@ -34,6 +34,9 @@ _EVIDENCE_FIELDS = frozenset({
     "obligation_id",
     "obligation_contract_hash",
     "revision_binding",
+    "round_id",
+    "session_id",
+    "request_ids",
     "outcome",
     "execution",
     "artifacts",
@@ -52,6 +55,8 @@ _EXECUTION_FIELDS = frozenset({
 _ARTIFACT_FIELDS = frozenset({"role", "path", "sha256"})
 _VERIFIER_FIELDS = frozenset({
     "verifier_id",
+    "verifier_version",
+    "implementation_hash",
     "status",
     "details",
     "evidence_sha256s",
@@ -121,6 +126,81 @@ def admit_product_obligation_evidence(
             obligation_id: admitted[obligation_id]
             for obligation_id in sorted(admitted)
         },
+    }
+
+
+def admit_product_chaos_rounds(
+    *,
+    obligations: Sequence[Mapping[str, Any]],
+    evidence_by_round: Mapping[str, Sequence[str | Path]],
+    revision: Mapping[str, str],
+    required_round_ids: Sequence[str] = ("round-1", "round-2"),
+) -> dict[str, Any]:
+    """Admit two complete G4 rounds and reject all cross-round identity reuse."""
+
+    expected = tuple(required_round_ids)
+    if (
+        not expected
+        or len(expected) != len(set(expected))
+        or any(not str(round_id).strip() for round_id in expected)
+        or set(evidence_by_round) != set(expected)
+    ):
+        raise ValueError("G4 round set does not match the required round contract")
+
+    summaries: dict[str, dict[str, Any]] = {}
+    identity_owners: dict[tuple[str, str], str] = {}
+    for round_id in expected:
+        summary = admit_product_obligation_evidence(
+            obligations=obligations,
+            evidence_paths=evidence_by_round[round_id],
+            revision=revision,
+        )
+        for obligation_id, admitted in summary["admitted_evidence"].items():
+            if admitted["round_id"] != round_id:
+                raise ValueError(
+                    f"G4 evidence round mismatch: {round_id}/{obligation_id}"
+                )
+            for identity_type, values in (
+                ("session", (admitted["session_id"],)),
+                ("request", admitted["request_ids"]),
+                ("execution", (admitted["execution_id"],)),
+                ("evidence", (admitted["evidence_id"],)),
+                ("artifact", admitted["artifact_sha256s"]),
+            ):
+                for value in values:
+                    key = (identity_type, str(value))
+                    owner = identity_owners.setdefault(key, round_id)
+                    if owner != round_id:
+                        raise ValueError(
+                            "G4 cross-round identity reuse: "
+                            f"{identity_type}/{value}"
+                        )
+        summaries[round_id] = summary
+
+    complete = all(summary["complete"] for summary in summaries.values())
+    new_root_classes = {
+        round_id: []
+        if summary["failed"] == 0
+        else ["unclassified-product-failure"]
+        for round_id, summary in summaries.items()
+    }
+    converged = complete and all(
+        not root_classes for root_classes in new_root_classes.values()
+    )
+    return {
+        "schema_version": PRODUCT_OBLIGATION_EVIDENCE_SCHEMA_VERSION,
+        "revision_binding": _validated_revision(revision),
+        "required_round_ids": list(expected),
+        "rounds": summaries,
+        "denominator_per_round": len(obligations),
+        "total_denominator": len(obligations) * len(expected),
+        "new_s1_s2_root_classes": new_root_classes,
+        "complete": converged,
+        "status": "complete" if converged else (
+            "failed"
+            if any(summary["failed"] for summary in summaries.values())
+            else "incomplete"
+        ),
     }
 
 
@@ -202,6 +282,9 @@ def _validate_evidence_document(
     if outcome not in EVIDENCE_OUTCOMES:
         raise ValueError(f"invalid evidence outcome: {obligation_id}")
     _validate_execution(document.get("execution"), obligation_id)
+    round_id = _required_text(document, "round_id")
+    session_id = _required_text(document, "session_id")
+    request_ids = _validated_request_ids(document.get("request_ids"), obligation_id)
     artifacts = _validate_artifacts(
         document.get("artifacts"),
         evidence_path=evidence_path,
@@ -215,6 +298,8 @@ def _validate_evidence_document(
             document=document,
             obligation=obligation,
             artifacts=artifacts,
+            session_id=session_id,
+            request_ids=request_ids,
         )
     _validate_verifier_results(
         document.get("verifier_results"),
@@ -227,6 +312,9 @@ def _validate_evidence_document(
         "obligation_id": obligation_id,
         "obligation_contract_hash": obligation["contract_hash"],
         "revision_binding": dict(revision),
+        "round_id": round_id,
+        "session_id": session_id,
+        "request_ids": list(request_ids),
         "execution_id": dict(document["execution"])["execution_id"],
         "artifact_sha256s": sorted(artifact_hashes),
     }
@@ -237,6 +325,10 @@ def _validate_evidence_document(
         "evidence_path": str(evidence_path),
         "evidence_sha256": _sha256_file(evidence_path),
         "outcome": outcome,
+        "round_id": round_id,
+        "session_id": session_id,
+        "request_ids": list(request_ids),
+        "execution_id": dict(document["execution"])["execution_id"],
         "artifact_sha256s": sorted(artifact_hashes),
     }
 
@@ -251,6 +343,19 @@ def _validate_execution(value: Any, obligation_id: str) -> None:
         raise ValueError(f"evidence was not produced by a real PTY: {obligation_id}")
     if execution["started_at"] == execution["finished_at"]:
         raise ValueError(f"execution interval is empty: {obligation_id}")
+
+
+def _validated_request_ids(value: Any, obligation_id: str) -> tuple[str, ...]:
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes))
+        or not value
+    ):
+        raise ValueError(f"request identity set is incomplete: {obligation_id}")
+    normalized = tuple(str(item).strip() for item in value)
+    if any(not item for item in normalized) or len(normalized) != len(set(normalized)):
+        raise ValueError(f"request identity set is invalid: {obligation_id}")
+    return normalized
 
 
 def _validate_artifacts(
@@ -318,6 +423,8 @@ def _validate_g4_runtime_provenance(
     document: Mapping[str, Any],
     obligation: Mapping[str, Any],
     artifacts: Mapping[str, Mapping[str, Any]],
+    session_id: str,
+    request_ids: Sequence[str],
 ) -> None:
     obligation_id = str(obligation["obligation_id"])
     required_roles = {
@@ -351,12 +458,31 @@ def _validate_g4_runtime_provenance(
         or journey.get("qualification_reason")
         != "trusted_container_pty_execution"
         or journey.get("execution_id") != execution.get("execution_id")
+        or journey.get("session_id") != session_id
         or journey.get("provider") != execution.get("provider")
         or journey.get("model") != execution.get("model")
         or not isinstance(proof, Mapping)
     ):
         raise ValueError(
             f"G4 Journey provenance does not match product evidence: {obligation_id}"
+        )
+    observed_request_ids = tuple(
+        str(
+            dict(turn.get("decision_provenance") or {}).get(
+                "broker_request_id"
+            )
+            or ""
+        )
+        for turn in tuple(journey.get("turns") or ())
+        if isinstance(turn, Mapping)
+    )
+    if (
+        not observed_request_ids
+        or any(not value for value in observed_request_ids)
+        or observed_request_ids != tuple(request_ids)
+    ):
+        raise ValueError(
+            f"G4 request identities do not match Journey evidence: {obligation_id}"
         )
     receipt_path = Path(artifacts["process_guard_receipt"]["path"]).resolve()
     transcript_root = Path(artifacts["transcript"]["path"]).resolve().parent
@@ -405,6 +531,7 @@ def _validate_verifier_results(
     ):
         raise ValueError(f"verifier results are missing: {obligation_id}")
     results: dict[str, str] = {}
+    expected_bindings = _expected_verifier_bindings(obligation)
     for raw in value:
         if not isinstance(raw, Mapping) or set(raw) != _VERIFIER_FIELDS:
             raise ValueError(f"verifier result contract is invalid: {obligation_id}")
@@ -416,6 +543,17 @@ def _validate_verifier_results(
         if status not in VERIFIER_STATUSES:
             raise ValueError(f"invalid verifier status: {obligation_id}/{verifier_id}")
         _required_text(result, "details")
+        binding = expected_bindings.get(verifier_id)
+        if (
+            binding is None
+            or result.get("verifier_version") != binding["verifier_version"]
+            or _required_sha256(result, "implementation_hash")
+            != binding["implementation_hash"]
+        ):
+            raise ValueError(
+                f"verifier implementation binding is stale: "
+                f"{obligation_id}/{verifier_id}"
+            )
         references = result.get("evidence_sha256s")
         if (
             not isinstance(references, Sequence)
@@ -468,6 +606,42 @@ def _expected_verifier_ids(obligation: Mapping[str, Any]) -> set[str]:
     ):
         raise ValueError("frozen obligation verifier identifiers are invalid")
     return set(verifier_ids)
+
+
+def _expected_verifier_bindings(
+    obligation: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    verifier = obligation.get("verifier_contract")
+    if not isinstance(verifier, Mapping):
+        raise ValueError("frozen obligation has no verifier contract")
+    rows = [
+        *(verifier.get("required_bindings") or ()),
+        *(verifier.get("forbidden_bindings") or ()),
+    ]
+    expected_ids = _expected_verifier_ids(obligation)
+    bindings: dict[str, dict[str, Any]] = {}
+    for raw in rows:
+        if not isinstance(raw, Mapping):
+            raise ValueError("frozen verifier implementation binding is invalid")
+        postcondition_id = str(raw.get("postcondition_id") or "")
+        version = raw.get("verifier_version")
+        implementation_hash = str(raw.get("implementation_hash") or "")
+        if (
+            postcondition_id not in expected_ids
+            or postcondition_id in bindings
+            or isinstance(version, bool)
+            or not isinstance(version, int)
+            or version <= 0
+            or not _is_sha256(implementation_hash)
+        ):
+            raise ValueError("frozen verifier implementation binding is invalid")
+        bindings[postcondition_id] = {
+            "verifier_version": version,
+            "implementation_hash": implementation_hash,
+        }
+    if set(bindings) != expected_ids:
+        raise ValueError("frozen verifier implementation bindings are incomplete")
+    return bindings
 
 
 def _obligation_revision(obligation: Mapping[str, Any]) -> dict[str, str]:

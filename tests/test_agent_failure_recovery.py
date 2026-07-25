@@ -9,6 +9,30 @@ from pathlib import Path
 from unittest.mock import patch
 
 
+def _render_question(question: dict, language: str = "en") -> str:
+    """Render a v3 question through the production catalog boundary."""
+
+    from agent.harness.questions import render_question
+
+    return render_question(question, language)
+
+
+def _render_consultation(
+    state: dict,
+    topic: str,
+    subject: str = "",
+    language: str | None = None,
+) -> str:
+    from agent.harness.domains.orientation import consultation_fragment
+    from agent.harness.response_catalog import render_fragment
+
+    fragment = consultation_fragment(state, {"topic": topic, "subject": subject})
+    return render_fragment(
+        fragment,
+        language or str(state.get("language") or "en"),
+    ).text
+
+
 def _upgrade_seeded_queue(state):
     """Make deferred test proposals conform to the current durable contract."""
 
@@ -30,23 +54,39 @@ class FailureRecoveryTest(unittest.TestCase):
         return _apply_handler_result(state, result, owner=owner)
 
     def test_current_state_summarizes_pending_contract_without_repeating_prompt(self) -> None:
-        from agent.harness.oracle import format_current_state
-        from agent.harness.questions import manual_question
+        from agent.harness.questions import manual_question, question_text
         from agent.harness.state import new_state
 
-        for question_id, field, prompt in (
-            ("CLOUD_REGION", "CLOUD_REGION", "Enter the cloud region with a long explanation."),
-            ("custom_rpc_endpoint", "custom_rpc_endpoint", "Provide the complete endpoint validation instructions."),
+        for question_id, field, prompt_ref in (
+            (
+                "CLOUD_REGION",
+                "CLOUD_REGION",
+                question_text("question.environment.cloud_region.prompt"),
+            ),
+            (
+                "custom_rpc_endpoint",
+                "custom_rpc_endpoint",
+                question_text("question.chain_rpc.custom_endpoint.prompt"),
+            ),
         ):
             with self.subTest(question_id=question_id):
                 state = new_state(f"pending-{question_id}", language="en")
                 state["active_group"] = "provider_deployment" if question_id == "CLOUD_REGION" else "endpoint_process"
                 state["pending_question"] = manual_question(
-                    state["active_group"], question_id, prompt, field=field,
+                    state["active_group"],
+                    question_id,
+                    prompt_ref,
+                    owner=(
+                        "environment"
+                        if question_id == "CLOUD_REGION"
+                        else "chain_rpc"
+                    ),
+                    field=field,
                 )
-                rendered = format_current_state(state, "en")
+                prompt = _render_question(state["pending_question"], "en")
+                rendered = _render_consultation(state, "current_context")
                 self.assertNotIn(prompt, rendered)
-                self.assertIn(f"confirm `{field}`", rendered)
+                self.assertIn(field, rendered)
 
     def test_target_mode_prompt_distinguishes_initial_selection_from_replacement(self) -> None:
         from agent.harness.domains.chain_rpc import question_for_chain_rpc
@@ -54,36 +94,37 @@ class FailureRecoveryTest(unittest.TestCase):
 
         initial = new_state("initial-target", language="en")
         initial_question = question_for_chain_rpc(initial, "target_mode") or {}
-        self.assertEqual(initial_question.get("prompt"), "Choose the target mode.")
+        self.assertIn("Choose the target mode", _render_question(initial_question, "en"))
 
         replacement = new_state("replacement-target", language="en")
         replacement["target_mode"] = "fake-node"
         replacement_question = question_for_chain_rpc(replacement, "target_mode") or {}
-        self.assertIn("new target mode", str(replacement_question.get("prompt")))
+        self.assertIn("new target mode", _render_question(replacement_question, "en"))
 
     def test_current_state_localizes_target_mode_blocker(self) -> None:
         from agent.harness.domains.chain_rpc import question_for_chain_rpc
-        from agent.harness.oracle import format_current_state
         from agent.harness.state import new_state
 
         state = new_state("target-mode-label", language="zh")
         state["active_group"] = "target_mode"
         state["pending_question"] = question_for_chain_rpc(state, "target_mode") or {}
-        rendered = format_current_state(state, "zh")
-        self.assertIn("测试模式", rendered)
-        self.assertIn("选择 fake-node、real-node 或 sync-observe", rendered)
+        rendered = _render_consultation(state, "current_context")
+        self.assertIn("待确认问题", rendered)
+        self.assertIn("target_mode_select", rendered)
         self.assertNotIn("继续确认target_mode", rendered)
 
     def test_resume_summary_exposes_deferred_configuration_requests(self) -> None:
-        from agent.harness.domains.orientation import resume_summary
+        from agent.harness.domains.orientation import resume_question
+        from agent.harness.questions import render_question
         from agent.harness.state import new_state
 
         state = new_state("resume-queue", language="en")
         state["action_queue"] = [{"type": "set_qps_mode", "qps_mode": "quick"}]
-        self.assertIn("deferred requests: QPS=quick", resume_summary(state))
+        question = resume_question(state)
+        self.assertIn("deferred request count: 1", render_question(question, "en"))
+        self.assertTrue(question["resume_action_queue"])
 
     def test_current_state_names_effective_workload_and_weights(self) -> None:
-        from agent.harness.oracle import format_current_state
         from agent.harness.state import new_state
 
         state = new_state("auditable-workload", language="en")
@@ -99,19 +140,22 @@ class FailureRecoveryTest(unittest.TestCase):
             },
         })
 
-        rendered = format_current_state(state, "en")
+        rendered = _render_consultation(state, "workload_config")
         self.assertIn("eth_blockNumber, eth_accounts", rendered)
         self.assertIn("eth_blockNumber=70", rendered)
         self.assertIn("eth_accounts=30", rendered)
 
     def test_fixture_choice_explains_preserved_configuration(self) -> None:
-        from agent.harness.domains.orientation import pending_context_response
         from agent.harness.state import new_state
 
         state = new_state("fixture-preservation", language="en")
         state["workload"] = {"methods": ["eth_accounts"]}
         state["confirmed_config"] = {"LEDGER_DEVICE": "vda", "CLOUD_REGION": "test"}
-        rendered = pending_context_response(state, {"id": "custom_rpc_fixture_choice"})
+        rendered = _render_consultation(
+            state,
+            "config_explanation",
+            "custom_rpc_fixture_choice",
+        )
 
         self.assertIn("eth_accounts", rendered)
         self.assertIn("LEDGER_DEVICE", rendered)
@@ -238,10 +282,15 @@ class FailureRecoveryTest(unittest.TestCase):
         with patch("agent.harness.domains.recovery.analyze_evidence_with_model", return_value="advisory") as analyze:
             result = apply_recovery_action(state, ActionProposal("inspect", "inspect_failure"))
         inspected = _apply_handler_result(state, result, owner="recovery")
+        from agent.harness.response import finalize_turn_response
+        inspected = finalize_turn_response(inspected)
         analyze.assert_called_once()
         self.assertEqual(inspected["confirmed_config"], state["confirmed_config"])
         self.assertEqual(inspected["failure_recovery"]["status"], "pending")
-        self.assertEqual(result.visible_results[-1], "advisory")
+        self.assertEqual(
+            result.response_fragments[-1].payload["text"],
+            "advisory",
+        )
         final_response = "\n".join(inspected["visible_response"])
         self.assertEqual(final_response.count("Execution recovery:"), 1)
         self.assertEqual(final_response.count("exit 2"), 1)
@@ -269,9 +318,15 @@ class FailureRecoveryTest(unittest.TestCase):
             final = answer_pending(state, "2")
         response = "\n".join(final["visible_response"])
 
-        self.assertEqual(response.count("Execution recovery:"), 1)
+        self.assertEqual(
+            (final["pending_question"].get("prompt_ref") or {}).get("message_id"),
+            "question.recovery.action_with_summary.prompt",
+        )
         self.assertEqual(response.count("connection refused"), 1)
-        self.assertEqual(response.count("Choose the next step."), 1)
+        self.assertEqual(
+            response.count(_render_question(final["pending_question"], "en")),
+            1,
+        )
         self.assertIn("advisory", response)
         self.assertEqual(final["pending_question"]["id"], "failure_recovery_action")
 
@@ -385,13 +440,18 @@ class FailureRecoveryTest(unittest.TestCase):
         from agent.harness.invariants import StateInvariantError
         from agent.harness.state import new_state
 
-        runtime = object.__new__(AnyChainGraphRuntime)
-        runtime.thread_id = "invariant"
-        runtime.session_purpose = "chaos"
-        runtime._persist_state = lambda state: state
-        state = new_state("invariant")
-        state["active_group"] = "not-a-real-group"
-        recovered = runtime._recover_invariant_failure(state, StateInvariantError("unknown active group"))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with AnyChainGraphRuntime(
+                "invariant",
+                checkpoint_path=Path(tmpdir) / "checkpoints.sqlite3",
+                session_purpose="chaos",
+            ) as runtime:
+                state = new_state("invariant")
+                state["active_group"] = "not-a-real-group"
+                recovered = runtime._recover_invariant_failure(
+                    state,
+                    StateInvariantError("unknown active group"),
+                )
         self.assertEqual(recovered["active_group"], "failure_recovery")
         self.assertEqual(recovered["failure_recovery"]["record"]["code"], "HARNESS_INVARIANT_FAILED")
         self.assertEqual(recovered["pending_question"]["id"], "failure_recovery_action")
@@ -404,14 +464,16 @@ class FailureRecoveryTest(unittest.TestCase):
         text = "My custom RPC returned only HTTP 404. Explain what failed and what to fix next."
         with patch("agent.harness.domains.analysis.analyze_evidence_with_model", return_value="analysis"):
             result = analyze_inline_evidence_result(state, text)
-        self.assertEqual(result.visible_result, "analysis")
+        self.assertEqual(result.response_fragments[0].payload["text"], "analysis")
         analyzed = self._commit_domain_delta(state, result, owner="analysis")
         self.assertEqual(analyzed["evidence_buffer"][-1]["text"], text)
         self.assertFalse(result.pending_question)
 
     def test_current_state_consultation_exposes_domain_failure_and_correction_field(self) -> None:
-        from agent.harness.domains.orientation import answer_consultation
+        from agent.harness.contracts import ActionProposal
+        from agent.harness.domains.orientation import apply_orientation_action
         from agent.harness.failures import build_failure_record
+        from agent.harness.response_catalog import render_fragment
         from agent.harness.state import new_state
 
         state = new_state("endpoint-failure", language="en")
@@ -432,7 +494,19 @@ class FailureRecoveryTest(unittest.TestCase):
             )
         }
 
-        response = answer_consultation(state, {"topic": "current_config"})
+        result = apply_orientation_action(
+            state,
+            ActionProposal(
+                "consult-current-config",
+                "answer_opening_question",
+                {"topic": "current_config"},
+                "high",
+            ),
+        )
+        response = "\n".join(
+            render_fragment(fragment, "en").text
+            for fragment in result.response_fragments
+        )
 
         self.assertIn("ENDPOINT_UNREACHABLE", response)
         self.assertIn("connection refused", response)
@@ -441,7 +515,7 @@ class FailureRecoveryTest(unittest.TestCase):
         self.assertIn("LEDGER_DEVICE", response)
 
     def test_successful_endpoint_revalidation_clears_stale_domain_failure(self) -> None:
-        from tests.agent_live.graph_turn import invoke_product_graph_turn
+        from tests.agent_live.graph_turn import answer_pending
         from agent.harness.domains.chain_rpc import question_for_chain_rpc
         from agent.harness.failures import build_failure_record
         from agent.harness.state import new_state
@@ -463,13 +537,13 @@ class FailureRecoveryTest(unittest.TestCase):
         state["last_user_input"] = "https://rpc.example"
 
         with patch("agent.harness.domains.rpc_endpoint.validate_rpc_endpoint", return_value=probe):
-            state = invoke_product_graph_turn(state)
+            state = answer_pending(state, state["last_user_input"])
 
         self.assertNotIn("last_failure_record", state["endpoint_evidence"])
         self.assertTrue(state["custom_rpc"]["endpoint_ready"])
 
     def test_failed_custom_endpoint_keeps_correction_question_ahead_of_deferred_groups(self) -> None:
-        from tests.agent_live.graph_turn import invoke_product_graph_turn
+        from tests.agent_live.graph_turn import answer_pending
         from agent.harness.domains.chain_rpc import question_for_chain_rpc
         from agent.harness.state import new_state
 
@@ -495,7 +569,7 @@ class FailureRecoveryTest(unittest.TestCase):
         }
 
         with patch("agent.harness.domains.rpc_endpoint.validate_rpc_endpoint", return_value=probe):
-            result = invoke_product_graph_turn(state)
+            result = answer_pending(state, state["last_user_input"])
 
         self.assertEqual((result.get("pending_question") or {}).get("id"), "custom_rpc_endpoint")
         self.assertTrue((result.get("pending_question") or {}).get("queue_barrier"))
@@ -504,11 +578,11 @@ class FailureRecoveryTest(unittest.TestCase):
             ["set_qps_mode"],
         )
         self.assertEqual((result.get("custom_rpc") or {}).get("status"), "probe_failed")
-        prompt = str((result.get("pending_question") or {}).get("prompt") or "")
+        prompt = _render_question(result["pending_question"], "en")
         self.assertEqual(sum(prompt in item for item in result.get("visible_response") or []), 1)
 
     def test_successful_custom_endpoint_shows_method_question_without_consuming_deferred_qps(self) -> None:
-        from tests.agent_live.graph_turn import invoke_product_graph_turn
+        from tests.agent_live.graph_turn import answer_pending
         from agent.harness.domains.chain_rpc import question_for_chain_rpc
         from agent.harness.state import new_state
 
@@ -533,14 +607,14 @@ class FailureRecoveryTest(unittest.TestCase):
         }
 
         with patch("agent.harness.domains.rpc_endpoint.validate_rpc_endpoint", return_value=probe):
-            result = invoke_product_graph_turn(state)
+            result = answer_pending(state, state["last_user_input"])
 
         self.assertEqual((result.get("pending_question") or {}).get("id"), "custom_rpc_method")
         self.assertEqual(
             [item.get("action_type") or item.get("type") for item in result.get("action_queue") or []],
             ["set_qps_mode"],
         )
-        prompt = str((result.get("pending_question") or {}).get("prompt") or "")
+        prompt = _render_question(result["pending_question"], "en")
         self.assertEqual(sum(prompt in item for item in result.get("visible_response") or []), 1)
 
 

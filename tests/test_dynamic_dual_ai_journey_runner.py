@@ -207,12 +207,12 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
                 {
                     "step_id": "source-1",
                     "turn_index": 1,
-                    "semantic_role": "request_capabilities",
+                    "semantic_role": "capability_consultation",
                 },
                 {
                     "step_id": "source-2",
                     "turn_index": 2,
-                    "semantic_role": "select_mode",
+                    "semantic_role": "select_real_node",
                 },
             ],
         })
@@ -347,9 +347,9 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
                 binding = {
                     "source_step_id": f"source-{step_index}",
                     "semantic_role": (
-                        "request_capabilities"
+                        "capability_consultation"
                         if step_index == 1
-                        else "select_mode"
+                        else "select_real_node"
                     ),
                 }
                 message = f"response-driven retained turn {step_index}"

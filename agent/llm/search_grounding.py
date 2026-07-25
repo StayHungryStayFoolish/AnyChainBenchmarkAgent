@@ -97,8 +97,7 @@ def run_google_search_grounding(
 ) -> SearchGroundingResult:
     """Execute one Gemini `google_search` grounding query, or report unavailable.
 
-    Deliberately not `agent/adk_app/root_agent.py`'s 40-tool builder: this
-    constructs a throwaway, single-purpose Agent scoped to exactly the one
+    This constructs a throwaway, single-purpose Agent scoped to exactly the one
     capability ADK is needed for, runs exactly one turn, and returns. Any
     failure (missing package, auth failure, timeout, runtime error) degrades
     to a typed `available=False` result rather than raising, matching how

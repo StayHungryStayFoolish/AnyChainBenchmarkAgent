@@ -505,12 +505,25 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
         state["chain_identity"] = {"canonical": "bsc", "adapter_family": "jsonrpc"}
         state["custom_rpc"] = {"status": "needs_method", "endpoint_ready": True}
         state = deepcopy(state)
-        _apply_method_answer(state, "custom_rpc_method", "please recover the previous method")
+        _apply_method_answer(
+            state,
+            "custom_rpc",
+            "please recover the previous method",
+            responses=[],
+        )
         self.assertEqual(state["custom_rpc"]["status"], "needs_method")
         self.assertFalse(draft_view(state).get("method"))
 
         request = '{"jsonrpc":"2.0","id":1,"method":"vendor$exact","params":[]}'
-        _apply_method_answer(state, "custom_rpc_method", request)
+        with patch(
+            "agent.harness.domains.rpc_endpoint.extract_rpc_schema_from_evidence",
+            return_value={
+                "status": "draft",
+                "method": "vendor$exact",
+                "params": [],
+            },
+        ):
+            _apply_method_answer(state, "custom_rpc", request, responses=[])
         self.assertEqual(draft_view(state)["method"], "vendor$exact")
 
     def test_versioned_catalog_confirms_zero_positional_and_object_params_semantically(self) -> None:
@@ -643,7 +656,12 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
         }
 
         state = deepcopy(state)
-        _apply_continue(state, "custom_rpc_continue", "add_another")
+        _apply_continue(
+            state,
+            "custom_rpc_continue",
+            "add_another",
+            responses=[],
+        )
 
         self.assertEqual(state["custom_rpc"]["catalog"]["methods"], [{"method": "demo_a", "params": []}])
         self.assertEqual(state["custom_rpc"]["catalog"]["draft"], {})
@@ -668,11 +686,20 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
             "agent.harness.domains.rpc_endpoint.validate_rpc_endpoint",
             return_value={"ready": True, "status": "ok", "evidence_file": "second-endpoint.json"},
         ):
-            _apply_endpoint_answer(state, "custom_rpc_endpoint", "http://second.invalid")
+            _apply_endpoint_answer(
+                state,
+                {
+                    "endpoint_role": "validation",
+                    "rpc_case": "custom_rpc",
+                    "config_field": "",
+                },
+                "http://second.invalid",
+                responses=[],
+            )
 
         self.assertEqual(state["custom_rpc"]["catalog"]["methods"], [{"method": "demo_complete", "params": []}])
         self.assertEqual(state["custom_rpc"]["catalog"]["draft"], {})
-        _apply_method_answer(state, "custom_rpc_method", "demo_next")
+        _apply_method_answer(state, "custom_rpc", "demo_next", responses=[])
         self.assertEqual(state["custom_rpc"]["catalog"]["draft"]["method"], "demo_next")
         self.assertEqual(state["custom_rpc"]["catalog"]["methods"], [{"method": "demo_complete", "params": []}])
 
@@ -688,6 +715,39 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
         )
 
         self.assertTrue(any("height expected number" in item for item in conflicts))
+
+    def test_response_summary_does_not_control_json_type_validation(self) -> None:
+        from agent.harness.domains.rpc_endpoint import _response_contract_conflicts
+
+        observed = '{"jsonrpc":"2.0","result":[]}'
+        self.assertEqual(
+            _response_contract_conflicts(
+                {"response_summary": "hex string returned by the method"},
+                observed,
+            ),
+            [],
+        )
+        self.assertIn(
+            "response contract expected string, observed array",
+            _response_contract_conflicts(
+                {
+                    "response_summary": "human-readable explanation",
+                    "response_json_type": "string",
+                },
+                observed,
+            ),
+        )
+
+    def test_rpc_params_require_structured_wire_evidence(self) -> None:
+        from agent.harness.input_values import extract_rpc_params_or_request
+
+        self.assertEqual(
+            extract_rpc_params_or_request(
+                "The method is eth_blockNumber and it has no params."
+            ),
+            ("", None),
+        )
+        self.assertEqual(extract_rpc_params_or_request("[]"), ("", []))
 
     def test_validated_method_records_its_own_probe_endpoint(self) -> None:
         from agent.harness.domains.rpc_endpoint import _probe_schema
@@ -722,7 +782,7 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
             }],
         }
         with patch("agent.harness.domains.rpc_endpoint.validate_rpc_endpoint", return_value=probe):
-            _probe_schema(state, "custom_rpc", [])
+            _probe_schema(state, "custom_rpc", [], responses=[])
 
         contract = state["custom_rpc"]["catalog"]["methods"][0]
         self.assertEqual(contract["validation_endpoint"], "http://sample-one.invalid")
@@ -747,7 +807,16 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
             return {"ready": True, "status": "ok", "evidence_file": f"{method}.json"}
 
         with patch("agent.harness.domains.rpc_endpoint.validate_rpc_endpoint", side_effect=probe) as validate:
-            _apply_endpoint_answer(state, "LOCAL_RPC_URL", "http://final.invalid")
+            _apply_endpoint_answer(
+                state,
+                {
+                    "endpoint_role": "final_benchmark",
+                    "rpc_case": "runtime",
+                    "config_field": "LOCAL_RPC_URL",
+                },
+                "http://final.invalid",
+                responses=[],
+            )
 
         self.assertEqual(validate.call_count, 2)
         self.assertEqual(
@@ -786,7 +855,16 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
             }
 
         with patch("agent.harness.domains.rpc_endpoint.validate_rpc_endpoint", side_effect=probe):
-            _apply_endpoint_answer(state, "LOCAL_RPC_URL", "http://final.invalid")
+            _apply_endpoint_answer(
+                state,
+                {
+                    "endpoint_role": "final_benchmark",
+                    "rpc_case": "runtime",
+                    "config_field": "LOCAL_RPC_URL",
+                },
+                "http://final.invalid",
+                responses=[],
+            )
 
         self.assertNotIn("LOCAL_RPC_URL", state.get("confirmed_config", {}))
         self.assertFalse(state["endpoint_evidence"]["local_rpc_url_ready"])
@@ -801,10 +879,20 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
         replace["chain_identity"] = {"canonical": "bsc"}
         replace["custom_rpc"] = _custom_rpc_catalog([{"method": "demo_a"}, {"method": "demo_b"}], scope="mixed_replace")
         replace = deepcopy(replace)
-        _apply_weights(replace, "custom_rpc_weights", '{"demo_a":0,"demo_b":100}')
+        _apply_weights(
+            replace,
+            "custom_rpc_weights",
+            '{"demo_a":0,"demo_b":100}',
+            responses=[],
+        )
         self.assertFalse((replace.get("workload") or {}).get("confirmed"))
 
-        _apply_weights(replace, "custom_rpc_weights", '{"demo_a":50.0,"demo_b":50.0}')
+        _apply_weights(
+            replace,
+            "custom_rpc_weights",
+            '{"demo_a":50.0,"demo_b":50.0}',
+            responses=[],
+        )
         self.assertFalse((replace.get("workload") or {}).get("confirmed"))
 
         add = new_state("add-weights")
@@ -812,7 +900,12 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
         add["custom_rpc"] = _custom_rpc_catalog([{"method": "demo_custom"}], scope="mixed_add")
         add = deepcopy(add)
         incomplete = {"demo_custom": 100}
-        _apply_weights(add, "custom_rpc_weights", json.dumps(incomplete))
+        _apply_weights(
+            add,
+            "custom_rpc_weights",
+            json.dumps(incomplete),
+            responses=[],
+        )
         self.assertFalse((add.get("workload") or {}).get("confirmed"))
 
         final = {
@@ -822,7 +915,12 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
             "eth_gasPrice": 20,
             "demo_custom": 20,
         }
-        _apply_weights(add, "custom_rpc_weights", json.dumps(final))
+        _apply_weights(
+            add,
+            "custom_rpc_weights",
+            json.dumps(final),
+            responses=[],
+        )
         self.assertTrue(add["workload"]["confirmed"])
         self.assertFalse(add["workload"]["replace_defaults"])
         self.assertEqual(add["workload"]["mixed_weights"], final)
@@ -862,6 +960,7 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
             state,
             "custom_rpc_weights",
             "weights:\n  eth_getBalance: 25\n  eth_getTransactionCount: 25\n  eth_blockNumber: 25\n  eth_gasPrice: 25",
+            responses=[],
         )
 
         self.assertTrue(state["workload"]["confirmed"])
@@ -878,7 +977,12 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
             [{"method": "demo_custom", "params": []}], scope="mixed_replace",
         )
         manual = deepcopy(manual)
-        _apply_weights(manual, "custom_rpc_weights", json.dumps(weights))
+        _apply_weights(
+            manual,
+            "custom_rpc_weights",
+            json.dumps(weights),
+            responses=[],
+        )
 
         typed = new_state("typed-replace")
         typed["chain_identity"] = {"canonical": "bsc"}
@@ -891,7 +995,7 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
         })
 
         typed = deepcopy(typed)
-        self.assertTrue(_apply_requested_workload(typed))
+        self.assertTrue(_apply_requested_workload(typed, responses=[]))
         self.assertEqual(manual["workload"]["mixed_weights"], weights)
         self.assertEqual(typed["workload"]["mixed_weights"], weights)
         self.assertTrue(manual["workload"]["replace_defaults"])
