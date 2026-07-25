@@ -44,6 +44,54 @@ def _manifest(role: str = "error") -> dict[str, str]:
 
 
 class ControlPlaneResponseContractTest(unittest.TestCase):
+    def test_hierarchical_planner_stage_receipts_are_registered_and_strict(self) -> None:
+        receipts = (
+            {
+                "receipt_type": "semantic_partition",
+                "turn_index": 3,
+                "status": "compile_owner",
+                "unit_count": 2,
+                "owner_count": 1,
+                "stage_a_calls": 1,
+                "errors_hash": "1" * 64,
+            },
+            {
+                "receipt_type": "owner_compilation",
+                "turn_index": 3,
+                "owner": "chain_rpc",
+                "cursor_before": 0,
+                "cursor_after": 1,
+                "status": "review_plan",
+                "document_hash": "2" * 64,
+                "errors_hash": "3" * 64,
+            },
+            {
+                "receipt_type": "whole_plan_review",
+                "turn_index": 3,
+                "status": "reviewed",
+                "result_hash": "4" * 64,
+                "admission_calls": 1,
+            },
+        )
+        for payload in receipts:
+            with self.subTest(receipt_type=payload["receipt_type"]):
+                receipt = _signed_receipt(payload)
+                self.assertEqual(
+                    validate_coordinator_control_receipt(
+                        receipt,
+                        turn_index=3,
+                    ),
+                    (True, ""),
+                )
+
+                malformed = dict(payload)
+                malformed["unexpected"] = True
+                valid, _ = validate_coordinator_control_receipt(
+                    _signed_receipt(malformed),
+                    turn_index=3,
+                )
+                self.assertFalse(valid)
+
     def test_every_registered_control_message_renders_in_both_languages(self) -> None:
         value_by_type = {
             "string": "value",

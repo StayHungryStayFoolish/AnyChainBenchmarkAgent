@@ -28,6 +28,9 @@ _HANDLER_OWNER_BY_RECEIPT = {
 
 _COORDINATOR_RECEIPT_TYPES = frozenset({
     "pending_resolution",
+    "semantic_partition",
+    "owner_compilation",
+    "whole_plan_review",
     "semantic_planner",
     "fallback_selection",
     "response_composition",
@@ -203,6 +206,89 @@ def _validate_semantic_planner(
             return False, "semantic-planner metric is invalid"
         if isinstance(value, float) and not math.isfinite(value):
             return False, "semantic-planner metric is not finite"
+    return True, ""
+
+
+def _valid_nonnegative_integer(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _validate_semantic_partition(
+    receipt: Mapping[str, Any],
+) -> tuple[bool, str]:
+    fields = {
+        "receipt_type",
+        "turn_index",
+        "status",
+        "unit_count",
+        "owner_count",
+        "stage_a_calls",
+        "errors_hash",
+    }
+    if not _exact_fields(receipt, fields):
+        return False, "semantic-partition receipt shape is invalid"
+    if (
+        receipt.get("status") not in {"compile_owner", "review_plan", "failed"}
+        or not _valid_nonnegative_integer(receipt.get("unit_count"))
+        or not _valid_nonnegative_integer(receipt.get("owner_count"))
+        or not _valid_nonnegative_integer(receipt.get("stage_a_calls"))
+        or not _valid_hash(receipt.get("errors_hash"))
+    ):
+        return False, "semantic-partition receipt semantics are invalid"
+    if (
+        receipt.get("status") == "compile_owner"
+        and int(receipt["owner_count"]) == 0
+    ):
+        return False, "semantic-partition compile schedule has no owner"
+    return True, ""
+
+
+def _validate_owner_compilation(
+    receipt: Mapping[str, Any],
+) -> tuple[bool, str]:
+    fields = {
+        "receipt_type",
+        "turn_index",
+        "owner",
+        "cursor_before",
+        "cursor_after",
+        "status",
+        "document_hash",
+        "errors_hash",
+    }
+    if not _exact_fields(receipt, fields):
+        return False, "owner-compilation receipt shape is invalid"
+    if (
+        not str(receipt.get("owner") or "")
+        or not _valid_nonnegative_integer(receipt.get("cursor_before"))
+        or not _valid_nonnegative_integer(receipt.get("cursor_after"))
+        or int(receipt["cursor_after"]) != int(receipt["cursor_before"]) + 1
+        or receipt.get("status") not in {"compile_owner", "review_plan", "failed"}
+        or not _valid_hash(receipt.get("document_hash"))
+        or not _valid_hash(receipt.get("errors_hash"))
+    ):
+        return False, "owner-compilation receipt semantics are invalid"
+    return True, ""
+
+
+def _validate_whole_plan_review(
+    receipt: Mapping[str, Any],
+) -> tuple[bool, str]:
+    fields = {
+        "receipt_type",
+        "turn_index",
+        "status",
+        "result_hash",
+        "admission_calls",
+    }
+    if not _exact_fields(receipt, fields):
+        return False, "whole-plan-review receipt shape is invalid"
+    if (
+        receipt.get("status") != "reviewed"
+        or not _valid_hash(receipt.get("result_hash"))
+        or not _valid_nonnegative_integer(receipt.get("admission_calls"))
+    ):
+        return False, "whole-plan-review receipt semantics are invalid"
     return True, ""
 
 
@@ -414,6 +500,9 @@ def validate_coordinator_control_receipt(
         return valid, reason
     validators = {
         "pending_resolution": _validate_pending_resolution,
+        "semantic_partition": _validate_semantic_partition,
+        "owner_compilation": _validate_owner_compilation,
+        "whole_plan_review": _validate_whole_plan_review,
         "semantic_planner": _validate_semantic_planner,
         "fallback_selection": _validate_fallback_selection,
         "response_composition": _validate_response_composition,
