@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -88,13 +90,21 @@ class LinuxShellGateManifestTest(unittest.TestCase):
         with patch(
             "tests.agent_live.linux_shell_gates.subprocess.run",
             side_effect=completed,
-        ):
+        ) as subprocess_run:
             result = execute_required_linux_shell_gates(Path("/repo"), manifest)
 
         self.assertEqual(result["required_denominator"], 2)
         self.assertEqual(result["passed"], 1)
         self.assertEqual(result["failed"], 1)
         self.assertEqual(result["status"], "failed")
+        calls = subprocess_run.call_args_list
+        for call in calls:
+            environment = call.kwargs["env"]
+            self.assertEqual(environment["PYTHON_BIN"], sys.executable)
+            self.assertEqual(
+                environment["PATH"].split(os.pathsep, 1)[0],
+                str(Path(sys.executable).parent),
+            )
 
 
 def subprocess_result(returncode: int, stdout: str, stderr: str):

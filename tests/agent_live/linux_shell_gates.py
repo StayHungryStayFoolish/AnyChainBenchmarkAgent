@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -121,6 +123,13 @@ def execute_required_linux_shell_gates(
 ) -> dict[str, Any]:
     """Execute every required entry and retain bounded auditable results."""
 
+    gate_environment = os.environ.copy()
+    runtime_bin = str(Path(sys.executable).parent)
+    gate_environment["PATH"] = os.pathsep.join(
+        (runtime_bin, gate_environment.get("PATH", ""))
+    ).rstrip(os.pathsep)
+    gate_environment["PYTHON_BIN"] = sys.executable
+
     results = []
     for entry in manifest.get("entries") or ():
         if entry.get("classification") != "required":
@@ -130,6 +139,7 @@ def execute_required_linux_shell_gates(
             completed = subprocess.run(
                 ("bash", path),
                 cwd=repo_root,
+                env=gate_environment,
                 capture_output=True,
                 text=True,
                 check=False,
