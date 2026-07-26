@@ -2228,7 +2228,12 @@ def _prepare_pending_answer_result(
             deepcopy(state),
             pending,
             value,
-            str(raw_answer or ""),
+            str(
+                (state.get("turn_context") or {}).get("text")
+                or state.get("last_user_input")
+                or raw_answer
+                or ""
+            ),
         ),
         consumed_action_ids=(envelope.action_id,),
     )

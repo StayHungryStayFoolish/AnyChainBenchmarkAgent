@@ -68,7 +68,7 @@ CHECKPOINT_DIFF_TYPE = "product_chaos_checkpoint_diffs"
 JOURNEY_RUNNER = "dynamic_dual_ai_journey"
 REAL_PTY_TRANSPORT = "real_pty"
 DEFAULT_PROVIDER = "deepseek"
-DEFAULT_MODEL = "deepseek-v4-flash"
+DEFAULT_MODEL = "deepseek-chat"
 DEFAULT_REQUIRED_ENV_NAMES = ("DEEPSEEK_API_KEY",)
 
 _SOURCE_CLASSIFICATION_TO_OUTCOME = {

@@ -12,7 +12,6 @@ from urllib.parse import urlparse
 from agent.knowledge.entry_contract import (
     ENTRYPOINT_SCRIPTS,
     dependency_names,
-    validate_mixed_weighted,
 )
 from agent.planners.chain_template_requirements import inspect_chain_template
 from agent.planners.strategy_planner import template_requirements_from_override
@@ -94,10 +93,6 @@ def run_preflight(plan: dict[str, Any]) -> dict[str, Any]:
         use_fake_node=use_fake_node,
     )
     checks.extend(workload_checks)
-    if rpc_mode == "mixed" and not is_sync_observe:
-        ok, detail = validate_mixed_weighted(plan.get("chain_template_requirements", {}))
-        checks.append(_check("mixed_weighted_total_valid", ok, detail))
-
     if not use_fake_node and not is_sync_observe:
         local_rpc_url = plan.get("execution", {}).get("environment", {}).get("LOCAL_RPC_URL", "")
         checks.append(_check("local_rpc_url_valid", _valid_endpoint(local_rpc_url), local_rpc_url))
@@ -224,9 +219,6 @@ def _workload_checks(
         return checks
 
     for method in methods:
-        if method and requirements.get("runtime_sample_variables") and method in ("",):
-            # compatibility branch for historical data where runtime sample variables are not yet generated.
-            continue
         if method and method not in param_spec_methods and not _method_has_default_contract(requirements, method):
             checks.append(_check(
                 "rpc_method_contract_available",

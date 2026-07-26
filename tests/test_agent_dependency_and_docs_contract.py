@@ -11,6 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 REQUIREMENTS = ROOT / "requirements-adk.txt"
 INSTALLER = ROOT / "scripts" / "install_agent_deps.sh"
+AGENT_ENTRYPOINT = ROOT / "bin" / "anychain-agent"
 HANDOFF = ROOT / "docs" / "en" / "agent-handoff-product-verification.md"
 
 LONG_LIVED_DOCS = (
@@ -64,6 +65,20 @@ class AgentDependencyContractTests(unittest.TestCase):
         core_probe = script.split("agent_runtime_ready()", 1)[1].split("google_search_ready()", 1)[0]
         self.assertIn("import langgraph", core_probe)
         self.assertNotIn("google.adk", core_probe)
+
+    def test_product_entrypoint_probes_the_complete_core_runtime(self) -> None:
+        script = _text(AGENT_ENTRYPOINT)
+        core_probe = script.split("has_agent_runtime()", 1)[1].split(
+            "bootstrap_agent_runtime()", 1
+        )[0]
+        for required_import in (
+            "import langgraph",
+            "import langgraph.checkpoint.sqlite",
+            "import openai",
+            "import prompt_toolkit",
+        ):
+            self.assertIn(required_import, core_probe)
+        subprocess.run(["bash", "-n", str(AGENT_ENTRYPOINT)], cwd=ROOT, check=True)
 
 
 class AgentDocumentationContractTests(unittest.TestCase):

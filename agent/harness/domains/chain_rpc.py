@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 from ..contracts import ActionProposal, HandlerResult
 from ..input_values import (
+    extract_rpc_params_or_request,
     extract_url_candidate,
     normalize_scalar,
     normalize_target_mode,
@@ -729,6 +730,28 @@ def _install_chain_rpc_next_question(state: AgentGraphState, group: str) -> None
         state['active_group'] = str(question.get("group") or group)
 
 
+def _method_answer_evidence(
+    state: AgentGraphState,
+    value: Any,
+    user_text: str,
+) -> Any:
+    """Keep a complete wire request when it proves the resolved method."""
+
+    parsed_method, parsed_params = extract_rpc_params_or_request(user_text)
+    if parsed_params is None:
+        return value
+    resolved_method = strict_method_identity(
+        value,
+        adapter_family=_adapter_family(state),
+    )
+    source_method = strict_method_identity(
+        parsed_method,
+        adapter_family=_adapter_family(state),
+        from_protocol_request=True,
+    )
+    return user_text if source_method and source_method == resolved_method else value
+
+
 def apply_chain_rpc_answer(
     state: AgentGraphState,
     question: dict[str, Any],
@@ -897,13 +920,14 @@ def apply_chain_rpc_answer(
         confirmed["MAINNET_RPC_URL_REVIEWED"] = True
         return _answer_result(state, next_state)
     if question_id in {"custom_rpc_method", "new_chain_method"}:
-        # The coordinator owns language interpretation and delivers the
-        # contract-validated value. The original turn is provenance only;
-        # feeding it back into the domain would discard semantic
-        # normalization such as prose -> exact RPC method.
         if rpc_case not in {"custom_rpc", "new_chain"}:
             return HandlerResult(blocker=failure("chain_rpc.failure.invalid_question_contract", arguments={"question_id": question_id}, source=__name__))
-        _apply_method_answer(next_state, rpc_case, value, responses=responses)
+        _apply_method_answer(
+            next_state,
+            rpc_case,
+            _method_answer_evidence(next_state, value, user_text),
+            responses=responses,
+        )
         _install_chain_rpc_next_question(next_state, "endpoint_process")
         return _answer_result(state, next_state, completion="in_progress", response_fragments=tuple(responses))
     if question_id in {"custom_rpc_schema_evidence", "new_chain_schema_evidence"}:

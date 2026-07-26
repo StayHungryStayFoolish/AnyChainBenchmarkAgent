@@ -20,13 +20,14 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import Any, Iterator
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 from ..diagnostics.adk_status import adk_status
 from ..diagnostics.doctor import run_doctor
+from ..harness.graph import AnyChainGraphRuntime
 from ..harness.invariants import StateInvariantError
 from ..knowledge.framework_capabilities import load_framework_capabilities
 from ..knowledge.framework_context import load_framework_context
@@ -45,10 +46,6 @@ from .io import OutputOnlyIO, TerminalIO
 from .job_commands import JobCommandHandler
 from .language import detect_language, t
 from .startup_state import load_startup_state
-
-if TYPE_CHECKING:  # pragma: no cover - typing-only import gate
-    from ..harness.graph import AnyChainGraphRuntime
-
 
 DEFAULT_AGENT_SESSION_ID = "default"
 
@@ -156,7 +153,7 @@ class AnyChainTerminal:
         self.checkpoint_path = Path(checkpoint_path) if checkpoint_path else None
         self.fresh_session = bool(fresh_session)
         self.session_purpose = session_purpose or "user"
-        self._harness: Any | None = None
+        self._harness: AnyChainGraphRuntime | None = None
         self._startup_state: dict[str, Any] = {}
         self._llm_config = load_llm_config()
         self._web_research_status: dict[str, Any] = {}
@@ -379,10 +376,8 @@ class AnyChainTerminal:
                 return True
         return False
 
-    def _ensure_harness(self) -> Any:
+    def _ensure_harness(self) -> AnyChainGraphRuntime:
         if self._harness is None:
-            from ..harness.graph import AnyChainGraphRuntime
-
             self._harness = AnyChainGraphRuntime(
                 thread_id=self.session_id,
                 checkpoint_path=self.checkpoint_path,

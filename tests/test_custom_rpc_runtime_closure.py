@@ -1025,26 +1025,32 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             plan_file = Path(tmpdir) / "plan.json"
             plan_file.write_text("{}\n", encoding="utf-8")
-            prepared = {
-                "status": "blocked",
-                "warnings": ["chain_template_exists", "keep-this-warning"],
-                "data": {
-                    "plan": {"chain": "case2-execution", "artifacts": {}},
-                    "plan_file": str(plan_file),
-                    "preflight": {"blockers": ["chain_template_exists"]},
+            preflight = {"passed": True, "checks": [], "blockers": []}
+
+            def prepare_with_runtime_override(**kwargs):
+                plan = {
+                    "chain": "case2-execution",
+                    "artifacts": {},
+                    "chain_config_override": deepcopy(
+                        kwargs["chain_config_override"]
+                    ),
                 }
-            }
-            preflight = {
-                "passed": False,
-                "checks": [
-                    {"name": "chain_template_exists", "passed": False, "detail": "missing"},
-                    {"name": "chain_template_json_valid", "passed": False, "detail": "missing"},
-                    {"name": "runtime_contract", "passed": True, "detail": "ok"},
-                ],
-                "blockers": ["chain_template_exists", "chain_template_json_valid"],
-            }
+                observed_preflight = run_preflight(plan)
+                return {
+                    "status": "ok",
+                    "warnings": ["keep-this-warning"],
+                    "data": {
+                        "plan": plan,
+                        "plan_file": str(plan_file),
+                        "preflight": observed_preflight,
+                    },
+                }
+
             with (
-                patch("agent.runners.application_service.prepare_benchmark_run", return_value=prepared),
+                patch(
+                    "agent.runners.application_service.prepare_benchmark_run",
+                    side_effect=prepare_with_runtime_override,
+                ),
                 patch("agent.runners.application_service.run_preflight", return_value=preflight) as run_preflight,
             ):
                 result = _prepare_benchmark_with_runtime_contract(state)
@@ -1064,6 +1070,47 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
                 {},
                 "runtime custom-RPC materialization must not overwrite the approved source plan",
             )
+
+    def test_execution_runtime_rejects_prepare_service_that_omits_case2_override(self) -> None:
+        from agent.harness.domains.execution_runtime import (
+            _prepare_benchmark_with_runtime_contract,
+        )
+
+        state = {
+            "chain_identity": {
+                "canonical": "case2-execution",
+                "adapter_family": "jsonrpc",
+            },
+            "custom_rpc": _custom_rpc_catalog(
+                [{"method": "demo_object", "params": {"height": "latest"}}],
+                chain="case2-execution",
+            ),
+            "workload": {
+                "confirmed": True,
+                "job_local_override": True,
+                "methods": ["demo_object"],
+            },
+            "rpc_mode": "single",
+            "target_mode": "real-node",
+            "confirmed_config": {"LOCAL_RPC_URL": "http://node.invalid"},
+        }
+        prepared = {
+            "status": "blocked",
+            "data": {
+                "plan": {"chain": "case2-execution", "artifacts": {}},
+                "preflight": {"passed": False, "blockers": ["missing override"]},
+            },
+        }
+
+        with patch(
+            "agent.runners.application_service.prepare_benchmark_run",
+            return_value=prepared,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "omitted or changed the validated chain_config_override",
+            ):
+                _prepare_benchmark_with_runtime_contract(state)
 
 
 if __name__ == "__main__":

@@ -10413,6 +10413,134 @@ response:
         self.assertEqual(result.get("qps_profile"), {})
         self.assertIn("Provide schema evidence", "\n".join(result.get("visible_response") or []))
 
+    def test_pending_custom_rpc_method_reuses_complete_request_as_schema_evidence(self) -> None:
+        from tests.agent_live.graph_turn import invoke_actions
+        from agent.harness.domains.chain_rpc import question_for_chain_rpc
+        from agent.harness.state import new_state
+
+        state = new_state("custom-rpc-complete-request", language="en")
+        state["target_mode"] = "fake-node"
+        state["workflow_mode"] = "rpc_benchmark"
+        state["active_group"] = "endpoint_process"
+        state["chain_identity"] = {
+            "raw": "bsc",
+            "canonical": "bsc",
+            "adapter_family": "jsonrpc",
+            "status": "confirmed",
+            "case": "known",
+        }
+        state["custom_rpc"] = {
+            "status": "needs_method",
+            "endpoint": "https://example.invalid/rpc",
+            "endpoint_ready": True,
+        }
+        state["pending_question"] = question_for_chain_rpc(
+            state, "endpoint_process"
+        ) or {}
+        request = (
+            '{"jsonrpc":"2.0","method":"eth_blockNumber",'
+            '"params":[],"id":1}'
+        )
+
+        with patch(
+            "agent.harness.domains.rpc_endpoint.extract_rpc_schema_from_evidence",
+            return_value={
+                "status": "draft",
+                "method": "eth_blockNumber",
+                "params": [],
+                "params_json": [],
+                "response_summary": "unknown",
+                "confidence": "high",
+            },
+        ):
+            result = invoke_actions(
+                state,
+                [{
+                    "type": "answer_pending",
+                    "answer": "eth_blockNumber",
+                    "source_evidence": request,
+                    "pending_option_semantic_verified": True,
+                    "semantic_purpose_verified": True,
+                    "confidence": "high",
+                }],
+                request,
+            )
+
+        draft = _catalog_draft(result)
+        self.assertEqual(draft["method"], "eth_blockNumber")
+        self.assertEqual(draft["params_json"], [])
+        self.assertEqual(
+            (result.get("pending_question") or {}).get("id"),
+            "custom_rpc_schema_confirm",
+        )
+        self.assertTrue(
+            any(
+                item.get("content") == request
+                for item in draft.get("evidence") or []
+                if isinstance(item, dict)
+            )
+        )
+
+    def test_pending_new_chain_method_reuses_complete_request_as_schema_evidence(self) -> None:
+        from tests.agent_live.graph_turn import invoke_actions
+        from agent.harness.domains.chain_rpc import question_for_chain_rpc
+        from agent.harness.state import new_state
+
+        state = new_state("new-chain-complete-request", language="en")
+        state["target_mode"] = "real-node"
+        state["workflow_mode"] = "rpc_benchmark"
+        state["active_group"] = "endpoint_process"
+        state["chain_identity"] = {
+            "raw": "flow-evm",
+            "canonical": "flow-evm",
+            "adapter_family": "jsonrpc",
+            "status": "existing_family_needs_method",
+            "case": "case2",
+        }
+        state["endpoint_evidence"] = {
+            "candidate_endpoint": "https://example.invalid/rpc",
+            "candidate_endpoint_ready": True,
+        }
+        state["pending_question"] = question_for_chain_rpc(
+            state, "endpoint_process"
+        ) or {}
+        request = (
+            '{"jsonrpc":"2.0","method":"eth_blockNumber",'
+            '"params":[],"id":1}'
+        )
+
+        with patch(
+            "agent.harness.domains.rpc_endpoint.extract_rpc_schema_from_evidence",
+            return_value={
+                "status": "draft",
+                "method": "eth_blockNumber",
+                "params": [],
+                "params_json": [],
+                "response_summary": "unknown",
+                "confidence": "high",
+            },
+        ):
+            result = invoke_actions(
+                state,
+                [{
+                    "type": "answer_pending",
+                    "answer": "eth_blockNumber",
+                    "source_evidence": request,
+                    "pending_option_semantic_verified": True,
+                    "semantic_purpose_verified": True,
+                    "confidence": "high",
+                }],
+                request,
+            )
+
+        draft = _catalog_draft(result)
+        self.assertEqual(draft["method"], "eth_blockNumber")
+        self.assertEqual(draft["params_json"], [])
+        self.assertEqual(
+            (result.get("pending_question") or {}).get("id"),
+            "new_chain_schema_confirm",
+        )
+
     def test_custom_rpc_catalog_intake_precedes_unresolved_target_mode(self) -> None:
         from tests.agent_live.graph_turn import invoke_actions
         from agent.harness.state import new_state

@@ -2171,7 +2171,22 @@ class HarnessArchitectureTest(unittest.TestCase):
         harness_root = REPO_ROOT / "agent" / "harness"
         for path in sorted(harness_root.rglob("*.py")):
             source = path.read_text(encoding="utf-8")
-            if "except ImportError" in source or "except ModuleNotFoundError" in source:
+            tree = ast.parse(source, filename=str(path))
+            import_fallback = any(
+                isinstance(node, ast.Try)
+                and any(
+                    isinstance(child, (ast.Import, ast.ImportFrom))
+                    for statement in node.body
+                    for child in ast.walk(statement)
+                )
+                and bool(node.handlers)
+                for node in ast.walk(tree)
+            )
+            if (
+                "except ImportError" in source
+                or "except ModuleNotFoundError" in source
+                or import_fallback
+            ):
                 offenders.append(str(path.relative_to(REPO_ROOT)))
         self.assertEqual(offenders, [])
 

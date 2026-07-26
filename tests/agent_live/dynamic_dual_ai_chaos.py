@@ -116,7 +116,7 @@ class ChaosRunConfig:
     execution_id: str = field(default_factory=lambda: f"chaos-{uuid.uuid4().hex}")
     session_purpose: str = "dynamic-dual-ai-chaos"
     provider: str = "deepseek"
-    model: str = "deepseek-v4-flash"
+    model: str = "deepseek-chat"
     max_turns: int = 20
     response_timeout_seconds: float = 180.0
     poll_interval_seconds: float = 0.05

@@ -535,15 +535,23 @@ class RpcEvidenceReceiptTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             plan_file = Path(tmpdir) / "plan.json"
             plan_file.write_text("{}\n", encoding="utf-8")
-            prepared = {
-                "status": "blocked",
-                "warnings": ["chain_template_exists"],
-                "data": {
-                    "plan": {"chain": "case2-receipt", "artifacts": {}},
-                    "plan_file": str(plan_file),
-                    "preflight": {"blockers": ["chain_template_exists"]},
-                },
-            }
+            def prepared_with_runtime_override(**kwargs):
+                return {
+                    "status": "blocked",
+                    "warnings": ["chain_template_exists"],
+                    "data": {
+                        "plan": {
+                            "chain": "case2-receipt",
+                            "artifacts": {},
+                            "chain_config_override": deepcopy(
+                                kwargs["chain_config_override"]
+                            ),
+                        },
+                        "plan_file": str(plan_file),
+                        "preflight": {"blockers": ["chain_template_exists"]},
+                    },
+                }
+
             preflight = {
                 "passed": False,
                 "checks": [
@@ -567,7 +575,7 @@ class RpcEvidenceReceiptTest(unittest.TestCase):
             with (
                 patch(
                     "agent.runners.application_service.prepare_benchmark_run",
-                    return_value=prepared,
+                    side_effect=prepared_with_runtime_override,
                 ),
                 patch(
                     "agent.runners.application_service.run_preflight",
