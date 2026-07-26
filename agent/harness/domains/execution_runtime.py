@@ -363,6 +363,37 @@ def _prepare_benchmark_with_runtime_contract(state: AgentGraphState) -> dict[str
         )
     )
     prepared = prepared_result.to_dict()
+    prepared_data = prepared.setdefault("data", {})
+    plan = prepared_data.setdefault("plan", {})
+    if not isinstance(plan, dict):
+        plan = {}
+        prepared_data["plan"] = plan
+
+    runtime_override = prepare_kwargs.get("chain_config_override")
+    plan_override = plan.get("chain_config_override")
+    merged_override = {}
+    if isinstance(plan_override, dict):
+        merged_override.update(plan_override)
+    if isinstance(runtime_override, dict):
+        for key, value in runtime_override.items():
+            if value is None:
+                continue
+            if key in {"mixed_weights", "rpc_methods", "param_spec"}:
+                if isinstance(value, dict):
+                    merged_override[key] = merged_override.get(key, {})
+                    if isinstance(merged_override[key], dict):
+                        merged_override[key].update(value)
+                    else:
+                        merged_override[key] = value
+                else:
+                    merged_override[key] = value
+            else:
+                merged_override[key] = value
+    if merged_override:
+        plan["chain_config_override"] = merged_override
+    elif "chain_config_override" not in plan:
+        plan["chain_config_override"] = {}
+
     if prepared_result.failure and not (prepared.get("data") or {}).get("preflight"):
         prepared.setdefault("data", {})["preflight"] = {
             "passed": False,

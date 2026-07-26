@@ -7,9 +7,13 @@ import json
 import os
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Callable, Mapping, TypedDict
+from typing import Any, Callable, Mapping, TypedDict, Protocol
 
-from langgraph.runtime import Runtime
+try:
+    from langgraph.runtime import Runtime
+except Exception:
+    class Runtime(Protocol):
+        context: dict[str, Any]
 
 from .checkpoints import create_sqlite_checkpointer, default_checkpoint_path
 from ..llm.config import load_llm_config
