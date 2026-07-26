@@ -219,6 +219,75 @@ class BenchmarkPipelineTest(unittest.TestCase):
         self.assertIn("eth_accounts", fixture_check["detail"])
         self.assertNotIn("eth_blockNumber ->", fixture_check["detail"])
 
+    def test_preflight_accepts_lightweight_job_local_override_for_fake_node(self) -> None:
+        from agent.planners.preflight import run_preflight
+
+        plan = {
+            "chain": "bsc",
+            "use_fake_node": True,
+            "rpc_mode": "single",
+            "required_inputs": [],
+            "configuration_checklist": {"missing_blockers": []},
+            "chain_config_override": {
+                "_meta": {"adapter_family": "jsonrpc"},
+                "rpc_methods": {"single": "eth_blockNumber"},
+            },
+            "materialized_config": {},
+            "discovery": {},
+        }
+        result = run_preflight(plan)
+        checks = {item["name"]: item for item in result["checks"]}
+        self.assertTrue(checks["chain_template_json_valid"]["passed"])
+        self.assertTrue(checks["rpc_mode_valid"]["passed"])
+        self.assertTrue(checks["effective_workload_fixtures_available"]["passed"])
+
+    def test_preflight_rejects_override_without_rpc_methods(self) -> None:
+        from agent.planners.preflight import run_preflight
+
+        plan = {
+            "chain": "bsc",
+            "use_fake_node": True,
+            "rpc_mode": "single",
+            "required_inputs": [],
+            "configuration_checklist": {"missing_blockers": []},
+            "chain_config_override": {
+                "_meta": {"adapter_family": "jsonrpc"},
+            },
+            "materialized_config": {},
+            "discovery": {},
+        }
+        result = run_preflight(plan)
+        checks = {item["name"]: item for item in result["checks"]}
+        self.assertFalse(checks["chain_template_json_valid"]["passed"])
+        self.assertIn("missing required runtime override fields", checks["chain_template_json_valid"]["detail"])
+
+    def test_preflight_blocks_real_node_without_contract_metadata(self) -> None:
+        from agent.planners.preflight import run_preflight
+
+        plan = {
+            "chain": "bsc",
+            "use_fake_node": False,
+            "workflow_type": "rpc_benchmark",
+            "rpc_mode": "single",
+            "required_inputs": [],
+            "configuration_checklist": {"missing_blockers": []},
+            "chain_config_override": {
+                "_meta": {"adapter_family": "jsonrpc"},
+                "rpc_methods": {"single": "eth_blockNumber"},
+            },
+            "execution": {
+                "environment": {
+                    "LOCAL_RPC_URL": "http://127.0.0.1:8545",
+                }
+            },
+            "materialized_config": {},
+            "discovery": {},
+        }
+        result = run_preflight(plan)
+        checks = {item["name"]: item for item in result["checks"]}
+        self.assertFalse(checks["rpc_method_contract_available"]["passed"])
+        self.assertIn("missing from param spec/contract metadata", checks["rpc_method_contract_available"]["detail"])
+
     def test_zero_success_vegeta_and_missing_archive_fail_business_result(self) -> None:
         from agent.runners.result_status import classify_benchmark_result
 

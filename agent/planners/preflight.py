@@ -14,6 +14,8 @@ from agent.knowledge.entry_contract import (
     dependency_names,
     validate_mixed_weighted,
 )
+from agent.planners.chain_template_requirements import inspect_chain_template
+from agent.planners.strategy_planner import template_requirements_from_override
 from agent.validators.fixture_checks import validate_plan_fake_node_fixtures
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -38,8 +40,27 @@ def run_preflight(plan: dict[str, Any]) -> dict[str, Any]:
     ))
 
     chain_template = REPO_ROOT / "config" / "chains" / f"{chain}.json"
-    checks.append(_check("chain_template_exists", chain_template.is_file(), str(chain_template)))
-    checks.append(_check("chain_template_json_valid", _json_valid(chain_template), str(chain_template)))
+    chain_template_override = plan.get("chain_config_override")
+    chain_template_requirements = _resolved_chain_template_requirements(plan, chain)
+    if isinstance(chain_template_override, dict) and chain_template_override:
+        checks.append(_check(
+            "chain_template_exists",
+            bool(chain_template_override),
+            "chain template provided by runtime override",
+        ))
+        checks.append(_check(
+            "chain_template_json_valid",
+            _dict_has_required_runtime_template_fields(chain_template_override, chain_template_requirements),
+            "missing required runtime override fields",
+        ))
+    else:
+        checks.append(_check("chain_template_exists", chain_template.is_file(), str(chain_template)))
+        checks.append(_check("chain_template_json_valid", _json_valid(chain_template), str(chain_template)))
+    checks.append(_check(
+        "chain_template_requirements_available",
+        bool(chain_template_requirements),
+        "chain template workload requirements could not be resolved",
+    ))
 
     entry = REPO_ROOT / "blockchain_node_benchmark.sh"
     checks.append(_check("benchmark_entry_exists", entry.is_file() and os.access(entry, os.X_OK), str(entry)))
@@ -64,11 +85,20 @@ def run_preflight(plan: dict[str, Any]) -> dict[str, Any]:
 
     rpc_mode = plan.get("rpc_mode", "")
     checks.append(_check("rpc_mode_valid", rpc_mode in {"single", "mixed"} or is_sync_observe, rpc_mode))
+    use_fake_node = bool(plan.get("use_fake_node"))
+    workload_checks = _workload_checks(
+        rpc_mode,
+        chain_template_requirements,
+        chain_template_override,
+        is_sync_observe,
+        use_fake_node=use_fake_node,
+    )
+    checks.extend(workload_checks)
     if rpc_mode == "mixed" and not is_sync_observe:
         ok, detail = validate_mixed_weighted(plan.get("chain_template_requirements", {}))
         checks.append(_check("mixed_weighted_total_valid", ok, detail))
 
-    if not plan.get("use_fake_node") and not is_sync_observe:
+    if not use_fake_node and not is_sync_observe:
         local_rpc_url = plan.get("execution", {}).get("environment", {}).get("LOCAL_RPC_URL", "")
         checks.append(_check("local_rpc_url_valid", _valid_endpoint(local_rpc_url), local_rpc_url))
 
@@ -96,6 +126,20 @@ def _check(name: str, passed: bool, detail: str = "") -> dict[str, Any]:
     return {"name": name, "passed": bool(passed), "detail": detail}
 
 
+def _resolved_chain_template_requirements(plan: dict[str, Any], chain: str) -> dict[str, Any]:
+    requirements = plan.get("chain_template_requirements")
+    if isinstance(requirements, dict) and requirements:
+        return requirements
+    override = plan.get("chain_config_override")
+    if isinstance(override, dict) and override:
+        return _requirements_from_override(chain, override)
+    return inspect_chain_template(chain)
+
+
+def _requirements_from_override(chain: str, template: dict[str, Any]) -> dict[str, Any]:
+    return template_requirements_from_override(chain, template)
+
+
 def _json_valid(path: Path) -> bool:
     if not path.is_file():
         return False
@@ -104,6 +148,109 @@ def _json_valid(path: Path) -> bool:
         return True
     except Exception:
         return False
+
+
+def _dict_has_required_runtime_template_fields(payload: dict[str, Any], requirements: dict[str, Any]) -> bool:
+    required_keys = {"rpc_methods"}
+    if not isinstance(payload, dict):
+        return False
+    if not required_keys.issubset(set(payload.keys())):
+        return False
+    rpc_methods = payload.get("rpc_methods")
+    if not isinstance(rpc_methods, dict):
+        return False
+    adapter_family = str((payload.get("_meta") or {}).get("adapter_family") or "").strip()
+    if not adapter_family and not str(requirements.get("adapter_family") or "").strip():
+        return False
+    return True
+
+
+def _workload_checks(
+    rpc_mode: str,
+    requirements: dict[str, Any],
+    chain_template_override: Any,
+    is_sync_observe: bool,
+    *,
+    use_fake_node: bool = False,
+) -> list[dict[str, Any]]:
+    if is_sync_observe:
+        return []
+
+    checks: list[dict[str, Any]] = []
+    mode = str(rpc_mode or "").strip().lower()
+    if mode not in {"single", "mixed"}:
+        return [
+            _check("chain_workload_requires_rpc_mode", False, f"unsupported rpc_mode={rpc_mode}"),
+        ]
+
+    methods = []
+    if mode == "single":
+        method = str(requirements.get("single_method") or "").strip()
+        if not method and isinstance(chain_template_override, dict):
+            method = str((chain_template_override.get("rpc_methods") or {}).get("single") or "").strip()
+        checks.append(_check("single_rpc_method_present", bool(method), f"single method={method or '<empty>'}"))
+        if method:
+            methods = [method]
+    else:
+        weighted = requirements.get("mixed_weighted") if isinstance(requirements.get("mixed_weighted"), list) else []
+        entries: list[tuple[str, int]] = []
+        for item in weighted:
+            if not isinstance(item, dict):
+                continue
+            method = str(item.get("method") or "").strip()
+            weight = _safe_int(item.get("weight"))
+            if not method:
+                checks.append(_check("mixed_weighted_method", False, "method is required"))
+                continue
+            if weight < 0:
+                checks.append(_check("mixed_weighted_weight", False, f"invalid weight for {method}: {item.get('weight')}"))
+                continue
+            entries.append((method, weight))
+        duplicate = [method for method in set(method for method, _ in entries) if [m for m, _ in entries].count(method) > 1]
+        if duplicate:
+            checks.append(_check("mixed_weighted_no_duplicate_methods", False, f"duplicate methods: {', '.join(sorted(set(duplicate)))}"))
+        non_positive = [method for method, weight in entries if weight <= 0]
+        if non_positive:
+            checks.append(_check("mixed_weighted_positive_weights", False, f"weights must be > 0; invalid methods: {', '.join(sorted(set(non_positive)))}"))
+        if not entries:
+            checks.append(_check("mixed_weighted_entries", False, "rpc_mode=mixed requires mixed_weighted entries"))
+        total = sum(weight for _, weight in entries)
+        checks.append(_check("mixed_weighted_total_valid", total == 100, f"mixed weights must total 100, got {total}"))
+        checks.append(_check("mixed_weighted_methods_present", bool(entries), f"methods={', '.join(method for method, _ in entries)}"))
+        methods = [method for method, _ in entries]
+
+    param_spec_methods = [str(m) for m in (requirements.get("param_spec_methods") or [])]
+    if use_fake_node:
+        return checks
+
+    for method in methods:
+        if method and requirements.get("runtime_sample_variables") and method in ("",):
+            # compatibility branch for historical data where runtime sample variables are not yet generated.
+            continue
+        if method and method not in param_spec_methods and not _method_has_default_contract(requirements, method):
+            checks.append(_check(
+                "rpc_method_contract_available",
+                False,
+                f"method {method} missing from param spec/contract metadata",
+            ))
+
+    return checks
+
+
+def _method_has_default_contract(requirements: dict[str, Any], method: str) -> bool:
+    if not method:
+        return False
+    param_formats = requirements.get("param_formats") or {}
+    if isinstance(param_formats, dict) and method in param_formats:
+        return True
+    return False
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return -1
 
 
 def _valid_endpoint(value: str) -> bool:
