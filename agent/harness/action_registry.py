@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Mapping
 
+from agent.knowledge.chain_identity import canonical_chain_aliases, repo_chain_names
+
 from .input_values import (
+    extract_json_object_or_array,
+    extract_rpc_wire_evidence_spans,
+    extract_url_candidates,
     looks_like_wire_method_identity,
     normalize_observability_mode,
     normalize_target_mode,
@@ -59,6 +65,14 @@ SEMANTIC_OPERATIONS = frozenset({
     "context",
     "unresolved",
 })
+SEMANTIC_VALUE_DOMAIN_POLICY: Mapping[str, Any] = {
+    "schema_version": 2,
+    "identifier_boundary": "ascii_alnum_underscore_hyphen",
+    "specialized_input_exemption": "validated_candidate_shape",
+    "declared_pending_options_own_values": True,
+    "targetless_domain_owner": "action_type",
+}
+_SEMANTIC_VALUE_IDENTIFIER_CHARACTER = r"A-Za-z0-9_-"
 
 
 def answer_pending_representation_conflict(action: Mapping[str, Any]) -> bool:
@@ -1138,15 +1152,19 @@ def action_registry_contract_hash() -> str:
         "argument_schemas": ACTION_ARGUMENT_SCHEMAS,
         "semantic_scope_policies": SEMANTIC_SCOPE_POLICIES,
         "consultation_topics": sorted(CONSULTATION_TOPICS),
+        "semantic_value_domain_policy": SEMANTIC_VALUE_DOMAIN_POLICY,
+        "semantic_value_domains": registered_semantic_value_domains(),
     })
 
 
-def registered_closed_value_domains() -> tuple[dict[str, Any], ...]:
-    """Expose registry-derived closed values for cross-domain admission.
+def registered_semantic_value_domains() -> tuple[dict[str, Any], ...]:
+    """Expose exact values whose workflow ownership is already authoritative.
 
-    These records come only from enum-backed action arguments. They let the
-    planner distinguish a researched open identity from a value that belongs
-    to another registered closed dimension without maintaining phrase lists.
+    Closed enum values come from action schemas. Supported chain identities
+    and their exact aliases come from the repository chain catalog. The
+    planner and final admission boundary use this one registry to prevent a
+    value owned by one workflow group from being consumed by an unrelated
+    manual-text question.
     """
 
     records: list[dict[str, Any]] = []
@@ -1164,9 +1182,194 @@ def registered_closed_value_domains() -> tuple[dict[str, Any], ...]:
                     "action_type": spec.action_type,
                     "argument": argument,
                     "target_group": spec.target_group,
+                    "semantic_owner": (
+                        spec.target_group or f"action:{spec.action_type}"
+                    ),
                     "value": canonical,
+                    "canonical_value": canonical,
+                    "domain_kind": "closed_enum",
                 })
-    return tuple(records)
+    known_chains = set(repo_chain_names())
+    chain_values = {
+        chain: chain for chain in known_chains
+    }
+    chain_values.update({
+        alias: canonical
+        for alias, canonical in canonical_chain_aliases().items()
+        if canonical in known_chains
+    })
+    chain_identity_spec = next(
+        spec
+        for spec in ACTION_SPECS
+        if spec.target_group == "chain_identity"
+        and "chain_text" in spec.entry_intake_value_arguments
+    )
+    records.extend({
+        "action_type": chain_identity_spec.action_type,
+        "argument": "chain_text",
+        "target_group": chain_identity_spec.target_group,
+        "semantic_owner": chain_identity_spec.target_group,
+        "value": alias,
+        "canonical_value": canonical,
+        "domain_kind": "known_identity",
+    } for alias, canonical in sorted(chain_values.items()))
+    unique: dict[tuple[str, str], dict[str, Any]] = {}
+    for record in records:
+        key = (
+            str(record.get("semantic_owner") or ""),
+            str(record.get("value") or "").casefold(),
+        )
+        unique.setdefault(key, record)
+    return tuple(unique.values())
+
+
+def semantic_value_domain_conflicts(
+    text: Any,
+    *,
+    owning_group: str,
+    pending_question: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], ...]:
+    """Return exact registered values owned by another workflow group."""
+
+    source = str(text or "").strip()
+    pending = dict(pending_question or {})
+    if not source:
+        return ()
+    conflicts: list[dict[str, Any]] = []
+    for record in registered_semantic_value_domains():
+        semantic_owner = str(record.get("semantic_owner") or "")
+        value = str(record.get("value") or "").strip()
+        if (
+            semantic_owner == owning_group
+            or not value
+            or _pending_option_owns_semantic_value(pending, record)
+        ):
+            continue
+        pattern = (
+            rf"(?<![{_SEMANTIC_VALUE_IDENTIFIER_CHARACTER}])"
+            rf"{re.escape(value)}"
+            rf"(?![{_SEMANTIC_VALUE_IDENTIFIER_CHARACTER}])"
+        )
+        if re.search(pattern, source, flags=re.IGNORECASE):
+            conflicts.append(record)
+    if not conflicts or not pending:
+        return tuple(conflicts)
+    specialized_spans = _pending_specialized_value_spans(source, pending)
+    return tuple(
+        record
+        for record in conflicts
+        if not _semantic_value_occurs_only_within_spans(
+            source,
+            str(record.get("value") or ""),
+            specialized_spans,
+        )
+    )
+
+
+def _pending_specialized_value_spans(
+    source: str,
+    pending: Mapping[str, Any],
+) -> tuple[tuple[int, int], ...]:
+    """Return source spans whose structure proves specialized field ownership."""
+
+    kind = str(pending.get("kind") or "")
+    validation = (
+        dict(pending.get("validation") or {})
+        if isinstance(pending.get("validation"), Mapping)
+        else {}
+    )
+    value_type = str(validation.get("value_type") or "")
+    input_mode = str(validation.get("input_mode") or "")
+    candidates: list[str] = []
+    if kind == "url" or value_type == "url":
+        candidates.extend(extract_url_candidates(source))
+    elif kind == "json" or value_type == "json":
+        candidate = extract_json_object_or_array(source)
+        if candidate:
+            candidates.append(candidate)
+    elif (
+        kind == "evidence"
+        or value_type == "evidence_contribution"
+        or input_mode == "rpc_method_or_schema_evidence"
+    ):
+        candidates.extend(extract_url_candidates(source))
+    spans: list[tuple[int, int]] = []
+    lowered = source.casefold()
+    for candidate in candidates:
+        needle = candidate.casefold()
+        start = 0
+        while needle:
+            index = lowered.find(needle, start)
+            if index < 0:
+                break
+            spans.append((index, index + len(candidate)))
+            start = index + len(candidate)
+    if (
+        kind == "evidence"
+        or value_type == "evidence_contribution"
+        or input_mode == "rpc_method_or_schema_evidence"
+    ):
+        spans.extend(
+            extract_rpc_wire_evidence_spans(
+                source,
+                allow_params_only=True,
+            )
+        )
+    return tuple(spans)
+
+
+def _semantic_value_occurs_only_within_spans(
+    source: str,
+    value: str,
+    spans: tuple[tuple[int, int], ...],
+) -> bool:
+    if not value or not spans:
+        return False
+    pattern = (
+        rf"(?<![{_SEMANTIC_VALUE_IDENTIFIER_CHARACTER}])"
+        rf"{re.escape(value)}"
+        rf"(?![{_SEMANTIC_VALUE_IDENTIFIER_CHARACTER}])"
+    )
+    occurrences = tuple(re.finditer(pattern, source, flags=re.IGNORECASE))
+    return bool(occurrences) and all(
+        any(
+            span_start <= occurrence.start()
+            and occurrence.end() <= span_end
+            for span_start, span_end in spans
+        )
+        for occurrence in occurrences
+    )
+
+
+def _pending_option_owns_semantic_value(
+    pending: Mapping[str, Any],
+    record: Mapping[str, Any],
+) -> bool:
+    value_identities = {
+        str(record.get("value") or "").strip().casefold(),
+        str(record.get("canonical_value") or "").strip().casefold(),
+    } - {""}
+    action_type = str(record.get("action_type") or "")
+    argument = str(record.get("argument") or "")
+    for option in pending.get("options") or []:
+        if not isinstance(option, Mapping):
+            continue
+        option_value = str(option.get("value") or "").strip().casefold()
+        action = (
+            dict(option.get("action") or {})
+            if isinstance(option.get("action"), Mapping)
+            else {}
+        )
+        action_value = str(action.get(argument) or "").strip().casefold()
+        if (
+            option_value in value_identities
+            or (
+                str(action.get("type") or "") == action_type
+                and action_value in value_identities
+            )
+        ):
+            return True
+    return False
 
 
 def admission_contract_hash() -> str:

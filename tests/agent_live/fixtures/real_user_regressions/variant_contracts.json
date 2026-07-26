@@ -52,11 +52,11 @@
     },
     {
       "case_id": "RR-006",
-      "source_turns_hash": "024d47666ab1d3bbf3ae7182da839e87e26cf20204339663de601c76a1271c5a",
+      "source_turns_hash": "635c19df60881bf9140b54bdb48573e775f13b64ba97dff2ded7be076404ca81",
       "source_steps": [
-        {"step_id": "source-1", "turn_index": 1, "semantic_role": "select_detected_ledger_device"},
+        {"step_id": "source-1", "turn_index": 1, "semantic_role": "provide_ledger_device"},
         {"step_id": "source-2", "turn_index": 2, "semantic_role": "provide_disk_type"},
-        {"step_id": "source-3", "turn_index": 3, "semantic_role": "confirm_detected_disk_size"},
+        {"step_id": "source-3", "turn_index": 3, "semantic_role": "provide_disk_size"},
         {"step_id": "source-4", "turn_index": 4, "semantic_role": "provide_disk_iops"},
         {"step_id": "source-5", "turn_index": 5, "semantic_role": "provide_disk_throughput"}
       ]

@@ -34,9 +34,9 @@
     },
     {
       "id": "RR-006",
-      "precondition": "ledger disk inventory contains vda with detected size",
-      "turns": ["1", "hyperdisk-balanced,", "Y", "20000", "1000"],
-      "expected": "Normalize surrounding copy punctuation, show device and detected size, confirm inferred size, then collect IOPS and throughput exactly once."
+      "precondition": "ledger disk configuration is incomplete and the device can be entered directly",
+      "turns": ["vda", "hyperdisk-balanced,", "1", "20000", "1000"],
+      "expected": "Accept an explicit device and size independently of discovery, normalize surrounding copy punctuation, then collect IOPS and throughput exactly once."
     },
     {
       "id": "RR-007",

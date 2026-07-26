@@ -9,6 +9,700 @@ from unittest.mock import patch
 
 
 class HierarchicalPlannerContractTest(unittest.TestCase):
+    def test_registered_semantic_domains_include_chain_aliases(self) -> None:
+        from agent.harness.action_registry import (
+            ACTION_BY_TYPE,
+            SEMANTIC_VALUE_DOMAIN_POLICY,
+            action_registry_contract_hash,
+            registered_semantic_value_domains,
+        )
+
+        records = registered_semantic_value_domains()
+        chain_spec = ACTION_BY_TYPE["choose_chain"]
+
+        self.assertTrue(any(
+            record.get("target_group") == "chain_identity"
+            and record.get("value") == "bnb"
+            and record.get("canonical_value") == "bsc"
+            and record.get("action_type") == chain_spec.action_type
+            and record.get("target_group") == chain_spec.target_group
+            for record in records
+        ))
+        self.assertTrue(any(
+            record.get("target_group") == "target_mode"
+            and record.get("value") == "fake-node"
+            for record in records
+        ))
+        self.assertEqual(SEMANTIC_VALUE_DOMAIN_POLICY["schema_version"], 2)
+        self.assertEqual(len(action_registry_contract_hash()), 64)
+
+    def test_local_pending_path_uses_registered_semantic_domains(self) -> None:
+        from agent.harness.questions import answer_fits_pending
+
+        region_question = {
+            "group": "provider_deployment",
+            "kind": "manual_value",
+            "manual_input_allowed": True,
+            "options": [],
+            "validation": {"value_type": "scalar_token"},
+        }
+        endpoint_question = {
+            "group": "endpoint_process",
+            "kind": "url",
+            "manual_input_allowed": True,
+            "options": [],
+            "validation": {"value_type": "url"},
+        }
+
+        for value in ("bnb", "ethereum", "quick", "real-node"):
+            self.assertFalse(answer_fits_pending(value, region_question), value)
+        self.assertTrue(answer_fits_pending("asia-east1", region_question))
+        self.assertTrue(
+            answer_fits_pending(
+                "https://ethereum.example/rpc",
+                endpoint_question,
+            )
+        )
+        self.assertFalse(answer_fits_pending("en", region_question))
+
+    def test_specialized_rpc_pending_requires_its_declared_input_shape(self) -> None:
+        from agent.harness.domains.chain_rpc_questions import (
+            _endpoint_validation_question,
+        )
+        from agent.harness.questions import answer_fits_pending
+        from agent.harness.state import new_state
+
+        state = new_state("specialized-pending-shape", language="en")
+        state["custom_rpc"] = {
+            "status": "needs_endpoint",
+            "endpoint_ready": False,
+        }
+        endpoint_question = _endpoint_validation_question(state)
+        self.assertIsNotNone(endpoint_question)
+        self.assertFalse(
+            answer_fits_pending("I need to switch to BNB", endpoint_question)
+        )
+        self.assertTrue(
+            answer_fits_pending(
+                "https://bsc.example/rpc",
+                endpoint_question,
+            )
+        )
+        self.assertFalse(answer_fits_pending(
+            "switch to BNB and use https://bsc.example/rpc",
+            endpoint_question,
+        ))
+
+        state["custom_rpc"] = {
+            "status": "needs_method",
+            "endpoint_ready": True,
+        }
+        method_question = _endpoint_validation_question(state)
+        self.assertIsNotNone(method_question)
+        self.assertFalse(answer_fits_pending("bnb", method_question))
+        self.assertFalse(answer_fits_pending("quick", method_question))
+        self.assertTrue(answer_fits_pending("eth_chainId", method_question))
+
+        state["custom_rpc"] = {
+            "status": "needs_schema_evidence",
+            "endpoint_ready": True,
+            "candidate_method": "eth_chainId",
+        }
+        evidence_question = _endpoint_validation_question(state)
+        self.assertIsNotNone(evidence_question)
+        self.assertFalse(
+            answer_fits_pending("I need to switch to BNB", evidence_question)
+        )
+        self.assertTrue(answer_fits_pending(
+            '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}',
+            evidence_question,
+        ))
+        self.assertTrue(answer_fits_pending(
+            "method: eth_chainId\nparams:\n  - bnb",
+            evidence_question,
+        ))
+        self.assertTrue(answer_fits_pending(
+            "```yaml\nmethod: eth_chainId\nparams:\n  - bnb\n```",
+            evidence_question,
+        ))
+        self.assertFalse(answer_fits_pending(
+            '{"note":"switch to BNB"}',
+            evidence_question,
+        ))
+        self.assertFalse(answer_fits_pending(
+            'switch to BNB; evidence={"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}',
+            evidence_question,
+        ))
+
+    def test_final_admission_rejects_chain_request_as_rpc_endpoint(self) -> None:
+        from agent.harness.domains.chain_rpc_questions import (
+            _endpoint_validation_question,
+        )
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.semantic_admission import prepare_hierarchical_candidate
+        from agent.harness.state import new_state
+
+        text = "I need to switch to BNB"
+        clauses = segment_user_turn(text)
+        state = new_state("endpoint-cross-domain-final-admission", language="en")
+        state["custom_rpc"] = {
+            "status": "needs_endpoint",
+            "endpoint_ready": False,
+        }
+        state["pending_question"] = _endpoint_validation_question(state)
+        candidate = {
+            "actions": [{
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_endpoint",
+                "rpc_endpoint": text,
+                "source_evidence": text,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": text,
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "incorrect endpoint ownership",
+            }],
+        }
+
+        _prepared, validation = prepare_hierarchical_candidate(
+            json.dumps(candidate),
+            state,
+            clauses,
+            pending_choice_unit_ids=frozenset({"unit-1"}),
+        )
+
+        self.assertFalse(validation.valid)
+        self.assertTrue(
+            any("registered semantic value" in error for error in validation.errors),
+            validation.errors,
+        )
+
+    def test_final_admission_allows_structured_rpc_endpoint_and_evidence(self) -> None:
+        from agent.harness.domains.chain_rpc_questions import (
+            _endpoint_validation_question,
+        )
+        from agent.harness.hierarchical_planner import _cross_domain_pending_errors
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.semantic_admission import prepare_hierarchical_candidate
+        from agent.harness.state import new_state
+
+        for status, command, argument, text in (
+            (
+                "needs_endpoint",
+                "set_endpoint",
+                "rpc_endpoint",
+                "https://bsc.example/rpc",
+            ),
+            (
+                "needs_method",
+                "set_method",
+                "rpc_method",
+                "eth_chainId",
+            ),
+            (
+                "needs_schema_evidence",
+                "append_evidence",
+                "rpc_schema_evidence",
+                '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}',
+            ),
+            (
+                "needs_schema_evidence",
+                "append_evidence",
+                "rpc_schema_evidence",
+                "method: eth_chainId\nparams:\n  - bnb",
+            ),
+            (
+                "needs_schema_evidence",
+                "append_evidence",
+                "rpc_schema_evidence",
+                "```yaml\nmethod: eth_chainId\nparams:\n  - bnb\n```",
+            ),
+        ):
+            with self.subTest(status=status):
+                state = new_state(f"structured-{status}", language="en")
+                state["custom_rpc"] = {
+                    "status": status,
+                    "endpoint_ready": status != "needs_endpoint",
+                    "candidate_method": "eth_chainId",
+                }
+                state["pending_question"] = _endpoint_validation_question(state)
+                clauses = segment_user_turn(text)
+                self.assertEqual(
+                    _cross_domain_pending_errors(
+                        [{
+                            "unit_id": "unit-1",
+                            "source_text": text,
+                            "operation": "pending_answer",
+                        }],
+                        state,
+                    ),
+                    (),
+                )
+                candidate = {
+                    "actions": [{
+                        "type": "rpc_catalog_command",
+                        "catalog_command": command,
+                        argument: text,
+                        "source_evidence": text,
+                    }],
+                    "semantic_units": [{
+                        "unit_id": "unit-1",
+                        "clause_id": "clause-1",
+                        "source_text": text,
+                        "disposition": "action",
+                        "action_indexes": [0],
+                        "reason": "typed RPC input",
+                    }],
+                }
+
+                _prepared, validation = prepare_hierarchical_candidate(
+                    json.dumps(candidate),
+                    state,
+                    clauses,
+                    pending_choice_unit_ids=frozenset({"unit-1"}),
+                )
+
+                self.assertTrue(validation.valid, validation.errors)
+
+    def test_rpc_evidence_admission_rejects_non_wire_json_domain_detour(self) -> None:
+        from agent.harness.domains.chain_rpc_questions import (
+            _endpoint_validation_question,
+        )
+        from agent.harness.hierarchical_planner import _cross_domain_pending_errors
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.semantic_admission import prepare_hierarchical_candidate
+        from agent.harness.state import new_state
+
+        text = '{"note":"switch to BNB"}'
+        state = new_state("non-wire-json-evidence", language="en")
+        state["custom_rpc"] = {
+            "status": "needs_schema_evidence",
+            "endpoint_ready": True,
+            "candidate_method": "eth_chainId",
+        }
+        state["pending_question"] = _endpoint_validation_question(state)
+        partition = [{
+            "unit_id": "unit-1",
+            "source_text": text,
+            "operation": "pending_answer",
+        }]
+        self.assertTrue(_cross_domain_pending_errors(partition, state))
+
+        candidate = {
+            "actions": [{
+                "type": "rpc_catalog_command",
+                "catalog_command": "append_evidence",
+                "rpc_schema_evidence": text,
+                "source_evidence": text,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": text,
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "incorrect evidence ownership",
+            }],
+        }
+        _prepared, validation = prepare_hierarchical_candidate(
+            json.dumps(candidate),
+            state,
+            segment_user_turn(text),
+            pending_choice_unit_ids=frozenset({"unit-1"}),
+        )
+        self.assertFalse(validation.valid)
+        self.assertTrue(
+            any("registered semantic value" in error for error in validation.errors),
+            validation.errors,
+        )
+
+    def test_language_domain_cannot_be_consumed_by_environment_pending(self) -> None:
+        from agent.harness.hierarchical_planner import _cross_domain_pending_errors
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.semantic_admission import prepare_hierarchical_candidate
+        from agent.harness.state import new_state
+
+        text = "en"
+        state = new_state("language-domain-ownership", language="zh")
+        state["pending_question"] = {
+            "id": "CLOUD_REGION",
+            "group": "provider_deployment",
+            "kind": "manual_value",
+            "field": "CLOUD_REGION",
+            "manual_input_allowed": True,
+            "options": [],
+            "accepted_action_types": ["answer_pending"],
+            "validation": {"value_type": "scalar_token"},
+        }
+        wrong_partition = [{
+            "unit_id": "unit-1",
+            "source_text": text,
+            "operation": "pending_answer",
+        }]
+        self.assertTrue(_cross_domain_pending_errors(wrong_partition, state))
+
+        clauses = segment_user_turn(text)
+        wrong_candidate = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": text,
+                "source_evidence": text,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": text,
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "incorrect environment ownership",
+            }],
+        }
+        _prepared, validation = prepare_hierarchical_candidate(
+            json.dumps(wrong_candidate),
+            state,
+            clauses,
+            pending_choice_unit_ids=frozenset({"unit-1"}),
+        )
+        self.assertFalse(validation.valid)
+
+        language_candidate = {
+            "actions": [{
+                "type": "set_response_language",
+                "language": "en",
+                "source_evidence": "en",
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": text,
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "explicit language detour",
+            }],
+        }
+        _prepared, validation = prepare_hierarchical_candidate(
+            json.dumps(language_candidate),
+            state,
+            clauses,
+            pending_choice_unit_ids=frozenset(),
+        )
+        self.assertTrue(validation.valid, validation.errors)
+
+    def test_stage_a_repairs_chain_request_misassigned_to_environment_pending(
+        self,
+    ) -> None:
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.state import new_state
+        from tests.agent_live.graph_turn import (
+            resolve_product_action_queue_for_test as resolve_product_action_queue,
+        )
+
+        text = "我需要换成 BNB"
+        state = new_state("stage-a-cross-domain-repair", language="zh")
+        state["pending_question"] = {
+            "id": "CLOUD_REGION",
+            "group": "provider_deployment",
+            "kind": "manual_value",
+            "field": "CLOUD_REGION",
+            "manual_input_allowed": True,
+            "options": [],
+            "accepted_action_types": ["answer_pending"],
+            "validation": {"value_type": "scalar_token"},
+        }
+        wrong_partition = {
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": text,
+                "operation": "pending_answer",
+                "owner_routes": [{
+                    "owner": "coordinator",
+                    "group": "provider_deployment",
+                }],
+                "reason": "incorrectly assigned to active pending",
+            }],
+        }
+        repaired_partition = {
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": text,
+                "operation": "domain_request",
+                "owner_routes": [{
+                    "owner": "chain_rpc",
+                    "group": "chain_identity",
+                }],
+                "reason": "chain replacement request",
+            }],
+        }
+        owner_document = {
+            "actions": [{
+                "type": "change_chain",
+                "chain_text": "BNB",
+                "source_evidence": "BNB",
+            }],
+            "bindings": [{
+                "unit_id": "unit-1",
+                "action_indexes": [0],
+                "disposition": "action",
+                "reason": "compiled chain replacement",
+            }],
+        }
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                side_effect=[
+                    json.dumps(wrong_partition, ensure_ascii=False),
+                    json.dumps(repaired_partition, ensure_ascii=False),
+                ],
+            ) as stage_a,
+            patch(
+                "agent.harness.hierarchical_planner._compile_owner_document",
+                return_value=(owner_document, (), (100,)),
+            ) as owner_compiler,
+            patch(
+                "agent.harness.hierarchical_planner.prepare_hierarchical_candidate",
+                side_effect=lambda candidate, *_args, **_kwargs: (
+                    candidate,
+                    PlanCoverageResult(True, (), ()),
+                ),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner._review_bounded_semantic_candidate",
+                return_value=(
+                    SimpleNamespace(request_json="{}"),
+                    SimpleNamespace(valid=True, errors=()),
+                    (),
+                ),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner._admitted_action_queue",
+                return_value={"actions": [{"type": "change_chain"}]},
+            ),
+        ):
+            result = resolve_product_action_queue(state, text)
+
+        self.assertEqual(stage_a.call_count, 2)
+        repair_payload = stage_a.call_args_list[1].kwargs["request_payload"]
+        self.assertTrue(repair_payload.get("contract_repair"))
+        self.assertTrue(any(
+            "registered semantic value" in error
+            for error in repair_payload["contract_repair"]["validation_errors"]
+        ))
+        owner_compiler.assert_called_once()
+        self.assertEqual(
+            owner_compiler.call_args.args[1:3],
+            ("chain_rpc", frozenset({"chain_identity"})),
+        )
+        self.assertEqual(result["actions"], [{"type": "change_chain"}])
+        self.assertEqual(result["planner_metrics"]["stage_a_calls"], 2)
+
+    def test_environment_pending_rejects_known_chain_identity_prose(self) -> None:
+        from agent.harness.hierarchical_planner import _cross_domain_pending_errors
+
+        state = {
+            "pending_question": {
+                "group": "provider_deployment",
+                "value_domain": "environment_value",
+            },
+        }
+        partition = [{
+            "unit_id": "unit-1",
+            "source_text": "我需要换成 BNB",
+            "operation": "pending_answer",
+        }]
+
+        errors = _cross_domain_pending_errors(partition, state)
+
+        self.assertTrue(errors)
+        self.assertIn("chain_identity", errors[0])
+        self.assertIn("bnb", errors[0].lower())
+
+    def test_chain_pending_owns_known_chain_identity(self) -> None:
+        from agent.harness.hierarchical_planner import _cross_domain_pending_errors
+
+        state = {
+            "pending_question": {
+                "group": "chain_identity",
+                "value_domain": "researched_identity",
+            },
+        }
+        partition = [{
+            "unit_id": "unit-1",
+            "source_text": "我需要换成 BNB",
+            "operation": "pending_answer",
+        }]
+
+        self.assertEqual(_cross_domain_pending_errors(partition, state), ())
+
+    def test_final_admission_rejects_chain_prose_as_environment_value(self) -> None:
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.semantic_admission import prepare_hierarchical_candidate
+        from agent.harness.state import new_state
+
+        text = "我需要换成 BNB"
+        clauses = segment_user_turn(text)
+        state = new_state("cross-domain-final-admission", language="zh")
+        state["pending_question"] = {
+            "id": "CLOUD_REGION",
+            "group": "provider_deployment",
+            "kind": "text",
+            "field": "CLOUD_REGION",
+            "manual_input_allowed": True,
+            "options": [],
+            "accepted_action_types": ["answer_pending"],
+            "validation": {
+                "value_type": "bounded_text",
+                "max_length": 128,
+            },
+        }
+        candidate = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": text,
+                "source_evidence": text,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": text,
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "incorrect environment ownership",
+            }],
+        }
+
+        _prepared, validation = prepare_hierarchical_candidate(
+            json.dumps(candidate, ensure_ascii=False),
+            state,
+            clauses,
+            pending_choice_unit_ids=frozenset({"unit-1"}),
+        )
+
+        self.assertFalse(validation.valid)
+        self.assertTrue(
+            any("registered semantic value" in error for error in validation.errors),
+            validation.errors,
+        )
+
+    def test_final_admission_allows_environment_value_without_domain_conflict(self) -> None:
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.semantic_admission import prepare_hierarchical_candidate
+        from agent.harness.state import new_state
+
+        text = "asia-east1"
+        clauses = segment_user_turn(text)
+        state = new_state("environment-value-final-admission", language="en")
+        state["pending_question"] = {
+            "id": "CLOUD_REGION",
+            "group": "provider_deployment",
+            "kind": "text",
+            "field": "CLOUD_REGION",
+            "manual_input_allowed": True,
+            "options": [],
+            "accepted_action_types": ["answer_pending"],
+            "validation": {
+                "value_type": "bounded_text",
+                "max_length": 128,
+            },
+        }
+        candidate = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": text,
+                "source_evidence": text,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": text,
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "valid environment ownership",
+            }],
+        }
+
+        _prepared, validation = prepare_hierarchical_candidate(
+            json.dumps(candidate),
+            state,
+            clauses,
+            pending_choice_unit_ids=frozenset({"unit-1"}),
+        )
+
+        self.assertTrue(validation.valid, validation.errors)
+
+    def test_endpoint_pending_allows_chain_name_inside_typed_url(self) -> None:
+        from agent.harness.hierarchical_planner import _cross_domain_pending_errors
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.semantic_admission import prepare_hierarchical_candidate
+        from agent.harness.state import new_state
+
+        text = "https://ethereum.example/rpc"
+        clauses = segment_user_turn(text)
+        state = new_state("typed-url-domain-value", language="en")
+        state["pending_question"] = {
+            "id": "LOCAL_RPC_URL",
+            "group": "endpoint_process",
+            "kind": "url",
+            "field": "LOCAL_RPC_URL",
+            "manual_input_allowed": True,
+            "options": [],
+            "accepted_action_types": ["answer_pending"],
+            "validation": {"value_type": "url"},
+        }
+        partition = [{
+            "unit_id": "unit-1",
+            "source_text": text,
+            "operation": "pending_answer",
+        }]
+        candidate = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": text,
+                "source_evidence": text,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": text,
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "typed endpoint",
+            }],
+        }
+
+        self.assertEqual(_cross_domain_pending_errors(partition, state), ())
+        _prepared, validation = prepare_hierarchical_candidate(
+            json.dumps(candidate),
+            state,
+            clauses,
+            pending_choice_unit_ids=frozenset({"unit-1"}),
+        )
+        self.assertTrue(validation.valid, validation.errors)
+
+    def test_pending_option_owns_registered_value_for_its_declared_action(self) -> None:
+        from agent.harness.domains.orientation import opening_question
+        from agent.harness.hierarchical_planner import _cross_domain_pending_errors
+        from agent.harness.state import new_state
+
+        state = new_state("declared-option-domain-value", language="en")
+        state["pending_question"] = opening_question(state)
+        partition = [{
+            "unit_id": "unit-1",
+            "source_text": "fake-node",
+            "operation": "pending_answer",
+        }]
+
+        self.assertEqual(_cross_domain_pending_errors(partition, state), ())
+
     def test_open_chain_pending_rejects_registered_closed_domain_value(self) -> None:
         from agent.harness.hierarchical_planner import _cross_domain_pending_errors
 
@@ -81,7 +775,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
 
         self.assertFalse(validation.valid)
         self.assertTrue(
-            any("registered closed-domain value" in error for error in validation.errors),
+            any("registered semantic value" in error for error in validation.errors),
             validation.errors,
         )
 

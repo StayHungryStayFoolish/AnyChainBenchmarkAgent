@@ -1214,15 +1214,16 @@ def _typed_detected_value_confirmed(context: Any) -> PredicateResult:
     )
 
 
-def _detected_size_confirmed(context: Any) -> PredicateResult:
+def _manual_disk_size_provided(context: Any) -> PredicateResult:
     return _receipt_predicate(
         context,
         family="pending_lineage",
         receipt_types=("pending_resolution",),
         predicate=lambda receipt: (
-            receipt.get("resolution_path") == "exact_contract"
+            receipt.get("resolution_path") == "typed_manual_value"
             and _path_leaf(str(receipt.get("pending_id") or ""))
             in {"DATA_VOL_SIZE", "ACCOUNTS_VOL_SIZE"}
+            and bool(receipt.get("selected_value_hash"))
         ),
     )
 
@@ -2033,7 +2034,7 @@ POSTCONDITION_EVALUATORS: Mapping[str, PostconditionEvaluator] = {
     "fallback_resumed": _fallback_resumed,
     "stale_fallback_emitted": _stale_fallback_emitted,
     "copied_scalar_normalized": _copied_scalar_normalized,
-    "detected_size_confirmed": _detected_size_confirmed,
+    "manual_disk_size_provided": _manual_disk_size_provided,
     "disk_limits_collected_once": _disk_limits_collected_once,
     "disk_subgroup_repeated": _disk_subgroup_repeated,
     "typed_detected_value_confirmed": _typed_detected_value_confirmed,

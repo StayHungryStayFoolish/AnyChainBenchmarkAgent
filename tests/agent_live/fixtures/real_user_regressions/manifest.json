@@ -4,13 +4,13 @@
   "files": [
     {
       "path": "tests/agent_live/fixtures/real_user_regressions/cases.json",
-      "sha256": "e71dd432312eae9baab9bf7a15f1c8f0241128f74f29113aaf338caadb1827a6",
+      "sha256": "6727df29c2248dfe99165355bc82f3c508d7c4d01e95695fd90e8da59c20ce55",
       "case_count": 15,
       "sanitized": true
     },
     {
       "path": "tests/agent_live/fixtures/real_user_regressions/variant_contracts.json",
-      "sha256": "822b56c3d19706f30d8bf1f6a66d69924836ee62540b1c43580e73a9321fa432",
+      "sha256": "b8874ecd29674dce7de79c49aaf78c54df01b8029c8297df3a8d17eb0e4caa2f",
       "case_count": 15,
       "sanitized": true
     }

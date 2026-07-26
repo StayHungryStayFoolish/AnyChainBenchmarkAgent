@@ -116,7 +116,7 @@ _CASE_CONTRACTS: Mapping[str, _CaseContract] = {
     "RR-006": _CaseContract(
         "ledger_ledger_device",
         "S2",
-        ("copied_scalar_normalized", "detected_size_confirmed", "disk_limits_collected_once"),
+        ("copied_scalar_normalized", "manual_disk_size_provided", "disk_limits_collected_once"),
         ("disk_subgroup_repeated",),
     ),
     "RR-007": _CaseContract(

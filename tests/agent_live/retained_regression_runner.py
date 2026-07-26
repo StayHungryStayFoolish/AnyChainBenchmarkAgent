@@ -132,7 +132,7 @@ _RULE_CLASSES: Mapping[str, tuple[str, ...]] = {
         "declined_mode_change_resumes_chain_pending",
     ),
     "pending_advanced": (
-        "detected_size_confirmed",
+        "manual_disk_size_provided",
         "typed_detected_value_confirmed",
         "owned_group_backtrack_completed",
         "chain_confirmation_required",

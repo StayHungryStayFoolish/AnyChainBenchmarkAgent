@@ -18,8 +18,8 @@ from .action_registry import (
     build_proposal_field_receipt,
     canonical_consultation_topic,
     normalize_current_action_envelope,
-    registered_closed_value_domains,
     resolve_action_target_group,
+    semantic_value_domain_conflicts,
     semantic_grounding_arguments,
     semantic_scope_accepts_action,
     semantic_scope_schema,
@@ -1140,11 +1140,6 @@ def _validate_action_document(
         for index in payload.get("pending_answer_admissions", [])
         if isinstance(index, int)
     }
-    closed_value_records = (
-        registered_closed_value_domains()
-        if str(pending.get("value_domain") or "") == "researched_identity"
-        else ()
-    )
     for index, raw in enumerate(payload["actions"]):
         if not isinstance(raw, dict):
             action_errors.append(f"action {index} is not an object")
@@ -1164,7 +1159,6 @@ def _validate_action_document(
         domain_error = _pending_value_domain_error(
             raw,
             pending,
-            closed_value_records,
         )
         if domain_error:
             action_errors.append(f"action {index} {domain_error}")
@@ -1265,38 +1259,54 @@ def _validate_action_document(
 def _pending_value_domain_error(
     action: Mapping[str, Any],
     pending: Mapping[str, Any],
-    closed_value_records: tuple[dict[str, Any], ...],
 ) -> str:
-    """Reject an exact value owned by another registered closed dimension."""
+    """Reject a value whose exact identity belongs to another workflow group."""
 
-    if not pending or not closed_value_records:
+    if not pending:
         return ""
-    value = (
-        _manual_value_from_answer_pending(action, pending)
-        if str(action.get("type") or "") == "answer_pending"
-        else _matching_pending_manual_value(action, pending)
-    )
+    value = _raw_pending_candidate(action, pending)
     if not isinstance(value, str) or not value.strip():
         return ""
-    candidate = value.strip().casefold()
     pending_group = str(pending.get("group") or "")
-    conflicts = [
-        record
-        for record in closed_value_records
-        if str(record.get("target_group") or "")
-        and str(record.get("target_group") or "") != pending_group
-        and str(record.get("value") or "").strip().casefold() == candidate
-    ]
+    conflicts = semantic_value_domain_conflicts(
+        value,
+        owning_group=pending_group,
+        pending_question=pending,
+    )
     if not conflicts:
         return ""
     owners = ", ".join(sorted({
-        f"{record.get('action_type')}.{record.get('argument')}"
+        f"{record.get('semantic_owner')}:{record.get('action_type')}.{record.get('argument')}"
         for record in conflicts
     }))
     return (
-        "uses a registered closed-domain value as an open researched identity "
+        "uses a registered semantic value as an unrelated pending answer "
         f"({owners})"
     )
+
+
+def _raw_pending_candidate(
+    action: Mapping[str, Any],
+    pending: Mapping[str, Any],
+) -> Any:
+    if str(action.get("type") or "") == "answer_pending":
+        supplied = []
+        for key in ("answer", "selected_value"):
+            value = action.get(key)
+            if value is None or (isinstance(value, str) and not value.strip()):
+                continue
+            supplied.append(value)
+        return supplied[0] if len(supplied) == 1 else None
+    declared = pending.get("manual_action")
+    if (
+        not isinstance(declared, Mapping)
+        or str(action.get("type") or "") != str(declared.get("type") or "")
+    ):
+        return None
+    value_argument = str(declared.get("value_argument") or "").strip()
+    if not value_argument:
+        return None
+    return action.get(value_argument)
 
 
 def _semantic_action_purpose(

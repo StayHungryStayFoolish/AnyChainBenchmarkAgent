@@ -274,7 +274,83 @@ def extract_rpc_method_token_candidates(value: Any) -> list[str]:
 def has_rpc_wire_evidence(value: Any, *, allow_params_only: bool = False) -> bool:
     """Return whether one turn contains an attributable RPC wire fact."""
 
-    for payload in _rpc_wire_payloads(value):
+    return any(
+        _parsed_rpc_wire_evidence(
+            document,
+            allow_params_only=allow_params_only,
+        )
+        for document in extract_rpc_wire_values(value)
+    )
+
+
+def extract_rpc_wire_evidence_spans(
+    value: Any,
+    *,
+    allow_params_only: bool = False,
+) -> tuple[tuple[int, int], ...]:
+    """Locate source-exact JSON/YAML regions that carry RPC wire evidence."""
+
+    text = str(value or "")
+    if not text.strip():
+        return ()
+    spans: list[tuple[int, int]] = []
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(text):
+        if character not in "[{":
+            continue
+        try:
+            parsed, consumed = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if _parsed_rpc_wire_evidence(parsed, allow_params_only=allow_params_only):
+            spans.append((index, index + consumed))
+    yaml_regions: list[tuple[int, int]] = [
+        match.span(1)
+        for match in re.finditer(
+            r"```(?:ya?ml)?\s*\n(.*?)```",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if match.group(1).strip()
+    ]
+    stripped_start = len(text) - len(text.lstrip())
+    yaml_regions.append((stripped_start, len(text.rstrip())))
+    line_offset = 0
+    for line in text.splitlines(keepends=True):
+        if line == line.lstrip() and ":" in line:
+            key = line.split(":", 1)[0].strip().strip("\"'").casefold()
+            if key in _RPC_WIRE_KEYS:
+                yaml_regions.append((line_offset, len(text.rstrip())))
+                break
+        line_offset += len(line)
+    for start, end in yaml_regions:
+        candidate = text[start:end].strip()
+        if not candidate or candidate[0] in "[{":
+            continue
+        leading = len(text[start:end]) - len(text[start:end].lstrip())
+        trailing = len(text[start:end].rstrip())
+        try:
+            parsed = yaml.safe_load(candidate)
+        except yaml.YAMLError:
+            continue
+        if _parsed_rpc_wire_evidence(parsed, allow_params_only=allow_params_only):
+            spans.append((start + leading, start + trailing))
+    return tuple(dict.fromkeys(spans))
+
+
+def _parsed_rpc_wire_evidence(
+    document: Any,
+    *,
+    allow_params_only: bool,
+) -> bool:
+    payloads = [document]
+    if isinstance(document, dict):
+        payloads.extend(
+            document[key]
+            for key in ("request", "response")
+            if isinstance(document.get(key), (dict, list))
+        )
+    for payload in payloads:
         if isinstance(payload, list):
             if allow_params_only:
                 return True

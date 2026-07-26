@@ -24,7 +24,8 @@ from .action_registry import (
     ACTION_BY_TYPE,
     ACTION_SPECS,
     SEMANTIC_OPERATIONS,
-    registered_closed_value_domains,
+    registered_semantic_value_domains,
+    semantic_value_domain_conflicts,
     validate_action_contract,
 )
 from .context import (
@@ -467,10 +468,11 @@ def _stage_a_prompt() -> str:
         "the active pending_question.group as that route's group, and "
         "emit every sibling as separate domain_request units. Never label a normal domain_request "
         "as a pending answer, and never combine a pending answer with a sibling mutation. "
-        "Respect pending_question.value_domain and registered_closed_value_domains. A value "
-        "owned by another registered closed dimension is routed to that dimension's owner; it "
-        "is not consumed as an open researched identity merely because such a question is pending. "
-        "If the source explicitly claims that a closed-domain token is instead a new identity, "
+        "Respect pending_question.value_domain and registered_semantic_value_domains. A known "
+        "identity or closed value owned by another registered dimension is routed to that "
+        "dimension's owner; it is not consumed by an unrelated manual-text question merely "
+        "because that question is pending. If the source explicitly claims that a registered "
+        "value is instead a new identity, "
         "mark that unit unresolved so the user can disambiguate. "
         "A semantic option selection and adjacent prose that only explains the reason, uncertainty, "
         "basis, referential application, or declared completion effect for that same selection form "
@@ -522,8 +524,8 @@ def _stage_a_payload(
         "language": state.get("language") or "en",
         "active_group": state.get("active_group") or "opening",
         "pending_question": pending,
-        "registered_closed_value_domains": list(
-            registered_closed_value_domains()
+        "registered_semantic_value_domains": list(
+            registered_semantic_value_domains()
         ),
         "pending_typed_candidates": [
             value
@@ -562,30 +564,28 @@ def _cross_domain_pending_errors(
     partition: Sequence[Mapping[str, Any]],
     state: AgentGraphState,
 ) -> tuple[str, ...]:
-    """Reject a closed-domain value consumed by an open pending identity."""
+    """Reject a registered semantic value consumed by another pending owner."""
 
     pending = dict(state.get("pending_question") or {})
-    if str(pending.get("value_domain") or "") != "researched_identity":
+    if not pending:
         return ()
     pending_group = str(pending.get("group") or "")
-    records = registered_closed_value_domains()
     errors: list[str] = []
     for unit in partition:
         if str(unit.get("operation") or "") != "pending_answer":
             continue
         source = str(unit.get("source_text") or "")
-        for record in records:
-            target_group = str(record.get("target_group") or "")
-            if not target_group or target_group == pending_group:
-                continue
-            value = str(record.get("value") or "")
-            pattern = rf"(?<![\w-]){re.escape(value)}(?![\w-])"
-            if re.search(pattern, source, flags=re.IGNORECASE):
-                errors.append(
-                    "Stage A assigned a registered closed-domain value to an "
-                    "open researched pending identity: "
-                    f"{unit.get('unit_id')}/{record.get('action_type')}/{value}"
-                )
+        for record in semantic_value_domain_conflicts(
+            source,
+            owning_group=pending_group,
+            pending_question=pending,
+        ):
+            errors.append(
+                "Stage A assigned a registered semantic value to the wrong "
+                "pending owner: "
+                f"{unit.get('unit_id')}/{record.get('semantic_owner')}/"
+                f"{record.get('action_type')}/{record.get('value')}"
+            )
     return tuple(dict.fromkeys(errors))
 
 
@@ -1414,8 +1414,8 @@ def _stage_b_payload(
             for row in group_schema()
             if row["name"] in groups
         ],
-        "registered_closed_value_domains": list(
-            registered_closed_value_domains()
+        "registered_semantic_value_domains": list(
+            registered_semantic_value_domains()
         ),
         "owner_state": owner_workflow_snapshot(state, owner, groups=groups),
     }

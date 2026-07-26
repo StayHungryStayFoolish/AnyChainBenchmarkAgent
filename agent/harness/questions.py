@@ -11,6 +11,7 @@ from agent.knowledge.chain_identity import canonicalize_chain_scalar, repo_chain
 from agent.workflows.group_registry import GROUP_OWNER
 from .action_registry import (
     ACTION_BY_TYPE,
+    semantic_value_domain_conflicts,
     validate_candidate_binding_contract,
 )
 from .contracts import (
@@ -910,8 +911,10 @@ def answer_fits_pending(text: str, question: dict[str, Any]) -> bool:
     raw = _strip_scalar(text)
     if not raw:
         return False
-    if question.get("group") != "chain_identity" and canonicalize_chain_scalar(
-        raw, known_chains=set(repo_chain_names())
+    if semantic_value_domain_conflicts(
+        text,
+        owning_group=str(question.get("group") or ""),
+        pending_question=question,
     ):
         return False
     kind = str(question.get("kind") or "")
