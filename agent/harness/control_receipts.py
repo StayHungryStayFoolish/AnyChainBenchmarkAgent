@@ -287,6 +287,7 @@ def _validate_semantic_partition(
     fields = {
         "receipt_type",
         "turn_index",
+        "planning_lane",
         "status",
         "unit_count",
         "owner_count",
@@ -296,7 +297,9 @@ def _validate_semantic_partition(
     if not _exact_fields(receipt, fields):
         return False, "semantic-partition receipt shape is invalid"
     if (
-        receipt.get("status") not in {"compile_owner", "review_plan", "failed"}
+        receipt.get("planning_lane")
+        not in {"bounded_semantic_value", "hierarchical"}
+        or receipt.get("status") not in {"compile_owner", "review_plan", "failed"}
         or not _valid_nonnegative_integer(receipt.get("unit_count"))
         or not _valid_nonnegative_integer(receipt.get("owner_count"))
         or not _valid_nonnegative_integer(receipt.get("stage_a_calls"))

@@ -199,6 +199,14 @@ execution edge without hashed job artifacts fails the scheduled row closed.
 The schedule result remains `incomplete` or `failed`, and no passing evidence
 artifact is written.
 
+The runner resolves provider/model with the production Agent configuration
+loader and freezes that identity into the child PTY environment. A private
+configuration file cannot change the model between schedule creation and CLI
+startup. Extra environment values are copied into an immutable snapshot;
+provider/model/local-config keys are reserved, and the frozen identity is
+applied last. Evidence conversion uses the same resolved identity rather than
+a hard-coded default model name.
+
 Covering-array reports expose generated rows/tuples separately from observed
 rows/tuples. Critical-sequence reports derive coverage ids from validated turn
 artifacts; simulator-supplied or invented evidence ids do not count.

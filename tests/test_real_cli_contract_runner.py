@@ -11,9 +11,11 @@ from unittest.mock import patch
 from tests.agent_live.execute_real_cli_contract_ledger import (
     _prepare_execution_case,
     _require_target_contract,
+    _runtime_environment,
     eligible_edges,
     select_edges,
 )
+from tests.agent_live.dynamic_dual_ai_chaos import ChaosRunConfig
 from tests.agent_live.generate_harness_coverage_ledger import (
     build_ledger,
     contract_variant_hash,
@@ -22,6 +24,25 @@ from tests.agent_live.harness_contract_scenarios import question_scenarios
 
 
 class RealCliContractRunnerTest(unittest.TestCase):
+    def test_runtime_environment_freezes_configured_provider_identity(self) -> None:
+        root = Path("/workspace/.agent/real-cli/unit")
+        config = ChaosRunConfig(
+            repo_root=Path("/workspace"),
+            command=("agent",),
+            provider="deepseek",
+            model="deepseek-v4-pro",
+            runtime_root=root,
+            runtime_root_in_process=root,
+        )
+        environment = _runtime_environment(config, root)
+
+        self.assertEqual(environment["LLM_PROVIDER"], "deepseek")
+        self.assertEqual(environment["LLM_MODEL"], "deepseek-v4-pro")
+        self.assertEqual(
+            environment["AGENT_CONFIG_LOCAL"],
+            "/dev/null",
+        )
+
     def test_unknown_setup_capability_is_rejected(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "unsupported execution-case setup"):
             _prepare_execution_case(("unknown",), {})

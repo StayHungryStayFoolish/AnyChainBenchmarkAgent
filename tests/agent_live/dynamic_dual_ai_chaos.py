@@ -30,6 +30,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from agent.harness.input_identity import user_input_hash
 from agent.harness.turn_transactions import product_authority_id
+from agent.llm.config import load_llm_config
 from agent.harness.terminal_protocol import (
     TerminalDetourProjection,
     TerminalOutcomeProjection,
@@ -115,6 +116,13 @@ class SimulatorDecisionInvalid(ValueError):
     """A simulator turn violated its immutable scheduled contract."""
 
 
+_FROZEN_IDENTITY_ENVIRONMENT_KEYS = frozenset({
+    "AGENT_CONFIG_LOCAL",
+    "LLM_MODEL",
+    "LLM_PROVIDER",
+})
+
+
 @dataclass(frozen=True)
 class ChaosRunConfig:
     repo_root: Path
@@ -122,8 +130,8 @@ class ChaosRunConfig:
     session_id: str = field(default_factory=lambda: f"dynamic-chaos-{uuid.uuid4().hex}")
     execution_id: str = field(default_factory=lambda: f"chaos-{uuid.uuid4().hex}")
     session_purpose: str = "dynamic-dual-ai-chaos"
-    provider: str = "deepseek"
-    model: str = "deepseek-chat"
+    provider: str = ""
+    model: str = ""
     language: str = "en"
     max_turns: int = 20
     response_timeout_seconds: float = 180.0
@@ -132,6 +140,70 @@ class ChaosRunConfig:
     runtime_root_in_process: Path | None = None
     extra_env: Mapping[str, str] = field(default_factory=dict)
     transport_kind: str = "direct_pty"
+
+    def __post_init__(self) -> None:
+        normalized_extra_env = {
+            str(key).strip(): str(value)
+            for key, value in self.extra_env.items()
+        }
+        if "" in normalized_extra_env:
+            raise ValueError("Chaos runtime extra_env keys cannot be empty")
+        identity_overrides = sorted(
+            set(normalized_extra_env)
+            & _FROZEN_IDENTITY_ENVIRONMENT_KEYS
+        )
+        if identity_overrides:
+            raise ValueError(
+                "Chaos runtime extra_env cannot override frozen identity keys: "
+                + ", ".join(identity_overrides)
+            )
+        provider = str(self.provider).strip()
+        model = str(self.model).strip()
+        if bool(provider) != bool(model):
+            raise ValueError(
+                "Chaos runtime provider and model must be supplied together"
+            )
+        if not provider:
+            configured_identity = load_llm_config()
+            provider = configured_identity.provider
+            model = configured_identity.model
+        object.__setattr__(self, "provider", provider)
+        object.__setattr__(self, "model", model)
+        object.__setattr__(
+            self,
+            "extra_env",
+            MappingProxyType(normalized_extra_env),
+        )
+
+    def frozen_identity_environment(self) -> dict[str, str]:
+        return self._identity_environment(
+            provider=self.provider,
+            model=self.model,
+        )
+
+    @staticmethod
+    def _identity_environment(
+        *,
+        provider: str,
+        model: str,
+    ) -> dict[str, str]:
+        return {
+            "LLM_PROVIDER": provider,
+            "LLM_MODEL": model,
+            "AGENT_CONFIG_LOCAL": "/dev/null",
+        }
+
+    def isolated_environment(
+        self,
+        base_environment: Mapping[str, str],
+    ) -> dict[str, str]:
+        environment = {
+            str(key): str(value)
+            for key, value in base_environment.items()
+        }
+        environment.update(self.extra_env)
+        environment.update(self.frozen_identity_environment())
+        return environment
 
     @classmethod
     def docker(
@@ -146,8 +218,9 @@ class ChaosRunConfig:
         root = Path(repo_root).resolve()
         session_id = str(changes.pop("session_id", f"dynamic-chaos-{uuid.uuid4().hex}"))
         execution_id = str(changes.pop("execution_id", f"chaos-{uuid.uuid4().hex}"))
-        changes.setdefault("provider", os.environ.get("LLM_PROVIDER", cls.provider))
-        changes.setdefault("model", os.environ.get("LLM_MODEL", cls.model))
+        configured_identity = load_llm_config()
+        changes.setdefault("provider", configured_identity.provider)
+        changes.setdefault("model", configured_identity.model)
         host_runtime = Path(changes.pop(
             "runtime_root",
             root / ".agent" / "dynamic-chaos" / session_id,
@@ -159,6 +232,10 @@ class ChaosRunConfig:
         language = str(changes.get("language", "en"))
         container_env = {
             "ANYCHAIN_CHAOS_EXECUTION_ID": execution_id,
+            **cls._identity_environment(
+                provider=str(changes["provider"]),
+                model=str(changes["model"]),
+            ),
             "ANYCHAIN_CHAOS_INNER_CLEANUP_RECEIPT_DIR": str(
                 container_runtime / "container-cleanup-receipts"
             ),
@@ -211,8 +288,9 @@ class ChaosRunConfig:
 
         root = Path(repo_root).resolve()
         session_id = str(changes.pop("session_id", f"dynamic-chaos-{uuid.uuid4().hex}"))
-        changes.setdefault("provider", os.environ.get("LLM_PROVIDER", cls.provider))
-        changes.setdefault("model", os.environ.get("LLM_MODEL", cls.model))
+        configured_identity = load_llm_config()
+        changes.setdefault("provider", configured_identity.provider)
+        changes.setdefault("model", configured_identity.model)
         runtime = Path(changes.pop(
             "runtime_root",
             root / ".agent" / "dynamic-chaos" / session_id,
@@ -2022,28 +2100,27 @@ def validate_startup_session_event(
         session_id=expected_session_id,
         session_purpose=expected_session_purpose,
     )
-    candidates = [
+    identity_candidates = [
         event
         for event in events
         if dict(event.origin_revision) == dict(expected_revision)
-        and event.provider == expected_provider
-        and event.model == expected_model
         and event.session_id == expected_session_id
         and event.session_purpose == expected_session_purpose
         and event.presentation_hash == presentation_hash(startup_response)
     ]
-    if len(candidates) != 1:
-        raise RuntimeError("typed provider/model session identity is missing")
-    event = candidates[0]
+    if len(identity_candidates) != 1:
+        raise RuntimeError("typed terminal session identity is missing")
+    event = identity_candidates[0]
+    if event.provider != expected_provider or event.model != expected_model:
+        raise RuntimeError(
+            "typed provider/model does not match the configured Chaos boundary: "
+            f"expected {expected_provider}/{expected_model}, "
+            f"observed {event.provider}/{event.model}"
+        )
     if not event.provider_ready or event.startup_status != "ready":
         raise RuntimeError(
             "terminal session is not provider-ready: "
             f"{event.failure_category or event.startup_status}"
-        )
-    if event.provider != expected_provider or event.model != expected_model:
-        raise RuntimeError(
-            "typed provider/model does not match the configured Chaos boundary: "
-            f"{event.provider}/{event.model}"
         )
     if (
         event.session_id != expected_session_id
@@ -2941,8 +3018,7 @@ class DynamicDualAiChaosRunner:
                 process_root / "terminal-outcomes.jsonl"
             ),
         })
-        env.update({str(key): str(value) for key, value in self.config.extra_env.items()})
-        return env
+        return self.config.isolated_environment(env)
 
 
 class DynamicDualAiJourneyRunner:
@@ -3834,8 +3910,7 @@ class DynamicDualAiJourneyRunner:
                 process_root / "terminal-outcomes.jsonl"
             ),
         })
-        env.update({str(key): str(value) for key, value in self.config.extra_env.items()})
-        return env
+        return self.config.isolated_environment(env)
 
 
 def _validate_journey_decision(

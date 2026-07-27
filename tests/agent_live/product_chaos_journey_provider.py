@@ -19,6 +19,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from agent.llm.config import load_llm_config
 from tests.agent_live.chaos_scheduler import (
     build_journey_schedule,
     journey_schedule_payload,
@@ -68,7 +69,6 @@ CHECKPOINT_DIFF_TYPE = "product_chaos_checkpoint_diffs"
 JOURNEY_RUNNER = "dynamic_dual_ai_journey"
 REAL_PTY_TRANSPORT = "real_pty"
 DEFAULT_PROVIDER = "deepseek"
-DEFAULT_MODEL = "deepseek-chat"
 DEFAULT_REQUIRED_ENV_NAMES = ("DEEPSEEK_API_KEY",)
 
 _SOURCE_CLASSIFICATION_TO_OUTCOME = {
@@ -644,8 +644,8 @@ def convert_completed_journey_to_product_evidence(
     runtime_root: str | Path,
     evidence_path: str | Path,
     checkpoint_diff_path: str | Path | None = None,
-    provider: str = DEFAULT_PROVIDER,
-    model: str = DEFAULT_MODEL,
+    provider: str | None = None,
+    model: str | None = None,
 ) -> Path:
     """Convert one completed Journey run into product-obligation evidence.
 
@@ -657,7 +657,10 @@ def convert_completed_journey_to_product_evidence(
     normalized_round_id = str(round_id).strip()
     if not normalized_round_id:
         raise ValueError("G4 product evidence requires an explicit round identity")
-    if provider != DEFAULT_PROVIDER or not str(model).strip():
+    configured_identity = load_llm_config()
+    provider = str(provider or configured_identity.provider).strip()
+    model = str(model or configured_identity.model).strip()
+    if provider != DEFAULT_PROVIDER or not model:
         raise ValueError("G4 product evidence requires an explicit DeepSeek provider/model")
     root = Path(runtime_root).resolve()
     output = Path(evidence_path).resolve()
@@ -1716,8 +1719,8 @@ def _parser() -> argparse.ArgumentParser:
     evidence.add_argument("--runtime-root", required=True, type=Path)
     evidence.add_argument("--output", required=True, type=Path)
     evidence.add_argument("--checkpoint-diff", type=Path)
-    evidence.add_argument("--provider", default=DEFAULT_PROVIDER)
-    evidence.add_argument("--model", default=DEFAULT_MODEL)
+    evidence.add_argument("--provider")
+    evidence.add_argument("--model")
 
     evidence_batch = subparsers.add_parser(
         "evidence-batch",
@@ -1728,8 +1731,8 @@ def _parser() -> argparse.ArgumentParser:
     evidence_batch.add_argument("--result-index", required=True, type=Path)
     evidence_batch.add_argument("--round-id", required=True)
     evidence_batch.add_argument("--output-dir", required=True, type=Path)
-    evidence_batch.add_argument("--provider", default=DEFAULT_PROVIDER)
-    evidence_batch.add_argument("--model", default=DEFAULT_MODEL)
+    evidence_batch.add_argument("--provider")
+    evidence_batch.add_argument("--model")
     return parser
 
 
@@ -1773,6 +1776,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     rows, revision = load_frozen_product_chaos_catalog(args.catalog)
+    configured_identity = load_llm_config()
+    evidence_provider = getattr(args, "provider", None) or configured_identity.provider
+    evidence_model = getattr(args, "model", None) or configured_identity.model
     if args.command == "definitions":
         manifest = build_product_chaos_journey_manifest(
             rows,
@@ -1795,8 +1801,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 runtime_root=runtime_root,
                 evidence_path=evidence_path,
                 checkpoint_diff_path=checkpoint_diff,
-                provider=args.provider,
-                model=args.model,
+                provider=evidence_provider,
+                model=evidence_model,
             )
 
         convert_completed_journey_batch(
@@ -1823,8 +1829,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         runtime_root=args.runtime_root,
         evidence_path=args.output,
         checkpoint_diff_path=args.checkpoint_diff,
-        provider=args.provider,
-        model=args.model,
+        provider=evidence_provider,
+        model=evidence_model,
     )
     return 0
 

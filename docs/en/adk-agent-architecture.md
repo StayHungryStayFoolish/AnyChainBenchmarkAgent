@@ -118,6 +118,11 @@ node is a different trust boundary: it deterministically validates action
 schema, provenance, conflicts, prerequisites, pending-question contracts, and
 queue eligibility before actions become durable.
 
+The persisted semantic-partition receipt names its `planning_lane` as either
+`bounded_semantic_value` or `hierarchical`. The producer, runtime-event
+validator, retained-regression verifier, and audit export share this strict
+schema; an absent or unknown lane fails closed.
+
 One bounded scalar lane is intentionally narrower than the general
 whole-plan path. When a pending option/manual value or a registered semantic
 value has an exact source anchor, `bounded_semantic_lane.py` may request one
@@ -212,11 +217,22 @@ never relabeled as current evidence. Every runtime projection path has a
 durable single-authority marker, and default paths include an authority hash,
 so one session or purpose cannot remove another authority's observations.
 
+Live acceptance resolves provider/model through the same persistent Agent
+configuration loader as the CLI, then freezes that exact identity into the
+child PTY environment. Runner-specific environment values are copied into an
+immutable snapshot; identity keys are reserved and reapplied last. The child
+cannot re-source a private override or mutate an environment mapping to
+silently select another model. Both missing identity and expected/observed
+identity mismatch fail before any evidence can qualify.
+
 Startup session schema version 3 requires a ready session to name a committed
 Product Head at revision one or later and the complete runtime-event
 publication fence at that same revision. Revision-zero sessions cannot be
 advertised as ready. Both the interactive CLI and one-shot prompt entrypoint
 close the LangGraph runtime and its SQLite resources on every exit path.
+Blocked startup sessions use the terminal protocol's closed
+`StartupFailureCategory` enum. Producers, builders, and raw-record validators
+share that enum; unknown categories fail closed.
 
 Control-plane responsibilities are deliberately separate:
 

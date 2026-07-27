@@ -364,7 +364,7 @@ def _runtime_environment(config: ChaosRunConfig, runtime_root: Path) -> dict[str
             process_root / "terminal-outcomes.jsonl"
         ),
     })
-    return env
+    return config.isolated_environment(env)
 
 
 def _prepare_execution_case(

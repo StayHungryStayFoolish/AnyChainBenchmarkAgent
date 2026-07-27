@@ -684,6 +684,42 @@ class TerminalProjectionContractTest(unittest.TestCase):
                 },
             )
 
+    def test_blocked_startup_rejects_unknown_failure_category(self) -> None:
+        from agent.harness.terminal_protocol import (
+            TerminalProtocolError,
+            build_terminal_session_event,
+        )
+
+        with self.assertRaisesRegex(
+            TerminalProtocolError,
+            "startup failure category is invalid",
+        ):
+            build_terminal_session_event(
+                process_instance_id="process-1",
+                session_id="session-1",
+                session_purpose="user",
+                provider="deepseek",
+                model="deepseek-v4-pro",
+                auth_mode="api_key",
+                provider_ready=False,
+                startup_status="blocked",
+                failure_category="provider_readdiness_failed",
+                product_authority_id="",
+                product_revision=None,
+                product_checkpoint_thread_id="",
+                product_checkpoint_id="",
+                product_fingerprint="",
+                runtime_event_fence_sequence=0,
+                runtime_event_fence_terminal_event_id="",
+                runtime_event_fence_id="",
+                runtime_event_fence_hash="",
+                rendered_frame="Agent> blocked",
+                origin_revision={
+                    "commit": "test-revision",
+                    "worktree_hash": "1" * 64,
+                },
+            )
+
     def test_ready_startup_rejects_revision_zero_without_publication_fence(
         self,
     ) -> None:

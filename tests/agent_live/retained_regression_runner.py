@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from agent.harness.runtime_identity import repository_revision
+from agent.llm.config import load_llm_config
 from agent.utils.redaction import redact
 from tests.agent_live.batch_orchestrator import (
     TimeoutPolicy,
@@ -96,7 +97,6 @@ RETAINED_REGRESSION_TARGET_SET_SCHEMA_VERSION = 1
 RETAINED_REGRESSION_EXACT_COUNT = 15
 RETAINED_REGRESSION_OPEN_COUNT = 45
 DEFAULT_PROVIDER = "deepseek"
-DEFAULT_MODEL = "deepseek-chat"
 
 
 def _is_sha256(value: Any) -> bool:
@@ -977,6 +977,18 @@ def build_product_obligation_evidence_artifact(
     return {**unsigned, "evidence_hash": content_hash(unsigned)}
 
 
+def _validate_exact_terminal_revision(
+    terminal_outcome: Any,
+    *,
+    active_revision: Mapping[str, str],
+    stage: str,
+) -> None:
+    if dict(terminal_outcome.origin_revision) != dict(active_revision):
+        raise RuntimeError(
+            f"exact retained-regression {stage} terminal revision is stale"
+        )
+
+
 def execute_exact_retained_regression(
     *,
     repo_root: str | Path,
@@ -1075,6 +1087,7 @@ def execute_exact_retained_regression(
             container_runtime / "terminal-outcomes.jsonl"
         ),
     })
+    env = config.isolated_environment(env)
     transport = transport_for_config(config)
     event_stream = JsonlRuntimeEventStream(event_path)
     terminal_outcome_stream = JsonlTerminalOutcomeStream(
@@ -1163,10 +1176,11 @@ def execute_exact_retained_regression(
             previous_response = resume_completion.response
             initial_event = resume_completion.event
             validate_runtime_turn_event(initial_event)
-            if dict(resume_completion.terminal_outcome.revision) != active_revision:
-                raise RuntimeError(
-                    "exact retained-regression resume terminal revision is stale"
-                )
+            _validate_exact_terminal_revision(
+                resume_completion.terminal_outcome,
+                active_revision=active_revision,
+                stage="resume",
+            )
             previous_received_at_ns = time.time_ns()
             transcript_lines.extend((
                 f"User> {resume_submission}",
@@ -1206,9 +1220,13 @@ def execute_exact_retained_regression(
             response = completion.response
             response_received_at_ns = time.time_ns()
             validate_runtime_turn_event(committed)
+            _validate_exact_terminal_revision(
+                completion.terminal_outcome,
+                active_revision=active_revision,
+                stage="turn",
+            )
             if (
-                dict(completion.terminal_outcome.origin_revision) != active_revision
-                or dict(committed.revision) != active_revision
+                dict(committed.revision) != active_revision
                 or committed.before_fingerprint
                 != baseline.after_fingerprint
                 or committed.turn_index != baseline.turn_index + 1
@@ -1390,14 +1408,17 @@ def convert_completed_retained_journey_to_product_evidence(
     revision: Mapping[str, str],
     runtime_root: str | Path,
     evidence_path: str | Path,
-    provider: str = DEFAULT_PROVIDER,
-    model: str = DEFAULT_MODEL,
+    provider: str | None = None,
+    model: str | None = None,
 ) -> Path:
     """Validate one completed open Journey and adapt its retained artifacts."""
 
     if str(obligation.get("variant") or "") == "exact":
         raise ValueError("Journey conversion requires an open G3 obligation")
-    if provider != DEFAULT_PROVIDER or not str(model).strip():
+    configured_identity = load_llm_config()
+    provider = str(provider or configured_identity.provider).strip()
+    model = str(model or configured_identity.model).strip()
+    if provider != DEFAULT_PROVIDER or not model:
         raise ValueError(
             "G3 Journey evidence requires an explicit DeepSeek provider/model"
         )
@@ -2653,8 +2674,8 @@ def _parser() -> argparse.ArgumentParser:
     evidence.add_argument("--obligation-id", required=True)
     evidence.add_argument("--runtime-root", required=True, type=Path)
     evidence.add_argument("--output", required=True, type=Path)
-    evidence.add_argument("--provider-name", default=DEFAULT_PROVIDER)
-    evidence.add_argument("--model", default=DEFAULT_MODEL)
+    evidence.add_argument("--provider-name")
+    evidence.add_argument("--model")
 
     evidence_batch = commands.add_parser("evidence-batch")
     evidence_batch.add_argument("--repo-root", required=True, type=Path)
@@ -2662,8 +2683,8 @@ def _parser() -> argparse.ArgumentParser:
     evidence_batch.add_argument("--manifest", required=True, type=Path)
     evidence_batch.add_argument("--result-index", required=True, type=Path)
     evidence_batch.add_argument("--output-dir", required=True, type=Path)
-    evidence_batch.add_argument("--provider-name", default=DEFAULT_PROVIDER)
-    evidence_batch.add_argument("--model", default=DEFAULT_MODEL)
+    evidence_batch.add_argument("--provider-name")
+    evidence_batch.add_argument("--model")
     return parser
 
 
@@ -2682,6 +2703,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if args.command == "validate-provider":
         return 0
+    configured_identity = load_llm_config()
+    evidence_provider = (
+        getattr(args, "provider_name", None) or configured_identity.provider
+    )
+    evidence_model = getattr(args, "model", None) or configured_identity.model
     if args.command == "exact":
         execute_exact_retained_regressions(
             repo_root=args.repo_root,
@@ -2747,8 +2773,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 revision=revision,
                 runtime_root=runtime_root,
                 evidence_path=evidence_path,
-                provider=args.provider_name,
-                model=args.model,
+                provider=evidence_provider,
+                model=evidence_model,
             )
 
         convert_completed_journey_batch(
@@ -2785,8 +2811,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         revision=revision,
         runtime_root=args.runtime_root,
         evidence_path=args.output,
-        provider=args.provider_name,
-        model=args.model,
+        provider=evidence_provider,
+        model=evidence_model,
     )
     return 0
 

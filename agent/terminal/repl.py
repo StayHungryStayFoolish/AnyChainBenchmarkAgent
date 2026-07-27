@@ -33,6 +33,7 @@ from ..harness.invariants import StateInvariantError
 from ..harness.input_identity import canonical_user_input
 from ..harness.runtime_identity import repository_revision
 from ..harness.terminal_protocol import (
+    StartupFailureCategory,
     append_terminal_detour_projection,
     append_terminal_session_event,
     append_terminal_outcome_projection,
@@ -296,7 +297,9 @@ class AnyChainTerminal:
         runtime_errors = provider_runtime_errors(self._llm_config)
         self._llm_runtime_available = not runtime_errors
         if runtime_errors:
-            self._startup_failure_category = "provider_runtime_unavailable"
+            self._startup_failure_category = (
+                StartupFailureCategory.PROVIDER_RUNTIME_UNAVAILABLE.value
+            )
             self._llm_readiness_error = None
             self._llm_unavailable_reason = "; ".join(runtime_errors)
             self.state.current_question_id = "install_agent_runtime"
@@ -335,7 +338,9 @@ class AnyChainTerminal:
                     self._llm_readiness_error = None
                     self._llm_unavailable_reason = "agent workflow runtime unavailable"
                     self.io.agent(self.state.language, t(self.state.language, "harness_runtime_error"))
-                    self._startup_failure_category = "harness_runtime_unavailable"
+                    self._startup_failure_category = (
+                        StartupFailureCategory.HARNESS_RUNTIME_UNAVAILABLE.value
+                    )
                     self._publish_startup_event()
                     return
                 self._deliver_pending_terminal_outcomes()
@@ -349,7 +354,9 @@ class AnyChainTerminal:
                 elif not deps_offer_pending:
                     self._offer_harness_resume_if_needed()
             else:
-                self._startup_failure_category = "provider_readiness_failed"
+                self._startup_failure_category = (
+                    StartupFailureCategory.PROVIDER_READINESS_FAILED.value
+                )
         self.io.agent(self.state.language, t(self.state.language, "help"))
         self._publish_startup_event()
 
@@ -917,9 +924,10 @@ class AnyChainTerminal:
             and not dependency_consent_pending
         )
         failure_category = "" if ready else (
-            "dependency_consent_pending"
+            StartupFailureCategory.DEPENDENCY_CONSENT_PENDING.value
             if dependency_consent_pending
-            else self._startup_failure_category or "startup_blocked"
+            else self._startup_failure_category
+            or StartupFailureCategory.STARTUP_BLOCKED.value
         )
         product_head = self._harness.product_head() if ready else None
         runtime_event_fence = (

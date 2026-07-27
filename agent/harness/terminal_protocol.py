@@ -9,6 +9,7 @@ import fcntl
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
@@ -19,6 +20,20 @@ TERMINAL_DETOUR_PROJECTION_SCHEMA_VERSION = 3
 _OUTCOMES = frozenset({"committed", "aborted", "reconciliation_required"})
 _DELIVERY_PHASES = frozenset({"live", "startup_replay"})
 _STARTUP_STATUSES = frozenset({"ready", "blocked"})
+
+
+class StartupFailureCategory(str, Enum):
+    DEPENDENCY_CONSENT_PENDING = "dependency_consent_pending"
+    PROVIDER_RUNTIME_UNAVAILABLE = "provider_runtime_unavailable"
+    PROVIDER_READINESS_FAILED = "provider_readiness_failed"
+    HARNESS_RUNTIME_UNAVAILABLE = "harness_runtime_unavailable"
+    STARTUP_BLOCKED = "startup_blocked"
+
+
+_STARTUP_FAILURE_CATEGORIES = frozenset(
+    category.value
+    for category in StartupFailureCategory
+)
 _DETOUR_EFFECT_CLASSES = frozenset({
     "read_only",
     "observation_refresh",
@@ -862,6 +877,14 @@ def build_terminal_session_event(
 ) -> TerminalSessionEvent:
     if startup_status not in _STARTUP_STATUSES:
         raise TerminalProtocolError("terminal session startup status is invalid")
+    normalized_failure_category = str(failure_category or "")
+    if (
+        startup_status == "blocked"
+        and normalized_failure_category not in _STARTUP_FAILURE_CATEGORIES
+    ):
+        raise TerminalProtocolError(
+            "terminal session startup failure category is invalid"
+        )
     frame_hash = presentation_hash(rendered_frame)
     event_identity = _record_hash({
         "process_instance_id": process_instance_id,
@@ -880,7 +903,7 @@ def build_terminal_session_event(
         "auth_mode": auth_mode,
         "provider_ready": bool(provider_ready),
         "startup_status": startup_status,
-        "failure_category": failure_category,
+        "failure_category": normalized_failure_category,
         "product_authority_id": product_authority_id,
         "product_revision": product_revision,
         "product_checkpoint_thread_id": product_checkpoint_thread_id,
@@ -965,8 +988,13 @@ def validate_terminal_session_event(
     if status == "ready":
         if not raw["provider_ready"] or failure_category:
             raise TerminalProtocolError("ready terminal session has failure metadata")
-    elif raw["provider_ready"] or not failure_category:
-        raise TerminalProtocolError("blocked terminal session lacks failure metadata")
+    else:
+        if raw["provider_ready"] or not failure_category:
+            raise TerminalProtocolError("blocked terminal session lacks failure metadata")
+        if failure_category not in _STARTUP_FAILURE_CATEGORIES:
+            raise TerminalProtocolError(
+                "terminal session startup failure category is invalid"
+            )
     product_authority_id = str(raw.get("product_authority_id") or "")
     product_revision = raw.get("product_revision")
     product_checkpoint_thread_id = str(

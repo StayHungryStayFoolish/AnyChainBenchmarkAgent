@@ -111,6 +111,11 @@ whole-plan semantic admission。其后的 `admit` 是不同的信任边界：在
 进入 durable queue 前，确定性校验 action schema、provenance、冲突、前置条件、
 pending-question contract 和 queue eligibility。
 
+持久化 semantic-partition receipt 必须把 `planning_lane` 明确记录为
+`bounded_semantic_value` 或 `hierarchical`。生产者、runtime-event validator、
+retained-regression verifier 和审计导出共用同一严格 schema；lane 缺失或未知时
+必须 fail closed。
+
 单个标量值的 bounded lane 比通用 whole-plan 路径更窄。只有 pending
 option/manual value 或已注册 semantic value 在用户原文中存在精确 anchor 时，
 `bounded_semantic_lane.py` 才能让模型在有限 candidate catalog 内映射一次。
@@ -193,11 +198,20 @@ Head revision 从精确 checkpoint 重建当前 v6 event。每个 runtime projec
 因此一个 session 或 purpose 不能移除另一个 authority 的 observation。
 不得把旧字节重新标记成当前证据。
 
+live acceptance 必须通过与 CLI 相同的持久 Agent 配置加载器解析
+provider/model，并把该精确身份冻结到子 PTY 环境。runner 专用环境变量会先
+复制为不可变快照；身份键是保留键，并且始终最后写入。子进程不能再次加载私有
+override，也不能通过事后修改环境映射静默切换模型。身份缺失或
+expected/observed 身份不一致时，在任何 evidence 获得资格前都必须 fail closed。
+
 startup session schema version 3 要求 ready session 必须引用 revision 1
 或更高的 committed Product Head，
 并携带同一 revision 的完整 runtime-event publication fence；revision 0
 不得声明 ready。交互式 CLI 与 one-shot prompt 入口在成功、失败、EOF 和
 中断路径上都必须确定性关闭 LangGraph runtime 与 SQLite 资源。
+blocked startup session 必须使用 terminal protocol 的封闭
+`StartupFailureCategory` 枚举。生产者、builder 和原始记录 validator 共用该
+枚举；未知分类必须 fail closed。
 
 控制平面的职责被明确拆分：
 

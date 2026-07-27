@@ -49,6 +49,7 @@ class ControlPlaneResponseContractTest(unittest.TestCase):
             {
                 "receipt_type": "semantic_partition",
                 "turn_index": 3,
+                "planning_lane": "hierarchical",
                 "status": "compile_owner",
                 "unit_count": 2,
                 "owner_count": 1,
@@ -91,6 +92,30 @@ class ControlPlaneResponseContractTest(unittest.TestCase):
                     turn_index=3,
                 )
                 self.assertFalse(valid)
+
+        bounded = _signed_receipt({
+            "receipt_type": "semantic_partition",
+            "turn_index": 3,
+            "planning_lane": "bounded_semantic_value",
+            "status": "review_plan",
+            "unit_count": 1,
+            "owner_count": 1,
+            "stage_a_calls": 1,
+            "errors_hash": "1" * 64,
+        })
+        self.assertEqual(
+            validate_coordinator_control_receipt(bounded, turn_index=3),
+            (True, ""),
+        )
+        unsupported_lane = dict(bounded)
+        unsupported_lane["planning_lane"] = "transcript_specific"
+        unsupported_lane.pop("receipt_id")
+        valid, reason = validate_coordinator_control_receipt(
+            _signed_receipt(unsupported_lane),
+            turn_index=3,
+        )
+        self.assertFalse(valid)
+        self.assertIn("semantics", reason)
 
     def test_every_registered_control_message_renders_in_both_languages(self) -> None:
         value_by_type = {

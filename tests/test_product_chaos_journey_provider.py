@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent.harness.runtime_identity import repository_revision
@@ -56,6 +57,8 @@ REVISION = {"commit": "abc123", "worktree_hash": "frozen-tree"}
 
 def convert_completed_journey_to_product_evidence(*args, **kwargs):
     kwargs.setdefault("round_id", "round-1")
+    kwargs.setdefault("provider", "deepseek")
+    kwargs.setdefault("model", "deepseek-chat")
     return _convert_completed_journey_to_product_evidence(*args, **kwargs)
 
 
@@ -943,6 +946,27 @@ class ProductChaosJourneyProviderTest(unittest.TestCase):
                 evidence_path=output,
             )
         self.assertFalse(output.exists())
+
+    def test_conversion_uses_persistent_nondefault_model_identity(self) -> None:
+        runtime = self._runtime(model="deepseek-v4-pro")
+        output = self.root / "configured-model-evidence" / "evidence.json"
+        with (
+            patch(
+                "tests.agent_live.product_chaos_journey_provider.load_llm_config",
+                return_value=SimpleNamespace(
+                    provider="deepseek",
+                    model="deepseek-v4-pro",
+                ),
+            ),
+            self.assertRaisesRegex(ValueError, "missing product receipts"),
+        ):
+            _convert_completed_journey_to_product_evidence(
+                self.obligation,
+                revision=REVISION,
+                round_id="round-configured-model",
+                runtime_root=runtime,
+                evidence_path=output,
+            )
 
     def test_conversion_rejects_shared_evidence_and_checkpoint_directory(self) -> None:
         runtime = self._runtime()

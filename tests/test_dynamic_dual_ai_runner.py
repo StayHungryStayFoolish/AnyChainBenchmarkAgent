@@ -597,6 +597,58 @@ class OrderedClock:
 
 
 class DynamicDualAiRunnerTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._runtime_identity = patch(
+            "tests.agent_live.dynamic_dual_ai_chaos.load_llm_config",
+            return_value=SimpleNamespace(
+                provider="deepseek",
+                model="deepseek-chat",
+            ),
+        )
+        self._runtime_identity.start()
+        self.addCleanup(self._runtime_identity.stop)
+
+    def test_config_rejects_extra_environment_identity_override(self) -> None:
+        for key in ("LLM_PROVIDER", "LLM_MODEL", "AGENT_CONFIG_LOCAL"):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "cannot override frozen identity keys",
+                ):
+                    ChaosRunConfig(
+                        repo_root=Path("/workspace"),
+                        command=("./bin/anychain-agent",),
+                        provider="deepseek",
+                        model="deepseek-v4-pro",
+                        extra_env={key: "override"},
+                    )
+
+    def test_config_freezes_extra_environment_snapshot(self) -> None:
+        source = {"CUSTOM_CHAOS_VALUE": "before"}
+        config = ChaosRunConfig(
+            repo_root=Path("/workspace"),
+            command=("./bin/anychain-agent",),
+            provider="deepseek",
+            model="deepseek-v4-pro",
+            extra_env=source,
+        )
+
+        source["CUSTOM_CHAOS_VALUE"] = "after"
+        source["LLM_MODEL"] = "another-model"
+        environment = config.isolated_environment({
+            "LLM_PROVIDER": "another-provider",
+            "LLM_MODEL": "another-model",
+            "AGENT_CONFIG_LOCAL": "/tmp/private.sh",
+        })
+
+        self.assertEqual(config.extra_env["CUSTOM_CHAOS_VALUE"], "before")
+        self.assertEqual(environment["CUSTOM_CHAOS_VALUE"], "before")
+        self.assertEqual(environment["LLM_PROVIDER"], "deepseek")
+        self.assertEqual(environment["LLM_MODEL"], "deepseek-v4-pro")
+        self.assertEqual(environment["AGENT_CONFIG_LOCAL"], "/dev/null")
+        with self.assertRaises(TypeError):
+            config.extra_env["CUSTOM_CHAOS_VALUE"] = "mutated"
+
     def test_complete_response_uses_the_newest_prompt_delimited_agent_frame(self) -> None:
         startup = "Agent> Ready.\nAgent> Choose a mode.\nUser> "
         self.assertEqual(
@@ -1289,7 +1341,7 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 current = super().baseline_session_events(**kwargs)[0]
                 return (replace(current, session_id="another-session"),)
 
-        with self.assertRaisesRegex(RuntimeError, "typed provider/model"):
+        with self.assertRaisesRegex(RuntimeError, "typed terminal session"):
             validate_startup_session_event(
                 WrongSessionStream(turn_count=1),
                 expected_revision=REVISION,
@@ -1305,9 +1357,28 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 current = super().baseline_session_events(**kwargs)[0]
                 return (replace(current, presentation_hash="0" * 64),)
 
-        with self.assertRaisesRegex(RuntimeError, "typed provider/model"):
+        with self.assertRaisesRegex(RuntimeError, "typed terminal session"):
             validate_startup_session_event(
                 WrongPresentationStream(turn_count=1),
+                expected_revision=REVISION,
+                expected_provider="deepseek",
+                expected_model="deepseek-chat",
+                expected_session_id="contract-session",
+                expected_session_purpose="dynamic-dual-ai-chaos",
+                startup_response=response,
+            )
+
+        class WrongModelStream(FakeTerminalOutcomeStream):
+            def baseline_session_events(self, **kwargs):
+                current = super().baseline_session_events(**kwargs)[0]
+                return (replace(current, model="deepseek-v4-pro"),)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "expected deepseek/deepseek-chat, observed deepseek/deepseek-v4-pro",
+        ):
+            validate_startup_session_event(
+                WrongModelStream(turn_count=1),
                 expected_revision=REVISION,
                 expected_provider="deepseek",
                 expected_model="deepseek-chat",
@@ -1762,7 +1833,7 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 ),
                 revision=REVISION,
             )
-            with self.assertRaisesRegex(RuntimeError, "provider/model"):
+            with self.assertRaisesRegex(RuntimeError, "terminal session"):
                 runner.run()
             result = json.loads(
                 (root / ".agent/dynamic-chaos/contract-session/schedule-result.json").read_text(
@@ -3001,12 +3072,12 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
 
     def test_runtime_identity_follows_explicit_process_configuration(self) -> None:
         root = Path("/tmp/anychain-chaos-contract")
-        with patch.dict(
-            os.environ,
-            {
-                "LLM_PROVIDER": "deepseek",
-                "LLM_MODEL": "configured-runtime-model",
-            },
+        with patch(
+            "tests.agent_live.dynamic_dual_ai_chaos.load_llm_config",
+            return_value=SimpleNamespace(
+                provider="deepseek",
+                model="configured-runtime-model",
+            ),
         ):
             linux = ChaosRunConfig.linux(root, session_id="configured-linux")
             docker = ChaosRunConfig.docker(root, session_id="configured-docker")
@@ -3019,6 +3090,52 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             (docker.provider, docker.model),
             ("deepseek", "configured-runtime-model"),
         )
+
+    def test_runtime_identity_follows_persistent_agent_configuration(self) -> None:
+        root = Path("/tmp/anychain-chaos-contract")
+        configured = SimpleNamespace(
+            provider="deepseek",
+            model="deepseek-v4-pro",
+        )
+        with patch(
+            "tests.agent_live.dynamic_dual_ai_chaos.load_llm_config",
+            return_value=configured,
+        ):
+            direct = ChaosRunConfig(
+                repo_root=root,
+                command=("agent",),
+                session_id="persistent-direct",
+            )
+            linux = ChaosRunConfig.linux(root, session_id="persistent-linux")
+            docker = ChaosRunConfig.docker(root, session_id="persistent-docker")
+
+        self.assertEqual(
+            (direct.provider, direct.model),
+            ("deepseek", "deepseek-v4-pro"),
+        )
+        self.assertEqual(
+            (linux.provider, linux.model),
+            ("deepseek", "deepseek-v4-pro"),
+        )
+        self.assertEqual(
+            (docker.provider, docker.model),
+            ("deepseek", "deepseek-v4-pro"),
+        )
+        command_text = " ".join(docker.command)
+        self.assertIn("LLM_PROVIDER=deepseek", command_text)
+        self.assertIn("LLM_MODEL=deepseek-v4-pro", command_text)
+        self.assertIn(
+            "AGENT_CONFIG_LOCAL=/dev/null",
+            command_text,
+        )
+
+    def test_runtime_identity_rejects_partial_explicit_configuration(self) -> None:
+        with self.assertRaisesRegex(ValueError, "supplied together"):
+            ChaosRunConfig(
+                repo_root=Path("/tmp/anychain-chaos-contract"),
+                command=("agent",),
+                provider="deepseek",
+            )
 
     def test_explicit_runtime_identity_overrides_process_configuration(self) -> None:
         root = Path("/tmp/anychain-chaos-contract")

@@ -336,6 +336,17 @@ class OrderedClock:
 
 
 class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._runtime_identity = patch(
+            "tests.agent_live.dynamic_dual_ai_chaos.load_llm_config",
+            return_value=SimpleNamespace(
+                provider="deepseek",
+                model="deepseek-chat",
+            ),
+        )
+        self._runtime_identity.start()
+        self.addCleanup(self._runtime_identity.stop)
+
     def _event(
         self,
         turn_index: int,

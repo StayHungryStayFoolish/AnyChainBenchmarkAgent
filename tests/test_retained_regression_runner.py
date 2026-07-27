@@ -47,6 +47,7 @@ from tests.agent_live.retained_regression_runner import (
     freeze_retained_regression_open_batch,
     RETAINED_REGRESSION_JOURNEY_VERIFIER_REGISTRY,
     RETAINED_REGRESSION_REGISTRY_IMPORT,
+    _validate_exact_terminal_revision,
     _write_exact_retained_artifacts,
     retained_regression_journey_definitions,
     validate_retained_regression_runner_provider,
@@ -59,6 +60,25 @@ REVISION = {"commit": "a" * 40, "worktree_hash": "b" * 64}
 
 
 class RetainedRegressionExactFailureBoundaryTest(unittest.TestCase):
+    def test_exact_terminal_revision_uses_protocol_origin_revision(self) -> None:
+        class Outcome:
+            origin_revision = REVISION
+
+        _validate_exact_terminal_revision(
+            Outcome(),
+            active_revision=REVISION,
+            stage="resume",
+        )
+        with self.assertRaisesRegex(RuntimeError, "turn terminal revision"):
+            _validate_exact_terminal_revision(
+                Outcome(),
+                active_revision={
+                    "commit": "stale",
+                    "worktree_hash": REVISION["worktree_hash"],
+                },
+                stage="turn",
+            )
+
     def test_exact_suite_failure_never_publishes_execution_index(self) -> None:
         obligation_id = "exact-failure-boundary"
         target = {
@@ -855,6 +875,8 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
                         revision=REVISION,
                         runtime_root=root,
                         evidence_path=output,
+                        provider="deepseek",
+                        model="deepseek-chat",
                     )
                 )
             self.assertEqual(converted, output)
