@@ -24,6 +24,7 @@ from .action_registry import (
     ACTION_BY_TYPE,
     ACTION_SPECS,
     SEMANTIC_OPERATIONS,
+    pending_barrier_semantics,
     registered_semantic_value_domains,
     semantic_value_domain_conflicts,
     validate_action_contract,
@@ -481,6 +482,11 @@ def _stage_a_prompt() -> str:
         "declared option's meaning or action, form one pending_answer for the affirmed option. "
         "The rejected alternative is contrast evidence, not a pending answer of its own, and the "
         "affirmed option action is not also a sibling domain request. "
+        "pending_barrier_contract governs pending-answer ownership and queue scheduling only. "
+        "It never forbids semantic routing to another registered group. In particular, when "
+        "registered_cross_group_values is route_to_registered_owner, route an independent "
+        "registered value to that owner even under exclusive_owner; do not mark it unresolved "
+        "merely because another group has a pending question. "
         "The supporting clause may be context, but it is not a separate demand. The explanation is not a "
         "domain request merely because it discusses the option's subject. Split it only when the "
         "user independently asks for research, explanation, navigation, or a mutation. "
@@ -524,6 +530,7 @@ def _stage_a_payload(
         "language": state.get("language") or "en",
         "active_group": state.get("active_group") or "opening",
         "pending_question": pending,
+        "pending_barrier_contract": pending_barrier_semantics(pending),
         "registered_semantic_value_domains": list(
             registered_semantic_value_domains()
         ),
@@ -564,7 +571,7 @@ def _cross_domain_pending_errors(
     partition: Sequence[Mapping[str, Any]],
     state: AgentGraphState,
 ) -> tuple[str, ...]:
-    """Reject a registered semantic value consumed by another pending owner."""
+    """Enforce registered value ownership while another group is pending."""
 
     pending = dict(state.get("pending_question") or {})
     if not pending:
@@ -572,20 +579,51 @@ def _cross_domain_pending_errors(
     pending_group = str(pending.get("group") or "")
     errors: list[str] = []
     for unit in partition:
-        if str(unit.get("operation") or "") != "pending_answer":
-            continue
+        operation = str(unit.get("operation") or "")
         source = str(unit.get("source_text") or "")
-        for record in semantic_value_domain_conflicts(
+        conflicts = semantic_value_domain_conflicts(
             source,
             owning_group=pending_group,
             pending_question=pending,
-        ):
-            errors.append(
-                "Stage A assigned a registered semantic value to the wrong "
-                "pending owner: "
-                f"{unit.get('unit_id')}/{record.get('semantic_owner')}/"
-                f"{record.get('action_type')}/{record.get('value')}"
-            )
+        )
+        if not conflicts:
+            continue
+        if operation == "pending_answer":
+            for record in conflicts:
+                errors.append(
+                    "Stage A assigned a registered semantic value to the wrong "
+                    "pending owner: "
+                    f"{unit.get('unit_id')}/{record.get('semantic_owner')}/"
+                    f"{record.get('action_type')}/{record.get('value')}"
+                )
+            continue
+        if operation == "unresolved":
+            for record in conflicts:
+                errors.append(
+                    "Stage A left a registered cross-group semantic value "
+                    "unresolved while another group was pending; route an "
+                    "independent request to its registered owner instead of "
+                    "treating the pending barrier as a routing barrier: "
+                    f"{unit.get('unit_id')}/{record.get('semantic_owner')}/"
+                    f"{record.get('action_type')}/{record.get('value')}"
+                )
+            continue
+        if operation != "domain_request":
+            continue
+        routed_groups = {
+            str(route.get("group") or "")
+            for route in unit.get("owner_routes") or []
+            if isinstance(route, Mapping)
+        }
+        for record in conflicts:
+            target_group = str(record.get("target_group") or "")
+            if target_group and target_group not in routed_groups:
+                errors.append(
+                    "Stage A routed a registered cross-group semantic value "
+                    "to the wrong domain owner: "
+                    f"{unit.get('unit_id')}/{target_group}/"
+                    f"{record.get('action_type')}/{record.get('value')}"
+                )
     return tuple(dict.fromkeys(errors))
 
 
@@ -963,8 +1001,14 @@ def _review_stage_a_partition(
         "clauses": stage_a_payload["clauses"],
         "semantic_units": [dict(unit) for unit in partition],
         "pending_question": dict(stage_a_payload.get("pending_question") or {}),
+        "pending_barrier_contract": dict(
+            stage_a_payload.get("pending_barrier_contract") or {}
+        ),
         "pending_typed_candidates": list(
             stage_a_payload.get("pending_typed_candidates") or []
+        ),
+        "registered_semantic_value_domains": list(
+            stage_a_payload.get("registered_semantic_value_domains") or []
         ),
         "groups": stage_a_payload["groups"],
         "universal_operations": stage_a_payload["universal_operations"],

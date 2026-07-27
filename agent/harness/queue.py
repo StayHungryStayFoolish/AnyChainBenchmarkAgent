@@ -13,6 +13,7 @@ from .action_registry import (
     action_merge_key,
     action_execution_phase,
     action_is_turn_local,
+    pending_barrier_semantics,
     state_has_capability,
 )
 from .state import AgentGraphState
@@ -374,8 +375,9 @@ def action_can_run_while_pending(
         and action.get("navigation_explicit") is True
         and source_is_grounded
     )
-    if pending.get("queue_barrier"):
-        barrier_policy = str(pending.get("barrier_policy") or "")
+    barrier = pending_barrier_semantics(pending)
+    if barrier["queue_barrier"]:
+        barrier_policy = str(barrier["policy"])
         pending_created_this_turn = bool(
             int(pending.get("created_turn_index") or 0)
             == int(state.get("turn_index") or 0)

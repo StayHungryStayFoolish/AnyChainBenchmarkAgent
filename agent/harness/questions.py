@@ -11,6 +11,7 @@ from agent.knowledge.chain_identity import canonicalize_chain_scalar, repo_chain
 from agent.workflows.group_registry import GROUP_OWNER
 from .action_registry import (
     ACTION_BY_TYPE,
+    pending_barrier_semantics,
     semantic_value_domain_conflicts,
     validate_candidate_binding_contract,
 )
@@ -140,6 +141,7 @@ def validate_pending_question_contract(question: dict[str, Any]) -> dict[str, An
         raise ValueError(
             f"pending question requires contract_version {QUESTION_CONTRACT_VERSION}"
         )
+    pending_barrier_semantics(question)
     retired_text_keys = {"prompt", "help_text", "completion_effect"}
     present_retired = sorted(retired_text_keys & set(question))
     if present_retired:

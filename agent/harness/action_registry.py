@@ -72,7 +72,66 @@ SEMANTIC_VALUE_DOMAIN_POLICY: Mapping[str, Any] = {
     "declared_pending_options_own_values": True,
     "targetless_domain_owner": "action_type",
 }
+PENDING_BARRIER_POLICIES: Mapping[str, Mapping[str, Any]] = {
+    "none": {
+        "answer_ownership": "pending_owner_only",
+        "registered_cross_group_values": "route_to_registered_owner",
+        "new_question_same_turn": "question_contract",
+        "independent_cross_group_request": "route_then_apply_queue_policy",
+        "declared_entry_intake": True,
+        "preserving_detour": True,
+        "explicit_navigation": True,
+    },
+    "exclusive_owner": {
+        "answer_ownership": "pending_owner_only",
+        "registered_cross_group_values": "route_to_registered_owner",
+        "new_question_same_turn": "block_durable_actions",
+        "independent_cross_group_request": "route_then_apply_queue_policy",
+        "declared_entry_intake": True,
+        "preserving_detour": False,
+        "explicit_navigation": True,
+    },
+    "explicit_detour_only": {
+        "answer_ownership": "pending_owner_only",
+        "registered_cross_group_values": "route_to_registered_owner",
+        "new_question_same_turn": "explicit_detours_only",
+        "independent_cross_group_request": "route_then_apply_queue_policy",
+        "declared_entry_intake": False,
+        "preserving_detour": False,
+        "explicit_navigation": True,
+    },
+}
 _SEMANTIC_VALUE_IDENTIFIER_CHARACTER = r"A-Za-z0-9_-"
+
+
+def pending_barrier_semantics(
+    pending_question: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Return the authoritative semantics for one pending queue barrier.
+
+    A barrier owns pending-answer binding and queue scheduling. It never
+    changes the semantic owner of an independent user request.
+    """
+
+    pending = dict(pending_question or {})
+    queue_barrier = pending.get("queue_barrier") is True
+    policy = str(pending.get("barrier_policy") or "").strip()
+    if not policy:
+        policy = "exclusive_owner" if queue_barrier else "none"
+    if policy not in PENDING_BARRIER_POLICIES:
+        raise ValueError(f"unknown pending barrier policy: {policy}")
+    if not queue_barrier and policy != "none":
+        raise ValueError(
+            "pending barrier policy requires queue_barrier=true"
+        )
+    return {
+        "schema_version": 1,
+        "policy": policy,
+        "queue_barrier": queue_barrier,
+        "pending_group": str(pending.get("group") or ""),
+        "pending_owner": str(pending.get("owner") or ""),
+        **dict(PENDING_BARRIER_POLICIES[policy]),
+    }
 
 
 def answer_pending_representation_conflict(action: Mapping[str, Any]) -> bool:
@@ -1154,6 +1213,7 @@ def action_registry_contract_hash() -> str:
         "consultation_topics": sorted(CONSULTATION_TOPICS),
         "semantic_value_domain_policy": SEMANTIC_VALUE_DOMAIN_POLICY,
         "semantic_value_domains": registered_semantic_value_domains(),
+        "pending_barrier_policies": PENDING_BARRIER_POLICIES,
     })
 
 

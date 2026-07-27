@@ -12,8 +12,10 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
     def test_registered_semantic_domains_include_chain_aliases(self) -> None:
         from agent.harness.action_registry import (
             ACTION_BY_TYPE,
+            PENDING_BARRIER_POLICIES,
             SEMANTIC_VALUE_DOMAIN_POLICY,
             action_registry_contract_hash,
+            pending_barrier_semantics,
             registered_semantic_value_domains,
         )
 
@@ -34,7 +36,186 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             for record in records
         ))
         self.assertEqual(SEMANTIC_VALUE_DOMAIN_POLICY["schema_version"], 2)
+        self.assertEqual(
+            PENDING_BARRIER_POLICIES["exclusive_owner"][
+                "registered_cross_group_values"
+            ],
+            "route_to_registered_owner",
+        )
+        self.assertEqual(
+            pending_barrier_semantics({
+                "queue_barrier": True,
+                "barrier_policy": "exclusive_owner",
+                "group": "chain_identity",
+                "owner": "chain_rpc",
+            })["pending_group"],
+            "chain_identity",
+        )
         self.assertEqual(len(action_registry_contract_hash()), 64)
+
+    def test_pending_barrier_rejects_unknown_policy(self) -> None:
+        from agent.harness.action_registry import pending_barrier_semantics
+
+        with self.assertRaisesRegex(ValueError, "unknown pending barrier policy"):
+            pending_barrier_semantics({
+                "queue_barrier": True,
+                "barrier_policy": "model_decides",
+            })
+
+    def test_registered_cross_group_value_cannot_be_left_unresolved(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _cross_domain_pending_errors,
+        )
+
+        state = {
+            "pending_question": {
+                "group": "chain_identity",
+                "value_domain": "researched_identity",
+                "queue_barrier": True,
+                "barrier_policy": "exclusive_owner",
+            },
+        }
+        unresolved = [{
+            "unit_id": "unit-1",
+            "source_text": "standard",
+            "operation": "unresolved",
+            "owner_routes": [],
+        }]
+        correctly_routed = [{
+            "unit_id": "unit-1",
+            "source_text": "standard",
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "performance",
+                "group": "qps_profile",
+            }],
+        }]
+        incorrectly_routed = [{
+            "unit_id": "unit-1",
+            "source_text": "standard",
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "chain_rpc",
+                "group": "chain_identity",
+            }],
+        }]
+
+        self.assertTrue(_cross_domain_pending_errors(unresolved, state))
+        self.assertEqual(
+            _cross_domain_pending_errors(correctly_routed, state),
+            (),
+        )
+        self.assertTrue(_cross_domain_pending_errors(incorrectly_routed, state))
+
+    def test_registered_value_consultation_remains_read_only(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _cross_domain_pending_errors,
+        )
+
+        state = {
+            "pending_question": {
+                "group": "chain_identity",
+                "value_domain": "researched_identity",
+                "queue_barrier": True,
+                "barrier_policy": "exclusive_owner",
+            },
+        }
+        consultation = [{
+            "unit_id": "unit-1",
+            "source_text": "What does the standard profile mean?",
+            "operation": "consultation",
+            "owner_routes": [{
+                "owner": "orientation",
+                "group": "qps_profile",
+            }],
+        }]
+
+        self.assertEqual(
+            _cross_domain_pending_errors(consultation, state),
+            (),
+        )
+
+    def test_stage_a_repairs_registered_cross_group_unresolved_unit(self) -> None:
+        from agent.harness.hierarchical_planner import begin_semantic_partition
+        from agent.harness.state import new_state
+
+        state = new_state("cross-group-stage-a-repair", language="en")
+        state["turn_index"] = 4
+        state["active_group"] = "chain_identity"
+        state["pending_question"] = {
+            "id": "chain",
+            "group": "chain_identity",
+            "owner": "chain_rpc",
+            "kind": "chain",
+            "field": "chain",
+            "manual_input_allowed": True,
+            "options": [],
+            "queue_barrier": True,
+            "barrier_policy": "exclusive_owner",
+            "value_domain": "researched_identity",
+        }
+        first = {
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": "standard",
+                "operation": "unresolved",
+                "owner_routes": [],
+                "reason": "another group has an exclusive pending question",
+            }],
+            "reason": "unresolved",
+        }
+        repaired = {
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": "standard",
+                "operation": "domain_request",
+                "owner_routes": [{
+                    "owner": "performance",
+                    "group": "qps_profile",
+                }],
+                "reason": "registered QPS profile request",
+            }],
+            "reason": "routed",
+        }
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                side_effect=(
+                    json.dumps(first),
+                    json.dumps(repaired),
+                ),
+            ) as compiler,
+        ):
+            result = begin_semantic_partition(state, "standard")
+
+        self.assertEqual(result["status"], "compile_owner")
+        self.assertEqual(result["stage_a_calls"], 2)
+        self.assertEqual(
+            result["owner_requests"],
+            [{
+                "owner": "performance",
+                "unit_ids": ["unit-1"],
+                "groups": ["qps_profile"],
+            }],
+        )
+        repair_payload = compiler.call_args_list[1].kwargs["request_payload"]
+        self.assertTrue(any(
+            "registered cross-group semantic value" in error
+            for error in repair_payload["contract_repair"]["validation_errors"]
+        ))
+        self.assertEqual(
+            repair_payload["pending_barrier_contract"][
+                "registered_cross_group_values"
+            ],
+            "route_to_registered_owner",
+        )
 
     def test_local_pending_path_uses_registered_semantic_domains(self) -> None:
         from agent.harness.questions import answer_fits_pending

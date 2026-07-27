@@ -476,6 +476,66 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         self.assertEqual(result["pending_question"]["id"], "qps_profile_confirm")
         self.assertEqual(result["action_queue"], [])
 
+    def test_declared_entry_intake_can_interrupt_exclusive_pending(
+        self,
+    ) -> None:
+        from agent.harness.queue import action_can_run_while_pending
+        from agent.harness.state import new_state
+
+        state = new_state("exclusive-entry-interruption", language="en")
+        state["turn_index"] = 4
+        state["active_group"] = "chain_identity"
+        state["pending_question"] = {
+            "id": "chain",
+            "group": "chain_identity",
+            "owner": "chain_rpc",
+            "queue_barrier": True,
+            "barrier_policy": "exclusive_owner",
+            "created_turn_index": 2,
+            "accepted_action_types": ["answer_pending", "choose_chain"],
+        }
+        action = {
+            "type": "choose_target_mode",
+            "target_mode": "sync-observe",
+            "target_mode_explicit": True,
+            "source_evidence": "sync-observe",
+            "_origin_text": "Switch to sync-observe.",
+        }
+
+        self.assertTrue(action_can_run_while_pending(state, action))
+
+        state["pending_question"]["created_turn_index"] = 4
+        self.assertFalse(action_can_run_while_pending(state, action))
+
+    def test_ungrounded_entry_intake_cannot_cross_exclusive_pending(
+        self,
+    ) -> None:
+        from agent.harness.queue import action_can_run_while_pending
+        from agent.harness.state import new_state
+
+        state = new_state("exclusive-ungrounded-entry", language="en")
+        state["turn_index"] = 4
+        state["pending_question"] = {
+            "id": "chain",
+            "group": "chain_identity",
+            "owner": "chain_rpc",
+            "queue_barrier": True,
+            "barrier_policy": "exclusive_owner",
+            "created_turn_index": 2,
+            "accepted_action_types": ["answer_pending", "choose_chain"],
+        }
+
+        self.assertFalse(action_can_run_while_pending(
+            state,
+            {
+                "type": "choose_target_mode",
+                "target_mode": "sync-observe",
+                "target_mode_explicit": True,
+                "source_evidence": "sync-observe",
+                "_origin_text": "Tell me about the benchmark.",
+            },
+        ))
+
     def test_single_free_text_resolver_is_the_action_queue(self) -> None:
         """Architecture audit: the older single-action resolver generation
 
