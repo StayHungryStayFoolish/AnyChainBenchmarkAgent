@@ -7,6 +7,7 @@ import json
 import re
 from typing import Any, Mapping
 
+from ..llm.types import ReasoningMode
 from .action_registry import (
     ACTION_BY_TYPE,
     ACTION_SPECS,
@@ -451,6 +452,7 @@ def _review_bounded_semantic_candidate(
     allowed_action_types: frozenset[str] | None = None,
     whole_plan_contract_repair: bool = False,
     compact_pending_review: bool = False,
+    reasoning_mode: ReasoningMode = "provider_default",
 ) -> tuple[ImmutableSemanticPlan | None, WholePlanAdmission | None, tuple[str, ...]]:
     if not validation.valid:
         return None, None, tuple(validation.errors)
@@ -474,6 +476,7 @@ def _review_bounded_semantic_candidate(
             else ALLOWED_ACTION_TYPES
         ),
         contract_repair=whole_plan_contract_repair,
+        reasoning_mode=reasoning_mode,
     )
     return plan, admission, admission.errors
 

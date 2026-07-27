@@ -26,14 +26,21 @@ from tests.agent_live.coverage_evidence import (
     content_hash,
     pty_transcript_hash,
     repository_revision,
+    validate_runtime_turn_event,
     verify_runtime_postcondition,
     write_evidence_artifact,
 )
 from tests.agent_live.dynamic_dual_ai_chaos import (
     ChaosRunConfig,
+    CompletionExpectation,
     JsonlRuntimeEventStream,
+    JsonlTerminalOutcomeStream,
     SubprocessPtyTransport,
-    _provider_model_from_startup,
+    WorkflowCompletion,
+    _startup_resume_submission,
+    validate_startup_terminal_protocol,
+    validate_startup_session_event,
+    wait_for_turn_completion,
 )
 from tests.agent_live.generate_harness_coverage_ledger import (
     build_ledger,
@@ -131,25 +138,85 @@ def execute_edge(
     env = _runtime_environment(config, runtime_root)
     transport = SubprocessPtyTransport(config.command, cwd=repo_root)
     event_stream = JsonlRuntimeEventStream(runtime_root / "turn-events.jsonl")
+    terminal_stream = JsonlTerminalOutcomeStream(
+        runtime_root / "terminal-outcomes.jsonl",
+        poll_interval_seconds=config.poll_interval_seconds,
+    )
     transcript: list[str] = []
+    terminal_stream.mark_process_start()
+    event_stream.mark_process_start()
     transport.start(env=env)
     try:
         startup = transport.read_complete_agent_response(timeout_seconds=timeout_seconds)
         transcript.append(startup)
-        provider, model = _provider_model_from_startup(startup)
-        baseline = event_stream.baseline()
+        startup_session = validate_startup_session_event(
+            terminal_stream,
+            expected_revision=revision,
+            expected_provider=config.provider,
+            expected_model=config.model,
+            expected_session_id=session_id,
+            expected_session_purpose=config.session_purpose,
+            startup_response=startup,
+        )
+        provider = startup_session.provider
+        model = startup_session.model
+        runtime_history, startup_events = event_stream.capture_startup_snapshot()
+        combined_events = (*runtime_history, *startup_events)
+        if not combined_events:
+            raise RuntimeError("real CLI contract requires a baseline runtime event")
+        for historical_event in runtime_history:
+            validate_runtime_turn_event(historical_event)
+        baseline = combined_events[-1]
+        startup_outcomes, startup_detours = (
+            terminal_stream.capture_startup_snapshot()
+        )
+        validate_startup_terminal_protocol(
+            startup_events,
+            startup_outcomes,
+            expected_revision=revision,
+            session_event=startup_session,
+            detours=startup_detours,
+            baseline_event=baseline,
+        )
         _require_revision(baseline.revision, revision)
 
         if baseline.pending_question_id != str(edge.get("question_id") or ""):
-            if baseline.pending_question_id != "resume_harness_session":
+            resume_submission = _startup_resume_submission(
+                baseline.pending_contract,
+                desired="continue",
+            )
+            if not resume_submission:
                 raise RuntimeError(
                     "startup did not expose the target or resume contract: "
                     f"{baseline.pending_question_id or '<none>'}"
                 )
-            transport.submit_bracketed_paste("1")
-            resumed_response = transport.read_complete_agent_response(timeout_seconds=timeout_seconds)
-            transcript.extend(("User> 1", resumed_response))
-            baseline = event_stream.next_event(timeout_seconds=timeout_seconds)
+            transport.submit_bracketed_paste(resume_submission)
+            resume_completion = wait_for_turn_completion(
+                transport,
+                event_stream,
+                terminal_stream,
+                timeout_seconds=timeout_seconds,
+                expectation=CompletionExpectation(
+                    submitted_input=resume_submission,
+                    session_id=session_id,
+                    session_purpose=config.session_purpose,
+                    product_authority_id=startup_session.product_authority_id,
+                    process_instance_id=startup_session.process_instance_id,
+                    product_revision=int(baseline.product_revision),
+                    product_checkpoint_thread_id=(
+                        baseline.product_checkpoint_thread_id
+                    ),
+                    product_checkpoint_id=baseline.product_checkpoint_id,
+                    product_fingerprint=baseline.after_fingerprint,
+                ),
+            )
+            if not isinstance(resume_completion, WorkflowCompletion):
+                raise RuntimeError(
+                    "real CLI resume did not produce a workflow completion"
+                )
+            resumed_response = resume_completion.response
+            transcript.extend((f"User> {resume_submission}", resumed_response))
+            baseline = resume_completion.event
             _require_revision(baseline.revision, revision)
 
         _require_target_contract(edge, baseline.pending_contract)
@@ -157,9 +224,32 @@ def execute_edge(
         previous_received_ns = time.time_ns()
         submitted_ns = time.time_ns()
         transport.submit_bracketed_paste(user_input)
-        response = transport.read_complete_agent_response(timeout_seconds=timeout_seconds)
+        completion = wait_for_turn_completion(
+            transport,
+            event_stream,
+            terminal_stream,
+            timeout_seconds=timeout_seconds,
+            expectation=CompletionExpectation(
+                submitted_input=user_input,
+                session_id=session_id,
+                session_purpose=config.session_purpose,
+                product_authority_id=startup_session.product_authority_id,
+                process_instance_id=startup_session.process_instance_id,
+                product_revision=int(baseline.product_revision),
+                product_checkpoint_thread_id=(
+                    baseline.product_checkpoint_thread_id
+                ),
+                product_checkpoint_id=baseline.product_checkpoint_id,
+                product_fingerprint=baseline.after_fingerprint,
+            ),
+        )
+        if not isinstance(completion, WorkflowCompletion):
+            raise RuntimeError(
+                "real CLI edge did not produce a workflow completion"
+            )
+        response = completion.response
         response_received_ns = time.time_ns()
-        committed = event_stream.next_event(timeout_seconds=timeout_seconds)
+        committed = completion.event
         _require_revision(committed.revision, revision)
         transcript.extend((f"User> {user_input}", response))
 
@@ -270,6 +360,9 @@ def _runtime_environment(config: ChaosRunConfig, runtime_root: Path) -> dict[str
         "ANYCHAIN_AGENT_SESSION_PURPOSE": config.session_purpose,
         "ANYCHAIN_AGENT_JOBS_DIR": str(process_root / "jobs"),
         "ANYCHAIN_AGENT_TURN_EVENT_FILE": str(process_root / "turn-events.jsonl"),
+        "ANYCHAIN_AGENT_TERMINAL_OUTCOME_FILE": str(
+            process_root / "terminal-outcomes.jsonl"
+        ),
     })
     return env
 

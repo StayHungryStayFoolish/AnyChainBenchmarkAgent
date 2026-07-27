@@ -7751,6 +7751,7 @@ network:
 
     def test_target_mode_change_candidate_survives_langgraph_checkpoint(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.domains.environment import question_for_environment
         from agent.harness.state import new_state
         from tests.agent_live.graph_turn import reviewed_stage_planner
 
@@ -7763,13 +7764,10 @@ network:
             initial["active_group"] = "provider_deployment"
             initial["chain_identity"] = {"raw": "bsc", "canonical": "bsc", "status": "confirmed", "case": "known"}
             initial["confirmed_config"] = {"BLOCKCHAIN_NODE": "bsc"}
-            initial["pending_question"] = {
-                "id": "CLOUD_REGION",
-                "group": "provider_deployment",
-                "kind": "manual_value",
-                "field": "CLOUD_REGION",
-                "manual_input_allowed": True,
-            }
+            initial["pending_question"] = question_for_environment(
+                initial,
+                "provider_deployment",
+            )
             runtime.graph.update_state({"configurable": {"thread_id": "unit-thread"}}, initial)
 
             with reviewed_stage_planner(_admitted_mock_resolver({

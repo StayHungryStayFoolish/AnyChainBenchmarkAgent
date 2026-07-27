@@ -11,7 +11,12 @@ from typing import Any, Mapping
 from agent.runners.job_manager import verify_job_receipt
 
 from .state import AgentGraphState, PendingQuestion, RESET_PRESERVED_KEYS, new_state
+from .input_identity import user_input_hash
 from . import hierarchical_planner
+from .bounded_semantic_lane import (
+    compile_bounded_semantic_value,
+    review_bounded_semantic_plan,
+)
 from .oracle import (
     compute_next_action,
 )
@@ -618,7 +623,7 @@ def _record_pending_resolution(
             ),
             "selected_value_hash": _receipt_hash(selected),
             "resolved_action_id": str(action.get("action_id") or ""),
-            "input_hash": hashlib.sha256(input_text.encode("utf-8")).hexdigest(),
+            "input_hash": user_input_hash(input_text),
             "normalizer": str(
                 (pending.get("validation") or {}).get("normalization")
                 or (
@@ -934,7 +939,7 @@ def prepare_turn_step(state: AgentGraphState) -> AgentGraphState:
     state["turn_receipt"] = turn_receipt_to_dict(
         TurnReceipt(
             turn_id=turn_id,
-            input_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            input_hash=user_input_hash(text),
             language=str(state.get("language") or "en"),
             input_shape=input_shape,
             clauses=tuple(clause.as_dict() for clause in clauses),
@@ -1167,12 +1172,17 @@ def partition_turn_step(state: AgentGraphState) -> AgentGraphState:
     """Persist Stage A's semantic partition and owner schedule."""
 
     text = str((state.get("turn_context") or {}).get("text") or "")
-    document = hierarchical_planner.begin_semantic_partition(state, text)
+    document = compile_bounded_semantic_value(state, text)
+    planning_lane = "bounded_semantic_value"
+    if document is None:
+        document = hierarchical_planner.begin_semantic_partition(state, text)
+        planning_lane = "hierarchical"
     state["semantic_planning"] = document
     _append_control_receipt(
         state,
         "semantic_partition",
         {
+            "planning_lane": planning_lane,
             "status": str(document.get("status") or ""),
             "unit_count": int(document.get("unit_count") or 0),
             "owner_count": int(document.get("owner_count") or 0),
@@ -1231,7 +1241,12 @@ def review_plan_turn_step(state: AgentGraphState) -> AgentGraphState:
     """Run whole-plan admission only after all owner documents are persisted."""
 
     document = dict(state.get("semantic_planning") or {})
-    queue = hierarchical_planner.review_semantic_plan(state, document)
+    try:
+        queue = review_bounded_semantic_plan(state, document)
+    except ValueError as exc:
+        raise StateInvariantError(str(exc)) from exc
+    if queue is None:
+        queue = hierarchical_planner.review_semantic_plan(state, document)
     state["semantic_planning"] = {
         **document,
         "status": "reviewed",
@@ -1262,7 +1277,7 @@ def _consume_planner_queue(
         state,
         "semantic_planner",
         {
-            "input_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "input_hash": user_input_hash(text),
             "pending_contract_hash": _receipt_hash(
                 state.get("pending_question") or {}
             ),

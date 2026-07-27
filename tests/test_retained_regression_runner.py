@@ -28,6 +28,7 @@ from tests.agent_live.coverage_evidence import (
 from tests.agent_live.dynamic_dual_ai_chaos import (
     JourneyDecisionProvenance,
     JourneyVerifierContext,
+    TerminalTurnFailure,
 )
 from tests.agent_live.journey_simulator_bridge import load_verifier_registry
 from tests.agent_live.retained_regression_obligations import (
@@ -55,6 +56,59 @@ from tests.agent_live.retained_regression_runner import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REVISION = {"commit": "a" * 40, "worktree_hash": "b" * 64}
+
+
+class RetainedRegressionExactFailureBoundaryTest(unittest.TestCase):
+    def test_exact_suite_failure_never_publishes_execution_index(self) -> None:
+        obligation_id = "exact-failure-boundary"
+        target = {
+            "obligation_id": obligation_id,
+            "variant": "exact",
+        }
+        provider = {
+            "provider_hash": "provider-hash",
+            "revision_binding": REVISION,
+            "targets": [target],
+        }
+        obligations = [{"obligation_id": obligation_id}]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "exact"
+
+            def fail_execution(**kwargs):
+                runtime = kwargs["output_root"] / "failed-runtime"
+                runtime.mkdir()
+                (runtime / "terminal-failure.json").write_text(
+                    json.dumps({
+                        "qualifying_evidence": False,
+                        "failure_kind": "typed_terminal_failure",
+                    }),
+                    encoding="utf-8",
+                )
+                raise TerminalTurnFailure(
+                    "provider_failure",
+                    "Agent terminal reported a provider failure.",
+                )
+
+            with patch(
+                "tests.agent_live.retained_regression_runner."
+                "execute_exact_retained_regression",
+                side_effect=fail_execution,
+            ):
+                with self.assertRaises(TerminalTurnFailure):
+                    execute_exact_retained_regressions(
+                        repo_root=REPO_ROOT,
+                        provider=provider,
+                        obligations=obligations,
+                        output_root=output,
+                        obligation_id=obligation_id,
+                    )
+
+            self.assertTrue((output / "failed-runtime/terminal-failure.json").is_file())
+            self.assertFalse((output / "execution-index.json").exists())
+            self.assertEqual(
+                list(output.rglob("product-obligation-evidence.json")),
+                [],
+            )
 
 
 class RetainedRegressionRunnerProviderTest(unittest.TestCase):

@@ -14,7 +14,7 @@ import re
 from dataclasses import dataclass, replace
 from typing import Any, Collection, Mapping, Sequence
 
-from ..llm.types import LLMMessage, LLMRequest, ensure_turn_active
+from ..llm.types import LLMMessage, LLMRequest, ReasoningMode, ensure_turn_active
 from .input_values import parse_weight_spec
 from .semantic_policy import PENDING_CANDIDATE_SEMANTIC_POLICY
 
@@ -228,14 +228,25 @@ class WholePlanAdmission:
         }
 
 
-def request_semantic_compilation(
+@dataclass(frozen=True)
+class SemanticCompilationResult:
+    """One normalized model response with immutable provider evidence."""
+
+    text: str
+    provider: str
+    model: str
+    response_hash: str
+
+
+def request_semantic_compilation_result(
     provider: Any,
     *,
     system_prompt: str,
     request_payload: Mapping[str, Any],
     max_tokens: int = 3600,
-) -> str:
-    """Run one call and leave malformed output to the caller's bounded repair."""
+    reasoning_mode: ReasoningMode = "provider_default",
+) -> SemanticCompilationResult:
+    """Run one bounded call and retain its provider/model response identity."""
 
     ensure_turn_active()
     response = provider.complete(LLMRequest(
@@ -248,12 +259,38 @@ def request_semantic_compilation(
         ],
         temperature=0.0,
         max_tokens=max_tokens,
+        reasoning_mode=reasoning_mode,
     ))
     raw = str(response.text or "")
     try:
-        return _canonical_json(_strict_json_object(raw))
+        normalized = _canonical_json(_strict_json_object(raw))
     except ValueError:
-        return raw
+        normalized = raw
+    return SemanticCompilationResult(
+        text=normalized,
+        provider=str(getattr(response, "provider", "") or ""),
+        model=str(getattr(response, "model", "") or ""),
+        response_hash=hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+    )
+
+
+def request_semantic_compilation(
+    provider: Any,
+    *,
+    system_prompt: str,
+    request_payload: Mapping[str, Any],
+    max_tokens: int = 3600,
+    reasoning_mode: ReasoningMode = "provider_default",
+) -> str:
+    """Run one call and leave malformed output to the caller's bounded repair."""
+
+    return request_semantic_compilation_result(
+        provider,
+        system_prompt=system_prompt,
+        request_payload=request_payload,
+        max_tokens=max_tokens,
+        reasoning_mode=reasoning_mode,
+    ).text
 
 
 def freeze_semantic_plan(
@@ -357,6 +394,7 @@ def request_whole_plan_admission(
     allowed_action_types: Collection[str],
     max_tokens: int = 7200,
     contract_repair: bool = False,
+    reasoning_mode: ReasoningMode = "provider_default",
 ) -> WholePlanAdmission:
     """Run one immutable review with one bounded structural-contract repair."""
 
@@ -398,6 +436,7 @@ def request_whole_plan_admission(
             ],
             temperature=0.0,
             max_tokens=max_tokens,
+            reasoning_mode=reasoning_mode,
         ))
         previous_output = str(response.text or "")
         admission = validate_whole_plan_admission(

@@ -111,6 +111,94 @@ whole-plan semantic admission。其后的 `admit` 是不同的信任边界：在
 进入 durable queue 前，确定性校验 action schema、provenance、冲突、前置条件、
 pending-question contract 和 queue eligibility。
 
+单个标量值的 bounded lane 比通用 whole-plan 路径更窄。只有 pending
+option/manual value 或已注册 semantic value 在用户原文中存在精确 anchor 时，
+`bounded_semantic_lane.py` 才能让模型在有限 candidate catalog 内映射一次。
+不可变 receipt 会绑定 question/registry/catalog、source clause 与 units、
+candidate identity、provider/model、prompt/response hash 和确定性检查。receipt
+验证通过后直接投影到正常 deterministic admission，不再交给第二个 whole-plan
+模型 reviewer。语义有歧义、缺少 anchor、存在竞争 identity 或结果超出 catalog
+时，必须返回通用 hierarchical path。
+
+## Product Head 与终端交付
+
+LangGraph checkpoint 是物理执行存储，不是“用户已经接受哪一轮”的权威。
+`turn_transactions.py` 持有唯一 logical Product Head，并为每次 turn attempt
+创建隔离的 physical checkpoint thread。成功 attempt 会原子推进 Product Head
+并写入一个不可变 terminal outbox result。取消、超时、provider/runtime 失败
+不得推进 Product Head。无法确认的外部副作用必须建立 reconciliation barrier；
+在记录不可变 operator resolution 前，任何新 attempt 都不能启动。
+
+invariant recovery 必须在原来的 physical attempt 上提交类型化 recovery state，
+不能为同一个已接受输入先留下 aborted result，再创建第二个 committed result。
+进程重启时，active attempt 根据类型化 side-effect evidence 收口，未交付 outbox
+结果从精确 checkpoint 和 render hash 重放。
+
+`terminal_protocol.py` 是产品与 live acceptance runner 共用的非敏感终端投影
+协议。交付顺序固定为：
+
+```text
+提交 SQLite outbox
+-> 渲染并 flush 完整 terminal frame
+-> append 并 fsync 类型化 projection
+-> 将 outbox row 标记为 delivered
+```
+
+projection 写入失败时，outbox row 必须保持未交付并可重放。runtime event
+schema version 6 与 terminal outcome projection schema version 3 绑定相同的
+Product Head authority、transaction ID、terminal event ID、完整
+base/attempt/product checkpoint lineage、render hash、publication receipt 和原始
+repository revision。projection 只能包含 hash 和控制身份，严禁包含用户/模型
+原文、endpoint、配置值、checkpoint payload 或原始诊断。live runner 通过这些
+类型化身份汇合 PTY frame、terminal projection 与 runtime event，不能根据
+本地化文案、question ID 或选项位置推断结果。该汇合过程只读；生产 runner
+和测试 runner 都不能在观察到预期 terminal outcome 后改写 runtime event。
+注入测试证据必须分别使用独立的 runtime-event producer 与 terminal-projection
+producer，并在汇合前分别通过同一套生产 validator。
+
+确定性 shell command、有限 `follow` stream 和类型化 termination 使用 terminal
+detour projection schema version 3。detour 必须携带显式 Product Head
+authority、完整且保持不变的前后 head、input/stream hash、类型化 stop reason，
+以及启动 detour 时观察到的 durable runtime-event publication fence；它不得创建
+workflow attempt 或伪造 runtime event。SQLite turn-transaction ledger 当前为
+schema version 14；显式 v12-to-v13 migration 会为旧的 pending committed
+outcome 分配稳定 runtime-event identity，v13-to-v14 migration 会在审计
+quarantine 中保留完整 canonical legacy-detour record。当前读取与迁移必须
+复用同一个语义 validator，统一验证历史 v10/v12 的精确字段集合、quarantine
+row 身份、类型化 termination、response 与 rolling-stream hash、Product Head
+lineage、runtime fence、lifecycle status 及 reconciliation provenance。
+terminal projection 还必须独立拒绝未知 effect class 与不可投影的 effect
+status；残缺、身份不一致，或 record hash 正确但语义非法的审计记录必须
+fail-closed。包含
+committed 历史的 v10 ledger 因无法证明权威 revision
+顺序而必须拒绝迁移；所有缺少 runtime-event fence 的 legacy detour（包括
+completed 但未交付的记录）都必须写入审计 quarantine，并从 live replay
+中删除。
+
+启动身份同样属于生产类型化协议。每个 session event 会绑定 process
+instance、logical session 及用途、provider/model、完整启动输出 hash、
+本次重放的 terminal projection 集合和 repository revision。验收 runner
+必须拒绝过期、重复、跨 session 或 presentation 不匹配的启动证据。
+runtime event schema v6 只使用 `turn_committed` 这一种 event type，
+并把 `startup_snapshot`、`turn_recovered`、`workflow_reset` 等具体用途
+记录在 `observation`。committed outcome 的 runtime observation 未存在前，
+终端不得展示该结果；即使旧 delivery acknowledgement 已存在，重启恢复
+仍须从精确 committed checkpoint 重建缺失 observation。terminal
+projection 的 read-check-append 边界使用 Linux file lock 跨进程序列化。
+如果 runtime-event JSONL 包含任意 pre-v6 record，必须先把该 authority 的
+committed outcome publication receipt 重新置为 pending，再把整份不兼容
+日志原子移动到使用内容 hash 命名的 quarantine 路径，最后按连续 Product
+Head revision 从精确 checkpoint 重建当前 v6 event。每个 runtime projection
+路径都有持久化 single-authority marker，默认路径还包含 authority hash，
+因此一个 session 或 purpose 不能移除另一个 authority 的 observation。
+不得把旧字节重新标记成当前证据。
+
+startup session schema version 3 要求 ready session 必须引用 revision 1
+或更高的 committed Product Head，
+并携带同一 revision 的完整 runtime-event publication fence；revision 0
+不得声明 ready。交互式 CLI 与 one-shot prompt 入口在成功、失败、EOF 和
+中断路径上都必须确定性关闭 LangGraph runtime 与 SQLite 资源。
+
 控制平面的职责被明确拆分：
 
 - `admission.py` 在 action 持久化前校验 proposal、冲突、前置条件和 semantic
@@ -122,6 +210,13 @@ pending-question contract 和 queue eligibility。
   document；它不暴露 planner 入口，也不选择 provider；checkpointed
   `review_plan` transition 会为受限的 whole-plan semantic review 提供当前配置的
   provider；
+- `bounded_semantic_lane.py` 只负责 finite-catalog、source-anchored semantic
+  mapping 及其不可变 evidence receipt；它不拥有通用 intent routing 或状态修改
+  权限；
+- `turn_transactions.py` 持有 logical Product Head、隔离 physical attempt、
+  reconciliation 和 terminal outbox；
+- `terminal_protocol.py` 持有版本化非敏感 terminal projection schema 与 durable
+  JSONL append contract；
 - `advisory.py` 负责链身份、RPC schema 提取和证据分析等 model-backed advisory
   能力；这些能力不能修改状态或选择 graph transition；
 - `queue.py` 负责满足依赖的排序和 pending barrier 下的执行资格；

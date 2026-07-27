@@ -3,13 +3,22 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import tempfile
 import unittest
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Mapping
 from unittest.mock import patch
 
+from agent.harness.input_identity import user_input_hash
+from agent.harness.terminal_protocol import (
+    TerminalSessionEvent,
+    build_terminal_session_event,
+    presentation_hash,
+    validate_terminal_outcome_projection,
+)
 from tests.agent_live.chaos_scheduler import (
     build_journey_schedule,
     journey_schedule_payload,
@@ -35,6 +44,7 @@ from tests.agent_live.dynamic_dual_ai_chaos import (
     JourneySimulatorDecision,
     JourneySimulatorInvalidError,
     JourneyTerminalClassification,
+    TerminalOutcomeObservation,
     build_journey_outcome_verifier_registry,
     validate_journey_evidence_artifact,
 )
@@ -57,6 +67,66 @@ EDGE = {
     "applicable": True,
     "expected_postcondition": {"target_mode": "fake-node"},
 }
+
+
+def _independent_journey_outcome(
+    turn_index: int,
+    *,
+    response: str = "Agent> fixture response",
+) -> TerminalOutcomeObservation:
+    transaction_id = f"00000000-0000-0000-0000-{turn_index:012d}"
+    physical_thread_id = f"attempt:{transaction_id}"
+    outcome = TerminalOutcomeObservation(
+        schema_version=3,
+        record_type="terminal_outcome_projection",
+        projection_id=f"projection-{turn_index}",
+        event_id=f"terminal-{turn_index}",
+        transaction_id=transaction_id,
+        product_authority_id="dynamic-dual-ai-chaos:journey-session",
+        logical_thread_id="dynamic-dual-ai-chaos:journey-session",
+        physical_thread_id=physical_thread_id,
+        outcome="committed",
+        failure_category="",
+        diagnostic_hash="",
+        base_revision=turn_index - 1,
+        base_checkpoint_thread_id=(
+            "head"
+            if turn_index == 1
+            else "attempt:"
+            f"00000000-0000-0000-0000-{turn_index - 1:012d}"
+        ),
+        base_checkpoint_id=f"checkpoint-{turn_index - 1}",
+        base_fingerprint=chr(96 + turn_index) * 64,
+        attempt_checkpoint_id=f"checkpoint-{turn_index}",
+        attempt_fingerprint=chr(97 + turn_index) * 64,
+        product_revision=turn_index,
+        product_checkpoint_thread_id=physical_thread_id,
+        product_checkpoint_id=f"checkpoint-{turn_index}",
+        product_fingerprint=chr(97 + turn_index) * 64,
+        render_hash="f" * 64,
+        runtime_event_id=f"runtime-{turn_index}",
+        runtime_event_sequence=turn_index,
+        runtime_event_payload_hash="9" * 64,
+        presentation_hash=presentation_hash(response),
+        origin_revision=REVISION,
+        delivery_phase="live",
+        projected_at="2026-07-27T00:00:00+00:00",
+        record_hash="0" * 64,
+    )
+    payload = asdict(outcome)
+    payload["record_hash"] = hashlib.sha256(
+        json.dumps(
+            {
+                key: value
+                for key, value in payload.items()
+                if key != "record_hash"
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return validate_terminal_outcome_projection(payload)
 
 
 def ready_at_turn_three(context):
@@ -129,18 +199,131 @@ class FakeTransport:
         self.closed = True
 
 
-class FakeEventStream:
+class FakeRuntimeEventStream:
     def __init__(self, events: list[RuntimeTurnEvent]) -> None:
         self.events = list(events)
 
+    def mark_process_start(self) -> None:
+        return None
+
+    def capture_startup_snapshot(self):
+        return (), ()
+
     def baseline(self) -> RuntimeTurnEvent:
         return self.events.pop(0)
+
+    def mark_baseline(self) -> None:
+        return None
 
     def next_event(self, *, timeout_seconds: float) -> RuntimeTurnEvent:
         del timeout_seconds
         if not self.events:
             raise RuntimeError("missing committed event")
         return self.events.pop(0)
+
+    def assert_publication_fence(self, detour) -> None:
+        if self.events:
+            raise RuntimeError("unexpected runtime event at detour fence")
+        if detour.runtime_event_fence_sequence != 0:
+            raise RuntimeError("fake stream does not contain the detour fence")
+
+
+class FakeTerminalOutcomeStream:
+    def __init__(
+        self,
+        *,
+        turn_count: int,
+        startup_product_revision: int = 1,
+        startup_product_fingerprint: str = "b" * 64,
+        responses: list[str] | None = None,
+    ) -> None:
+        response_frames = list(responses or ())
+        self.outcomes = [
+            _independent_journey_outcome(
+                index,
+                response=(
+                    response_frames[index - 1]
+                    if index <= len(response_frames)
+                    else f"Agent> fixture response {index}"
+                ),
+            )
+            for index in range(1, turn_count + 1)
+        ]
+        self._outcome_cursor = 0
+        self._startup_product_revision = startup_product_revision
+        self._startup_product_fingerprint = startup_product_fingerprint
+
+    def baseline_session_events(
+        self,
+        *,
+        startup_response: str,
+        session_id: str,
+        session_purpose: str,
+    ) -> tuple[TerminalSessionEvent, ...]:
+        transaction_id = (
+            "00000000-0000-0000-0000-"
+            f"{self._startup_product_revision:012d}"
+        )
+        physical_thread_id = f"attempt:{transaction_id}"
+        return (
+            build_terminal_session_event(
+                process_instance_id="test-process",
+                session_id=session_id,
+                session_purpose=session_purpose,
+                provider="deepseek",
+                model="deepseek-chat",
+                auth_mode="api_key",
+                provider_ready=True,
+                startup_status="ready",
+                failure_category="",
+                product_authority_id=f"{session_purpose}:{session_id}",
+                product_revision=self._startup_product_revision,
+                product_checkpoint_thread_id=physical_thread_id,
+                product_checkpoint_id=(
+                    f"checkpoint-{self._startup_product_revision}"
+                ),
+                product_fingerprint=self._startup_product_fingerprint,
+                runtime_event_fence_sequence=self._startup_product_revision,
+                runtime_event_fence_terminal_event_id=(
+                    f"terminal-{self._startup_product_revision}"
+                ),
+                runtime_event_fence_id=(
+                    f"runtime-{self._startup_product_revision}"
+                ),
+                runtime_event_fence_hash="9" * 64,
+                rendered_frame=startup_response,
+                origin_revision=REVISION,
+            ),
+        )
+
+    def mark_process_start(self) -> None:
+        return None
+
+    def capture_startup_snapshot(self):
+        self._outcome_cursor = self._startup_product_revision
+        return (), ()
+
+    def mark_baseline(self) -> None:
+        self._outcome_cursor = self._startup_product_revision
+
+    def next_outcome(
+        self,
+        *,
+        timeout_seconds: float,
+    ) -> TerminalOutcomeObservation:
+        del timeout_seconds
+        if self._outcome_cursor >= len(self.outcomes):
+            raise RuntimeError("missing terminal outcome")
+        outcome = self.outcomes[self._outcome_cursor]
+        self._outcome_cursor += 1
+        return outcome
+
+    def next_completion(
+        self,
+        *,
+        timeout_seconds: float,
+    ):
+        return self.next_outcome(timeout_seconds=timeout_seconds)
 
 
 class OrderedClock:
@@ -153,9 +336,15 @@ class OrderedClock:
 
 
 class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
-    def _event(self, turn_index: int) -> RuntimeTurnEvent:
+    def _event(
+        self,
+        turn_index: int,
+        submitted_input: str = "<fixture-input-not-specified>",
+    ) -> RuntimeTurnEvent:
+        transaction_id = f"00000000-0000-0000-0000-{turn_index:012d}"
+        physical_thread_id = f"attempt:{transaction_id}"
         return RuntimeTurnEvent(
-            schema_version=2,
+            schema_version=6,
             event_type="turn_committed",
             thread_id="journey-session",
             session_purpose="dynamic-dual-ai-chaos",
@@ -167,13 +356,45 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
             pending_contract={"id": "opening_next_action"},
             revision=REVISION,
             action_queue_types=(),
+            observation="turn_committed",
             admitted_action_types=("answer_pending",) if turn_index > 1 else (),
+            turn_receipt_summary={
+                "turn_id": f"test:{turn_index}",
+                "input_hash": user_input_hash(submitted_input),
+                "admitted_action_ids": [],
+                "execution_order": [],
+            },
+            pending_transition={
+                "before_hash": hashlib.sha256(b"pending-before").hexdigest(),
+                "after_hash": hashlib.sha256(b"pending-after").hexdigest(),
+            },
             state_diff_hashes=(
                 {"target_mode": {"before": "", "after": "f" * 64}}
                 if turn_index > 1 else {}
             ),
             after_value_hashes={},
             next_result={"kind": "question", "question_id": "opening_next_action"},
+            runtime_event_id=f"runtime-{turn_index}",
+            runtime_event_sequence=turn_index,
+            runtime_event_payload_hash="9" * 64,
+            terminal_event_id=f"terminal-{turn_index}",
+            transaction_id=transaction_id,
+            terminal_outcome="committed",
+            render_hash="f" * 64,
+            base_revision=turn_index - 1,
+            base_checkpoint_thread_id=(
+                "head"
+                if turn_index == 1
+                else "attempt:"
+                f"00000000-0000-0000-0000-{turn_index - 1:012d}"
+            ),
+            base_checkpoint_id=f"checkpoint-{turn_index - 1}",
+            product_revision=turn_index,
+            product_checkpoint_thread_id=physical_thread_id,
+            product_checkpoint_id=f"checkpoint-{turn_index}",
+            product_authority_id="dynamic-dual-ai-chaos:journey-session",
+            physical_thread_id=physical_thread_id,
+            attempt_checkpoint_id=f"checkpoint-{turn_index}",
         )
 
     def _schedule(self, *, max_turns: int = 3, verifier_input_contract=None):
@@ -250,7 +471,18 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
             ),
         ))
 
-    def _runner(self, root, *, schedule, simulator, transport, events, registry=None):
+    def _runner(
+        self,
+        root,
+        *,
+        schedule,
+        simulator,
+        transport,
+        events,
+        registry=None,
+        startup_product_revision=1,
+        startup_product_fingerprint="b" * 64,
+    ):
         return DynamicDualAiJourneyRunner(
             ChaosRunConfig.linux(root, session_id="journey-session"),
             simulator,
@@ -258,7 +490,13 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
             schedule=schedule,
             postcondition_verifier_registry=registry or self._registry(),
             transport=transport,
-            event_stream=FakeEventStream(events),
+            event_stream=FakeRuntimeEventStream(events),
+            terminal_outcome_stream=FakeTerminalOutcomeStream(
+                turn_count=max(len(events), startup_product_revision),
+                startup_product_revision=startup_product_revision,
+                startup_product_fingerprint=startup_product_fingerprint,
+                responses=list(transport.responses),
+            ),
             revision=REVISION,
             clock_ns=OrderedClock(),
         )
@@ -302,7 +540,12 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
             registry = self._registry()
             runner = self._runner(
                 Path(tmpdir), schedule=schedule, simulator=simulator, transport=transport,
-                events=[self._event(1), self._event(2), self._event(3)], registry=registry,
+                events=[
+                    self._event(1),
+                    self._event(2, "Responding to turn 2: continue safely."),
+                    self._event(3, "Responding to turn 3: continue safely."),
+                ],
+                registry=registry,
             )
             with patch(
                 "tests.agent_live.dynamic_dual_ai_chaos.verify_runtime_postcondition",
@@ -412,7 +655,11 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
                     "Agent> Second.",
                     "Agent> Terminal.",
                 ]),
-                events=[self._event(1), self._event(2), self._event(3)],
+                events=[
+                    self._event(1),
+                    self._event(2, "response-driven retained turn 1"),
+                    self._event(3, "response-driven retained turn 2"),
+                ],
             )
             with patch(
                 "tests.agent_live.dynamic_dual_ai_chaos.verify_runtime_postcondition",
@@ -454,7 +701,10 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
                 schedule=self._schedule(max_turns=1),
                 simulator=simulator,
                 transport=transport,
-                events=[self._event(1), self._event(2)],
+                events=[
+                    self._event(1),
+                    self._event(2, f"https://rpc.example/{secret}"),
+                ],
                 registry=self._registry(ready=ready_at_turn_two),
             )
             result = self._run(runner)
@@ -496,7 +746,10 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
                 transport=FakeTransport([
                     "Agent> Model config: provider=deepseek, model=deepseek-chat, auth=api_key\nDone."
                 ]),
-                events=[self._event(3)], registry=registry,
+                events=[self._event(3)],
+                registry=registry,
+                startup_product_revision=3,
+                startup_product_fingerprint="d" * 64,
             )
             result = self._run(runner)
             artifact = json.loads(result.evidence_path.read_text())
@@ -526,7 +779,13 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
                         "Agent> Model config: provider=deepseek, model=deepseek-chat, auth=api_key\nStart.",
                         "Agent> Next.",
                     ]),
-                    events=[self._event(1), self._event(2)],
+                    events=[
+                        self._event(1),
+                        self._event(
+                            2,
+                            "Responding to turn 2: continue safely.",
+                        ),
+                    ],
                     registry=self._registry(ready, lost),
                 )
                 with patch(

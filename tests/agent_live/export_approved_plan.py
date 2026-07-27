@@ -24,6 +24,7 @@ from agent.harness.control_receipts import validate_coordinator_control_receipt
 from agent.harness.invariants import validate_state
 from agent.harness.runtime_identity import repository_revision
 from agent.harness.state import migrate_state, project_checkpoint_state
+from agent.harness.turn_transactions import product_authority_id, read_product_head
 from agent.runners.execution_scenarios import workflow_type_from_plan
 from agent.runners.job_manager import verify_job_receipt
 
@@ -158,10 +159,19 @@ def _isolated_checkpoint_bytes(
     source_path: Path,
     *,
     thread_id: str,
+    session_purpose: str,
 ) -> tuple[bytes, dict[str, Any]]:
     """Copy one exact checkpoint row into a single-thread SQLite database."""
 
     _assert_regular_nonsymlink(source_path, description="Agent checkpoint")
+    product_head = read_product_head(
+        source_path,
+        product_authority_id(thread_id, session_purpose),
+    )
+    checkpoint_thread_id = (
+        product_head.checkpoint_thread_id if product_head else thread_id
+    )
+    checkpoint_id = product_head.checkpoint_id if product_head else ""
     source_uri = f"file:{source_path}?mode=ro"
     with tempfile.TemporaryDirectory() as tmpdir:
         isolated = Path(tmpdir) / "approval-checkpoint.sqlite"
@@ -174,10 +184,11 @@ def _isolated_checkpoint_bytes(
                            parent_checkpoint_id, type, checkpoint, metadata
                     FROM checkpoints
                     WHERE thread_id = ? AND checkpoint_ns = ''
+                      AND (? = '' OR checkpoint_id = ?)
                     ORDER BY checkpoint_id DESC
                     LIMIT 1
                     """,
-                    (thread_id,),
+                    (checkpoint_thread_id, checkpoint_id, checkpoint_id),
                 ).fetchone()
                 if row is None:
                     raise ValueError("Agent checkpoint has no requested thread")
@@ -236,6 +247,7 @@ def _isolated_checkpoint_bytes(
         payload = isolated.read_bytes()
     identity = {
         "thread_id": str(row[0]),
+        "logical_thread_id": thread_id,
         "checkpoint_ns": str(row[1]),
         "checkpoint_id": str(row[2]),
         "parent_checkpoint_id": str(row[3] or ""),
@@ -249,7 +261,8 @@ def _isolated_checkpoint_bytes(
 def _read_checkpoint_state(
     path: Path,
     *,
-    thread_id: str,
+    checkpoint_thread_id: str,
+    logical_thread_id: str,
     checkpoint_id: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Read one exact checkpoint without invoking migrations or graph writes."""
@@ -260,7 +273,7 @@ def _read_checkpoint_state(
         saver = SqliteSaver(connection)
         config = {
             "configurable": {
-                "thread_id": thread_id,
+                "thread_id": checkpoint_thread_id,
                 "checkpoint_ns": "",
                 "checkpoint_id": checkpoint_id,
             }
@@ -277,7 +290,7 @@ def _read_checkpoint_state(
             raise ValueError("checkpoint contains non-durable runtime state")
         migrated = migrate_state(
             deepcopy(state),
-            thread_id=thread_id,
+            thread_id=logical_thread_id,
             language=str(state.get("language") or "en"),
             session_purpose=str((state.get("session") or {}).get("purpose") or ""),
         )
@@ -302,6 +315,7 @@ def _checkpoint_identity_from_isolated(
     *,
     thread_id: str,
     checkpoint_id: str,
+    logical_thread_id: str = "",
 ) -> dict[str, Any]:
     uri = f"file:{path}?mode=ro&immutable=1"
     with closing(sqlite3.connect(uri, uri=True, check_same_thread=False)) as connection:
@@ -339,7 +353,7 @@ def _checkpoint_identity_from_isolated(
         )
     if checkpoint_count != 1 or unrelated_writes:
         raise ValueError("isolated checkpoint contains unrelated state")
-    return {
+    identity = {
         "thread_id": str(row[0]),
         "checkpoint_ns": str(row[1]),
         "checkpoint_id": str(row[2]),
@@ -348,6 +362,9 @@ def _checkpoint_identity_from_isolated(
         "metadata_blob_hash": hashlib.sha256(bytes(row[6])).hexdigest(),
         "write_count": write_count,
     }
+    if logical_thread_id:
+        identity["logical_thread_id"] = logical_thread_id
+    return identity
 
 
 def _approval_chain(
@@ -583,6 +600,7 @@ def export_approved_plan(
     checkpoint_payload, checkpoint_identity = _isolated_checkpoint_bytes(
         checkpoint_path,
         thread_id=thread_id,
+        session_purpose=session_purpose,
     )
     checkpoint_hash = hashlib.sha256(checkpoint_payload).hexdigest()
     exported_checkpoint = output_dir / f"checkpoint-{checkpoint_hash}.sqlite"
@@ -599,7 +617,8 @@ def export_approved_plan(
 
     state, checkpoint_metadata = _read_checkpoint_state(
         exported_checkpoint,
-        thread_id=thread_id,
+        checkpoint_thread_id=str(checkpoint_identity["thread_id"]),
+        logical_thread_id=thread_id,
         checkpoint_id=str(checkpoint_identity["checkpoint_id"]),
     )
     raw_plan_path = Path(str(state.get("plan_file") or ""))
@@ -758,14 +777,16 @@ def validate_approved_plan_artifact(
         identity = dict(artifact.get("checkpoint_identity") or {})
         observed_identity = _checkpoint_identity_from_isolated(
             checkpoint_file,
-            thread_id=str(artifact.get("thread_id") or ""),
+            thread_id=str(identity.get("thread_id") or ""),
             checkpoint_id=str(identity.get("checkpoint_id") or ""),
+            logical_thread_id=str(artifact.get("thread_id") or ""),
         )
         if identity != observed_identity:
             raise ValueError("checkpoint identity differs from isolated bytes")
         state, metadata = _read_checkpoint_state(
             checkpoint_file,
-            thread_id=str(artifact.get("thread_id") or ""),
+            checkpoint_thread_id=str(identity.get("thread_id") or ""),
+            logical_thread_id=str(artifact.get("thread_id") or ""),
             checkpoint_id=str(identity.get("checkpoint_id") or ""),
         )
         plan, workflow, target_mode, chain = _validate_state_and_plan(

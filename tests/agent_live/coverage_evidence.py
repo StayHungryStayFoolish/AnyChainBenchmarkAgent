@@ -157,6 +157,7 @@ class RuntimeTurnEvent:
     active_group: str
     pending_question_id: str
     action_queue_types: tuple[str, ...]
+    observation: str = ""
     pending_contract: Mapping[str, Any] = field(default_factory=dict)
     revision: Mapping[str, str] = field(default_factory=dict)
     admitted_action_types: tuple[str, ...] = ()
@@ -173,6 +174,22 @@ class RuntimeTurnEvent:
     )
     after_value_hashes: Mapping[str, str] = field(default_factory=dict)
     next_result: Mapping[str, Any] = field(default_factory=dict)
+    runtime_event_id: str = ""
+    runtime_event_sequence: int | None = None
+    runtime_event_payload_hash: str = ""
+    terminal_event_id: str = ""
+    transaction_id: str = ""
+    terminal_outcome: str = ""
+    render_hash: str = ""
+    base_revision: int | None = None
+    base_checkpoint_thread_id: str = ""
+    base_checkpoint_id: str = ""
+    product_revision: int | None = None
+    product_checkpoint_thread_id: str = ""
+    product_checkpoint_id: str = ""
+    product_authority_id: str = ""
+    physical_thread_id: str = ""
+    attempt_checkpoint_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -1356,7 +1373,13 @@ def _validate_turn_observation(
         observation.runtime_events,
         observation.runtime_events[1:],
     ):
-        if current.event_type not in {"turn_committed", "turn_recovered"}:
+        if (
+            current.event_type != "turn_committed"
+            and not (
+                current.schema_version < 4
+                and current.event_type == "turn_recovered"
+            )
+        ):
             raise ValueError("linked runtime event is not a committed turn")
         if current.turn_index != previous.turn_index + 1:
             raise ValueError("linked runtime event turn indexes are not contiguous")
@@ -1463,10 +1486,18 @@ def _validate_turn_observation(
 
 
 def _validate_runtime_event(event: RuntimeTurnEvent) -> None:
-    if event.schema_version not in {2, 3}:
+    if event.schema_version not in {2, 3, 4, 5, 6}:
         raise ValueError("unsupported runtime turn event schema")
-    if event.event_type not in {"startup_snapshot", "turn_committed", "turn_recovered"}:
+    if event.schema_version >= 4 and event.event_type != "turn_committed":
+        raise ValueError("runtime event transaction type must be turn_committed")
+    if event.schema_version < 4 and event.event_type not in {
+        "startup_snapshot",
+        "turn_committed",
+        "turn_recovered",
+    }:
         raise ValueError("runtime event type is not observable")
+    if event.schema_version >= 4 and not event.observation.strip():
+        raise ValueError("runtime event observation is missing")
     if not event.thread_id.strip() or not event.session_purpose.strip():
         raise ValueError("runtime event identity is missing")
     if event.turn_index < 0:
@@ -1478,7 +1509,7 @@ def _validate_runtime_event(event: RuntimeTurnEvent) -> None:
         str(event.revision.get("worktree_hash") or "")
     ):
         raise ValueError("runtime event revision is invalid")
-    if event.schema_version == 3:
+    if event.schema_version >= 3:
         turn_receipt = dict(event.turn_receipt_summary or {})
         if turn_receipt:
             if (
@@ -1569,6 +1600,49 @@ def _validate_runtime_event(event: RuntimeTurnEvent) -> None:
                 )
             ):
                 raise ValueError("runtime material state diff is invalid")
+    if event.schema_version >= 4:
+        if (
+            not event.runtime_event_id
+            or not event.terminal_event_id
+            or not event.transaction_id
+            or event.terminal_outcome != "committed"
+            or not _is_sha256(event.render_hash)
+            or not isinstance(event.product_revision, int)
+            or event.product_revision < 0
+            or not event.product_checkpoint_thread_id
+            or not event.product_checkpoint_id
+        ):
+            raise ValueError("runtime event terminal transaction binding is invalid")
+    if event.schema_version >= 5:
+        if (
+            not isinstance(event.base_revision, int)
+            or event.base_revision < 0
+            or not event.base_checkpoint_thread_id
+            or not event.base_checkpoint_id
+            or event.product_revision != event.base_revision + 1
+            or not isinstance(event.runtime_event_sequence, int)
+            or event.runtime_event_sequence < 1
+            or event.runtime_event_sequence != event.product_revision
+            or not _is_sha256(event.runtime_event_payload_hash)
+        ):
+            raise ValueError(
+                "runtime event complete Product Head binding is invalid"
+            )
+    if event.schema_version >= 6:
+        if (
+            not event.product_authority_id
+            or event.product_authority_id
+            != f"{event.session_purpose}:{event.thread_id}"
+            or not event.physical_thread_id
+            or not event.attempt_checkpoint_id
+            or event.product_checkpoint_thread_id
+            != event.physical_thread_id
+            or event.product_checkpoint_id
+            != event.attempt_checkpoint_id
+        ):
+            raise ValueError(
+                "runtime event Product Head authority or attempt binding is invalid"
+            )
     if str(event.pending_contract.get("id") or "") != event.pending_question_id:
         raise ValueError("runtime event pending contract identity is inconsistent")
 

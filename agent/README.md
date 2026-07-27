@@ -109,6 +109,71 @@ LLM output is never executed directly. The semantic path checkpoints
 pending-contract validation. Repository tools own configuration
 materialization, execution, monitoring, and evidence-backed analysis.
 
+For a single source-anchored scalar pending value,
+`harness/bounded_semantic_lane.py` may map once into a finite typed catalog.
+Its immutable receipt binds source, candidate, question/registry/catalog,
+provider/model, prompt/response hashes, and deterministic checks. A verified
+bounded receipt enters deterministic admission directly; ambiguous or
+out-of-catalog input uses the general hierarchical path.
+
+The user-visible conversation is committed through a separate Product Head
+authority. `harness/turn_transactions.py` creates one isolated physical
+checkpoint attempt per turn, advances the logical Product Head only on commit,
+and writes one immutable terminal outbox result. Cancellation, timeout, and
+provider/runtime failure do not advance the head. Uncertain external effects
+block new turns behind explicit reconciliation. Invariant recovery commits on
+the original attempt so one user input cannot produce competing replayable
+results.
+
+`harness/terminal_protocol.py` defines the shared non-secret delivery
+projection. The terminal renders and flushes the complete frame, durably
+appends the projection, and only then acknowledges the outbox row as
+delivered. A typed startup session event separately binds the process instance,
+session purpose, provider/model, complete startup presentation, replayed
+projection set, and originating revision. Runtime event schema v6 binds the
+same transaction, terminal event, Product Head, render hash, and originating
+revision; its canonical event type is separate from the specific observation.
+Missing post-commit runtime observations are reconstructed from exact
+committed checkpoints before terminal presentation. Live runners join these
+typed identities and never infer outcomes from localized text, question IDs,
+or numeric option positions, and no test callback may rewrite an event after
+seeing the expected terminal outcome. Cross-process JSONL publication is
+serialized with a Linux file lock. Acceptance runners require independent
+runtime-event and terminal-projection producers and pass both through the
+production validators before joining them.
+
+The current live runtime contract is schema v6. It carries the explicit
+Product Head authority plus the physical attempt thread and attempt checkpoint
+ID, so a terminal outcome and runtime event cannot agree with each other while
+pointing at the wrong attempt. Terminal outcome projection schema v3 preserves
+the complete base/attempt/product lineage. Terminal detour projection schema
+v3 binds the same authority and a durable runtime-event publication fence;
+detours may stream or terminate a session but may never advance Product Head.
+The SQLite turn-transaction ledger is schema v14. Its explicit v12-to-v13
+migration assigns stable runtime-event identities to older pending committed
+outcomes. Schema v14 adds the complete canonical legacy-detour record to its
+audit quarantine instead of retaining only a partial hash. Current reads and
+legacy migration use one shared semantic validator for the historical v10/v12
+field set, row identity, typed termination, response and rolling-stream
+hashes, Product Head lineage, runtime fence, lifecycle status, and
+reconciliation provenance. Terminal projections independently reject unknown
+effect classes and unprojectable effect statuses. Incomplete, mismatched, or
+correctly hashed but semantically invalid audit records fail closed. A
+v10 ledger with
+committed history is rejected because that schema
+cannot prove revision order; legacy detours without a publication fence are
+audited and removed from live delivery. If a runtime JSONL contains a
+pre-v6 event, the authority's committed publication receipts are requeued
+first, the complete file is atomically retained under a content-hashed
+quarantine name, and v6 events are rebuilt in contiguous Product Head revision
+order from exact checkpoints. Each runtime JSONL path has a durable
+single-authority marker; default paths also include an authority hash, so one
+session or purpose cannot quarantine another authority's events. Startup
+session schema v3 requires a ready session to have an already committed Product
+Head and a complete publication fence. Interactive and one-shot terminal
+entrypoints close the runtime deterministically on success, failure, EOF, and
+interruption.
+
 The product compiles one checkpointer-backed graph. Each execution transition
 selects, routes, and commits at most one durable action. Side effects are
 persisted as an intent before invocation and as a receipt afterward. Checkpoint
@@ -150,6 +215,12 @@ quarantined for explicit reconfirmation.
   adapter; current turns must not import it.
 - `harness/semantic_admission.py`: immutable semantic-document preparation and
   admission after owner-scoped compilation; it exposes no planner entry.
+- `harness/bounded_semantic_lane.py`: finite-catalog, source-anchored semantic
+  mapping with an immutable evidence receipt.
+- `harness/turn_transactions.py`: logical Product Head, physical attempts,
+  reconciliation, and terminal outbox authority.
+- `harness/terminal_protocol.py`: versioned non-secret terminal projection and
+  durable append contract shared with live acceptance.
 - `harness/advisory.py`: model-backed chain/RPC/evidence analysis with no state
   mutation or graph-transition authority.
 - `workflows/group_registry.py`: the single metadata authority for group order,

@@ -76,9 +76,7 @@ class DeepSeekProvider:
             lambda: client.chat.completions.create(
                 model=self.config.model,
                 messages=_openai_messages(request.messages),
-                temperature=request.temperature,
-                max_tokens=request.max_tokens,
-                tools=request.tools or None,
+                **_deepseek_completion_options(request),
             ),
         )
         text = _openai_response_text(self.config, response)
@@ -505,6 +503,19 @@ def _openai_completion_options(model: str, request: LLMRequest) -> dict[str, Any
         payload["max_completion_tokens"] = request.max_tokens
     else:
         payload["max_tokens"] = request.max_tokens
+    return payload
+
+
+def _deepseek_completion_options(request: LLMRequest) -> dict[str, Any]:
+    """Map the common inference contract to DeepSeek's official API."""
+
+    payload: dict[str, Any] = {
+        "temperature": request.temperature,
+        "max_tokens": request.max_tokens,
+        "tools": request.tools or None,
+    }
+    if request.reasoning_mode == "disabled":
+        payload["extra_body"] = {"thinking": {"type": "disabled"}}
     return payload
 
 

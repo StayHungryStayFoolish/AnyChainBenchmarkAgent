@@ -511,7 +511,11 @@ class ApprovedPlanExportTests(unittest.TestCase):
             self.assertFalse(valid)
             self.assertIn("identity", reason)
 
-    def test_normal_turn_does_not_probe_repository_revision(self) -> None:
+    def test_normal_turn_binds_attempt_and_event_to_repository_revision(self) -> None:
+        expected_revision = {
+            "commit": "a" * 40,
+            "worktree_hash": "b" * 64,
+        }
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime = AnyChainGraphRuntime(
                 thread_id="normal-turn",
@@ -521,11 +525,21 @@ class ApprovedPlanExportTests(unittest.TestCase):
             with (
                 patch.object(runtime, "_load_state", return_value=state),
                 patch.object(runtime.graph, "invoke", return_value=state),
-                patch("agent.harness.graph.repository_revision") as revision,
+                patch(
+                    "agent.harness.graph.repository_revision",
+                    return_value=expected_revision,
+                ) as revision,
             ):
                 runtime.invoke("What can you do?", language="en")
+            outcome = runtime.last_terminal_outcome
             runtime.close()
-            revision.assert_not_called()
+            self.assertGreaterEqual(revision.call_count, 1)
+            self.assertIsNotNone(outcome)
+            self.assertEqual(outcome.origin_revision_commit, expected_revision["commit"])
+            self.assertEqual(
+                outcome.origin_revision_worktree_hash,
+                expected_revision["worktree_hash"],
+            )
 
     def test_execution_commit_fails_if_revision_changes_after_owner_step(
         self,

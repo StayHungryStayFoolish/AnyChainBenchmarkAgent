@@ -393,6 +393,11 @@ def review_semantic_plan(
             routed_partition
         ),
         whole_plan_contract_repair=True,
+        reasoning_mode=(
+            "disabled"
+            if output.get("planner_kind") == "bounded_semantic_value"
+            else "provider_default"
+        ),
     )
     admission_calls = (
         int(getattr(admission, "request_count", 1))

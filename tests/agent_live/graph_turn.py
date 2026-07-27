@@ -180,6 +180,10 @@ def reviewed_stage_planner(resolve):
 
     with ExitStack() as stack:
         stack.enter_context(patch(
+            "agent.harness.coordinator.compile_bounded_semantic_value",
+            return_value=None,
+        ))
+        stack.enter_context(patch(
             "agent.harness.hierarchical_planner.begin_semantic_partition",
             side_effect=partition,
         ))
@@ -633,6 +637,10 @@ def invoke_product_graph_turn(
                 }
 
             stack.enter_context(patch(
+                "agent.harness.coordinator.compile_bounded_semantic_value",
+                return_value=None,
+            ))
+            stack.enter_context(patch(
                 "agent.harness.hierarchical_planner.begin_semantic_partition",
                 side_effect=reviewed_partition,
             ))
@@ -643,6 +651,12 @@ def invoke_product_graph_turn(
                 ),
             ))
         elif not allow_semantic_resolver:
+            stack.enter_context(patch(
+                "agent.harness.coordinator.compile_bounded_semantic_value",
+                side_effect=AssertionError(
+                    "deterministic graph turn attempted to call a live model entry"
+                ),
+            ))
             stack.enter_context(patch(
                 "agent.harness.hierarchical_planner.begin_semantic_partition",
                 side_effect=AssertionError(

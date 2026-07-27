@@ -28,6 +28,18 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
+from agent.harness.input_identity import user_input_hash
+from agent.harness.turn_transactions import product_authority_id
+from agent.harness.terminal_protocol import (
+    TerminalDetourProjection,
+    TerminalOutcomeProjection,
+    TerminalSessionEvent,
+    presentation_hash,
+    read_jsonl_records,
+    validate_terminal_outcome_projection,
+    validate_terminal_detour_projection,
+    validate_terminal_session_event,
+)
 from agent.utils.redaction import redact
 from tests.agent_live.coverage_evidence import (
     DynamicTurnSelection,
@@ -41,6 +53,7 @@ from tests.agent_live.coverage_evidence import (
     content_hash,
     pty_transcript_hash,
     repository_revision,
+    validate_runtime_turn_event,
     verify_runtime_postcondition,
     write_evidence_artifact,
     write_pty_diagnostic_artifact,
@@ -62,12 +75,6 @@ from agent.harness.plan_coverage import segment_user_turn
 _ANSI_CSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _USER_PROMPT_RE = re.compile(r"(?:^|\n)User>\s*$")
 _USER_PROMPT_BOUNDARY_RE = re.compile(r"(?:^|\n)User>[ \t]*(?=\n|$)")
-_MODEL_CONFIG_RE = re.compile(
-    r"provider\s*=\s*([^,\s]+)\s*,\s*model\s*=\s*([^,\s]+)",
-    re.IGNORECASE,
-)
-
-
 def _write_redacted_transcript(path: Path, lines: Sequence[str]) -> None:
     """Persist terminal evidence only after applying the shared secret boundary."""
 
@@ -117,6 +124,7 @@ class ChaosRunConfig:
     session_purpose: str = "dynamic-dual-ai-chaos"
     provider: str = "deepseek"
     model: str = "deepseek-chat"
+    language: str = "en"
     max_turns: int = 20
     response_timeout_seconds: float = 180.0
     poll_interval_seconds: float = 0.05
@@ -148,6 +156,7 @@ class ChaosRunConfig:
             "runtime_root_in_process",
             Path("/workspace/.agent/dynamic-chaos") / session_id,
         ))
+        language = str(changes.get("language", "en"))
         container_env = {
             "ANYCHAIN_CHAOS_EXECUTION_ID": execution_id,
             "ANYCHAIN_CHAOS_INNER_CLEANUP_RECEIPT_DIR": str(
@@ -160,6 +169,9 @@ class ChaosRunConfig:
             ),
             "ANYCHAIN_AGENT_JOBS_DIR": str(container_runtime / "jobs"),
             "ANYCHAIN_AGENT_TURN_EVENT_FILE": str(container_runtime / "turn-events.jsonl"),
+            "ANYCHAIN_AGENT_TERMINAL_OUTCOME_FILE": str(
+                container_runtime / "terminal-outcomes.jsonl"
+            ),
         }
         command: list[str] = ["docker", "compose", "exec", "-T"]
         for name, value in container_env.items():
@@ -176,7 +188,7 @@ class ChaosRunConfig:
             "--state-file",
             str(container_runtime / "terminal-session.json"),
             "--language",
-            "en",
+            language,
         ))
         return cls(
             repo_root=root,
@@ -209,6 +221,7 @@ class ChaosRunConfig:
             "runtime_root_in_process",
             runtime,
         ))
+        language = str(changes.get("language", "en"))
         return cls(
             repo_root=root,
             command=(
@@ -222,7 +235,7 @@ class ChaosRunConfig:
                 "--state-file",
                 str(runtime / "terminal-session.json"),
                 "--language",
-                "en",
+                language,
             ),
             session_id=session_id,
             runtime_root=runtime,
@@ -553,6 +566,567 @@ class RuntimeEventStream(Protocol):
 
     def next_event(self, *, timeout_seconds: float) -> RuntimeTurnEvent: ...
 
+    def assert_publication_fence(
+        self,
+        detour: TerminalDetourProjection,
+    ) -> None: ...
+
+
+TerminalOutcomeObservation = TerminalOutcomeProjection
+TerminalDetourObservation = TerminalDetourProjection
+TerminalCompletionObservation = (
+    TerminalOutcomeObservation | TerminalDetourObservation
+)
+
+
+class TerminalOutcomeStream(Protocol):
+    def capture_startup_snapshot(
+        self,
+    ) -> tuple[
+        tuple[TerminalOutcomeObservation, ...],
+        tuple[TerminalDetourObservation, ...],
+    ]: ...
+
+    def next_completion(
+        self,
+        *,
+        timeout_seconds: float,
+    ) -> TerminalCompletionObservation: ...
+
+    def mark_process_start(self) -> None: ...
+
+    def baseline_session_events(
+        self,
+        *,
+        startup_response: str,
+        session_id: str,
+        session_purpose: str,
+    ) -> tuple[TerminalSessionEvent, ...]: ...
+
+    def mark_baseline(self) -> None: ...
+
+    def next_outcome(
+        self,
+        *,
+        timeout_seconds: float,
+    ) -> TerminalOutcomeObservation: ...
+
+    def next_completion(
+        self,
+        *,
+        timeout_seconds: float,
+    ) -> TerminalCompletionObservation: ...
+
+
+class TerminalCompletionError(RuntimeError):
+    """A submitted turn did not complete the terminal/event protocol."""
+
+    failure_kind = "terminal_completion_error"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        response: str = "",
+        event: RuntimeTurnEvent | None = None,
+        response_error: BaseException | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.response = response
+        self.event = event
+        self.response_error = response_error
+
+    def diagnostic_payload(self) -> dict[str, Any]:
+        return {
+            "failure_kind": self.failure_kind,
+            "message": str(redact(str(self))),
+            "response": str(redact(self.response)),
+            "event_type": self.event.event_type if self.event is not None else "",
+            "event_turn_index": self.event.turn_index if self.event is not None else None,
+            "response_error_type": (
+                type(self.response_error).__name__
+                if self.response_error is not None
+                else ""
+            ),
+            "response_error": (
+                str(redact(str(self.response_error)))
+                if self.response_error is not None
+                else ""
+            ),
+        }
+
+
+class TerminalTurnFailure(TerminalCompletionError):
+    """The product terminal reported a typed non-committing turn outcome."""
+
+    failure_kind = "typed_terminal_failure"
+
+    def __init__(self, outcome: str, response: str) -> None:
+        super().__init__(
+            f"Agent terminal reported {outcome} without committing the turn",
+            response=response,
+        )
+        self.outcome = outcome
+
+    def diagnostic_payload(self) -> dict[str, Any]:
+        return {**super().diagnostic_payload(), "terminal_outcome": self.outcome}
+
+
+class TerminalProtocolViolation(TerminalCompletionError):
+    """A normal terminal response had no matching runtime event."""
+
+    failure_kind = "response_without_event"
+
+
+class TerminalPresentationViolation(TerminalCompletionError):
+    """A runtime event committed, but no complete terminal response arrived."""
+
+    failure_kind = "event_without_response"
+
+
+class TerminalBoundaryInterrupted(TerminalCompletionError):
+    """Neither terminal nor event channel completed before the boundary failed."""
+
+    failure_kind = "terminal_boundary_interrupted"
+
+
+class NoRuntimeEventBeforeFence(TimeoutError):
+    """No runtime event advanced during the bounded detour fence."""
+
+
+@dataclass(frozen=True)
+class WorkflowCompletion:
+    """One committed product turn joined across all workflow channels."""
+
+    response: str
+    event: RuntimeTurnEvent
+    terminal_outcome: TerminalOutcomeObservation
+
+
+@dataclass(frozen=True)
+class TerminalDetourCompletion:
+    """One non-workflow command completion with an unchanged Product Head."""
+
+    response: str
+    terminal_detour: TerminalDetourObservation
+    effect_status: str
+    stream_stop_reason: str
+
+
+@dataclass(frozen=True)
+class SessionTerminationCompletion:
+    """One typed terminal shutdown, distinct from workflow and command detours."""
+
+    response: str
+    terminal_detour: TerminalDetourObservation
+    termination_reason: str
+    exit_code: int
+
+
+TurnCompletion = (
+    WorkflowCompletion
+    | TerminalDetourCompletion
+    | SessionTerminationCompletion
+)
+
+
+@dataclass(frozen=True)
+class CompletionExpectation:
+    submitted_input: str
+    session_id: str
+    session_purpose: str
+    process_instance_id: str
+    product_revision: int
+    product_checkpoint_thread_id: str
+    product_checkpoint_id: str
+    product_fingerprint: str
+    product_authority_id: str
+
+
+def wait_for_turn_completion(
+    transport: PtyTransport,
+    event_stream: RuntimeEventStream,
+    terminal_outcome_stream: TerminalOutcomeStream,
+    *,
+    timeout_seconds: float,
+    expectation: CompletionExpectation,
+    event_grace_seconds: float | None = None,
+) -> TurnCompletion:
+    """Observe one terminal response and its matching runtime event.
+
+    The terminal is read first so typed non-committing outcomes are visible
+    immediately instead of being hidden behind a full event timeout.  A normal
+    response must be followed by exactly one runtime event within a short
+    protocol grace period.
+    """
+
+    grace = (
+        min(5.0, max(0.25, timeout_seconds * 0.05))
+        if event_grace_seconds is None
+        else max(0.0, event_grace_seconds)
+    )
+    try:
+        response = transport.read_complete_agent_response(
+            timeout_seconds=timeout_seconds
+        )
+    except Exception as response_error:
+        terminal_completion: TerminalCompletionObservation | None = None
+        outcome_error: BaseException | None = None
+        try:
+            terminal_completion = terminal_outcome_stream.next_completion(
+                timeout_seconds=grace
+            )
+        except Exception as exc:
+            outcome_error = exc
+        event: RuntimeTurnEvent | None = None
+        event_error: BaseException | None = None
+        try:
+            event = event_stream.next_event(timeout_seconds=grace)
+        except Exception as exc:
+            event_error = exc
+        if terminal_completion is not None or event is not None:
+            raise TerminalPresentationViolation(
+                "typed terminal/runtime evidence advanced without a complete "
+                "Agent terminal response",
+                event=event,
+                response_error=response_error,
+            ) from response_error
+        if outcome_error is not None and event_error is not None:
+            raise TerminalBoundaryInterrupted(
+                "no complete Agent response, terminal outcome, or runtime event "
+                "was observed",
+                response_error=response_error,
+            ) from event_error
+        raise TerminalBoundaryInterrupted(
+            "terminal completion channels ended in an inconsistent state",
+            response_error=response_error,
+        ) from response_error
+
+    try:
+        terminal_completion = terminal_outcome_stream.next_completion(
+            timeout_seconds=grace
+        )
+    except Exception as outcome_error:
+        raise TerminalProtocolViolation(
+            "Agent terminal response completed without a typed terminal outcome",
+            response=response,
+            response_error=outcome_error,
+        ) from outcome_error
+    if isinstance(terminal_completion, TerminalDetourProjection):
+        try:
+            terminal_completion = validate_terminal_detour_projection(
+                asdict(terminal_completion)
+            )
+        except Exception as exc:
+            raise TerminalProtocolViolation(
+                "terminal detour failed the shared projection contract",
+                response=response,
+                response_error=exc,
+            ) from exc
+        expected_input_hash = user_input_hash(expectation.submitted_input)
+        if terminal_completion.input_hash != expected_input_hash:
+            raise TerminalProtocolViolation(
+                "terminal detour is bound to a different submitted input",
+                response=response,
+            )
+        if (
+            terminal_completion.session_id != expectation.session_id
+            or terminal_completion.session_purpose
+            != expectation.session_purpose
+            or terminal_completion.process_instance_id
+            != expectation.process_instance_id
+            or terminal_completion.product_authority_id
+            != expectation.product_authority_id
+            or terminal_completion.logical_thread_id
+            != expectation.product_authority_id
+        ):
+            raise TerminalProtocolViolation(
+                "terminal detour is bound to a different process or session",
+                response=response,
+            )
+        if (
+            terminal_completion.product_revision_before
+            != expectation.product_revision
+            or terminal_completion.product_revision_after
+            != expectation.product_revision
+            or terminal_completion.product_checkpoint_thread_id_before
+            != expectation.product_checkpoint_thread_id
+            or terminal_completion.product_checkpoint_thread_id_after
+            != expectation.product_checkpoint_thread_id
+            or terminal_completion.product_checkpoint_id_before
+            != expectation.product_checkpoint_id
+            or terminal_completion.product_checkpoint_id_after
+            != expectation.product_checkpoint_id
+            or
+            terminal_completion.product_fingerprint_before
+            != expectation.product_fingerprint
+            or terminal_completion.product_fingerprint_after
+            != expectation.product_fingerprint
+        ):
+            raise TerminalProtocolViolation(
+                "terminal detour is bound to a different Product Head",
+                response=response,
+            )
+        if (
+            terminal_completion.presentation_hash
+            != presentation_hash(response)
+        ):
+            raise TerminalProtocolViolation(
+                "terminal detour does not match the presented terminal frame",
+                response=response,
+            )
+        event_stream.assert_publication_fence(terminal_completion)
+        if terminal_completion.result_kind == "session_termination":
+            return SessionTerminationCompletion(
+                response=response,
+                terminal_detour=terminal_completion,
+                termination_reason=terminal_completion.termination_reason,
+                exit_code=int(terminal_completion.exit_code),
+            )
+        return TerminalDetourCompletion(
+            response=response,
+            terminal_detour=terminal_completion,
+            effect_status=terminal_completion.effect_status,
+            stream_stop_reason=terminal_completion.stream_stop_reason,
+        )
+    terminal_outcome = terminal_completion
+    try:
+        terminal_outcome = validate_terminal_outcome_projection(
+            asdict(terminal_outcome)
+        )
+    except Exception as exc:
+        raise TerminalProtocolViolation(
+            "terminal outcome failed the shared projection contract",
+            response=response,
+            response_error=exc,
+        ) from exc
+    if terminal_outcome.outcome != "committed":
+        failure = (
+            "reconciliation_required"
+            if terminal_outcome.outcome == "reconciliation_required"
+            else terminal_outcome.failure_category or terminal_outcome.outcome
+        )
+        raise TerminalTurnFailure(failure, response)
+    try:
+        event = event_stream.next_event(timeout_seconds=grace)
+    except Exception as event_error:
+        raise TerminalProtocolViolation(
+            "Agent terminal response completed without a matching runtime event",
+            response=response,
+            response_error=event_error,
+        ) from event_error
+
+    if event.event_type != "turn_committed":
+        raise TerminalProtocolViolation(
+            "Agent terminal response was paired with a non-terminal runtime event",
+            response=response,
+            event=event,
+        )
+    if event.schema_version != 6:
+        raise TerminalProtocolViolation(
+            "live workflow completion requires runtime event schema v6",
+            response=response,
+            event=event,
+        )
+    try:
+        validate_runtime_turn_event(event)
+    except Exception as exc:
+        raise TerminalProtocolViolation(
+            "runtime event failed the shared v6 contract",
+            response=response,
+            event=event,
+        ) from exc
+    if event.schema_version == 6:
+        if terminal_outcome.transaction_id != event.transaction_id:
+            raise TerminalProtocolViolation(
+                "terminal outcome and runtime event identify different transactions",
+                response=response,
+                event=event,
+            )
+        if (
+            terminal_outcome.product_authority_id
+            != event.product_authority_id
+            or event.product_authority_id
+            != expectation.product_authority_id
+            or terminal_outcome.logical_thread_id
+            != expectation.product_authority_id
+        ):
+            raise TerminalProtocolViolation(
+                "terminal outcome and runtime event identify different Product Head authorities",
+                response=response,
+                event=event,
+            )
+        if (
+            terminal_outcome.runtime_event_id != event.runtime_event_id
+            or terminal_outcome.runtime_event_sequence
+            != event.runtime_event_sequence
+            or terminal_outcome.runtime_event_payload_hash
+            != event.runtime_event_payload_hash
+        ):
+            raise TerminalProtocolViolation(
+                "terminal outcome and runtime event publication receipts differ",
+                response=response,
+                event=event,
+            )
+        if terminal_outcome.event_id != event.terminal_event_id:
+            raise TerminalProtocolViolation(
+                "terminal outcome and runtime event identify different outbox events",
+                response=response,
+                event=event,
+            )
+        if (
+            terminal_outcome.physical_thread_id != event.physical_thread_id
+            or terminal_outcome.attempt_checkpoint_id
+            != event.attempt_checkpoint_id
+        ):
+            raise TerminalProtocolViolation(
+                "terminal outcome and runtime event identify different attempts",
+                response=response,
+                event=event,
+            )
+    if terminal_outcome.product_fingerprint != event.after_fingerprint:
+        raise TerminalProtocolViolation(
+            "terminal outcome and runtime event identify different Product Heads",
+            response=response,
+            event=event,
+        )
+    if terminal_outcome.base_fingerprint != event.before_fingerprint:
+        raise TerminalProtocolViolation(
+            "terminal outcome and runtime event identify different base Product Heads",
+            response=response,
+            event=event,
+        )
+    terminal_before_identity = (
+        terminal_outcome.base_revision,
+        terminal_outcome.base_checkpoint_thread_id,
+        terminal_outcome.base_checkpoint_id,
+        terminal_outcome.base_fingerprint,
+    )
+    event_before_identity = (
+        event.base_revision,
+        event.base_checkpoint_thread_id,
+        event.base_checkpoint_id,
+        event.before_fingerprint,
+    )
+    expected_before_identity = (
+        expectation.product_revision,
+        expectation.product_checkpoint_thread_id,
+        expectation.product_checkpoint_id,
+        expectation.product_fingerprint,
+    )
+    terminal_after_identity = (
+        terminal_outcome.product_revision,
+        terminal_outcome.product_checkpoint_thread_id,
+        terminal_outcome.product_checkpoint_id,
+        terminal_outcome.product_fingerprint,
+    )
+    event_after_identity = (
+        event.product_revision,
+        event.product_checkpoint_thread_id,
+        event.product_checkpoint_id,
+        event.after_fingerprint,
+    )
+    if (
+        terminal_before_identity != event_before_identity
+        or event_before_identity != expected_before_identity
+        or terminal_after_identity != event_after_identity
+    ):
+        raise TerminalProtocolViolation(
+            "workflow completion Product Head lineage is inconsistent",
+            response=response,
+            event=event,
+        )
+    if event.before_fingerprint != expectation.product_fingerprint:
+        raise TerminalProtocolViolation(
+            "runtime event is bound to a different expected Product Head",
+            response=response,
+            event=event,
+        )
+    if (
+        event.thread_id != expectation.session_id
+        or event.session_purpose != expectation.session_purpose
+    ):
+        raise TerminalProtocolViolation(
+            "runtime event is bound to a different session",
+            response=response,
+            event=event,
+        )
+    if dict(event.revision) != dict(terminal_outcome.origin_revision):
+        raise TerminalProtocolViolation(
+            "runtime event and terminal outcome identify different revisions",
+            response=response,
+            event=event,
+        )
+    if str(event.turn_receipt_summary.get("input_hash") or "") != user_input_hash(
+        expectation.submitted_input
+    ):
+        raise TerminalProtocolViolation(
+            "runtime event is bound to a different submitted input",
+            response=response,
+            event=event,
+        )
+    if event.schema_version == 6 and terminal_outcome.render_hash != event.render_hash:
+        raise TerminalProtocolViolation(
+            "terminal outcome and runtime event identify different rendered results",
+            response=response,
+            event=event,
+        )
+    if terminal_outcome.presentation_hash != presentation_hash(response):
+        raise TerminalProtocolViolation(
+            "terminal outcome does not match the presented terminal frame",
+            response=response,
+            event=event,
+        )
+    return WorkflowCompletion(
+        response=response,
+        event=event,
+        terminal_outcome=terminal_outcome,
+    )
+
+
+def write_terminal_completion_diagnostic(
+    error: TerminalCompletionError,
+    directory: str | Path,
+    *,
+    session_id: str,
+    revision: Mapping[str, str],
+    user_message: str,
+    last_complete_event: RuntimeTurnEvent | None,
+) -> Path:
+    """Persist a redacted, non-qualifying terminal protocol failure."""
+
+    unsigned = {
+        "schema_version": 1,
+        "artifact_type": "terminal_completion_diagnostic",
+        "qualifying_evidence": False,
+        "session_id": session_id,
+        "revision": dict(revision),
+        "user_message": str(redact(user_message)),
+        "failure": error.diagnostic_payload(),
+        "last_complete_event": (
+            {
+                "event_type": last_complete_event.event_type,
+                "turn_index": last_complete_event.turn_index,
+                "after_fingerprint": last_complete_event.after_fingerprint,
+                "pending_question_id": last_complete_event.pending_question_id,
+            }
+            if last_complete_event is not None
+            else {}
+        ),
+    }
+    diagnostic = {
+        **unsigned,
+        "diagnostic_id": content_hash(unsigned),
+    }
+    output_dir = Path(directory)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"terminal-{diagnostic['diagnostic_id']}.json"
+    path.write_text(
+        json.dumps(diagnostic, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
 
 class SubprocessPtyTransport:
     """Small stdlib PTY transport suitable for Docker Compose or direct Linux."""
@@ -597,9 +1171,13 @@ class SubprocessPtyTransport:
         while time.monotonic() < deadline:
             if self._process.poll() is not None:
                 captured.extend(self._drain())
+                cleaned = _clean_terminal_text(bytes(captured))
+                terminal_response = _complete_agent_response_at_exit(cleaned)
+                if terminal_response is not None:
+                    return terminal_response
                 raise RuntimeError(
                     f"Agent CLI exited before the next User prompt (exit={self._process.returncode}): "
-                    f"{_clean_terminal_text(bytes(captured))[-2000:]}"
+                    f"{cleaned[-2000:]}"
                 )
             ready, _, _ = select.select(
                 [self._master_fd],
@@ -962,8 +1540,27 @@ class JsonlRuntimeEventStream:
         self.poll_interval_seconds = poll_interval_seconds
         self._events: list[RuntimeTurnEvent] = []
         self._cursor = 0
+        self._process_start_cursor = 0
+
+    def mark_process_start(self) -> None:
+        self._refresh()
+        self._process_start_cursor = len(self._events)
+
+    def capture_startup_snapshot(
+        self,
+    ) -> tuple[tuple[RuntimeTurnEvent, ...], tuple[RuntimeTurnEvent, ...]]:
+        """Return immutable history and consume only this process's startup delta."""
+
+        self._refresh()
+        history = tuple(self._events[:self._process_start_cursor])
+        delta = tuple(self._events[self._process_start_cursor:])
+        self._cursor = len(self._events)
+        return history, delta
 
     def baseline(self) -> RuntimeTurnEvent:
+        return self.baseline_events()[-1]
+
+    def baseline_events(self) -> tuple[RuntimeTurnEvent, ...]:
         self._refresh()
         if not self._events:
             raise RuntimeError(
@@ -971,7 +1568,7 @@ class JsonlRuntimeEventStream:
                 "through the product runtime before scheduling coverage turns"
             )
         self._cursor = len(self._events)
-        return self._events[-1]
+        return tuple(self._events)
 
     def next_event(self, *, timeout_seconds: float) -> RuntimeTurnEvent:
         deadline = time.monotonic() + timeout_seconds
@@ -985,17 +1582,477 @@ class JsonlRuntimeEventStream:
                 self._cursor += 1
                 return event
             time.sleep(min(self.poll_interval_seconds, max(0.0, deadline - time.monotonic())))
-        raise RuntimeError("CLI returned without a new committed runtime turn event")
+        raise NoRuntimeEventBeforeFence(
+            "CLI returned without a new committed runtime turn event"
+        )
+
+    def assert_publication_fence(
+        self,
+        detour: TerminalDetourProjection,
+    ) -> None:
+        """Prove the detour's SQLite publication fence from one stable snapshot."""
+
+        self._refresh()
+        if self._cursor != len(self._events):
+            raise RuntimeError(
+                "runtime event stream has unconsumed evidence at a detour fence"
+            )
+        authority_events = [
+            event
+            for event in self._events
+            if product_authority_id(
+                event.thread_id,
+                event.session_purpose,
+            )
+            == detour.logical_thread_id
+            and event.schema_version == 6
+        ]
+        expected = (
+            detour.runtime_event_fence_sequence,
+            detour.runtime_event_fence_terminal_event_id,
+            detour.runtime_event_fence_id,
+            detour.runtime_event_fence_hash,
+        )
+        if not authority_events:
+            actual = (0, "", "", "")
+        else:
+            latest = authority_events[-1]
+            sequences = [
+                int(event.runtime_event_sequence or 0)
+                for event in authority_events
+            ]
+            if sequences != list(range(1, sequences[-1] + 1)):
+                raise RuntimeError(
+                    "runtime event publication sequence is not contiguous"
+                )
+            actual = (
+                int(latest.runtime_event_sequence or 0),
+                latest.terminal_event_id,
+                latest.runtime_event_id,
+                latest.runtime_event_payload_hash,
+            )
+        if actual != expected:
+            raise RuntimeError(
+                "runtime event stream does not match the durable detour fence"
+            )
 
     def _refresh(self) -> None:
-        try:
-            lines = self.path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            lines = []
-        parsed = [_runtime_event_from_mapping(json.loads(line)) for line in lines if line.strip()]
+        parsed = [
+            _runtime_event_from_mapping(record)
+            for record in read_jsonl_records(self.path)
+        ]
+        event_ids = [event.runtime_event_id for event in parsed]
+        if len(set(event_ids)) != len(event_ids):
+            raise RuntimeError("runtime turn event identity is duplicated")
         if len(parsed) < len(self._events) or parsed[:len(self._events)] != self._events:
             raise RuntimeError("runtime turn event stream was truncated or rewritten")
         self._events = parsed
+
+
+class JsonlTerminalOutcomeStream:
+    """Read the terminal's projection of the authoritative SQLite outbox."""
+
+    def __init__(self, path: Path, *, poll_interval_seconds: float) -> None:
+        self.path = path
+        self.poll_interval_seconds = poll_interval_seconds
+        self._outcomes: list[TerminalOutcomeObservation] = []
+        self._detours: list[TerminalDetourObservation] = []
+        self._completions: list[TerminalCompletionObservation] = []
+        self._session_events: list[TerminalSessionEvent] = []
+        self._session_cursor = 0
+        self._cursor = 0
+        self._process_start_completion_cursor = 0
+
+    def mark_process_start(self) -> None:
+        self._refresh()
+        self._session_cursor = len(self._session_events)
+        self._process_start_completion_cursor = len(self._completions)
+
+    def capture_startup_snapshot(
+        self,
+    ) -> tuple[
+        tuple[TerminalOutcomeObservation, ...],
+        tuple[TerminalDetourObservation, ...],
+    ]:
+        """Consume exactly the terminal projections added by this process start."""
+
+        self._refresh()
+        delta = tuple(
+            self._completions[self._process_start_completion_cursor:]
+        )
+        self._cursor = len(self._completions)
+        return (
+            tuple(
+                item
+                for item in delta
+                if isinstance(item, TerminalOutcomeProjection)
+            ),
+            tuple(
+                item
+                for item in delta
+                if isinstance(item, TerminalDetourProjection)
+            ),
+        )
+
+    def mark_baseline(self) -> None:
+        self.baseline_outcomes()
+
+    def baseline_outcomes(self) -> tuple[TerminalOutcomeObservation, ...]:
+        self._refresh()
+        self._cursor = len(self._completions)
+        return tuple(self._outcomes)
+
+    def baseline_detours(self) -> tuple[TerminalDetourObservation, ...]:
+        self._refresh()
+        self._cursor = len(self._completions)
+        return tuple(self._detours)
+
+    def baseline_session_events(
+        self,
+        *,
+        startup_response: str,
+        session_id: str,
+        session_purpose: str,
+    ) -> tuple[TerminalSessionEvent, ...]:
+        del startup_response, session_id, session_purpose
+        self._refresh()
+        if not self._session_events:
+            raise RuntimeError("CLI startup did not publish a typed session event")
+        return tuple(self._session_events[self._session_cursor:])
+
+    def next_outcome(
+        self,
+        *,
+        timeout_seconds: float,
+    ) -> TerminalOutcomeObservation:
+        completion = self.next_completion(timeout_seconds=timeout_seconds)
+        if not isinstance(completion, TerminalOutcomeProjection):
+            raise RuntimeError(
+                "next terminal completion is a detour, not a workflow outcome"
+            )
+        return completion
+
+    def next_completion(
+        self,
+        *,
+        timeout_seconds: float,
+    ) -> TerminalCompletionObservation:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            self._refresh()
+            available = len(self._completions) - self._cursor
+            if available > 1:
+                raise RuntimeError(
+                    "multiple terminal outcomes advanced for one submitted PTY turn"
+                )
+            if available == 1:
+                outcome = self._completions[self._cursor]
+                self._cursor += 1
+                return outcome
+            time.sleep(min(
+                self.poll_interval_seconds,
+                max(0.0, deadline - time.monotonic()),
+            ))
+        raise RuntimeError("CLI returned without a typed terminal outcome")
+
+    def _refresh(self) -> None:
+        records = list(read_jsonl_records(self.path))
+        parsed = [
+            _terminal_outcome_from_mapping(record)
+            for record in records
+            if record.get("record_type") == "terminal_outcome_projection"
+        ]
+        detours = [
+            validate_terminal_detour_projection(record)
+            for record in records
+            if record.get("record_type") == "terminal_detour_projection"
+        ]
+        completions: list[TerminalCompletionObservation] = []
+        for record in records:
+            if record.get("record_type") == "terminal_outcome_projection":
+                completions.append(_terminal_outcome_from_mapping(record))
+            elif record.get("record_type") == "terminal_detour_projection":
+                completions.append(validate_terminal_detour_projection(record))
+        session_events = [
+            validate_terminal_session_event(record)
+            for record in records
+            if record.get("record_type") == "terminal_session_event"
+        ]
+        if (
+            len(parsed) < len(self._outcomes)
+            or parsed[:len(self._outcomes)] != self._outcomes
+        ):
+            raise RuntimeError(
+                "terminal outcome stream was truncated or rewritten"
+            )
+        if (
+            len(session_events) < len(self._session_events)
+            or session_events[:len(self._session_events)] != self._session_events
+        ):
+            raise RuntimeError(
+                "terminal session event stream was truncated or rewritten"
+            )
+        if (
+            len(completions) < len(self._completions)
+            or completions[:len(self._completions)] != self._completions
+        ):
+            raise RuntimeError(
+                "terminal completion stream was truncated or rewritten"
+            )
+        event_ids = [event.session_event_id for event in session_events]
+        process_ids = [event.process_instance_id for event in session_events]
+        if (
+            len(set(event_ids)) != len(event_ids)
+            or len(set(process_ids)) != len(process_ids)
+        ):
+            raise RuntimeError("terminal session event identity is duplicated")
+        self._outcomes = parsed
+        self._detours = detours
+        self._completions = completions
+        self._session_events = session_events
+
+
+def validate_startup_terminal_protocol(
+    events: Sequence[RuntimeTurnEvent],
+    outcomes: Sequence[TerminalOutcomeObservation],
+    *,
+    expected_revision: Mapping[str, str],
+    session_event: TerminalSessionEvent | None = None,
+    detours: Sequence[TerminalDetourObservation] = (),
+    baseline_event: RuntimeTurnEvent | None = None,
+) -> None:
+    """Audit startup replay before a simulator may submit the first turn."""
+
+    events_by_terminal_id: dict[str, RuntimeTurnEvent] = {}
+    runtime_event_ids: set[str] = set()
+    for event in events:
+        validate_runtime_turn_event(event)
+        if event.runtime_event_id in runtime_event_ids:
+            raise RuntimeError("startup runtime event identity is duplicated")
+        runtime_event_ids.add(event.runtime_event_id)
+        if event.schema_version != 6 or not event.terminal_event_id:
+            continue
+        if event.terminal_event_id in events_by_terminal_id:
+            raise RuntimeError(
+                "startup runtime event duplicates one terminal outcome"
+            )
+        if event.terminal_outcome != "committed":
+            raise RuntimeError(
+                "startup runtime event does not represent a committed outcome"
+            )
+        events_by_terminal_id[event.terminal_event_id] = event
+    immutable_by_event: dict[str, tuple[Any, ...]] = {}
+    for outcome in outcomes:
+        if dict(outcome.origin_revision) != dict(expected_revision):
+            raise RuntimeError("startup terminal projection revision is stale")
+        immutable = (
+            outcome.transaction_id,
+            outcome.product_authority_id,
+            outcome.logical_thread_id,
+            outcome.physical_thread_id,
+            outcome.outcome,
+            outcome.failure_category,
+            outcome.diagnostic_hash,
+            outcome.base_fingerprint,
+            outcome.base_revision,
+            outcome.base_checkpoint_thread_id,
+            outcome.base_checkpoint_id,
+            outcome.attempt_checkpoint_id,
+            outcome.attempt_fingerprint,
+            outcome.product_fingerprint,
+            outcome.product_revision,
+            outcome.product_checkpoint_thread_id,
+            outcome.product_checkpoint_id,
+            outcome.render_hash,
+            outcome.runtime_event_id,
+            outcome.runtime_event_sequence,
+            outcome.runtime_event_payload_hash,
+        )
+        previous = immutable_by_event.setdefault(outcome.event_id, immutable)
+        if previous != immutable:
+            raise RuntimeError(
+                "startup terminal replay changed immutable outbox facts"
+            )
+        if outcome.outcome != "committed":
+            if outcome.product_fingerprint != outcome.base_fingerprint:
+                raise RuntimeError(
+                    "non-committing startup outcome advanced the Product Head"
+                )
+            continue
+        event = events_by_terminal_id.get(outcome.event_id)
+        if event is None:
+            raise RuntimeError(
+                "committed startup projection has no matching runtime event"
+            )
+        if (
+            event.transaction_id != outcome.transaction_id
+            or event.product_authority_id != outcome.product_authority_id
+            or outcome.logical_thread_id != outcome.product_authority_id
+            or event.before_fingerprint != outcome.base_fingerprint
+            or event.after_fingerprint != outcome.product_fingerprint
+            or event.base_revision != outcome.base_revision
+            or event.base_checkpoint_thread_id
+            != outcome.base_checkpoint_thread_id
+            or event.base_checkpoint_id != outcome.base_checkpoint_id
+            or event.product_revision != outcome.product_revision
+            or event.product_checkpoint_thread_id
+            != outcome.product_checkpoint_thread_id
+            or event.product_checkpoint_id != outcome.product_checkpoint_id
+            or event.physical_thread_id != outcome.physical_thread_id
+            or event.attempt_checkpoint_id
+            != outcome.attempt_checkpoint_id
+            or event.render_hash != outcome.render_hash
+            or event.runtime_event_id != outcome.runtime_event_id
+            or event.runtime_event_sequence
+            != outcome.runtime_event_sequence
+            or event.runtime_event_payload_hash
+            != outcome.runtime_event_payload_hash
+            or event.terminal_outcome != outcome.outcome
+        ):
+            raise RuntimeError(
+                "startup runtime event and terminal projection do not match"
+            )
+    outcomes_by_event = {outcome.event_id: outcome for outcome in outcomes}
+    for terminal_event_id, event in events_by_terminal_id.items():
+        if event.terminal_outcome == "committed" and terminal_event_id not in outcomes_by_event:
+            raise RuntimeError(
+                "startup runtime event has no matching terminal projection"
+            )
+    for detour in detours:
+        if dict(detour.origin_revision) != dict(expected_revision):
+            raise RuntimeError("startup terminal detour revision is stale")
+        if (
+            detour.product_revision_before != detour.product_revision_after
+            or detour.product_checkpoint_thread_id_before
+            != detour.product_checkpoint_thread_id_after
+            or detour.product_checkpoint_id_before
+            != detour.product_checkpoint_id_after
+            or detour.product_fingerprint_before
+            != detour.product_fingerprint_after
+        ):
+            raise RuntimeError("startup terminal detour advanced Product Head")
+    if session_event is not None:
+        replayed = tuple(
+            item.projection_id
+            for item in (*outcomes, *detours)
+            if item.delivery_phase == "startup_replay"
+        )
+        if tuple(session_event.replayed_projection_ids) != replayed:
+            raise RuntimeError(
+                "terminal session replay set does not match startup projections"
+            )
+        if baseline_event is None:
+            raise RuntimeError(
+                "terminal session Product Head requires a runtime baseline"
+            )
+        expected_authority = product_authority_id(
+            baseline_event.thread_id,
+            baseline_event.session_purpose,
+        )
+        if baseline_event.product_authority_id != expected_authority:
+            raise RuntimeError(
+                "runtime baseline Product Head authority is inconsistent"
+            )
+        if any(
+            outcome.product_authority_id
+            != session_event.product_authority_id
+            or outcome.logical_thread_id
+            != session_event.product_authority_id
+            for outcome in outcomes
+        ):
+            raise RuntimeError(
+                "startup terminal outcome authority differs from the session"
+            )
+        if any(
+            detour.product_authority_id
+            != session_event.product_authority_id
+            or detour.logical_thread_id
+            != session_event.product_authority_id
+            for detour in detours
+        ):
+            raise RuntimeError(
+                "startup terminal detour authority differs from the session"
+            )
+        session_head = (
+            session_event.product_authority_id,
+            session_event.product_revision,
+            session_event.product_checkpoint_thread_id,
+            session_event.product_checkpoint_id,
+            session_event.product_fingerprint,
+        )
+        baseline_head = (
+            baseline_event.product_authority_id,
+            baseline_event.product_revision,
+            baseline_event.product_checkpoint_thread_id,
+            baseline_event.product_checkpoint_id,
+            baseline_event.after_fingerprint,
+        )
+        baseline_fence = (
+            baseline_event.runtime_event_sequence,
+            baseline_event.terminal_event_id,
+            baseline_event.runtime_event_id,
+            baseline_event.runtime_event_payload_hash,
+        )
+        session_fence = (
+            session_event.runtime_event_fence_sequence,
+            session_event.runtime_event_fence_terminal_event_id,
+            session_event.runtime_event_fence_id,
+            session_event.runtime_event_fence_hash,
+        )
+        if session_head != baseline_head or session_fence != baseline_fence:
+            raise RuntimeError(
+                "terminal startup session is not bound to the runtime Product Head"
+            )
+
+
+def validate_startup_session_event(
+    stream: TerminalOutcomeStream,
+    *,
+    expected_revision: Mapping[str, str],
+    expected_provider: str,
+    expected_model: str,
+    expected_session_id: str,
+    expected_session_purpose: str,
+    startup_response: str,
+) -> TerminalSessionEvent:
+    """Require the production startup identity instead of parsing terminal prose."""
+
+    events = stream.baseline_session_events(
+        startup_response=startup_response,
+        session_id=expected_session_id,
+        session_purpose=expected_session_purpose,
+    )
+    candidates = [
+        event
+        for event in events
+        if dict(event.origin_revision) == dict(expected_revision)
+        and event.provider == expected_provider
+        and event.model == expected_model
+        and event.session_id == expected_session_id
+        and event.session_purpose == expected_session_purpose
+        and event.presentation_hash == presentation_hash(startup_response)
+    ]
+    if len(candidates) != 1:
+        raise RuntimeError("typed provider/model session identity is missing")
+    event = candidates[0]
+    if not event.provider_ready or event.startup_status != "ready":
+        raise RuntimeError(
+            "terminal session is not provider-ready: "
+            f"{event.failure_category or event.startup_status}"
+        )
+    if event.provider != expected_provider or event.model != expected_model:
+        raise RuntimeError(
+            "typed provider/model does not match the configured Chaos boundary: "
+            f"{event.provider}/{event.model}"
+        )
+    if (
+        event.session_id != expected_session_id
+        or event.session_purpose != expected_session_purpose
+    ):
+        raise RuntimeError("terminal session identity does not match this runner")
+    if event.presentation_hash != presentation_hash(startup_response):
+        raise RuntimeError("terminal session presentation hash does not match the PTY")
+    return event
 
 
 class DynamicDualAiChaosRunner:
@@ -1010,6 +2067,7 @@ class DynamicDualAiChaosRunner:
         schedule: ChaosSchedule,
         transport: PtyTransport | None = None,
         event_stream: RuntimeEventStream | None = None,
+        terminal_outcome_stream: TerminalOutcomeStream | None = None,
         revision: Mapping[str, str] | None = None,
         clock_ns: Callable[[], int] = time.time_ns,
     ) -> None:
@@ -1034,6 +2092,33 @@ class DynamicDualAiChaosRunner:
         self.event_stream = event_stream or JsonlRuntimeEventStream(
             default_event_path,
             poll_interval_seconds=config.poll_interval_seconds,
+        )
+        default_terminal_outcome_path = (
+            (
+                config.runtime_root
+                or config.repo_root / ".agent" / "dynamic-chaos" / config.session_id
+            )
+            / "terminal-outcomes.jsonl"
+        )
+        if event_stream is not None and terminal_outcome_stream is None:
+            raise ValueError(
+                "injected runtime events require an independent terminal "
+                "outcome stream"
+            )
+        if (
+            event_stream is not None
+            and terminal_outcome_stream is event_stream
+        ):
+            raise ValueError(
+                "runtime events and terminal outcomes require independent "
+                "producers"
+            )
+        self.terminal_outcome_stream = (
+            terminal_outcome_stream
+            or JsonlTerminalOutcomeStream(
+                default_terminal_outcome_path,
+                poll_interval_seconds=config.poll_interval_seconds,
+            )
         )
         self.clock_ns = clock_ns
 
@@ -1077,20 +2162,57 @@ class DynamicDualAiChaosRunner:
         last_complete_event: RuntimeTurnEvent | None = None
         last_complete_turn: PtyCliTurnRecord | None = None
         last_complete_selection: DynamicTurnSelection | None = None
+        active_user_message = ""
 
+        self.terminal_outcome_stream.mark_process_start()
+        if hasattr(self.event_stream, "mark_process_start"):
+            self.event_stream.mark_process_start()  # type: ignore[attr-defined]
         self.transport.start(env=env)
         try:
             previous_response = self.transport.read_complete_agent_response(
                 timeout_seconds=self.config.response_timeout_seconds
             )
             previous_received_ns = self.clock_ns()
-            observed_provider, observed_model = _provider_model_from_startup(previous_response)
-            if observed_provider != self.config.provider or observed_model != self.config.model:
-                raise RuntimeError(
-                    "observed provider/model does not match the configured Chaos boundary: "
-                    f"{observed_provider}/{observed_model}"
+            startup_session = validate_startup_session_event(
+                self.terminal_outcome_stream,
+                expected_revision=self.revision,
+                expected_provider=self.config.provider,
+                expected_model=self.config.model,
+                expected_session_id=self.config.session_id,
+                expected_session_purpose=self.config.session_purpose,
+                startup_response=previous_response,
+            )
+            observed_provider = startup_session.provider
+            observed_model = startup_session.model
+            if isinstance(self.event_stream, JsonlRuntimeEventStream):
+                runtime_history, startup_events = (
+                    self.event_stream.capture_startup_snapshot()  # type: ignore[attr-defined]
                 )
-            baseline_event = self.event_stream.baseline()
+                combined_events = (*runtime_history, *startup_events)
+                if not combined_events:
+                    raise RuntimeError(
+                        "dynamic Chaos requires a baseline runtime event"
+                    )
+                for historical_event in runtime_history:
+                    validate_runtime_turn_event(historical_event)
+                baseline_event = combined_events[-1]
+            elif hasattr(self.event_stream, "baseline_events"):
+                startup_events = self.event_stream.baseline_events()  # type: ignore[attr-defined]
+                baseline_event = startup_events[-1]
+            else:
+                startup_events = ()
+                baseline_event = self.event_stream.baseline()
+            startup_outcomes, startup_detours = (
+                self.terminal_outcome_stream.capture_startup_snapshot()  # type: ignore[attr-defined]
+            )
+            validate_startup_terminal_protocol(
+                startup_events,
+                startup_outcomes,
+                expected_revision=self.revision,
+                session_event=startup_session,
+                detours=startup_detours,
+                baseline_event=baseline_event,
+            )
             self._validate_event_revision(baseline_event)
             transcript_lines.append(previous_response)
             last_complete_response = previous_response
@@ -1100,23 +2222,45 @@ class DynamicDualAiChaosRunner:
                 first_target = self.schedule.targets[0]
                 first_edge = self.edge_index[first_target.edge_key]
                 expected_question = str(first_edge.get("question_id") or "")
-                if (
-                    baseline_event.pending_question_id == "resume_harness_session"
-                    and expected_question != "resume_harness_session"
-                ):
-                    resume_choice = (
-                        "2"
-                        if str(first_edge.get("edge_type") or "") == "action_transition"
-                        else "1"
+                resume_choice = _startup_resume_submission(
+                    baseline_event.pending_contract,
+                    desired=(
+                        "modify"
+                        if str(first_edge.get("edge_type") or "")
+                        == "action_transition"
+                        else "continue"
                     )
+                )
+                if resume_choice and expected_question != baseline_event.pending_question_id:
+                    active_user_message = resume_choice
                     self.transport.submit_bracketed_paste(resume_choice)
-                    resumed_response = self.transport.read_complete_agent_response(
-                        timeout_seconds=self.config.response_timeout_seconds
+                    resumed_completion = wait_for_turn_completion(
+                        self.transport,
+                        self.event_stream,
+                        self.terminal_outcome_stream,
+                        timeout_seconds=self.config.response_timeout_seconds,
+                        expectation=CompletionExpectation(
+                            submitted_input=resume_choice,
+                            session_id=self.config.session_id,
+                            session_purpose=self.config.session_purpose,
+                            product_authority_id=startup_session.product_authority_id,
+                            process_instance_id=startup_session.process_instance_id,
+                            product_revision=int(baseline_event.product_revision),
+                            product_checkpoint_thread_id=baseline_event.product_checkpoint_thread_id,
+                            product_checkpoint_id=baseline_event.product_checkpoint_id,
+                            product_fingerprint=baseline_event.after_fingerprint,
+                        ),
                     )
-                    resumed_event = self.event_stream.next_event(
-                        timeout_seconds=self.config.response_timeout_seconds
-                    )
+                    if not isinstance(resumed_completion, WorkflowCompletion):
+                        raise JourneyInfrastructureInterruptedError(
+                            "startup resume did not produce a workflow completion"
+                        )
+                    resumed_response = resumed_completion.response
+                    resumed_event = resumed_completion.event
                     self._validate_event_revision(resumed_event)
+                    self._validate_terminal_revision(
+                        resumed_completion.terminal_outcome
+                    )
                     transcript.extend(((resume_choice, resumed_response),))
                     transcript_lines.extend((f"User> {resume_choice}", resumed_response))
                     previous_response = resumed_response
@@ -1126,6 +2270,7 @@ class DynamicDualAiChaosRunner:
                     last_complete_event = resumed_event
                     last_complete_turn = None
                     last_complete_selection = None
+                    active_user_message = ""
                 if (
                     expected_question
                     and baseline_event.pending_question_id != expected_question
@@ -1143,32 +2288,83 @@ class DynamicDualAiChaosRunner:
                         f"scheduled edge disappeared from authoritative ledger: {scheduled_target.edge_key}"
                     )
                 _require_scheduled_baseline_contract(baseline_event, edge)
-                context = SimulatorContext(
-                    session_id=self.config.session_id,
-                    turn_index=baseline_event.turn_index + 1,
-                    previous_agent_response=previous_response,
-                    previous_response_received_at_ns=previous_received_ns,
-                    scheduled_target=scheduled_target,
-                    transcript=tuple(transcript),
-                    coverage_contract=dict(edge),
-                )
-                decision = self.simulator(context)
-                selection_observed_at_ns = self.clock_ns()
-                if decision is None:
-                    target_results.append({
-                        "target_id": scheduled_target.target_id,
-                        "edge_key": scheduled_target.edge_key,
-                        "status": "externally_blocked",
-                        "reason": "external Codex simulator did not provide a decision",
-                    })
-                    raise RuntimeError("external Codex simulator did not provide a decision")
-                _validate_decision(decision, scheduled_target, edge)
-                submitted_at_ns = self.clock_ns()
-                self.transport.submit_bracketed_paste(decision.user_message)
-                committed_event = self.event_stream.next_event(
-                    timeout_seconds=self.config.response_timeout_seconds
-                )
+                detour_budget = 4
+                while True:
+                    context = SimulatorContext(
+                        session_id=self.config.session_id,
+                        turn_index=baseline_event.turn_index + 1,
+                        previous_agent_response=previous_response,
+                        previous_response_received_at_ns=previous_received_ns,
+                        scheduled_target=scheduled_target,
+                        transcript=tuple(transcript),
+                        coverage_contract=dict(edge),
+                    )
+                    decision = self.simulator(context)
+                    selection_observed_at_ns = self.clock_ns()
+                    if decision is None:
+                        target_results.append({
+                            "target_id": scheduled_target.target_id,
+                            "edge_key": scheduled_target.edge_key,
+                            "status": "externally_blocked",
+                            "reason": "external Codex simulator did not provide a decision",
+                        })
+                        raise RuntimeError(
+                            "external Codex simulator did not provide a decision"
+                        )
+                    _validate_decision(decision, scheduled_target, edge)
+                    submitted_at_ns = self.clock_ns()
+                    active_user_message = decision.user_message
+                    self.transport.submit_bracketed_paste(
+                        decision.user_message
+                    )
+                    completion = wait_for_turn_completion(
+                        self.transport,
+                        self.event_stream,
+                        self.terminal_outcome_stream,
+                        timeout_seconds=self.config.response_timeout_seconds,
+                        expectation=CompletionExpectation(
+                            submitted_input=decision.user_message,
+                            session_id=self.config.session_id,
+                            session_purpose=self.config.session_purpose,
+                            product_authority_id=startup_session.product_authority_id,
+                            process_instance_id=startup_session.process_instance_id,
+                            product_revision=int(baseline_event.product_revision),
+                            product_checkpoint_thread_id=baseline_event.product_checkpoint_thread_id,
+                            product_checkpoint_id=baseline_event.product_checkpoint_id,
+                            product_fingerprint=baseline_event.after_fingerprint,
+                        ),
+                    )
+                    if isinstance(completion, WorkflowCompletion):
+                        break
+                    if isinstance(completion, SessionTerminationCompletion):
+                        raise JourneyInfrastructureInterruptedError(
+                            "Agent terminated during a scheduled workflow target"
+                        )
+                    detour = completion.terminal_detour
+                    if dict(detour.origin_revision) != self.revision:
+                        raise JourneyInfrastructureInterruptedError(
+                            "terminal detour revision differs from the runner"
+                        )
+                    if detour_budget <= 0:
+                        raise JourneyInfrastructureInterruptedError(
+                            "terminal detour budget was exhausted"
+                        )
+                    detour_budget -= 1
+                    detour_response = completion.response
+                    transcript.append(
+                        (decision.user_message, detour_response)
+                    )
+                    transcript_lines.extend((
+                        f"User> {decision.user_message}",
+                        detour_response,
+                    ))
+                    previous_response = detour_response
+                    previous_received_ns = self.clock_ns()
+                    last_complete_response = detour_response
+                    active_user_message = ""
+                committed_event = completion.event
                 self._validate_event_revision(committed_event)
+                self._validate_terminal_revision(completion.terminal_outcome)
                 if (
                     committed_event.before_fingerprint
                     != baseline_event.after_fingerprint
@@ -1178,9 +2374,7 @@ class DynamicDualAiChaosRunner:
                     raise JourneyInfrastructureInterruptedError(
                         "Journey runtime event lineage skipped or diverged"
                     )
-                response = self.transport.read_complete_agent_response(
-                    timeout_seconds=self.config.response_timeout_seconds
-                )
+                response = completion.response
                 response_received_ns = self.clock_ns()
 
                 transcript_data = {
@@ -1221,6 +2415,7 @@ class DynamicDualAiChaosRunner:
                 last_complete_event = committed_event
                 last_complete_turn = turn
                 last_complete_selection = selection
+                active_user_message = ""
 
                 pending_diagnostic = build_pty_diagnostic_artifact(
                     PtyDiagnosticRecord(
@@ -1309,36 +2504,104 @@ class DynamicDualAiChaosRunner:
                             ),
                         },
                     }
-                    continuation_context = SimulatorContext(
-                        session_id=self.config.session_id,
-                        turn_index=committed_event.turn_index + 1,
-                        previous_agent_response=response,
-                        previous_response_received_at_ns=response_received_ns,
-                        scheduled_target=scheduled_target,
-                        transcript=tuple(transcript),
-                        coverage_contract=continuation_contract,
-                    )
-                    continuation_decision = self.simulator(continuation_context)
-                    continuation_selected_at_ns = self.clock_ns()
-                    if continuation_decision is None:
-                        raise RuntimeError(
-                            "external Codex simulator did not provide a continuation decision"
+                    continuation_detour_budget = 4
+                    while True:
+                        continuation_context = SimulatorContext(
+                            session_id=self.config.session_id,
+                            turn_index=committed_event.turn_index + 1,
+                            previous_agent_response=response,
+                            previous_response_received_at_ns=response_received_ns,
+                            scheduled_target=scheduled_target,
+                            transcript=tuple(transcript),
+                            coverage_contract=continuation_contract,
                         )
-                    _validate_continuation_decision(
-                        continuation_decision,
-                        scheduled_target,
-                    )
-                    continuation_submitted_at_ns = self.clock_ns()
-                    self.transport.submit_bracketed_paste(
-                        continuation_decision.user_message
-                    )
-                    continuation_event = self.event_stream.next_event(
-                        timeout_seconds=self.config.response_timeout_seconds
-                    )
+                        continuation_decision = self.simulator(
+                            continuation_context
+                        )
+                        continuation_selected_at_ns = self.clock_ns()
+                        if continuation_decision is None:
+                            raise RuntimeError(
+                                "external Codex simulator did not provide a "
+                                "continuation decision"
+                            )
+                        _validate_continuation_decision(
+                            continuation_decision,
+                            scheduled_target,
+                        )
+                        continuation_submitted_at_ns = self.clock_ns()
+                        active_user_message = continuation_decision.user_message
+                        self.transport.submit_bracketed_paste(
+                            continuation_decision.user_message
+                        )
+                        continuation_completion = wait_for_turn_completion(
+                            self.transport,
+                            self.event_stream,
+                            self.terminal_outcome_stream,
+                            timeout_seconds=self.config.response_timeout_seconds,
+                            expectation=CompletionExpectation(
+                                submitted_input=(
+                                    continuation_decision.user_message
+                                ),
+                                session_id=self.config.session_id,
+                                session_purpose=self.config.session_purpose,
+                                product_authority_id=(
+                                    startup_session.product_authority_id
+                                ),
+                                process_instance_id=(
+                                    startup_session.process_instance_id
+                                ),
+                                product_revision=int(
+                                    committed_event.product_revision
+                                ),
+                                product_checkpoint_thread_id=(
+                                    committed_event.product_checkpoint_thread_id
+                                ),
+                                product_checkpoint_id=(
+                                    committed_event.product_checkpoint_id
+                                ),
+                                product_fingerprint=(
+                                    committed_event.after_fingerprint
+                                ),
+                            ),
+                        )
+                        if isinstance(
+                            continuation_completion,
+                            WorkflowCompletion,
+                        ):
+                            break
+                        if isinstance(
+                            continuation_completion,
+                            SessionTerminationCompletion,
+                        ):
+                            raise JourneyInfrastructureInterruptedError(
+                                "Agent terminated during a continuation"
+                            )
+                        if continuation_detour_budget <= 0:
+                            raise JourneyInfrastructureInterruptedError(
+                                "continuation detour budget was exhausted"
+                            )
+                        continuation_detour_budget -= 1
+                        detour_response = continuation_completion.response
+                        transcript.append(
+                            (
+                                continuation_decision.user_message,
+                                detour_response,
+                            )
+                        )
+                        transcript_lines.extend((
+                            "User> "
+                            + continuation_decision.user_message,
+                            detour_response,
+                        ))
+                        response = detour_response
+                        response_received_ns = self.clock_ns()
+                        active_user_message = ""
+                    continuation_event = continuation_completion.event
                     self._validate_event_revision(continuation_event)
-                    continuation_response = self.transport.read_complete_agent_response(
-                        timeout_seconds=self.config.response_timeout_seconds
+                    self._validate_terminal_revision(
+                        continuation_completion.terminal_outcome
                     )
+                    continuation_response = continuation_completion.response
                     continuation_received_ns = self.clock_ns()
                     continuation_transcript_data = {
                         "session_id": self.config.session_id,
@@ -1388,6 +2651,7 @@ class DynamicDualAiChaosRunner:
                     last_complete_event = committed_event
                     last_complete_turn = continuation_turn
                     last_complete_selection = continuation_selection
+                    active_user_message = ""
                     verified_postcondition = _verify_declared_postconditions(
                         baseline_event,
                         root_committed_event,
@@ -1544,6 +2808,25 @@ class DynamicDualAiChaosRunner:
                 baseline_event = committed_event
             execution_status = "complete"
         except Exception as exc:
+            terminal_diagnostic_path: Path | None = None
+            if isinstance(exc, TerminalCompletionError):
+                transcript_lines.append(f"User> {active_user_message}")
+                failed_output = exc.response or (
+                    str(exc.response_error)
+                    if exc.response_error is not None
+                    else ""
+                )
+                if failed_output:
+                    transcript_lines.append(failed_output)
+                terminal_diagnostic_path = write_terminal_completion_diagnostic(
+                    exc,
+                    diagnostic_dir,
+                    session_id=self.config.session_id,
+                    revision=self.revision,
+                    user_message=active_user_message,
+                    last_complete_event=last_complete_event,
+                )
+                diagnostic_paths.append(terminal_diagnostic_path)
             if not target_results or target_results[-1].get("status") == "passed":
                 completed_ids = {item["target_id"] for item in target_results}
                 pending = next(
@@ -1560,7 +2843,18 @@ class DynamicDualAiChaosRunner:
                         "status": "failed",
                         "reason": interruption_reason,
                     }
-                    if last_complete_event is not None and last_complete_response:
+                    if terminal_diagnostic_path is not None:
+                        failed_result.update({
+                            "diagnostic_path": str(terminal_diagnostic_path),
+                            "diagnostic_id": json.loads(
+                                terminal_diagnostic_path.read_text(encoding="utf-8")
+                            )["diagnostic_id"],
+                        })
+                    if (
+                        terminal_diagnostic_path is None
+                        and last_complete_event is not None
+                        and last_complete_response
+                    ):
                         interruption = build_pty_diagnostic_artifact(
                             PtyDiagnosticRecord(
                                 diagnostic_kind="interruption",
@@ -1588,20 +2882,25 @@ class DynamicDualAiChaosRunner:
                     target_results.append(failed_result)
             raise
         finally:
-            self.transport.close()
-            _write_redacted_transcript(transcript_path, transcript_lines)
-            schedule_result_path.write_text(
-                json.dumps({
-                    "schema_version": 1,
-                    "schedule_id": self.schedule.schedule_id,
-                    "revision": self.revision,
-                    "execution_status": execution_status,
-                    "required_target_count": len(self.schedule.targets),
-                    "passed_target_count": sum(item.get("status") == "passed" for item in target_results),
-                    "targets": target_results,
-                }, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
+            try:
+                self.transport.close()
+            finally:
+                _write_redacted_transcript(transcript_path, transcript_lines)
+                schedule_result_path.write_text(
+                    json.dumps({
+                        "schema_version": 1,
+                        "schedule_id": self.schedule.schedule_id,
+                        "revision": self.revision,
+                        "execution_status": execution_status,
+                        "required_target_count": len(self.schedule.targets),
+                        "passed_target_count": sum(
+                            item.get("status") == "passed"
+                            for item in target_results
+                        ),
+                        "targets": target_results,
+                    }, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
 
         return ChaosRunResult(
             session_id=self.config.session_id,
@@ -1620,6 +2919,15 @@ class DynamicDualAiChaosRunner:
                 "runtime event revision does not match the scheduled ledger revision"
             )
 
+    def _validate_terminal_revision(
+        self,
+        outcome: TerminalOutcomeObservation,
+    ) -> None:
+        if dict(outcome.origin_revision) != self.revision:
+            raise RuntimeError(
+                "terminal outcome revision does not match the scheduled ledger revision"
+            )
+
     def _isolated_environment(self, runtime_root: Path) -> dict[str, str]:
         process_root = self.config.runtime_root_in_process or runtime_root
         env = os.environ.copy()
@@ -1629,6 +2937,9 @@ class DynamicDualAiChaosRunner:
             "ANYCHAIN_AGENT_SESSION_PURPOSE": self.config.session_purpose,
             "ANYCHAIN_AGENT_JOBS_DIR": str(process_root / "jobs"),
             "ANYCHAIN_AGENT_TURN_EVENT_FILE": str(process_root / "turn-events.jsonl"),
+            "ANYCHAIN_AGENT_TERMINAL_OUTCOME_FILE": str(
+                process_root / "terminal-outcomes.jsonl"
+            ),
         })
         env.update({str(key): str(value) for key, value in self.config.extra_env.items()})
         return env
@@ -1647,6 +2958,7 @@ class DynamicDualAiJourneyRunner:
         postcondition_verifier_registry: JourneyOutcomeVerifierRegistry,
         transport: PtyTransport | None = None,
         event_stream: RuntimeEventStream | None = None,
+        terminal_outcome_stream: TerminalOutcomeStream | None = None,
         revision: Mapping[str, str] | None = None,
         clock_ns: Callable[[], int] = time.time_ns,
     ) -> None:
@@ -1678,6 +2990,33 @@ class DynamicDualAiJourneyRunner:
         self.event_stream = event_stream or JsonlRuntimeEventStream(
             default_event_path,
             poll_interval_seconds=config.poll_interval_seconds,
+        )
+        default_terminal_outcome_path = (
+            (
+                config.runtime_root
+                or config.repo_root / ".agent" / "dynamic-chaos" / config.session_id
+            )
+            / "terminal-outcomes.jsonl"
+        )
+        if event_stream is not None and terminal_outcome_stream is None:
+            raise ValueError(
+                "injected runtime events require an independent terminal "
+                "outcome stream"
+            )
+        if (
+            event_stream is not None
+            and terminal_outcome_stream is event_stream
+        ):
+            raise ValueError(
+                "runtime events and terminal outcomes require independent "
+                "producers"
+            )
+        self.terminal_outcome_stream = (
+            terminal_outcome_stream
+            or JsonlTerminalOutcomeStream(
+                default_terminal_outcome_path,
+                poll_interval_seconds=config.poll_interval_seconds,
+            )
         )
         self.clock_ns = clock_ns
 
@@ -1720,20 +3059,60 @@ class DynamicDualAiJourneyRunner:
         observed_model = ""
         execution_proof: Mapping[str, Any] = {}
         qualification_reason = "execution_not_completed"
+        active_user_message = ""
 
         try:
+            self.terminal_outcome_stream.mark_process_start()
+            if hasattr(self.event_stream, "mark_process_start"):
+                self.event_stream.mark_process_start()  # type: ignore[attr-defined]
             self.transport.start(env=env)
             previous_response = self.transport.read_complete_agent_response(
                 timeout_seconds=self.config.response_timeout_seconds
             )
             previous_received_ns = self.clock_ns()
-            observed_provider, observed_model = _provider_model_from_startup(previous_response)
-            if observed_provider != self.config.provider or observed_model != self.config.model:
-                raise JourneyInfrastructureInterruptedError(
-                    "observed provider/model does not match the configured Chaos boundary: "
-                    f"{observed_provider}/{observed_model}"
+            try:
+                startup_session = validate_startup_session_event(
+                    self.terminal_outcome_stream,
+                    expected_revision=self.revision,
+                    expected_provider=self.config.provider,
+                    expected_model=self.config.model,
+                    expected_session_id=self.config.session_id,
+                    expected_session_purpose=self.config.session_purpose,
+                    startup_response=previous_response,
                 )
-            baseline_event = self.event_stream.baseline()
+            except RuntimeError as exc:
+                raise JourneyInfrastructureInterruptedError(str(exc)) from exc
+            observed_provider = startup_session.provider
+            observed_model = startup_session.model
+            if isinstance(self.event_stream, JsonlRuntimeEventStream):
+                runtime_history, startup_events = (
+                    self.event_stream.capture_startup_snapshot()  # type: ignore[attr-defined]
+                )
+                combined_events = (*runtime_history, *startup_events)
+                if not combined_events:
+                    raise RuntimeError(
+                        "dynamic Chaos requires a baseline runtime event"
+                    )
+                for historical_event in runtime_history:
+                    validate_runtime_turn_event(historical_event)
+                baseline_event = combined_events[-1]
+            elif hasattr(self.event_stream, "baseline_events"):
+                startup_events = self.event_stream.baseline_events()  # type: ignore[attr-defined]
+                baseline_event = startup_events[-1]
+            else:
+                startup_events = ()
+                baseline_event = self.event_stream.baseline()
+            startup_outcomes, startup_detours = (
+                self.terminal_outcome_stream.capture_startup_snapshot()  # type: ignore[attr-defined]
+            )
+            validate_startup_terminal_protocol(
+                startup_events,
+                startup_outcomes,
+                expected_revision=self.revision,
+                session_event=startup_session,
+                detours=startup_detours,
+                baseline_event=baseline_event,
+            )
             self._validate_event_revision(baseline_event)
             initial_event = baseline_event
             transcript_lines.append(previous_response)
@@ -1775,47 +3154,94 @@ class DynamicDualAiJourneyRunner:
                 terminal_classification != JourneyTerminalClassification.PASSED
                 and len(turns) < self.schedule.max_turns
             ):
-                context = JourneySimulatorContext(
-                    session_id=self.config.session_id,
-                    turn_index=baseline_event.turn_index + 1,
-                    previous_agent_response=previous_response,
-                    previous_response_received_at_ns=previous_received_ns,
-                    schedule=self.schedule,
-                    transcript=tuple(transcript),
-                    observed_edge_keys=tuple(observed_edge_keys),
-                )
-                decision = self.simulator(context)
-                selection_observed_at_ns = self.clock_ns()
-                if decision is None:
-                    raise JourneyExternallyBlockedError(
-                        "external Codex simulator did not provide a journey decision"
+                detour_budget = 4
+                while True:
+                    context = JourneySimulatorContext(
+                        session_id=self.config.session_id,
+                        turn_index=baseline_event.turn_index + 1,
+                        previous_agent_response=previous_response,
+                        previous_response_received_at_ns=previous_received_ns,
+                        schedule=self.schedule,
+                        transcript=tuple(transcript),
+                        observed_edge_keys=tuple(observed_edge_keys),
                     )
-                try:
-                    _validate_journey_decision(decision, self.schedule)
-                except (TypeError, ValueError) as exc:
-                    raise JourneySimulatorInvalidError(str(exc)) from exc
+                    decision = self.simulator(context)
+                    selection_observed_at_ns = self.clock_ns()
+                    if decision is None:
+                        raise JourneyExternallyBlockedError(
+                            "external Codex simulator did not provide a journey decision"
+                        )
+                    try:
+                        _validate_journey_decision(decision, self.schedule)
+                    except (TypeError, ValueError) as exc:
+                        raise JourneySimulatorInvalidError(str(exc)) from exc
 
-                submitted_at_ns = self.clock_ns()
-                (
-                    simulator_attestation,
-                    variant_attestation,
-                    selected_at_ns,
-                ) = self._validated_decision_attestations(
-                    context=context,
-                    decision=decision,
-                    selection_observed_at_ns=selection_observed_at_ns,
-                    submitted_at_ns=submitted_at_ns,
-                    prior_decisions=decisions,
-                )
-                self.transport.submit_bracketed_paste(decision.user_message)
-                committed_event = self.event_stream.next_event(
-                    timeout_seconds=self.config.response_timeout_seconds
-                )
+                    submitted_at_ns = self.clock_ns()
+                    (
+                        simulator_attestation,
+                        variant_attestation,
+                        selected_at_ns,
+                    ) = self._validated_decision_attestations(
+                        context=context,
+                        decision=decision,
+                        selection_observed_at_ns=selection_observed_at_ns,
+                        submitted_at_ns=submitted_at_ns,
+                        prior_decisions=decisions,
+                    )
+                    active_user_message = decision.user_message
+                    self.transport.submit_bracketed_paste(
+                        decision.user_message
+                    )
+                    completion = wait_for_turn_completion(
+                        self.transport,
+                        self.event_stream,
+                        self.terminal_outcome_stream,
+                        timeout_seconds=self.config.response_timeout_seconds,
+                        expectation=CompletionExpectation(
+                            submitted_input=decision.user_message,
+                            session_id=self.config.session_id,
+                            session_purpose=self.config.session_purpose,
+                            product_authority_id=startup_session.product_authority_id,
+                            process_instance_id=startup_session.process_instance_id,
+                            product_revision=int(baseline_event.product_revision),
+                            product_checkpoint_thread_id=baseline_event.product_checkpoint_thread_id,
+                            product_checkpoint_id=baseline_event.product_checkpoint_id,
+                            product_fingerprint=baseline_event.after_fingerprint,
+                        ),
+                    )
+                    if isinstance(completion, WorkflowCompletion):
+                        break
+                    if isinstance(completion, SessionTerminationCompletion):
+                        raise JourneyInfrastructureInterruptedError(
+                            "Agent terminated during a scheduled journey"
+                        )
+                    detour = completion.terminal_detour
+                    if dict(detour.origin_revision) != self.revision:
+                        raise JourneyInfrastructureInterruptedError(
+                            "terminal detour revision differs from the runner"
+                        )
+                    if detour_budget <= 0:
+                        raise JourneyInfrastructureInterruptedError(
+                            "terminal detour budget was exhausted"
+                        )
+                    detour_budget -= 1
+                    detour_response = completion.response
+                    transcript.append(
+                        (decision.user_message, detour_response)
+                    )
+                    transcript_lines.extend((
+                        f"User> {decision.user_message}",
+                        detour_response,
+                    ))
+                    previous_response = detour_response
+                    previous_received_ns = self.clock_ns()
+                    active_user_message = ""
+                committed_event = completion.event
                 self._validate_event_revision(committed_event)
-                response = self.transport.read_complete_agent_response(
-                    timeout_seconds=self.config.response_timeout_seconds
-                )
+                self._validate_terminal_revision(completion.terminal_outcome)
+                response = completion.response
                 response_received_ns = self.clock_ns()
+                active_user_message = ""
 
                 transcript_data = {
                     "session_id": self.config.session_id,
@@ -1978,6 +3404,26 @@ class DynamicDualAiJourneyRunner:
             terminal_classification = exc.classification
             failure_reason = f"{type(exc).__name__}: {exc}"
             raise
+        except TerminalCompletionError as exc:
+            terminal_classification = JourneyTerminalClassification.INFRASTRUCTURE_INTERRUPTED
+            failure_reason = f"{type(exc).__name__}: {exc}"
+            transcript_lines.append(f"User> {active_user_message}")
+            failed_output = exc.response or (
+                str(exc.response_error)
+                if exc.response_error is not None
+                else ""
+            )
+            if failed_output:
+                transcript_lines.append(failed_output)
+            write_terminal_completion_diagnostic(
+                exc,
+                runtime_root / "diagnostics",
+                session_id=self.config.session_id,
+                revision=self.revision,
+                user_message=active_user_message,
+                last_complete_event=events[-1] if events else initial_event,
+            )
+            raise JourneyInfrastructureInterruptedError(failure_reason) from exc
         except Exception as exc:
             terminal_classification = JourneyTerminalClassification.INFRASTRUCTURE_INTERRUPTED
             failure_reason = f"{type(exc).__name__}: {exc}"
@@ -2366,6 +3812,15 @@ class DynamicDualAiJourneyRunner:
                 "runtime event revision does not match the scheduled journey revision"
             )
 
+    def _validate_terminal_revision(
+        self,
+        outcome: TerminalOutcomeObservation,
+    ) -> None:
+        if dict(outcome.origin_revision) != self.revision:
+            raise RuntimeError(
+                "terminal outcome revision does not match the scheduled journey revision"
+            )
+
     def _isolated_environment(self, runtime_root: Path) -> dict[str, str]:
         process_root = self.config.runtime_root_in_process or runtime_root
         env = os.environ.copy()
@@ -2375,6 +3830,9 @@ class DynamicDualAiJourneyRunner:
             "ANYCHAIN_AGENT_SESSION_PURPOSE": self.config.session_purpose,
             "ANYCHAIN_AGENT_JOBS_DIR": str(process_root / "jobs"),
             "ANYCHAIN_AGENT_TURN_EVENT_FILE": str(process_root / "turn-events.jsonl"),
+            "ANYCHAIN_AGENT_TERMINAL_OUTCOME_FILE": str(
+                process_root / "terminal-outcomes.jsonl"
+            ),
         })
         env.update({str(key): str(value) for key, value in self.config.extra_env.items()})
         return env
@@ -2918,11 +4376,41 @@ def _complete_agent_response(cleaned: str) -> str | None:
     return response or None
 
 
-def _provider_model_from_startup(response: str) -> tuple[str, str]:
-    match = _MODEL_CONFIG_RE.search(response)
-    if match is None:
-        raise RuntimeError("Agent startup response did not expose provider/model identity")
-    return match.group(1), match.group(2)
+def _complete_agent_response_at_exit(cleaned: str) -> str | None:
+    """Return a final Agent frame when typed termination closes the PTY."""
+
+    boundaries = list(_USER_PROMPT_BOUNDARY_RE.finditer(cleaned))
+    frame_start = boundaries[-1].end() if boundaries else 0
+    frame = cleaned[frame_start:]
+    first_agent = frame.find("Agent>")
+    if first_agent < 0:
+        return None
+    response = frame[first_agent:].strip()
+    return response or None
+
+
+def _startup_resume_submission(
+    pending_contract: Mapping[str, Any],
+    *,
+    desired: str,
+) -> str:
+    """Select a resume action from typed option values, never UI positions."""
+
+    values = {
+        str(option.get("value") or "")
+        for option in pending_contract.get("options") or ()
+        if isinstance(option, Mapping)
+    }
+    resume_values = {"continue", "modify", "reset"}
+    if not resume_values.issubset(values) or desired not in resume_values:
+        return ""
+    return desired if desired in values else ""
+
+
+def _terminal_outcome_from_mapping(
+    payload: Mapping[str, Any],
+) -> TerminalOutcomeObservation:
+    return validate_terminal_outcome_projection(payload)
 
 
 def _runtime_event_from_mapping(payload: Mapping[str, Any]) -> RuntimeTurnEvent:
@@ -2948,7 +4436,7 @@ def _runtime_event_from_mapping(payload: Mapping[str, Any]) -> RuntimeTurnEvent:
     missing = sorted(required - set(payload))
     if missing:
         raise RuntimeError(f"runtime turn event is missing: {', '.join(missing)}")
-    if int(payload["schema_version"]) == 3:
+    if int(payload["schema_version"]) >= 3:
         required_v3 = {
             "admitted_action_provenance",
             "turn_receipt_summary",
@@ -2963,9 +4451,57 @@ def _runtime_event_from_mapping(payload: Mapping[str, Any]) -> RuntimeTurnEvent:
             raise RuntimeError(
                 "runtime turn event v3 is missing: " + ", ".join(missing_v3)
             )
+    if int(payload["schema_version"]) >= 4:
+        required_v4 = {
+            "observation",
+            "runtime_event_id",
+            "terminal_event_id",
+            "transaction_id",
+            "terminal_outcome",
+            "render_hash",
+            "product_revision",
+            "product_checkpoint_thread_id",
+            "product_checkpoint_id",
+        }
+        missing_v4 = sorted(required_v4 - set(payload))
+        if missing_v4:
+            raise RuntimeError(
+                "runtime turn event v4 is missing: " + ", ".join(missing_v4)
+            )
+    if int(payload["schema_version"]) >= 5:
+        required_v5 = {
+            "base_revision",
+            "base_checkpoint_thread_id",
+            "base_checkpoint_id",
+            "runtime_event_sequence",
+            "runtime_event_payload_hash",
+        }
+        missing_v5 = sorted(required_v5 - set(payload))
+        if missing_v5:
+            raise RuntimeError(
+                "runtime turn event v5 is missing: " + ", ".join(missing_v5)
+            )
+        unsigned_runtime_event = dict(payload)
+        expected_runtime_hash = str(
+            unsigned_runtime_event.pop("runtime_event_payload_hash", "") or ""
+        )
+        if content_hash(unsigned_runtime_event) != expected_runtime_hash:
+            raise RuntimeError("runtime turn event payload hash is invalid")
+    if int(payload["schema_version"]) >= 6:
+        required_v6 = {
+            "product_authority_id",
+            "physical_thread_id",
+            "attempt_checkpoint_id",
+        }
+        missing_v6 = sorted(required_v6 - set(payload))
+        if missing_v6:
+            raise RuntimeError(
+                "runtime turn event v6 is missing: " + ", ".join(missing_v6)
+            )
     return RuntimeTurnEvent(
         schema_version=int(payload["schema_version"]),
         event_type=str(payload["event_type"]),
+        observation=str(payload.get("observation") or payload["event_type"]),
         thread_id=str(payload["thread_id"]),
         session_purpose=str(payload["session_purpose"]),
         before_fingerprint=str(payload["before_fingerprint"]),
@@ -3019,4 +4555,26 @@ def _runtime_event_from_mapping(payload: Mapping[str, Any]) -> RuntimeTurnEvent:
             for path, value in dict(payload["after_value_hashes"] or {}).items()
         },
         next_result=dict(payload["next_result"] or {}),
+        runtime_event_id=str(payload.get("runtime_event_id") or ""),
+        runtime_event_sequence=payload.get("runtime_event_sequence"),
+        runtime_event_payload_hash=str(
+            payload.get("runtime_event_payload_hash") or ""
+        ),
+        terminal_event_id=str(payload.get("terminal_event_id") or ""),
+        transaction_id=str(payload.get("transaction_id") or ""),
+        terminal_outcome=str(payload.get("terminal_outcome") or ""),
+        render_hash=str(payload.get("render_hash") or ""),
+        base_revision=payload.get("base_revision"),
+        base_checkpoint_thread_id=str(
+            payload.get("base_checkpoint_thread_id") or ""
+        ),
+        base_checkpoint_id=str(payload.get("base_checkpoint_id") or ""),
+        product_revision=payload.get("product_revision"),
+        product_checkpoint_thread_id=str(
+            payload.get("product_checkpoint_thread_id") or ""
+        ),
+        product_checkpoint_id=str(payload.get("product_checkpoint_id") or ""),
+        product_authority_id=str(payload.get("product_authority_id") or ""),
+        physical_thread_id=str(payload.get("physical_thread_id") or ""),
+        attempt_checkpoint_id=str(payload.get("attempt_checkpoint_id") or ""),
     )

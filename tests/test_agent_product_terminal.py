@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -62,7 +63,9 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
             installed = {"called": False}
             app._load_framework_context = lambda: None  # type: ignore[method-assign]
             app._startup_doctor = lambda: setattr(app.state, "current_question_id", "install_dependencies")  # type: ignore[method-assign]
-            app._install_dependencies = lambda: installed.__setitem__("called", True)  # type: ignore[method-assign]
+            app._install_dependencies_messages = lambda: (  # type: ignore[method-assign]
+                installed.__setitem__("called", True) or "installed",
+            )
             app._offer_harness_resume_if_needed = lambda: None  # type: ignore[method-assign]
 
             with patch.object(
@@ -156,9 +159,7 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
         self.assertIn("HTTP 400", output)
         self.assertNotEqual(app.state.current_question_id, "install_agent_runtime")
 
-    def test_runtime_install_reuses_live_provider_readiness_and_preserves_error(self) -> None:
-        from agent.llm.types import LLMProviderError
-        from agent.terminal import repl as repl_mod
+    def test_runtime_install_consent_returns_external_command_without_effect(self) -> None:
         from agent.terminal.repl import AnyChainTerminal, TerminalSession
 
         messages: list[str] = []
@@ -167,15 +168,6 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
             def agent(self, _language: str, message: str) -> None:
                 messages.append(message)
 
-        failure = LLMProviderError(
-            "quota exhausted",
-            provider="deepseek",
-            model="deepseek-chat",
-            category="quota",
-            stage="provider_readiness",
-            status_code=402,
-            retriable=False,
-        )
         app = AnyChainTerminal(
             state=TerminalSession(
                 language="en",
@@ -185,36 +177,21 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
             session_id="install-readiness",
             session_purpose="chaos",
         )
-        app._startup_doctor = lambda: None  # type: ignore[method-assign]
-        with patch.object(
-            repl_mod,
-            "load_llm_config",
-            return_value=app._llm_config,
-        ), patch.object(
-            repl_mod.subprocess,
-            "run",
-            return_value=type("Completed", (), {"returncode": 0})(),
-        ), patch.object(
-            repl_mod,
-            "provider_runtime_errors",
-            return_value=[],
-        ), patch.object(
-            repl_mod,
-            "probe_provider_readiness",
-            return_value=failure,
-        ) as readiness, patch.object(
+        with patch(
+            "subprocess.run",
+        ) as subprocess_run, patch.object(
             app,
             "_ensure_harness",
         ) as ensure_harness:
             app._install_agent_runtime()
 
-        readiness.assert_called_once_with(app._llm_config)
+        subprocess_run.assert_not_called()
         ensure_harness.assert_not_called()
-        self.assertFalse(app._llm_runtime_available)
-        self.assertIs(app._llm_readiness_error, failure)
-        self.assertIn("deepseek/deepseek-chat", app._llm_unavailable_reason)
-        self.assertIn("HTTP 402", app._llm_unavailable_reason)
-        self.assertIn("HTTP 402", "\n".join(messages))
+        self.assertEqual(app.state.current_question_id, "")
+        self.assertIn(
+            "bash scripts/install_agent_deps.sh --yes",
+            "\n".join(messages),
+        )
 
     def test_logs_command_reports_clean_error_for_missing_job(self) -> None:
         """`logs <bad-id>` must emit a clean "job not found" message, not a raw
@@ -230,18 +207,265 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
             language = "en"
             latest_job_id = ""
 
-        messages: list[str] = []
-
-        class _IO:
-            def agent(self, language: str, message: str) -> None:
-                messages.append(message)
-
-        handler = JobCommandHandler(_State(), _IO())
-        handler._logs("totally-bogus-xyz")  # must not raise
-        joined = "\n".join(messages)
+        handler = JobCommandHandler(_State())
+        result = handler._logs("totally-bogus-xyz")  # must not raise
+        joined = "\n".join(result)
         self.assertNotIn("FileNotFoundError", joined)
         self.assertNotIn("Traceback", joined)
         self.assertIn("totally-bogus-xyz", joined)
+
+    def test_exact_help_is_typed_detour_and_does_not_create_workflow_turn(self) -> None:
+        from agent.harness.turn_transactions import (
+            TurnTransactionStore,
+            product_authority_id,
+        )
+        from agent.harness.terminal_protocol import read_jsonl_records
+        from agent.terminal.repl import (
+            AnyChainTerminal,
+            OutputOnlyIO,
+            TerminalSession,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / "checkpoints.sqlite"
+            protocol = Path(tmpdir) / "terminal.jsonl"
+            runtime_events = Path(tmpdir) / "runtime.jsonl"
+            app = AnyChainTerminal(
+                state=TerminalSession(
+                    language="en",
+                    current_question_id="",
+                ),
+                io=OutputOnlyIO(),
+                session_id="help-detour",
+                checkpoint_path=checkpoint,
+                session_purpose="chaos",
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "ANYCHAIN_AGENT_TERMINAL_OUTCOME_FILE": str(protocol),
+                    "ANYCHAIN_AGENT_TURN_EVENT_FILE": str(runtime_events),
+                },
+            ):
+                app.handle_user_text("help")
+
+            authority = product_authority_id("help-detour", "chaos")
+            detours = TurnTransactionStore(
+                checkpoint
+            ).list_terminal_detours(authority)
+            records = read_jsonl_records(protocol)
+
+        self.assertEqual(len(detours), 1)
+        self.assertEqual(detours[0].command_name, "help")
+        self.assertEqual(detours[0].effect_class, "read_only")
+        self.assertIsNotNone(detours[0].delivered_at)
+        self.assertEqual(
+            [record["record_type"] for record in records],
+            ["terminal_detour_projection"],
+        )
+        self.assertFalse(runtime_events.exists())
+
+    def test_exact_exit_is_typed_before_terminal_requests_shutdown(self) -> None:
+        from agent.harness.turn_transactions import (
+            TurnTransactionStore,
+            product_authority_id,
+        )
+        from agent.terminal.repl import (
+            AnyChainTerminal,
+            OutputOnlyIO,
+            TerminalSession,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / "checkpoints.sqlite"
+            protocol = Path(tmpdir) / "terminal.jsonl"
+            runtime_events = Path(tmpdir) / "runtime.jsonl"
+            app = AnyChainTerminal(
+                state=TerminalSession(language="en"),
+                io=OutputOnlyIO(),
+                session_id="exit-detour",
+                checkpoint_path=checkpoint,
+                session_purpose="chaos",
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "ANYCHAIN_AGENT_TERMINAL_OUTCOME_FILE": str(protocol),
+                    "ANYCHAIN_AGENT_TURN_EVENT_FILE": str(runtime_events),
+                },
+            ):
+                app.handle_user_text("exit")
+
+            authority = product_authority_id("exit-detour", "chaos")
+            detours = TurnTransactionStore(checkpoint).list_terminal_detours(
+                authority
+            )
+
+        self.assertEqual(app._requested_exit_code, 0)
+        self.assertEqual(len(detours), 1)
+        self.assertEqual(detours[0].command_name, "exit")
+        self.assertEqual(detours[0].effect_class, "read_only")
+        self.assertEqual(detours[0].result_kind, "session_termination")
+        self.assertEqual(detours[0].termination_reason, "exit")
+        self.assertEqual(detours[0].exit_code, 0)
+        self.assertIsNotNone(detours[0].delivered_at)
+        self.assertFalse(runtime_events.exists())
+
+    def test_eof_is_projected_before_run_returns(self) -> None:
+        from agent.harness.terminal_protocol import read_jsonl_records
+        from agent.terminal.io import TerminalIO
+        from agent.terminal.repl import AnyChainTerminal, TerminalSession
+
+        class EofIO(TerminalIO):
+            def input(self, language: str) -> str:
+                raise EOFError()
+
+            def agent(self, language: str, message: str) -> None:
+                return None
+
+        class EofApp(AnyChainTerminal):
+            def startup(self) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / "checkpoints.sqlite"
+            protocol = Path(tmpdir) / "terminal.jsonl"
+            runtime_events = Path(tmpdir) / "runtime.jsonl"
+            app = EofApp(
+                state=TerminalSession(language="en"),
+                io=EofIO(),
+                session_id="eof-detour",
+                checkpoint_path=checkpoint,
+                session_purpose="chaos",
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "ANYCHAIN_AGENT_TERMINAL_OUTCOME_FILE": str(protocol),
+                    "ANYCHAIN_AGENT_TURN_EVENT_FILE": str(runtime_events),
+                },
+            ):
+                exit_code = app.run()
+            records = read_jsonl_records(protocol)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(records[-1]["result_kind"], "session_termination")
+        self.assertEqual(records[-1]["termination_reason"], "eof")
+        self.assertEqual(records[-1]["exit_code"], 0)
+        self.assertFalse(runtime_events.exists())
+
+    def test_follow_stream_chunks_are_durable_and_do_not_create_workflow_turn(
+        self,
+    ) -> None:
+        from agent.terminal.job_commands import FollowEvent
+
+        from agent.harness.turn_transactions import (
+            TurnTransactionStore,
+            product_authority_id,
+        )
+        from agent.terminal.repl import (
+            AnyChainTerminal,
+            OutputOnlyIO,
+            TerminalSession,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / "checkpoints.sqlite"
+            protocol = Path(tmpdir) / "terminal.jsonl"
+            runtime_events = Path(tmpdir) / "runtime.jsonl"
+            io = OutputOnlyIO()
+            app = AnyChainTerminal(
+                state=TerminalSession(language="en"),
+                io=io,
+                session_id="follow-detour",
+                checkpoint_path=checkpoint,
+                session_purpose="chaos",
+            )
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "ANYCHAIN_AGENT_TERMINAL_OUTCOME_FILE": str(protocol),
+                        "ANYCHAIN_AGENT_TURN_EVENT_FILE": str(runtime_events),
+                    },
+                ),
+                patch.object(
+                    app._job_commands,
+                    "iter_follow_events",
+                    return_value=iter(
+                        (
+                            FollowEvent("follow started"),
+                            FollowEvent("line 1"),
+                            FollowEvent(
+                                "completed",
+                                terminal=True,
+                                stop_reason="completed",
+                            ),
+                        )
+                    ),
+                ),
+            ):
+                app.handle_user_text("follow job-1")
+
+            authority = product_authority_id("follow-detour", "chaos")
+            detours = TurnTransactionStore(checkpoint).list_terminal_detours(
+                authority
+            )
+
+        self.assertEqual(len(detours), 1)
+        self.assertEqual(detours[0].effect_class, "streaming_observation")
+        self.assertEqual(detours[0].stream_chunk_count, 2)
+        self.assertEqual(detours[0].effect_status, "succeeded")
+        self.assertIn("line 1", detours[0].response_messages)
+        self.assertFalse(runtime_events.exists())
+
+    def test_ctrl_c_cancels_active_read_only_detour_without_exiting(self) -> None:
+        from agent.harness.turn_transactions import (
+            TurnTransactionStore,
+            product_authority_id,
+        )
+        from agent.terminal.repl import (
+            AnyChainTerminal,
+            OutputOnlyIO,
+            TerminalSession,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / "checkpoints.sqlite"
+            app = AnyChainTerminal(
+                state=TerminalSession(language="en"),
+                io=OutputOnlyIO(),
+                session_id="cancel-detour",
+                checkpoint_path=checkpoint,
+                session_purpose="chaos",
+            )
+
+            def interrupted():
+                raise KeyboardInterrupt()
+
+            with patch.dict(
+                os.environ,
+                {
+                    "ANYCHAIN_AGENT_TERMINAL_OUTCOME_FILE": str(
+                        Path(tmpdir) / "terminal.jsonl"
+                    ),
+                },
+            ):
+                completed = app._run_terminal_detour(
+                    command_name="doctor",
+                    effect_class="observation_refresh",
+                    producer=interrupted,
+                    input_text="doctor",
+                )
+            persisted = TurnTransactionStore(
+                checkpoint
+            ).list_terminal_detours(
+                product_authority_id("cancel-detour", "chaos")
+            )[0]
+
+        self.assertEqual(persisted.status, "completed")
+        self.assertEqual(persisted.effect_status, "failed")
+        self.assertIsNone(app._requested_exit_code)
 
     def test_technical_scalar_keeps_existing_chinese_language(self) -> None:
         from agent.terminal.language import detect_language
@@ -373,6 +597,8 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
 
     def test_terminal_user_session_does_not_resume_live_matrix_checkpoint(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.domains.environment import question_for_environment
+        from agent.harness.state import new_state
         from agent.terminal.io import TerminalIO
         from agent.terminal.repl import AnyChainTerminal, TerminalSession
 
@@ -393,15 +619,26 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
                 checkpoint_path=checkpoint,
                 session_purpose="live-matrix",
             )
-            matrix_runtime._persist_state(
-                {
-                    "target_mode": "fake-node",
-                    "workflow_mode": "rpc_benchmark",
-                    "chain_identity": {"canonical": "bsc", "status": "confirmed"},
-                    "confirmed_config": {"CLOUD_REGION": "asia-east1"},
-                    "pending_question": {"id": "CLOUD_ZONE", "prompt": "Confirm CLOUD_ZONE."},
-                }
+            matrix_state = new_state(
+                "shared-thread",
+                session_purpose="live-matrix",
             )
+            matrix_state["target_mode"] = "fake-node"
+            matrix_state["workflow_mode"] = "rpc_benchmark"
+            matrix_state["chain_identity"] = {
+                "raw": "bsc",
+                "canonical": "bsc",
+                "status": "confirmed",
+                "case": "known",
+            }
+            matrix_state["confirmed_config"] = {"CLOUD_REGION": "asia-east1"}
+            matrix_state["active_group"] = "provider_deployment"
+            matrix_state["pending_question"] = question_for_environment(
+                matrix_state,
+                "provider_deployment",
+            )
+            matrix_runtime._persist_state(matrix_state)
+            matrix_runtime.close()
             session = TerminalSession(language="zh")
             app = AnyChainTerminal(
                 state=session,
@@ -581,32 +818,47 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
         self.assertEqual([item["action_id"] for item in state["action_queue"]], ["obs-deferred"])
 
     def test_terminal_resume_reset_discards_deferred_action_queue(self) -> None:
+        from agent.harness.contracts import ActionEnvelope, action_envelope_to_dict
+        from agent.harness.domains.chain_rpc import question_for_chain_rpc
         from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.state import new_state
 
         with tempfile.TemporaryDirectory() as tmpdir:
             checkpoint = Path(tmpdir) / "checkpoint.sqlite"
             runtime = AnyChainGraphRuntime(thread_id="reset-queue", checkpoint_path=checkpoint)
-            runtime._persist_state(
-                {
-                    "target_mode": "fake-node",
-                    "workflow_mode": "rpc_benchmark",
-                    "pending_question": {
-                        "id": "custom_rpc_method",
-                        "group": "endpoint_process",
-                        "kind": "manual_value",
-                        "prompt": "Enter the custom RPC method.",
-                    },
-                    "active_group": "endpoint_process",
-                    "action_queue": [
-                        {
-                            "action_id": "obs-deferred",
-                            "type": "set_observability",
-                            "observability_mode": "disabled",
-                            "confidence": "high",
-                        }
-                    ],
-                }
+            persisted = new_state("reset-queue")
+            persisted["target_mode"] = "fake-node"
+            persisted["workflow_mode"] = "rpc_benchmark"
+            persisted["chain_identity"] = {
+                "raw": "bsc",
+                "canonical": "bsc",
+                "status": "confirmed",
+                "case": "known",
+            }
+            persisted["confirmed_config"] = {"BLOCKCHAIN_NODE": "bsc"}
+            persisted["active_group"] = "endpoint_process"
+            persisted["pending_question"] = question_for_chain_rpc(
+                persisted,
+                "endpoint_process",
             )
+            persisted["action_queue"] = [
+                action_envelope_to_dict(
+                    ActionEnvelope(
+                    action_id="obs-deferred",
+                    action_type="set_observability",
+                    owner="observability",
+                    target_group="observability",
+                    arguments={
+                        "observability_mode": "disabled",
+                        "mutation_explicit": True,
+                    },
+                    confidence="high",
+                    origin_text="Disable observability.",
+                    submitted_turn_index=1,
+                    )
+                )
+            ]
+            runtime._persist_state(persisted)
             runtime.prepare_resume_offer(language="en")
             state = runtime.invoke("3", language="en")
 
@@ -651,15 +903,20 @@ class ProductTerminalHarnessContractTest(unittest.TestCase):
 
     def test_invalid_checkpoint_is_quarantined_instead_of_silently_resumed(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.state import new_state
 
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime = AnyChainGraphRuntime(thread_id="resume-quarantine", checkpoint_path=Path(tmpdir) / "checkpoint.sqlite")
-            runtime._persist_state(
-                {
-                    "active_group": "provider_deployment",
-                    "confirmed_config": {"CLOUD_REGION": "asia-east1"},
-                    "pending_question": {"id": "CLOUD_ZONE", "prompt": "missing owner"},
-                }
+            invalid = new_state("resume-quarantine")
+            invalid["active_group"] = "provider_deployment"
+            invalid["confirmed_config"] = {"CLOUD_REGION": "asia-east1"}
+            invalid["pending_question"] = {
+                "id": "CLOUD_ZONE",
+                "prompt": "missing owner",
+            }
+            runtime.graph.update_state(
+                {"configurable": {"thread_id": "resume-quarantine"}},
+                invalid,
             )
             state = runtime.snapshot()
 

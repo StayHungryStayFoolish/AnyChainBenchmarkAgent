@@ -118,6 +118,106 @@ node is a different trust boundary: it deterministically validates action
 schema, provenance, conflicts, prerequisites, pending-question contracts, and
 queue eligibility before actions become durable.
 
+One bounded scalar lane is intentionally narrower than the general
+whole-plan path. When a pending option/manual value or a registered semantic
+value has an exact source anchor, `bounded_semantic_lane.py` may request one
+model mapping into the finite candidate catalog. Its immutable receipt binds
+the question/registry/catalog, source clause and units, candidate identity,
+provider/model, prompt and response hashes, and deterministic checks. The
+verified receipt projects directly into normal deterministic admission; it
+does not pass through a second whole-plan model reviewer. Ambiguous prose,
+missing anchors, competing identities, or an out-of-catalog value returns to
+the general hierarchical path.
+
+## Product Head And Terminal Delivery
+
+LangGraph checkpoints are physical execution storage, not the authority for
+which turn the user has accepted. `turn_transactions.py` owns one logical
+Product Head and creates an isolated physical checkpoint thread for each turn
+attempt. A successful attempt atomically advances the Product Head and writes
+one immutable terminal outbox result. Cancellation, timeout, and provider or
+runtime failure leave the Product Head unchanged. An uncertain external effect
+creates a reconciliation barrier; no new attempt may start until an immutable
+operator resolution is recorded.
+
+Invariant recovery commits a typed recovery state on the original physical
+attempt. It cannot leave one aborted result and then create a second committed
+result for the same accepted input. On restart, active attempts are closed
+from typed side-effect evidence and undelivered outbox results are replayed
+from their exact checkpoint and render hash.
+
+`terminal_protocol.py` defines the shared non-secret terminal projection used
+by the product and live acceptance runners. Delivery order is:
+
+```text
+commit SQLite outbox
+-> render and flush the complete terminal frame
+-> append and fsync the typed projection
+-> acknowledge the outbox row as delivered
+```
+
+Projection failure leaves the row undelivered and replayable. Runtime event
+schema version 6 and terminal outcome projection schema version 3 bind the
+same Product Head authority, transaction ID, terminal event ID, complete
+base/attempt/product checkpoint lineage, render hash, publication receipt, and
+originating repository revision. The projection contains hashes and control
+identities only; it cannot contain user/model text, endpoints, configuration
+values, checkpoint payloads, or raw diagnostics. Live runners join the PTY
+frame, terminal projection, and runtime event by these typed identities and
+never infer outcome from localized prose, question IDs, or option positions.
+The join is read-only: production and test runners cannot mutate a runtime
+event after observing the expected terminal outcome. Injected test evidence
+must use separate runtime-event and terminal-projection producers; both sides
+pass through the same production validators before the join.
+
+Deterministic shell commands, bounded `follow` streams, and typed termination
+use terminal detour projection schema version 3. A detour carries the explicit
+Product Head authority, complete unchanged before/after head, input and stream
+hashes, typed stop reason, and the durable runtime-event publication fence
+observed when it began. It never creates a workflow attempt or synthetic
+runtime event. The SQLite turn-transaction ledger is schema version 14; the
+explicit v12-to-v13 migration assigns stable runtime-event identities to
+older pending committed outcomes, and v13-to-v14 retains the complete
+canonical legacy-detour record in the audit quarantine. Current reads and
+migration use the same semantic validator for the exact historical v10/v12
+field set, quarantine-row identity, typed termination, response and
+rolling-stream hashes, Product Head lineage, runtime fence, lifecycle status,
+and reconciliation provenance. Terminal projections independently reject
+unknown effect classes and unprojectable effect statuses. Partial,
+identity-mismatched, or correctly hashed but semantically invalid audit
+records fail closed. A v10 ledger
+containing committed history
+fails closed because it has no authoritative revision ordering. Every legacy
+detour that lacks a runtime-event fence is retained in the audit quarantine
+and removed from live replay, including completed but undelivered detours.
+Current reads reject incomplete lineage.
+
+Startup identity is also a typed production protocol. One session event binds
+the process instance, logical session and purpose, provider/model, complete
+startup presentation hash, replayed terminal projections, and repository
+revision. Qualifying runners reject stale, duplicated, cross-session, or
+presentation-mismatched startup evidence. Runtime event schema v6 uses
+`turn_committed` as its single event type and records `startup_snapshot`,
+`turn_recovered`, `workflow_reset`, or another specific purpose in
+`observation`. A committed outcome cannot be presented until its runtime
+observation exists; restart recovery reconstructs a missing observation from
+the exact committed checkpoints even when an older delivery acknowledgement
+already exists. Linux file locking serializes the terminal projection
+read-check-append boundary across processes. If the runtime-event JSONL
+contains any pre-v6 record, publication receipts for that authority are first
+requeued, then the whole incompatible log is atomically moved to a
+content-hashed quarantine path. Current v6 records are reconstructed from
+exact checkpoints in contiguous Product Head revision order; legacy bytes are
+never relabeled as current evidence. Every runtime projection path has a
+durable single-authority marker, and default paths include an authority hash,
+so one session or purpose cannot remove another authority's observations.
+
+Startup session schema version 3 requires a ready session to name a committed
+Product Head at revision one or later and the complete runtime-event
+publication fence at that same revision. Revision-zero sessions cannot be
+advertised as ready. Both the interactive CLI and one-shot prompt entrypoint
+close the LangGraph runtime and its SQLite resources on every exit path.
+
 Control-plane responsibilities are deliberately separate:
 
 - `admission.py` validates proposals, conflicts, prerequisites, and semantic
@@ -130,6 +230,13 @@ Control-plane responsibilities are deliberately separate:
   after owner-scoped compilation. It has no planner entry and does not select a
   provider; the checkpointed `review_plan` transition supplies the configured
   provider for bounded whole-plan semantic review;
+- `bounded_semantic_lane.py` owns finite-catalog, source-anchored semantic
+  mapping and its immutable evidence receipt; it has no general intent-routing
+  or state-mutation authority;
+- `turn_transactions.py` owns the logical Product Head, isolated physical
+  attempts, reconciliation, and terminal outbox;
+- `terminal_protocol.py` owns the versioned non-secret terminal projection
+  schema and durable JSONL append contract;
 - `advisory.py` owns model-backed chain identity, RPC-schema extraction, and
   evidence analysis that cannot mutate state or choose a graph transition;
 - `queue.py` owns dependency-safe ordering and pending-barrier eligibility;

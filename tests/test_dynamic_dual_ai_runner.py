@@ -2,17 +2,28 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
 import tempfile
 import unittest
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Mapping
 from unittest.mock import patch
 
+from agent.harness.input_identity import user_input_hash
+from agent.harness.terminal_protocol import (
+    TerminalDetourProjection,
+    TerminalSessionEvent,
+    build_terminal_session_event,
+    presentation_hash,
+    validate_terminal_detour_projection,
+    validate_terminal_outcome_projection,
+)
+from agent.terminal.language import t
 from tests.agent_live.chaos_scheduler import ScheduledCoverageTarget, build_chaos_schedule
 from tests.agent_live.coverage_evidence import (
     RuntimeTurnEvent,
@@ -25,17 +36,28 @@ from tests.agent_live.coverage_evidence import (
 )
 from tests.agent_live.dynamic_dual_ai_chaos import (
     ChaosRunConfig,
+    CompletionExpectation,
     DynamicDualAiChaosRunner,
     ContainerPtyBridgeTransport,
+    NoRuntimeEventBeforeFence,
     SimulatorContext,
     SimulatorDecision,
     SimulatorDecisionInvalid,
+    SessionTerminationCompletion,
     SubprocessPtyTransport,
+    TerminalPresentationViolation,
+    TerminalDetourCompletion,
+    TerminalProtocolViolation,
+    TerminalOutcomeObservation,
+    TerminalTurnFailure,
     _complete_agent_response,
     _validate_decision,
     _verify_declared_postconditions,
     encode_bracketed_paste,
     transport_for_config,
+    validate_startup_session_event,
+    validate_startup_terminal_protocol,
+    wait_for_turn_completion,
 )
 from tests.agent_live.generate_harness_coverage_ledger import contract_variant_hash
 
@@ -174,6 +196,72 @@ EDGE = {
 REVISION = {"commit": "test-commit", "worktree_hash": "a" * 64}
 
 
+def _independent_workflow_outcome(
+    turn_index: int,
+    *,
+    response: str = "Agent> fixture response",
+) -> TerminalOutcomeObservation:
+    transaction_id = f"00000000-0000-0000-0000-{turn_index:012d}"
+    physical_thread_id = f"attempt:{transaction_id}"
+    outcome = TerminalOutcomeObservation(
+        schema_version=3,
+        record_type="terminal_outcome_projection",
+        projection_id=f"projection-{turn_index}",
+        event_id=f"terminal-{turn_index}",
+        transaction_id=transaction_id,
+        product_authority_id="dynamic-dual-ai-chaos:contract-session",
+        logical_thread_id="dynamic-dual-ai-chaos:contract-session",
+        physical_thread_id=physical_thread_id,
+        outcome="committed",
+        failure_category="",
+        diagnostic_hash="",
+        base_revision=turn_index - 1,
+        base_checkpoint_thread_id=(
+            "head"
+            if turn_index == 1
+            else "attempt:"
+            f"00000000-0000-0000-0000-{turn_index - 1:012d}"
+        ),
+        base_checkpoint_id=f"checkpoint-{turn_index - 1}",
+        base_fingerprint=chr(96 + turn_index) * 64,
+        attempt_checkpoint_id=f"checkpoint-{turn_index}",
+        attempt_fingerprint=chr(97 + turn_index) * 64,
+        product_revision=turn_index,
+        product_checkpoint_thread_id=physical_thread_id,
+        product_checkpoint_id=f"checkpoint-{turn_index}",
+        product_fingerprint=chr(97 + turn_index) * 64,
+        render_hash="f" * 64,
+        runtime_event_id=f"runtime-{turn_index}",
+        runtime_event_sequence=turn_index,
+        runtime_event_payload_hash="9" * 64,
+        presentation_hash=presentation_hash(response),
+        origin_revision=REVISION,
+        delivery_phase="live",
+        projected_at="2026-07-27T00:00:00+00:00",
+        record_hash="0" * 64,
+    )
+    return _seal_terminal_outcome(outcome)
+
+
+def _seal_terminal_outcome(
+    outcome: TerminalOutcomeObservation,
+) -> TerminalOutcomeObservation:
+    payload = asdict(outcome)
+    payload["record_hash"] = hashlib.sha256(
+        json.dumps(
+            {
+                key: value
+                for key, value in payload.items()
+                if key != "record_hash"
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return validate_terminal_outcome_projection(payload)
+
+
 class FakeTransport:
     def __init__(self, responses: list[str]) -> None:
         self.responses = list(responses)
@@ -197,18 +285,306 @@ class FakeTransport:
         self.closed = True
 
 
-class FakeEventStream:
+class FakeRuntimeEventStream:
     def __init__(self, events: list[RuntimeTurnEvent]) -> None:
         self.events = list(events)
+
+    def mark_process_start(self) -> None:
+        return None
+
+    def capture_startup_snapshot(self):
+        return (), ()
 
     def baseline(self) -> RuntimeTurnEvent:
         return self.events.pop(0)
 
+    def mark_baseline(self) -> None:
+        return None
+
     def next_event(self, *, timeout_seconds: float) -> RuntimeTurnEvent:
         del timeout_seconds
         if not self.events:
-            raise RuntimeError("CLI returned without a new committed runtime turn event")
+            raise NoRuntimeEventBeforeFence(
+                "CLI returned without a new committed runtime turn event"
+            )
         return self.events.pop(0)
+
+    def assert_publication_fence(self, detour) -> None:
+        if self.events:
+            raise RuntimeError("unexpected runtime event at detour fence")
+        if detour.runtime_event_fence_sequence != 0:
+            raise RuntimeError("fake stream does not contain the detour fence")
+
+
+class FakeTerminalOutcomeStream:
+    def __init__(
+        self,
+        *,
+        turn_count: int,
+        outcomes: list[TerminalOutcomeObservation] | None = None,
+        publish_session_event: bool = True,
+        startup_product_revision: int = 1,
+        startup_outcome_count: int | None = None,
+        responses: list[str] | None = None,
+    ) -> None:
+        response_frames = list(responses or ())
+        self.outcomes = list(outcomes) if outcomes is not None else [
+            _independent_workflow_outcome(
+                index,
+                response=(
+                    response_frames[index - 1]
+                    if index <= len(response_frames)
+                    else f"Agent> fixture response {index}"
+                ),
+            )
+            for index in range(1, turn_count + 1)
+        ]
+        self._outcome_cursor = 0
+        self._publish_session_event = publish_session_event
+        self._startup_product_revision = startup_product_revision
+        self._startup_outcome_count = (
+            startup_product_revision
+            if startup_outcome_count is None
+            else startup_outcome_count
+        )
+
+    def baseline_session_events(
+        self,
+        *,
+        startup_response: str,
+        session_id: str,
+        session_purpose: str,
+    ) -> tuple[TerminalSessionEvent, ...]:
+        if not self._publish_session_event:
+            return ()
+        return (
+            _ready_session_event(
+                REVISION,
+                startup_response=startup_response,
+                session_id=session_id,
+                session_purpose=session_purpose,
+                product_revision=self._startup_product_revision,
+            ),
+        )
+
+    def mark_process_start(self) -> None:
+        return None
+
+    def capture_startup_snapshot(self):
+        self._outcome_cursor = self._startup_outcome_count
+        return (), ()
+
+    def mark_baseline(self) -> None:
+        self._outcome_cursor = self._startup_outcome_count
+
+    def next_outcome(
+        self,
+        *,
+        timeout_seconds: float,
+    ) -> TerminalOutcomeObservation:
+        del timeout_seconds
+        if self._outcome_cursor >= len(self.outcomes):
+            raise RuntimeError("CLI returned without a typed terminal outcome")
+        outcome = self.outcomes[self._outcome_cursor]
+        self._outcome_cursor += 1
+        return outcome
+
+    def next_completion(
+        self,
+        *,
+        timeout_seconds: float,
+    ):
+        return self.next_outcome(timeout_seconds=timeout_seconds)
+
+
+def _ready_session_event(
+    revision: Mapping[str, str],
+    *,
+    startup_response: str,
+    session_id: str,
+    session_purpose: str,
+    product_revision: int,
+    product_fingerprint: str | None = None,
+    product_checkpoint_thread_id: str | None = None,
+    product_checkpoint_id: str | None = None,
+    runtime_event_fence_terminal_event_id: str | None = None,
+    runtime_event_fence_id: str | None = None,
+) -> TerminalSessionEvent:
+    transaction_id = (
+        f"00000000-0000-0000-0000-{product_revision:012d}"
+    )
+    physical_thread_id = f"attempt:{transaction_id}"
+    return build_terminal_session_event(
+        process_instance_id="test-process",
+        session_id=session_id,
+        session_purpose=session_purpose,
+        provider="deepseek",
+        model="deepseek-chat",
+        auth_mode="api_key",
+        provider_ready=True,
+        startup_status="ready",
+        failure_category="",
+        product_authority_id=f"{session_purpose}:{session_id}",
+        product_revision=product_revision,
+        product_checkpoint_thread_id=(
+            product_checkpoint_thread_id or physical_thread_id
+        ),
+        product_checkpoint_id=(
+            product_checkpoint_id or f"checkpoint-{product_revision}"
+        ),
+        product_fingerprint=(
+            product_fingerprint
+            or chr(96 + product_revision + 1) * 64
+        ),
+        runtime_event_fence_sequence=product_revision,
+        runtime_event_fence_terminal_event_id=(
+            runtime_event_fence_terminal_event_id
+            or f"terminal-{product_revision}"
+        ),
+        runtime_event_fence_id=(
+            runtime_event_fence_id or f"runtime-{product_revision}"
+        ),
+        runtime_event_fence_hash="9" * 64,
+        rendered_frame=startup_response,
+        origin_revision=revision,
+    )
+
+
+def _terminal_outcome(
+    outcome: str,
+    *,
+    failure_category: str = "",
+    product_fingerprint: str = "c" * 64,
+    product_authority: str = "chaos:test-session",
+) -> TerminalOutcomeObservation:
+    return _seal_terminal_outcome(TerminalOutcomeObservation(
+        schema_version=3,
+        record_type="terminal_outcome_projection",
+        projection_id=f"projection-{outcome}-{failure_category or 'ok'}",
+        event_id=f"terminal-{outcome}-{failure_category or 'ok'}",
+        transaction_id="00000000-0000-0000-0000-000000000099",
+        product_authority_id=product_authority,
+        logical_thread_id=product_authority,
+        physical_thread_id="attempt:00000000-0000-0000-0000-000000000099",
+        outcome=outcome,
+        failure_category=failure_category,
+        diagnostic_hash="d" * 64 if outcome != "committed" else "",
+        base_revision=2,
+        base_checkpoint_thread_id="head",
+        base_checkpoint_id="checkpoint-2",
+        base_fingerprint=product_fingerprint,
+        attempt_checkpoint_id=(
+            "checkpoint-3" if outcome == "committed" else ""
+        ),
+        attempt_fingerprint=product_fingerprint if outcome == "committed" else "",
+        product_revision=3 if outcome == "committed" else 2,
+        product_checkpoint_thread_id=(
+            "attempt:00000000-0000-0000-0000-000000000099"
+            if outcome == "committed"
+            else "head"
+        ),
+        product_checkpoint_id=(
+            "checkpoint-3" if outcome == "committed" else "checkpoint-2"
+        ),
+        product_fingerprint=product_fingerprint,
+        render_hash="f" * 64 if outcome == "committed" else "",
+        runtime_event_id=(
+            "runtime-terminal-committed-ok"
+            if outcome == "committed"
+            else ""
+        ),
+        runtime_event_sequence=3 if outcome == "committed" else 2,
+        runtime_event_payload_hash="9" * 64 if outcome == "committed" else "",
+        presentation_hash=presentation_hash("Agent> fixture response"),
+        origin_revision=REVISION,
+        delivery_phase="live",
+        projected_at="2026-07-27T00:00:00+00:00",
+        record_hash="0" * 64,
+    ))
+
+
+def _terminal_detour(response: str) -> TerminalDetourProjection:
+    detour = TerminalDetourProjection(
+        schema_version=3,
+        record_type="terminal_detour_projection",
+        projection_id="detour-projection-test",
+        detour_id="00000000-0000-0000-0000-000000000088",
+        product_authority_id="chaos:test-session",
+        logical_thread_id="chaos:test-session",
+        process_instance_id="process-1",
+        session_id="test-session",
+        session_purpose="chaos",
+        command_name="help",
+        input_hash=hashlib.sha256(b"help").hexdigest(),
+        result_kind="command",
+        interruption_kind="",
+        termination_reason="",
+        exit_code=None,
+        effect_class="read_only",
+        effect_status="not_applicable",
+        shell_state_before_hash="4" * 64,
+        shell_state_after_hash="4" * 64,
+        product_revision_before=2,
+        product_checkpoint_thread_id_before="head",
+        product_checkpoint_id_before="checkpoint-2",
+        product_fingerprint_before="c" * 64,
+        product_revision_after=2,
+        product_checkpoint_thread_id_after="head",
+        product_checkpoint_id_after="checkpoint-2",
+        product_fingerprint_after="c" * 64,
+        runtime_event_fence_sequence=0,
+        runtime_event_fence_terminal_event_id="",
+        runtime_event_fence_id="",
+        runtime_event_fence_hash="",
+        response_hash="6" * 64,
+        stream_chunk_count=0,
+        stream_hash="9" * 64,
+        stream_stop_reason="not_streaming",
+        identity_trust="trusted",
+        presentation_hash=presentation_hash(response),
+        origin_revision=REVISION,
+        delivery_phase="live",
+        projected_at="2026-07-27T00:00:00+00:00",
+        record_hash="0" * 64,
+    )
+    return _seal_terminal_detour(detour)
+
+
+def _seal_terminal_detour(
+    detour: TerminalDetourProjection,
+) -> TerminalDetourProjection:
+    payload = asdict(detour)
+    payload["record_hash"] = hashlib.sha256(
+        json.dumps(
+            {
+                key: value
+                for key, value in payload.items()
+                if key != "record_hash"
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return validate_terminal_detour_projection(payload)
+
+
+def _completion_expectation(
+    submitted_input: str = "test input",
+    *,
+    product_fingerprint: str = "c" * 64,
+) -> CompletionExpectation:
+    return CompletionExpectation(
+        submitted_input=submitted_input,
+        session_id="test-session",
+        session_purpose="chaos",
+        product_authority_id="chaos:test-session",
+        process_instance_id="process-1",
+        product_revision=2,
+        product_checkpoint_thread_id="head",
+        product_checkpoint_id="checkpoint-2",
+        product_fingerprint=product_fingerprint,
+    )
 
 
 class OrderedClock:
@@ -268,9 +644,12 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
         before: str,
         after: str,
         pending: str,
+        submitted_input: str = "<fixture-input-not-specified>",
     ) -> RuntimeTurnEvent:
+        transaction_id = f"00000000-0000-0000-0000-{turn_index:012d}"
+        physical_thread_id = f"attempt:{transaction_id}"
         return RuntimeTurnEvent(
-            schema_version=2,
+            schema_version=6,
             event_type="turn_committed",
             thread_id="contract-session",
             session_purpose="dynamic-dual-ai-chaos",
@@ -280,15 +659,104 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             active_group="opening",
             pending_question_id=pending,
             action_queue_types=(),
-            pending_contract={"id": pending} if pending else {},
+            pending_contract=(
+                {
+                    "id": pending,
+                    "options": [
+                        {"id": "1", "value": "continue"},
+                        {"id": "2", "value": "modify"},
+                        {"id": "3", "value": "reset"},
+                    ],
+                }
+                if pending == "resume_harness_session"
+                else ({"id": pending} if pending else {})
+            ),
             revision=REVISION,
+            observation="turn_committed",
             admitted_action_types=("choose_target_mode",) if turn_index > 1 else (),
+            turn_receipt_summary={
+                "turn_id": f"test:{turn_index}",
+                "input_hash": user_input_hash(submitted_input),
+                "admitted_action_ids": [],
+                "execution_order": [],
+            },
+            pending_transition={
+                "before_hash": hashlib.sha256(b"pending-before").hexdigest(),
+                "after_hash": hashlib.sha256(b"pending-after").hexdigest(),
+            },
             state_diff_hashes=(
                 {"target_mode": {"before": "", "after": "f" * 64}}
                 if turn_index > 1 else {}
             ),
             next_result={"kind": "question", "question_id": pending},
+            runtime_event_id=f"runtime-{turn_index}",
+            runtime_event_sequence=turn_index,
+            runtime_event_payload_hash="9" * 64,
+            terminal_event_id=f"terminal-{turn_index}",
+            transaction_id=transaction_id,
+            terminal_outcome="committed",
+            render_hash="f" * 64,
+            base_revision=turn_index - 1,
+            base_checkpoint_thread_id=(
+                "head"
+                if turn_index == 1
+                else "attempt:"
+                f"00000000-0000-0000-0000-{turn_index - 1:012d}"
+            ),
+            base_checkpoint_id=f"checkpoint-{turn_index - 1}",
+            product_revision=turn_index,
+            product_checkpoint_thread_id=physical_thread_id,
+            product_checkpoint_id=f"checkpoint-{turn_index}",
+            product_authority_id="dynamic-dual-ai-chaos:contract-session",
+            physical_thread_id=physical_thread_id,
+            attempt_checkpoint_id=f"checkpoint-{turn_index}",
         )
+
+    def test_runner_requires_independent_runtime_and_terminal_producers(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            ledger = self._ledger()
+            runtime_stream = FakeRuntimeEventStream([
+                self._event(
+                    1,
+                    "a" * 64,
+                    "b" * 64,
+                    "opening_next_action",
+                )
+            ])
+            with self.assertRaisesRegex(
+                ValueError,
+                "independent terminal outcome stream",
+            ):
+                DynamicDualAiChaosRunner(
+                    ChaosRunConfig.linux(
+                        root,
+                        session_id="contract-session",
+                    ),
+                    lambda context: None,
+                    ledger=ledger,
+                    schedule=self._schedule(ledger),
+                    event_stream=runtime_stream,
+                    revision=REVISION,
+                )
+            with self.assertRaisesRegex(
+                ValueError,
+                "independent producers",
+            ):
+                DynamicDualAiChaosRunner(
+                    ChaosRunConfig.linux(
+                        root,
+                        session_id="contract-session",
+                    ),
+                    lambda context: None,
+                    ledger=ledger,
+                    schedule=self._schedule(ledger),
+                    event_stream=runtime_stream,
+                    terminal_outcome_stream=runtime_stream,
+                    revision=REVISION,
+                )
 
     def test_each_turn_is_selected_from_schedule_after_full_previous_response(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -324,10 +792,20 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 ledger=ledger,
                 schedule=self._schedule(ledger),
                 transport=transport,
-                event_stream=FakeEventStream([
+                event_stream=FakeRuntimeEventStream([
                     self._event(1, "a" * 64, "b" * 64, "opening_next_action"),
-                    self._event(2, "b" * 64, "c" * 64, "opening_next_action"),
+                    self._event(
+                        2,
+                        "b" * 64,
+                        "c" * 64,
+                        "opening_next_action",
+                        "I only want a safe dry run first.",
+                    ),
                 ]),
+                terminal_outcome_stream=FakeTerminalOutcomeStream(
+                    turn_count=2,
+                    responses=list(transport.responses),
+                ),
                 revision=REVISION,
                 clock_ns=OrderedClock(),
             )
@@ -374,7 +852,7 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 [],
             )
 
-    def test_committed_event_precedes_reading_the_new_turn_response(self) -> None:
+    def test_complete_response_precedes_short_runtime_event_grace(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             ledger = self._ledger()
@@ -391,7 +869,7 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                     order.append("submit")
                     super(OrderedTransport, inner_self).submit_bracketed_paste(message)
 
-            class OrderedEvents(FakeEventStream):
+            class OrderedEvents(FakeRuntimeEventStream):
                 def baseline(inner_self) -> RuntimeTurnEvent:
                     order.append("baseline")
                     return super(OrderedEvents, inner_self).baseline()
@@ -409,7 +887,13 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             ])
             events = OrderedEvents([
                 self._event(1, "a" * 64, "b" * 64, "opening_next_action"),
-                self._event(2, "b" * 64, "c" * 64, "opening_next_action"),
+                self._event(
+                    2,
+                    "b" * 64,
+                    "c" * 64,
+                    "opening_next_action",
+                    "Use fake-node.",
+                ),
             ])
             runner = DynamicDualAiChaosRunner(
                 ChaosRunConfig.linux(root, session_id="contract-session"),
@@ -424,12 +908,550 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 schedule=self._schedule(ledger),
                 transport=transport,
                 event_stream=events,
+                terminal_outcome_stream=FakeTerminalOutcomeStream(
+                    turn_count=2,
+                    responses=list(transport.responses),
+                ),
                 revision=REVISION,
             )
 
             runner.run()
 
-            self.assertEqual(order, ["read", "baseline", "submit", "event", "read"])
+            self.assertEqual(order, ["read", "baseline", "submit", "read", "event"])
+
+    def test_typed_terminal_failures_do_not_wait_for_committed_event(self) -> None:
+        cases = {
+            "cancelled": ("aborted", "cancelled"),
+            "timeout": ("aborted", "timeout"),
+            "provider_failure": ("aborted", "provider_failure"),
+            "runtime_failure": ("aborted", "unexpected_failure"),
+            "reconciliation_required": (
+                "reconciliation_required",
+                "external_effect_uncertain",
+            ),
+        }
+        for outcome, (terminal_status, failure_category) in cases.items():
+            with self.subTest(outcome=outcome):
+                response = "Agent> localized presentation may change"
+                runtime_stream = FakeRuntimeEventStream([])
+                terminal_stream = FakeTerminalOutcomeStream(
+                    turn_count=0,
+                    outcomes=[_terminal_outcome(
+                        terminal_status,
+                        failure_category=failure_category,
+                    )],
+                )
+                with self.assertRaises(TerminalTurnFailure) as raised:
+                    wait_for_turn_completion(
+                        FakeTransport([response]),
+                        runtime_stream,
+                        terminal_stream,
+                        timeout_seconds=1,
+                        expectation=_completion_expectation(),
+                        event_grace_seconds=0,
+                    )
+                expected = (
+                    "reconciliation_required"
+                    if terminal_status == "reconciliation_required"
+                    else failure_category
+                )
+                self.assertEqual(raised.exception.outcome, expected)
+                self.assertEqual(raised.exception.response, response)
+
+    def test_v6_completion_joins_complete_product_head_and_presented_frame(self) -> None:
+        response = "Agent> 任意语言的完整结果"
+        outcome = _seal_terminal_outcome(replace(
+            _terminal_outcome(
+                "committed",
+                product_fingerprint="c" * 64,
+            ),
+            presentation_hash=presentation_hash(response),
+        ))
+        event = replace(
+            self._event(2, "c" * 64, "c" * 64, "opening_next_action"),
+            schema_version=6,
+            observation="turn_committed",
+            thread_id="test-session",
+            session_purpose="chaos",
+            product_authority_id="chaos:test-session",
+            base_revision=2,
+            base_checkpoint_thread_id="head",
+            base_checkpoint_id="checkpoint-2",
+            product_revision=3,
+            product_checkpoint_thread_id=outcome.product_checkpoint_thread_id,
+            product_checkpoint_id=outcome.product_checkpoint_id,
+            physical_thread_id=outcome.physical_thread_id,
+            attempt_checkpoint_id=str(outcome.attempt_checkpoint_id or ""),
+            runtime_event_id=outcome.runtime_event_id,
+            runtime_event_sequence=outcome.runtime_event_sequence,
+            runtime_event_payload_hash=outcome.runtime_event_payload_hash,
+            terminal_event_id=outcome.event_id,
+            transaction_id=outcome.transaction_id,
+            terminal_outcome="committed",
+            render_hash=outcome.render_hash,
+            pending_transition={
+                "before_hash": "7" * 64,
+                "after_hash": "8" * 64,
+            },
+            render_manifest={"fragment_hashes": []},
+            turn_receipt_summary={
+                "turn_id": "test:2",
+                "input_hash": user_input_hash("test input"),
+                "admitted_action_ids": [],
+                "execution_order": [],
+            },
+        )
+        runtime_stream = FakeRuntimeEventStream([event])
+        terminal_stream = FakeTerminalOutcomeStream(
+            turn_count=0,
+            outcomes=[outcome],
+        )
+
+        completion = wait_for_turn_completion(
+            FakeTransport([response]),
+            runtime_stream,
+            terminal_stream,
+            timeout_seconds=1,
+            expectation=_completion_expectation(),
+            event_grace_seconds=0,
+        )
+
+        self.assertEqual(completion.event.transaction_id, outcome.transaction_id)
+        self.assertEqual(completion.response, response)
+
+    def test_detour_completion_requires_no_runtime_event_and_keeps_head(self) -> None:
+        response = "Agent> terminal help"
+        detour = _terminal_detour(response)
+        runtime_stream = FakeRuntimeEventStream([])
+        terminal_stream = FakeTerminalOutcomeStream(
+            turn_count=0,
+            outcomes=[detour],
+        )
+
+        completion = wait_for_turn_completion(
+            FakeTransport([response]),
+            runtime_stream,
+            terminal_stream,
+            timeout_seconds=1,
+            expectation=_completion_expectation("help"),
+            event_grace_seconds=0,
+        )
+
+        self.assertIsInstance(completion, TerminalDetourCompletion)
+        self.assertEqual(completion.terminal_detour, detour)
+
+    def test_session_termination_is_not_a_command_or_workflow_completion(
+        self,
+    ) -> None:
+        response = "Agent> bye"
+        detour = _seal_terminal_detour(replace(
+            _terminal_detour(response),
+            command_name="exit",
+            input_hash=hashlib.sha256(b"exit").hexdigest(),
+            result_kind="session_termination",
+            termination_reason="exit",
+            exit_code=0,
+        ))
+        runtime_stream = FakeRuntimeEventStream([])
+        terminal_stream = FakeTerminalOutcomeStream(
+            turn_count=0,
+            outcomes=[detour],
+        )
+
+        completion = wait_for_turn_completion(
+            FakeTransport([response]),
+            runtime_stream,
+            terminal_stream,
+            timeout_seconds=1,
+            expectation=_completion_expectation("exit"),
+            event_grace_seconds=0,
+        )
+
+        self.assertIsInstance(completion, SessionTerminationCompletion)
+        self.assertEqual(completion.termination_reason, "exit")
+        self.assertEqual(completion.exit_code, 0)
+
+    def test_v6_completion_rejects_cross_transaction_composition(self) -> None:
+        response = "Agent> complete"
+        outcome = _seal_terminal_outcome(replace(
+            _terminal_outcome(
+                "committed",
+                product_fingerprint="c" * 64,
+            ),
+            presentation_hash=presentation_hash(response),
+        ))
+        event = replace(
+            self._event(2, "c" * 64, "c" * 64, "opening_next_action"),
+            schema_version=6,
+            observation="turn_committed",
+            thread_id="test-session",
+            session_purpose="chaos",
+            product_authority_id="chaos:test-session",
+            base_revision=2,
+            base_checkpoint_thread_id="head",
+            base_checkpoint_id="checkpoint-2",
+            product_revision=3,
+            product_checkpoint_thread_id=outcome.product_checkpoint_thread_id,
+            product_checkpoint_id=outcome.product_checkpoint_id,
+            physical_thread_id=outcome.physical_thread_id,
+            attempt_checkpoint_id=str(outcome.attempt_checkpoint_id or ""),
+            runtime_event_id=outcome.runtime_event_id,
+            runtime_event_sequence=outcome.runtime_event_sequence,
+            runtime_event_payload_hash=outcome.runtime_event_payload_hash,
+            terminal_event_id=outcome.event_id,
+            transaction_id="00000000-0000-0000-0000-000000000777",
+            terminal_outcome="committed",
+            render_hash=outcome.render_hash,
+            pending_transition={
+                "before_hash": "7" * 64,
+                "after_hash": "8" * 64,
+            },
+            render_manifest={"fragment_hashes": []},
+        )
+        runtime_stream = FakeRuntimeEventStream([event])
+        terminal_stream = FakeTerminalOutcomeStream(
+            turn_count=0,
+            outcomes=[outcome],
+        )
+
+        with self.assertRaisesRegex(
+            TerminalProtocolViolation,
+            "different transactions",
+        ):
+            wait_for_turn_completion(
+                FakeTransport([response]),
+                runtime_stream,
+                terminal_stream,
+                timeout_seconds=1,
+                expectation=_completion_expectation(),
+                event_grace_seconds=0,
+            )
+
+    def test_startup_audit_accepts_live_and_replay_for_one_committed_event(
+        self,
+    ) -> None:
+        outcome = _terminal_outcome(
+            "committed",
+            product_fingerprint="c" * 64,
+            product_authority="dynamic-dual-ai-chaos:test-session",
+        )
+        event = replace(
+            self._event(2, "c" * 64, "c" * 64, "opening_next_action"),
+            schema_version=6,
+            observation="turn_committed",
+            thread_id="test-session",
+            session_purpose="dynamic-dual-ai-chaos",
+            product_authority_id="dynamic-dual-ai-chaos:test-session",
+            base_revision=outcome.base_revision,
+            base_checkpoint_thread_id=outcome.base_checkpoint_thread_id,
+            base_checkpoint_id=outcome.base_checkpoint_id,
+            product_revision=outcome.product_revision,
+            product_checkpoint_thread_id=(
+                outcome.product_checkpoint_thread_id
+            ),
+            product_checkpoint_id=outcome.product_checkpoint_id,
+            physical_thread_id=outcome.physical_thread_id,
+            attempt_checkpoint_id=str(outcome.attempt_checkpoint_id or ""),
+            runtime_event_id=outcome.runtime_event_id,
+            runtime_event_sequence=outcome.runtime_event_sequence,
+            runtime_event_payload_hash=outcome.runtime_event_payload_hash,
+            terminal_event_id=outcome.event_id,
+            transaction_id=outcome.transaction_id,
+            terminal_outcome="committed",
+            render_hash=outcome.render_hash,
+            pending_transition={
+                "before_hash": "7" * 64,
+                "after_hash": "8" * 64,
+            },
+            render_manifest={"fragment_hashes": []},
+        )
+        replay = replace(
+            outcome,
+            projection_id="projection-replay",
+            delivery_phase="startup_replay",
+            presentation_hash="9" * 64,
+        )
+        session_event = replace(
+            _ready_session_event(
+                REVISION,
+                startup_response="Agent> startup",
+                session_id="test-session",
+                session_purpose="dynamic-dual-ai-chaos",
+                product_revision=3,
+                product_fingerprint="c" * 64,
+                product_checkpoint_thread_id=(
+                    "attempt:00000000-0000-0000-0000-000000000099"
+                ),
+                product_checkpoint_id="checkpoint-3",
+                runtime_event_fence_terminal_event_id=(
+                    "terminal-committed-ok"
+                ),
+                runtime_event_fence_id="runtime-terminal-committed-ok",
+            ),
+            replayed_projection_ids=(replay.projection_id,),
+        )
+
+        validate_startup_terminal_protocol(
+            [event],
+            [outcome, replay],
+            expected_revision=REVISION,
+            session_event=session_event,
+            baseline_event=event,
+        )
+
+    def test_startup_audit_rejects_conflict_missing_event_and_head_advance(
+        self,
+    ) -> None:
+        committed = _terminal_outcome(
+            "committed",
+            product_fingerprint="c" * 64,
+            product_authority="dynamic-dual-ai-chaos:test-session",
+        )
+        conflicting = replace(
+            committed,
+            projection_id="projection-conflict",
+            product_fingerprint="d" * 64,
+        )
+        matching_event = replace(
+            self._event(2, "c" * 64, "c" * 64, "opening_next_action"),
+            schema_version=6,
+            observation="turn_committed",
+            thread_id="test-session",
+            session_purpose="dynamic-dual-ai-chaos",
+            product_authority_id="dynamic-dual-ai-chaos:test-session",
+            base_revision=committed.base_revision,
+            base_checkpoint_thread_id=committed.base_checkpoint_thread_id,
+            base_checkpoint_id=committed.base_checkpoint_id,
+            product_revision=committed.product_revision,
+            product_checkpoint_thread_id=(
+                committed.product_checkpoint_thread_id
+            ),
+            product_checkpoint_id=committed.product_checkpoint_id,
+            physical_thread_id=committed.physical_thread_id,
+            attempt_checkpoint_id=str(
+                committed.attempt_checkpoint_id or ""
+            ),
+            runtime_event_id=committed.runtime_event_id,
+            runtime_event_sequence=committed.runtime_event_sequence,
+            runtime_event_payload_hash=(
+                committed.runtime_event_payload_hash
+            ),
+            terminal_event_id=committed.event_id,
+            transaction_id=committed.transaction_id,
+            terminal_outcome="committed",
+            render_hash=committed.render_hash,
+            pending_transition={
+                "before_hash": "7" * 64,
+                "after_hash": "8" * 64,
+            },
+            render_manifest={"fragment_hashes": []},
+        )
+        with self.assertRaisesRegex(RuntimeError, "immutable outbox"):
+            validate_startup_terminal_protocol(
+                [matching_event],
+                [committed, conflicting],
+                expected_revision=REVISION,
+            )
+        with self.assertRaisesRegex(RuntimeError, "no matching runtime event"):
+            validate_startup_terminal_protocol(
+                [],
+                [committed],
+                expected_revision=REVISION,
+            )
+        aborted = replace(
+            _terminal_outcome(
+                "aborted",
+                failure_category="timeout",
+                product_fingerprint="b" * 64,
+            ),
+            base_fingerprint="a" * 64,
+        )
+        with self.assertRaisesRegex(RuntimeError, "advanced the Product Head"):
+            validate_startup_terminal_protocol(
+                [],
+                [aborted],
+                expected_revision=REVISION,
+            )
+        with self.assertRaisesRegex(RuntimeError, "revision is stale"):
+            validate_startup_terminal_protocol(
+                [],
+                [replace(aborted, origin_revision={
+                    "commit": "stale",
+                    "worktree_hash": "0" * 64,
+                })],
+                expected_revision=REVISION,
+            )
+
+    def test_startup_session_rejects_wrong_identity_and_presentation(self) -> None:
+        response = "Agent> 任意启动内容"
+        class WrongSessionStream(FakeTerminalOutcomeStream):
+            def baseline_session_events(self, **kwargs):
+                current = super().baseline_session_events(**kwargs)[0]
+                return (replace(current, session_id="another-session"),)
+
+        with self.assertRaisesRegex(RuntimeError, "typed provider/model"):
+            validate_startup_session_event(
+                WrongSessionStream(turn_count=1),
+                expected_revision=REVISION,
+                expected_provider="deepseek",
+                expected_model="deepseek-chat",
+                expected_session_id="contract-session",
+                expected_session_purpose="dynamic-dual-ai-chaos",
+                startup_response=response,
+            )
+
+        class WrongPresentationStream(FakeTerminalOutcomeStream):
+            def baseline_session_events(self, **kwargs):
+                current = super().baseline_session_events(**kwargs)[0]
+                return (replace(current, presentation_hash="0" * 64),)
+
+        with self.assertRaisesRegex(RuntimeError, "typed provider/model"):
+            validate_startup_session_event(
+                WrongPresentationStream(turn_count=1),
+                expected_revision=REVISION,
+                expected_provider="deepseek",
+                expected_model="deepseek-chat",
+                expected_session_id="contract-session",
+                expected_session_purpose="dynamic-dual-ai-chaos",
+                startup_response=response,
+            )
+
+    def test_normal_response_without_event_is_protocol_violation(self) -> None:
+        runtime_stream = FakeRuntimeEventStream([])
+        terminal_stream = FakeTerminalOutcomeStream(
+            turn_count=0,
+            outcomes=[_terminal_outcome("committed")],
+        )
+        with self.assertRaises(TerminalProtocolViolation) as raised:
+            wait_for_turn_completion(
+                FakeTransport(["Agent> Choose the next action."]),
+                runtime_stream,
+                terminal_stream,
+                timeout_seconds=1,
+                expectation=_completion_expectation(),
+                event_grace_seconds=0,
+            )
+        self.assertEqual(raised.exception.failure_kind, "response_without_event")
+
+    def test_nonterminal_runtime_event_cannot_complete_a_turn(self) -> None:
+        event = replace(
+            self._event(2, "b" * 64, "c" * 64, "opening_next_action"),
+            event_type="startup_snapshot",
+        )
+        runtime_stream = FakeRuntimeEventStream([event])
+        terminal_stream = FakeTerminalOutcomeStream(turn_count=1)
+        with self.assertRaises(TerminalProtocolViolation) as raised:
+            wait_for_turn_completion(
+                FakeTransport(["Agent> Choose the next action."]),
+                runtime_stream,
+                terminal_stream,
+                timeout_seconds=1,
+                expectation=_completion_expectation(),
+                event_grace_seconds=0,
+            )
+        self.assertIs(raised.exception.event, event)
+
+    def test_event_without_complete_response_is_presentation_violation(self) -> None:
+        class MissingResponseTransport(FakeTransport):
+            def read_complete_agent_response(
+                self,
+                *,
+                timeout_seconds: float,
+            ) -> str:
+                del timeout_seconds
+                raise TimeoutError("partial output: Agent> still rendering")
+
+        event = self._event(2, "b" * 64, "c" * 64, "opening_next_action")
+        runtime_stream = FakeRuntimeEventStream([event])
+        terminal_stream = FakeTerminalOutcomeStream(turn_count=1)
+        with self.assertRaises(TerminalPresentationViolation) as raised:
+            wait_for_turn_completion(
+                MissingResponseTransport([]),
+                runtime_stream,
+                terminal_stream,
+                timeout_seconds=1,
+                expectation=_completion_expectation(),
+                event_grace_seconds=0,
+            )
+        self.assertIs(raised.exception.event, event)
+        self.assertIn("partial output", str(raised.exception.response_error))
+
+    def test_typed_failure_preserves_transcript_and_nonqualifying_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            ledger = self._ledger()
+            runtime = root / "runtime"
+            timeout_response = "Agent> " + t(
+                'en',
+                'turn_timeout',
+                timeout=30,
+                provider='deepseek',
+                model='deepseek-chat',
+            )
+            transport = FakeTransport([
+                "Agent> Model config: provider=deepseek, model=deepseek-chat, auth=api_key\n"
+                "Agent> Choose a mode.",
+                timeout_response,
+            ])
+            events = FakeRuntimeEventStream([
+                replace(
+                    self._event(
+                        1,
+                        "a" * 64,
+                        "b" * 64,
+                        "opening_next_action",
+                    ),
+                    thread_id="typed-failure",
+                    product_authority_id=(
+                        "dynamic-dual-ai-chaos:typed-failure"
+                    ),
+                ),
+            ])
+            terminal_outcomes = FakeTerminalOutcomeStream(
+                turn_count=0,
+                startup_outcome_count=0,
+                outcomes=[_terminal_outcome(
+                    "aborted",
+                    failure_category="timeout",
+                    product_fingerprint="b" * 64,
+                )],
+            )
+            runner = DynamicDualAiChaosRunner(
+                ChaosRunConfig.linux(
+                    root,
+                    session_id="typed-failure",
+                    runtime_root=runtime,
+                ),
+                lambda context: SimulatorDecision(
+                    user_message="Use the offered mode.",
+                    persona=context.scheduled_target.persona,
+                    goal=context.scheduled_target.goal,
+                    rationale="Selected from the complete response.",
+                    target_coverage_ids=(context.scheduled_target.edge_key,),
+                ),
+                ledger=ledger,
+                schedule=self._schedule(ledger),
+                transport=transport,
+                event_stream=events,
+                terminal_outcome_stream=terminal_outcomes,
+                revision=REVISION,
+            )
+
+            with self.assertRaises(TerminalTurnFailure):
+                runner.run()
+
+            transcript = (runtime / "transcript.txt").read_text(encoding="utf-8")
+            self.assertIn("User> Use the offered mode.", transcript)
+            self.assertIn("stopped on timeout", transcript)
+            diagnostics = list((runtime / "diagnostics").glob("terminal-*.json"))
+            self.assertEqual(len(diagnostics), 1)
+            payload = json.loads(diagnostics[0].read_text(encoding="utf-8"))
+            self.assertFalse(payload["qualifying_evidence"])
+            self.assertEqual(payload["failure"]["terminal_outcome"], "timeout")
+            self.assertEqual(
+                list((runtime / "evidence").glob("*.json")),
+                [],
+            )
 
     def test_scheduler_rejects_a_seed_scenario_owned_by_another_edge(self) -> None:
         ledger = self._ledger()
@@ -492,11 +1514,27 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 ledger=ledger,
                 schedule=schedule,
                 transport=transport,
-                event_stream=FakeEventStream([
+                event_stream=FakeRuntimeEventStream([
                     self._event(1, "a" * 64, "b" * 64, "resume_harness_session"),
-                    self._event(2, "b" * 64, "c" * 64, "opening_next_action"),
-                    self._event(3, "c" * 64, "d" * 64, "chain_select"),
+                    self._event(
+                        2,
+                        "b" * 64,
+                        "c" * 64,
+                        "opening_next_action",
+                        "continue",
+                    ),
+                    self._event(
+                        3,
+                        "c" * 64,
+                        "d" * 64,
+                        "chain_select",
+                        "Use the simulated node for this check.",
+                    ),
                 ]),
+                terminal_outcome_stream=FakeTerminalOutcomeStream(
+                    turn_count=3,
+                    responses=list(transport.responses),
+                ),
                 revision=REVISION,
                 clock_ns=OrderedClock(),
             )
@@ -507,7 +1545,10 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 result = runner.run()
 
             self.assertEqual(result.execution_status, "complete")
-            self.assertEqual(transport.submitted, ["1", "Use the simulated node for this check."])
+            self.assertEqual(transport.submitted, [
+                "continue",
+                "Use the simulated node for this check.",
+            ])
             self.assertEqual(len(seen), 1)
             seed_checkpoint.assert_called_once()
 
@@ -518,7 +1559,14 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 **EDGE,
                 "edge_key": "opening::resume_harness_session::variant::natural_language_option::option:3",
                 "question_id": "resume_harness_session",
-                "contract_hash": contract_variant_hash({"id": "resume_harness_session"}),
+                "contract_hash": contract_variant_hash({
+                    "id": "resume_harness_session",
+                    "options": [
+                        {"id": "1", "value": "continue"},
+                        {"id": "2", "value": "modify"},
+                        {"id": "3", "value": "reset"},
+                    ],
+                }),
                 "edge_type": "question_option",
                 "action_type": "answer_pending",
                 "option_id": "3",
@@ -558,7 +1606,13 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 )
 
             committed = replace(
-                self._event(2, "b" * 64, "c" * 64, "opening_next_action"),
+                self._event(
+                    2,
+                    "b" * 64,
+                    "c" * 64,
+                    "opening_next_action",
+                    "Discard that partial setup and let me start clean.",
+                ),
                 admitted_action_types=("answer_pending",),
                 state_diff_hashes={"confirmed_config": {"before": "1" * 64, "after": "2" * 64}},
                 after_value_hashes={"confirmed_config": content_hash({})},
@@ -570,10 +1624,14 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 ledger=ledger,
                 schedule=schedule,
                 transport=transport,
-                event_stream=FakeEventStream([
+                event_stream=FakeRuntimeEventStream([
                     self._event(1, "a" * 64, "b" * 64, "resume_harness_session"),
                     committed,
                 ]),
+                terminal_outcome_stream=FakeTerminalOutcomeStream(
+                    turn_count=2,
+                    responses=list(transport.responses),
+                ),
                 revision=REVISION,
                 clock_ns=OrderedClock(),
             )
@@ -635,7 +1693,13 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
 
             startup = self._event(1, "a" * 64, "b" * 64, "resume_harness_session")
             waiting = replace(
-                self._event(2, "b" * 64, "c" * 64, "typed_action_intake"),
+                self._event(
+                    2,
+                    "b" * 64,
+                    "c" * 64,
+                    "typed_action_intake",
+                    "modify",
+                ),
                 admitted_action_types=("answer_pending",),
                 state_diff_hashes={"pending_question": {"before": "a" * 64, "after": "b" * 64}},
                 pending_contract={
@@ -645,7 +1709,13 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 next_result={"kind": "question", "question_id": "typed_action_intake"},
             )
             committed = replace(
-                self._event(3, "c" * 64, "d" * 64, ""),
+                self._event(
+                    3,
+                    "c" * 64,
+                    "d" * 64,
+                    "",
+                    "Finish this benchmark first, then observe node synchronization.",
+                ),
                 admitted_action_types=("queue_workflow_goal",),
                 state_diff_hashes={"workflow_goals": {"before": "a" * 64, "after": "b" * 64}},
                 next_result={"kind": "result", "status": "workflow_goal_queued"},
@@ -656,7 +1726,11 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 ledger=ledger,
                 schedule=schedule,
                 transport=transport,
-                event_stream=FakeEventStream([startup, waiting, committed]),
+                event_stream=FakeRuntimeEventStream([startup, waiting, committed]),
+                terminal_outcome_stream=FakeTerminalOutcomeStream(
+                    turn_count=3,
+                    responses=list(transport.responses),
+                ),
                 revision=REVISION,
                 clock_ns=OrderedClock(),
             )
@@ -666,7 +1740,7 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
 
             self.assertEqual(result.execution_status, "complete")
             self.assertEqual(transport.submitted, [
-                "2",
+                "modify",
                 "Finish this benchmark first, then observe node synchronization.",
             ])
             self.assertEqual(len(seen), 1)
@@ -681,7 +1755,11 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 ledger=ledger,
                 schedule=self._schedule(ledger),
                 transport=FakeTransport(["Agent> Ready."]),
-                event_stream=FakeEventStream([]),
+                event_stream=FakeRuntimeEventStream([]),
+                terminal_outcome_stream=FakeTerminalOutcomeStream(
+                    turn_count=0,
+                    publish_session_event=False,
+                ),
                 revision=REVISION,
             )
             with self.assertRaisesRegex(RuntimeError, "provider/model"):
@@ -711,7 +1789,10 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                     "Agent> Model config: provider=deepseek, model=deepseek-chat, auth=api_key\n"
                     "Agent> Choose a mode."
                 ]),
-                event_stream=FakeEventStream([stale]),
+                event_stream=FakeRuntimeEventStream([stale]),
+                terminal_outcome_stream=FakeTerminalOutcomeStream(
+                    turn_count=1,
+                ),
                 revision=REVISION,
             )
 
@@ -738,12 +1819,16 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 ledger=ledger,
                 schedule=self._schedule(ledger),
                 transport=transport,
-                event_stream=FakeEventStream([
+                event_stream=FakeRuntimeEventStream([
                     self._event(1, "a" * 64, "b" * 64, "opening_next_action"),
                 ]),
+                terminal_outcome_stream=FakeTerminalOutcomeStream(
+                    turn_count=2,
+                    responses=list(transport.responses),
+                ),
                 revision=REVISION,
             )
-            with self.assertRaisesRegex(RuntimeError, "without a new committed"):
+            with self.assertRaises(TerminalProtocolViolation):
                 runner.run()
             self.assertEqual(list((root / ".agent/dynamic-chaos/contract-session/evidence").glob("*.json")), [])
             diagnostics = list(
@@ -751,13 +1836,16 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             )
             self.assertEqual(len(diagnostics), 1)
             diagnostic = json.loads(diagnostics[0].read_text(encoding="utf-8"))
-            valid, reason = validate_pty_diagnostic_artifact(diagnostic)
-            self.assertTrue(valid, reason)
-            self.assertEqual(diagnostic["diagnostic_kind"], "interruption")
-            boundary = diagnostic["last_complete_boundary"]
-            self.assertIn("Model config", boundary["agent_response"])
-            self.assertNotIn("Returned, but no runtime event", boundary["agent_response"])
-            self.assertIsNone(boundary["completed_turn"])
+            self.assertEqual(
+                diagnostic["artifact_type"],
+                "terminal_completion_diagnostic",
+            )
+            self.assertFalse(diagnostic["qualifying_evidence"])
+            self.assertEqual(
+                diagnostic["failure"]["failure_kind"],
+                "response_without_event",
+            )
+            self.assertEqual(diagnostic["last_complete_event"]["turn_index"], 1)
 
     def test_failed_postcondition_fails_closed_after_event_advancement(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -780,13 +1868,23 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 ledger=ledger,
                 schedule=self._schedule(ledger),
                 transport=transport,
-                event_stream=FakeEventStream([
+                event_stream=FakeRuntimeEventStream([
                     self._event(1, "a" * 64, "b" * 64, "opening_next_action"),
                     replace(
-                        self._event(2, "b" * 64, "c" * 64, "chain_select"),
+                        self._event(
+                            2,
+                            "b" * 64,
+                            "c" * 64,
+                            "chain_select",
+                            "https://rpc.example/abcdefghijklmnopqrstuvwxyz123456",
+                        ),
                         admitted_action_types=(),
                     ),
                 ]),
+                terminal_outcome_stream=FakeTerminalOutcomeStream(
+                    turn_count=2,
+                    responses=list(transport.responses),
+                ),
                 revision=REVISION,
             )
             observed_pending: list[dict] = []
@@ -901,7 +1999,13 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 state_diff_hashes={},
             )
             deferred = replace(
-                self._event(2, "b" * 64, "c" * 64, "target_mode_select"),
+                self._event(
+                    2,
+                    "b" * 64,
+                    "c" * 64,
+                    "target_mode_select",
+                    "Switch this workflow to sync-observe.",
+                ),
                 active_group="target_mode",
                 admitted_action_types=("change_group",),
                 admitted_action_targets=({"type": "change_group", "group": "sync_observe"},),
@@ -919,7 +2023,13 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 },
             )
             terminal = replace(
-                self._event(3, "c" * 64, "d" * 64, "sync_observe_source"),
+                self._event(
+                    3,
+                    "c" * 64,
+                    "d" * 64,
+                    "sync_observe_source",
+                    "Use real-node so sync-observe can continue.",
+                ),
                 active_group="sync_observe",
                 admitted_action_types=("choose_target_mode",),
                 state_diff_hashes={
@@ -972,7 +2082,11 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 ledger=ledger,
                 schedule=schedule,
                 transport=transport,
-                event_stream=FakeEventStream([baseline, deferred, terminal]),
+                event_stream=FakeRuntimeEventStream([baseline, deferred, terminal]),
+                terminal_outcome_stream=FakeTerminalOutcomeStream(
+                    turn_count=3,
+                    responses=list(transport.responses),
+                ),
                 revision=REVISION,
                 clock_ns=OrderedClock(),
             )
@@ -1047,14 +2161,24 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 ledger=ledger,
                 schedule=schedule,
                 transport=transport,
-                event_stream=FakeEventStream([
+                event_stream=FakeRuntimeEventStream([
                     self._event(1, "a" * 64, "b" * 64, "opening_next_action"),
-                    self._event(2, "b" * 64, "c" * 64, "opening_next_action"),
+                    self._event(
+                        2,
+                        "b" * 64,
+                        "c" * 64,
+                        "opening_next_action",
+                        "turn-2",
+                    ),
                 ]),
+                terminal_outcome_stream=FakeTerminalOutcomeStream(
+                    turn_count=2,
+                    responses=list(transport.responses),
+                ),
                 revision=REVISION,
                 clock_ns=OrderedClock(),
             )
-            with self.assertRaisesRegex(RuntimeError, "without a new committed"):
+            with self.assertRaises(TerminalProtocolViolation):
                 runner.run()
 
             diagnostics = list(
@@ -1062,17 +2186,16 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             )
             self.assertEqual(len(diagnostics), 1)
             diagnostic = json.loads(diagnostics[0].read_text(encoding="utf-8"))
-            valid, reason = validate_pty_diagnostic_artifact(diagnostic)
-            self.assertTrue(valid, reason)
-            boundary = diagnostic["last_complete_boundary"]
-            self.assertEqual(boundary["completed_turn"]["user_message"], "turn-2")
             self.assertEqual(
-                boundary["completed_turn"]["agent_response"],
-                "Agent> First complete response.",
+                diagnostic["failure"]["failure_kind"],
+                "response_without_event",
             )
-            serialized = diagnostics[0].read_text(encoding="utf-8")
-            self.assertNotIn("turn-3", serialized)
-            self.assertNotIn("Second response without a committed event", serialized)
+            self.assertEqual(diagnostic["last_complete_event"]["turn_index"], 2)
+            transcript = (
+                root / ".agent/dynamic-chaos/contract-session/transcript.txt"
+            ).read_text(encoding="utf-8")
+            self.assertIn("User> turn-3", transcript)
+            self.assertIn("Second response without a committed event", transcript)
             schedule_result = json.loads(
                 (root / ".agent/dynamic-chaos/contract-session/schedule-result.json").read_text(
                     encoding="utf-8"
@@ -1119,10 +2242,27 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                     "Agent> Which region?",
                     "Agent> Which chain?",
                 ]),
-                event_stream=FakeEventStream([
+                event_stream=FakeRuntimeEventStream([
                     self._event(1, "a" * 64, "b" * 64, ""),
-                    self._event(2, "b" * 64, "c" * 64, "chain_select"),
+                    self._event(
+                        2,
+                        "b" * 64,
+                        "c" * 64,
+                        "chain_select",
+                        "Take me to workload settings.",
+                    ),
                 ]),
+                terminal_outcome_stream=FakeTerminalOutcomeStream(
+                    turn_count=2,
+                    responses=[
+                        (
+                            "Agent> Model config: provider=deepseek, "
+                            "model=deepseek-chat, auth=api_key\n"
+                            "Agent> Which region?"
+                        ),
+                        "Agent> Which chain?",
+                    ],
+                ),
                 revision=REVISION,
             )
             with self.assertRaisesRegex(ValueError, "scheduled action was not admitted"):

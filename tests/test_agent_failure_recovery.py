@@ -447,14 +447,23 @@ class FailureRecoveryTest(unittest.TestCase):
                 session_purpose="chaos",
             ) as runtime:
                 state = new_state("invariant")
-                state["active_group"] = "not-a-real-group"
+                attempt = runtime._begin_turn_attempt(state)
+                candidate = dict(state)
+                candidate["active_group"] = "not-a-real-group"
                 recovered = runtime._recover_invariant_failure(
                     state,
+                    candidate,
                     StateInvariantError("unknown active group"),
+                    attempt,
+                )
+                outcomes = runtime.turn_transactions.list_terminal_outcomes(
+                    runtime.transaction_authority_id
                 )
         self.assertEqual(recovered["active_group"], "failure_recovery")
         self.assertEqual(recovered["failure_recovery"]["record"]["code"], "HARNESS_INVARIANT_FAILED")
         self.assertEqual(recovered["pending_question"]["id"], "failure_recovery_action")
+        self.assertEqual(len(outcomes), 1)
+        self.assertEqual(outcomes[0].outcome, "committed")
 
     def test_complete_single_line_failure_question_is_analyzed_without_paste_mode(self) -> None:
         from agent.harness.domains.analysis import analyze_inline_evidence_result

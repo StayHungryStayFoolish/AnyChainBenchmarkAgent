@@ -223,9 +223,7 @@ class InvocationContextAuthorityTest(unittest.TestCase):
                             "latest_job_id": "job_external",
                         },
                     )
-                raw = dict(runtime.graph.get_state(
-                    {"configurable": {"thread_id": "external-context-recovery"}}
-                ).values or {})
+                raw = runtime.snapshot()
             finally:
                 runtime.close()
 

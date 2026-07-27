@@ -1143,6 +1143,7 @@ def _runtime_event(payload: Mapping[str, Any]) -> RuntimeTurnEvent:
     return RuntimeTurnEvent(
         schema_version=int(payload["schema_version"]),
         event_type=str(payload["event_type"]),
+        observation=str(payload.get("observation") or ""),
         thread_id=str(payload["thread_id"]),
         session_purpose=str(payload.get("session_purpose") or ""),
         before_fingerprint=str(payload["before_fingerprint"]),
@@ -1175,6 +1176,34 @@ def _runtime_event(payload: Mapping[str, Any]) -> RuntimeTurnEvent:
         ),
         after_value_hashes=dict(payload.get("after_value_hashes") or {}),
         next_result=dict(payload.get("next_result") or {}),
+        runtime_event_id=str(payload.get("runtime_event_id") or ""),
+        runtime_event_sequence=payload.get("runtime_event_sequence"),
+        runtime_event_payload_hash=str(
+            payload.get("runtime_event_payload_hash") or ""
+        ),
+        terminal_event_id=str(payload.get("terminal_event_id") or ""),
+        transaction_id=str(payload.get("transaction_id") or ""),
+        terminal_outcome=str(payload.get("terminal_outcome") or ""),
+        render_hash=str(payload.get("render_hash") or ""),
+        base_revision=payload.get("base_revision"),
+        base_checkpoint_thread_id=str(
+            payload.get("base_checkpoint_thread_id") or ""
+        ),
+        base_checkpoint_id=str(payload.get("base_checkpoint_id") or ""),
+        product_revision=payload.get("product_revision"),
+        product_checkpoint_thread_id=str(
+            payload.get("product_checkpoint_thread_id") or ""
+        ),
+        product_checkpoint_id=str(
+            payload.get("product_checkpoint_id") or ""
+        ),
+        product_authority_id=str(
+            payload.get("product_authority_id") or ""
+        ),
+        physical_thread_id=str(payload.get("physical_thread_id") or ""),
+        attempt_checkpoint_id=str(
+            payload.get("attempt_checkpoint_id") or ""
+        ),
     )
 
 

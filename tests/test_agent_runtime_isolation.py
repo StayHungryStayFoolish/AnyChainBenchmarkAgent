@@ -67,7 +67,24 @@ class AgentRuntimeIsolationTests(unittest.TestCase):
 
             event = json.loads(event_file.read_text(encoding="utf-8").splitlines()[-1])
             self.assertEqual(event["event_type"], "turn_committed")
-            self.assertEqual(event["schema_version"], 3)
+            self.assertEqual(event["schema_version"], 6)
+            self.assertEqual(event["terminal_outcome"], "committed")
+            self.assertTrue(event["runtime_event_id"])
+            self.assertTrue(event["terminal_event_id"])
+            self.assertTrue(event["transaction_id"])
+            self.assertEqual(
+                event["product_authority_id"],
+                "chaos:event-runtime",
+            )
+            self.assertEqual(
+                event["physical_thread_id"],
+                event["product_checkpoint_thread_id"],
+            )
+            self.assertEqual(
+                event["attempt_checkpoint_id"],
+                event["product_checkpoint_id"],
+            )
+            self.assertEqual(len(event["render_hash"]), 64)
             self.assertEqual(event["thread_id"], "event-runtime")
             self.assertEqual(event["turn_index"], result["turn_index"])
             self.assertEqual(len(event["before_fingerprint"]), 64)
@@ -133,7 +150,8 @@ class AgentRuntimeIsolationTests(unittest.TestCase):
                 result = runtime.invoke("trigger invalid transition", language="en")
 
             events = [json.loads(line) for line in event_file.read_text(encoding="utf-8").splitlines()]
-            self.assertEqual([event["event_type"] for event in events], ["turn_recovered"])
+            self.assertEqual([event["event_type"] for event in events], ["turn_committed"])
+            self.assertEqual([event["observation"] for event in events], ["turn_recovered"])
             self.assertEqual(events[0]["turn_index"], result["turn_index"])
             self.assertEqual(result["active_group"], "failure_recovery")
             self.assertEqual(events[0]["pending_question_id"], "failure_recovery_action")
@@ -161,7 +179,8 @@ class AgentRuntimeIsolationTests(unittest.TestCase):
                 result = runtime.invoke("confirm", language="en")
 
             events = [json.loads(line) for line in event_file.read_text(encoding="utf-8").splitlines()]
-            self.assertEqual([event["event_type"] for event in events], ["turn_recovered"])
+            self.assertEqual([event["event_type"] for event in events], ["turn_committed"])
+            self.assertEqual([event["observation"] for event in events], ["turn_recovered"])
             self.assertEqual(result["active_group"], "failure_recovery")
             self.assertEqual(result["turn_index"], 1)
             record = result["failure_recovery"]["record"]

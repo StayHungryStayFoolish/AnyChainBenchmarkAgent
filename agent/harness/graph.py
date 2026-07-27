@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import uuid
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable, Mapping, TypedDict
@@ -13,7 +14,13 @@ from langgraph.runtime import Runtime
 
 from .checkpoints import create_sqlite_checkpointer, default_checkpoint_path
 from ..llm.config import load_llm_config
-from ..llm.types import ensure_turn_active, llm_turn_scope
+from ..llm.types import (
+    LLMProviderError,
+    LLMTurnCancelledError,
+    LLMTurnTimeoutError,
+    ensure_turn_active,
+    llm_turn_scope,
+)
 from .coordinator import (
     admit_turn_step,
     adjudicate_turn_step,
@@ -35,7 +42,21 @@ from .invariants import StateInvariantError, validate_state
 from .domains.recovery import question_for_recovery
 from .response import finalize_turn_response, reset_turn_response
 from .runtime_identity import repository_revision
+from .terminal_protocol import (
+    append_jsonl_record,
+    claim_jsonl_authority,
+    quarantine_jsonl_file,
+    read_jsonl_records,
+)
 from .state import AgentGraphState, RESET_PRESERVED_KEYS, ensure_session_metadata, migrate_state, new_state, project_checkpoint_state
+from .turn_transactions import (
+    ProductAuthorityLease,
+    ProductHead,
+    TerminalOutcome,
+    TurnAttempt,
+    TurnTransactionStore,
+    product_authority_id,
+)
 
 
 _EXECUTION_APPROVAL_QUESTIONS = frozenset({
@@ -61,15 +82,163 @@ class AnyChainGraphRuntime:
     ) -> None:
         self.thread_id = thread_id
         self.session_purpose = session_purpose or "user"
+        self.transaction_authority_id = product_authority_id(
+            self.thread_id,
+            self.session_purpose,
+        )
         self.checkpoint_path = Path(checkpoint_path or default_checkpoint_path())
         self.checkpointer = checkpointer or create_sqlite_checkpointer(self.checkpoint_path)
         self.graph = build_graph(self.checkpointer)
+        self.turn_transactions = TurnTransactionStore(self.checkpoint_path)
+        self._last_terminal_outcome: TerminalOutcome | None = None
+        self.authority_lease = ProductAuthorityLease(
+            self.checkpoint_path,
+            self.transaction_authority_id,
+        )
+        try:
+            self.authority_lease.acquire()
+            self._recover_interrupted_attempts()
+            self._recover_missing_runtime_observations()
+        except BaseException:
+            self.close()
+            raise
 
     def close(self) -> None:
+        lease = getattr(self, "authority_lease", None)
+        if lease is not None:
+            lease.close()
         manager = getattr(self.checkpointer, "_anychain_context_manager", None)
         if manager is not None:
             manager.__exit__(None, None, None)
             delattr(self.checkpointer, "_anychain_context_manager")
+
+    @property
+    def last_terminal_outcome(self) -> TerminalOutcome | None:
+        return self._last_terminal_outcome
+
+    def pending_terminal_outcomes(self) -> tuple[TerminalOutcome, ...]:
+        return self.turn_transactions.list_undelivered_outcomes(
+            self.transaction_authority_id
+        )
+
+    def unresolved_reconciliation(self) -> TerminalOutcome | None:
+        return self.turn_transactions.get_unresolved_reconciliation(
+            self.transaction_authority_id
+        )
+
+    def product_head(self) -> ProductHead | None:
+        return self.turn_transactions.get_product_head(
+            self.transaction_authority_id
+        )
+
+    def runtime_event_fence(self) -> tuple[int, str, str, str]:
+        return self.turn_transactions.runtime_event_fence(
+            self.transaction_authority_id
+        )
+
+    def _runtime_event_path(self) -> Path:
+        configured = str(
+            os.environ.get("ANYCHAIN_AGENT_TURN_EVENT_FILE") or ""
+        ).strip()
+        if configured:
+            return Path(configured)
+        authority_digest = hashlib.sha256(
+            self.transaction_authority_id.encode("utf-8")
+        ).hexdigest()[:16]
+        return Path(
+            f"{self.checkpoint_path}.runtime-events."
+            f"{authority_digest}.jsonl"
+        )
+
+    def terminal_messages(self, outcome: TerminalOutcome) -> tuple[str, ...]:
+        """Load a committed response from its exact Product Head checkpoint."""
+
+        if outcome.logical_thread_id != self.transaction_authority_id:
+            raise RuntimeError("terminal outcome belongs to another Product Head")
+        if outcome.outcome != "committed":
+            return ()
+        snapshot = self.graph.get_state({
+            "configurable": {
+                "thread_id": outcome.product_checkpoint_thread_id,
+                "checkpoint_ns": "",
+                "checkpoint_id": outcome.product_checkpoint_id,
+            }
+        })
+        values = dict(getattr(snapshot, "values", None) or {})
+        if _state_fingerprint(values) != outcome.product_fingerprint:
+            raise RuntimeError("terminal replay checkpoint fingerprint mismatch")
+        messages = tuple(str(item) for item in values.get("visible_response") or ())
+        if _canonical_hash(list(messages)) != outcome.render_hash:
+            raise RuntimeError("terminal replay response hash mismatch")
+        return messages
+
+    def mark_terminal_delivered(
+        self,
+        outcome: TerminalOutcome,
+    ) -> TerminalOutcome:
+        delivered = self.turn_transactions.mark_terminal_delivered(
+            logical_thread_id=self.transaction_authority_id,
+            event_id=outcome.event_id,
+        )
+        if (
+            self._last_terminal_outcome is not None
+            and self._last_terminal_outcome.event_id == outcome.event_id
+        ):
+            self._last_terminal_outcome = delivered
+        return delivered
+
+    def ensure_runtime_observation(self, outcome: TerminalOutcome) -> None:
+        """Repair and verify the committed runtime event before presentation."""
+
+        destination = self._runtime_event_path()
+        if outcome.outcome != "committed":
+            return
+        self._recover_missing_runtime_observations()
+        observed: dict[str, Mapping[str, Any]] = {}
+        runtime_event_ids: set[str] = set()
+        for payload in read_jsonl_records(destination):
+            event_id = str(payload.get("terminal_event_id") or "")
+            runtime_event_id = str(payload.get("runtime_event_id") or "")
+            if not runtime_event_id or runtime_event_id in runtime_event_ids:
+                raise RuntimeError(
+                    "runtime observation identity is missing or duplicated"
+                )
+            runtime_event_ids.add(runtime_event_id)
+            if event_id:
+                if event_id in observed:
+                    raise RuntimeError(
+                        "runtime observation contains a duplicate terminal event"
+                    )
+                observed[event_id] = payload
+        if outcome.event_id not in observed:
+            raise RuntimeError(
+                "committed terminal outcome lacks its runtime observation"
+            )
+        self._validate_runtime_observation_payload(
+            observed[outcome.event_id],
+            outcome,
+        )
+
+    def resolve_reconciliation(
+        self,
+        *,
+        transaction_id: str,
+        resolution: str,
+        evidence_hash: str,
+    ) -> None:
+        self.turn_transactions.resolve_reconciliation(
+            logical_thread_id=self.transaction_authority_id,
+            transaction_id=transaction_id,
+            resolution=resolution,
+            evidence_hash=evidence_hash,
+        )
+        current = self._last_terminal_outcome
+        if (
+            current is not None
+            and current.transaction_id == transaction_id
+            and current.outcome == "reconciliation_required"
+        ):
+            self._last_terminal_outcome = None
 
     def __enter__(self) -> "AnyChainGraphRuntime":
         return self
@@ -106,7 +275,8 @@ class AnyChainGraphRuntime:
         # a prior startup command into the next graph invocation.
         invocation_context["runtime_action"] = {}
         state = ensure_session_metadata(state, self.thread_id, self.session_purpose)
-        config = {"configurable": {"thread_id": self.thread_id}}
+        attempt = self._begin_turn_attempt(before)
+        config = {"configurable": {"thread_id": attempt.physical_thread_id}}
         with llm_turn_scope(load_llm_config().turn_timeout_seconds):
             ensure_turn_active()
             try:
@@ -123,58 +293,92 @@ class AnyChainGraphRuntime:
                     int(candidate.get("turn_index") or 0),
                     int(before.get("turn_index") or 0) + 1,
                 )
-                recovered = self._recover_invariant_failure(candidate, exc)
-                self._write_turn_observation("turn_recovered", before, recovered)
+                if self._attempt_effect_evidence(attempt)[0]:
+                    self._finish_failed_turn_attempt(attempt, exc)
+                    raise
+                recovered = self._recover_invariant_failure(
+                    before,
+                    candidate,
+                    exc,
+                    attempt,
+                )
+                self._write_turn_observation(
+                    "turn_recovered",
+                    before,
+                    recovered,
+                    self._last_terminal_outcome,
+                )
                 return recovered
+            except BaseException as exc:
+                self._finish_failed_turn_attempt(attempt, exc)
+                raise
             persisted = dict(result)
-            self._write_turn_observation("turn_committed", before, persisted)
+            try:
+                self._last_terminal_outcome = self._commit_turn_attempt(
+                    attempt,
+                    persisted,
+                )
+            except BaseException as exc:
+                self._terminalize_failed_attempt_once(attempt, exc)
+                raise
+            self._write_turn_observation(
+                "turn_committed",
+                before,
+                persisted,
+                self._last_terminal_outcome,
+            )
             return persisted
 
-    def _recover_invariant_failure(self, state: AgentGraphState, exc: StateInvariantError) -> AgentGraphState:
-        """Re-enter the product graph from its last valid checkpoint."""
+    def _recover_invariant_failure(
+        self,
+        base_state: AgentGraphState,
+        candidate_state: AgentGraphState,
+        exc: StateInvariantError,
+        attempt: TurnAttempt,
+    ) -> AgentGraphState:
+        """Commit typed recovery on the original physical attempt."""
 
         record = build_failure_record(
             "HARNESS_INVARIANT_FAILED",
             source="harness",
             severity="blocking",
             facts=[{"code": "HARNESS_INVARIANT_FAILED", "source": "harness", "detail": str(exc)}],
-            confirmed_config=state.get("confirmed_config") or {},
+            confirmed_config=candidate_state.get("confirmed_config") or {},
         )
-        try:
-            return self._invoke_runtime_action(
-                {
-                    "type": "activate_harness_recovery",
-                    "failure_record": record,
-                    "confidence": "high",
-                },
-                language=str(state.get("language") or "en"),
-                observation="",
-            )
-        except Exception:
-            # If the graph itself cannot execute its recovery action, retain
-            # only a typed quarantine state. This is the sole emergency direct
-            # checkpoint path and cannot apply normal user or domain actions.
-            recovered: AgentGraphState = dict(state)
-            recovered["action_queue"] = []
-            recovered["selected_action"] = {}
-            recovered["current_action"] = {}
-            recovered["pending_domain_result"] = {}
-            recovered["side_effect_intent"] = {}
-            recovered["side_effect_receipt"] = {}
-            recovered["pending_question"] = {}
-            recovered["failure_recovery"] = {
-                "status": "pending",
-                "record": record,
-            }
-            recovered["active_group"] = "failure_recovery"
-            recovered["control"] = {}
-            recovered["pending_question"] = (
-                question_for_recovery(recovered, "failure_recovery") or {}
-            )
-            reset_turn_response(recovered)
-            recovered = finalize_turn_response(recovered)
-            validate_state(recovered)
-            return self._persist_state(recovered)
+        recovered: AgentGraphState = deepcopy(base_state)
+        recovered["turn_index"] = max(
+            int(candidate_state.get("turn_index") or 0),
+            int(base_state.get("turn_index") or 0) + 1,
+        )
+        recovered["action_queue"] = []
+        recovered["selected_action"] = {}
+        recovered["current_action"] = {}
+        recovered["pending_domain_result"] = {}
+        recovered["side_effect_intent"] = {}
+        recovered["side_effect_receipt"] = {}
+        recovered["failure_recovery"] = {"status": "pending", "record": record}
+        recovered["active_group"] = "failure_recovery"
+        recovered["control"] = {}
+        recovered["pending_question"] = (
+            question_for_recovery(recovered, "failure_recovery") or {}
+        )
+        reset_turn_response(recovered)
+        recovered = finalize_turn_response(recovered)
+        validate_state(recovered)
+        config = self.graph.update_state(
+            {"configurable": {"thread_id": attempt.physical_thread_id}},
+            project_checkpoint_state(recovered),
+            as_node="validate",
+        )
+        snapshot = self.graph.get_state(config)
+        persisted = dict(getattr(snapshot, "values", None) or {})
+        validate_state(persisted)
+        self._last_terminal_outcome = self._commit_turn_attempt(
+            attempt,
+            persisted,
+            snapshot=snapshot,
+        )
+        return persisted
 
     def snapshot(self) -> AgentGraphState:
         return self._load_state(language="en")
@@ -232,42 +436,90 @@ class AnyChainGraphRuntime:
             self.thread_id,
             self.session_purpose,
         )
-        config = {"configurable": {"thread_id": self.thread_id}}
-        result = self.graph.invoke(
-            state,
-            config=config,
-            context={
-                "discovery": {},
-                "framework_summary": {},
-                "web_research": {},
-                "runtime_action": deepcopy(dict(action)),
-                "repository_revision": {},
-            },
-        )
-        validate_state(result)
-        persisted = dict(result)
+        attempt = self._begin_turn_attempt(state)
+        config = {"configurable": {"thread_id": attempt.physical_thread_id}}
+        try:
+            result = self.graph.invoke(
+                state,
+                config=config,
+                context={
+                    "discovery": {},
+                    "framework_summary": {},
+                    "web_research": {},
+                    "runtime_action": deepcopy(dict(action)),
+                    "repository_revision": {},
+                },
+            )
+            validate_state(result)
+            persisted = dict(result)
+            self._last_terminal_outcome = self._commit_turn_attempt(
+                attempt,
+                persisted,
+            )
+        except BaseException as exc:
+            self._finish_failed_turn_attempt(attempt, exc)
+            raise
         if observation:
-            self._write_turn_observation(observation, before, persisted)
+            self._write_turn_observation(
+                observation,
+                before,
+                persisted,
+                self._last_terminal_outcome,
+            )
         return persisted
 
     def _persist_state(self, patch: dict[str, Any]) -> AgentGraphState:
         """Internal checkpoint write used by typed runtime operations."""
 
-        config = {"configurable": {"thread_id": self.thread_id}}
         patch = ensure_session_metadata(dict(patch), self.thread_id, self.session_purpose)
         patch = project_checkpoint_state(patch)
-        self.graph.update_state(config, patch)
-        snapshot = self.graph.get_state(config)
-        values = getattr(snapshot, "values", None) or {}
-        return dict(values)
+        self._ensure_product_head(
+            language=str(patch.get("language") or "en"),
+            preferred_state=patch,
+        )
+        revision = repository_revision(Path(__file__).resolve().parents[2])
+        attempt = self.turn_transactions.begin_attempt(
+            logical_thread_id=self.transaction_authority_id,
+            origin_revision_commit=revision["commit"],
+            origin_revision_worktree_hash=revision["worktree_hash"],
+        )
+        try:
+            config = self.graph.update_state(
+                {"configurable": {"thread_id": attempt.physical_thread_id}},
+                patch,
+                as_node="validate",
+            )
+            snapshot = self.graph.get_state(config)
+            values = dict(getattr(snapshot, "values", None) or {})
+            validate_state(values)
+            self._last_terminal_outcome = self._commit_turn_attempt(
+                attempt,
+                values,
+                snapshot=snapshot,
+            )
+            return values
+        except BaseException as exc:
+            self._finish_failed_turn_attempt(attempt, exc)
+            raise
 
     def _load_state(self, language: str) -> AgentGraphState:
-        config = {"configurable": {"thread_id": self.thread_id}}
         values: dict[str, Any] = {}
         try:
+            head = self._ensure_product_head(language=language)
+            config = {
+                "configurable": {
+                    "thread_id": head.checkpoint_thread_id,
+                    "checkpoint_ns": "",
+                    "checkpoint_id": head.checkpoint_id,
+                }
+            }
             snapshot = self.graph.get_state(config)
             values = dict(getattr(snapshot, "values", None) or {})
             if values:
+                if _state_fingerprint(values) != head.state_fingerprint:
+                    raise RuntimeError(
+                        "product head fingerprint does not match its checkpoint"
+                    )
                 migrated = migrate_state(
                     dict(values),
                     thread_id=self.thread_id,
@@ -291,15 +543,473 @@ class AnyChainGraphRuntime:
             quarantined["audit_events"] = list(values.get("audit_events") or []) + [
                 {"event": "checkpoint_quarantined", "error_type": type(exc).__name__}
             ]
+            if values and self.turn_transactions.get_product_head(
+                self.transaction_authority_id
+            ):
+                try:
+                    return self._persist_state(quarantined)
+                except Exception:
+                    pass
             return quarantined
         return new_state(self.thread_id, language=language, session_purpose=self.session_purpose)
 
+    def _ensure_product_head(
+        self,
+        *,
+        language: str,
+        preferred_state: AgentGraphState | None = None,
+    ) -> ProductHead:
+        head = self.turn_transactions.get_product_head(
+            self.transaction_authority_id
+        )
+        if head is not None:
+            return head
+        snapshot = self._latest_completed_legacy_snapshot()
+        values = dict(getattr(snapshot, "values", None) or {}) if snapshot else {}
+        if preferred_state is not None:
+            values = dict(preferred_state)
+            snapshot = None
+        if not values:
+            values = new_state(
+                self.thread_id,
+                language=language,
+                session_purpose=self.session_purpose,
+            )
+        values = ensure_session_metadata(
+            values,
+            self.thread_id,
+            self.session_purpose,
+            touch=False,
+        )
+        values = project_checkpoint_state(values)
+        if preferred_state is not None or snapshot is None:
+            validate_state(values)
+        if snapshot is None:
+            bootstrap_thread = f"head:{self.transaction_authority_id}"
+            bootstrap_config = self.graph.update_state(
+                {"configurable": {"thread_id": bootstrap_thread}},
+                values,
+                as_node="validate",
+            )
+            snapshot = self.graph.get_state(bootstrap_config)
+        checkpoint_id = str(
+            (getattr(snapshot, "config", {}) or {})
+            .get("configurable", {})
+            .get("checkpoint_id", "")
+        )
+        checkpoint_thread_id = str(
+            (getattr(snapshot, "config", {}) or {})
+            .get("configurable", {})
+            .get("thread_id", "")
+        )
+        if not checkpoint_id or not checkpoint_thread_id:
+            raise RuntimeError("product head bootstrap checkpoint has no identity")
+        return self.turn_transactions.bootstrap_product_head(
+            logical_thread_id=self.transaction_authority_id,
+            checkpoint_thread_id=checkpoint_thread_id,
+            checkpoint_id=checkpoint_id,
+            state_fingerprint=_state_fingerprint(values),
+        )
+
+    def _latest_completed_legacy_snapshot(self) -> Any | None:
+        config = {"configurable": {"thread_id": self.thread_id}}
+        for snapshot in self.graph.get_state_history(config):
+            metadata = dict(getattr(snapshot, "metadata", None) or {})
+            if (
+                not tuple(getattr(snapshot, "next", ()) or ())
+                or str(metadata.get("source") or "") == "update"
+            ):
+                values = dict(getattr(snapshot, "values", None) or {})
+                if values:
+                    return snapshot
+        return None
+
+    def _begin_turn_attempt(
+        self,
+        base_state: AgentGraphState,
+    ) -> TurnAttempt:
+        self._ensure_product_head(
+            language=str(base_state.get("language") or "en"),
+        )
+        revision = repository_revision(Path(__file__).resolve().parents[2])
+        attempt = self.turn_transactions.begin_attempt(
+            logical_thread_id=self.transaction_authority_id,
+            origin_revision_commit=revision["commit"],
+            origin_revision_worktree_hash=revision["worktree_hash"],
+        )
+        try:
+            self.graph.update_state(
+                {"configurable": {"thread_id": attempt.physical_thread_id}},
+                project_checkpoint_state(base_state),
+                as_node="validate",
+            )
+        except BaseException as exc:
+            self._terminalize_failed_attempt_once(attempt, exc)
+            raise
+        return attempt
+
+    def _commit_turn_attempt(
+        self,
+        attempt: TurnAttempt,
+        state: AgentGraphState,
+        *,
+        snapshot: Any | None = None,
+    ) -> TerminalOutcome:
+        config = {"configurable": {"thread_id": attempt.physical_thread_id}}
+        snapshot = snapshot or self.graph.get_state(config)
+        if tuple(getattr(snapshot, "next", ()) or ()):
+            raise RuntimeError("completed turn attempt did not reach graph END")
+        checkpoint_id = str(
+            (getattr(snapshot, "config", {}) or {})
+            .get("configurable", {})
+            .get("checkpoint_id", "")
+        )
+        if not checkpoint_id:
+            raise RuntimeError("completed turn attempt has no checkpoint identity")
+        return self.turn_transactions.commit_attempt(
+            logical_thread_id=self.transaction_authority_id,
+            transaction_id=attempt.transaction_id,
+            physical_thread_id=attempt.physical_thread_id,
+            attempt_checkpoint_id=checkpoint_id,
+            attempt_fingerprint=_state_fingerprint(state),
+            render_hash=_canonical_hash(state.get("visible_response") or []),
+        )
+
+    def _terminalize_failed_attempt_once(
+        self,
+        attempt: TurnAttempt,
+        exc: BaseException,
+    ) -> TerminalOutcome:
+        existing = self.turn_transactions.get_terminal_outcome(
+            attempt.transaction_id
+        )
+        if existing is not None:
+            self._last_terminal_outcome = existing
+            return existing
+        return self._finish_failed_turn_attempt(attempt, exc)
+
+    def _finish_failed_turn_attempt(
+        self,
+        attempt: TurnAttempt,
+        exc: BaseException,
+    ) -> TerminalOutcome:
+        diagnostic_hash = _canonical_hash({
+            "type": type(exc).__name__,
+            "provider": str(getattr(exc, "provider", "") or ""),
+            "model": str(getattr(exc, "model", "") or ""),
+            "stage": str(getattr(exc, "stage", "") or ""),
+            "category": str(getattr(exc, "category", "") or ""),
+            "status_code": int(getattr(exc, "status_code", 0) or 0),
+        })
+        (
+            requires_reconciliation,
+            checkpoint_id,
+            checkpoint_fingerprint,
+        ) = self._attempt_effect_evidence(attempt)
+
+        if requires_reconciliation:
+            checkpoint_arguments = (
+                {
+                    "attempt_checkpoint_id": checkpoint_id,
+                    "attempt_fingerprint": checkpoint_fingerprint,
+                }
+                if checkpoint_id and checkpoint_fingerprint
+                else {}
+            )
+            self._last_terminal_outcome = (
+                self.turn_transactions.require_reconciliation(
+                    logical_thread_id=self.transaction_authority_id,
+                    transaction_id=attempt.transaction_id,
+                    physical_thread_id=attempt.physical_thread_id,
+                    diagnostic_hash=diagnostic_hash,
+                    failure_category=_failure_category(exc),
+                    **checkpoint_arguments,
+                )
+            )
+        else:
+            self._last_terminal_outcome = self.turn_transactions.abort_attempt(
+                logical_thread_id=self.transaction_authority_id,
+                transaction_id=attempt.transaction_id,
+                physical_thread_id=attempt.physical_thread_id,
+                diagnostic_hash=diagnostic_hash,
+                failure_category=_failure_category(exc),
+            )
+        return self._last_terminal_outcome
+
+    def _recover_interrupted_attempts(self) -> None:
+        """Close attempts left by a process that no longer owns the lease."""
+
+        for attempt in self.turn_transactions.list_attempts(
+            self.transaction_authority_id
+        ):
+            if attempt.status != "active":
+                continue
+            reconcile, checkpoint_id, checkpoint_fingerprint = (
+                self._attempt_effect_evidence(attempt)
+            )
+            diagnostic_hash = _canonical_hash({
+                "type": "InterruptedTurnAttempt",
+                "stage": "runtime_restart_recovery",
+            })
+            if reconcile:
+                checkpoint_arguments = (
+                    {
+                        "attempt_checkpoint_id": checkpoint_id,
+                        "attempt_fingerprint": checkpoint_fingerprint,
+                    }
+                    if checkpoint_id and checkpoint_fingerprint
+                    else {}
+                )
+                self._last_terminal_outcome = (
+                    self.turn_transactions.require_reconciliation(
+                        logical_thread_id=self.transaction_authority_id,
+                        transaction_id=attempt.transaction_id,
+                        physical_thread_id=attempt.physical_thread_id,
+                        diagnostic_hash=diagnostic_hash,
+                        failure_category="runtime_restart_interrupted",
+                        **checkpoint_arguments,
+                    )
+                )
+            else:
+                self._last_terminal_outcome = self.turn_transactions.abort_attempt(
+                    logical_thread_id=self.transaction_authority_id,
+                    transaction_id=attempt.transaction_id,
+                    physical_thread_id=attempt.physical_thread_id,
+                    diagnostic_hash=diagnostic_hash,
+                    failure_category="runtime_restart_interrupted",
+                )
+
+    def _recover_missing_runtime_observations(self) -> None:
+        """Rebuild committed runtime evidence after a post-commit crash."""
+
+        path = self._runtime_event_path()
+        observed_terminal_events: dict[str, Mapping[str, Any]] = {}
+        runtime_event_ids: set[str] = set()
+        claim_jsonl_authority(
+            path,
+            product_authority_id=self.transaction_authority_id,
+        )
+        records = read_jsonl_records(path) if path.exists() else ()
+        if any(
+            int(payload.get("schema_version") or 0) < 6
+            for payload in records
+        ):
+            self.turn_transactions.requeue_runtime_events_after_legacy_log_quarantine(
+                self.transaction_authority_id
+            )
+            quarantine_jsonl_file(
+                path,
+                reason="legacy-runtime-schema",
+            )
+            records = ()
+        observed_sequences: list[int] = []
+        for payload in records:
+            if int(payload.get("schema_version") or 0) > 6:
+                raise RuntimeError(
+                    "runtime observation schema is newer than this runtime"
+                )
+            if (
+                str(payload.get("product_authority_id") or "")
+                != self.transaction_authority_id
+            ):
+                raise RuntimeError(
+                    "runtime observation belongs to another Product Head authority"
+                )
+            sequence = payload.get("runtime_event_sequence")
+            if not isinstance(sequence, int) or isinstance(sequence, bool):
+                raise RuntimeError(
+                    "runtime observation sequence is invalid"
+                )
+            observed_sequences.append(sequence)
+            runtime_event_id = str(payload.get("runtime_event_id") or "")
+            if not runtime_event_id or runtime_event_id in runtime_event_ids:
+                raise RuntimeError(
+                    "runtime observation identity is missing or duplicated"
+                )
+            runtime_event_ids.add(runtime_event_id)
+            terminal_event_id = str(payload.get("terminal_event_id") or "")
+            if terminal_event_id:
+                if terminal_event_id in observed_terminal_events:
+                    raise RuntimeError(
+                        "runtime observation contains a duplicate terminal event"
+                    )
+                observed_terminal_events[terminal_event_id] = payload
+        if observed_sequences != sorted(observed_sequences):
+            raise RuntimeError(
+                "runtime observations are not ordered by Product Head revision"
+            )
+        committed_outcomes = sorted(
+            (
+                outcome
+                for outcome in self.turn_transactions.list_terminal_outcomes(
+                    self.transaction_authority_id
+                )
+                if outcome.outcome == "committed"
+            ),
+            key=lambda outcome: outcome.runtime_event_sequence,
+        )
+        expected_sequences = list(range(1, len(committed_outcomes) + 1))
+        if [
+            outcome.runtime_event_sequence
+            for outcome in committed_outcomes
+        ] != expected_sequences:
+            raise RuntimeError(
+                "committed runtime-event sequence is not contiguous"
+            )
+        for outcome in committed_outcomes:
+            existing = observed_terminal_events.get(outcome.event_id)
+            if existing is not None:
+                self._validate_runtime_observation_payload(existing, outcome)
+                payload_hash = str(
+                    existing.get("runtime_event_payload_hash") or ""
+                )
+                self.turn_transactions.mark_runtime_event_published(
+                    logical_thread_id=self.transaction_authority_id,
+                    event_id=outcome.event_id,
+                    runtime_event_id=str(existing["runtime_event_id"]),
+                    payload_hash=payload_hash,
+                )
+                continue
+            before = self._checkpoint_state(
+                outcome.base_checkpoint_thread_id,
+                outcome.base_checkpoint_id,
+                outcome.base_fingerprint,
+            )
+            after = self._checkpoint_state(
+                outcome.product_checkpoint_thread_id,
+                outcome.product_checkpoint_id,
+                outcome.product_fingerprint,
+            )
+            self._write_turn_observation(
+                "turn_recovered",
+                before,
+                after,
+                outcome,
+            )
+
+    def _validate_runtime_observation_payload(
+        self,
+        payload: Mapping[str, Any],
+        outcome: TerminalOutcome,
+    ) -> None:
+        expected_revision = {
+            "commit": outcome.origin_revision_commit,
+            "worktree_hash": outcome.origin_revision_worktree_hash,
+        }
+        if (
+            int(payload.get("schema_version") or 0) != 6
+            or str(payload.get("event_type") or "") != "turn_committed"
+            or not str(payload.get("observation") or "")
+            or str(payload.get("terminal_event_id") or "") != outcome.event_id
+            or str(payload.get("transaction_id") or "")
+            != outcome.transaction_id
+            or str(payload.get("terminal_outcome") or "") != outcome.outcome
+            or not str(payload.get("runtime_event_id") or "")
+            or str(payload.get("before_fingerprint") or "")
+            != outcome.base_fingerprint
+            or str(payload.get("after_fingerprint") or "")
+            != outcome.product_fingerprint
+            or not isinstance(payload.get("base_revision"), int)
+            or int(payload["base_revision"]) != outcome.base_revision
+            or str(payload.get("base_checkpoint_thread_id") or "")
+            != outcome.base_checkpoint_thread_id
+            or str(payload.get("base_checkpoint_id") or "")
+            != outcome.base_checkpoint_id
+            or not isinstance(payload.get("product_revision"), int)
+            or int(payload["product_revision"]) != outcome.product_revision
+            or str(payload.get("product_checkpoint_thread_id") or "")
+            != outcome.product_checkpoint_thread_id
+            or str(payload.get("product_checkpoint_id") or "")
+            != outcome.product_checkpoint_id
+            or str(payload.get("render_hash") or "") != outcome.render_hash
+            or dict(payload.get("revision") or {}) != expected_revision
+            or str(payload.get("thread_id") or "") != self.thread_id
+            or str(payload.get("session_purpose") or "")
+            != self.session_purpose
+            or str(payload.get("product_authority_id") or "")
+            != self.transaction_authority_id
+            or str(payload.get("physical_thread_id") or "")
+            != outcome.physical_thread_id
+            or str(payload.get("attempt_checkpoint_id") or "")
+            != str(outcome.attempt_checkpoint_id or "")
+        ):
+            raise RuntimeError(
+                "runtime observation does not match committed terminal facts"
+            )
+        runtime_event_id = str(payload.get("runtime_event_id") or "")
+        if outcome.runtime_event_id and runtime_event_id != outcome.runtime_event_id:
+            raise RuntimeError(
+                "runtime observation does not match its reserved event identity"
+            )
+        unsigned = dict(payload)
+        payload_hash = str(unsigned.pop("runtime_event_payload_hash", "") or "")
+        if not payload_hash or _canonical_hash(unsigned) != payload_hash:
+            raise RuntimeError("runtime observation payload hash is invalid")
+        if (
+            outcome.runtime_event_status == "published"
+            and outcome.runtime_event_payload_hash != payload_hash
+        ):
+            raise RuntimeError(
+                "runtime observation differs from its published receipt"
+            )
+
+    def _checkpoint_state(
+        self,
+        checkpoint_thread_id: str,
+        checkpoint_id: str,
+        expected_fingerprint: str,
+    ) -> AgentGraphState:
+        snapshot = self.graph.get_state({
+            "configurable": {
+                "thread_id": checkpoint_thread_id,
+                "checkpoint_ns": "",
+                "checkpoint_id": checkpoint_id,
+            }
+        })
+        values = dict(getattr(snapshot, "values", None) or {})
+        if _state_fingerprint(values) != expected_fingerprint:
+            raise RuntimeError(
+                "runtime observation recovery checkpoint fingerprint mismatch"
+            )
+        return values
+
+    def _attempt_effect_evidence(
+        self,
+        attempt: TurnAttempt,
+    ) -> tuple[bool, str, str]:
+        try:
+            snapshot = self.graph.get_state({
+                "configurable": {"thread_id": attempt.physical_thread_id}
+            })
+            values = dict(getattr(snapshot, "values", None) or {})
+            intent = dict(values.get("side_effect_intent") or {})
+            receipt = dict(values.get("side_effect_receipt") or {})
+            checkpoint_id = str(
+                (getattr(snapshot, "config", {}) or {})
+                .get("configurable", {})
+                .get("checkpoint_id", "")
+            )
+            fingerprint = (
+                _state_fingerprint(values)
+                if checkpoint_id and values
+                else ""
+            )
+            return (
+                str(intent.get("status") or "") == "invoking"
+                or bool(receipt),
+                checkpoint_id,
+                fingerprint,
+            )
+        except Exception:
+            return True, "", ""
+
     def _write_turn_observation(
         self,
-        event_type: str,
+        observation: str,
         before: AgentGraphState,
         after: AgentGraphState,
-    ) -> None:
+        outcome: TerminalOutcome | None,
+    ) -> TerminalOutcome:
         """Emit an out-of-band committed-state observation for live Chaos.
 
         The observer is deliberately write-only from the product process. Live
@@ -308,10 +1018,12 @@ class AnyChainGraphRuntime:
         identifiers are emitted; configuration values and evidence are absent.
         """
 
-        destination = str(os.environ.get("ANYCHAIN_AGENT_TURN_EVENT_FILE") or "").strip()
-        if not destination:
-            return
-        path = Path(destination)
+        destination = self._runtime_event_path()
+        if outcome is None or outcome.outcome != "committed":
+            raise RuntimeError(
+                "runtime observation requires its committed terminal outcome"
+            )
+        path = destination
         path.parent.mkdir(parents=True, exist_ok=True)
         admitted_action_types: list[str] = []
         for item in (after.get("turn_context") or {}).get("admitted_actions") or []:
@@ -319,11 +1031,39 @@ class AnyChainGraphRuntime:
             if action_type and action_type not in admitted_action_types:
                 admitted_action_types.append(action_type)
         admitted_action_provenance = _admitted_action_provenance(after)
+        if (
+            _state_fingerprint(before) != outcome.base_fingerprint
+            or _state_fingerprint(after) != outcome.product_fingerprint
+        ):
+            raise RuntimeError(
+                "runtime observation state does not match terminal outcome identity"
+            )
+        runtime_event_id = outcome.runtime_event_id or str(uuid.uuid4())
         payload = {
-            "schema_version": 3,
-            "event_type": event_type,
+            "schema_version": 6,
+            "event_type": "turn_committed",
+            "observation": observation,
+            "runtime_event_id": runtime_event_id,
+            "runtime_event_sequence": outcome.runtime_event_sequence,
+            "terminal_event_id": outcome.event_id,
+            "transaction_id": outcome.transaction_id,
+            "terminal_outcome": outcome.outcome,
+            "render_hash": outcome.render_hash,
+            "base_revision": outcome.base_revision,
+            "base_checkpoint_thread_id": outcome.base_checkpoint_thread_id,
+            "base_checkpoint_id": outcome.base_checkpoint_id,
+            "product_revision": outcome.product_revision,
+            "product_checkpoint_thread_id": (
+                outcome.product_checkpoint_thread_id
+            ),
+            "product_checkpoint_id": outcome.product_checkpoint_id,
             "thread_id": self.thread_id,
             "session_purpose": self.session_purpose,
+            "product_authority_id": self.transaction_authority_id,
+            "physical_thread_id": outcome.physical_thread_id,
+            "attempt_checkpoint_id": str(
+                outcome.attempt_checkpoint_id or ""
+            ),
             "before_fingerprint": _state_fingerprint(before),
             "after_fingerprint": _state_fingerprint(after),
             "turn_index": int(after.get("turn_index") or 0),
@@ -363,8 +1103,20 @@ class AnyChainGraphRuntime:
             "after_value_hashes": _leaf_value_hashes(after),
             "next_result": _next_result(after),
         }
-        with path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        payload["runtime_event_payload_hash"] = _canonical_hash(payload)
+        append_jsonl_record(path, payload)
+        published = self.turn_transactions.mark_runtime_event_published(
+            logical_thread_id=self.transaction_authority_id,
+            event_id=outcome.event_id,
+            runtime_event_id=runtime_event_id,
+            payload_hash=str(payload["runtime_event_payload_hash"]),
+        )
+        if (
+            self._last_terminal_outcome is not None
+            and self._last_terminal_outcome.event_id == outcome.event_id
+        ):
+            self._last_terminal_outcome = published
+        return published
 
 
 def _admitted_action_provenance(state: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -639,6 +1391,18 @@ def _canonical_hash(value: Any) -> str:
         default=str,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _failure_category(exc: BaseException) -> str:
+    if isinstance(exc, LLMTurnCancelledError):
+        return "cancelled"
+    if isinstance(exc, LLMTurnTimeoutError):
+        return "timeout"
+    if isinstance(exc, LLMProviderError):
+        return "provider_failure"
+    if isinstance(exc, StateInvariantError):
+        return "state_invariant_failure"
+    return "unexpected_failure"
 
 
 def _state_fingerprint(state: AgentGraphState) -> str:

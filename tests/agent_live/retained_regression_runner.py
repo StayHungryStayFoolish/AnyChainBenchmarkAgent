@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from agent.harness.runtime_identity import repository_revision
+from agent.utils.redaction import redact
 from tests.agent_live.batch_orchestrator import (
     TimeoutPolicy,
     freeze_batch_manifest,
@@ -41,16 +42,24 @@ from tests.agent_live.completed_journey_batch import (
 )
 from tests.agent_live.dynamic_dual_ai_chaos import (
     ChaosRunConfig,
+    CompletionExpectation,
     JsonlRuntimeEventStream,
+    JsonlTerminalOutcomeStream,
     JourneyDecisionProvenance,
     JourneyPostconditionResult,
     JourneyPostconditionVerifierDefinition,
     JourneyVerifierContext,
+    TerminalCompletionError,
+    WorkflowCompletion,
     _runtime_event_from_mapping,
-    _provider_model_from_startup,
+    _startup_resume_submission,
     build_journey_outcome_verifier_registry,
     validate_journey_evidence_artifact,
+    validate_startup_session_event,
+    validate_startup_terminal_protocol,
     transport_for_config,
+    wait_for_turn_completion,
+    write_terminal_completion_diagnostic,
 )
 from tests.agent_live.product_obligation_evidence import (
     PRODUCT_OBLIGATION_EVIDENCE_SCHEMA_VERSION,
@@ -1011,6 +1020,7 @@ def execute_exact_retained_regression(
     session_id = execution_id
     checkpoint_path = runtime_root / "checkpoints.sqlite"
     event_path = runtime_root / "turn-events.jsonl"
+    terminal_outcome_path = runtime_root / "terminal-outcomes.jsonl"
     try:
         container_runtime = (
             Path("/workspace") / runtime_root.relative_to(root)
@@ -1061,53 +1071,144 @@ def execute_exact_retained_regression(
         "ANYCHAIN_AGENT_TURN_EVENT_FILE": str(
             container_runtime / "turn-events.jsonl"
         ),
+        "ANYCHAIN_AGENT_TERMINAL_OUTCOME_FILE": str(
+            container_runtime / "terminal-outcomes.jsonl"
+        ),
     })
     transport = transport_for_config(config)
     event_stream = JsonlRuntimeEventStream(event_path)
+    terminal_outcome_stream = JsonlTerminalOutcomeStream(
+        terminal_outcome_path,
+        poll_interval_seconds=config.poll_interval_seconds,
+    )
     observed_turns: list[PtyCliTurnRecord] = []
     observed_events: list[RuntimeTurnEvent] = []
     transcript_lines: list[str] = []
     started_at = str(time.time_ns())
+    initial_event: RuntimeTurnEvent | None = None
+    active_user_message = ""
+    terminal_outcome_stream.mark_process_start()
+    event_stream.mark_process_start()
     transport.start(env=env)
     try:
         previous_response = transport.read_complete_agent_response(
             timeout_seconds=timeout_seconds
         )
         previous_received_at_ns = time.time_ns()
-        provider, model = _provider_model_from_startup(previous_response)
-        initial_event = event_stream.baseline()
+        startup_session = validate_startup_session_event(
+            terminal_outcome_stream,
+            expected_revision=active_revision,
+            expected_provider=config.provider,
+            expected_model=config.model,
+            expected_session_id=session_id,
+            expected_session_purpose="retained-regression-exact",
+            startup_response=previous_response,
+        )
+        provider = startup_session.provider
+        model = startup_session.model
+        runtime_history, startup_events = event_stream.capture_startup_snapshot()
+        combined_events = (*runtime_history, *startup_events)
+        if not combined_events:
+            raise RuntimeError("retained regression requires a baseline runtime event")
+        for historical_event in runtime_history:
+            validate_runtime_turn_event(historical_event)
+        initial_event = combined_events[-1]
+        startup_outcomes, startup_detours = (
+            terminal_outcome_stream.capture_startup_snapshot()
+        )
+        validate_startup_terminal_protocol(
+            startup_events,
+            startup_outcomes,
+            expected_revision=active_revision,
+            session_event=startup_session,
+            detours=startup_detours,
+            baseline_event=initial_event,
+        )
         validate_runtime_turn_event(initial_event)
         if dict(initial_event.revision) != active_revision:
             raise RuntimeError(
                 "exact retained-regression startup revision is stale"
             )
         transcript_lines.append(previous_response)
-        if initial_event.pending_question_id == "resume_harness_session":
-            transport.submit_bracketed_paste("1")
-            previous_response = transport.read_complete_agent_response(
-                timeout_seconds=timeout_seconds
+        resume_submission = _startup_resume_submission(
+            initial_event.pending_contract,
+            desired="continue",
+        )
+        if resume_submission:
+            active_user_message = resume_submission
+            transport.submit_bracketed_paste(resume_submission)
+            resume_completion = wait_for_turn_completion(
+                transport,
+                event_stream,
+                terminal_outcome_stream,
+                timeout_seconds=timeout_seconds,
+                expectation=CompletionExpectation(
+                    submitted_input=resume_submission,
+                    session_id=session_id,
+                    session_purpose=config.session_purpose,
+                    product_authority_id=startup_session.product_authority_id,
+                    process_instance_id=startup_session.process_instance_id,
+                    product_revision=int(initial_event.product_revision),
+                    product_checkpoint_thread_id=(
+                        initial_event.product_checkpoint_thread_id
+                    ),
+                    product_checkpoint_id=initial_event.product_checkpoint_id,
+                    product_fingerprint=initial_event.after_fingerprint,
+                ),
             )
-            initial_event = event_stream.next_event(
-                timeout_seconds=timeout_seconds
-            )
+            if not isinstance(resume_completion, WorkflowCompletion):
+                raise RuntimeError(
+                    "retained resume did not produce a workflow completion"
+                )
+            previous_response = resume_completion.response
+            initial_event = resume_completion.event
             validate_runtime_turn_event(initial_event)
+            if dict(resume_completion.terminal_outcome.revision) != active_revision:
+                raise RuntimeError(
+                    "exact retained-regression resume terminal revision is stale"
+                )
             previous_received_at_ns = time.time_ns()
-            transcript_lines.extend(("User> 1", previous_response))
+            transcript_lines.extend((
+                f"User> {resume_submission}",
+                previous_response,
+            ))
+            active_user_message = ""
 
         baseline = initial_event
         for user_message in turns_to_submit:
             submitted_at_ns = time.time_ns()
+            active_user_message = user_message
             transport.submit_bracketed_paste(user_message)
-            committed = event_stream.next_event(
-                timeout_seconds=timeout_seconds
+            completion = wait_for_turn_completion(
+                transport,
+                event_stream,
+                terminal_outcome_stream,
+                timeout_seconds=timeout_seconds,
+                expectation=CompletionExpectation(
+                    submitted_input=user_message,
+                    session_id=session_id,
+                    session_purpose=config.session_purpose,
+                    product_authority_id=startup_session.product_authority_id,
+                    process_instance_id=startup_session.process_instance_id,
+                    product_revision=int(baseline.product_revision),
+                    product_checkpoint_thread_id=(
+                        baseline.product_checkpoint_thread_id
+                    ),
+                    product_checkpoint_id=baseline.product_checkpoint_id,
+                    product_fingerprint=baseline.after_fingerprint,
+                ),
             )
-            response = transport.read_complete_agent_response(
-                timeout_seconds=timeout_seconds
-            )
+            if not isinstance(completion, WorkflowCompletion):
+                raise RuntimeError(
+                    "retained turn did not produce a workflow completion"
+                )
+            committed = completion.event
+            response = completion.response
             response_received_at_ns = time.time_ns()
             validate_runtime_turn_event(committed)
             if (
-                dict(committed.revision) != active_revision
+                dict(completion.terminal_outcome.origin_revision) != active_revision
+                or dict(committed.revision) != active_revision
                 or committed.before_fingerprint
                 != baseline.after_fingerprint
                 or committed.turn_index != baseline.turn_index + 1
@@ -1142,8 +1243,36 @@ def execute_exact_retained_regression(
             previous_response = response
             previous_received_at_ns = response_received_at_ns
             baseline = committed
+            active_user_message = ""
+    except TerminalCompletionError as exc:
+        transcript_lines.append(f"User> {active_user_message}")
+        failed_output = exc.response or (
+            str(exc.response_error)
+            if exc.response_error is not None
+            else ""
+        )
+        if failed_output:
+            transcript_lines.append(failed_output)
+        write_terminal_completion_diagnostic(
+            exc,
+            runtime_root / "diagnostics",
+            session_id=session_id,
+            revision=active_revision,
+            user_message=active_user_message,
+            last_complete_event=observed_events[-1] if observed_events else initial_event,
+        )
+        raise
     finally:
-        transport.close()
+        try:
+            transport.close()
+        finally:
+            (runtime_root / "transcript.txt").write_text(
+                str(redact("\n".join(transcript_lines).rstrip() + "\n")),
+                encoding="utf-8",
+            )
+
+    if initial_event is None:
+        raise RuntimeError("exact retained-regression did not observe a startup event")
 
     artifact_paths = _write_exact_retained_artifacts(
         runtime_root=runtime_root,
@@ -1175,10 +1304,6 @@ def execute_exact_retained_regression(
     evidence_path.write_text(
         json.dumps(evidence, ensure_ascii=False, indent=2, sort_keys=True)
         + "\n",
-        encoding="utf-8",
-    )
-    (runtime_root / "transcript.txt").write_text(
-        "\n".join(transcript_lines).rstrip() + "\n",
         encoding="utf-8",
     )
     return evidence_path

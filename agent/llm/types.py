@@ -11,6 +11,7 @@ from typing import Any, Callable, Iterator, Literal, ParamSpec, Protocol, TypeVa
 
 
 MessageRole = Literal["system", "user", "assistant", "tool"]
+ReasoningMode = Literal["provider_default", "disabled"]
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
@@ -159,6 +160,7 @@ class LLMRequest:
     max_tokens: int = 4096
     tools: list[dict[str, Any]] = field(default_factory=list)
     response_schema: dict[str, Any] | None = None
+    reasoning_mode: ReasoningMode = "provider_default"
 
 
 @dataclass(frozen=True)
