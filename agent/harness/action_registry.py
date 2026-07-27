@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Mapping
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 from agent.knowledge.chain_identity import canonical_chain_aliases, repo_chain_names
 
@@ -1063,6 +1063,7 @@ def lifecycle_rejected_action_indexes(
             and spec.provides_capabilities
             and bool(str(action.get("source_evidence") or "").strip())
             and action.get("selection_contract_verified") is not True
+            and not replacement_intake_admission_verified(action)
             and all(
                 capability in projected_capabilities
                 for capability in spec.provides_capabilities
@@ -1120,6 +1121,7 @@ ACTION_METADATA_FIELDS = frozenset({"type", "confidence", "reason", "action_id"}
 TRUSTED_ACTION_METADATA_FIELDS = frozenset({
     "selection_contract_verified",
     "semantic_purpose_verified",
+    "_replacement_intake_receipt",
     "pending_option_semantic_verified",
     "chain_selection_semantic_verified",
     "target_mode_semantic_verified",
@@ -1481,6 +1483,127 @@ def build_admission_transaction_hash(
         "actions": canonical_actions,
         "semantic_units": canonical_units,
     })
+
+
+def build_replacement_intake_admission_receipt(
+    *,
+    thread_id: str,
+    session_id: str,
+    submitted_turn_index: int,
+    transaction_hash: str,
+    admission_action_id: str,
+    action_type: str,
+    source_evidence: str,
+    target_group: str,
+    provides_capabilities: Sequence[str],
+    reviewer_evidence_hash: str,
+) -> dict[str, Any]:
+    """Mint one reviewed authorization to reopen a completed typed intake."""
+
+    payload = {
+        "version": SEMANTIC_ADMISSION_RECEIPT_VERSION,
+        "action_type": str(action_type or "").strip(),
+        "thread_id": str(thread_id or "").strip(),
+        "session_id": str(session_id or "").strip(),
+        "submitted_turn_index": int(submitted_turn_index),
+        "transaction_hash": str(transaction_hash or "").strip(),
+        "admission_action_id": str(admission_action_id or "").strip(),
+        "target_group": str(target_group or "").strip(),
+        "provides_capabilities": sorted(
+            str(value).strip()
+            for value in provides_capabilities
+            if str(value).strip()
+        ),
+        "source_hash": hashlib.sha256(
+            str(source_evidence or "").strip().encode("utf-8")
+        ).hexdigest(),
+        "reviewer_evidence_hash": str(reviewer_evidence_hash or "").strip(),
+        "action_contract_hash": action_registry_contract_hash(),
+        "admission_contract_hash": admission_contract_hash(),
+    }
+    if not all(
+        str(payload[key] or "").strip()
+        for key in (
+            "action_type",
+            "thread_id",
+            "session_id",
+            "transaction_hash",
+            "admission_action_id",
+            "target_group",
+            "reviewer_evidence_hash",
+        )
+    ) or not payload["provides_capabilities"]:
+        raise ValueError("replacement intake admission receipt is incomplete")
+    return {**payload, "receipt_id": _content_hash(payload)}
+
+
+def validate_replacement_intake_admission_receipt(
+    action: Mapping[str, Any],
+    *,
+    thread_id: str | None = None,
+    session_id: str | None = None,
+    submitted_turn_index: int | None = None,
+) -> None:
+    """Validate a reviewed replacement authorization against its action."""
+
+    receipt = action.get("_replacement_intake_receipt")
+    if not isinstance(receipt, Mapping):
+        raise ValueError("replacement intake requires an admission receipt")
+    spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
+    if (
+        spec is None
+        or not spec.incomplete_mutation_intake
+        or not spec.provides_capabilities
+    ):
+        raise ValueError("replacement intake receipt belongs to an invalid action")
+    expected = build_replacement_intake_admission_receipt(
+        thread_id=str(receipt.get("thread_id") or ""),
+        session_id=str(receipt.get("session_id") or ""),
+        submitted_turn_index=int(receipt.get("submitted_turn_index") or 0),
+        transaction_hash=str(receipt.get("transaction_hash") or ""),
+        admission_action_id=str(receipt.get("admission_action_id") or ""),
+        action_type=str(action.get("type") or ""),
+        source_evidence=str(action.get("source_evidence") or ""),
+        target_group=str(spec.target_group or ""),
+        provides_capabilities=spec.provides_capabilities,
+        reviewer_evidence_hash=str(
+            receipt.get("reviewer_evidence_hash") or ""
+        ),
+    )
+    if dict(receipt) != expected:
+        raise ValueError("replacement intake admission receipt does not match the action")
+    if str(action.get("_plan_transaction_hash") or "") != str(
+        receipt.get("transaction_hash") or ""
+    ):
+        raise ValueError("replacement intake receipt transaction mismatch")
+    if str(action.get("_admission_action_id") or "") != str(
+        receipt.get("admission_action_id") or ""
+    ):
+        raise ValueError("replacement intake receipt action identity mismatch")
+    if thread_id is not None and str(receipt.get("thread_id") or "") != str(
+        thread_id
+    ):
+        raise ValueError("replacement intake receipt thread mismatch")
+    if session_id is not None and str(receipt.get("session_id") or "") != str(
+        session_id
+    ):
+        raise ValueError("replacement intake receipt session mismatch")
+    if (
+        submitted_turn_index is not None
+        and int(receipt.get("submitted_turn_index") or 0)
+        != int(submitted_turn_index)
+    ):
+        raise ValueError("replacement intake receipt belongs to another turn")
+
+
+def replacement_intake_admission_verified(action: Mapping[str, Any]) -> bool:
+    """Return whether one action carries a self-consistent trusted receipt."""
+
+    try:
+        validate_replacement_intake_admission_receipt(action)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def build_field_intake_admission_receipt(

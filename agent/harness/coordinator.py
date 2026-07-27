@@ -131,6 +131,7 @@ from agent.workflows.group_registry import (
 ALLOWED_GROUPS = frozenset(USER_NAVIGABLE_GROUPS)
 _ADMISSION_METADATA_KEYS = (
     "_semantic_admission_receipt",
+    "_replacement_intake_receipt",
     "_proposal_field_receipts",
     "_proposal_transaction_hashes",
     "_admission_action_id",
@@ -1556,7 +1557,25 @@ def select_action_step(state: AgentGraphState) -> AgentGraphState:
     else:
         queued_envelope = dict(queue[0])
     envelope = action_envelope_from_dict(queued_envelope)
-    action = _action_from_envelope(queued_envelope)
+    action = _queue_action(queued_envelope)
+    try:
+        _validate_admission_transaction(
+            state,
+            [action],
+            current_submission=False,
+        )
+    except (StateInvariantError, TypeError, ValueError) as exc:
+        state["action_queue"] = queue[1:]
+        state.setdefault("action_errors", []).append({
+            "action": action,
+            "error": "durable_admission_metadata_invalid",
+            "detail": str(exc),
+        })
+        return _set_turn_phase(
+            state,
+            "execute",
+            "durable_admission_metadata_rejected",
+        )
     target_group = resolve_action_target_group(action)
     prerequisite = next(
         (
@@ -1761,10 +1780,7 @@ def _is_serialized_action_envelope(payload: Mapping[str, Any]) -> bool:
 def _queue_action(payload: Mapping[str, Any]) -> dict[str, Any]:
     if not _is_serialized_action_envelope(payload):
         raise StateInvariantError("durable action queue contains a raw proposal")
-    envelope = action_envelope_from_dict(payload)
-    action = _action_from_envelope(payload)
-    action["_origin_text"] = envelope.origin_text
-    return action
+    return _admission_action_from_envelope(payload)
 
 
 def _serialize_admitted_actions(

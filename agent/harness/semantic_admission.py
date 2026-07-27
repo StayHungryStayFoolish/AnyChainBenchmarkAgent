@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 from ..llm.types import ReasoningMode
 from .action_registry import (
+    ACTION_ARGUMENT_SCHEMAS,
     ACTION_BY_TYPE,
     ACTION_SPECS,
     CONSULTATION_TOPIC_PURPOSES,
@@ -17,6 +18,7 @@ from .action_registry import (
     build_admission_transaction_hash,
     build_field_intake_admission_receipt,
     build_proposal_field_receipt,
+    build_replacement_intake_admission_receipt,
     canonical_consultation_topic,
     normalize_current_action_envelope,
     resolve_action_target_group,
@@ -24,6 +26,7 @@ from .action_registry import (
     semantic_grounding_arguments,
     semantic_scope_accepts_action,
     semantic_scope_schema,
+    state_has_capability,
     validate_action_contract,
     validate_action_transaction_contract,
 )
@@ -46,6 +49,7 @@ from .questions import (
 )
 from .semantic_compiler import (
     ImmutableSemanticPlan,
+    STRICT_JSON_REASONING_MODE,
     WholePlanAdmission,
     freeze_semantic_plan,
     request_whole_plan_admission,
@@ -64,6 +68,7 @@ _ADMISSION_RECEIPT_KEYS = frozenset({
     "consultation_admissions",
     "group_navigation_admissions",
     "field_reconfiguration_admissions",
+    "replacement_intake_admissions",
     "admission_rejections",
     "admission_action_ids",
 })
@@ -452,7 +457,7 @@ def _review_bounded_semantic_candidate(
     allowed_action_types: frozenset[str] | None = None,
     whole_plan_contract_repair: bool = False,
     compact_pending_review: bool = False,
-    reasoning_mode: ReasoningMode = "provider_default",
+    reasoning_mode: ReasoningMode = STRICT_JSON_REASONING_MODE,
 ) -> tuple[ImmutableSemanticPlan | None, WholePlanAdmission | None, tuple[str, ...]]:
     if not validation.valid:
         return None, None, tuple(validation.errors)
@@ -604,6 +609,17 @@ def _freeze_bounded_semantic_plan(
             "required_value_grounding_arguments": list(
                 semantic_grounding_arguments(action)
             ),
+            "closed_enum_grounding_values": {
+                argument: list(
+                    (ACTION_ARGUMENT_SCHEMAS.get(argument) or {}).get("enum")
+                    or []
+                )
+                for argument in semantic_grounding_arguments(action)
+                if isinstance(
+                    (ACTION_ARGUMENT_SCHEMAS.get(argument) or {}).get("enum"),
+                    list,
+                )
+            },
             "exact_source_value_arguments": list(spec.exact_source_value_arguments),
             "pending_value_candidates": pending_value_candidates,
             "turn_pending_value_candidates": action_turn_candidates,
@@ -814,6 +830,7 @@ def _admitted_action_queue(
     consultation_indexes: list[int] = []
     navigation_rows: list[dict[str, Any]] = []
     field_rows: list[dict[str, Any]] = []
+    replacement_rows: list[dict[str, Any]] = []
     action_ids = list(plan.action_ids)
     pending_choice_contracts = [
         dict(row)
@@ -855,6 +872,20 @@ def _admitted_action_queue(
             chain_indexes.append(index)
         if action_type in {"choose_target_mode", "queue_workflow_goal"}:
             target_indexes.append(index)
+        spec = ACTION_BY_TYPE.get(action_type)
+        if (
+            spec is not None
+            and spec.incomplete_mutation_intake
+            and spec.provides_capabilities
+            and all(
+                state_has_capability(state, capability)
+                for capability in spec.provides_capabilities
+            )
+        ):
+            replacement_rows.append({
+                "action_index": index,
+                "reviewer_evidence_hash": _content_hash(row),
+            })
         if action_type == "answer_opening_question":
             consultation_indexes.append(index)
         if action_type == "change_group":
@@ -903,6 +934,7 @@ def _admitted_action_queue(
         "consultation_admissions": consultation_indexes,
         "group_navigation_admissions": navigation_rows,
         "field_reconfiguration_admissions": field_rows,
+        "replacement_intake_admissions": replacement_rows,
     })
     admitted = _attach_semantic_admission_receipts(
         json.dumps(payload, ensure_ascii=False, sort_keys=True),
@@ -1331,6 +1363,22 @@ def _semantic_action_purpose(
         )
     if action_type == "answer_pending" and state:
         return "Supply a source-grounded answer that actually satisfies the active typed pending contract."
+    action_spec = ACTION_BY_TYPE.get(action_type)
+    if (
+        action_spec is not None
+        and action_spec.incomplete_mutation_intake
+        and action_spec.provides_capabilities
+        and state
+        and all(
+            state_has_capability(state, capability)
+            for capability in action_spec.provides_capabilities
+        )
+    ):
+        return (
+            f"Reopen {action_spec.target_group!r} typed intake only because the "
+            "source explicitly requests replacing the already confirmed value "
+            "but supplies no concrete replacement."
+        )
     if action_type == "change_group":
         target_group = str(action.get("group") or "").strip()
         entry_purposes = [
@@ -1602,6 +1650,7 @@ def _semantic_operation_arguments(action: dict[str, Any]) -> dict[str, Any]:
         "chain_selection_semantic_verified",
         "target_mode_semantic_verified",
         "semantic_purpose_verified",
+        "_replacement_intake_receipt",
         "group_navigation_semantic_verified",
     }
     return {
@@ -1700,6 +1749,17 @@ def _attach_semantic_admission_receipts(
         _valid_group_navigation_admissions(payload, actions)
     )
     field_admissions = _valid_field_reconfiguration_admissions(payload, actions)
+    replacement_admissions = {
+        int(row["action_index"]): str(
+            row.get("reviewer_evidence_hash") or ""
+        )
+        for row in payload.pop("replacement_intake_admissions", [])
+        if isinstance(row, Mapping)
+        and isinstance(row.get("action_index"), int)
+        and not isinstance(row.get("action_index"), bool)
+        and 0 <= int(row["action_index"]) < len(actions)
+        and str(row.get("reviewer_evidence_hash") or "")
+    }
     payload.pop("consultation_admissions", None)
     payload.pop("group_navigation_admissions", None)
     payload.pop("field_reconfiguration_admissions", None)
@@ -1727,6 +1787,24 @@ def _attach_semantic_admission_receipts(
             action["_plan_transaction_hash"] = transaction_hash
         if isinstance(action, dict) and _requires_semantic_fulfillment_review(action):
             action["semantic_purpose_verified"] = True
+            spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
+            if spec is not None and index in replacement_admissions:
+                action["_replacement_intake_receipt"] = (
+                    build_replacement_intake_admission_receipt(
+                        thread_id=thread_id,
+                        session_id=session_id,
+                        submitted_turn_index=submitted_turn_index,
+                        transaction_hash=transaction_hash,
+                        admission_action_id=admission_action_ids[index],
+                        action_type=str(action.get("type") or ""),
+                        source_evidence=str(
+                            action.get("source_evidence") or ""
+                        ),
+                        target_group=str(spec.target_group or ""),
+                        provides_capabilities=spec.provides_capabilities,
+                        reviewer_evidence_hash=replacement_admissions[index],
+                    )
+                )
         if isinstance(action, dict) and index in pending_admissions:
             action["pending_option_semantic_verified"] = True
         if isinstance(action, dict) and index in chain_admissions:
@@ -1866,6 +1944,7 @@ def _semantic_fulfillment_prompt(*, review_kind: str = "both") -> str:
         "semantically and explicitly support the declared purpose and its supplied arguments. Workflow state "
         "and a pending question are context, never user evidence. For unit_reviews, ignore pending_question entirely: "
         "an explicit mutation or navigation may interrupt the old question, and the coordinator alone decides interruption, invalidation, and resume behavior. "
+        "For a closed-enum argument, rejecting or excluding one value while multiple legal values remain does not select any one remaining value. Reject a purpose that supplies a specific remaining value from that evidence; a registered typed intake must collect the unresolved selection. "
         "For an action-purpose review with several source_units, return every exact source_units string once in source_unit_reviews. Mark at least one as direct. Mark another as support only when its exact support_relation appears in the supplied allowed_support_relations; otherwise the action is unsupported. Direct rows use an empty support_relation. A support unit may not hide an independent selection, mutation, consultation, contradiction, concrete value owned by another operation, or evidence demand. For a single source unit, source_unit_reviews may be empty. In particular, structured partial configuration directly supports a configuration-proposal purpose, and a same-turn instruction to ask for remaining required values after review is processing scope only when that relation is declared by the operation contract. "
         "Pending-question context is present only when a pending-answer purpose itself is being reviewed. A question asking to "
         "summarize, explain, compare, or report retained state is read-only and cannot support "

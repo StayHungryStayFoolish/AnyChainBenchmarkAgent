@@ -924,6 +924,296 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
         ))
         self.assertFalse(observed)
 
+        confirmation = "Y"
+        confirmation_contract = _verifier_input(
+            "exact",
+            (confirmation,),
+            semantic_roles=("confirmation",),
+        )
+        confirmation_turn, _ = _turn_and_decision(confirmation)
+        confirmation_receipt = _pending_receipt(
+            pending_id="CLOUD_REGION",
+            pending_group="provider_deployment",
+            resolution_path="typed_manual_value",
+            selected_option_id="",
+            selected_value_hash="3" * 64,
+            resolved_action_id=action_id,
+            input_hash=hashlib.sha256(
+                confirmation.encode("utf-8")
+            ).hexdigest(),
+            normalizer="declared_value_type",
+        )
+        confirmation_event = _event(
+            confirmation_receipt,
+            pending_transition=transition,
+            turn_receipt={"admitted_action_ids": [action_id]},
+        )
+        observed, details = POSTCONDITION_EVALUATORS[
+            "environment_text_consumed_as_region"
+        ](_context(
+            confirmation_event,
+            turns=(confirmation_turn,),
+            verifier_input_contract=confirmation_contract,
+        ))
+        self.assertFalse(observed, details)
+
+        request = "change chain and mode"
+        request_turn, _ = _turn_and_decision(request, turn_index=1)
+        confirmation_turn, _ = _turn_and_decision(
+            confirmation,
+            turn_index=2,
+        )
+        paired_contract = _verifier_input(
+            "exact",
+            (request, confirmation),
+            semantic_roles=(
+                "chain_mode_change_request",
+                "confirmation",
+            ),
+        )
+        paired_receipt = _pending_receipt(
+            turn_index=2,
+            pending_id="CLOUD_REGION",
+            pending_group="provider_deployment",
+            resolution_path="typed_manual_value",
+            selected_option_id="",
+            selected_value_hash="3" * 64,
+            resolved_action_id=action_id,
+            input_hash=hashlib.sha256(
+                confirmation.encode("utf-8")
+            ).hexdigest(),
+            normalizer="declared_value_type",
+        )
+        paired_event = _event(
+            paired_receipt,
+            turn_index=2,
+            pending_transition=transition,
+            turn_receipt={"admitted_action_ids": [action_id]},
+        )
+        observed, details = POSTCONDITION_EVALUATORS[
+            "environment_text_consumed_as_region"
+        ](_context(
+            paired_event,
+            turns=(request_turn, confirmation_turn),
+            verifier_input_contract=paired_contract,
+        ))
+        self.assertTrue(observed, details)
+
+    def test_chain_mode_change_requires_compound_transaction_evidence(
+        self,
+    ) -> None:
+        messages = (
+            "change chain",
+            "Y",
+            "change chain and mode",
+            "Y",
+        )
+        contract = _verifier_input(
+            "exact",
+            messages,
+            semantic_roles=(
+                "chain_change_request",
+                "confirmation",
+                "chain_mode_change_request",
+                "confirmation",
+            ),
+        )
+        turns = tuple(
+            _turn_and_decision(message, turn_index=index + 2)[0]
+            for index, message in enumerate(messages, start=1)
+        )
+        prior_chain_change = _event(
+            turn_index=4,
+            material_diffs={
+                "chain_identity.canonical": {
+                    "before": "1" * 64,
+                    "after": "2" * 64,
+                },
+            },
+        )
+        compound = _event(
+            turn_index=5,
+            admitted_actions=(
+                {
+                    "type": "change_chain",
+                    "action_id": "chain-action",
+                    "owner": "chain_rpc",
+                },
+                {
+                    "type": "request_target_mode_selection",
+                    "action_id": "mode-action",
+                    "owner": "chain_rpc",
+                },
+            ),
+        )
+        confirmation = _event(
+            _domain_commit(
+                turn_index=6,
+                action_id="chain-action",
+                paths=("chain_identity.change_candidate.canonical",),
+            ),
+            turn_index=6,
+            pending_transition={
+                "transition": "replaced",
+                "before_id": "chain_change_confirm",
+                "before_group": "chain_identity",
+                "before_hash": "3" * 64,
+                "after_id": "target_mode_select",
+                "after_group": "target_mode",
+                "after_hash": "4" * 64,
+                "consumer_action_ids": ["chain-action", "mode-action"],
+            },
+            material_diffs={
+                "chain_identity.canonical": {
+                    "before": "2" * 64,
+                    "after": "5" * 64,
+                },
+            },
+        )
+        predicate = POSTCONDITION_EVALUATORS[
+            "chain_mode_change_confirmed"
+        ]
+
+        satisfied, details = predicate(_context(
+            prior_chain_change,
+            compound,
+            confirmation,
+            turns=turns,
+            verifier_input_contract=contract,
+        ))
+        self.assertTrue(satisfied, details)
+
+        satisfied, details = predicate(_context(
+            prior_chain_change,
+            replace(compound, admitted_action_provenance=()),
+            confirmation,
+            turns=turns,
+            verifier_input_contract=contract,
+        ))
+        self.assertFalse(satisfied, details)
+
+        mode_only_confirmation = _event(
+            _domain_commit(
+                turn_index=6,
+                action_id="mode-action",
+                paths=("target_mode",),
+            ),
+            turn_index=6,
+        )
+        satisfied, details = predicate(_context(
+            prior_chain_change,
+            compound,
+            mode_only_confirmation,
+            turns=turns,
+            verifier_input_contract=contract,
+        ))
+        self.assertFalse(satisfied, details)
+
+        chain_only_confirmation = _event(
+            _domain_commit(
+                turn_index=6,
+                action_id="chain-action",
+                paths=("chain_identity.canonical",),
+            ),
+            turn_index=6,
+        )
+        satisfied, details = predicate(_context(
+            prior_chain_change,
+            compound,
+            chain_only_confirmation,
+            turns=turns,
+            verifier_input_contract=contract,
+        ))
+        self.assertFalse(satisfied, details)
+
+        premature_direct_commits = _event(
+            _domain_commit(
+                turn_index=5,
+                action_id="chain-action",
+                paths=("chain_identity.canonical",),
+            ),
+            _domain_commit(
+                turn_index=5,
+                action_id="mode-action",
+                paths=("target_mode",),
+            ),
+            turn_index=5,
+            admitted_actions=compound.admitted_action_provenance,
+        )
+        satisfied, details = predicate(_context(
+            prior_chain_change,
+            premature_direct_commits,
+            turns=turns,
+            verifier_input_contract=contract,
+        ))
+        self.assertFalse(satisfied, details)
+
+        wrong_mode_lineage = replace(
+            confirmation,
+            pending_transition={
+                **confirmation.pending_transition,
+                "consumer_action_ids": [
+                    "chain-action",
+                    "unrelated-mode-action",
+                ],
+            },
+        )
+        satisfied, details = predicate(_context(
+            prior_chain_change,
+            compound,
+            wrong_mode_lineage,
+            turns=turns,
+            verifier_input_contract=contract,
+        ))
+        self.assertFalse(satisfied, details)
+
+        compound_with_mode_transition = _event(
+            turn_index=5,
+            admitted_actions=compound.admitted_action_provenance,
+            pending_transition={
+                "transition": "replaced",
+                "before_id": "CLOUD_REGION",
+                "before_group": "provider_deployment",
+                "before_hash": "3" * 64,
+                "after_id": "target_mode_change_confirm",
+                "after_group": "target_mode",
+                "after_hash": "4" * 64,
+                "consumer_action_ids": [
+                    "chain-action",
+                    "mode-action",
+                ],
+            },
+        )
+        staged_chain_and_mode = _event(
+            _domain_commit(
+                turn_index=6,
+                action_id="chain-action",
+                paths=("chain_identity.change_candidate.canonical",),
+            ),
+            turn_index=6,
+            pending_transition={
+                "transition": "replaced",
+                "before_id": "target_mode_change_confirm",
+                "before_group": "target_mode",
+                "before_hash": "3" * 64,
+                "after_id": "chain_change_confirm",
+                "after_group": "chain_identity",
+                "after_hash": "4" * 64,
+                "consumer_action_ids": [
+                    "mode-action",
+                    "chain-action",
+                ],
+            },
+        )
+        satisfied, details = predicate(_context(
+            prior_chain_change,
+            compound_with_mode_transition,
+            staged_chain_and_mode,
+            turns=turns,
+            verifier_input_contract=contract,
+        ))
+        self.assertTrue(satisfied, details)
+
     def test_pending_evaluator_accepts_valid_receipt_and_rejects_rehashed_bad_semantics(
         self,
     ) -> None:

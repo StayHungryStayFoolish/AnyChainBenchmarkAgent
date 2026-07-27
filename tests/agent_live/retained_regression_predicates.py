@@ -402,6 +402,18 @@ def _environment_text_consumed_as_region(context: Any) -> PredicateResult:
         int(getattr(event, "turn_index", -1)): event
         for event in _events(context)
     }
+    interruption_turns = {
+        turn_index
+        for turn_index, roles in roles_by_turn.items()
+        if roles & _ENVIRONMENT_INTERRUPT_ROLES
+    }
+    interruption_turns.update(
+        turn_index
+        for turn_index, roles in roles_by_turn.items()
+        if "confirmation" in roles
+        and roles_by_turn.get(turn_index - 1, set())
+        & _ENVIRONMENT_INTERRUPT_ROLES
+    )
     violations: list[dict[str, Any]] = []
     for item in valid:
         receipt = item["receipt"]
@@ -425,8 +437,7 @@ def _environment_text_consumed_as_region(context: Any) -> PredicateResult:
             receipt.get("pending_id") == "CLOUD_REGION"
             and receipt.get("verdict") == "accepted"
             and receipt.get("input_hash") == input_hash
-            and roles_by_turn.get(turn_index, set())
-            & _ENVIRONMENT_INTERRUPT_ROLES
+            and turn_index in interruption_turns
             and action_id in admitted_ids
             and transition is not None
             and action_id in set(transition["consumer_action_ids"])
@@ -1102,22 +1113,133 @@ def _unknown_chain_silently_configured(context: Any) -> PredicateResult:
 
 def _chain_mode_change_confirmed(context: Any) -> PredicateResult:
     deltas, invalid = _material_delta_records(context)
+    roles_by_turn, invalid_attestations, role_error = _semantic_roles_by_turn(
+        context
+    )
+    events_by_turn = {
+        int(getattr(event, "turn_index", -1)): event
+        for event in _events(context)
+    }
     by_turn: dict[int, set[str]] = defaultdict(set)
     for item in deltas:
-        root = _path_root(item["path"])
-        if root in {"chain_identity", "target_mode", "workflow_mode"}:
-            by_turn[int(item["turn_index"])].add(root)
+        path = str(item["path"])
+        if path == "chain_identity.canonical":
+            by_turn[int(item["turn_index"])].add("chain_identity")
+        elif path in {"target_mode", "workflow_mode"}:
+            by_turn[int(item["turn_index"])].add(path)
     confirmed = {
         turn: sorted(roots)
         for turn, roots in by_turn.items()
         if "chain_identity" in roots
         or {"target_mode", "workflow_mode"} & roots
     }
-    return bool(confirmed) and not invalid, _receipt_details(
+    compound_requests: list[dict[str, Any]] = []
+    for event in _events(context):
+        turn_index = int(getattr(event, "turn_index", -1))
+        if "chain_mode_change_request" not in roles_by_turn.get(
+            turn_index, set()
+        ):
+            continue
+        provenance = [
+            action
+            for action in tuple(
+                getattr(event, "admitted_action_provenance", ()) or ()
+            )
+            if isinstance(action, Mapping)
+            and str(action.get("action_id") or "")
+            and str(action.get("owner") or "") == "chain_rpc"
+        ]
+        chain_actions = {
+            str(action["action_id"]): str(action["type"])
+            for action in provenance
+            if str(action.get("type") or "") in {
+                "change_chain",
+                "choose_chain",
+            }
+        }
+        mode_actions = {
+            str(action["action_id"]): str(action["type"])
+            for action in provenance
+            if str(action.get("type") or "") in {
+                "choose_target_mode",
+                "request_target_mode_selection",
+            }
+        }
+        if chain_actions and mode_actions:
+            compound_requests.append({
+                "turn_index": turn_index,
+                "chain_action_ids": sorted(chain_actions),
+                "chain_actions": sorted(chain_actions.values()),
+                "mode_action_ids": sorted(mode_actions),
+                "mode_actions": sorted(mode_actions.values()),
+            })
+    commit_records = [
+        item
+        for item in deltas
+        if item["receipt"].get("completion") != "rejected"
+    ]
+    mode_progress_turns: set[int] = set()
+    chain_progress_turns: set[int] = set()
+    completed_compound_turns: set[int] = set()
+    for request in compound_requests:
+        compound_turn = int(request["turn_index"])
+        chain_ids = set(request["chain_action_ids"])
+        mode_ids = set(request["mode_action_ids"])
+        staged_chain_turns = {
+            int(item["turn_index"])
+            for item in commit_records
+            if int(item["turn_index"]) >= compound_turn
+            and chain_ids.intersection(
+                str(value)
+                for value in item["receipt"].get("consumed_action_ids") or ()
+            )
+            and str(item["path"])
+            == "chain_identity.change_candidate.canonical"
+        }
+        mode_turns: set[int] = set()
+        for turn_index, event in events_by_turn.items():
+            if turn_index < compound_turn:
+                continue
+            transition = _valid_pending_transition(event)
+            if (
+                transition is not None
+                and transition["after_group"] == "target_mode"
+                and transition["after_id"]
+                and mode_ids.intersection(
+                    str(value)
+                    for value in transition["consumer_action_ids"]
+                )
+            ):
+                mode_turns.add(turn_index)
+        chain_progress_turns.update(staged_chain_turns)
+        mode_progress_turns.update(mode_turns)
+        if staged_chain_turns and mode_turns:
+            completed_compound_turns.add(compound_turn)
+    correlated_changes = {
+        turn: roots
+        for turn, roots in confirmed.items()
+        if any(
+            turn >= int(request["turn_index"])
+            for request in compound_requests
+        )
+    }
+    complete = (
+        bool(completed_compound_turns)
+        and not invalid
+        and not invalid_attestations
+        and not role_error
+    )
+    return complete, _receipt_details(
         "registry_invalidation",
         deltas,
         invalid,
-        changed_roots_by_turn=confirmed,
+        changed_roots_by_turn=correlated_changes,
+        compound_requests=compound_requests,
+        chain_progress_turns=sorted(chain_progress_turns),
+        mode_progress_turns=sorted(mode_progress_turns),
+        completed_compound_turns=sorted(completed_compound_turns),
+        invalid_attestations=invalid_attestations,
+        role_error=role_error,
     )
 
 

@@ -19,6 +19,35 @@ from .input_values import parse_weight_spec
 from .semantic_policy import PENDING_CANDIDATE_SEMANTIC_POLICY
 
 
+STRICT_JSON_REASONING_MODE: ReasoningMode = "disabled"
+
+
+def closed_enum_quote_names_only_competing_values(
+    *,
+    exact_value: Any,
+    enum_values: Sequence[Any],
+    quote: str,
+) -> bool:
+    """Reject evidence that names competitors but not the selected enum value."""
+
+    selected = str(exact_value or "").strip()
+    values = [
+        str(value).strip()
+        for value in enum_values
+        if str(value).strip()
+    ]
+    named_values = {
+        value
+        for value in values
+        if re.search(
+            rf"(?<!\w){re.escape(value)}(?!\w)",
+            quote,
+            flags=re.IGNORECASE,
+        )
+    }
+    return bool(selected and named_values and selected not in named_values)
+
+
 _ADMISSION_TOP_LEVEL_KEYS = frozenset({
     "plan_hash",
     "action_verdicts",
@@ -244,7 +273,7 @@ def request_semantic_compilation_result(
     system_prompt: str,
     request_payload: Mapping[str, Any],
     max_tokens: int = 3600,
-    reasoning_mode: ReasoningMode = "provider_default",
+    reasoning_mode: ReasoningMode = STRICT_JSON_REASONING_MODE,
 ) -> SemanticCompilationResult:
     """Run one bounded call and retain its provider/model response identity."""
 
@@ -281,7 +310,7 @@ def request_semantic_compilation(
     system_prompt: str,
     request_payload: Mapping[str, Any],
     max_tokens: int = 3600,
-    reasoning_mode: ReasoningMode = "provider_default",
+    reasoning_mode: ReasoningMode = STRICT_JSON_REASONING_MODE,
 ) -> str:
     """Run one call and leave malformed output to the caller's bounded repair."""
 
@@ -372,7 +401,7 @@ def whole_plan_admission_prompt(semantic_policy: str) -> str:
         "Each action_verdict is {action_id,verdict:'admit'|'reject',unit_ids:[string],evidence:[{unit_id,quote,relation:'direct'|'support',support_relation:string}],grounded_arguments:[{argument_name:string,evidence_quote:string}],pending_answer_argument:string,turn_candidate_verdicts:[{candidate_id:string,verdict:'selected'|'not_selected',evidence_quote:string,reason:string}],reason}. "
         "A pending option may be selected by its number, id, canonical value, label, or a clear natural-language semantic equivalent. Do not require the source to repeat an option number or full label when it directly names the declared value or meaning. "
         "unit_ids must exactly equal that action's supplied immutable unit_ids. An admitted action needs one evidence row for every unit_id, every quote must be a non-empty exact substring of that unit, at least one relation must be direct, and a support row may use only one supplied allowed_support_relation. Direct rows use an empty support_relation. "
-        "grounded_arguments must contain exactly one row for every supplied required_value_grounding_argument and no other row. argument_name is the exact required_value_grounding_argument name copied verbatim, never an explanation or value. Its evidence_quote must be a non-empty exact substring of one owned source unit that semantically selects the exact immutable operation_arguments value. Merely naming the argument or dimension, asking to change it without selecting a value, stating a generic benchmark goal, or relying on workflow state does not ground a concrete value. Natural-language equivalents may ground a value only when they unambiguously select that exact value. Actions with no required value-grounding arguments return an empty list. "
+        "grounded_arguments must contain exactly one row for every supplied required_value_grounding_argument and no other row. argument_name is the exact required_value_grounding_argument name copied verbatim, never an explanation or value. Its evidence_quote must be the shortest non-empty exact affirmative substring of one owned source unit that semantically selects the exact immutable operation_arguments value; exclude contrast text and rejected alternatives from the quote. Merely naming the argument or dimension, asking to change it without selecting a value, stating a generic benchmark goal, or relying on workflow state does not ground a concrete value. Natural-language equivalents may ground a value only when they unambiguously select that exact value. Rejecting or excluding one value in a closed enum with multiple remaining values does not select any one remaining value; reject that concrete selection so the registered typed intake can ask the user. Actions with no required value-grounding arguments return an empty list. "
         "pending_answer_argument is an opaque manual-candidate id, never an answer value, option id, option label, number, or paraphrase. Declared options are reviewed through the immutable action and pending_choice_contracts; they do not use pending_answer_argument. If an action record supplies an empty pending_value_candidates list, pending_answer_argument must be exactly the empty string even when that action selects a declared option. Only when the supplied active pending question allows manual input and exactly one supplied pending_value_candidate semantically answers that question, set pending_answer_argument to that candidate's exact candidate_id copied verbatim. Each action record also supplies turn_pending_value_candidates scoped to source units owned by that action. For every action with non-empty pending_value_candidates return exactly one turn_candidate_verdict for every supplied turn candidate in supplied order; actions with no pending_value_candidates return an empty list. Each evidence_quote must be a non-empty exact substring of one candidate source unit. For a parser-derived literal it contains the literal; for a semantically normalized number, map, or enum it must be the exact phrase that selects that canonical value. Each reason must explain the source role rather than repeat the verdict. Exactly one row may be selected, and it must have the same contract-owned identity as the immutable operation value selected by pending_answer_argument; every other row is not_selected. Evaluate the selected operation against the complete scoped set, not only its operation argument. When two or more candidates exist, admit one only when the source explicitly distinguishes it as selected and distinguishes every other value as rejected, old, example-only, or otherwise not selected. A comparison, conjunction, disjunction, slash-separated list, or bare sequence is unresolved and must reject the pending answer rather than arbitrarily labeling one selected. A syntax-compatible value for an unrelated interruption is not an answer. A candidate mentioned only as an example, quotation, rejected option, negated operation, correction target, or value the user says not to apply is not an answer. Never invent a candidate id or rewrite the action. "
         "Each unit_verdict is {unit_id,verdict:'complete'|'support'|'context'|'unresolved'|'omitted',owner_action_ids:[string],evidence_quote:string,omitted_action_type:string,reason}. "
         "owner_action_ids must exactly equal the supplied immutable owner_action_ids. complete is valid only when the unit directly expresses a present demand preserved by every registered owner action. support is valid only when the unit does not independently request another action, every owner action cites it with relation=support and a supplied allowed_support_relation, and each owner action has direct evidence in another unit. A supplied immutable disposition=context has no owner and must receive verdict=context when it contains no independent omitted demand, or verdict=omitted when it does; never reinterpret it as complete or support and never invent an owner. context is invalid for any other supplied disposition. unresolved means the request is genuinely unsafe or not expressible. omitted means the unit contains a present independently actionable demand expressible by one action_schema type but missing from the immutable actions; set omitted_action_type to that exact registered type. Never propose its arguments or a replacement action. For every other verdict omitted_action_type is empty. Every evidence_quote is a non-empty exact substring of that unit. "
@@ -395,7 +424,7 @@ def request_whole_plan_admission(
     allowed_action_types: Collection[str],
     max_tokens: int = 7200,
     contract_repair: bool = False,
-    reasoning_mode: ReasoningMode = "provider_default",
+    reasoning_mode: ReasoningMode = STRICT_JSON_REASONING_MODE,
 ) -> WholePlanAdmission:
     """Run one immutable review with one bounded structural-contract repair."""
 
@@ -573,6 +602,11 @@ def validate_whole_plan_admission(
             if isinstance(record.get("operation_arguments"), Mapping)
             else {}
         )
+        closed_enum_values = (
+            record.get("closed_enum_grounding_values")
+            if isinstance(record.get("closed_enum_grounding_values"), Mapping)
+            else {}
+        )
         grounding_counts: dict[str, int] = {}
         owned_sources = [
             str((unit_records.get(unit_id) or {}).get("source_text") or "")
@@ -597,6 +631,15 @@ def validate_whole_plan_admission(
                 errors.append(
                     f"whole-plan exact grounded argument quote does not contain its immutable value: "
                     f"{action_id}/{argument}"
+                )
+            if closed_enum_quote_names_only_competing_values(
+                exact_value=exact_value,
+                enum_values=closed_enum_values.get(argument) or [],
+                quote=quote,
+            ):
+                errors.append(
+                    "whole-plan closed-enum grounding quote names only "
+                    f"competing values: {action_id}/{argument}"
                 )
         if [str(item.get("argument_name") or "") for item in grounding_rows if isinstance(item, dict)] != expected_grounding:
             errors.append(f"whole-plan grounded argument order or cardinality mismatch: {action_id}")

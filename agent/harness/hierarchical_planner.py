@@ -21,11 +21,13 @@ from ..llm.types import (
     LLMTurnTimeoutError,
 )
 from .action_registry import (
+    ACTION_ARGUMENT_SCHEMAS,
     ACTION_BY_TYPE,
     ACTION_SPECS,
     SEMANTIC_OPERATIONS,
     pending_barrier_semantics,
     registered_semantic_value_domains,
+    semantic_grounding_arguments,
     semantic_value_domain_conflicts,
     validate_action_contract,
 )
@@ -50,6 +52,8 @@ from .questions import (
     typed_pending_value_candidates,
 )
 from .semantic_compiler import (
+    STRICT_JSON_REASONING_MODE,
+    closed_enum_quote_names_only_competing_values,
     request_semantic_compilation,
     whole_plan_admission_prompt,
 )
@@ -167,6 +171,7 @@ def begin_semantic_partition(
                 system_prompt=request_prompt,
                 request_payload=request_payload,
                 max_tokens=2600,
+                reasoning_mode=STRICT_JSON_REASONING_MODE,
             )
             partition, partition_errors = _validate_partition_document(
                 previous_output,
@@ -393,11 +398,7 @@ def review_semantic_plan(
             routed_partition
         ),
         whole_plan_contract_repair=True,
-        reasoning_mode=(
-            "disabled"
-            if output.get("planner_kind") == "bounded_semantic_value"
-            else "provider_default"
-        ),
+        reasoning_mode=STRICT_JSON_REASONING_MODE,
     )
     admission_calls = (
         int(getattr(admission, "request_count", 1))
@@ -415,6 +416,63 @@ def review_semantic_plan(
             )
             + len(plan.request_json.encode("utf-8"))
         )
+    if (
+        plan is not None
+        and admission is not None
+        and not admission.valid
+    ):
+        repaired_candidate = _conservative_closed_enum_intake_repair(
+            candidate,
+            plan,
+            admission,
+        )
+        if repaired_candidate is not None:
+            repaired_text, repaired_validation = prepare_hierarchical_candidate(
+                json.dumps(
+                    repaired_candidate,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                state,
+                clauses,
+                pending_choice_unit_ids=frozenset(
+                    str(unit["unit_id"])
+                    for unit in source_partition
+                    if str(unit.get("operation") or "") == "pending_answer"
+                ),
+            )
+            if repaired_validation.valid:
+                repaired_plan, repaired_admission, repaired_errors = (
+                    _review_bounded_semantic_candidate(
+                        provider,
+                        repaired_text,
+                        repaired_validation,
+                        state,
+                        clauses,
+                        allowed_action_types=_allowed_action_types_for_partition(
+                            routed_partition
+                        ),
+                        whole_plan_contract_repair=True,
+                        reasoning_mode=STRICT_JSON_REASONING_MODE,
+                    )
+                )
+                if repaired_admission is not None:
+                    admission_calls += int(
+                        getattr(repaired_admission, "request_count", 1)
+                    )
+                    request_sizes.extend(
+                        tuple(
+                            getattr(
+                                repaired_admission,
+                                "request_sizes",
+                                (),
+                            )
+                            or ()
+                        )
+                    )
+                plan = repaired_plan
+                admission = repaired_admission
+                admission_errors = repaired_errors
     result = (
         _admitted_action_queue(plan, admission, state)
         if admission is not None and admission.valid and plan is not None
@@ -430,6 +488,92 @@ def review_semantic_plan(
         owner_count=owner_count,
         unit_count=unit_count,
     )
+
+
+def _conservative_closed_enum_intake_repair(
+    candidate: Mapping[str, Any],
+    plan: Any,
+    admission: Any,
+) -> dict[str, Any] | None:
+    """Replace rejected enum guesses with one registry-owned typed intake.
+
+    Stage A already established that the source is a domain request. The
+    independent admission reviewer may still reject Stage B's concrete enum
+    selection. When the registry exposes exactly one intake for that same
+    group, asking the user is the only lossless projection.
+    """
+
+    payload = json.loads(
+        json.dumps(candidate, ensure_ascii=False, sort_keys=True)
+    )
+    actions = payload.get("actions")
+    units = payload.get("semantic_units")
+    if not isinstance(actions, list) or not isinstance(units, list):
+        return None
+    action_ids = tuple(getattr(plan, "action_ids", ()) or ())
+    verdicts = {
+        str(row.get("action_id") or ""): row
+        for row in tuple(getattr(admission, "action_verdicts", ()) or ())
+        if isinstance(row, Mapping)
+    }
+    changed = False
+    for index, raw_action in enumerate(actions):
+        if not isinstance(raw_action, Mapping) or index >= len(action_ids):
+            continue
+        verdict = verdicts.get(str(action_ids[index]) or "")
+        if (
+            not isinstance(verdict, Mapping)
+            or str(verdict.get("verdict") or "") == "admit"
+        ):
+            continue
+        action = dict(raw_action)
+        spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
+        if spec is None or not spec.target_group:
+            continue
+        closed_enum_arguments = [
+            argument
+            for argument in semantic_grounding_arguments(action)
+            if isinstance(
+                (ACTION_ARGUMENT_SCHEMAS.get(argument) or {}).get("enum"),
+                list,
+            )
+            and action.get(argument) not in {"", None}
+        ]
+        if not closed_enum_arguments:
+            continue
+        intake_specs = [
+            candidate_spec
+            for candidate_spec in ACTION_SPECS
+            if candidate_spec.incomplete_mutation_intake
+            and candidate_spec.target_group == spec.target_group
+            and set(candidate_spec.required_arguments).issubset(
+                {"source_evidence"}
+            )
+        ]
+        if len(intake_specs) != 1:
+            continue
+        owned_units = [
+            unit
+            for unit in units
+            if isinstance(unit, Mapping)
+            and str(unit.get("disposition") or "") == "action"
+            and index in tuple(unit.get("action_indexes") or ())
+            and str(unit.get("source_text") or "").strip()
+        ]
+        if len(owned_units) != 1:
+            continue
+        replacement = {
+            "type": intake_specs[0].action_type,
+            "source_evidence": str(
+                owned_units[0].get("source_text") or ""
+            ).strip(),
+        }
+        try:
+            actions[index] = validate_action_contract(replacement)
+        except ValueError:
+            continue
+        changed = True
+    return payload if changed else None
 
 
 def _turn_clauses(
@@ -1048,6 +1192,7 @@ def _review_stage_a_partition(
             system_prompt=request_prompt,
             request_payload=request_payload,
             max_tokens=2200,
+            reasoning_mode=STRICT_JSON_REASONING_MODE,
         )
         contract_errors, semantic_errors, redundant_unit_ids = (
             _validate_stage_a_admission_document(
@@ -1319,7 +1464,9 @@ def _stage_b_prompt(owner: str) -> str:
         "the binding and semantic unit and is not an action argument. Follow owner_action_schema "
         "exactly: never add an undeclared argument, and emit source_evidence only when that action "
         "declares it. Any emitted source_evidence must be one exact substring of a supplied semantic "
-        "unit, never a paraphrase. Configuration values remain proposals until the owning workflow "
+        "unit, never a paraphrase. For a concrete closed-enum selection, use the shortest exact "
+        "affirmative source span that semantically selects that value; exclude contrast text and "
+        "rejected alternatives from source_evidence. Configuration values remain proposals until the owning workflow "
         "validates and confirms them. Do not copy a value from owner_state "
         "unless the source unit explicitly supplies or confirms it. Do not add inferred "
         "identity, existence, protocol, canonical-name, or evidence-summary arguments to a "
@@ -1327,7 +1474,14 @@ def _stage_b_prompt(owner: str) -> str:
         "explanations are read-only actions. A concrete request owned by another group has "
         "no valid action in this owner schema: mark that binding unresolved so Stage A can be "
         "corrected, rather than coercing it into a superficially similar action. Ambiguous or "
-        "incomplete demands remain unresolved instead of being guessed. "
+        "incomplete demands remain unresolved instead of being guessed, except when the unit "
+        "is an explicit initial-selection or replacement demand for its routed group and "
+        "owner_action_schema declares an action for that same target_group with "
+        "incomplete_mutation_intake=true. In that case emit that registered typed intake "
+        "action instead of guessing a concrete value or marking the unit unresolved. This "
+        "includes closed enums where the source rejects one value but leaves multiple legal "
+        "values: exclusion is not a concrete selection, so use the registered intake to ask "
+        "the user. Never synthesize an intake that is absent from owner_action_schema. "
         "When a semantic unit has operation=pending_answer, compare its complete exact source "
         "meaning with owner_state.pending_question and every declared option. If exactly one "
         "option is semantically selected, emit the coordinator-owned answer_pending action with "
@@ -1500,6 +1654,11 @@ def _compile_owner_document(
         for unit in partition
         if str(unit["unit_id"]) in unit_ids
     }
+    expected_sources = {
+        str(unit["unit_id"]): str(unit.get("source_text") or "")
+        for unit in partition
+        if str(unit["unit_id"]) in unit_ids
+    }
     request_sizes: list[int] = []
     response = ""
     document: dict[str, Any] = {}
@@ -1509,11 +1668,14 @@ def _compile_owner_document(
         request_prompt = prompt
         if attempt:
             request_prompt = (
-                f"{prompt} This is a bounded structural-contract repair. Preserve "
-                "the semantic selections and unresolved dispositions from the prior "
-                "document. Correct only the reported JSON, action-schema, ownership, "
-                "route, or binding-contract violations. Do not turn an unresolved "
-                "binding into an action merely because a repair was requested."
+                f"{prompt} This is a bounded contract repair. Preserve every source "
+                "demand, but do not preserve a concrete semantic value that the "
+                "validator reports as ungrounded. For a reported closed-enum grounding "
+                "violation, remove the guessed concrete selection and use the registered "
+                "incomplete_mutation_intake for the same routed group when one exists. "
+                "Correct only the reported JSON, action-schema, ownership, route, "
+                "grounding, or binding-contract violations. Do not turn an otherwise "
+                "unresolved binding into an action merely because repair was requested."
             )
             request_payload = {
                 **payload,
@@ -1528,6 +1690,7 @@ def _compile_owner_document(
             system_prompt=request_prompt,
             request_payload=request_payload,
             max_tokens=3200,
+            reasoning_mode=STRICT_JSON_REASONING_MODE,
         )
         document, errors = _validate_owner_document(
             response,
@@ -1535,6 +1698,7 @@ def _compile_owner_document(
             unit_ids,
             expected_groups=expected_groups,
             expected_operations=expected_operations,
+            expected_sources=expected_sources,
             pending_question=dict(state.get("pending_question") or {}),
         )
         if not errors:
@@ -1549,6 +1713,7 @@ def _validate_owner_document(
     *,
     expected_groups: Mapping[str, frozenset[str]] | None = None,
     expected_operations: Mapping[str, str] | None = None,
+    expected_sources: Mapping[str, str] | None = None,
     pending_question: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], tuple[str, ...]]:
     try:
@@ -1637,6 +1802,23 @@ def _validate_owner_document(
                     f"Stage B {owner} action {spec.action_type} is outside "
                     f"unit route {unit_id}/{operation}/{sorted(groups)}"
                 )
+            source = str((expected_sources or {}).get(unit_id) or "")
+            evidence = str(normalized_action.get("source_evidence") or "")
+            quote = evidence if evidence and evidence in source else source
+            for argument in semantic_grounding_arguments(normalized_action):
+                argument_schema = ACTION_ARGUMENT_SCHEMAS.get(argument) or {}
+                enum_values = argument_schema.get("enum")
+                if not isinstance(enum_values, list):
+                    continue
+                if closed_enum_quote_names_only_competing_values(
+                    exact_value=normalized_action.get(argument),
+                    enum_values=enum_values,
+                    quote=quote,
+                ):
+                    errors.append(
+                        "Stage B closed-enum grounding quote names only "
+                        f"competing values: {unit_id}/{spec.action_type}/{argument}"
+                    )
     if seen_units != list(unit_ids):
         errors.append(f"Stage B {owner} binding order or cardinality mismatch")
     return {

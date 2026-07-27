@@ -11,6 +11,7 @@ from .action_registry import (
     validate_action_contract,
     validate_action_transaction_contract,
     validate_field_intake_admission_receipt,
+    validate_replacement_intake_admission_receipt,
     validate_proposal_field_receipts,
 )
 from .contracts import AdmissionRejection, AdmissionResult
@@ -405,6 +406,15 @@ def _validate_admission_transaction(
             raise StateInvariantError("admission transaction action order mismatch")
     for action in actions:
         action_type = str(action.get("type") or "")
+        if "_replacement_intake_receipt" in action:
+            validate_replacement_intake_admission_receipt(
+                action,
+                thread_id=thread_id,
+                session_id=session_id,
+                submitted_turn_index=turn_index
+                if current_submission
+                else None,
+            )
         if action_type == "request_config_field_input":
             validate_field_intake_admission_receipt(
                 action,

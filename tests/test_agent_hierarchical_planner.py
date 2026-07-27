@@ -197,6 +197,10 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "compile_owner")
         self.assertEqual(result["stage_a_calls"], 2)
+        self.assertTrue(all(
+            call.kwargs["reasoning_mode"] == "disabled"
+            for call in compiler.call_args_list
+        ))
         self.assertEqual(
             result["owner_requests"],
             [{
@@ -2160,6 +2164,10 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(errors, ())
         self.assertEqual(len(sizes), 2)
         self.assertEqual(compiler.call_count, 2)
+        self.assertTrue(all(
+            call.kwargs["reasoning_mode"] == "disabled"
+            for call in compiler.call_args_list
+        ))
         repair_payload = compiler.call_args_list[1].kwargs["request_payload"]
         self.assertIn("contract_repair", repair_payload)
 
@@ -2694,6 +2702,10 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         )
         self.assertEqual(len(sizes), 2)
         self.assertEqual(compiler.call_count, 2)
+        self.assertTrue(all(
+            call.kwargs["reasoning_mode"] == "disabled"
+            for call in compiler.call_args_list
+        ))
         repair_payload = compiler.call_args_list[1].kwargs["request_payload"]
         self.assertIn("contract_repair", repair_payload)
         self.assertIn(
@@ -2843,6 +2855,278 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(document["actions"], [])
         self.assertEqual(len(sizes), 1)
         self.assertEqual(compiler.call_count, 1)
+
+    def test_stage_b_uses_registered_intake_for_incomplete_closed_enum_replacement(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _compile_owner_document
+        from agent.harness.state import new_state
+
+        state = new_state("stage-b-closed-enum-intake", language="en")
+        state["target_mode"] = "fake-node"
+        state["workflow_mode"] = "rpc_benchmark"
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": "Change the target mode; do not keep alpha.",
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "chain_rpc",
+                "group": "target_mode",
+            }],
+            "reason": "explicit replacement without one selected remaining value",
+        }]
+        compiled = {
+            "actions": [{
+                "type": "request_target_mode_selection",
+                "source_evidence": "Change the target mode; do not keep alpha.",
+            }],
+            "bindings": [{
+                "unit_id": "unit-1",
+                "action_indexes": [0],
+                "disposition": "action",
+                "reason": "registered typed intake owns the incomplete replacement",
+            }],
+            "reason": "compiled without guessing a closed-enum value",
+        }
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                return_value=json.dumps(compiled),
+            ) as compiler,
+        ):
+            document, errors, sizes = _compile_owner_document(
+                state,
+                "chain_rpc",
+                frozenset({"target_mode"}),
+                partition,
+                ("unit-1",),
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(document["actions"], compiled["actions"])
+        self.assertEqual(len(sizes), 1)
+        request = compiler.call_args.kwargs
+        self.assertIn(
+            "incomplete_mutation_intake=true",
+            request["system_prompt"],
+        )
+        schema = request["request_payload"]["owner_action_schema"]
+        intake = next(
+            row
+            for row in schema
+            if row["type"] == "request_target_mode_selection"
+        )
+        self.assertTrue(intake["incomplete_mutation_intake"])
+        self.assertEqual(intake["target_group"], "target_mode")
+
+    def test_stage_b_repairs_closed_enum_guess_to_registered_intake(self) -> None:
+        from agent.harness.hierarchical_planner import _compile_owner_document
+        from agent.harness.state import new_state
+
+        state = new_state("stage-b-closed-enum-repair", language="en")
+        state["target_mode"] = "fake-node"
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": "Do not use fake-node.",
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "chain_rpc",
+                "group": "target_mode",
+            }],
+            "reason": "rejects one value without selecting a remaining value",
+        }]
+        guessed = {
+            "actions": [{
+                "type": "choose_target_mode",
+                "target_mode": "real-node",
+                "target_mode_explicit": True,
+                "source_evidence": "fake-node",
+            }],
+            "bindings": [{
+                "unit_id": "unit-1",
+                "action_indexes": [0],
+                "disposition": "action",
+                "reason": "guessed a remaining value",
+            }],
+            "reason": "invalid guess",
+        }
+        repaired = {
+            "actions": [{
+                "type": "request_target_mode_selection",
+                "source_evidence": "Do not use fake-node.",
+            }],
+            "bindings": [{
+                "unit_id": "unit-1",
+                "action_indexes": [0],
+                "disposition": "action",
+                "reason": "registered intake preserves the unresolved choice",
+            }],
+            "reason": "repaired without selecting a value",
+        }
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                side_effect=[json.dumps(guessed), json.dumps(repaired)],
+            ) as compiler,
+        ):
+            document, errors, sizes = _compile_owner_document(
+                state,
+                "chain_rpc",
+                frozenset({"target_mode"}),
+                partition,
+                ("unit-1",),
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(document["actions"], repaired["actions"])
+        self.assertEqual(len(sizes), 2)
+        repair_errors = compiler.call_args_list[1].kwargs["request_payload"][
+            "contract_repair"
+        ]["validator_errors"]
+        self.assertTrue(any(
+            "closed-enum grounding quote names only competing values" in error
+            for error in repair_errors
+        ))
+
+    def test_stage_b_accepts_minimal_natural_language_enum_grounding(self) -> None:
+        from agent.harness.hierarchical_planner import _validate_owner_document
+
+        document = {
+            "actions": [{
+                "type": "choose_target_mode",
+                "target_mode": "real-node",
+                "target_mode_explicit": True,
+                "source_evidence": "真实节点",
+            }],
+            "bindings": [{
+                "unit_id": "unit-1",
+                "action_indexes": [0],
+                "disposition": "action",
+                "reason": "the affirmative span selects the concrete mode",
+            }],
+            "reason": "compiled",
+        }
+
+        payload, errors = _validate_owner_document(
+            json.dumps(document, ensure_ascii=False),
+            "chain_rpc",
+            ("unit-1",),
+            expected_groups={"unit-1": frozenset({"target_mode"})},
+            expected_operations={"unit-1": "domain_request"},
+            expected_sources={
+                "unit-1": "不要 fake-node，改用真实节点",
+            },
+        )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(payload["actions"], document["actions"])
+
+    def test_rejected_closed_enum_selection_repairs_to_registered_intake(
+        self,
+    ) -> None:
+        from types import SimpleNamespace
+
+        from agent.harness.hierarchical_planner import (
+            _conservative_closed_enum_intake_repair,
+        )
+
+        candidate = {
+            "actions": [
+                {
+                    "type": "change_chain",
+                    "chain_text": "eth",
+                    "source_evidence": "eth",
+                },
+                {
+                    "type": "choose_target_mode",
+                    "target_mode": "fake-node",
+                    "target_mode_explicit": True,
+                    "source_evidence": "fake-node",
+                },
+            ],
+            "semantic_units": [
+                {
+                    "unit_id": "unit-1",
+                    "source_text": "我需要换成 eth，",
+                    "disposition": "action",
+                    "action_indexes": [0],
+                },
+                {
+                    "unit_id": "unit-2",
+                    "source_text": "不使用 fake-node 模式",
+                    "disposition": "action",
+                    "action_indexes": [1],
+                },
+            ],
+            "reason": "compiled",
+        }
+        plan = SimpleNamespace(action_ids=("chain-action", "mode-action"))
+        admission = SimpleNamespace(action_verdicts=(
+            {"action_id": "chain-action", "verdict": "admit"},
+            {"action_id": "mode-action", "verdict": "reject"},
+        ))
+
+        repaired = _conservative_closed_enum_intake_repair(
+            candidate,
+            plan,
+            admission,
+        )
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(repaired["actions"][0], candidate["actions"][0])
+        self.assertEqual(
+            repaired["actions"][1],
+            {
+                "type": "request_target_mode_selection",
+                "source_evidence": "不使用 fake-node 模式",
+            },
+        )
+
+    def test_rejected_non_enum_action_does_not_rewrite_to_intake(self) -> None:
+        from types import SimpleNamespace
+
+        from agent.harness.hierarchical_planner import (
+            _conservative_closed_enum_intake_repair,
+        )
+
+        candidate = {
+            "actions": [{
+                "type": "change_chain",
+                "chain_text": "eth",
+                "source_evidence": "eth",
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "source_text": "change to eth",
+                "disposition": "action",
+                "action_indexes": [0],
+            }],
+            "reason": "compiled",
+        }
+        plan = SimpleNamespace(action_ids=("chain-action",))
+        admission = SimpleNamespace(action_verdicts=(
+            {"action_id": "chain-action", "verdict": "reject"},
+        ))
+
+        self.assertIsNone(
+            _conservative_closed_enum_intake_repair(
+                candidate,
+                plan,
+                admission,
+            )
+        )
 
     def test_merge_preserves_semantic_order_across_owners(self) -> None:
         from agent.harness.hierarchical_planner import _merge_owner_documents

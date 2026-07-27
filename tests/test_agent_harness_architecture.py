@@ -316,6 +316,44 @@ def _immutable_admission_fixture() -> tuple[Any, dict[str, Any]]:
 
 
 class BoundedSemanticAdmissionTest(unittest.TestCase):
+    def test_strict_json_compilation_disables_provider_reasoning(self) -> None:
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import (
+            request_semantic_compilation_result,
+            request_whole_plan_admission,
+        )
+
+        compilation_provider = Mock()
+        compilation_provider.complete.return_value = SimpleNamespace(
+            text="{}",
+            provider="deepseek",
+            model="deepseek-v4-pro",
+        )
+        request_semantic_compilation_result(
+            compilation_provider,
+            system_prompt="Return one JSON object.",
+            request_payload={"value": "test"},
+        )
+
+        compilation_request = compilation_provider.complete.call_args.args[0]
+        self.assertEqual(compilation_request.reasoning_mode, "disabled")
+
+        plan, valid = _immutable_admission_fixture()
+        admission_provider = Mock()
+        admission_provider.complete.return_value = SimpleNamespace(
+            text=json.dumps(valid, sort_keys=True),
+        )
+        admission = request_whole_plan_admission(
+            admission_provider,
+            plan,
+            semantic_policy="preserve the immutable plan",
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+
+        self.assertTrue(admission.valid, admission.errors)
+        admission_request = admission_provider.complete.call_args.args[0]
+        self.assertEqual(admission_request.reasoning_mode, "disabled")
+
     def test_admission_prompt_requires_unit_and_action_relation_consistency(self) -> None:
         from agent.harness.semantic_compiler import whole_plan_admission_prompt
 
@@ -323,9 +361,16 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
 
         self.assertIn("one consistency contract", prompt)
         self.assertIn("Never return complete for a support-cited unit", prompt)
+        self.assertIn(
+            "excluding one value in a closed enum with multiple remaining values",
+            prompt,
+        )
 
     def test_typed_option_can_reopen_completed_intake_without_weakening_lifecycle(self) -> None:
-        from agent.harness.action_registry import lifecycle_rejected_action_indexes
+        from agent.harness.action_registry import (
+            build_replacement_intake_admission_receipt,
+            lifecycle_rejected_action_indexes,
+        )
         from agent.harness.state import new_state
 
         state = new_state("typed-replacement-lifecycle", language="en")
@@ -342,6 +387,30 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
             **ungrounded,
             "selection_contract_verified": True,
         }
+        admitted_replacement = {
+            **ungrounded,
+            "semantic_purpose_verified": True,
+            "_admission_action_id": "replacement-action",
+            "_plan_transaction_hash": "1" * 64,
+        }
+        admitted_replacement["_replacement_intake_receipt"] = (
+            build_replacement_intake_admission_receipt(
+                thread_id=state["thread_id"],
+                session_id=state["session"]["id"],
+                submitted_turn_index=state["turn_index"],
+                transaction_hash="1" * 64,
+                admission_action_id="replacement-action",
+                action_type="request_chain_selection",
+                source_evidence="choose a chain",
+                target_group="chain_identity",
+                provides_capabilities=("chain_identity",),
+                reviewer_evidence_hash="2" * 64,
+            )
+        )
+        semantic_only = {
+            **ungrounded,
+            "semantic_purpose_verified": True,
+        }
 
         self.assertEqual(
             lifecycle_rejected_action_indexes(state, [ungrounded]),
@@ -350,6 +419,142 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
         self.assertEqual(
             lifecycle_rejected_action_indexes(state, [declared_option]),
             (),
+        )
+        self.assertEqual(
+            lifecycle_rejected_action_indexes(state, [admitted_replacement]),
+            (),
+        )
+        self.assertEqual(
+            lifecycle_rejected_action_indexes(state, [semantic_only]),
+            (0,),
+        )
+        tampered = {
+            **admitted_replacement,
+            "source_evidence": "unrelated consultation",
+        }
+        self.assertEqual(
+            lifecycle_rejected_action_indexes(state, [tampered]),
+            (0,),
+        )
+
+    def test_admitted_compound_chain_and_mode_replacement_is_atomic(self) -> None:
+        from agent.harness.admission import validate_action_plan
+        from agent.harness.action_registry import (
+            build_replacement_intake_admission_receipt,
+        )
+        from agent.harness.state import new_state
+
+        state = new_state("compound-chain-mode-replacement", language="en")
+        state["target_mode"] = "fake-node"
+        state["chain_identity"] = {
+            "raw": "bsc",
+            "canonical": "bsc",
+            "status": "confirmed",
+            "case": "known",
+        }
+        source = "Switch to ethereum and do not use fake-node."
+        actions = [
+            {
+                "type": "change_chain",
+                "chain_text": "ethereum",
+                "source_evidence": "Switch to ethereum",
+                "semantic_purpose_verified": True,
+            },
+            {
+                "type": "request_target_mode_selection",
+                "source_evidence": "do not use fake-node",
+                "semantic_purpose_verified": True,
+                "_admission_action_id": "mode-action",
+                "_plan_transaction_hash": "3" * 64,
+            },
+        ]
+        actions[1]["_replacement_intake_receipt"] = (
+            build_replacement_intake_admission_receipt(
+                thread_id=state["thread_id"],
+                session_id=state["session"]["id"],
+                submitted_turn_index=state["turn_index"],
+                transaction_hash="3" * 64,
+                admission_action_id="mode-action",
+                action_type="request_target_mode_selection",
+                source_evidence="do not use fake-node",
+                target_group="target_mode",
+                provides_capabilities=("target_mode",),
+                reviewer_evidence_hash="4" * 64,
+            )
+        )
+
+        result = validate_action_plan(state, actions)
+
+        self.assertEqual(result.status, "accepted", result.rejections)
+        self.assertEqual(
+            [action["type"] for action in result.actions],
+            ["change_chain", "request_target_mode_selection"],
+        )
+
+    def test_replacement_intake_receipt_survives_durable_queue_round_trip(
+        self,
+    ) -> None:
+        from agent.harness.action_registry import (
+            build_replacement_intake_admission_receipt,
+            lifecycle_rejected_action_indexes,
+        )
+        from agent.harness.contracts import action_envelope_to_dict
+        from agent.harness.coordinator import _build_action_envelope, _queue_action
+        from agent.harness.state import new_state
+
+        state = new_state("replacement-intake-queue-round-trip", language="en")
+        state["target_mode"] = "fake-node"
+        source = "Do not keep fake-node."
+        action = {
+            "type": "request_target_mode_selection",
+            "action_id": "queued-mode-intake",
+            "source_evidence": source,
+            "_admission_action_id": "admitted-mode-intake",
+            "_plan_transaction_hash": "5" * 64,
+            "_transaction_action_ids": ["admitted-mode-intake"],
+        }
+        action["_replacement_intake_receipt"] = (
+            build_replacement_intake_admission_receipt(
+                thread_id=state["thread_id"],
+                session_id=state["session"]["id"],
+                submitted_turn_index=state["turn_index"],
+                transaction_hash="5" * 64,
+                admission_action_id="admitted-mode-intake",
+                action_type="request_target_mode_selection",
+                source_evidence=source,
+                target_group="target_mode",
+                provides_capabilities=("target_mode",),
+                reviewer_evidence_hash="6" * 64,
+            )
+        )
+
+        durable = action_envelope_to_dict(_build_action_envelope(state, action))
+        restored = _queue_action(durable)
+
+        self.assertEqual(
+            restored["_replacement_intake_receipt"],
+            action["_replacement_intake_receipt"],
+        )
+        self.assertEqual(
+            restored["_plan_transaction_hash"],
+            action["_plan_transaction_hash"],
+        )
+        self.assertEqual(lifecycle_rejected_action_indexes(state, [restored]), ())
+
+        copied = deepcopy(state)
+        copied["thread_id"] = "another-thread"
+        copied["session"] = {
+            **copied["session"],
+            "id": "another-session",
+        }
+        copied["action_queue"] = [durable]
+        from agent.harness.coordinator import select_action_step
+
+        rejected = select_action_step(copied)
+        self.assertEqual(rejected["action_queue"], [])
+        self.assertEqual(
+            rejected["action_errors"][-1]["error"],
+            "durable_admission_metadata_invalid",
         )
 
     def _validate(self, payload: dict[str, Any] | str):
@@ -611,7 +816,15 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
                 "action": action,
                 "unit_ids": ["unit-1"],
                 "allowed_support_relations": [],
+                "operation_arguments": {"target_mode": "fake-node"},
                 "required_value_grounding_arguments": ["target_mode"],
+                "closed_enum_grounding_values": {
+                    "target_mode": [
+                        "fake-node",
+                        "real-node",
+                        "sync-observe",
+                    ],
+                },
             }],
             unit_records=[{
                 "unit_id": "unit-1",
@@ -669,6 +882,69 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
         )
         self.assertFalse(result.valid)
         self.assertIn("grounded argument order or cardinality mismatch", "; ".join(result.errors))
+
+        competing_source = "Do not use fake-node mode."
+        competing_action = {
+            **action,
+            "target_mode": "real-node",
+            "source_evidence": competing_source,
+        }
+        competing_unit = {
+            **unit,
+            "source_text": competing_source,
+        }
+        competing_plan = freeze_semantic_plan(
+            {
+                "actions": [competing_action],
+                "semantic_units": [competing_unit],
+            },
+            action_records=[{
+                "action_id": "action-1",
+                "action_index": 0,
+                "action": competing_action,
+                "unit_ids": ["unit-1"],
+                "allowed_support_relations": [],
+                "operation_arguments": {"target_mode": "real-node"},
+                "required_value_grounding_arguments": ["target_mode"],
+                "closed_enum_grounding_values": {
+                    "target_mode": [
+                        "fake-node",
+                        "real-node",
+                        "sync-observe",
+                    ],
+                },
+            }],
+            unit_records=[{
+                "unit_id": "unit-1",
+                "unit_index": 0,
+                "unit": competing_unit,
+                "source_text": competing_source,
+                "disposition": "action",
+                "owner_action_ids": ["action-1"],
+            }],
+            review_context={"pending_question": {}},
+        )
+        competing_payload = deepcopy(payload)
+        competing_payload["plan_hash"] = competing_plan.plan_hash
+        competing_payload["action_verdicts"][0]["evidence"][0]["quote"] = (
+            competing_source
+        )
+        competing_payload["action_verdicts"][0]["grounded_arguments"][0][
+            "evidence_quote"
+        ] = competing_source
+        competing_payload["unit_verdicts"][0]["evidence_quote"] = (
+            competing_source
+        )
+        result = validate_whole_plan_admission(
+            json.dumps(competing_payload),
+            competing_plan,
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+        self.assertFalse(result.valid)
+        self.assertIn(
+            "closed-enum grounding quote names only competing values",
+            "; ".join(result.errors),
+        )
 
 
 def _rpc_catalog(
