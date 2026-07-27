@@ -37,6 +37,7 @@ from tests.agent_live.batch_orchestrator import (
     _append_discovery_results,
     _classify,
     _scan_batch_execution_ids,
+    _validate_context_frame,
     _validate_result_frame,
     freeze_batch_manifest,
     load_frozen_manifest,
@@ -711,6 +712,78 @@ class BatchOrchestratorTests(unittest.TestCase):
             "seed": seed,
             "schedule_id": schedule.schedule_id,
         })
+
+    def test_journey_context_uses_product_turn_identity_not_decision_ordinal(
+        self,
+    ) -> None:
+        target = self.targets / "01.json"
+        target.write_text(
+            json.dumps(formal_journey_definitions()[0]), encoding="utf-8"
+        )
+        manifest = freeze_batch_manifest(
+            repo_root=self.root,
+            targets_dir=self.targets,
+            manifest_path=self.root / ".agent" / "turn-identity-manifest.json",
+            runtime_base=self.root / ".agent" / "turn-identity-runtime",
+            shard_count=1,
+            required_env_names=(),
+            command_factory=lambda *_args: (sys.executable, "-c", "pass"),
+        )
+        shard = manifest.shards[0]
+        target_payload = json.loads(Path(shard.target_path).read_text())
+        schedule = journey_schedule_payload(build_journey_schedule(
+            revision=self.revision,
+            seed=shard.seed,
+            journey=target_payload["journey"],
+        ))
+        context = {
+            "session_id": shard.session_id,
+            "turn_index": 7,
+            "schedule": schedule,
+        }
+
+        _validate_context_frame(
+            shard,
+            context,
+            0,
+            previous_turn_index=None,
+        )
+        _validate_context_frame(
+            shard,
+            context,
+            1,
+            previous_turn_index=7,
+        )
+        _validate_context_frame(
+            shard,
+            {**context, "turn_index": 8},
+            2,
+            previous_turn_index=7,
+        )
+        with self.assertRaisesRegex(RuntimeError, "turn order"):
+            _validate_context_frame(
+                shard,
+                {**context, "turn_index": 6},
+                3,
+                previous_turn_index=7,
+            )
+        with self.assertRaisesRegex(RuntimeError, "turn order"):
+            _validate_context_frame(
+                shard,
+                {**context, "turn_index": 9},
+                3,
+                previous_turn_index=7,
+            )
+        for invalid in (0, True, "7"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                RuntimeError, "turn identity"
+            ):
+                _validate_context_frame(
+                    shard,
+                    {**context, "turn_index": invalid},
+                    3,
+                    previous_turn_index=7,
+                )
 
     def test_product_journey_rejects_frozen_schedule_hash_drift(self) -> None:
         target = self.targets / "01.json"

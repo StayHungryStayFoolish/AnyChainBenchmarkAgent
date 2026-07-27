@@ -214,6 +214,7 @@ class BatchResultIndex:
 class _RunState:
     response_hashes: list[str] = field(default_factory=list)
     decision_hashes: list[str] = field(default_factory=list)
+    context_turn_indices: list[int] = field(default_factory=list)
     result_payload: Mapping[str, Any] | None = None
     forced_classification: str = ""
     reason: str = ""
@@ -1092,11 +1093,22 @@ async def _exchange_frames(
         result_frame = JOURNEY_RESULT_FRAME if shard.lane == "journey" else RESULT_FRAME
         if text.startswith(context_frame):
             context = _parse_frame(text, context_frame)
-            _validate_context_frame(shard, context, len(state.response_hashes))
+            _validate_context_frame(
+                shard,
+                context,
+                len(state.response_hashes),
+                previous_turn_index=(
+                    state.context_turn_indices[-1]
+                    if state.context_turn_indices
+                    else None
+                ),
+            )
             response_hash = str(context.get("previous_response_hash") or "")
             if not response_hash:
                 raise RuntimeError("simulator context has no response hash")
             state.response_hashes.append(response_hash)
+            if shard.lane == "journey":
+                state.context_turn_indices.append(int(context["turn_index"]))
             try:
                 decision = await _call_broker_with_timeout(
                     broker,
@@ -1286,6 +1298,8 @@ def _validate_context_frame(
     shard: FrozenShardSpec,
     context: Mapping[str, Any],
     target_index: int,
+    *,
+    previous_turn_index: int | None = None,
 ) -> None:
     if str(context.get("session_id") or "") != shard.session_id:
         raise RuntimeError("simulator context belongs to another session")
@@ -1299,7 +1313,18 @@ def _validate_context_frame(
             raise RuntimeError("Journey simulator context persona changed")
         if str(schedule.get("mission") or "") != shard.goals[0]:
             raise RuntimeError("Journey simulator context mission changed")
-        if int(context.get("turn_index") or 0) != target_index + 1:
+        raw_turn_index = context.get("turn_index")
+        if (
+            isinstance(raw_turn_index, bool)
+            or not isinstance(raw_turn_index, int)
+            or raw_turn_index < 1
+        ):
+            raise RuntimeError("Journey simulator context turn identity is invalid")
+        turn_index = raw_turn_index
+        if previous_turn_index is not None and turn_index not in {
+            previous_turn_index,
+            previous_turn_index + 1,
+        }:
             raise RuntimeError("Journey simulator context turn order is invalid")
         return
     if target_index >= len(shard.target_ids):
@@ -1330,6 +1355,15 @@ async def _cleanup_process(
         actions.append("stdin_closed")
     if process is None:
         actions.append("spawn_failed_no_process")
+    elif process.returncode is None:
+        try:
+            await asyncio.wait_for(
+                process.wait(),
+                timeout=max(cleanup_seconds / 2, 0.01),
+            )
+            actions.append("worker_exited_after_stdin_close")
+        except asyncio.TimeoutError:
+            actions.append("worker_graceful_exit_timeout")
     reapers = (
         {process.pid: lambda: process.returncode}
         if process is not None
