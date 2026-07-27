@@ -106,6 +106,16 @@ class AgentGraphState(TypedDict, total=False):
     workflow_goals: list[dict[str, Any]]
 
 
+# Durable environment ownership excludes invocation-only discovery. Discovery
+# is refreshed for every graph invocation and is deliberately cleared before
+# checkpointing; retention checks must only claim the state that can persist.
+DURABLE_ENVIRONMENT_STATE_ROOTS = frozenset({
+    "inferred_config",
+    "confirmed_config",
+})
+INVOCATION_ENVIRONMENT_STATE_ROOTS = frozenset({"discovery"})
+
+
 INVOCATION_CONTEXT_DEFAULTS: dict[str, Any] = {
     "discovery": {},
     "framework_summary": {},

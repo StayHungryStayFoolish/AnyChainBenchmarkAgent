@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tests.agent_live.g5_collection_manifest import (
     SCENARIOS,
@@ -30,30 +31,55 @@ class G5CollectionManifestTest(unittest.TestCase):
         path.chmod(0o400)
         return path
 
+    def _complete_evidence(self, attempt_dir: Path) -> list[Path]:
+        return [
+            self._evidence(attempt_dir, scenario_id, sequence)
+            for sequence, scenario_id in enumerate(SCENARIOS, start=1)
+        ]
+
     def test_complete_collection_uses_only_declared_attempt_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir) / "g5"
             attempt_id, attempt_dir = create_g5_attempt(root / "evidence")
-            evidence = [
-                self._evidence(attempt_dir, scenario_id, sequence)
-                for sequence, scenario_id in enumerate(SCENARIOS, start=1)
-            ]
+            evidence = self._complete_evidence(attempt_dir)
             stale = root / "evidence" / "stale.json"
             stale.write_text('{"scenario_id":"not-authoritative"}', encoding="utf-8")
 
-            manifest = publish_g5_collection(
-                g5_root=root,
-                attempt_id=attempt_id,
-                revision=REVISION,
-                evidence_paths=evidence,
-                status="complete",
-            )
+            with patch(
+                "tests.agent_live.g5_collection_manifest.build_ledger",
+                return_value={"revision": REVISION},
+            ) as build, patch(
+                "tests.agent_live.g5_collection_manifest.ingest_evidence_artifacts",
+                return_value={"summary": {"status": "complete"}},
+            ) as ingest, patch(
+                "tests.agent_live.g5_collection_manifest."
+                "validate_real_execution_ledger_artifacts",
+                return_value=(True, ""),
+            ) as validate:
+                manifest = publish_g5_collection(
+                    g5_root=root,
+                    attempt_id=attempt_id,
+                    revision=REVISION,
+                    evidence_paths=evidence,
+                    status="complete",
+                )
             payload, reason = load_active_g5_collection(
                 root,
                 revision=REVISION,
             )
             manifest_text = manifest.read_text(encoding="utf-8")
 
+        build.assert_called_once_with(revision=REVISION)
+        ingest.assert_called_once_with(
+            {"revision": REVISION},
+            tuple(str(path.resolve()) for path in evidence),
+        )
+        validate.assert_called_once()
+        self.assertEqual(validate.call_args.kwargs["revision"], REVISION)
+        self.assertEqual(
+            [item["scenario_id"] for item in validate.call_args.args[0]],
+            list(SCENARIOS),
+        )
         self.assertEqual(reason, "")
         self.assertEqual(payload["status"], "complete")
         self.assertEqual(
@@ -61,6 +87,100 @@ class G5CollectionManifestTest(unittest.TestCase):
             list(SCENARIOS),
         )
         self.assertNotIn(str(stale), manifest_text)
+
+    def test_complete_collection_rejects_tampered_evidence_before_publication(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "g5"
+            attempt_id, attempt_dir = create_g5_attempt(root / "evidence")
+            evidence = self._complete_evidence(attempt_dir)
+            with patch(
+                "tests.agent_live.g5_collection_manifest.build_ledger",
+                return_value={"revision": REVISION},
+            ), patch(
+                "tests.agent_live.g5_collection_manifest.ingest_evidence_artifacts",
+                side_effect=ValueError("artifact hash mismatch"),
+            ), patch(
+                "tests.agent_live.g5_collection_manifest."
+                "validate_real_execution_ledger_artifacts",
+            ) as validate:
+                with self.assertRaisesRegex(ValueError, "artifact hash mismatch"):
+                    publish_g5_collection(
+                        g5_root=root,
+                        attempt_id=attempt_id,
+                        revision=REVISION,
+                        evidence_paths=evidence,
+                        status="complete",
+                    )
+
+            self.assertFalse((root / "active-collection.json").exists())
+            self.assertFalse((root / "collections").exists())
+            validate.assert_not_called()
+
+    def test_complete_collection_rejects_failed_evidence_before_publication(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "g5"
+            attempt_id, attempt_dir = create_g5_attempt(root / "evidence")
+            evidence = self._complete_evidence(attempt_dir)
+            with patch(
+                "tests.agent_live.g5_collection_manifest.build_ledger",
+                return_value={"revision": REVISION},
+            ), patch(
+                "tests.agent_live.g5_collection_manifest.ingest_evidence_artifacts",
+                side_effect=ValueError(
+                    "observed-fail evidence does not qualify as a passing execution edge"
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "observed-fail evidence does not qualify",
+                ):
+                    publish_g5_collection(
+                        g5_root=root,
+                        attempt_id=attempt_id,
+                        revision=REVISION,
+                        evidence_paths=evidence,
+                        status="complete",
+                    )
+
+            self.assertFalse((root / "active-collection.json").exists())
+            self.assertFalse((root / "collections").exists())
+
+    def test_complete_collection_rejects_invalid_global_ledger_before_publication(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "g5"
+            attempt_id, attempt_dir = create_g5_attempt(root / "evidence")
+            evidence = self._complete_evidence(attempt_dir)
+            with patch(
+                "tests.agent_live.g5_collection_manifest.build_ledger",
+                return_value={"revision": REVISION},
+            ), patch(
+                "tests.agent_live.g5_collection_manifest.ingest_evidence_artifacts",
+                return_value={"summary": {"status": "complete"}},
+            ), patch(
+                "tests.agent_live.g5_collection_manifest."
+                "validate_real_execution_ledger_artifacts",
+                return_value=(False, "real execution ledger job identities are not unique"),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "ledger job identities are not unique",
+                ):
+                    publish_g5_collection(
+                        g5_root=root,
+                        attempt_id=attempt_id,
+                        revision=REVISION,
+                        evidence_paths=evidence,
+                        status="complete",
+                    )
+
+            self.assertFalse((root / "active-collection.json").exists())
+            self.assertFalse((root / "collections").exists())
 
     def test_failed_collection_accepts_only_an_ordered_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

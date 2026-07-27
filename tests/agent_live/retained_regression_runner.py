@@ -44,6 +44,7 @@ from tests.agent_live.completed_journey_batch import (
 from tests.agent_live.dynamic_dual_ai_chaos import (
     ChaosRunConfig,
     CompletionExpectation,
+    ContainerPtyBridgeTransport,
     JsonlRuntimeEventStream,
     JsonlTerminalOutcomeStream,
     JourneyDecisionProvenance,
@@ -64,6 +65,7 @@ from tests.agent_live.dynamic_dual_ai_chaos import (
 )
 from tests.agent_live.product_obligation_evidence import (
     PRODUCT_OBLIGATION_EVIDENCE_SCHEMA_VERSION,
+    admit_product_obligation_evidence,
 )
 from tests.agent_live.retained_regression_obligations import (
     KNOWN_POSTCONDITION_IDS,
@@ -92,6 +94,10 @@ RETAINED_REGRESSION_REGISTRY_IMPORT = (
 )
 RETAINED_REGRESSION_SEED = 20260724
 REQUIRED_ARTIFACT_ROLES = ("transcript", "runtime_events", "checkpoint_diff")
+EXACT_RUNTIME_ARTIFACT_ROLES = (
+    *REQUIRED_ARTIFACT_ROLES,
+    "process_guard_receipt",
+)
 RETAINED_REGRESSION_DEFINITION_MANIFEST_SCHEMA_VERSION = 1
 RETAINED_REGRESSION_TARGET_SET_SCHEMA_VERSION = 1
 RETAINED_REGRESSION_EXACT_COUNT = 15
@@ -141,7 +147,7 @@ _RULE_CLASSES: Mapping[str, tuple[str, ...]] = {
         "declined_mode_change_resumes_chain_pending",
     ),
     "pending_advanced": (
-        "manual_disk_size_provided",
+        "disk_size_resolved",
         "typed_detected_value_confirmed",
         "owned_group_backtrack_completed",
         "chain_confirmation_required",
@@ -1100,6 +1106,7 @@ def execute_exact_retained_regression(
     started_at = str(time.time_ns())
     initial_event: RuntimeTurnEvent | None = None
     active_user_message = ""
+    process_guard_proof: Mapping[str, Any] | None = None
     terminal_outcome_stream.mark_process_start()
     event_stream.mark_process_start()
     transport.start(env=env)
@@ -1283,6 +1290,11 @@ def execute_exact_retained_regression(
     finally:
         try:
             transport.close()
+            if not isinstance(transport, ContainerPtyBridgeTransport):
+                raise RuntimeError(
+                    "exact retained-regression requires the container PTY bridge"
+                )
+            process_guard_proof = transport.validated_execution_proof()
         finally:
             (runtime_root / "transcript.txt").write_text(
                 str(redact("\n".join(transcript_lines).rstrip() + "\n")),
@@ -1291,6 +1303,10 @@ def execute_exact_retained_regression(
 
     if initial_event is None:
         raise RuntimeError("exact retained-regression did not observe a startup event")
+    if process_guard_proof is None:
+        raise RuntimeError(
+            "exact retained-regression has no validated process cleanup proof"
+        )
 
     artifact_paths = _write_exact_retained_artifacts(
         runtime_root=runtime_root,
@@ -1302,6 +1318,9 @@ def execute_exact_retained_regression(
         events=observed_events,
         turns=observed_turns,
     )
+    artifact_paths["process_guard_receipt"] = Path(
+        str(process_guard_proof["path"])
+    ).resolve()
     execution = {
         "execution_id": execution_id,
         "runner": "retained-regression-real-cli-v1",
@@ -1361,11 +1380,12 @@ def execute_exact_retained_regressions(
         raise FileExistsError(f"G3 exact output is immutable: {output}")
     output.mkdir(parents=True)
     evidence_paths: list[Path] = []
+    admitted_evidence: list[dict[str, str]] = []
     for target in selected:
         obligation = obligation_index.get(str(target["obligation_id"]))
         if obligation is None:
             raise ValueError("G3 exact target has no authoritative obligation")
-        evidence_paths.append(execute_exact_retained_regression(
+        evidence_path = execute_exact_retained_regression(
             repo_root=repo_root,
             obligation=obligation,
             target=target,
@@ -1373,7 +1393,38 @@ def execute_exact_retained_regressions(
             output_root=output,
             timeout_seconds=timeout_seconds,
             worker_runtime=worker_runtime,
-        ))
+        )
+        admission = admit_product_obligation_evidence(
+            obligations=(obligation,),
+            evidence_paths=(evidence_path,),
+            revision=dict(provider["revision_binding"]),
+        )
+        if not admission["complete"]:
+            outcome = admission["outcomes"][str(target["obligation_id"])]
+            raise RuntimeError(
+                "G3 exact evidence did not pass: "
+                f"{target['obligation_id']} outcome={outcome}"
+            )
+        admitted = dict(
+            dict(admission.get("admitted_evidence") or {}).get(
+                str(target["obligation_id"])
+            )
+            or {}
+        )
+        if (
+            Path(str(admitted.get("evidence_path") or "")).resolve()
+            != evidence_path.resolve()
+            or not _is_sha256(admitted.get("evidence_sha256"))
+        ):
+            raise RuntimeError(
+                "G3 exact admission did not return its immutable evidence binding"
+            )
+        evidence_paths.append(evidence_path)
+        admitted_evidence.append({
+            "obligation_id": str(target["obligation_id"]),
+            "path": str(evidence_path),
+            "sha256": str(admitted["evidence_sha256"]),
+        })
     summary_unsigned = {
         "schema_version": 1,
         "artifact_type": "retained_regression_exact_execution_index",
@@ -1382,14 +1433,7 @@ def execute_exact_retained_regressions(
         "selection": "single" if obligation_id else "all",
         "scheduled": len(selected),
         "completed": len(evidence_paths),
-        "evidence": [
-            {
-                "obligation_id": target["obligation_id"],
-                "path": str(path),
-                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            }
-            for target, path in zip(selected, evidence_paths, strict=True)
-        ],
+        "evidence": admitted_evidence,
     }
     _write_json_once(
         output / "execution-index.json",
@@ -1984,9 +2028,16 @@ def _reconstruct_verifier_context(
     revision: Mapping[str, str],
     execution: Mapping[str, str],
 ) -> tuple[list[dict[str, str]], JourneyVerifierContext]:
-    if set(artifact_paths) != set(REQUIRED_ARTIFACT_ROLES):
-        raise ValueError("retained regression evidence requires exactly three artifacts")
     variant = str(target.get("variant") or "")
+    required_roles = (
+        EXACT_RUNTIME_ARTIFACT_ROLES
+        if variant == "exact"
+        else REQUIRED_ARTIFACT_ROLES
+    )
+    if set(artifact_paths) != set(required_roles):
+        raise ValueError(
+            "retained regression evidence has an invalid runtime artifact set"
+        )
     expected_schedule = _schedule_for_evidence(
         obligation=obligation,
         target=target,
@@ -2034,6 +2085,19 @@ def _reconstruct_verifier_context(
             "role": role,
             "path": str(path),
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        })
+    if variant == "exact":
+        process_path = Path(
+            artifact_paths["process_guard_receipt"]
+        ).expanduser().resolve()
+        if not process_path.is_file() or process_path.stat().st_size <= 0:
+            raise ValueError(
+                "retained regression process guard receipt is missing"
+            )
+        references.append({
+            "role": "process_guard_receipt",
+            "path": str(process_path),
+            "sha256": hashlib.sha256(process_path.read_bytes()).hexdigest(),
         })
     transcript_rows = payloads["transcript"].get("turns")
     runtime_rows = payloads["runtime_events"].get("events")

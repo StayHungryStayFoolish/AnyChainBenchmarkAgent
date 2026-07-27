@@ -15,6 +15,8 @@ from typing import Any, Callable, Mapping, Sequence
 from agent.harness.control_receipts import (
     validate_persisted_domain_control_receipt,
 )
+from agent.harness.state import DURABLE_ENVIRONMENT_STATE_ROOTS
+from agent.workflows.group_registry import GROUP_OWNER
 from tests.agent_live.coverage_evidence import content_hash
 from tests.agent_live.retained_regression_attestations import (
     collect_valid_variant_attestations,
@@ -29,10 +31,6 @@ _HASH_LENGTH = 64
 _ENVIRONMENT_INTERRUPT_ROLES = frozenset({
     "chain_change_request",
     "chain_mode_change_request",
-})
-_ENVIRONMENT_ROOTS = frozenset({
-    "confirmed_config",
-    "inferred_config",
 })
 _RPC_GROUPS = frozenset({
     "chain_identity",
@@ -368,14 +366,20 @@ def _semantic_roles_by_turn(
     roles: dict[int, set[str]] = defaultdict(set)
     variant = str(contract["variant_contract"]["variant"])
     if variant == "exact":
+        observed_turns = _turns(context)
         observed_hash = content_hash(tuple(
             str(getattr(turn, "user_message", ""))
-            for turn in _turns(context)
+            for turn in observed_turns
         ))
         if observed_hash != contract["source_contract"]["source_turns_hash"]:
             return {}, [], "exact observed turns do not match the source contract"
-        for step in contract["source_contract"]["source_steps"]:
-            roles[int(step["turn_index"])].add(str(step["semantic_role"]))
+        source_steps = tuple(contract["source_contract"]["source_steps"])
+        if len(source_steps) != len(observed_turns):
+            return {}, [], "exact source steps do not match observed turns"
+        for step, turn in zip(source_steps, observed_turns, strict=True):
+            roles[int(getattr(turn, "turn_index", -1))].add(
+                str(step["semantic_role"])
+            )
         return roles, [], ""
     valid, invalid = collect_valid_variant_attestations(context)
     for attestation in valid:
@@ -1190,15 +1194,176 @@ def _stale_fallback_emitted(context: Any) -> PredicateResult:
     )
 
 
-def _copied_scalar_normalized(context: Any) -> PredicateResult:
-    return _receipt_predicate(
+def _confirmed_pending_lineage(
+    context: Any,
+    *,
+    expected_field: str,
+    expected_role: str,
+    expected_group: str,
+    allowed_resolution_paths: frozenset[str],
+) -> tuple[
+    list[Mapping[str, Any]],
+    list[Mapping[str, Any]],
+    Mapping[str, Any],
+]:
+    """Bind one semantic source turn to its accepted configuration write."""
+
+    roles_by_turn, invalid_attestations, role_error = _semantic_roles_by_turn(
+        context
+    )
+    pending, invalid_pending = _valid_receipts(
         context,
-        family="scalar_normalization",
-        receipt_types=("pending_resolution",),
-        predicate=lambda receipt: (
-            receipt.get("resolution_path") == "typed_manual_value"
-            and receipt.get("normalizer") not in {"", "identity"}
-        ),
+        "pending_resolution",
+    )
+    commits, invalid_commits = _domain_commits(context)
+    turns = {
+        int(getattr(turn, "turn_index", -1)): turn
+        for turn in _turns(context)
+    }
+    commits_by_turn: dict[int, list[Mapping[str, Any]]] = defaultdict(list)
+    for item in commits:
+        commits_by_turn[int(item["turn_index"])].append(item)
+
+    matches: list[Mapping[str, Any]] = []
+    for item in pending:
+        receipt = item["receipt"]
+        turn_index = int(item["turn_index"])
+        turn = turns.get(turn_index)
+        event = next(
+            (
+                candidate
+                for candidate in _events(context)
+                if int(getattr(candidate, "turn_index", -1)) == turn_index
+            ),
+            None,
+        )
+        if turn is None or event is None:
+            continue
+        transition = _valid_pending_transition(event)
+        summary = dict(getattr(event, "turn_receipt_summary", {}) or {})
+        input_hash = hashlib.sha256(
+            str(getattr(turn, "user_message", "")).encode("utf-8")
+        ).hexdigest()
+        action_id = str(receipt.get("resolved_action_id") or "")
+        pending_hash = str(receipt.get("pending_contract_hash") or "")
+        expected_owner = str(GROUP_OWNER.get(expected_group) or "")
+        if (
+            receipt.get("verdict") != "accepted"
+            or receipt.get("pending_id") != expected_field
+            or receipt.get("pending_group") != expected_group
+            or receipt.get("resolution_path") not in allowed_resolution_paths
+            or receipt.get("input_hash") != input_hash
+            or expected_role not in roles_by_turn.get(turn_index, set())
+            or not action_id
+            or transition is None
+            or transition.get("before_id") != expected_field
+            or transition.get("before_group") != expected_group
+            or transition.get("before_hash") != pending_hash
+            or action_id not in set(transition.get("consumer_action_ids") or ())
+            or action_id not in set(summary.get("admitted_action_ids") or ())
+            or dict(summary.get("owner_bindings") or {}).get(action_id)
+            != expected_owner
+        ):
+            continue
+        matching_commits = []
+        expected_path = f"confirmed_config.{expected_field}"
+        material_diff = _valid_material_diffs(event).get(expected_path)
+        selected_value_hash = str(receipt.get("selected_value_hash") or "")
+        for commit_item in commits_by_turn.get(turn_index, ()):
+            commit = commit_item["receipt"]
+            matching_deltas = [
+                delta
+                for delta in commit.get("material_delta") or ()
+                if (
+                delta.get("operation") == "write"
+                and delta.get("path") == expected_path
+                )
+            ]
+            if (
+                commit.get("completion") != "rejected"
+                and commit.get("owner") == expected_owner
+                and commit.get("pending_before_hash") == pending_hash
+                and action_id in set(commit.get("consumed_action_ids") or ())
+                and len(matching_deltas) == 1
+                and material_diff is not None
+                and selected_value_hash
+                and matching_deltas[0].get("value_hash")
+                == selected_value_hash
+                == material_diff.get("after")
+            ):
+                matching_commits.append(commit_item)
+        if len(matching_commits) == 1:
+            matches.append({
+                "field": expected_field,
+                "turn_index": turn_index,
+                "pending_receipt": receipt,
+                "pending_receipt_id": item["receipt_id"],
+                "domain_commit": matching_commits[0]["receipt"],
+                "domain_commit_receipt_id": matching_commits[0]["receipt_id"],
+            })
+
+    invalid = [*invalid_pending, *invalid_commits]
+    if invalid_attestations or role_error:
+        invalid.append({
+            "receipt_id": "",
+            "reason": role_error or "invalid semantic-role attestation",
+        })
+    return matches, invalid, {
+        "expected_field": expected_field,
+        "expected_role": expected_role,
+        "invalid_attestations": invalid_attestations,
+        "role_error": role_error,
+    }
+
+
+def _disk_limit_lineage(
+    context: Any,
+) -> tuple[
+    list[Mapping[str, Any]],
+    list[Mapping[str, Any]],
+    Mapping[str, Any],
+]:
+    matches: list[Mapping[str, Any]] = []
+    invalid: list[Mapping[str, Any]] = []
+    observations: dict[str, Any] = {}
+    roles = {
+        "DATA_VOL_MAX_IOPS": "provide_disk_iops",
+        "DATA_VOL_MAX_THROUGHPUT": "provide_disk_throughput",
+    }
+    for field, role in roles.items():
+        field_matches, field_invalid, field_observations = (
+            _confirmed_pending_lineage(
+                context,
+                expected_field=field,
+                expected_role=role,
+                expected_group="ledger_disk",
+                allowed_resolution_paths=frozenset({"typed_manual_value"}),
+            )
+        )
+        matches.extend(field_matches)
+        invalid.extend(field_invalid)
+        observations[field] = field_observations
+    return matches, invalid, {"field_lineage": observations}
+
+
+def _copied_scalar_normalized(context: Any) -> PredicateResult:
+    matches, invalid, observations = _confirmed_pending_lineage(
+        context,
+        expected_field="DATA_VOL_TYPE",
+        expected_role="provide_disk_type",
+        expected_group="ledger_disk",
+        allowed_resolution_paths=frozenset({"typed_manual_value"}),
+    )
+    normalized = [
+        item for item in matches
+        if item["pending_receipt"].get("normalizer") not in {"", "identity"}
+    ]
+    return bool(normalized) and not invalid, _receipt_details(
+        "scalar_normalization",
+        normalized,
+        invalid,
+        **observations,
+        matched_receipt_count=len(normalized),
     )
 
 
@@ -1214,54 +1379,61 @@ def _typed_detected_value_confirmed(context: Any) -> PredicateResult:
     )
 
 
-def _manual_disk_size_provided(context: Any) -> PredicateResult:
-    return _receipt_predicate(
+def _disk_size_resolved(context: Any) -> PredicateResult:
+    matches, invalid, observations = _confirmed_pending_lineage(
         context,
-        family="pending_lineage",
-        receipt_types=("pending_resolution",),
-        predicate=lambda receipt: (
-            receipt.get("resolution_path") == "typed_manual_value"
-            and _path_leaf(str(receipt.get("pending_id") or ""))
-            in {"DATA_VOL_SIZE", "ACCOUNTS_VOL_SIZE"}
-            and bool(receipt.get("selected_value_hash"))
-        ),
+        expected_field="DATA_VOL_SIZE",
+        expected_role="provide_disk_size",
+        expected_group="ledger_disk",
+        allowed_resolution_paths=frozenset({
+            "typed_manual_value",
+            "exact_contract",
+        }),
+    )
+    resolved = [
+        item for item in matches
+        if (
+            item["pending_receipt"].get("resolution_path")
+            == "typed_manual_value"
+            or bool(item["pending_receipt"].get("selected_option_id"))
+        )
+        and bool(item["pending_receipt"].get("selected_value_hash"))
+    ]
+    return bool(resolved) and not invalid, _receipt_details(
+        "pending_lineage",
+        resolved,
+        invalid,
+        **observations,
+        matched_receipt_count=len(resolved),
     )
 
 
 def _disk_limits_collected_once(context: Any) -> PredicateResult:
-    deltas, invalid = _material_delta_records(context)
-    counts = Counter(
-        _path_leaf(item["path"])
-        for item in deltas
-        if item["operation"] == "write"
-        and _path_leaf(item["path"]) in _DISK_LIMIT_FIELDS
-    )
+    matches, invalid, observations = _disk_limit_lineage(context)
+    counts = Counter(item["field"] for item in matches)
     satisfied = set(counts) == set(_DISK_LIMIT_FIELDS) and all(
         count == 1 for count in counts.values()
     )
     return satisfied and not invalid, _receipt_details(
         "subgroup_progression",
-        deltas,
+        matches,
         invalid,
+        **observations,
         field_write_counts=dict(counts),
     )
 
 
 def _disk_subgroup_repeated(context: Any) -> PredicateResult:
-    deltas, invalid = _material_delta_records(context)
-    counts = Counter(
-        _path_leaf(item["path"])
-        for item in deltas
-        if item["operation"] == "write"
-        and _path_leaf(item["path"]) in _DISK_LIMIT_FIELDS
-    )
+    matches, invalid, observations = _disk_limit_lineage(context)
+    counts = Counter(item["field"] for item in matches)
     repeated = {
         field: count for field, count in counts.items() if count > 1
     }
     return bool(repeated) and not invalid, _receipt_details(
         "subgroup_progression",
-        deltas,
+        matches,
         invalid,
+        **observations,
         repeated_field_writes=repeated,
     )
 
@@ -1317,7 +1489,7 @@ def _backtrack_lost_configuration_state(context: Any) -> PredicateResult:
             for delta in receipt.get("material_delta") or ()
             if delta.get("operation") == "delete"
             and _path_root(str(delta.get("path") or ""))
-            in _ENVIRONMENT_ROOTS
+            in DURABLE_ENVIRONMENT_STATE_ROOTS
         ]
         if destructive:
             lost.append(item)
@@ -1719,7 +1891,7 @@ def _compatible_environment_retained(context: Any) -> PredicateResult:
         int(getattr(event, "turn_index", -1)): sorted(
             path
             for path in _valid_material_diffs(event)
-            if _path_root(path) in _ENVIRONMENT_ROOTS
+            if _path_root(path) in DURABLE_ENVIRONMENT_STATE_ROOTS
         )
         for event in _events(context)
         if int(getattr(event, "turn_index", -1)) in mode_turns
@@ -2034,7 +2206,7 @@ POSTCONDITION_EVALUATORS: Mapping[str, PostconditionEvaluator] = {
     "fallback_resumed": _fallback_resumed,
     "stale_fallback_emitted": _stale_fallback_emitted,
     "copied_scalar_normalized": _copied_scalar_normalized,
-    "manual_disk_size_provided": _manual_disk_size_provided,
+    "disk_size_resolved": _disk_size_resolved,
     "disk_limits_collected_once": _disk_limits_collected_once,
     "disk_subgroup_repeated": _disk_subgroup_repeated,
     "typed_detected_value_confirmed": _typed_detected_value_confirmed,

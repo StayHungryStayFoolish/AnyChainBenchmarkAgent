@@ -301,6 +301,12 @@ def _validate_evidence_document(
             session_id=session_id,
             request_ids=request_ids,
         )
+    if _is_g3_exact_obligation(obligation):
+        _validate_g3_exact_runtime_provenance(
+            document=document,
+            evidence_path=evidence_path,
+            artifacts=artifacts,
+        )
     _validate_verifier_results(
         document.get("verifier_results"),
         obligation=obligation,
@@ -416,6 +422,53 @@ def _is_g4_obligation(obligation: Mapping[str, Any]) -> bool:
         and isinstance(obligation.get("factors"), Mapping)
         and isinstance(obligation.get("start_contract"), Mapping)
     )
+
+
+def _is_g3_exact_obligation(obligation: Mapping[str, Any]) -> bool:
+    return (
+        obligation.get("variant") == "exact"
+        and isinstance(obligation.get("seed_contract"), Mapping)
+        and isinstance(obligation.get("stimulus_contract"), Mapping)
+    )
+
+
+def _validate_g3_exact_runtime_provenance(
+    *,
+    document: Mapping[str, Any],
+    evidence_path: Path,
+    artifacts: Mapping[str, Mapping[str, Any]],
+) -> None:
+    obligation_id = str(document["obligation_id"])
+    execution = dict(document["execution"])
+    if execution.get("runner") != "retained-regression-real-cli-v1":
+        raise ValueError(
+            f"G3 exact execution runner is invalid: {obligation_id}"
+        )
+    receipt = artifacts.get("process_guard_receipt")
+    if receipt is None:
+        raise ValueError(
+            f"required G3 exact process proof is missing: {obligation_id}"
+        )
+    runtime_root = evidence_path.parent.resolve()
+    expected_receipt_root = runtime_root / "container-cleanup-receipts"
+    receipt_path = Path(receipt["path"]).resolve()
+    if receipt_path.parent != expected_receipt_root:
+        raise ValueError(
+            f"G3 exact process proof is outside its runtime: {obligation_id}"
+        )
+    validated = validate_cleanup_receipt_artifact(
+        receipt_path,
+        execution_id=str(execution["execution_id"]),
+        required_roles=(
+            "container_bridge",
+            "agent_process_group_leader",
+        ),
+        allowed_roots=(expected_receipt_root,),
+    )
+    if validated["sha256"] != receipt["sha256"]:
+        raise ValueError(
+            f"G3 exact process proof differs from its artifact: {obligation_id}"
+        )
 
 
 def _validate_g4_runtime_provenance(

@@ -5,6 +5,8 @@ from dataclasses import asdict
 from dataclasses import replace
 import hashlib
 import json
+import os
+import sys
 import tempfile
 import time
 import unittest
@@ -26,6 +28,7 @@ from tests.agent_live.coverage_evidence import (
     pty_transcript_hash,
 )
 from tests.agent_live.dynamic_dual_ai_chaos import (
+    ContainerPtyBridgeTransport,
     JourneyDecisionProvenance,
     JourneyVerifierContext,
     TerminalTurnFailure,
@@ -373,6 +376,36 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
                 initial_event=context.initial_event,
                 events=context.completed_events,
                 turns=context.completed_turns,
+            )
+            receipt_root = root / "container-cleanup-receipts"
+            transport = ContainerPtyBridgeTransport(
+                (
+                    sys.executable,
+                    "-m",
+                    "tests.agent_live.container_pty_bridge",
+                    "--cwd",
+                    str(Path.cwd()),
+                    "--",
+                    sys.executable,
+                    "-u",
+                    "-c",
+                    (
+                        "import sys\n"
+                        "print('Agent> ready\\nUser> ', end='', flush=True)\n"
+                        "for _line in sys.stdin:\n"
+                        " print('Agent> received\\nUser> ', end='', flush=True)\n"
+                    ),
+                ),
+                cwd=Path.cwd(),
+                execution_id=execution_id,
+                cleanup_receipt_dir=receipt_root,
+            )
+            transport.start(env=os.environ)
+            transport.read_complete_agent_response(timeout_seconds=5)
+            transport.close()
+            proof = transport.validated_execution_proof()
+            artifacts["process_guard_receipt"] = Path(
+                str(proof["path"])
             )
             evidence = build_product_obligation_evidence_artifact(
                 obligation=obligation,
@@ -771,7 +804,22 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
                 "tests.agent_live.retained_regression_runner."
                 "execute_exact_retained_regression",
                 side_effect=fake_execute,
-            ) as execute:
+            ) as execute, patch(
+                "tests.agent_live.retained_regression_runner."
+                "admit_product_obligation_evidence",
+                side_effect=lambda **kwargs: {
+                    "complete": True,
+                    "outcomes": {
+                        kwargs["obligations"][0]["obligation_id"]: "passed"
+                    },
+                    "admitted_evidence": {
+                        kwargs["obligations"][0]["obligation_id"]: {
+                            "evidence_path": str(kwargs["evidence_paths"][0]),
+                            "evidence_sha256": "f" * 64,
+                        },
+                    },
+                },
+            ) as admit:
                 paths = execute_exact_retained_regressions(
                     repo_root=REPO_ROOT,
                     provider=self.provider,
@@ -780,11 +828,156 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
                 )
             self.assertEqual(len(paths), 15)
             self.assertEqual(execute.call_count, 15)
+            self.assertEqual(admit.call_count, 15)
             index = json.loads(
                 (output / "execution-index.json").read_text(encoding="utf-8")
             )
             self.assertEqual(index["scheduled"], 15)
             self.assertEqual(index["completed"], 15)
+            self.assertEqual(
+                {row["sha256"] for row in index["evidence"]},
+                {"f" * 64},
+            )
+
+    def test_exact_suite_fails_closed_on_failed_product_evidence(self) -> None:
+        obligation = next(
+            row for row in self.obligations
+            if row["variant"] == "exact"
+        )
+        obligation_id = obligation["obligation_id"]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "exact"
+
+            def fake_execute(**kwargs):
+                runtime = kwargs["output_root"] / "failed-evidence"
+                runtime.mkdir()
+                evidence = runtime / "evidence.json"
+                evidence.write_text("{}\n", encoding="utf-8")
+                return evidence
+
+            with patch(
+                "tests.agent_live.retained_regression_runner."
+                "execute_exact_retained_regression",
+                side_effect=fake_execute,
+            ), patch(
+                "tests.agent_live.retained_regression_runner."
+                "admit_product_obligation_evidence",
+                return_value={
+                    "complete": False,
+                    "outcomes": {obligation_id: "failed"},
+                },
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    rf"{obligation_id} outcome=failed",
+                ):
+                    execute_exact_retained_regressions(
+                        repo_root=REPO_ROOT,
+                        provider=self.provider,
+                        obligations=self.obligations,
+                        output_root=output,
+                        obligation_id=obligation_id,
+                    )
+
+            self.assertTrue((output / "failed-evidence/evidence.json").is_file())
+            self.assertFalse((output / "execution-index.json").exists())
+
+    def test_exact_suite_requires_admission_hash_and_path_binding(self) -> None:
+        obligation = next(
+            row for row in self.obligations
+            if row["variant"] == "exact"
+        )
+        obligation_id = obligation["obligation_id"]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "exact"
+
+            def fake_execute(**kwargs):
+                runtime = kwargs["output_root"] / "unbound-evidence"
+                runtime.mkdir()
+                evidence = runtime / "evidence.json"
+                evidence.write_text("{}\n", encoding="utf-8")
+                return evidence
+
+            with patch(
+                "tests.agent_live.retained_regression_runner."
+                "execute_exact_retained_regression",
+                side_effect=fake_execute,
+            ), patch(
+                "tests.agent_live.retained_regression_runner."
+                "admit_product_obligation_evidence",
+                return_value={
+                    "complete": True,
+                    "outcomes": {obligation_id: "passed"},
+                    "admitted_evidence": {},
+                },
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "immutable evidence binding",
+                ):
+                    execute_exact_retained_regressions(
+                        repo_root=REPO_ROOT,
+                        provider=self.provider,
+                        obligations=self.obligations,
+                        output_root=output,
+                        obligation_id=obligation_id,
+                    )
+
+            self.assertFalse((output / "execution-index.json").exists())
+
+    def test_exact_batch_stops_at_first_failed_product_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "exact"
+            executed: list[str] = []
+
+            def fake_execute(**kwargs):
+                obligation_id = kwargs["target"]["obligation_id"]
+                executed.append(obligation_id)
+                runtime = kwargs["output_root"] / obligation_id
+                runtime.mkdir()
+                evidence = runtime / "evidence.json"
+                evidence.write_text("{}\n", encoding="utf-8")
+                return evidence
+
+            def fake_admit(**kwargs):
+                obligation_id = kwargs["obligations"][0]["obligation_id"]
+                outcome = "passed" if len(executed) == 1 else "failed"
+                result = {
+                    "complete": outcome == "passed",
+                    "outcomes": {obligation_id: outcome},
+                }
+                if outcome == "passed":
+                    result["admitted_evidence"] = {
+                        obligation_id: {
+                            "evidence_path": str(kwargs["evidence_paths"][0]),
+                            "evidence_sha256": "e" * 64,
+                        },
+                    }
+                return result
+
+            with patch(
+                "tests.agent_live.retained_regression_runner."
+                "execute_exact_retained_regression",
+                side_effect=fake_execute,
+            ), patch(
+                "tests.agent_live.retained_regression_runner."
+                "admit_product_obligation_evidence",
+                side_effect=fake_admit,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "outcome=failed"):
+                    execute_exact_retained_regressions(
+                        repo_root=REPO_ROOT,
+                        provider=self.provider,
+                        obligations=self.obligations,
+                        output_root=output,
+                    )
+
+            self.assertEqual(len(executed), 2)
+            self.assertEqual(
+                len(list(output.rglob("evidence.json"))),
+                2,
+            )
+            self.assertFalse((output / "execution-index.json").exists())
 
     def test_completed_journey_converts_retained_runtime_artifacts(self) -> None:
         obligation = next(

@@ -9,7 +9,14 @@ import uuid
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from tests.agent_live.coverage_evidence import G5_SCENARIO_ADMISSION
+from tests.agent_live.coverage_evidence import (
+    G5_SCENARIO_ADMISSION,
+    validate_real_execution_ledger_artifacts,
+)
+from tests.agent_live.generate_harness_coverage_ledger import (
+    build_ledger,
+    ingest_evidence_artifacts,
+)
 
 
 MANIFEST_SCHEMA_VERSION = 1
@@ -54,6 +61,13 @@ def publish_g5_collection(
         raise ValueError("G5 evidence must form the ordered scenario prefix")
     if status == "complete" and observed != SCENARIOS:
         raise ValueError("complete G5 collection requires all four scenarios")
+    if status == "complete":
+        if failure_path is not None:
+            raise ValueError("complete G5 collection cannot bind failure evidence")
+        _validate_complete_collection(
+            evidence_paths=evidence_paths,
+            revision=revision,
+        )
 
     payload: dict[str, Any] = {
         "artifact_type": MANIFEST_ARTIFACT_TYPE,
@@ -86,6 +100,28 @@ def publish_g5_collection(
     }
     _replace_json(root / "active-collection.json", pointer)
     return manifest
+
+
+def _validate_complete_collection(
+    *,
+    evidence_paths: Sequence[Path],
+    revision: Mapping[str, str],
+) -> None:
+    artifacts = [
+        _read_object(path, "G5 real-execution evidence")
+        for path in evidence_paths
+    ]
+    ledger = build_ledger(revision=revision)
+    ingest_evidence_artifacts(
+        ledger,
+        tuple(str(path.resolve()) for path in evidence_paths),
+    )
+    valid, reason = validate_real_execution_ledger_artifacts(
+        artifacts,
+        revision=revision,
+    )
+    if not valid:
+        raise ValueError(f"complete G5 collection ledger is invalid: {reason}")
 
 
 def load_active_g5_collection(

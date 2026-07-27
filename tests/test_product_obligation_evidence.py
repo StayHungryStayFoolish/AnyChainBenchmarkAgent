@@ -3,12 +3,15 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
 
 from tests.agent_live.coverage_evidence import content_hash
+from tests.agent_live.dynamic_dual_ai_chaos import ContainerPtyBridgeTransport
 from tests.agent_live.product_obligation_evidence import (
     PRODUCT_OBLIGATION_EVIDENCE_SCHEMA_VERSION,
     admit_product_chaos_rounds,
@@ -21,7 +24,12 @@ REQUIRED_IMPLEMENTATION_HASH = "1" * 64
 FORBIDDEN_IMPLEMENTATION_HASH = "2" * 64
 
 
-def _obligation(name: str, *, nested_revision: bool = False) -> dict[str, Any]:
+def _obligation(
+    name: str,
+    *,
+    nested_revision: bool = False,
+    exact: bool = False,
+) -> dict[str, Any]:
     unsigned = {
         "obligation_id": name,
         "revision_binding": (
@@ -45,6 +53,12 @@ def _obligation(name: str, *, nested_revision: bool = False) -> dict[str, Any]:
             }],
         },
     }
+    if exact:
+        unsigned.update({
+            "variant": "exact",
+            "seed_contract": {"scenario_id": "opening"},
+            "stimulus_contract": {"turns": ["Hi"]},
+        })
     return {**unsigned, "contract_hash": content_hash(unsigned)}
 
 
@@ -76,12 +90,23 @@ class ProductObligationEvidenceTest(unittest.TestCase):
         outcome: str = "passed",
         suffix: str = "one",
         round_id: str = "round-1",
+        execution_id: str | None = None,
+        runner: str = "phase8-response-driven-runner",
+        process_guard_path: Path | None = None,
     ) -> tuple[Path, dict[str, Any]]:
         artifacts = [
             self._artifact("transcript", suffix),
             self._artifact("runtime_events", suffix),
             self._artifact("checkpoint_diff", suffix),
         ]
+        if process_guard_path is not None:
+            artifacts.append({
+                "role": "process_guard_receipt",
+                "path": str(process_guard_path.resolve()),
+                "sha256": hashlib.sha256(
+                    process_guard_path.read_bytes()
+                ).hexdigest(),
+            })
         artifact_hashes = [item["sha256"] for item in artifacts]
         statuses = {
             "passed": ("passed", "passed"),
@@ -89,8 +114,8 @@ class ProductObligationEvidenceTest(unittest.TestCase):
             "externally_blocked": ("externally_blocked", "passed"),
         }[outcome]
         execution = {
-            "execution_id": f"execution-{suffix}",
-            "runner": "phase8-response-driven-runner",
+            "execution_id": execution_id or f"execution-{suffix}",
+            "runner": runner,
             "transport": "real_pty",
             "provider": "deepseek",
             "model": "deepseek-chat",
@@ -144,6 +169,43 @@ class ProductObligationEvidenceTest(unittest.TestCase):
         path = self.root / f"evidence-{suffix}.json"
         path.write_text(json.dumps(payload), encoding="utf-8")
         return path, payload
+
+    def _genuine_process_proof(
+        self,
+        *,
+        execution_id: str,
+    ) -> dict[str, Any]:
+        receipt_dir = self.root / "container-cleanup-receipts"
+        repl = (
+            "import sys\n"
+            "print('Agent> ready\\nUser> ', end='', flush=True)\n"
+            "for _line in sys.stdin:\n"
+            "    print('Agent> received\\nUser> ', end='', flush=True)\n"
+        )
+        transport = ContainerPtyBridgeTransport(
+            (
+                sys.executable,
+                "-m",
+                "tests.agent_live.container_pty_bridge",
+                "--cwd",
+                str(Path.cwd()),
+                "--",
+                sys.executable,
+                "-u",
+                "-c",
+                repl,
+            ),
+            cwd=Path.cwd(),
+            execution_id=execution_id,
+            cleanup_receipt_dir=receipt_dir,
+        )
+        transport.start(env=os.environ)
+        self.assertEqual(
+            transport.read_complete_agent_response(timeout_seconds=5),
+            "Agent> ready",
+        )
+        transport.close()
+        return dict(transport.validated_execution_proof())
 
     def test_two_round_admission_requires_complete_unique_identity_sets(self) -> None:
         evidence_by_round: dict[str, list[Path]] = {}
@@ -364,6 +426,148 @@ class ProductObligationEvidenceTest(unittest.TestCase):
             admit_product_obligation_evidence(
                 obligations=self.obligations,
                 evidence_paths=[path],
+                revision=REVISION,
+            )
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux procfs")
+    def test_g3_exact_admits_genuine_process_cleanup_proof(self) -> None:
+        execution_id = "g3-exact-genuine-cleanup"
+        proof = self._genuine_process_proof(execution_id=execution_id)
+        obligation = _obligation(
+            "g3-exact-genuine",
+            nested_revision=True,
+            exact=True,
+        )
+        evidence_path, _payload = self._evidence(
+            obligation,
+            suffix="g3-exact-genuine",
+            round_id="g3-retained-regression",
+            execution_id=execution_id,
+            runner="retained-regression-real-cli-v1",
+            process_guard_path=Path(proof["path"]),
+        )
+
+        summary = admit_product_obligation_evidence(
+            obligations=[obligation],
+            evidence_paths=[evidence_path],
+            revision=REVISION,
+        )
+
+        self.assertTrue(summary["complete"])
+        admitted = summary["admitted_evidence"][obligation["obligation_id"]]
+        self.assertEqual(
+            admitted["evidence_sha256"],
+            hashlib.sha256(evidence_path.read_bytes()).hexdigest(),
+        )
+
+    def test_g3_exact_rejects_missing_process_cleanup_proof(self) -> None:
+        obligation = _obligation(
+            "g3-exact-missing-cleanup",
+            nested_revision=True,
+            exact=True,
+        )
+        evidence_path, _payload = self._evidence(
+            obligation,
+            suffix="g3-exact-missing-cleanup",
+            round_id="g3-retained-regression",
+            execution_id="g3-exact-missing-cleanup",
+            runner="retained-regression-real-cli-v1",
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "required G3 exact process proof is missing",
+        ):
+            admit_product_obligation_evidence(
+                obligations=[obligation],
+                evidence_paths=[evidence_path],
+                revision=REVISION,
+            )
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux procfs")
+    def test_g3_exact_rejects_process_runtime_identity_and_role_tampering(
+        self,
+    ) -> None:
+        execution_id = "g3-exact-tamper"
+        proof = self._genuine_process_proof(execution_id=execution_id)
+        receipt_path = Path(proof["path"])
+        obligation = _obligation(
+            "g3-exact-tamper",
+            nested_revision=True,
+            exact=True,
+        )
+        evidence_path, _payload = self._evidence(
+            obligation,
+            suffix="g3-exact-identity-tamper",
+            round_id="g3-retained-regression",
+            execution_id="different-execution",
+            runner="retained-regression-real-cli-v1",
+            process_guard_path=receipt_path,
+        )
+        with self.assertRaisesRegex(ValueError, "execution id mismatch"):
+            admit_product_obligation_evidence(
+                obligations=[obligation],
+                evidence_paths=[evidence_path],
+                revision=REVISION,
+            )
+
+        foreign_root = self.root / "foreign-cleanup-receipts"
+        foreign_root.mkdir()
+        foreign_receipt = foreign_root / receipt_path.name
+        foreign_receipt.write_bytes(receipt_path.read_bytes())
+        evidence_path, _payload = self._evidence(
+            obligation,
+            suffix="g3-exact-runtime-tamper",
+            round_id="g3-retained-regression",
+            execution_id=execution_id,
+            runner="retained-regression-real-cli-v1",
+            process_guard_path=foreign_receipt,
+        )
+        with self.assertRaisesRegex(ValueError, "outside its runtime"):
+            admit_product_obligation_evidence(
+                obligations=[obligation],
+                evidence_paths=[evidence_path],
+                revision=REVISION,
+            )
+
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        for row in receipt["registered_processes"]:
+            row["roles"] = [
+                role
+                for role in row["roles"]
+                if role != "agent_process_group_leader"
+            ]
+        unsigned_receipt = {
+            key: value for key, value in receipt.items()
+            if key != "receipt_id"
+        }
+        receipt["receipt_id"] = hashlib.sha256(
+            json.dumps(
+                unsigned_receipt,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        tampered_receipt = receipt_path.with_name(
+            f"container-cleanup-receipt-{receipt['receipt_id']}.json"
+        )
+        tampered_receipt.write_text(
+            json.dumps(receipt, sort_keys=True),
+            encoding="utf-8",
+        )
+        evidence_path, _payload = self._evidence(
+            obligation,
+            suffix="g3-exact-role-tamper",
+            round_id="g3-retained-regression",
+            execution_id=execution_id,
+            runner="retained-regression-real-cli-v1",
+            process_guard_path=tampered_receipt,
+        )
+        with self.assertRaisesRegex(ValueError, "missing required registered roles"):
+            admit_product_obligation_evidence(
+                obligations=[obligation],
+                evidence_paths=[evidence_path],
                 revision=REVISION,
             )
 

@@ -36,7 +36,7 @@
       "id": "RR-006",
       "precondition": "ledger disk configuration is incomplete and the device can be entered directly",
       "turns": ["vda", "hyperdisk-balanced,", "1", "20000", "1000"],
-      "expected": "Accept an explicit device and size independently of discovery, normalize surrounding copy punctuation, then collect IOPS and throughput exactly once."
+      "expected": "Accept an explicit device, resolve disk capacity through either a validated manual value or explicit confirmation of a detected value, normalize surrounding copy punctuation, then collect IOPS and throughput exactly once."
     },
     {
       "id": "RR-007",

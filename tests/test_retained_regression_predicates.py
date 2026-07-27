@@ -216,6 +216,109 @@ def _pending_receipt(**updates) -> dict:
     return _hashed(body)
 
 
+def _domain_commit(
+    *,
+    turn_index: int = 1,
+    action_id: str = "action-1",
+    paths: tuple[str, ...] = (),
+) -> dict:
+    return _hashed({
+        "receipt_type": "domain_commit",
+        "turn_index": turn_index,
+        "owner": "environment",
+        "completion": "in_progress",
+        "group_registry_contract_hash": "4" * 64,
+        "pending_before_hash": "1" * 64,
+        "pending_after_hash": "6" * 64,
+        "consumed_action_ids": [action_id],
+        "invalidated_groups": [],
+        "invalidated_fields": [],
+        "response_fragments": [],
+        "reconfigured_groups": [],
+        "group_state_transitions": [],
+        "material_delta": [
+            {
+                "operation": "write",
+                "path": path,
+                "value_hash": "7" * 64,
+            }
+            for path in paths
+        ],
+        "navigation_operation": "",
+        "navigation_origin_group": "",
+        "navigation_target_group": "",
+        "pending_after_id": "",
+    })
+
+
+def _confirmed_field_context(
+    *,
+    message: str,
+    role: str,
+    field: str,
+    resolution_path: str = "typed_manual_value",
+    option_id: str = "",
+    normalizer: str = "semantic_scalar",
+    committed_field: str | None = None,
+    admitted: bool = True,
+    commit_owner: str = "environment",
+    transition_before_hash: str = "1" * 64,
+) -> SimpleNamespace:
+    turn, _ = _turn_and_decision(message)
+    receipt = _pending_receipt(
+        pending_id=field,
+        pending_group="ledger_disk",
+        resolution_path=resolution_path,
+        selected_option_id=option_id,
+        normalizer=normalizer,
+        input_hash=hashlib.sha256(message.encode("utf-8")).hexdigest(),
+        selected_value_hash="7" * 64,
+    )
+    commit = _domain_commit(
+        paths=(f"confirmed_config.{committed_field or field}",),
+    )
+    if commit_owner != "environment":
+        commit = _hashed({
+            **{
+                key: value for key, value in commit.items()
+                if key != "receipt_id"
+            },
+            "owner": commit_owner,
+        })
+    return _context(
+        _event(
+            receipt,
+            commit,
+            pending_transition={
+                "transition": "consumed",
+                "before_id": field,
+                "before_group": "ledger_disk",
+                "before_hash": transition_before_hash,
+                "after_id": "",
+                "after_group": "",
+                "after_hash": "6" * 64,
+                "consumer_action_ids": ["action-1"],
+            },
+            turn_receipt={
+                "admitted_action_ids": ["action-1"] if admitted else [],
+                "owner_bindings": {"action-1": "environment"},
+            },
+            material_diffs={
+                f"confirmed_config.{committed_field or field}": {
+                    "before": "",
+                    "after": "7" * 64,
+                },
+            },
+        ),
+        turns=(turn,),
+        verifier_input_contract=_verifier_input(
+            "exact",
+            (message,),
+            semantic_roles=(role,),
+        ),
+    )
+
+
 def _workload_receipt(**updates) -> dict:
     methods = ["eth_accounts"]
     body = {
@@ -240,6 +343,237 @@ def _workload_receipt(**updates) -> dict:
 
 
 class RetainedRegressionPredicatesTest(unittest.TestCase):
+    def test_disk_size_resolution_accepts_detected_or_manual_capacity(self) -> None:
+        predicate = POSTCONDITION_EVALUATORS["disk_size_resolved"]
+        for resolution_path, option_id in (
+            ("typed_manual_value", ""),
+            ("exact_contract", "1"),
+        ):
+            with self.subTest(resolution_path=resolution_path):
+                context = _confirmed_field_context(
+                    message="926" if not option_id else "1",
+                    role="provide_disk_size",
+                    field="DATA_VOL_SIZE",
+                    resolution_path=resolution_path,
+                    option_id=option_id,
+                    normalizer="semantic_scalar",
+                )
+                satisfied, details = predicate(context)
+                self.assertTrue(satisfied, details)
+
+    def test_disk_size_resolution_rejects_unrelated_or_invalid_receipts(
+        self,
+    ) -> None:
+        predicate = POSTCONDITION_EVALUATORS["disk_size_resolved"]
+        unrelated = _confirmed_field_context(
+            message="1",
+            role="provide_disk_size",
+            field="NETWORK_INTERFACE",
+            resolution_path="exact_contract",
+            option_id="1",
+        )
+        satisfied, details = predicate(unrelated)
+        self.assertFalse(satisfied, details)
+
+        unbound_confirmation = _confirmed_field_context(
+            message="1",
+            role="provide_disk_size",
+            field="DATA_VOL_SIZE",
+            resolution_path="exact_contract",
+            option_id="",
+        )
+        satisfied, details = predicate(unbound_confirmation)
+        self.assertFalse(satisfied, details)
+
+        wrong_commit = _confirmed_field_context(
+            message="926",
+            role="provide_disk_size",
+            field="DATA_VOL_SIZE",
+            committed_field="ACCOUNTS_VOL_SIZE",
+        )
+        satisfied, details = predicate(wrong_commit)
+        self.assertFalse(satisfied, details)
+
+        wrong_role = _confirmed_field_context(
+            message="926",
+            role="provide_disk_iops",
+            field="DATA_VOL_SIZE",
+        )
+        satisfied, details = predicate(wrong_role)
+        self.assertFalse(satisfied, details)
+
+        unadmitted = _confirmed_field_context(
+            message="926",
+            role="provide_disk_size",
+            field="DATA_VOL_SIZE",
+            admitted=False,
+        )
+        satisfied, details = predicate(unadmitted)
+        self.assertFalse(satisfied, details)
+
+        wrong_owner = _confirmed_field_context(
+            message="926",
+            role="provide_disk_size",
+            field="DATA_VOL_SIZE",
+            commit_owner="chain_rpc",
+        )
+        satisfied, details = predicate(wrong_owner)
+        self.assertFalse(satisfied, details)
+
+        wrong_pending_contract = _confirmed_field_context(
+            message="926",
+            role="provide_disk_size",
+            field="DATA_VOL_SIZE",
+            transition_before_hash="8" * 64,
+        )
+        satisfied, details = predicate(wrong_pending_contract)
+        self.assertFalse(satisfied, details)
+
+    def test_disk_scalar_and_limits_require_user_confirmed_field_lineage(
+        self,
+    ) -> None:
+        normalized, details = POSTCONDITION_EVALUATORS[
+            "copied_scalar_normalized"
+        ](_confirmed_field_context(
+            message="hyperdisk-balanced,",
+            role="provide_disk_type",
+            field="DATA_VOL_TYPE",
+        ))
+        self.assertTrue(normalized, details)
+
+        turns = []
+        events = []
+        messages = ("20000", "1000")
+        roles = ("provide_disk_iops", "provide_disk_throughput")
+        fields = ("DATA_VOL_MAX_IOPS", "DATA_VOL_MAX_THROUGHPUT")
+        for index, (message, field) in enumerate(
+            zip(messages, fields, strict=True),
+            start=1,
+        ):
+            turn, _ = _turn_and_decision(message, turn_index=index)
+            turns.append(turn)
+            action_id = f"action-{index}"
+            events.append(_event(
+                _pending_receipt(
+                    turn_index=index,
+                    pending_id=field,
+                    pending_group="ledger_disk",
+                    resolved_action_id=action_id,
+                    resolution_path="typed_manual_value",
+                    selected_option_id="",
+                    normalizer="semantic_scalar",
+                    input_hash=hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                    selected_value_hash="7" * 64,
+                ),
+                _domain_commit(
+                    turn_index=index,
+                    action_id=action_id,
+                    paths=(f"confirmed_config.{field}",),
+                ),
+                turn_index=index,
+                pending_transition={
+                    "transition": "consumed",
+                    "before_id": field,
+                    "before_group": "ledger_disk",
+                    "before_hash": "1" * 64,
+                    "after_id": "",
+                    "after_group": "",
+                    "after_hash": "6" * 64,
+                    "consumer_action_ids": [action_id],
+                },
+                turn_receipt={
+                    "admitted_action_ids": [action_id],
+                    "owner_bindings": {action_id: "environment"},
+                },
+                material_diffs={
+                    f"confirmed_config.{field}": {
+                        "before": "",
+                        "after": "7" * 64,
+                    },
+                },
+            ))
+        context = _context(
+            *events,
+            turns=tuple(turns),
+            verifier_input_contract=_verifier_input(
+                "exact",
+                messages,
+                semantic_roles=roles,
+            ),
+        )
+        collected, details = POSTCONDITION_EVALUATORS[
+            "disk_limits_collected_once"
+        ](context)
+        self.assertTrue(collected, details)
+        repeated, details = POSTCONDITION_EVALUATORS[
+            "disk_subgroup_repeated"
+        ](context)
+        self.assertFalse(repeated, details)
+
+        inferred_only = _context(_event(_domain_commit(
+            paths=("inferred_config.DATA_VOL_MAX_IOPS",),
+        )))
+        collected, details = POSTCONDITION_EVALUATORS[
+            "disk_limits_collected_once"
+        ](inferred_only)
+        self.assertFalse(collected, details)
+
+    def test_environment_retention_distinguishes_durable_and_invocation_state(
+        self,
+    ) -> None:
+        mode_commit = _domain_commit(paths=("target_mode",))
+        clean = _context(_event(mode_commit))
+        retained, details = POSTCONDITION_EVALUATORS[
+            "compatible_environment_retained"
+        ](clean)
+        self.assertTrue(retained, details)
+
+        discovery_mutated = _context(_event(
+            mode_commit,
+            material_diffs={
+                "discovery.disk_candidates": {
+                    "before": "8" * 64,
+                    "after": "9" * 64,
+                },
+            },
+        ))
+        retained, details = POSTCONDITION_EVALUATORS[
+            "compatible_environment_retained"
+        ](discovery_mutated)
+        self.assertTrue(retained, details)
+
+        durable_mutated = _context(_event(
+            mode_commit,
+            material_diffs={
+                "inferred_config.DATA_VOL_SIZE": {
+                    "before": "8" * 64,
+                    "after": "9" * 64,
+                },
+            },
+        ))
+        retained, details = POSTCONDITION_EVALUATORS[
+            "compatible_environment_retained"
+        ](durable_mutated)
+        self.assertFalse(retained, details)
+
+        body = {
+            key: value
+            for key, value in mode_commit.items()
+            if key != "receipt_id"
+        }
+        body["navigation_operation"] = "go_back"
+        body["navigation_origin_group"] = "qps_profile"
+        body["navigation_target_group"] = "workload_rpc"
+        body["material_delta"] = [{
+            "operation": "delete",
+            "path": "confirmed_config.DATA_VOL_SIZE",
+            "value_hash": "",
+        }]
+        lost, details = POSTCONDITION_EVALUATORS[
+            "backtrack_lost_configuration_state"
+        ](_context(_event(_hashed(body))))
+        self.assertTrue(lost, details)
+
     def test_mapping_covers_known_ids_and_implements_variant_claims(
         self,
     ) -> None:
