@@ -125,6 +125,17 @@ block new turns behind explicit reconciliation. Invariant recovery commits on
 the original attempt so one user input cannot produce competing replayable
 results.
 
+All providers use one completion executor with the turn's absolute deadline,
+one bounded retry budget, and fail-closed completion parsing. Read-only
+requests may retry a transport failure or an otherwise normal text completion
+that contains no text; abnormal finish reasons, refusals, safety outcomes,
+tool calls, and alternate structured outputs are never accepted as text.
+The turn-scoped collector is the only provider-attempt evidence authority.
+Successful turns bind its bounded, secret-free sequence to the committed
+checkpoint. Failed turns bind the same sequence to the immutable physical
+attempt checkpoint and terminal diagnostic while leaving Product Head
+unchanged.
+
 `harness/terminal_protocol.py` defines the shared non-secret delivery
 projection. The terminal renders and flushes the complete frame, durably
 appends the projection, and only then acknowledges the outbox row as
@@ -149,10 +160,12 @@ pointing at the wrong attempt. Terminal outcome projection schema v3 preserves
 the complete base/attempt/product lineage. Terminal detour projection schema
 v3 binds the same authority and a durable runtime-event publication fence;
 detours may stream or terminate a session but may never advance Product Head.
-The SQLite turn-transaction ledger is schema v14. Its explicit v12-to-v13
+The SQLite turn-transaction ledger is schema v15. Its explicit v12-to-v13
 migration assigns stable runtime-event identities to older pending committed
 outcomes. Schema v14 adds the complete canonical legacy-detour record to its
-audit quarantine instead of retaining only a partial hash. Current reads and
+audit quarantine instead of retaining only a partial hash. Schema v15 permits
+an aborted provider failure to bind its immutable physical-attempt diagnostic
+checkpoint while the logical Product Head remains unchanged. Current reads and
 legacy migration use one shared semantic validator for the historical v10/v12
 field set, row identity, typed termination, response and rolling-stream
 hashes, Product Head lineage, runtime fence, lifecycle status, and

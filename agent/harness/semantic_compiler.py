@@ -260,6 +260,7 @@ def request_semantic_compilation_result(
         temperature=0.0,
         max_tokens=max_tokens,
         reasoning_mode=reasoning_mode,
+        replay_safety="side_effect_free",
     ))
     raw = str(response.text or "")
     try:
@@ -437,6 +438,7 @@ def request_whole_plan_admission(
             temperature=0.0,
             max_tokens=max_tokens,
             reasoning_mode=reasoning_mode,
+            replay_safety="side_effect_free",
         ))
         previous_output = str(response.text or "")
         admission = validate_whole_plan_admission(

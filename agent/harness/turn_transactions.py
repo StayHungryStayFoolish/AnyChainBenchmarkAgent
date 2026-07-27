@@ -17,7 +17,7 @@ from typing import Any, Iterator, Literal, Mapping, Sequence
 import fcntl
 
 
-TURN_TRANSACTION_SCHEMA_VERSION = 14
+TURN_TRANSACTION_SCHEMA_VERSION = 15
 
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}\Z")
 _HASH_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -525,15 +525,21 @@ class TurnTransactionStore:
         transaction_id: str,
         physical_thread_id: str,
         diagnostic_hash: str,
+        attempt_checkpoint_id: str | None = None,
+        attempt_fingerprint: str | None = None,
         failure_category: str = "unexpected_failure",
     ) -> TerminalOutcome:
+        if (attempt_checkpoint_id is None) != (attempt_fingerprint is None):
+            raise TurnTransactionValidationError(
+                "attempt checkpoint identity and fingerprint must be provided together"
+            )
         return self._finish_attempt(
             logical_thread_id=logical_thread_id,
             transaction_id=transaction_id,
             physical_thread_id=physical_thread_id,
             outcome="aborted",
-            attempt_checkpoint_id=None,
-            attempt_fingerprint=None,
+            attempt_checkpoint_id=attempt_checkpoint_id,
+            attempt_fingerprint=attempt_fingerprint,
             diagnostic_hash=diagnostic_hash,
             render_hash="",
             failure_category=failure_category,
@@ -2124,6 +2130,8 @@ class TurnTransactionStore:
                     pass
                 elif int(row["schema_version"]) == 13:
                     pass
+                elif int(row["schema_version"]) == 14:
+                    pass
                 elif int(row["schema_version"]) != TURN_TRANSACTION_SCHEMA_VERSION:
                     raise TurnTransactionSchemaError(
                         "turn transaction schema version "
@@ -2175,6 +2183,15 @@ class TurnTransactionStore:
                     ).fetchone()
                 if migrated is not None and int(migrated["schema_version"]) == 13:
                     self._migrate_v13_to_v14(connection)
+                    migrated = connection.execute(
+                        """
+                        SELECT schema_version
+                        FROM anychain_turn_transaction_meta
+                        WHERE singleton = 1
+                        """
+                    ).fetchone()
+                if migrated is not None and int(migrated["schema_version"]) == 14:
+                    self._migrate_v14_to_v15(connection)
                 connection.execute(
                     """
                     CREATE UNIQUE INDEX IF NOT EXISTS
@@ -2887,7 +2904,19 @@ class TurnTransactionStore:
             SET schema_version = ?
             WHERE singleton = 1
             """,
-            (TURN_TRANSACTION_SCHEMA_VERSION,),
+            (14,),
+        )
+
+    @staticmethod
+    def _migrate_v14_to_v15(connection: sqlite3.Connection) -> None:
+        """Allow aborted outcomes to bind immutable diagnostic checkpoints."""
+
+        connection.execute(
+            """
+            UPDATE anychain_turn_transaction_meta
+            SET schema_version = 15
+            WHERE singleton = 1
+            """
         )
 
     @contextmanager
@@ -3311,12 +3340,17 @@ def state_fingerprint(serialized_state: bytes) -> str:
     return hashlib.sha256(serialized_state).hexdigest()
 
 
-def _identifier(name: str, value: str) -> str:
+def validate_transaction_identifier(name: str, value: str) -> str:
+    """Validate identifiers shared by transaction and projection authorities."""
+
     if not isinstance(value, str) or not _IDENTIFIER_RE.fullmatch(value):
         raise TurnTransactionValidationError(
             f"{name} must be a non-empty ASCII identifier of at most 255 characters"
         )
     return value
+
+
+_identifier = validate_transaction_identifier
 
 
 def _transaction_id(value: str) -> str:
@@ -3588,11 +3622,11 @@ def _outcome_from_row(row: sqlite3.Row) -> TerminalOutcome:
                 "non-committing terminal outcome lineage is invalid"
             )
         if outcome == "aborted" and (
-            attempt_checkpoint_id is not None
-            or attempt_fingerprint is not None
+            (attempt_checkpoint_id is None)
+            != (attempt_fingerprint is None)
         ):
             raise TurnTransactionSchemaError(
-                "aborted terminal outcome carries attempt identity"
+                "aborted terminal outcome attempt identity is incomplete"
             )
         if outcome == "reconciliation_required" and (
             (attempt_checkpoint_id is None)

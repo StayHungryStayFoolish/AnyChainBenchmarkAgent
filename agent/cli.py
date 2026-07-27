@@ -266,6 +266,7 @@ def main(argv: list[str] | None = None) -> int:
                 ],
                 temperature=0,
                 max_tokens=512,
+                replay_safety="side_effect_free",
             )
         )
         return _emit({"provider": response.provider, "model": response.model, "text": response.text}, None)

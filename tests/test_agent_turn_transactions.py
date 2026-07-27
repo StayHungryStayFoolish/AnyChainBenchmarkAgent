@@ -907,6 +907,30 @@ class TurnTransactionStoreTest(unittest.TestCase):
         self.assertIn("record_json", columns)
         self.assertEqual(version, TURN_TRANSACTION_SCHEMA_VERSION)
 
+    def test_v14_store_migrates_to_diagnostic_checkpoint_schema(self) -> None:
+        connection = sqlite3.connect(self.path)
+        connection.execute(
+            """
+            UPDATE anychain_turn_transaction_meta
+            SET schema_version = 14
+            WHERE singleton = 1
+            """
+        )
+        connection.commit()
+        connection.close()
+
+        TurnTransactionStore(self.path)
+        connection = sqlite3.connect(self.path)
+        self.addCleanup(connection.close)
+        version = connection.execute(
+            """
+            SELECT schema_version
+            FROM anychain_turn_transaction_meta
+            WHERE singleton = 1
+            """
+        ).fetchone()[0]
+        self.assertEqual(version, TURN_TRANSACTION_SCHEMA_VERSION)
+
     def test_v13_incomplete_quarantine_history_fails_closed(self) -> None:
         connection = sqlite3.connect(self.path)
         connection.execute(
@@ -1702,29 +1726,39 @@ class TurnTransactionStoreTest(unittest.TestCase):
                 diagnostic_hash=_hash("different-failure"),
             )
 
-    def test_aborted_outcome_recovery_rejects_attempt_identity(self) -> None:
+    def test_aborted_outcome_binds_complete_diagnostic_identity(self) -> None:
         attempt = self._begin()
-        self.store.abort_attempt(
+        outcome = self.store.abort_attempt(
             logical_thread_id=attempt.logical_thread_id,
             transaction_id=attempt.transaction_id,
             physical_thread_id=attempt.physical_thread_id,
             diagnostic_hash=_hash("provider-timeout"),
+            attempt_checkpoint_id="diagnostic-checkpoint",
+            attempt_fingerprint=_hash("diagnostic-state"),
+        )
+        self.assertEqual(
+            outcome.attempt_checkpoint_id,
+            "diagnostic-checkpoint",
+        )
+        self.assertEqual(
+            outcome.attempt_fingerprint,
+            _hash("diagnostic-state"),
         )
         connection = sqlite3.connect(self.path)
         connection.execute(
             """
             UPDATE anychain_terminal_outbox
-            SET attempt_checkpoint_id = ?, attempt_fingerprint = ?
+            SET attempt_fingerprint = NULL
             WHERE transaction_id = ?
             """,
-            ("unexpected-checkpoint", _hash("unexpected"), attempt.transaction_id),
+            (attempt.transaction_id,),
         )
         connection.commit()
         connection.close()
 
         with self.assertRaisesRegex(
             TurnTransactionSchemaError,
-            "aborted terminal outcome carries attempt identity",
+            "aborted terminal outcome attempt identity is incomplete",
         ):
             self.store.get_terminal_outcome(attempt.transaction_id)
 

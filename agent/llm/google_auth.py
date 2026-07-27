@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from agent.llm.config import LLMConfig
+from agent.llm.types import ensure_turn_active, remaining_turn_seconds
 
 
 CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
@@ -49,6 +50,22 @@ def get_google_access_token(config: LLMConfig) -> str:
             "environment or use the project Docker image."
         ) from exc
 
+    transport = Request()
+
+    def deadline_request(*args: object, **kwargs: object) -> object:
+        remaining = remaining_turn_seconds(config.turn_timeout_seconds)
+        requested = kwargs.get("timeout")
+        if (
+            not isinstance(requested, (int, float))
+            or isinstance(requested, bool)
+            or requested <= 0
+            or requested > remaining
+        ):
+            kwargs["timeout"] = remaining
+        response = transport(*args, **kwargs)
+        ensure_turn_active()
+        return response
+
     scopes = [CLOUD_PLATFORM_SCOPE]
     if config.auth_mode == "service_account_file":
         try:
@@ -60,7 +77,10 @@ def get_google_access_token(config: LLMConfig) -> str:
             scopes=scopes,
         )
     else:
-        credentials, _ = google.auth.default(scopes=scopes)
+        credentials, _ = google.auth.default(
+            scopes=scopes,
+            request=deadline_request,
+        )
         if config.auth_mode == "service_account_impersonation":
             try:
                 from google.auth import impersonated_credentials
@@ -73,5 +93,7 @@ def get_google_access_token(config: LLMConfig) -> str:
                 lifetime=3600,
             )
 
-    credentials.refresh(Request())
+    ensure_turn_active()
+    credentials.refresh(deadline_request)
+    ensure_turn_active()
     return credentials.token

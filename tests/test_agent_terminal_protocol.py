@@ -356,6 +356,48 @@ class TerminalProjectionContractTest(unittest.TestCase):
         ):
             validate_terminal_outcome_projection(payload)
 
+    def test_projection_rejects_invalid_aborted_checkpoint_identifiers(
+        self,
+    ) -> None:
+        from agent.harness.terminal_protocol import (
+            TerminalProtocolError,
+            build_terminal_outcome_projection,
+            validate_terminal_outcome_projection,
+        )
+
+        outcome = replace(
+            self._make_outcome(),
+            outcome="aborted",
+            diagnostic_hash="4" * 64,
+            render_hash="",
+            failure_category="provider_failure",
+            product_revision=0,
+            product_checkpoint_thread_id="head",
+            product_checkpoint_id="checkpoint-0",
+            product_fingerprint="0" * 64,
+            runtime_event_id="",
+            runtime_event_sequence=0,
+            runtime_event_status="not_applicable",
+            runtime_event_payload_hash=None,
+            runtime_event_published_at=None,
+        )
+        original = build_terminal_outcome_projection(
+            outcome,
+            rendered_frame="Agent> failed",
+            delivery_phase="live",
+        ).as_dict()
+
+        for invalid in ("   ", "x" * 256, "checkpoint id"):
+            with self.subTest(identifier=invalid):
+                payload = dict(original)
+                payload["attempt_checkpoint_id"] = invalid
+                self._reseal(payload)
+                with self.assertRaisesRegex(
+                    TerminalProtocolError,
+                    "attempt checkpoint identity is invalid",
+                ):
+                    validate_terminal_outcome_projection(payload)
+
     def test_projection_rejects_noncommitting_product_identity_change(
         self,
     ) -> None:
@@ -395,6 +437,44 @@ class TerminalProjectionContractTest(unittest.TestCase):
             "changed Product Head identity",
         ):
             validate_terminal_outcome_projection(payload)
+
+    def test_aborted_projection_preserves_diagnostic_checkpoint_identity(
+        self,
+    ) -> None:
+        from agent.harness.terminal_protocol import (
+            build_terminal_outcome_projection,
+        )
+
+        outcome = replace(
+            self._make_outcome(),
+            outcome="aborted",
+            diagnostic_hash="4" * 64,
+            render_hash="",
+            failure_category="provider_failure",
+            product_revision=0,
+            product_checkpoint_thread_id="head",
+            product_checkpoint_id="checkpoint-0",
+            product_fingerprint="0" * 64,
+            runtime_event_id="",
+            runtime_event_sequence=0,
+            runtime_event_status="not_applicable",
+            runtime_event_payload_hash=None,
+            runtime_event_published_at=None,
+        )
+        projection = build_terminal_outcome_projection(
+            outcome,
+            rendered_frame="Agent> provider failure",
+            delivery_phase="live",
+        )
+
+        self.assertEqual(
+            projection.attempt_checkpoint_id,
+            outcome.attempt_checkpoint_id,
+        )
+        self.assertEqual(
+            projection.attempt_fingerprint,
+            outcome.attempt_fingerprint,
+        )
 
     def test_reconciliation_projection_preserves_optional_attempt_evidence(
         self,

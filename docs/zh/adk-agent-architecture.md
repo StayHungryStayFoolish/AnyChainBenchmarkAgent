@@ -139,6 +139,16 @@ invariant recovery 必须在原来的 physical attempt 上提交类型化 recove
 进程重启时，active attempt 根据类型化 side-effect evidence 收口，未交付 outbox
 结果从精确 checkpoint 和 render hash 重放。
 
+所有 provider call 都必须在本轮 absolute deadline 和同一个有限 retry budget
+内通过统一 completion executor。只有 side-effect-free 请求遇到 transport
+failure，或 finish disposition 正常但 text 为空时才能重试。异常 finish reason、
+refusal、safety outcome、tool call 与其他 structured output 即使携带部分文本也
+必须 fail closed。turn-scoped collector 是唯一 provider-attempt evidence
+权威：成功 turn 将有限、非敏感的 attempt sequence 绑定到 committed Product
+Head checkpoint；失败 turn 将同一 sequence 写入不可变 physical-attempt
+checkpoint，并把该 checkpoint 绑定到 terminal diagnostic。provider failure、
+timeout 与 cancellation 都不得推进 Product Head。
+
 `terminal_protocol.py` 是产品与 live acceptance runner 共用的非敏感终端投影
 协议。交付顺序固定为：
 
@@ -166,15 +176,17 @@ detour projection schema version 3。detour 必须携带显式 Product Head
 authority、完整且保持不变的前后 head、input/stream hash、类型化 stop reason，
 以及启动 detour 时观察到的 durable runtime-event publication fence；它不得创建
 workflow attempt 或伪造 runtime event。SQLite turn-transaction ledger 当前为
-schema version 14；显式 v12-to-v13 migration 会为旧的 pending committed
-outcome 分配稳定 runtime-event identity，v13-to-v14 migration 会在审计
-quarantine 中保留完整 canonical legacy-detour record。当前读取与迁移必须
-复用同一个语义 validator，统一验证历史 v10/v12 的精确字段集合、quarantine
-row 身份、类型化 termination、response 与 rolling-stream hash、Product Head
-lineage、runtime fence、lifecycle status 及 reconciliation provenance。
-terminal projection 还必须独立拒绝未知 effect class 与不可投影的 effect
-status；残缺、身份不一致，或 record hash 正确但语义非法的审计记录必须
-fail-closed。包含
+schema version 15。显式 v12-to-v13 migration 会为旧的 pending committed
+outcome 分配稳定 runtime-event identity；v13-to-v14 migration 会在审计
+quarantine 中保留完整 canonical legacy-detour record；v14-to-v15 允许 aborted
+provider turn 绑定不可变 physical-attempt diagnostic checkpoint，但不得推进
+Product Head。当前读取与迁移必须复用同一个语义 validator，统一验证历史
+v10/v12 的精确字段集合、quarantine row 身份、类型化 termination、response
+与 rolling-stream hash、Product Head lineage、runtime fence、lifecycle
+status 及 reconciliation provenance。terminal projection 还必须独立拒绝未知
+effect class、不可投影的 effect status、非法 attempt checkpoint identifier，
+以及不完整的 checkpoint/fingerprint pair；残缺、身份不一致，或 record hash
+正确但语义非法的审计记录必须 fail-closed。包含
 committed 历史的 v10 ledger 因无法证明权威 revision
 顺序而必须拒绝迁移；所有缺少 runtime-event fence 的 legacy detour（包括
 completed 但未交付的记录）都必须写入审计 quarantine，并从 live replay

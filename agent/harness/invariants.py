@@ -5,6 +5,11 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Mapping
 
+from ..llm.types import (
+    MAX_PROVIDER_ATTEMPT_RECORDS,
+    validate_provider_attempt_record,
+)
+
 from agent.workflows.group_registry import GROUPS
 from .contracts import DOMAIN_CONTROL_ROOTS, StateDelta, StatePath
 from .domains.registry import GROUP_OWNER
@@ -148,6 +153,28 @@ def _delete_path(state: dict[str, Any], path: StatePath) -> None:
         current.pop(path[-1], None)
 
 
+def _validate_provider_attempt_evidence(evidence: Any) -> None:
+    if not isinstance(evidence, (list, tuple)):
+        raise StateInvariantError(
+            "provider attempt evidence must be a list"
+        )
+    if len(evidence) > MAX_PROVIDER_ATTEMPT_RECORDS:
+        raise StateInvariantError(
+            "provider attempt evidence exceeds the per-turn limit"
+        )
+    for record in evidence:
+        if not isinstance(record, Mapping):
+            raise StateInvariantError(
+                "provider attempt evidence shape is invalid"
+            )
+        try:
+            validate_provider_attempt_record(record)
+        except ValueError as exc:
+            raise StateInvariantError(
+                "provider attempt evidence semantics are invalid"
+            ) from exc
+
+
 def validate_state(state: AgentGraphState) -> None:
     declared_roots = (
         set(AgentGraphState.__optional_keys__)
@@ -159,6 +186,12 @@ def validate_state(state: AgentGraphState) -> None:
             "state contains undeclared top-level roots: "
             + ", ".join(undeclared_roots)
         )
+    turn_context = state.get("turn_context") or {}
+    _validate_provider_attempt_evidence(
+        turn_context["provider_attempt_evidence"]
+        if "provider_attempt_evidence" in turn_context
+        else ()
+    )
 
     planning = state.get("semantic_planning") or {}
     if planning:

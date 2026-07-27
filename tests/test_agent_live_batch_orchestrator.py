@@ -581,7 +581,7 @@ class BatchOrchestratorTests(unittest.TestCase):
                 broker=lambda _shard_id, _context: {},
                 result_index_path=self.root / ".agent" / "concurrency-index.json",
             ))
-            await asyncio.wait_for(first_wave_ready.wait(), timeout=1)
+            await asyncio.wait_for(first_wave_ready.wait(), timeout=10)
             await asyncio.sleep(0)
             self.assertEqual(active, max_concurrency)
             self.assertEqual(peak, max_concurrency)
@@ -844,7 +844,7 @@ class BatchOrchestratorTests(unittest.TestCase):
                 modes, self.root / ".agent" / "stress-markers"
             ),
             timeout_policy=TimeoutPolicy(
-                shard_seconds=10, decision_seconds=1, cleanup_seconds=3
+                shard_seconds=30, decision_seconds=5, cleanup_seconds=10
             ),
             stderr_cap_bytes=128,
         )

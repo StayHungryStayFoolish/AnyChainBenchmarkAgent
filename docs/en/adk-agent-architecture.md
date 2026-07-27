@@ -151,6 +151,17 @@ result for the same accepted input. On restart, active attempts are closed
 from typed side-effect evidence and undelivered outbox results are replayed
 from their exact checkpoint and render hash.
 
+Every provider call uses one completion executor under the turn's absolute
+deadline and one bounded retry budget. A side-effect-free request may retry a
+transport failure or a normal text completion with empty text. Abnormal finish
+reasons, refusals, safety outcomes, tool calls, and alternate structured
+outputs fail closed even when partial text is present. The turn-scoped
+collector is the sole provider-attempt evidence authority: a successful turn
+stores its bounded, secret-free sequence with the committed Product Head
+checkpoint; a failed turn stores the same sequence in an immutable physical
+attempt checkpoint and binds that checkpoint to the terminal diagnostic.
+Provider failure, timeout, and cancellation never advance Product Head.
+
 `terminal_protocol.py` defines the shared non-secret terminal projection used
 by the product and live acceptance runners. Delivery order is:
 
@@ -180,15 +191,18 @@ use terminal detour projection schema version 3. A detour carries the explicit
 Product Head authority, complete unchanged before/after head, input and stream
 hashes, typed stop reason, and the durable runtime-event publication fence
 observed when it began. It never creates a workflow attempt or synthetic
-runtime event. The SQLite turn-transaction ledger is schema version 14; the
+runtime event. The SQLite turn-transaction ledger is schema version 15. The
 explicit v12-to-v13 migration assigns stable runtime-event identities to
-older pending committed outcomes, and v13-to-v14 retains the complete
-canonical legacy-detour record in the audit quarantine. Current reads and
-migration use the same semantic validator for the exact historical v10/v12
-field set, quarantine-row identity, typed termination, response and
-rolling-stream hashes, Product Head lineage, runtime fence, lifecycle status,
-and reconciliation provenance. Terminal projections independently reject
-unknown effect classes and unprojectable effect statuses. Partial,
+older pending committed outcomes; v13-to-v14 retains the complete canonical
+legacy-detour record in the audit quarantine; v14-to-v15 allows an aborted
+provider turn to bind its immutable physical-attempt diagnostic checkpoint
+without advancing Product Head. Current reads and migration use the same
+semantic validator for the exact historical v10/v12 field set,
+quarantine-row identity, typed termination, response and rolling-stream
+hashes, Product Head lineage, runtime fence, lifecycle status, and
+reconciliation provenance. Terminal projections independently reject unknown
+effect classes, unprojectable effect statuses, invalid attempt checkpoint
+identifiers, and incomplete checkpoint/fingerprint pairs. Partial,
 identity-mismatched, or correctly hashed but semantically invalid audit
 records fail closed. A v10 ledger
 containing committed history

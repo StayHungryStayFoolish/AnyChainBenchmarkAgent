@@ -44,6 +44,7 @@ def resolve_unknown_chain_identity(
                 ],
                 temperature=0.0,
                 max_tokens=900,
+                replay_safety="side_effect_free",
             )
         )
         payload = _parse_json_object(response.text)
@@ -110,6 +111,7 @@ def _extract_chain_mention_with_provider(
             ],
             temperature=0.0,
             max_tokens=300,
+            replay_safety="side_effect_free",
         )
     )
     return _parse_json_object(response.text)
@@ -144,6 +146,7 @@ def extract_rpc_schema_from_evidence(
                 ],
                 temperature=0.0,
                 max_tokens=1200,
+                replay_safety="side_effect_free",
             )
         )
         payload = _parse_json_object(response.text)
@@ -228,6 +231,7 @@ def analyze_evidence_with_model(
                 ],
                 temperature=0.0,
                 max_tokens=1200,
+                replay_safety="side_effect_free",
             )
         )
         answer = str(response.text or "").strip()

@@ -20,6 +20,7 @@ from ..llm.types import (
     LLMTurnTimeoutError,
     ensure_turn_active,
     llm_turn_scope,
+    provider_attempt_evidence,
 )
 from .coordinator import (
     admit_turn_step,
@@ -693,6 +694,30 @@ class AnyChainGraphRuntime:
         attempt: TurnAttempt,
         exc: BaseException,
     ) -> TerminalOutcome:
+        provider_evidence = [
+            dict(item) for item in provider_attempt_evidence()
+        ]
+        evidence_checkpoint_id = ""
+        evidence_checkpoint_hash = ""
+        evidence_persistence_error = ""
+        if provider_evidence:
+            try:
+                (
+                    evidence_checkpoint_id,
+                    evidence_checkpoint_hash,
+                ) = (
+                    self._persist_failed_provider_attempt_evidence(
+                        attempt,
+                        provider_evidence,
+                    )
+                )
+            except Exception as persistence_exc:
+                evidence_persistence_error = type(persistence_exc).__name__
+                add_note = getattr(exc, "add_note", None)
+                if callable(add_note):
+                    add_note(
+                        "provider attempt evidence could not be persisted"
+                    )
         diagnostic_hash = _canonical_hash({
             "type": type(exc).__name__,
             "provider": str(getattr(exc, "provider", "") or ""),
@@ -700,12 +725,33 @@ class AnyChainGraphRuntime:
             "stage": str(getattr(exc, "stage", "") or ""),
             "category": str(getattr(exc, "category", "") or ""),
             "status_code": int(getattr(exc, "status_code", 0) or 0),
+            "attempt_count": int(
+                getattr(exc, "attempt_count", 0) or 0
+            ),
+            "retry_reasons": list(
+                getattr(exc, "retry_reasons", ()) or ()
+            ),
+            "retry_exhausted": bool(
+                getattr(exc, "retry_exhausted", False)
+            ),
+            "last_finish_reason": str(
+                getattr(exc, "last_finish_reason", "") or ""
+            ),
+            "provider_attempt_evidence": provider_evidence,
+            "provider_evidence_checkpoint_id": evidence_checkpoint_id,
+            "provider_evidence_checkpoint_hash": evidence_checkpoint_hash,
+            "provider_evidence_persistence_error": evidence_persistence_error,
         })
         (
             requires_reconciliation,
             checkpoint_id,
             checkpoint_fingerprint,
         ) = self._attempt_effect_evidence(attempt)
+        failure_category = (
+            "provider_evidence_persistence_failure"
+            if evidence_persistence_error
+            else _failure_category(exc)
+        )
 
         if requires_reconciliation:
             checkpoint_arguments = (
@@ -722,7 +768,7 @@ class AnyChainGraphRuntime:
                     transaction_id=attempt.transaction_id,
                     physical_thread_id=attempt.physical_thread_id,
                     diagnostic_hash=diagnostic_hash,
-                    failure_category=_failure_category(exc),
+                    failure_category=failure_category,
                     **checkpoint_arguments,
                 )
             )
@@ -732,9 +778,62 @@ class AnyChainGraphRuntime:
                 transaction_id=attempt.transaction_id,
                 physical_thread_id=attempt.physical_thread_id,
                 diagnostic_hash=diagnostic_hash,
-                failure_category=_failure_category(exc),
+                attempt_checkpoint_id=(
+                    evidence_checkpoint_id or None
+                ),
+                attempt_fingerprint=(
+                    evidence_checkpoint_hash or None
+                ),
+                failure_category=failure_category,
             )
         return self._last_terminal_outcome
+
+    def _persist_failed_provider_attempt_evidence(
+        self,
+        attempt: TurnAttempt,
+        evidence: list[dict[str, Any]],
+    ) -> tuple[str, str]:
+        """Retain failed-turn provider evidence on the physical attempt only."""
+
+        config = {"configurable": {"thread_id": attempt.physical_thread_id}}
+        snapshot = self.graph.get_state(config)
+        state = dict(getattr(snapshot, "values", {}) or {})
+        if not state:
+            raise RuntimeError(
+                "failed turn has no physical attempt checkpoint"
+            )
+        state.setdefault("turn_context", {})[
+            "provider_attempt_evidence"
+        ] = deepcopy(evidence)
+        validate_state(state)
+        updated_config = self.graph.update_state(
+            config,
+            project_checkpoint_state(state),
+            as_node="provider_audit",
+        )
+        persisted = self.graph.get_state(config)
+        values = dict(getattr(persisted, "values", {}) or {})
+        observed = list(
+            (values.get("turn_context") or {}).get(
+                "provider_attempt_evidence"
+            )
+            or ()
+        )
+        if observed != evidence:
+            raise RuntimeError(
+                "failed-turn provider evidence checkpoint mismatch"
+            )
+        checkpoint_id = str(
+            (updated_config or {}).get("configurable", {}).get(
+                "checkpoint_id",
+                "",
+            )
+        )
+        if not checkpoint_id:
+            raise RuntimeError(
+                "failed-turn provider evidence has no checkpoint identity"
+            )
+        return checkpoint_id, _state_fingerprint(values)
 
     def _recover_interrupted_attempts(self) -> None:
         """Close attempts left by a process that no longer owns the lease."""
@@ -771,13 +870,54 @@ class AnyChainGraphRuntime:
                     )
                 )
             else:
+                diagnostic_checkpoint_arguments = (
+                    self._interrupted_provider_evidence_identity(
+                        attempt,
+                        checkpoint_id,
+                        checkpoint_fingerprint,
+                    )
+                )
                 self._last_terminal_outcome = self.turn_transactions.abort_attempt(
                     logical_thread_id=self.transaction_authority_id,
                     transaction_id=attempt.transaction_id,
                     physical_thread_id=attempt.physical_thread_id,
                     diagnostic_hash=diagnostic_hash,
+                    **diagnostic_checkpoint_arguments,
                     failure_category="runtime_restart_interrupted",
                 )
+
+    def _interrupted_provider_evidence_identity(
+        self,
+        attempt: TurnAttempt,
+        checkpoint_id: str,
+        checkpoint_fingerprint: str,
+    ) -> dict[str, str]:
+        if not checkpoint_id or not checkpoint_fingerprint:
+            return {}
+        snapshot = self.graph.get_state({
+            "configurable": {
+                "thread_id": attempt.physical_thread_id,
+                "checkpoint_id": checkpoint_id,
+            }
+        })
+        values = dict(getattr(snapshot, "values", {}) or {})
+        turn_context = values.get("turn_context") or {}
+        if "provider_attempt_evidence" not in turn_context:
+            return {}
+        validate_state(values)
+        evidence = turn_context.get("provider_attempt_evidence")
+        if not evidence:
+            raise RuntimeError(
+                "interrupted provider evidence checkpoint is empty"
+            )
+        if _state_fingerprint(values) != checkpoint_fingerprint:
+            raise RuntimeError(
+                "interrupted provider evidence checkpoint fingerprint mismatch"
+            )
+        return {
+            "attempt_checkpoint_id": checkpoint_id,
+            "attempt_fingerprint": checkpoint_fingerprint,
+        }
 
     def _recover_missing_runtime_observations(self) -> None:
         """Rebuild committed runtime evidence after a post-commit crash."""
@@ -1666,6 +1806,7 @@ def build_graph(checkpointer: Any) -> Any:
     graph.add_node("commit_receipt", _contextual_step(commit_side_effect_receipt_step))
     graph.add_node("fallback", _contextual_step(fallback_turn_step))
     graph.add_node("compose", _contextual_step(compose_turn_step))
+    graph.add_node("provider_audit", _provider_audit_graph_step)
     graph.add_node("validate", _validate_graph_state)
 
     graph.add_edge(START, "prepare")
@@ -1692,9 +1833,24 @@ def build_graph(checkpointer: Any) -> Any:
     graph.add_conditional_edges("perform_effect", _next_phase, _PHASE_NODE)
     graph.add_conditional_edges("commit_receipt", _next_phase, _PHASE_NODE)
     graph.add_edge("fallback", "compose")
-    graph.add_edge("compose", "validate")
+    graph.add_edge("compose", "provider_audit")
+    graph.add_edge("provider_audit", "validate")
     graph.add_edge("validate", END)
     return graph.compile(checkpointer=checkpointer)
+
+
+def _provider_audit_graph_step(
+    state: AgentGraphState,
+) -> AgentGraphState:
+    """Persist secret-free provider attempt evidence for the completed turn."""
+
+    output: AgentGraphState = deepcopy(state)
+    evidence = provider_attempt_evidence()
+    if evidence:
+        output.setdefault("turn_context", {})[
+            "provider_attempt_evidence"
+        ] = [dict(item) for item in evidence]
+    return output
 
 
 _PHASE_NODE = {

@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import socket
+import time
+from dataclasses import dataclass
 from typing import Any
 from urllib import error as urlerror
 from urllib import parse as urlparse
@@ -18,11 +20,26 @@ from .types import (
     LLMProviderError,
     LLMRequest,
     LLMResponse,
+    LLMTurnCancelledError,
     LLMTurnTimeoutError,
     ensure_turn_active,
     llm_turn_scope,
+    record_provider_attempt,
     remaining_turn_seconds,
 )
+
+
+@dataclass(frozen=True)
+class _CompletionResult:
+    response: Any
+    text: str
+    attempt_count: int
+    retry_reasons: tuple[str, ...]
+    last_finish_reason: str
+
+
+class _ProviderClientCloseError(RuntimeError):
+    """A client lifecycle failure after a completed provider request."""
 
 
 class OpenAIProvider:
@@ -35,21 +52,42 @@ class OpenAIProvider:
         except ImportError as exc:  # pragma: no cover - optional dependency guard
             raise RuntimeError("openai is required for LLM_PROVIDER=openai") from exc
 
-        client = _openai_client(OpenAI, self.config, api_key=self.config.openai_api_key or None)
-        response = _openai_request(
+        result = _execute_completion(
             self.config,
-            lambda: client.chat.completions.create(
-                model=self.config.model,
-                messages=_openai_messages(request.messages),
-                **_openai_completion_options(self.config.model, request),
+            request,
+            lambda: _openai_request(
+                self.config,
+                lambda: _openai_completion_call(
+                    lambda: _openai_client(
+                        OpenAI,
+                        self.config,
+                        api_key=self.config.openai_api_key or None,
+                    ),
+                    lambda client: client.chat.completions.create(
+                        model=self.config.model,
+                        messages=_openai_messages(request.messages),
+                        **_openai_completion_options(self.config.model, request),
+                    ),
+                ),
+            ),
+            lambda response: _parse_openai_completion(
+                self.config,
+                request,
+                response,
             ),
         )
-        text = _openai_response_text(self.config, response)
         return LLMResponse(
-            text=text,
+            text=result.text,
             model=self.config.model,
             provider=self.config.provider,
-            raw=response.model_dump() if hasattr(response, "model_dump") else {},
+            raw=(
+                result.response.model_dump()
+                if hasattr(result.response, "model_dump")
+                else {}
+            ),
+            attempt_count=result.attempt_count,
+            retry_reasons=result.retry_reasons,
+            last_finish_reason=result.last_finish_reason,
         )
 
 
@@ -65,26 +103,43 @@ class DeepSeekProvider:
         except ImportError as exc:  # pragma: no cover - optional dependency guard
             raise RuntimeError("openai is required for LLM_PROVIDER=deepseek") from exc
 
-        client = _openai_client(
-            OpenAI,
+        result = _execute_completion(
             self.config,
-            api_key=self.config.deepseek_api_key or None,
-            base_url="https://api.deepseek.com",
-        )
-        response = _openai_request(
-            self.config,
-            lambda: client.chat.completions.create(
-                model=self.config.model,
-                messages=_openai_messages(request.messages),
-                **_deepseek_completion_options(request),
+            request,
+            lambda: _openai_request(
+                self.config,
+                lambda: _openai_completion_call(
+                    lambda: _openai_client(
+                        OpenAI,
+                        self.config,
+                        api_key=self.config.deepseek_api_key or None,
+                        base_url="https://api.deepseek.com",
+                    ),
+                    lambda client: client.chat.completions.create(
+                        model=self.config.model,
+                        messages=_openai_messages(request.messages),
+                        **_deepseek_completion_options(request),
+                    ),
+                ),
+            ),
+            lambda response: _parse_openai_completion(
+                self.config,
+                request,
+                response,
             ),
         )
-        text = _openai_response_text(self.config, response)
         return LLMResponse(
-            text=text,
+            text=result.text,
             model=self.config.model,
             provider=self.config.provider,
-            raw=response.model_dump() if hasattr(response, "model_dump") else {},
+            raw=(
+                result.response.model_dump()
+                if hasattr(result.response, "model_dump")
+                else {}
+            ),
+            attempt_count=result.attempt_count,
+            retry_reasons=result.retry_reasons,
+            last_finish_reason=result.last_finish_reason,
         )
 
 
@@ -100,25 +155,48 @@ class VertexGeminiProvider:
         except ImportError as exc:  # pragma: no cover - optional dependency guard
             raise RuntimeError("openai is required for Gemini on Vertex OpenAI-compatible calls") from exc
 
-        token = get_google_access_token(self.config)
-        base_url = _vertex_openai_base_url(self.config)
-        client = _openai_client(OpenAI, self.config, api_key=token, base_url=base_url)
-        response = _openai_request(
-            self.config,
-            lambda: client.chat.completions.create(
-                model=f"google/{self.config.model}",
-                messages=_openai_messages(request.messages),
-                temperature=request.temperature,
-                max_tokens=request.max_tokens,
-                tools=request.tools or None,
-            ),
-        )
-        text = _openai_response_text(self.config, response)
+        with llm_turn_scope(self.config.turn_timeout_seconds):
+            token = _vertex_access_token(self.config)
+            base_url = _vertex_openai_base_url(self.config)
+            result = _execute_completion(
+                self.config,
+                request,
+                lambda: _openai_request(
+                    self.config,
+                    lambda: _openai_completion_call(
+                        lambda: _openai_client(
+                            OpenAI,
+                            self.config,
+                            api_key=token,
+                            base_url=base_url,
+                        ),
+                        lambda client: client.chat.completions.create(
+                            model=f"google/{self.config.model}",
+                            messages=_openai_messages(request.messages),
+                            temperature=request.temperature,
+                            max_tokens=request.max_tokens,
+                            tools=request.tools or None,
+                        ),
+                    ),
+                ),
+                lambda response: _parse_openai_completion(
+                    self.config,
+                    request,
+                    response,
+                ),
+            )
         return LLMResponse(
-            text=text,
+            text=result.text,
             model=self.config.model,
             provider=self.config.provider,
-            raw=response.model_dump() if hasattr(response, "model_dump") else {},
+            raw=(
+                result.response.model_dump()
+                if hasattr(result.response, "model_dump")
+                else {}
+            ),
+            attempt_count=result.attempt_count,
+            retry_reasons=result.retry_reasons,
+            last_finish_reason=result.last_finish_reason,
         )
 
 
@@ -173,9 +251,17 @@ class GeminiAPIKeyProvider:
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"{urlparse.quote(self.config.model, safe='')}:generateContent?key={urlparse.quote(api_key, safe='')}"
         )
-        response = _post_json(url, payload, headers={}, config=self.config)
-        text = _gemini_text(self.config, response)
-        return LLMResponse(text=text, model=self.config.model, provider=self.config.provider, raw=response)
+        result = _execute_completion(
+            self.config,
+            request,
+            lambda: _post_json(url, payload, headers={}, config=self.config),
+            lambda response: _parse_gemini_completion(
+                self.config,
+                request,
+                response,
+            ),
+        )
+        return _llm_response(self.config, result)
 
 
 class VertexClaudeProvider:
@@ -186,8 +272,6 @@ class VertexClaudeProvider:
 
     def complete(self, request: LLMRequest) -> LLMResponse:
         system, messages = _anthropic_messages(request.messages)
-        token = get_google_access_token(self.config)
-        url = _vertex_raw_predict_url(self.config, "anthropic", self.config.model)
         payload: dict[str, Any] = {
             "anthropic_version": "vertex-2023-10-16",
             "messages": messages,
@@ -198,14 +282,29 @@ class VertexClaudeProvider:
             payload["system"] = system
         if request.tools:
             payload["tools"] = request.tools
-        response = _post_json(url, payload, headers={"Authorization": f"Bearer {token}"}, config=self.config)
-        text = _anthropic_text(self.config, response)
-        return LLMResponse(
-            text=text,
-            model=self.config.model,
-            provider=self.config.provider,
-            raw=response,
-        )
+        with llm_turn_scope(self.config.turn_timeout_seconds):
+            token = _vertex_access_token(self.config)
+            url = _vertex_raw_predict_url(
+                self.config,
+                "anthropic",
+                self.config.model,
+            )
+            result = _execute_completion(
+                self.config,
+                request,
+                lambda: _post_json(
+                    url,
+                    payload,
+                    headers={"Authorization": f"Bearer {token}"},
+                    config=self.config,
+                ),
+                lambda response: _parse_anthropic_completion(
+                    self.config,
+                    request,
+                    response,
+                ),
+            )
+        return _llm_response(self.config, result)
 
 
 class AnthropicAPIKeyProvider:
@@ -229,17 +328,25 @@ class AnthropicAPIKeyProvider:
             payload["system"] = system
         if request.tools:
             payload["tools"] = request.tools
-        response = _post_json(
-            "https://api.anthropic.com/v1/messages",
-            payload,
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-            },
-            config=self.config,
+        result = _execute_completion(
+            self.config,
+            request,
+            lambda: _post_json(
+                "https://api.anthropic.com/v1/messages",
+                payload,
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                },
+                config=self.config,
+            ),
+            lambda response: _parse_anthropic_completion(
+                self.config,
+                request,
+                response,
+            ),
         )
-        text = _anthropic_text(self.config, response)
-        return LLMResponse(text=text, model=self.config.model, provider=self.config.provider, raw=response)
+        return _llm_response(self.config, result)
 
 
 def _openai_client(client_type: Any, config: LLMConfig, **kwargs: Any) -> Any:
@@ -255,7 +362,83 @@ def _openai_client(client_type: Any, config: LLMConfig, **kwargs: Any) -> Any:
         write=read_timeout,
         pool=connect_timeout,
     )
-    return client_type(timeout=timeout, max_retries=config.max_retries, **kwargs)
+    return client_type(timeout=timeout, max_retries=0, **kwargs)
+
+
+def _openai_completion_call(client_factory: Any, create: Any) -> Any:
+    client = client_factory()
+    try:
+        result = create(client)
+    except BaseException as primary:
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except BaseException as close_error:
+                add_note = getattr(primary, "add_note", None)
+                if callable(add_note):
+                    add_note(
+                        "provider client close also failed with "
+                        f"{type(close_error).__name__}"
+                    )
+        raise
+    close = getattr(client, "close", None)
+    if callable(close):
+        try:
+            close()
+        except (LLMTurnCancelledError, LLMTurnTimeoutError):
+            raise
+        except Exception as close_error:
+            raise _ProviderClientCloseError(
+                "provider client close failed after a completed request"
+            ) from close_error
+    return result
+
+
+def _vertex_access_token(config: LLMConfig) -> str:
+    try:
+        ensure_turn_active()
+        token = get_google_access_token(config)
+        ensure_turn_active()
+    except (LLMTurnTimeoutError, LLMTurnCancelledError) as exc:
+        _attach_terminal_attempt_evidence(
+            exc,
+            config=config,
+            attempt_count=1,
+            retry_reasons=(),
+            last_finish_reason="",
+        )
+        _record_terminal_outcome(config, exc)
+        raise
+    except Exception as exc:
+        if _is_transport_timeout(exc):
+            try:
+                ensure_turn_active()
+            except (LLMTurnTimeoutError, LLMTurnCancelledError) as terminal:
+                _attach_terminal_attempt_evidence(
+                    terminal,
+                    config=config,
+                    attempt_count=1,
+                    retry_reasons=(),
+                    last_finish_reason="",
+                )
+                _record_terminal_outcome(config, terminal)
+                raise
+            error = _transport_error(
+                config,
+                "credential_transport_timeout",
+            )
+        else:
+            error = _provider_error(config, exc)
+        terminal = _provider_error_with_attempt_evidence(
+            error,
+            attempt_count=1,
+            retry_reasons=(),
+            retry_exhausted=False,
+        )
+        _record_provider_failure(config, terminal)
+        raise terminal from exc
+    return token
 
 
 def _openai_request(config: LLMConfig, call: Any) -> Any:
@@ -264,38 +447,342 @@ def _openai_request(config: LLMConfig, call: Any) -> Any:
         response = call()
     except Exception as exc:
         if _is_transport_timeout(exc):
-            raise LLMTurnTimeoutError(
-                f"{config.provider}/{config.model} request exceeded the active turn deadline or transport timeout",
-                provider=config.provider,
-                model=config.model,
-                stage="provider_request",
-            ) from exc
+            ensure_turn_active()
+            raise _transport_error(config, "transport_timeout") from exc
         raise _provider_error(config, exc) from exc
     ensure_turn_active()
     return response
 
 
-def _response_error(config: LLMConfig, detail: str) -> LLMProviderError:
+def _execute_completion(
+    config: LLMConfig,
+    request: LLMRequest,
+    send_once: Any,
+    parse_response: Any,
+) -> _CompletionResult:
+    """Own the total attempt budget for one read-only completion."""
+
+    with llm_turn_scope(config.turn_timeout_seconds):
+        return _execute_completion_in_scope(
+            config,
+            request,
+            send_once,
+            parse_response,
+        )
+
+
+def _execute_completion_in_scope(
+    config: LLMConfig,
+    request: LLMRequest,
+    send_once: Any,
+    parse_response: Any,
+) -> _CompletionResult:
+    retry_reasons: list[str] = []
+    attempt_count = 0
+    last_finish_reason = ""
+    max_attempts = (
+        config.max_retries + 1
+        if request.replay_safety == "side_effect_free"
+        else 1
+    )
+    for _attempt_index in range(max_attempts):
+        try:
+            ensure_turn_active()
+            attempt_count += 1
+            response = send_once()
+            text, finish_reason = parse_response(response)
+            result = _CompletionResult(
+                response=response,
+                text=text,
+                attempt_count=attempt_count,
+                retry_reasons=tuple(retry_reasons),
+                last_finish_reason=finish_reason,
+            )
+            _record_completion_outcome(
+                config,
+                result,
+                outcome="success",
+            )
+            return result
+        except (LLMTurnTimeoutError, LLMTurnCancelledError) as exc:
+            _attach_terminal_attempt_evidence(
+                exc,
+                config=config,
+                attempt_count=attempt_count,
+                retry_reasons=tuple(retry_reasons),
+                last_finish_reason=last_finish_reason,
+            )
+            _record_terminal_outcome(config, exc)
+            raise
+        except LLMProviderError as exc:
+            last_finish_reason = exc.last_finish_reason
+            reason = exc.retry_reason or exc.category
+            can_retry = exc.retriable and attempt_count < max_attempts
+            if not can_retry:
+                terminal = _provider_error_with_attempt_evidence(
+                    exc,
+                    attempt_count=attempt_count,
+                    retry_reasons=tuple(retry_reasons),
+                    retry_exhausted=(
+                        exc.retriable
+                        and request.replay_safety == "side_effect_free"
+                        and attempt_count >= max_attempts
+                    ),
+                )
+                _record_provider_failure(config, terminal)
+                raise terminal from exc
+            retry_reasons.append(reason)
+            try:
+                _wait_for_retry(config, attempt_count)
+                ensure_turn_active()
+            except (LLMTurnTimeoutError, LLMTurnCancelledError) as terminal:
+                _attach_terminal_attempt_evidence(
+                    terminal,
+                    config=config,
+                    attempt_count=attempt_count,
+                    retry_reasons=tuple(retry_reasons),
+                    last_finish_reason=last_finish_reason,
+                )
+                _record_terminal_outcome(config, terminal)
+                raise
+    raise AssertionError("completion retry loop did not terminate")
+
+
+def _attach_terminal_attempt_evidence(
+    error: LLMTurnTimeoutError | LLMTurnCancelledError,
+    *,
+    config: LLMConfig,
+    attempt_count: int,
+    retry_reasons: tuple[str, ...],
+    last_finish_reason: str,
+) -> None:
+    error.provider = error.provider or config.provider
+    error.model = error.model or config.model
+    error.attempt_count = attempt_count
+    error.retry_reasons = retry_reasons
+    error.last_finish_reason = last_finish_reason
+
+
+def _record_completion_outcome(
+    config: LLMConfig,
+    result: _CompletionResult,
+    *,
+    outcome: str,
+) -> None:
+    record_provider_attempt({
+        "provider": config.provider,
+        "model": config.model,
+        "outcome": outcome,
+        "attempt_count": result.attempt_count,
+        "retry_reasons": list(result.retry_reasons),
+        "retry_exhausted": False,
+        "last_finish_reason": result.last_finish_reason,
+    })
+
+
+def _record_provider_failure(
+    config: LLMConfig,
+    error: LLMProviderError,
+) -> None:
+    record_provider_attempt({
+        "provider": config.provider,
+        "model": config.model,
+        "outcome": "provider_failure",
+        "category": error.category,
+        "attempt_count": error.attempt_count,
+        "retry_reasons": list(error.retry_reasons),
+        "retry_exhausted": error.retry_exhausted,
+        "last_finish_reason": error.last_finish_reason,
+    })
+
+
+def _record_terminal_outcome(
+    config: LLMConfig,
+    error: LLMTurnTimeoutError | LLMTurnCancelledError,
+) -> None:
+    record_provider_attempt({
+        "provider": config.provider,
+        "model": config.model,
+        "outcome": (
+            "cancelled"
+            if isinstance(error, LLMTurnCancelledError)
+            else "timeout"
+        ),
+        "attempt_count": error.attempt_count,
+        "retry_reasons": list(error.retry_reasons),
+        "retry_exhausted": False,
+        "last_finish_reason": error.last_finish_reason,
+    })
+
+
+def _wait_for_retry(config: LLMConfig, attempt_count: int) -> None:
+    remaining = remaining_turn_seconds(config.turn_timeout_seconds)
+    delay = min(0.25 * (2 ** (attempt_count - 1)), 1.0, remaining)
+    if delay > 0:
+        time.sleep(delay)
+
+
+def _provider_error_with_attempt_evidence(
+    error: LLMProviderError,
+    *,
+    attempt_count: int,
+    retry_reasons: tuple[str, ...],
+    retry_exhausted: bool,
+) -> LLMProviderError:
+    return LLMProviderError(
+        str(error),
+        provider=error.provider,
+        model=error.model,
+        category=error.category,
+        stage=error.stage,
+        status_code=error.status_code,
+        retriable=error.retriable,
+        attempt_count=attempt_count,
+        retry_reasons=retry_reasons,
+        retry_exhausted=retry_exhausted,
+        last_finish_reason=error.last_finish_reason,
+        retry_reason=error.retry_reason,
+    )
+
+
+def _response_error(
+    config: LLMConfig,
+    detail: str,
+    *,
+    retriable: bool = False,
+    retry_reason: str = "",
+    finish_reason: str = "",
+) -> LLMProviderError:
     return LLMProviderError(
         f"{config.provider}/{config.model} returned a malformed successful response: {detail}",
         provider=config.provider,
         model=config.model,
         category="response",
         stage="provider_response",
+        retriable=retriable,
+        retry_reason=retry_reason,
+        last_finish_reason=finish_reason,
     )
 
 
-def _openai_response_text(config: LLMConfig, response: Any) -> str:
+def _parse_openai_completion(
+    config: LLMConfig,
+    request: LLMRequest,
+    response: Any,
+) -> tuple[str, str]:
     choices = getattr(response, "choices", None)
     if not isinstance(choices, (list, tuple)) or not choices:
         raise _response_error(config, "choices is missing or empty")
-    message = getattr(choices[0], "message", None)
+    choice = choices[0]
+    finish_reason = _normalized_finish_reason(
+        getattr(choice, "finish_reason", ""),
+        {
+            "stop",
+            "length",
+            "tool_calls",
+            "function_call",
+            "content_filter",
+        },
+    )
+    message = getattr(choice, "message", None)
     if message is None:
         raise _response_error(config, "choices[0].message is missing")
     content = getattr(message, "content", None)
+    tool_calls = getattr(message, "tool_calls", None)
+    refusal = str(getattr(message, "refusal", "") or "").strip()
+    _require_text_completion_disposition(
+        config,
+        request,
+        finish_reason=finish_reason,
+        normal_finish_reasons={"stop"},
+        has_alternative_output=bool(tool_calls),
+        has_refusal=bool(refusal),
+    )
     if not isinstance(content, str) or not content.strip():
-        raise _response_error(config, "choices[0].message.content is missing or empty")
-    return content
+        retriable = _empty_text_retryable(
+            request,
+            finish_reason=finish_reason,
+            normal_finish_reasons={"stop"},
+            has_alternative_output=bool(tool_calls) or bool(refusal),
+        )
+        raise _response_error(
+            config,
+            "choices[0].message.content is missing or empty",
+            retriable=retriable,
+            retry_reason="normal_finish_empty_text" if retriable else "",
+            finish_reason=finish_reason,
+        )
+    return content, finish_reason
+
+
+def _normalized_finish_reason(
+    value: Any,
+    allowed: set[str],
+) -> str:
+    normalized = str(value or "").strip().casefold()
+    if not normalized:
+        return "missing"
+    return normalized if normalized in allowed else "other"
+
+
+def _require_text_completion_disposition(
+    config: LLMConfig,
+    request: LLMRequest,
+    *,
+    finish_reason: str,
+    normal_finish_reasons: set[str],
+    has_alternative_output: bool,
+    has_refusal: bool = False,
+) -> None:
+    if has_refusal:
+        raise _response_error(
+            config,
+            "provider returned a refusal",
+            finish_reason=finish_reason,
+        )
+    if has_alternative_output:
+        raise _response_error(
+            config,
+            "provider returned structured output that this text boundary cannot project",
+            finish_reason=finish_reason,
+        )
+    if finish_reason not in normal_finish_reasons:
+        raise _response_error(
+            config,
+            f"completion ended with {finish_reason}",
+            finish_reason=finish_reason,
+        )
+
+
+def _empty_text_retryable(
+    request: LLMRequest,
+    *,
+    finish_reason: str,
+    normal_finish_reasons: set[str],
+    has_alternative_output: bool,
+) -> bool:
+    return (
+        request.response_mode == "text_required"
+        and request.replay_safety == "side_effect_free"
+        and not request.tools
+        and not has_alternative_output
+        and finish_reason.casefold() in normal_finish_reasons
+    )
+
+
+def _llm_response(
+    config: LLMConfig,
+    result: _CompletionResult,
+) -> LLMResponse:
+    return LLMResponse(
+        text=result.text,
+        model=config.model,
+        provider=config.provider,
+        raw=dict(result.response),
+        attempt_count=result.attempt_count,
+        retry_reasons=result.retry_reasons,
+        last_finish_reason=result.last_finish_reason,
+    )
 
 
 def _is_transport_timeout(exc: BaseException) -> bool:
@@ -304,6 +791,29 @@ def _is_transport_timeout(exc: BaseException) -> bool:
     name = type(exc).__name__.casefold()
     module = type(exc).__module__.casefold()
     return "timeout" in name and any(marker in module for marker in ("openai", "httpx", "httpcore", "urllib"))
+
+
+def _is_transport_connection(exc: BaseException) -> bool:
+    if isinstance(exc, (ConnectionError, urlerror.URLError)):
+        return True
+    name = type(exc).__name__.casefold()
+    module = type(exc).__module__.casefold()
+    return (
+        "connection" in name
+        and any(marker in module for marker in ("openai", "httpx", "httpcore"))
+    )
+
+
+def _transport_error(config: LLMConfig, reason: str) -> LLMProviderError:
+    return LLMProviderError(
+        f"{config.provider}/{config.model} provider transport failed",
+        provider=config.provider,
+        model=config.model,
+        category="transport",
+        stage="provider_request",
+        retriable=True,
+        retry_reason=reason,
+    )
 
 
 def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str], config: LLMConfig) -> dict[str, Any]:
@@ -323,22 +833,14 @@ def _post_json(url: str, payload: dict[str, Any], headers: dict[str, str], confi
         with urlrequest.urlopen(req, timeout=timeout) as response:  # nosec B310 - URL is a configured provider endpoint
             payload = json.loads(response.read().decode("utf-8"))
     except (TimeoutError, socket.timeout) as exc:
-        raise LLMTurnTimeoutError(
-            f"{config.provider}/{config.model} request exceeded the active turn deadline or transport timeout",
-            provider=config.provider,
-            model=config.model,
-            stage="provider_request",
-        ) from exc
+        ensure_turn_active()
+        raise _transport_error(config, "transport_timeout") from exc
     except urlerror.HTTPError as exc:
         raise _provider_error(config, exc) from exc
     except urlerror.URLError as exc:
         if _is_transport_timeout(exc.reason if isinstance(exc.reason, BaseException) else exc):
-            raise LLMTurnTimeoutError(
-                f"{config.provider}/{config.model} request exceeded the active turn deadline or transport timeout",
-                provider=config.provider,
-                model=config.model,
-                stage="provider_request",
-            ) from exc
+            ensure_turn_active()
+            raise _transport_error(config, "transport_timeout") from exc
         raise _provider_error(config, exc) from exc
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise _response_error(config, "body is not valid UTF-8 JSON") from exc
@@ -420,6 +922,7 @@ def probe_provider_readiness(
                 ],
                 temperature=0.0,
                 max_tokens=256,
+                replay_safety="side_effect_free",
             ))
     except LLMTurnTimeoutError:
         return LLMProviderError(
@@ -439,6 +942,11 @@ def probe_provider_readiness(
             stage="provider_readiness",
             status_code=exc.status_code,
             retriable=exc.retriable,
+            attempt_count=exc.attempt_count,
+            retry_reasons=exc.retry_reasons,
+            retry_exhausted=exc.retry_exhausted,
+            last_finish_reason=exc.last_finish_reason,
+            retry_reason=exc.retry_reason,
         )
     except Exception as exc:
         return LLMProviderError(
@@ -479,7 +987,7 @@ def _provider_error(config: LLMConfig, exc: BaseException) -> LLMProviderError:
         category = "configuration"
     elif status_code >= 500:
         category = "service"
-    elif isinstance(exc, (ConnectionError, urlerror.URLError)):
+    elif _is_transport_connection(exc):
         category = "transport"
     else:
         category = "provider"
@@ -491,6 +999,7 @@ def _provider_error(config: LLMConfig, exc: BaseException) -> LLMProviderError:
         category=category,
         status_code=status_code,
         retriable=category in {"rate_limit", "service", "transport"},
+        retry_reason=category,
     )
 
 
@@ -549,6 +1058,19 @@ def _gemini_contents(messages: list[LLMMessage]) -> tuple[str, list[dict[str, An
 
 
 def _gemini_text(config: LLMConfig, response: dict[str, Any]) -> str:
+    text, _finish_reason = _parse_gemini_completion(
+        config,
+        LLMRequest(messages=[]),
+        response,
+    )
+    return text
+
+
+def _parse_gemini_completion(
+    config: LLMConfig,
+    request: LLMRequest,
+    response: dict[str, Any],
+) -> tuple[str, str]:
     candidates = response.get("candidates")
     if not isinstance(candidates, list) or not candidates:
         raise _response_error(config, "candidates is missing or empty")
@@ -561,20 +1083,106 @@ def _gemini_text(config: LLMConfig, response: dict[str, Any]) -> str:
     parts = content.get("parts")
     if not isinstance(parts, list) or not parts:
         raise _response_error(config, "candidates[0].content.parts is missing or empty")
+    finish_reason = _normalized_finish_reason(
+        candidate.get("finishReason"),
+        {
+            "stop",
+            "max_tokens",
+            "safety",
+            "recitation",
+            "language",
+            "blocklist",
+            "prohibited_content",
+            "spi",
+            "malformed_function_call",
+            "image_safety",
+        },
+    )
+    has_alternative_output = any(
+        isinstance(part, dict)
+        and any(
+            key in part
+            for key in (
+                "functionCall",
+                "functionResponse",
+                "inlineData",
+                "fileData",
+                "executableCode",
+                "codeExecutionResult",
+            )
+        )
+        for part in parts
+    )
+    _require_text_completion_disposition(
+        config,
+        request,
+        finish_reason=finish_reason,
+        normal_finish_reasons={"stop"},
+        has_alternative_output=has_alternative_output,
+    )
     text = "".join(
         str(part.get("text"))
         for part in parts
         if isinstance(part, dict) and isinstance(part.get("text"), str)
     )
     if not text.strip():
-        raise _response_error(config, "candidates[0].content.parts has no text")
-    return text
+        retriable = _empty_text_retryable(
+            request,
+            finish_reason=finish_reason,
+            normal_finish_reasons={"stop"},
+            has_alternative_output=has_alternative_output,
+        )
+        raise _response_error(
+            config,
+            "candidates[0].content.parts has no text",
+            retriable=retriable,
+            retry_reason="normal_finish_empty_text" if retriable else "",
+            finish_reason=finish_reason,
+        )
+    return text, finish_reason
 
 
 def _anthropic_text(config: LLMConfig, response: dict[str, Any]) -> str:
+    text, _stop_reason = _parse_anthropic_completion(
+        config,
+        LLMRequest(messages=[]),
+        response,
+    )
+    return text
+
+
+def _parse_anthropic_completion(
+    config: LLMConfig,
+    request: LLMRequest,
+    response: dict[str, Any],
+) -> tuple[str, str]:
     content = response.get("content")
     if not isinstance(content, list) or not content:
         raise _response_error(config, "content is missing or empty")
+    stop_reason = _normalized_finish_reason(
+        response.get("stop_reason"),
+        {
+            "end_turn",
+            "max_tokens",
+            "stop_sequence",
+            "tool_use",
+            "pause_turn",
+            "refusal",
+            "model_context_window_exceeded",
+        },
+    )
+    has_alternative_output = any(
+        isinstance(block, dict) and block.get("type") != "text"
+        for block in content
+    )
+    _require_text_completion_disposition(
+        config,
+        request,
+        finish_reason=stop_reason,
+        normal_finish_reasons={"end_turn", "stop_sequence"},
+        has_alternative_output=has_alternative_output,
+        has_refusal=stop_reason == "refusal",
+    )
     text = "".join(
         str(block.get("text"))
         for block in content
@@ -583,5 +1191,17 @@ def _anthropic_text(config: LLMConfig, response: dict[str, Any]) -> str:
         and isinstance(block.get("text"), str)
     )
     if not text.strip():
-        raise _response_error(config, "content has no text block")
-    return text
+        retriable = _empty_text_retryable(
+            request,
+            finish_reason=stop_reason,
+            normal_finish_reasons={"end_turn"},
+            has_alternative_output=has_alternative_output,
+        )
+        raise _response_error(
+            config,
+            "content has no text block",
+            retriable=retriable,
+            retry_reason="normal_finish_empty_text" if retriable else "",
+            finish_reason=stop_reason,
+        )
+    return text, stop_reason

@@ -13,6 +13,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
+from .turn_transactions import (
+    TurnTransactionValidationError,
+    validate_transaction_identifier,
+)
+
 
 TERMINAL_OUTCOME_PROJECTION_SCHEMA_VERSION = 3
 TERMINAL_SESSION_EVENT_SCHEMA_VERSION = 3
@@ -706,6 +711,16 @@ def validate_terminal_outcome_projection(
     diagnostic_hash = str(raw.get("diagnostic_hash") or "")
     attempt_fingerprint = str(raw.get("attempt_fingerprint") or "")
     attempt_checkpoint_id = str(raw.get("attempt_checkpoint_id") or "")
+    if attempt_checkpoint_id:
+        try:
+            validate_transaction_identifier(
+                "attempt_checkpoint_id",
+                attempt_checkpoint_id,
+            )
+        except TurnTransactionValidationError as exc:
+            raise TerminalProtocolError(
+                "terminal projection attempt checkpoint identity is invalid"
+            ) from exc
     base_revision = raw.get("base_revision")
     product_revision = raw.get("product_revision")
     if (
@@ -752,11 +767,12 @@ def validate_terminal_outcome_projection(
     elif outcome == "aborted":
         if (
             render_hash
-            or attempt_checkpoint_id
-            or attempt_fingerprint
+            or bool(attempt_checkpoint_id) != bool(attempt_fingerprint)
             or not failure_category
         ):
             raise TerminalProtocolError("failed projection metadata is invalid")
+        if attempt_fingerprint:
+            _require_hash("attempt_fingerprint", attempt_fingerprint)
         _require_hash("diagnostic_hash", diagnostic_hash)
         if product_revision != base_revision:
             raise TerminalProtocolError(
