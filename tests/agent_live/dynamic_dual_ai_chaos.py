@@ -190,7 +190,7 @@ class ChaosRunConfig:
         return {
             "LLM_PROVIDER": provider,
             "LLM_MODEL": model,
-            "AGENT_CONFIG_LOCAL": "/dev/null",
+            "AGENT_CONFIG_LOCAL": "config/agent_config.local.sh",
         }
 
     def isolated_environment(

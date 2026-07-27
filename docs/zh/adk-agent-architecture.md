@@ -201,8 +201,10 @@ Head revision 从精确 checkpoint 重建当前 v6 event。每个 runtime projec
 live acceptance 必须通过与 CLI 相同的持久 Agent 配置加载器解析
 provider/model，并把该精确身份冻结到子 PTY 环境。runner 专用环境变量会先
 复制为不可变快照；身份键是保留键，并且始终最后写入。子进程不能再次加载私有
-override，也不能通过事后修改环境映射静默切换模型。身份缺失或
-expected/observed 身份不一致时，在任何 evidence 获得资格前都必须 fail closed。
+配置来改变身份，但可以从仓库内标准私有配置文件读取凭据；配置加载器在 source
+之后恢复调用方显式冻结的 provider/model。子进程也不能通过事后修改环境映射
+静默切换模型。身份缺失或 expected/observed 身份不一致时，在任何 evidence
+获得资格前都必须 fail closed。
 
 startup session schema version 3 要求 ready session 必须引用 revision 1
 或更高的 committed Product Head，

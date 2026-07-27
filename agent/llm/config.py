@@ -30,6 +30,10 @@ AGENT_CONFIG = REPO_ROOT / "config" / "agent_config.sh"
 USER_CONFIG = REPO_ROOT / "config" / "user_config.sh"
 
 
+class LLMConfigurationLoadError(RuntimeError):
+    """Persistent Agent configuration could not be loaded atomically."""
+
+
 @dataclass(frozen=True)
 class LLMConfig:
     provider: str
@@ -250,8 +254,11 @@ def load_agent_environment() -> Mapping[str, str]:
     config_files = [path for path in (AGENT_CONFIG, USER_CONFIG) if path.is_file()]
     if not config_files:
         return os.environ
-    source_lines = "; ".join(f"source {str(path)!r}" for path in config_files)
-    command = f"set -a; {source_lines}; env -0"
+    source_chain = " && ".join(
+        f"source {str(path)!r}"
+        for path in config_files
+    )
+    command = f"set -a; {source_chain} && env -0"
     try:
         completed = subprocess.run(
             ["bash", "-lc", command],
@@ -263,14 +270,22 @@ def load_agent_environment() -> Mapping[str, str]:
             check=False,
             env=os.environ.copy(),
         )
-    except Exception:
-        return os.environ
+    except Exception as exc:
+        raise LLMConfigurationLoadError(
+            "persistent Agent configuration could not be loaded"
+        ) from exc
     if completed.returncode != 0:
-        return os.environ
+        raise LLMConfigurationLoadError(
+            "persistent Agent configuration returned a failure status"
+        )
     loaded: dict[str, str] = {}
     for item in completed.stdout.split(b"\0"):
         if not item or b"=" not in item:
             continue
         key, value = item.split(b"=", 1)
         loaded[key.decode("utf-8", errors="replace")] = value.decode("utf-8", errors="replace")
-    return loaded or os.environ
+    if not loaded:
+        raise LLMConfigurationLoadError(
+            "persistent Agent configuration produced an empty environment"
+        )
+    return loaded

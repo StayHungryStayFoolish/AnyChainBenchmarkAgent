@@ -16,6 +16,11 @@
 # claude: Anthropic API key or `claude` partner models on Vertex AI.
 # openai: OpenAI API.
 # deepseek: DeepSeek OpenAI-compatible API.
+_anychain_load_agent_config() {
+local -r _anychain_caller_llm_provider_set="${LLM_PROVIDER+x}"
+local -r _anychain_caller_llm_provider="${LLM_PROVIDER-}"
+local -r _anychain_caller_llm_model_set="${LLM_MODEL+x}"
+local -r _anychain_caller_llm_model="${LLM_MODEL-}"
 LLM_PROVIDER="${LLM_PROVIDER:-openai}"
 
 # Model name for the selected provider.
@@ -95,7 +100,20 @@ AGENT_NOTIFY_ON="${AGENT_NOTIFY_ON:-completed,failed}"
 AGENT_CONFIG_LOCAL="${AGENT_CONFIG_LOCAL:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/agent_config.local.sh}"
 if [[ -f "$AGENT_CONFIG_LOCAL" ]]; then
     # shellcheck source=/dev/null
-    source "$AGENT_CONFIG_LOCAL"
+    if ! source "$AGENT_CONFIG_LOCAL"; then
+        echo "Failed to load Agent private configuration: $AGENT_CONFIG_LOCAL" >&2
+        return 1
+    fi
+fi
+
+# A live acceptance runner freezes provider/model in its child environment.
+# The canonical private file may still supply credentials, but it cannot
+# replace an identity that the caller explicitly selected.
+if [[ "$_anychain_caller_llm_provider_set" == "x" ]]; then
+    LLM_PROVIDER="$_anychain_caller_llm_provider"
+fi
+if [[ "$_anychain_caller_llm_model_set" == "x" ]]; then
+    LLM_MODEL="$_anychain_caller_llm_model"
 fi
 
 export LLM_PROVIDER LLM_MODEL LLM_AUTH_MODE
@@ -103,3 +121,9 @@ export GOOGLE_CLOUD_PROJECT GOOGLE_CLOUD_LOCATION GOOGLE_SERVICE_ACCOUNT_EMAIL G
 export GEMINI_API_KEY GOOGLE_API_KEY ANTHROPIC_API_KEY OPENAI_API_KEY DEEPSEEK_API_KEY
 export AGENT_KNOWLEDGE_PROVIDER AGENT_KNOWLEDGE_PROVIDER_MODULE AGENT_KNOWLEDGE_BASE_URL AGENT_KNOWLEDGE_AUTH_REF
 export AGENT_NOTIFY_WEBHOOK_URL AGENT_NOTIFY_ON
+}
+
+if ! _anychain_load_agent_config; then
+    return 1 2>/dev/null || exit 1
+fi
+unset -f _anychain_load_agent_config

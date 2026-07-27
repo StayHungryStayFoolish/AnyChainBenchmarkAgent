@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -15,6 +16,7 @@ from typing import Mapping
 from unittest.mock import patch
 
 from agent.harness.input_identity import user_input_hash
+from agent.llm.config import LLMConfigurationLoadError, load_agent_environment
 from agent.harness.terminal_protocol import (
     TerminalDetourProjection,
     TerminalSessionEvent,
@@ -645,9 +647,141 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
         self.assertEqual(environment["CUSTOM_CHAOS_VALUE"], "before")
         self.assertEqual(environment["LLM_PROVIDER"], "deepseek")
         self.assertEqual(environment["LLM_MODEL"], "deepseek-v4-pro")
-        self.assertEqual(environment["AGENT_CONFIG_LOCAL"], "/dev/null")
+        self.assertEqual(
+            environment["AGENT_CONFIG_LOCAL"],
+            "config/agent_config.local.sh",
+        )
         with self.assertRaises(TypeError):
             config.extra_env["CUSTOM_CHAOS_VALUE"] = "mutated"
+
+    def test_private_config_supplies_secret_without_replacing_frozen_identity(
+        self,
+    ) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            private_config = Path(tmpdir) / "agent_config.local.sh"
+            private_config.write_text(
+                "\n".join((
+                    "LLM_PROVIDER=other-provider",
+                    "LLM_MODEL=other-model",
+                    "DEEPSEEK_API_KEY=test-secret",
+                ))
+                + "\n",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                (
+                    "bash",
+                    "-lc",
+                    "source config/agent_config.sh; "
+                    'printf "%s\\n%s\\n%s\\n" '
+                    '"$LLM_PROVIDER" "$LLM_MODEL" '
+                    '"${DEEPSEEK_API_KEY:+present}"',
+                ),
+                cwd=repo_root,
+                env={
+                    **os.environ,
+                    "AGENT_CONFIG_LOCAL": str(private_config),
+                    "LLM_PROVIDER": "deepseek",
+                    "LLM_MODEL": "deepseek-v4-pro",
+                },
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+        self.assertEqual(
+            completed.stdout.splitlines(),
+            ["deepseek", "deepseek-v4-pro", "present"],
+        )
+
+    def test_private_config_cannot_mutate_frozen_identity_snapshot(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            private_config = Path(tmpdir) / "agent_config.local.sh"
+            private_config.write_text(
+                "\n".join((
+                    "_anychain_caller_llm_provider=other-provider",
+                    "unset _anychain_caller_llm_model",
+                    "LLM_PROVIDER=other-provider",
+                    "LLM_MODEL=other-model",
+                    "DEEPSEEK_API_KEY=test-secret",
+                ))
+                + "\n",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                (
+                    "bash",
+                    "-lc",
+                    "source config/agent_config.sh; "
+                    'printf "%s\\n%s\\n%s\\n" '
+                    '"$LLM_PROVIDER" "$LLM_MODEL" '
+                    '"${DEEPSEEK_API_KEY:+present}"',
+                ),
+                cwd=repo_root,
+                env={
+                    **os.environ,
+                    "AGENT_CONFIG_LOCAL": str(private_config),
+                    "LLM_PROVIDER": "deepseek",
+                    "LLM_MODEL": "deepseek-v4-pro",
+                },
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+        self.assertEqual(
+            completed.stdout.splitlines(),
+            ["deepseek", "deepseek-v4-pro", "present"],
+        )
+
+    def test_private_config_source_failure_fails_closed(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            private_config = Path(tmpdir) / "agent_config.local.sh"
+            private_config.write_text("return 23\n", encoding="utf-8")
+            completed = subprocess.run(
+                ("bash", "-lc", "source config/agent_config.sh"),
+                cwd=repo_root,
+                env={
+                    **os.environ,
+                    "AGENT_CONFIG_LOCAL": str(private_config),
+                    "LLM_PROVIDER": "deepseek",
+                    "LLM_MODEL": "deepseek-v4-pro",
+                },
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(
+            "Failed to load Agent private configuration",
+            completed.stderr,
+        )
+
+    def test_shared_config_loader_rejects_partial_private_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            private_config = Path(tmpdir) / "agent_config.local.sh"
+            private_config.write_text(
+                "DEEPSEEK_API_KEY=partial-secret\nreturn 23\n",
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "AGENT_CONFIG_LOCAL": str(private_config),
+                    "LLM_PROVIDER": "deepseek",
+                    "LLM_MODEL": "deepseek-v4-pro",
+                },
+                clear=False,
+            ):
+                with self.assertRaisesRegex(
+                    LLMConfigurationLoadError,
+                    "returned a failure status",
+                ):
+                    load_agent_environment()
 
     def test_complete_response_uses_the_newest_prompt_delimited_agent_frame(self) -> None:
         startup = "Agent> Ready.\nAgent> Choose a mode.\nUser> "
@@ -3125,7 +3259,7 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
         self.assertIn("LLM_PROVIDER=deepseek", command_text)
         self.assertIn("LLM_MODEL=deepseek-v4-pro", command_text)
         self.assertIn(
-            "AGENT_CONFIG_LOCAL=/dev/null",
+            "AGENT_CONFIG_LOCAL=config/agent_config.local.sh",
             command_text,
         )
 

@@ -204,8 +204,10 @@ loader and freezes that identity into the child PTY environment. A private
 configuration file cannot change the model between schedule creation and CLI
 startup. Extra environment values are copied into an immutable snapshot;
 provider/model/local-config keys are reserved, and the frozen identity is
-applied last. Evidence conversion uses the same resolved identity rather than
-a hard-coded default model name.
+applied last. The canonical private config may supply credentials, while the
+config loader restores any caller-frozen provider/model after sourcing it.
+Evidence conversion uses the same resolved identity rather than a hard-coded
+default model name.
 
 Covering-array reports expose generated rows/tuples separately from observed
 rows/tuples. Critical-sequence reports derive coverage ids from validated turn

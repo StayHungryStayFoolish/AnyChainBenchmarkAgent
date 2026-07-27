@@ -221,9 +221,11 @@ Live acceptance resolves provider/model through the same persistent Agent
 configuration loader as the CLI, then freezes that exact identity into the
 child PTY environment. Runner-specific environment values are copied into an
 immutable snapshot; identity keys are reserved and reapplied last. The child
-cannot re-source a private override or mutate an environment mapping to
-silently select another model. Both missing identity and expected/observed
-identity mismatch fail before any evidence can qualify.
+may source only the repository's canonical private configuration to obtain
+credentials; the configuration loader restores an explicitly frozen
+provider/model after that source. It cannot use a private override or mutate
+an environment mapping to silently select another model. Both missing identity
+and expected/observed identity mismatch fail before any evidence can qualify.
 
 Startup session schema version 3 requires a ready session to name a committed
 Product Head at revision one or later and the complete runtime-event

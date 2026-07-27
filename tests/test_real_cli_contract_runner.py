@@ -40,7 +40,7 @@ class RealCliContractRunnerTest(unittest.TestCase):
         self.assertEqual(environment["LLM_MODEL"], "deepseek-v4-pro")
         self.assertEqual(
             environment["AGENT_CONFIG_LOCAL"],
-            "/dev/null",
+            "config/agent_config.local.sh",
         )
 
     def test_unknown_setup_capability_is_rejected(self) -> None:
