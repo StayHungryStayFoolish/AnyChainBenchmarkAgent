@@ -60,6 +60,13 @@ class DiscoveryLedgerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "content address mismatch"):
             validate_discovery_attempt(replace(first, persona="changed after hashing"))
 
+    def test_repeated_agent_response_is_product_evidence_not_ledger_corruption(self) -> None:
+        attempt = self._attempt(response_hashes=(HASH_A, HASH_A))
+
+        validate_discovery_attempt(attempt)
+        with self.assertRaisesRegex(ValueError, "decision_hashes contains duplicate"):
+            self._attempt(decision_hashes=(HASH_B, HASH_B))
+
     def test_append_preserves_history_and_requires_explicit_supersession(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             ledger_path = Path(tmpdir) / "attempts.jsonl"

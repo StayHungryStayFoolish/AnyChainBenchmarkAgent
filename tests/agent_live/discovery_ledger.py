@@ -268,11 +268,8 @@ def validate_discovery_attempt(attempt: DiscoveryAttempt) -> None:
         ("evidence_ids", attempt.evidence_ids),
     ):
         _validate_ids(name, values)
-    for name, values in (
-        ("response_hashes", attempt.response_hashes),
-        ("decision_hashes", attempt.decision_hashes),
-    ):
-        _validate_hashes(name, values)
+    _validate_hash_sequence("response_hashes", attempt.response_hashes)
+    _validate_hashes("decision_hashes", attempt.decision_hashes)
     for name, value in (
         ("schedule_hash", attempt.schedule_hash),
         ("transcript_hash", attempt.transcript_hash),
@@ -468,10 +465,14 @@ def _validate_ids(name: str, values: tuple[str, ...]) -> None:
 
 
 def _validate_hashes(name: str, values: tuple[str, ...]) -> None:
-    if any(not _is_sha256(value) for value in values):
-        raise ValueError(f"{name} contains a non-SHA-256 value")
+    _validate_hash_sequence(name, values)
     if len(values) != len(set(values)):
         raise ValueError(f"{name} contains duplicate values")
+
+
+def _validate_hash_sequence(name: str, values: tuple[str, ...]) -> None:
+    if any(not _is_sha256(value) for value in values):
+        raise ValueError(f"{name} contains a non-SHA-256 value")
 
 
 def _timestamp(value: str, name: str) -> datetime:

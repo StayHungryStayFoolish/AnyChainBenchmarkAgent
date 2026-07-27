@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import hashlib
 import json
 import os
@@ -97,7 +98,7 @@ class FilesystemDecisionBroker:
         request = {"request_id": request_id, **unsigned}
         _write_immutable_json(self.root / "requests" / f"{request_id}.json", request)
 
-        decision_path = self.root / "decisions" / f"{request_id}.json"
+        committed_path = self.root / "committed" / f"{request_id}.json"
         deadline = time.monotonic() + self.timeout_seconds
         wire_buffer = bytearray()
         try:
@@ -108,19 +109,23 @@ class FilesystemDecisionBroker:
                     chunk = b""
                 if chunk:
                     wire_buffer.extend(chunk)
-                if decision_path.is_file() and b"\n" in wire_buffer:
+                while b"\n" in wire_buffer:
                     raw, _, remainder = wire_buffer.partition(b"\n")
-                    if remainder.strip():
-                        raise ExternalDecisionBlocked(
-                            "external decision channel emitted more than one payload"
-                        )
+                    wire_buffer = bytearray(remainder)
+                    if not raw.strip():
+                        continue
                     try:
                         execution_payload = json.loads(raw.decode("utf-8"))
-                    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        # A failed writer may leave an incomplete frame. The
+                        # next leading delimiter makes that fragment safely
+                        # discardable before a complete bound frame arrives.
+                        continue
+                    decision_record = execution_payload.get("record")
+                    if not isinstance(decision_record, Mapping):
                         raise ExternalDecisionBlocked(
-                            "external decision channel payload is invalid"
-                        ) from exc
-                    decision_record = _load_json(decision_path)
+                            "external execution payload has no decision record"
+                        )
                     decision = _validate_decision_record(
                         request, decision_record, execution_payload
                     )
@@ -130,9 +135,25 @@ class FilesystemDecisionBroker:
                         "decision_hash": _content_hash(decision),
                         "consumed_at_ns": time.time_ns(),
                     }
+                    receipt = {
+                        "receipt_id": _content_hash(receipt_unsigned),
+                        **receipt_unsigned,
+                    }
+                    bundle_unsigned = {
+                        "schema_version": BROKER_SCHEMA_VERSION,
+                        "request_id": request_id,
+                        "decision_record": decision_record,
+                        "simulator_attestation": decision.get(
+                            "simulator_attestation"
+                        ),
+                        "consumed_receipt": receipt,
+                    }
                     _write_immutable_json(
-                        self.root / "consumed" / f"{request_id}.json",
-                        {"receipt_id": _content_hash(receipt_unsigned), **receipt_unsigned},
+                        committed_path,
+                        {
+                            "bundle_id": _content_hash(bundle_unsigned),
+                            **bundle_unsigned,
+                        },
                     )
                     return decision
                 await asyncio.sleep(self.poll_seconds)
@@ -146,11 +167,21 @@ class FilesystemDecisionBroker:
 
 def pending_requests(root: str | Path) -> tuple[Mapping[str, Any], ...]:
     broker_root = Path(root).resolve()
-    consumed = broker_root / "consumed"
+    committed = broker_root / "committed"
+    channels = broker_root / "channels"
     rows = []
     for path in sorted((broker_root / "requests").glob("*.json")):
-        if not (consumed / path.name).exists():
-            rows.append(_load_json(path))
+        if (committed / path.name).exists():
+            continue
+        request = _load_json(path)
+        channel_path = Path(str(request.get("decision_channel") or ""))
+        try:
+            channel_path.resolve().relative_to(channels.resolve())
+            channel_is_live = _channel_has_reader(channel_path)
+        except (ValueError, OSError):
+            channel_is_live = False
+        if channel_is_live:
+            rows.append(request)
     return tuple(rows)
 
 
@@ -242,10 +273,6 @@ def submit_decision(
             declared_at_ns=time.time_ns(),
         )
         decision["simulator_attestation"] = attestation
-        _write_immutable_json(
-            broker_root / "attestations" / f"{request_id}.json",
-            attestation,
-        )
     execution_payload_hash = _content_hash(decision)
     audit_decision = {
         **decision,
@@ -261,8 +288,7 @@ def submit_decision(
         "submitted_at_ns": time.time_ns(),
     }
     record = {"record_id": _content_hash(record_unsigned), **record_unsigned}
-    path = broker_root / "decisions" / f"{request_id}.json"
-    _write_immutable_json(path, record)
+    path = broker_root / "committed" / f"{request_id}.json"
     channel_path = Path(str(request.get("decision_channel") or ""))
     expected_channel = (broker_root / "channels").resolve()
     try:
@@ -274,10 +300,46 @@ def submit_decision(
         "previous_response_hash": response_hash,
         "execution_payload_hash": execution_payload_hash,
         "decision": decision,
+        "record": record,
     }
-    _write_channel_payload(
-        channel_path, (_canonical_json(wire) + "\n").encode("utf-8")
+    claim_descriptor = _acquire_request_claim(
+        broker_root / "claims" / f"{request_id}.lock"
     )
+    descriptor: int | None = None
+    try:
+        descriptor = _open_channel_writer(channel_path)
+        if path.exists():
+            raise FileExistsError(f"decision already submitted for request {request_id}")
+        payload = (_canonical_json(wire) + "\n").encode("utf-8")
+        _write_channel_payload_descriptor(
+            descriptor, b"\n" + payload
+        )
+        deadline = time.monotonic() + 5.0
+        while not path.is_file() and time.monotonic() < deadline:
+            if not channel_path.exists():
+                raise ExternalDecisionBlocked(
+                    "broker worker rejected the external decision"
+                )
+            time.sleep(0.01)
+        if not path.is_file():
+            raise TimeoutError("broker worker did not acknowledge the external decision")
+        bundle = _load_committed_bundle(path, request_id=request_id)
+        committed_record = bundle.get("decision_record")
+        if not isinstance(committed_record, Mapping):
+            raise ExternalDecisionBlocked("committed broker bundle has no decision record")
+        if (
+            str(committed_record.get("execution_payload_hash") or "")
+            != execution_payload_hash
+        ):
+            raise ExternalDecisionBlocked(
+                "broker acknowledgement belongs to another external decision"
+            )
+    finally:
+        try:
+            if descriptor is not None:
+                os.close(descriptor)
+        finally:
+            os.close(claim_descriptor)
     return path
 
 
@@ -328,7 +390,42 @@ def _validate_request_record(request: Mapping[str, Any], *, request_id: str) -> 
         raise ValueError("broker request id does not match its path")
 
 
-def _write_channel_payload(path: Path, payload: bytes, *, timeout_seconds: float = 5.0) -> None:
+def _load_committed_bundle(path: Path, *, request_id: str) -> Mapping[str, Any]:
+    bundle = _load_json(path)
+    if bundle.get("schema_version") != BROKER_SCHEMA_VERSION:
+        raise ExternalDecisionBlocked("unsupported committed broker bundle schema")
+    unsigned = {key: value for key, value in bundle.items() if key != "bundle_id"}
+    if str(bundle.get("bundle_id") or "") != _content_hash(unsigned):
+        raise ExternalDecisionBlocked("committed broker bundle identity is stale")
+    if str(bundle.get("request_id") or "") != request_id:
+        raise ExternalDecisionBlocked("committed broker bundle belongs to another request")
+    receipt = bundle.get("consumed_receipt")
+    if not isinstance(receipt, Mapping):
+        raise ExternalDecisionBlocked("committed broker bundle has no consumed receipt")
+    receipt_unsigned = {key: value for key, value in receipt.items() if key != "receipt_id"}
+    if str(receipt.get("receipt_id") or "") != _content_hash(receipt_unsigned):
+        raise ExternalDecisionBlocked("committed broker receipt identity is stale")
+    record = bundle.get("decision_record")
+    if not isinstance(record, Mapping):
+        raise ExternalDecisionBlocked("committed broker bundle has no decision record")
+    if str(record.get("request_id") or "") != request_id:
+        raise ExternalDecisionBlocked("committed decision belongs to another request")
+    if str(receipt.get("request_id") or "") != request_id:
+        raise ExternalDecisionBlocked("committed receipt belongs to another request")
+    if (
+        str(receipt.get("decision_hash") or "")
+        != str(record.get("execution_payload_hash") or "")
+    ):
+        raise ExternalDecisionBlocked("committed receipt does not match its decision")
+    decision = record.get("decision")
+    if not isinstance(decision, Mapping):
+        raise ExternalDecisionBlocked("committed decision record has no audit decision")
+    if bundle.get("simulator_attestation") != decision.get("simulator_attestation"):
+        raise ExternalDecisionBlocked("committed attestation does not match its decision")
+    return bundle
+
+
+def _open_channel_writer(path: Path) -> int:
     descriptor = os.open(
         path,
         os.O_WRONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
@@ -336,23 +433,46 @@ def _write_channel_payload(path: Path, payload: bytes, *, timeout_seconds: float
     if not stat.S_ISFIFO(os.fstat(descriptor).st_mode):
         os.close(descriptor)
         raise ValueError("external decision channel is not a FIFO")
+    return descriptor
+
+
+def _acquire_request_claim(path: Path) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _channel_has_reader(path: Path) -> bool:
+    descriptor = _open_channel_writer(path)
+    os.close(descriptor)
+    return True
+
+
+def _write_channel_payload_descriptor(
+    descriptor: int,
+    payload: bytes,
+    *,
+    timeout_seconds: float = 5.0,
+) -> None:
     view = memoryview(payload)
     deadline = time.monotonic() + timeout_seconds
-    try:
-        while view:
-            try:
-                written = os.write(descriptor, view)
-            except BlockingIOError:
-                written = 0
-            if written:
-                view = view[written:]
-                continue
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("external decision channel write timed out")
-            select.select((), (descriptor,), (), min(remaining, 0.05))
-    finally:
-        os.close(descriptor)
+    while view:
+        try:
+            written = os.write(descriptor, view)
+        except BlockingIOError:
+            written = 0
+        if written:
+            view = view[written:]
+            continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("external decision channel write timed out")
+        select.select((), (descriptor,), (), min(remaining, 0.05))
 
 
 def _control_identity(context: Mapping[str, Any]) -> dict[str, Any]:
@@ -387,11 +507,41 @@ def _load_json(path: Path) -> Mapping[str, Any]:
 def _write_immutable_json(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = (json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n").encode()
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
-    with os.fdopen(descriptor, "wb") as stream:
-        stream.write(payload)
-        stream.flush()
-        os.fsync(stream.fileno())
+    temporary = path.parent / (
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp"
+    )
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+    linked = False
+    temporary_removed = False
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, path)
+        linked = True
+        temporary.unlink()
+        temporary_removed = True
+        _fsync_directory(path.parent)
+    except BaseException:
+        if linked:
+            path.unlink(missing_ok=True)
+        if not temporary_removed:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if linked or temporary_removed:
+            _fsync_directory(path.parent)
+        raise
+
+
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def _parser() -> argparse.ArgumentParser:
