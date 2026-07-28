@@ -23,7 +23,11 @@ from ..questions import (
     question_text,
 )
 from ..state import AgentGraphState
-from ..transitions import record_group_invalidations
+from ..transitions import (
+    field_confirmation_revision,
+    mark_field_confirmed,
+    record_group_invalidations,
+)
 
 from agent.utils.redaction import redact
 from agent.workflows.group_registry import group_for_field, invalidation_targets
@@ -245,6 +249,7 @@ def apply_environment_action(state: AgentGraphState, action: ActionProposal) -> 
         confirmed = next_state.setdefault("confirmed_config", {})
         has_accounts = bool(action.arguments.get("has_accounts_device"))
         confirmed["has_accounts_device"] = has_accounts
+        mark_field_confirmed(next_state, "has_accounts_device")
         if not has_accounts:
             for key in (
                 "ACCOUNTS_DEVICE",
@@ -522,7 +527,20 @@ def reconstruct_environment_question(
             proposal,
             language=str(state.get("language") or "en"),
         )
-    if field:
+    reconfiguration_target = str(
+        identity.get("reconfiguration_target_field") or ""
+    ).strip()
+    if field and reconfiguration_target == field:
+        baseline_revision = int(
+            identity.get("reconfiguration_baseline_revision") or 0
+        )
+        current_revision = field_confirmation_revision(
+            state,
+            field,
+            group=group,
+        )
+        if current_revision > baseline_revision:
+            return None
         question = question_for_environment_field(state, group, field)
         if question and str(question.get("id") or "") == question_id:
             return question
@@ -890,12 +908,14 @@ def _apply_config_values(
             else:
                 confirmed[key] = scalar
                 applied[key] = scalar
+                mark_field_confirmed(state, key)
         elif key in PROPOSED_ENDPOINT_FIELDS:
             endpoint_proposals[key] = scalar
             endpoint_saved[key] = scalar
         elif key == "HAS_ACCOUNTS_DEVICE":
             has_accounts = bool(scalar)
             confirmed["has_accounts_device"] = has_accounts
+            mark_field_confirmed(state, "has_accounts_device")
             if not has_accounts:
                 for accounts_key in ("ACCOUNTS_DEVICE", "ACCOUNTS_VOL_TYPE", "ACCOUNTS_VOL_SIZE", "ACCOUNTS_VOL_MAX_IOPS", "ACCOUNTS_VOL_MAX_THROUGHPUT"):
                     confirmed.pop(accounts_key, None)
@@ -1195,6 +1215,8 @@ def apply_environment_answer(state: AgentGraphState, question: dict[str, Any], v
                 confirmed.pop(key, None)
     elif field:
         confirmed[field] = value
+    if field:
+        mark_field_confirmed(next_state, field, group=group)
     if field in {"LEDGER_DEVICE", "ACCOUNTS_DEVICE"}:
         prefix = "DATA" if field == "LEDGER_DEVICE" else "ACCOUNTS"
         for key in (f"{prefix}_VOL_TYPE", f"{prefix}_VOL_SIZE", f"{prefix}_VOL_MAX_IOPS", f"{prefix}_VOL_MAX_THROUGHPUT"):

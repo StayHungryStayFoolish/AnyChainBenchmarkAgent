@@ -521,9 +521,51 @@ def _retained_state_described(context: Any) -> PredicateResult:
 
 
 def _resume_action_contract_exposed(context: Any) -> PredicateResult:
+    from tests.agent_live.harness_contract_scenarios import (
+        canonical_question_contract,
+    )
+    from tests.agent_live.runtime_checkpoint import reviewed_scenario
+
+    scenario_id = str(
+        getattr(getattr(context, "schedule", None), "start_scenario", "") or ""
+    )
+    try:
+        scenario = reviewed_scenario(scenario_id)
+    except (KeyError, TypeError, ValueError):
+        return False, {
+            "evidence_family": "resume_contract",
+            "scenario_id": scenario_id,
+            "expected_pending_contract_hash": "",
+            "matched_pending_contract_hashes": [],
+            "matched_turn_indexes": [],
+            "error": "reviewed start scenario is unavailable",
+        }
+    expected_contract = dict(scenario.question or {})
+    expected_hash = (
+        content_hash(canonical_question_contract(expected_contract))
+        if expected_contract
+        else ""
+    )
     matched = []
-    for event in _events(context):
+    matched_hashes: list[str] = []
+    initial_event = getattr(context, "initial_event", None)
+    events = (
+        *((initial_event,) if initial_event is not None else ()),
+        *_events(context),
+    )
+    seen_event_ids: set[str] = set()
+    for event in events:
+        event_id = str(getattr(event, "runtime_event_id", "") or "")
+        if event_id and event_id in seen_event_ids:
+            continue
+        if event_id:
+            seen_event_ids.add(event_id)
         contract = dict(getattr(event, "pending_contract", {}) or {})
+        contract_hash = (
+            content_hash(canonical_question_contract(contract))
+            if contract
+            else ""
+        )
         options = tuple(contract.get("options") or ())
         option_ids = [
             str(option.get("id") or option.get("option_id") or "")
@@ -532,6 +574,8 @@ def _resume_action_contract_exposed(context: Any) -> PredicateResult:
         ]
         if (
             contract.get("id") == "resume_harness_session"
+            and expected_hash
+            and contract_hash == expected_hash
             and len(option_ids) >= 2
             and all(option_ids)
             and len(option_ids) == len(set(option_ids))
@@ -546,8 +590,12 @@ def _resume_action_contract_exposed(context: Any) -> PredicateResult:
             )
         ):
             matched.append(int(getattr(event, "turn_index", -1)))
+            matched_hashes.append(contract_hash)
     return bool(matched), {
         "evidence_family": "resume_contract",
+        "scenario_id": scenario_id,
+        "expected_pending_contract_hash": expected_hash,
+        "matched_pending_contract_hashes": matched_hashes,
         "matched_turn_indexes": matched,
     }
 

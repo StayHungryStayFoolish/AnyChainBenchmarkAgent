@@ -65,6 +65,50 @@ SEMANTIC_OPERATIONS = frozenset({
     "context",
     "unresolved",
 })
+SEMANTIC_OPERATION_PURPOSES: Mapping[str, str] = {
+    "pending_answer": (
+        "A present, user-authorized commitment or answer to the active pending "
+        "question. Hypothetical, counterfactual, consequence, explanation, or "
+        "capability questions are consultation, not pending answers."
+    ),
+    "consultation": (
+        "A read-only request for an answer, explanation, comparison, status, "
+        "guidance, or hypothetical consequences. It never authorizes mutation."
+    ),
+    "navigation": (
+        "An explicit request to move, return, resume, or change workflow position "
+        "without itself supplying a configuration value."
+    ),
+    "administrative": (
+        "An explicit present authorization for an Agent lifecycle operation such "
+        "as clearing, resetting, or managing a persisted session."
+    ),
+    "domain_request": (
+        "A present request to inspect, collect, confirm, or mutate one registered "
+        "benchmark workflow domain."
+    ),
+    "evidence_analysis": (
+        "A request to ingest or analyze logs, errors, traces, diagnostics, or "
+        "other evidence, including a request made before the evidence is pasted; "
+        "or the evidence contribution itself."
+    ),
+    "report_analysis": (
+        "A request to inspect or explain completed benchmark reports, artifacts, "
+        "metrics, or job results."
+    ),
+    "context": (
+        "Non-actionable framing or support that contains no independent present "
+        "request, answer, authorization, navigation, or evidence contribution."
+    ),
+    "unresolved": (
+        "A source demand whose operation or authoritative owner cannot be safely "
+        "determined without clarification."
+    ),
+}
+if set(SEMANTIC_OPERATION_PURPOSES) != set(SEMANTIC_OPERATIONS):
+    raise RuntimeError(
+        "semantic operation purposes must cover every registered operation exactly"
+    )
 SEMANTIC_VALUE_DOMAIN_POLICY: Mapping[str, Any] = {
     "schema_version": 2,
     "identifier_boundary": "ascii_alnum_underscore_hyphen",
@@ -1212,6 +1256,7 @@ def action_registry_contract_hash() -> str:
         "specs": specs,
         "argument_schemas": ACTION_ARGUMENT_SCHEMAS,
         "semantic_scope_policies": SEMANTIC_SCOPE_POLICIES,
+        "semantic_operation_purposes": SEMANTIC_OPERATION_PURPOSES,
         "consultation_topics": sorted(CONSULTATION_TOPICS),
         "semantic_value_domain_policy": SEMANTIC_VALUE_DOMAIN_POLICY,
         "semantic_value_domains": registered_semantic_value_domains(),

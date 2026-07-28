@@ -408,13 +408,19 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
             attempt_checkpoint_id=f"checkpoint-{turn_index}",
         )
 
-    def _schedule(self, *, max_turns: int = 3, verifier_input_contract=None):
+    def _schedule(
+        self,
+        *,
+        max_turns: int = 3,
+        verifier_input_contract=None,
+        start_scenario: str = "opening",
+    ):
         return build_journey_schedule(
             revision=REVISION,
             seed=271,
             journey={
                 "journey_id": "response-driven-journey",
-                "start_scenario": "opening",
+                "start_scenario": start_scenario,
                 "persona": "operator who reacts to the current response",
                 "mission": "reach a verified ready state without scripted turns",
                 "allowed_risk_factors": ["change_direction"],
@@ -512,9 +518,27 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
             clock_ns=OrderedClock(),
         )
 
-    def _run(self, runner):
+    def _run(self, runner, *, reviewed_question=None):
+        seed_state = {}
+        question = {}
+        if str(runner.schedule.start_scenario).startswith("resume"):
+            question = {
+                "id": "resume_harness_session",
+                "options": [
+                    {"value": "continue"},
+                    {"value": "modify"},
+                    {"value": "reset"},
+                ],
+            }
+            seed_state = {"pending_question": dict(question)}
+        if reviewed_question is not None:
+            question = dict(reviewed_question)
+            seed_state = {"pending_question": dict(question)}
         scenario = SimpleNamespace(
-            scenario_id="opening", state_fingerprint="scenario-fingerprint", seed_state={}
+            scenario_id=runner.schedule.start_scenario,
+            state_fingerprint="scenario-fingerprint",
+            seed_state=seed_state,
+            question=question,
         )
         with patch(
             "tests.agent_live.runtime_checkpoint.reviewed_scenario", return_value=scenario
@@ -590,6 +614,212 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
                 provenance["submitted_at_ns"],
                 artifact["turns"][0]["turn_identity"]["user_message_submitted_at_ns"],
             )
+
+    def test_startup_resume_is_bootstrap_not_a_simulator_source_step(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            resume_contract = {
+                "id": "resume_harness_session",
+                "options": [
+                    {"value": "continue"},
+                    {"value": "modify"},
+                    {"value": "reset"},
+                ],
+            }
+            baseline = replace(
+                self._event(1),
+                pending_question_id="resume_harness_session",
+                pending_contract=resume_contract,
+                next_result={
+                    "kind": "question",
+                    "question_id": "resume_harness_session",
+                },
+            )
+            resumed = replace(
+                self._event(2, "continue"),
+                admitted_action_types=("resume_session",),
+                pending_question_id="opening_next_action",
+                pending_contract={"id": "opening_next_action"},
+                next_result={
+                    "kind": "question",
+                    "question_id": "opening_next_action",
+                },
+            )
+            final_message = "Responding to turn 3: continue safely."
+            final = self._event(3, final_message)
+            transport = FakeTransport([
+                "Agent> Resume the retained configuration?",
+                "Agent> Retained configuration restored. What next?",
+                "Agent> Ready.",
+            ])
+            contexts: list[JourneySimulatorContext] = []
+
+            def simulator(context):
+                contexts.append(context)
+                return self._decision(context)
+
+            runner = self._runner(
+                Path(tmpdir),
+                schedule=self._schedule(max_turns=1),
+                simulator=simulator,
+                transport=transport,
+                events=[baseline, resumed, final],
+            )
+
+            result = self._run(runner)
+
+            self.assertEqual(
+                result.terminal_classification,
+                JourneyTerminalClassification.PASSED,
+            )
+            self.assertEqual(transport.submitted, ["continue", final_message])
+            self.assertEqual(len(contexts), 1)
+            self.assertEqual(contexts[0].turn_index, 3)
+            self.assertIn(
+                "Retained configuration restored",
+                contexts[0].previous_agent_response,
+            )
+            self.assertEqual(len(result.turns), 1)
+            self.assertEqual(
+                result.turns[0].turn_index,
+                3,
+            )
+
+    def test_resume_journey_leaves_resume_contract_to_simulator(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            resume_contract = {
+                "id": "resume_harness_session",
+                "options": [
+                    {"value": "continue"},
+                    {"value": "modify"},
+                    {"value": "reset"},
+                ],
+            }
+            baseline = replace(
+                self._event(1),
+                pending_question_id="resume_harness_session",
+                pending_contract=resume_contract,
+                next_result={
+                    "kind": "question",
+                    "question_id": "resume_harness_session",
+                },
+            )
+            final_message = "continue"
+            final = replace(
+                self._event(2, final_message),
+                admitted_action_types=("resume_session",),
+            )
+            transport = FakeTransport([
+                "Agent> Resume the retained configuration?",
+                "Agent> Retained configuration restored.",
+            ])
+            contexts: list[JourneySimulatorContext] = []
+
+            def simulator(context):
+                contexts.append(context)
+                return replace(
+                    self._decision(context),
+                    user_message=final_message,
+                )
+
+            runner = self._runner(
+                Path(tmpdir),
+                schedule=self._schedule(
+                    max_turns=1,
+                    start_scenario="resume",
+                ),
+                simulator=simulator,
+                transport=transport,
+                events=[baseline, final],
+                registry=self._registry(ready_at_turn_two),
+            )
+
+            result = self._run(runner)
+
+            self.assertEqual(
+                result.terminal_classification,
+                JourneyTerminalClassification.PASSED,
+            )
+            self.assertEqual(transport.submitted, [final_message])
+            self.assertEqual(len(contexts), 1)
+            self.assertEqual(
+                contexts[0].previous_agent_response,
+                "Agent> Resume the retained configuration?",
+            )
+
+    def test_changed_resume_action_is_bootstrap_not_owned_by_journey(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            live_contract = {
+                "id": "resume_harness_session",
+                "options": [
+                    {"value": "continue", "semantic_action": "resume_session"},
+                    {"value": "modify", "semantic_action": "modify_session"},
+                    {"value": "reset", "semantic_action": "reset_session"},
+                ],
+            }
+            reviewed_contract = {
+                "id": "resume_harness_session",
+                "options": [
+                    {"value": "continue", "semantic_action": "reset_session"},
+                    {"value": "modify", "semantic_action": "modify_session"},
+                    {"value": "reset", "semantic_action": "reset_session"},
+                ],
+            }
+            baseline = replace(
+                self._event(1),
+                pending_question_id="resume_harness_session",
+                pending_contract=live_contract,
+                next_result={
+                    "kind": "question",
+                    "question_id": "resume_harness_session",
+                },
+            )
+            resumed = replace(
+                self._event(2, "continue"),
+                admitted_action_types=("resume_session",),
+                pending_question_id="opening_next_action",
+                pending_contract={"id": "opening_next_action"},
+                next_result={
+                    "kind": "question",
+                    "question_id": "opening_next_action",
+                },
+            )
+            final_message = "Responding to turn 3: continue safely."
+            transport = FakeTransport([
+                "Agent> Resume the retained configuration?",
+                "Agent> Retained configuration restored. What next?",
+                "Agent> Ready.",
+            ])
+            contexts: list[JourneySimulatorContext] = []
+
+            def simulator(context):
+                contexts.append(context)
+                return self._decision(context)
+
+            runner = self._runner(
+                Path(tmpdir),
+                schedule=self._schedule(max_turns=1, start_scenario="resume"),
+                simulator=simulator,
+                transport=transport,
+                events=[baseline, resumed, self._event(3, final_message)],
+            )
+
+            result = self._run(
+                runner,
+                reviewed_question=reviewed_contract,
+            )
+
+            self.assertEqual(
+                result.terminal_classification,
+                JourneyTerminalClassification.PASSED,
+            )
+            self.assertEqual(transport.submitted, ["continue", final_message])
+            self.assertEqual(len(contexts), 1)
 
     def test_retained_journey_binds_live_codex_decisions_to_semantic_steps(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

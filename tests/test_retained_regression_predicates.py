@@ -7,6 +7,7 @@ import hashlib
 import json
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from agent.harness.domains.rpc_receipts import evidence_hash
 from agent.harness.domains.analysis_receipts import analysis_hash
@@ -78,6 +79,8 @@ def _context(*events: RuntimeTurnEvent, **values) -> SimpleNamespace:
         completed_turns=tuple(values.get("turns") or ()),
         completed_decisions=tuple(values.get("decisions") or ()),
         verifier_input_contract=values.get("verifier_input_contract") or {},
+        initial_event=values.get("initial_event"),
+        schedule=values.get("schedule") or SimpleNamespace(start_scenario=""),
     )
 
 
@@ -1769,21 +1772,59 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
     def test_resume_contract_and_evidence_classification_use_structured_evidence(
         self,
     ) -> None:
+        resume_contract = {
+            "id": "resume_harness_session",
+            "options": [
+                {"id": "1", "expected_patch": {"resume_context": {}}},
+                {"id": "2", "expected_patch": {"resume_context": {}}},
+            ],
+        }
         resume_event = replace(
             _event(),
             pending_question_id="resume_harness_session",
-            pending_contract={
-                "id": "resume_harness_session",
-                "options": [
-                    {"id": "1", "expected_patch": {"resume_context": {}}},
-                    {"id": "2", "expected_patch": {"resume_context": {}}},
-                ],
-            },
+            pending_contract=resume_contract,
         )
-        exposed, _ = POSTCONDITION_EVALUATORS[
-            "resume_action_contract_exposed"
-        ](_context(resume_event))
+        context = _context(
+            resume_event,
+            schedule=SimpleNamespace(start_scenario="resume-scenario"),
+        )
+        with patch(
+            "tests.agent_live.runtime_checkpoint.reviewed_scenario",
+            return_value=SimpleNamespace(question=resume_contract),
+        ):
+            exposed, _ = POSTCONDITION_EVALUATORS[
+                "resume_action_contract_exposed"
+            ](context)
         self.assertTrue(exposed)
+
+        changed_contract = {
+            **resume_contract,
+            "options": [
+                {
+                    **resume_contract["options"][0],
+                    "semantic_action": "reset_session",
+                },
+                resume_contract["options"][1],
+            ],
+        }
+        changed_event = replace(
+            resume_event,
+            pending_contract=changed_contract,
+        )
+        with patch(
+            "tests.agent_live.runtime_checkpoint.reviewed_scenario",
+            return_value=SimpleNamespace(question=resume_contract),
+        ):
+            exposed, details = POSTCONDITION_EVALUATORS[
+                "resume_action_contract_exposed"
+            ](
+                _context(
+                    changed_event,
+                    schedule=SimpleNamespace(start_scenario="resume-scenario"),
+                )
+            )
+        self.assertFalse(exposed)
+        self.assertEqual(details["matched_pending_contract_hashes"], [])
 
         orientation_body = {
             "receipt_type": "orientation_response",

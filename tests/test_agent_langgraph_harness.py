@@ -1973,7 +1973,7 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         self.assertEqual(_catalog_draft(resumed)["method"], "eth_blockNumber")
         self.assertEqual(resumed["interruption_stack"], [])
 
-    def test_go_back_consumes_interruption_before_domain_resume_fallback(self) -> None:
+    def test_go_back_discards_completed_interruption_before_domain_resume_fallback(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
         from agent.harness.domains.chain_rpc import question_for_chain_rpc
         from agent.harness.state import new_state
@@ -2004,8 +2004,8 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         ):
             result = process_turn(state)
 
-        self.assertEqual(result["pending_question"]["id"], "CLOUD_REGION")
-        self.assertEqual(result["active_group"], "provider_deployment")
+        self.assertEqual(result["pending_question"]["id"], "rpc_mode")
+        self.assertEqual(result["active_group"], "workload_rpc")
         self.assertEqual(result["interruption_stack"], [])
         self.assertEqual(result["custom_rpc"], {})
 

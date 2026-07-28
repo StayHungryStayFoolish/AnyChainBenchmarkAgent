@@ -24,6 +24,7 @@ from .action_registry import (
     ACTION_ARGUMENT_SCHEMAS,
     ACTION_BY_TYPE,
     ACTION_SPECS,
+    SEMANTIC_OPERATION_PURPOSES,
     SEMANTIC_OPERATIONS,
     pending_barrier_semantics,
     registered_semantic_value_domains,
@@ -188,8 +189,20 @@ def begin_semantic_partition(
             document["errors"] = list(partition_errors)
             document["unit_count"] = len(partition)
             return document
+        (
+            stage_a_admission_errors,
+            stage_a_admission_sizes,
+            redundant_unit_ids,
+        ) = _review_stage_a_partition(provider, stage_a_payload, partition)
+        document["request_sizes"].extend(stage_a_admission_sizes)
+        document["admission_calls"] += len(stage_a_admission_sizes)
+        if stage_a_admission_errors:
+            document["status"] = "failed"
+            document["errors"] = list(stage_a_admission_errors)
+            document["unit_count"] = len(partition)
+            return document
         source_partition, compilation_partition = (
-            _partition_after_stage_a_admission(partition, frozenset())
+            _partition_after_stage_a_admission(partition, redundant_unit_ids)
         )
         source_partition, compilation_partition = (
             _canonicalize_atomic_evidence_partition(
@@ -400,7 +413,7 @@ def review_semantic_plan(
         whole_plan_contract_repair=True,
         reasoning_mode=STRICT_JSON_REASONING_MODE,
     )
-    admission_calls = (
+    admission_calls += (
         int(getattr(admission, "request_count", 1))
         if admission is not None
         else 0
@@ -602,6 +615,11 @@ def _stage_a_prompt() -> str:
         "Do not choose product actions, mutate state, answer the user, or copy values from state. "
         "Each semantic unit must contain exactly: unit_id, clause_id, source_text, operation, "
         "owner_routes, reason. operation must be one of the supplied universal_operations. "
+        "Treat universal_operation_purposes as authoritative. pending_answer requires a present "
+        "commitment to the active question; a hypothetical, counterfactual, consequence, or "
+        "explanation question is consultation and never authorizes the pending action. A request "
+        "to analyze logs, errors, traces, or other evidence is evidence_analysis even when the "
+        "user has not pasted the evidence yet. "
         "owner_routes is an ordered list of {owner,group}; use an empty list only for context "
         "or unresolved. A unit may route to several owners when one atomic structured block "
         "contains independently owned values. Preserve questions, corrections, contradictions, "
@@ -693,6 +711,7 @@ def _stage_a_payload(
         "workflow_goals": state.get("workflow_goals") or [],
         "structured_candidates": structured_candidates,
         "universal_operations": sorted(_UNIVERSAL_OPERATIONS),
+        "universal_operation_purposes": dict(SEMANTIC_OPERATION_PURPOSES),
         "universal_operation_owners": dict(_UNIVERSAL_OPERATION_OWNER),
         "owners": sorted(_OWNERS),
         "groups": [
@@ -1106,6 +1125,10 @@ def _stage_a_admission_prompt() -> str:
         "You are the independent Stage A coverage authority for AnyChain Benchmark Agent. "
         "You are not a planner and must not create product actions. Compare the complete user "
         "clauses with the immutable semantic units and the supplied owner/group purposes. "
+        "Treat universal_operation_purposes as authoritative. Reject pending_answer for a "
+        "hypothetical, counterfactual, consequence, explanation, or capability question because "
+        "it contains no present authorization. Require evidence_analysis for a request to ingest "
+        "or analyze logs, errors, traces, or evidence even when the evidence will be pasted later. "
         "Return one strict JSON object with exactly unit_verdicts, clause_verdicts, and reason. "
         "unit_verdicts contains exactly one row per supplied unit in order: "
         "{unit_id,verdict:'complete'|'redundant'|'unresolved',supports_unit_id,reason}. "
@@ -1161,6 +1184,10 @@ def _review_stage_a_partition(
         ),
         "groups": stage_a_payload["groups"],
         "universal_operations": stage_a_payload["universal_operations"],
+        "universal_operation_purposes": dict(
+            stage_a_payload.get("universal_operation_purposes")
+            or SEMANTIC_OPERATION_PURPOSES
+        ),
     }
     request_sizes: list[int] = []
     response = ""

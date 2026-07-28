@@ -372,7 +372,10 @@ class ContainerProcessGuard:
                 zero_scans = (first, second)
                 break
 
-        reap_results = self._reap_results(reaper_callbacks)
+        reap_results = self._wait_for_reapers(
+            reaper_callbacks,
+            timeout_seconds=self.kill_grace_seconds,
+        )
         cleaned = bool(zero_scans) and not self._errors and all(
             result["reaped"] for result in reap_results
         )
@@ -395,6 +398,29 @@ class ContainerProcessGuard:
             "finished_at_ns": finished_at_ns,
         }
         return self._write_receipt(unsigned)
+
+    def _wait_for_reapers(
+        self,
+        reapers: Mapping[int, Callable[[], int | None]],
+        *,
+        timeout_seconds: float,
+    ) -> list[dict[str, Any]]:
+        """Allow parent runtimes to publish child exit status after disappearance."""
+
+        deadline = self._monotonic() + timeout_seconds
+        results = self._reap_results(reapers)
+        while (
+            any(not result["reaped"] for result in results)
+            and self._monotonic() < deadline
+        ):
+            self._sleep(
+                min(
+                    self.scan_interval_seconds,
+                    max(0.0, deadline - self._monotonic()),
+                )
+            )
+            results = self._reap_results(reapers)
+        return results
 
     def _wait_for_survivors(
         self,

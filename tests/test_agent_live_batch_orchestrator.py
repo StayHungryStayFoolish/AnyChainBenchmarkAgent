@@ -970,7 +970,21 @@ class BatchOrchestratorTests(unittest.TestCase):
         self.assertEqual(len(index.discovery_attempt_ids), DEFAULT_SHARD_COUNT)
         for row in index.shards:
             receipt = json.loads(Path(row.cleanup_receipt_path).read_text())
-            self.assertTrue(receipt["cleaned"])
+            self.assertTrue(
+                receipt["cleaned"],
+                {
+                    "shard_id": row.shard_id,
+                    "classification": row.classification,
+                    "reason": row.reason,
+                    "errors": receipt["errors"],
+                    "host_reap_results": (
+                        receipt.get("host_proof") or {}
+                    ).get("reap_results"),
+                    "container_reap_results": (
+                        receipt.get("container_proof") or {}
+                    ).get("reap_results"),
+                },
+            )
 
     def test_adversarial_result_artifacts_are_never_counted_as_passed(self) -> None:
         modes = [
@@ -1413,7 +1427,13 @@ class BatchOrchestratorTests(unittest.TestCase):
             ),
             # Leave enough time for the worker to install SIGTERM=SIG_IGN and
             # publish its result before the wait phase times out.
-            timeout_policy=TimeoutPolicy(shard_seconds=1, decision_seconds=1, cleanup_seconds=0.2),
+            # Keep the lifecycle assertion strict while allowing the asyncio
+            # child watcher to publish SIGKILL status under full-suite load.
+            timeout_policy=TimeoutPolicy(
+                shard_seconds=1,
+                decision_seconds=1,
+                cleanup_seconds=1,
+            ),
         )
         index = asyncio.run(run_batch(
             manifest,

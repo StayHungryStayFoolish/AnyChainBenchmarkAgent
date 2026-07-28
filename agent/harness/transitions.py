@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from .state import AgentGraphState
 
-from agent.workflows.group_registry import invalidation_targets
+from agent.workflows.group_registry import group_for_field, invalidation_targets
 
 
 _WORKLOAD_BOUND_CUSTOM_RPC_KEYS = {
@@ -278,6 +278,42 @@ def mark_group_reconfiguring(state: AgentGraphState, group: str) -> None:
 
     if group:
         state.setdefault("group_states", {}).setdefault(group, {})["status"] = "reconfiguring"
+
+
+def field_confirmation_revision(
+    state: AgentGraphState,
+    field: str,
+    *,
+    group: str = "",
+) -> int:
+    """Return the durable confirmation generation for one environment field."""
+
+    owner_group = group or group_for_field(field)
+    revisions = (
+        (state.get("group_states") or {})
+        .get(owner_group, {})
+        .get("field_confirmation_revisions", {})
+    )
+    return int((revisions or {}).get(field) or 0)
+
+
+def mark_field_confirmed(
+    state: AgentGraphState,
+    field: str,
+    *,
+    group: str = "",
+) -> None:
+    """Advance one field generation inside its existing group-owned state."""
+
+    owner_group = group or group_for_field(field)
+    if not owner_group or not field:
+        return
+    group_state = state.setdefault("group_states", {}).setdefault(
+        owner_group,
+        {},
+    )
+    revisions = group_state.setdefault("field_confirmation_revisions", {})
+    revisions[field] = int(revisions.get(field) or 0) + 1
 
 
 def record_group_invalidations(

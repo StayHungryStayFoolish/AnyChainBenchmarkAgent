@@ -235,6 +235,35 @@ class ContainerProcessGuardTest(unittest.TestCase):
         self.assertEqual(matches, ())
         self.assertEqual(errors, ())
 
+    def test_cleanup_waits_for_delayed_parent_reap_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            guard = ContainerProcessGuard(
+                "delayed-parent-reap",
+                receipt_dir=temp_dir,
+                kill_grace_seconds=0.2,
+                scan_interval_seconds=0.01,
+            )
+            results = iter((None, None, -15))
+            polls = 0
+
+            def delayed_reaper() -> int | None:
+                nonlocal polls
+                polls += 1
+                return next(results)
+
+            reap_results = guard._wait_for_reapers(
+                {4242: delayed_reaper},
+                timeout_seconds=0.2,
+            )
+
+        self.assertEqual(polls, 3)
+        self.assertEqual(reap_results, [{
+            "pid": 4242,
+            "reaped": True,
+            "return_code": -15,
+            "error": "",
+        }])
+
     @staticmethod
     def _write_fake_process(
         proc_root: Path,

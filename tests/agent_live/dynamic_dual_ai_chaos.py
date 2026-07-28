@@ -59,6 +59,9 @@ from tests.agent_live.coverage_evidence import (
     write_evidence_artifact,
     write_pty_diagnostic_artifact,
 )
+from tests.agent_live.harness_contract_scenarios import (
+    canonical_question_contract,
+)
 from tests.agent_live.chaos_scheduler import (
     ChaosSchedule,
     JourneyOutcomeContract,
@@ -3190,8 +3193,72 @@ class DynamicDualAiJourneyRunner:
                 baseline_event=baseline_event,
             )
             self._validate_event_revision(baseline_event)
-            initial_event = baseline_event
             transcript_lines.append(previous_response)
+            resume_choice = _startup_resume_submission(
+                baseline_event.pending_contract,
+                desired="continue",
+            )
+            reviewed_pending_contract = dict(start_scenario.question or {})
+            reviewed_pending_contract_hash = (
+                content_hash(canonical_question_contract(reviewed_pending_contract))
+                if reviewed_pending_contract
+                else ""
+            )
+            live_pending_contract = dict(baseline_event.pending_contract or {})
+            live_pending_contract_hash = (
+                content_hash(canonical_question_contract(live_pending_contract))
+                if live_pending_contract
+                else ""
+            )
+            journey_owns_startup_contract = bool(
+                reviewed_pending_contract_hash
+                and reviewed_pending_contract_hash == live_pending_contract_hash
+            )
+            if (
+                resume_choice
+                and not journey_owns_startup_contract
+            ):
+                active_user_message = resume_choice
+                self.transport.submit_bracketed_paste(resume_choice)
+                resumed_completion = wait_for_turn_completion(
+                    self.transport,
+                    self.event_stream,
+                    self.terminal_outcome_stream,
+                    timeout_seconds=self.config.response_timeout_seconds,
+                    expectation=CompletionExpectation(
+                        submitted_input=resume_choice,
+                        session_id=self.config.session_id,
+                        session_purpose=self.config.session_purpose,
+                        product_authority_id=startup_session.product_authority_id,
+                        process_instance_id=startup_session.process_instance_id,
+                        product_revision=int(baseline_event.product_revision),
+                        product_checkpoint_thread_id=(
+                            baseline_event.product_checkpoint_thread_id
+                        ),
+                        product_checkpoint_id=baseline_event.product_checkpoint_id,
+                        product_fingerprint=baseline_event.after_fingerprint,
+                    ),
+                )
+                if not isinstance(resumed_completion, WorkflowCompletion):
+                    raise JourneyInfrastructureInterruptedError(
+                        "startup resume did not produce a workflow completion"
+                    )
+                resumed_response = resumed_completion.response
+                resumed_event = resumed_completion.event
+                self._validate_event_revision(resumed_event)
+                self._validate_terminal_revision(
+                    resumed_completion.terminal_outcome
+                )
+                transcript.extend(((resume_choice, resumed_response),))
+                transcript_lines.extend((
+                    f"User> {resume_choice}",
+                    resumed_response,
+                ))
+                previous_response = resumed_response
+                previous_received_ns = self.clock_ns()
+                baseline_event = resumed_event
+                active_user_message = ""
+            initial_event = baseline_event
 
             initial_context = self._verifier_context(
                 initial_event=initial_event,

@@ -60,7 +60,13 @@ _CLAUSE_VERDICTS = frozenset({"direct", "support", "unrelated"})
 _SIBLING_VERDICTS = frozenset({"none", "present", "ambiguous"})
 _ADMISSION_VERDICTS = frozenset({"accept", "reject"})
 _IDENTIFIER_CHARACTER = r"\w.-"
-_BOUNDED_RECEIPT_VERSION = 2
+_BOUNDED_RECEIPT_VERSION = 3
+_BOUNDED_ELIGIBILITY_CONTRACT = (
+    "One non-empty clause; the complete stripped turn case-insensitively equals "
+    "one immutable candidate matched_value; exactly one candidate identity is "
+    "eligible. All prose, context, comparisons, negation, hypotheticals, and "
+    "multi-clause input escalate to the hierarchical semantic authority."
+)
 
 
 def _canonical_json(value: Any) -> str:
@@ -248,6 +254,36 @@ def build_candidate_catalog(
     for candidate in candidates:
         unique.setdefault(str(candidate["candidate_id"]), candidate)
     return tuple(unique.values())
+
+
+def _eligible_bounded_catalog(
+    text: str,
+    clauses: Sequence[TurnClause],
+    catalog: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], ...]:
+    """Limit the fast lane to one exact immutable value, never contextual prose."""
+
+    raw_source = str(text or "")
+    source = raw_source.strip().casefold()
+    if (
+        not source
+        or "\n" in raw_source
+        or "\r" in raw_source
+        or len(clauses) != 1
+    ):
+        return ()
+    eligible = [
+        dict(candidate)
+        for candidate in catalog
+        if str(candidate.get("matched_value") or "").strip().casefold() == source
+    ]
+    identities = {
+        str(candidate.get("value_identity") or "")
+        for candidate in eligible
+    }
+    if len(eligible) != 1 or len(identities) != 1 or "" in identities:
+        return ()
+    return tuple(eligible)
 
 
 def _mapper_prompt() -> str:
@@ -520,12 +556,16 @@ def compile_bounded_semantic_value(
     catalog = build_candidate_catalog(state, text)
     if not clauses or not catalog:
         return None
+    eligible_catalog = _eligible_bounded_catalog(text, clauses, catalog)
+    if not eligible_catalog:
+        return None
     active_provider = provider if provider is not None else provider_from_config()
     mapper_payload = {
         "original_turn": str(text),
         "clauses": [clause.as_dict() for clause in clauses],
-        "candidate_catalog": [dict(candidate) for candidate in catalog],
+        "candidate_catalog": [dict(candidate) for candidate in eligible_catalog],
         "candidate_catalog_hash": _content_hash(catalog),
+        "bounded_eligibility_contract": _BOUNDED_ELIGIBILITY_CONTRACT,
     }
     mapper_prompt = _mapper_prompt()
     mapper_result = request_semantic_compilation_result(
@@ -539,7 +579,7 @@ def compile_bounded_semantic_value(
         mapper_result.text,
         text=str(text),
         clauses=clauses,
-        catalog=catalog,
+        catalog=eligible_catalog,
     )
     if mapping is None:
         return None
@@ -560,6 +600,7 @@ def compile_bounded_semantic_value(
         "materialized_action": action,
         "original_turn_hash": _content_hash(str(text)),
         "candidate_catalog_hash": _content_hash(catalog),
+        "bounded_eligibility_contract": _BOUNDED_ELIGIBILITY_CONTRACT,
     }
     admission_prompt = _admission_prompt()
     admission_result = request_semantic_compilation_result(
@@ -586,6 +627,9 @@ def compile_bounded_semantic_value(
         "source_hash": str(candidate.get("source_hash") or ""),
         "question_hash": str(candidate.get("question_hash") or ""),
         "registry_hash": str(candidate.get("registry_hash") or ""),
+        "eligibility_contract_hash": _content_hash(
+            _BOUNDED_ELIGIBILITY_CONTRACT
+        ),
         "candidate_catalog_hash": candidate_catalog_hash,
         "action_hash": _content_hash(action),
         "checks_hash": _content_hash(admission.get("checks") or {}),
@@ -634,9 +678,15 @@ def review_bounded_semantic_plan(
     unsigned = {key: value for key, value in receipt.items() if key != "receipt_hash"}
     source_text = str((state.get("turn_context") or {}).get("text") or "")
     current_catalog = build_candidate_catalog(state, source_text)
+    current_clauses = segment_user_turn(source_text)
+    current_eligible_catalog = _eligible_bounded_catalog(
+        source_text,
+        current_clauses,
+        current_catalog,
+    )
     current_candidates = [
         candidate
-        for candidate in current_catalog
+        for candidate in current_eligible_catalog
         if candidate.get("candidate_id") == receipt.get("candidate_id")
     ]
     if (
@@ -647,6 +697,9 @@ def review_bounded_semantic_plan(
             dict(state.get("pending_question") or {})
         )
         or receipt.get("registry_hash") != action_registry_contract_hash()
+        or receipt.get("eligibility_contract_hash") != _content_hash(
+            _BOUNDED_ELIGIBILITY_CONTRACT
+        )
         or receipt.get("candidate_catalog_hash") != _content_hash(current_catalog)
         or len(current_candidates) != 1
         or receipt.get("source_kind") != document.get("bounded_source_kind")

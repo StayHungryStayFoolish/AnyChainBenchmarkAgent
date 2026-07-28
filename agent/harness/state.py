@@ -36,6 +36,7 @@ class PendingQuestion(TypedDict, total=False):
     requires_capabilities: list[str]
     resume_action_queue: bool
     supersedes_action_types: list[str]
+    reconfiguration_target_field: str
     created_turn_index: int
     queue_barrier: bool
     barrier_policy: str

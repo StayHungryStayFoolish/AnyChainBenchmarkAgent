@@ -145,13 +145,13 @@ class BoundedSemanticLaneTest(unittest.TestCase):
         )
 
         state = {"pending_question": _pending_question()}
-        text = "Use the simulated option."
+        text = "simulated"
         candidate = next(
             row
             for row in build_candidate_catalog(state, text)
             if row["canonical_value"] == "fake-node"
         )
-        mapper = _mapping(candidate["candidate_id"], "simulated option")
+        mapper = _mapping(candidate["candidate_id"], "simulated")
         provider = _Provider(mapper, _admission(mapper, candidate["candidate_id"]))
 
         document = compile_bounded_semantic_value(
@@ -167,7 +167,7 @@ class BoundedSemanticLaneTest(unittest.TestCase):
         self.assertEqual(action, {
             "type": "answer_pending",
             "selected_value": "fake-node",
-            "source_evidence": "simulated option",
+            "source_evidence": "simulated",
         })
         self.assertEqual(len(provider.requests), 2)
         self.assertEqual(document["admission_calls"], 1)
@@ -326,13 +326,11 @@ class BoundedSemanticLaneTest(unittest.TestCase):
         ))
         self.assertEqual(provider.requests, [])
 
-    def test_multiline_support_clauses_project_one_action_without_cardinality_error(
+    def test_multiline_input_escalates_to_hierarchical_semantic_authority(
         self,
     ):
         from agent.harness.bounded_semantic_lane import (
-            build_candidate_catalog,
             compile_bounded_semantic_value,
-            review_bounded_semantic_plan,
         )
 
         text = "quick\nplease proceed"
@@ -340,35 +338,28 @@ class BoundedSemanticLaneTest(unittest.TestCase):
             "turn_context": {"text": text},
             "pending_question": _pending_question(),
         }
-        candidate = next(
-            row
-            for row in build_candidate_catalog(state, text)
-            if row["action_type"] == "set_qps_mode"
-        )
-        mapper = _mapping(
-            candidate["candidate_id"],
-            "quick",
-            clauses=("clause-1", "clause-2"),
-        )
-        mapper["clause_verdicts"][1]["verdict"] = "support"
-        provider = _Provider(
-            mapper,
-            _admission(mapper, candidate["candidate_id"]),
-        )
+        provider = _Provider()
 
         document = compile_bounded_semantic_value(
             state,
             text,
             provider=provider,
         )
-        queue = review_bounded_semantic_plan(state, document)
 
-        self.assertEqual(len(queue["actions"]), 1)
-        self.assertEqual(len(queue["semantic_units"]), 2)
-        self.assertTrue(all(
-            unit["action_indexes"] == [0]
-            for unit in queue["semantic_units"]
-        ))
+        self.assertIsNone(document)
+        self.assertEqual(provider.requests, [])
+
+        for whitespace_multiline in ("quick\n", "quick\n\n", "quick\r\n"):
+            with self.subTest(text=repr(whitespace_multiline)):
+                provider = _Provider()
+                self.assertIsNone(
+                    compile_bounded_semantic_value(
+                        state,
+                        whitespace_multiline,
+                        provider=provider,
+                    )
+                )
+                self.assertEqual(provider.requests, [])
 
     def test_rejected_independent_admission_escalates_without_projection(self):
         from agent.harness.bounded_semantic_lane import (
@@ -403,7 +394,7 @@ class BoundedSemanticLaneTest(unittest.TestCase):
         )
 
         state = {"pending_question": _pending_question()}
-        text = "standard profile"
+        text = "standard"
         candidate = next(
             row
             for row in build_candidate_catalog(state, text)
@@ -446,7 +437,36 @@ class BoundedSemanticLaneTest(unittest.TestCase):
             text,
             provider=provider,
         ))
-        self.assertEqual(len(provider.requests), 1)
+        self.assertEqual(len(provider.requests), 0)
+
+    def test_hypothetical_pending_value_never_enters_bounded_lane(self):
+        from agent.harness.bounded_semantic_lane import (
+            build_candidate_catalog,
+            compile_bounded_semantic_value,
+        )
+
+        state = {
+            "pending_question": {
+                "id": "resume",
+                "group": "opening",
+                "owner": "coordinator",
+                "kind": "choice",
+                "options": [{"id": "reset", "value": "reset"}],
+                "manual_input_allowed": False,
+            },
+        }
+        text = "If I reset, what would be cleared?"
+        candidate = next(iter(build_candidate_catalog(state, text)))
+        mapper = _mapping(candidate["candidate_id"], "reset")
+        provider = _Provider(
+            mapper,
+            _admission(mapper, candidate["candidate_id"]),
+        )
+
+        self.assertIsNone(
+            compile_bounded_semantic_value(state, text, provider=provider)
+        )
+        self.assertEqual(provider.requests, [])
 
     def test_no_catalog_escalates_without_model_call(self):
         from agent.harness.bounded_semantic_lane import (

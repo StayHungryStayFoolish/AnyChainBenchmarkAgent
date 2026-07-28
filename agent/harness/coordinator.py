@@ -90,7 +90,11 @@ from .failures import (
 from .domains.registry import GROUP_OWNER
 from .domains.runtime import DOMAIN_RUNTIME, DomainRuntime
 from .invariants import StateInvariantError, apply_state_delta, validate_state
-from .transitions import mark_group_reconfigured, mark_group_reconfiguring
+from .transitions import (
+    field_confirmation_revision,
+    mark_group_reconfigured,
+    mark_group_reconfiguring,
+)
 from .questions import (
     action_for_value,
     exact_option_answer as contract_exact_option_answer,
@@ -2717,6 +2721,16 @@ def _push_interruption_frame(state: AgentGraphState, pending: PendingQuestion, *
     field = str(pending.get("field") or "").strip()
     if field:
         frame["field"] = field
+    reconfiguration_target = str(
+        pending.get("reconfiguration_target_field") or ""
+    ).strip()
+    if reconfiguration_target:
+        frame["reconfiguration_target_field"] = reconfiguration_target
+        frame["reconfiguration_baseline_revision"] = field_confirmation_revision(
+            state,
+            reconfiguration_target,
+            group=str(frame.get("group") or ""),
+        )
     if not frame["group"] or not frame["question_id"]:
         return
     stack = list(state.get("interruption_stack") or [])
@@ -2725,12 +2739,24 @@ def _push_interruption_frame(state: AgentGraphState, pending: PendingQuestion, *
         frame["owner"],
         frame["question_id"],
         str(frame.get("field") or ""),
+        str(frame.get("reconfiguration_target_field") or ""),
+        int(frame.get("reconfiguration_baseline_revision") or 0),
     )
     top_identity = (
         str((stack[-1] if stack else {}).get("group") or ""),
         str((stack[-1] if stack else {}).get("owner") or ""),
         str((stack[-1] if stack else {}).get("question_id") or ""),
         str((stack[-1] if stack else {}).get("field") or ""),
+        str(
+            (stack[-1] if stack else {}).get("reconfiguration_target_field")
+            or ""
+        ),
+        int(
+            (stack[-1] if stack else {}).get(
+                "reconfiguration_baseline_revision"
+            )
+            or 0
+        ),
     )
     if top_identity != frame_identity:
         stack.append(frame)
@@ -3550,7 +3576,20 @@ def _reconstruct_question(
         if question and str(question.get("id") or "") == question_id:
             return question
     field = str(identity.get("field") or "").strip()
-    if field:
+    reconfiguration_target = str(
+        identity.get("reconfiguration_target_field") or ""
+    ).strip()
+    if field and reconfiguration_target == field:
+        baseline_revision = int(
+            identity.get("reconfiguration_baseline_revision") or 0
+        )
+        current_revision = field_confirmation_revision(
+            state,
+            field,
+            group=group,
+        )
+        if current_revision > baseline_revision:
+            return None
         runtime = DOMAIN_RUNTIME.get(owner)
         question = (
             runtime.field_question_factory(state, group, field)

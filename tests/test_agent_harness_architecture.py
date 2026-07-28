@@ -1763,6 +1763,107 @@ class HarnessArchitectureTest(unittest.TestCase):
                 "source_evidence": "change QPS",
             })
 
+    def test_normal_environment_interruption_cannot_reopen_confirmed_field(
+        self,
+    ) -> None:
+        from agent.harness.domains.environment import (
+            reconstruct_environment_question,
+        )
+        from agent.harness.coordinator import _reconstruct_question
+        from agent.harness.state import new_state
+
+        state = new_state("normal-interruption", language="en")
+        state["confirmed_config"] = {
+            "LEDGER_DEVICE": "vda",
+            "DATA_VOL_TYPE": "pd-ssd",
+            "DATA_VOL_SIZE": "926",
+            "DATA_VOL_MAX_IOPS": "20000",
+            "DATA_VOL_MAX_THROUGHPUT": "1000",
+        }
+        identity = {
+            "group": "ledger_disk",
+            "owner": "environment",
+            "question_id": "DATA_VOL_TYPE",
+            "field": "DATA_VOL_TYPE",
+            "reason": "propose_config_values_overlay",
+        }
+
+        self.assertIsNone(reconstruct_environment_question(state, identity))
+        self.assertIsNone(_reconstruct_question(state, identity))
+
+        identity["reconfiguration_target_field"] = "DATA_VOL_TYPE"
+        question = reconstruct_environment_question(state, identity)
+        self.assertIsNotNone(question)
+        self.assertEqual(question["id"], "DATA_VOL_TYPE")
+        self.assertEqual(
+            question["reconfiguration_target_field"],
+            "DATA_VOL_TYPE",
+        )
+        resumed = _reconstruct_question(state, identity)
+        self.assertIsNotNone(resumed)
+        self.assertEqual(resumed["id"], "DATA_VOL_TYPE")
+
+    def test_explicit_reconfiguration_is_not_deduplicated_as_normal_interruption(
+        self,
+    ) -> None:
+        from agent.harness.coordinator import _push_interruption_frame
+        from agent.harness.state import new_state
+
+        state = new_state("interruption-dedup", language="en")
+        normal = {
+            "id": "DATA_VOL_TYPE",
+            "group": "ledger_disk",
+            "owner": "environment",
+            "field": "DATA_VOL_TYPE",
+        }
+        explicit = {
+            **normal,
+            "reconfiguration_target_field": "DATA_VOL_TYPE",
+        }
+
+        _push_interruption_frame(state, normal, reason="explicit_navigation")
+        _push_interruption_frame(state, explicit, reason="explicit_navigation")
+
+        self.assertEqual(len(state["interruption_stack"]), 2)
+        self.assertNotIn(
+            "reconfiguration_target_field",
+            state["interruption_stack"][0],
+        )
+        self.assertEqual(
+            state["interruption_stack"][1]["reconfiguration_target_field"],
+            "DATA_VOL_TYPE",
+        )
+
+    def test_explicit_reconfiguration_frame_expires_after_alternate_confirmation(
+        self,
+    ) -> None:
+        from agent.harness.coordinator import (
+            _pop_interruption_question,
+            _push_interruption_frame,
+        )
+        from agent.harness.state import new_state
+        from agent.harness.transitions import mark_field_confirmed
+
+        state = new_state("interruption-fulfilled", language="en")
+        state["confirmed_config"] = {"DATA_VOL_TYPE": "pd-ssd"}
+        pending = {
+            "id": "DATA_VOL_TYPE",
+            "group": "ledger_disk",
+            "owner": "environment",
+            "field": "DATA_VOL_TYPE",
+            "reconfiguration_target_field": "DATA_VOL_TYPE",
+        }
+        _push_interruption_frame(state, pending, reason="explicit_navigation")
+
+        mark_field_confirmed(
+            state,
+            "DATA_VOL_TYPE",
+            group="ledger_disk",
+        )
+
+        self.assertIsNone(_pop_interruption_question(state))
+        self.assertEqual(state["interruption_stack"], [])
+
     def test_scalar_reconfiguration_opens_exact_question_without_copying_state(self) -> None:
         from tests.agent_live.graph_turn import invoke_action
 
@@ -1932,6 +2033,24 @@ class HarnessArchitectureTest(unittest.TestCase):
         )
         baseline = action_registry.action_registry_contract_hash()
         with patch.object(action_registry, "ACTION_SPECS", modified):
+            changed = action_registry.action_registry_contract_hash()
+        self.assertNotEqual(baseline, changed)
+
+    def test_semantic_operation_purposes_participate_in_registry_identity(
+        self,
+    ) -> None:
+        from unittest.mock import patch
+
+        from agent.harness import action_registry
+
+        baseline = action_registry.action_registry_contract_hash()
+        changed_purposes = dict(action_registry.SEMANTIC_OPERATION_PURPOSES)
+        changed_purposes["consultation"] += " Changed contract."
+        with patch.object(
+            action_registry,
+            "SEMANTIC_OPERATION_PURPOSES",
+            changed_purposes,
+        ):
             changed = action_registry.action_registry_contract_hash()
         self.assertNotEqual(baseline, changed)
 
