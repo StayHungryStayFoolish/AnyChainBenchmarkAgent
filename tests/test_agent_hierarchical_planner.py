@@ -37,6 +37,24 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             and record.get("value") == "fake-node"
             for record in records
         ))
+        fake_node_records = [
+            record
+            for record in records
+            if record.get("value") == "fake-node"
+        ]
+        self.assertEqual(len(fake_node_records), 1)
+        self.assertEqual(
+            fake_node_records[0]["semantic_owner"],
+            "target_mode",
+        )
+        self.assertEqual(
+            fake_node_records[0]["target_group"],
+            "target_mode",
+        )
+        self.assertEqual(
+            fake_node_records[0]["action_type"],
+            "choose_target_mode",
+        )
         self.assertEqual(SEMANTIC_VALUE_DOMAIN_POLICY["schema_version"], 2)
         self.assertEqual(
             PENDING_BARRIER_POLICIES["exclusive_owner"][
@@ -66,6 +84,109 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             "before the evidence is pasted",
             SEMANTIC_OPERATION_PURPOSES["evidence_analysis"],
         )
+
+    def test_semantic_domain_representative_is_action_order_independent(
+        self,
+    ) -> None:
+        from agent.harness import action_registry
+
+        expected = [
+            row
+            for row in action_registry.registered_semantic_value_domains()
+            if row.get("value") in {"fake-node", "bnb"}
+        ]
+        with patch.object(
+            action_registry,
+            "ACTION_SPECS",
+            tuple(reversed(action_registry.ACTION_SPECS)),
+        ):
+            observed = [
+                row
+                for row in action_registry.registered_semantic_value_domains()
+                if row.get("value") in {"fake-node", "bnb"}
+            ]
+
+        self.assertEqual(observed, expected)
+        self.assertEqual(
+            {
+                row["value"]: row["action_type"]
+                for row in observed
+            },
+            {
+                "fake-node": "choose_target_mode",
+                "bnb": "choose_chain",
+            },
+        )
+
+    def test_semantic_domain_representative_invariants_fail_closed(self) -> None:
+        from dataclasses import replace
+
+        from agent.harness import action_registry
+
+        duplicate_target_mode = tuple(
+            replace(spec, semantic_value_representative=True)
+            if spec.action_type == "queue_workflow_goal"
+            else spec
+            for spec in action_registry.ACTION_SPECS
+        )
+        with (
+            patch.object(
+                action_registry,
+                "ACTION_SPECS",
+                duplicate_target_mode,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "exactly one canonical representative",
+            ),
+        ):
+            action_registry.registered_semantic_value_domains()
+
+        wrong_target_mode_owner = tuple(
+            replace(
+                spec,
+                semantic_value_representative=(
+                    spec.action_type == "queue_workflow_goal"
+                ),
+            )
+            if spec.action_type in {
+                "choose_target_mode",
+                "queue_workflow_goal",
+            }
+            else spec
+            for spec in action_registry.ACTION_SPECS
+        )
+        with (
+            patch.object(
+                action_registry,
+                "ACTION_SPECS",
+                wrong_target_mode_owner,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "does not own the canonical workflow group",
+            ),
+        ):
+            action_registry.registered_semantic_value_domains()
+
+        missing_chain_representative = tuple(
+            replace(spec, semantic_value_representative=False)
+            if spec.action_type == "choose_chain"
+            else spec
+            for spec in action_registry.ACTION_SPECS
+        )
+        with (
+            patch.object(
+                action_registry,
+                "ACTION_SPECS",
+                missing_chain_representative,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "known chain identities require exactly one",
+            ),
+        ):
+            action_registry.registered_semantic_value_domains()
 
     def test_pending_barrier_rejects_unknown_policy(self) -> None:
         from agent.harness.action_registry import pending_barrier_semantics
@@ -1236,6 +1357,689 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             any("unresolved" in error for error in result["errors"]),
             result["errors"],
         )
+
+    def test_inconsistent_wrapper_verdict_gets_one_admission_repair(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import begin_semantic_partition
+
+        cases = (
+            (
+                "fake-node 测试",
+                "fake-node",
+                "测试",
+                "chain_rpc",
+                "target_mode",
+            ),
+            (
+                "Use quick profile",
+                "quick",
+                "profile",
+                "performance",
+                "qps_profile",
+            ),
+        )
+        state = {
+            "language": "zh",
+            "active_group": "chain_identity",
+            "target_mode": "real-node",
+            "pending_question": {
+                "id": "chain",
+                "group": "chain_identity",
+                "owner": "chain_rpc",
+                "kind": "chain",
+                "manual_input_allowed": True,
+                "queue_barrier": True,
+                "barrier_policy": "exclusive_owner",
+                "value_domain": "researched_identity",
+            },
+        }
+        for text, value, wrapper, owner, group in cases:
+            with self.subTest(text=text):
+                initial_partition = {
+                    "semantic_units": [
+                        {
+                            "unit_id": "unit-1",
+                            "clause_id": "clause-1",
+                            "source_text": value,
+                            "operation": "domain_request",
+                            "owner_routes": [{
+                                "owner": owner,
+                                "group": group,
+                            }],
+                            "reason": "registered value",
+                        },
+                        {
+                            "unit_id": "unit-2",
+                            "clause_id": "clause-1",
+                            "source_text": wrapper,
+                            "operation": "unresolved",
+                            "owner_routes": [],
+                            "reason": "wrapper was split incorrectly",
+                        },
+                    ],
+                    "reason": "candidate partition",
+                }
+                rejected = {
+                    "unit_verdicts": [
+                        {
+                            "unit_id": "unit-1",
+                            "verdict": "complete",
+                            "supports_unit_id": "",
+                            "reason": "registered value is represented",
+                        },
+                        {
+                            "unit_id": "unit-2",
+                            "verdict": "unresolved",
+                            "supports_unit_id": "",
+                            "reason": "wrapper is not independently actionable",
+                        },
+                    ],
+                    "clause_verdicts": [{
+                        "clause_id": "clause-1",
+                        "verdict": "complete",
+                        "omitted_owner_routes": [],
+                        "reason": "no sibling demand is omitted",
+                    }],
+                    "reason": "one wrapper unit remains unresolved",
+                }
+                accepted = {
+                    "unit_verdicts": [
+                        {
+                            "unit_id": "unit-1",
+                            "verdict": "complete",
+                            "supports_unit_id": "",
+                            "reason": "the complete demand is represented",
+                        },
+                        {
+                            "unit_id": "unit-2",
+                            "verdict": "redundant",
+                            "supports_unit_id": "unit-1",
+                            "reason": "the wrapper adds no independent demand",
+                        },
+                    ],
+                    "clause_verdicts": [{
+                        "clause_id": "clause-1",
+                        "verdict": "complete",
+                        "omitted_owner_routes": [],
+                        "reason": "no demand is omitted",
+                    }],
+                    "reason": "partition is complete",
+                }
+
+                with (
+                    patch(
+                        "agent.harness.hierarchical_planner.provider_from_config",
+                        return_value=object(),
+                    ),
+                    patch(
+                        "agent.harness.hierarchical_planner.request_semantic_compilation",
+                        side_effect=[
+                            json.dumps(initial_partition),
+                            json.dumps(rejected),
+                            json.dumps(accepted),
+                        ],
+                    ) as compiler,
+                ):
+                    result = begin_semantic_partition(state, text)
+
+                self.assertEqual(result["status"], "compile_owner")
+                self.assertEqual(result["stage_a_calls"], 1)
+                self.assertEqual(result["admission_calls"], 2)
+                contract_repair = (
+                    compiler.call_args_list[2]
+                    .kwargs["request_payload"]["contract_repair"]
+                )
+                self.assertTrue(any(
+                    "internally inconsistent" in error
+                    for error in contract_repair["validation_errors"]
+                ))
+                source_by_id = {
+                    unit["unit_id"]: unit
+                    for unit in result["source_partition"]
+                }
+                self.assertEqual(
+                    source_by_id["unit-2"]["operation"],
+                    "context",
+                )
+                self.assertNotIn(
+                    "unit-2",
+                    {
+                        unit["unit_id"]
+                        for unit in result["routed_partition"]
+                    },
+                )
+
+    def test_registered_value_consultation_remains_read_only(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import begin_semantic_partition
+
+        text = "What does fake-node mean?"
+        partition = {
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": text,
+                "operation": "consultation",
+                "owner_routes": [{
+                    "owner": "orientation",
+                    "group": "target_mode",
+                }],
+                "reason": "read-only explanation request",
+            }],
+            "reason": "consultation partition",
+        }
+        accepted = {
+            "unit_verdicts": [{
+                "unit_id": "unit-1",
+                "verdict": "complete",
+                "supports_unit_id": "",
+                "reason": "the question is represented",
+            }],
+            "clause_verdicts": [{
+                "clause_id": "clause-1",
+                "verdict": "complete",
+                "omitted_owner_routes": [],
+                "reason": "no demand is omitted",
+            }],
+            "reason": "partition is complete",
+        }
+        state = {
+            "active_group": "chain_identity",
+            "pending_question": {
+                "id": "chain",
+                "group": "chain_identity",
+                "owner": "chain_rpc",
+                "kind": "chain",
+                "manual_input_allowed": True,
+                "queue_barrier": True,
+                "barrier_policy": "exclusive_owner",
+            },
+        }
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                side_effect=[json.dumps(partition), json.dumps(accepted)],
+            ) as compiler,
+        ):
+            result = begin_semantic_partition(state, text)
+
+        self.assertEqual(result["status"], "compile_owner")
+        self.assertEqual(result["stage_a_calls"], 1)
+        self.assertEqual(result["admission_calls"], 1)
+        self.assertEqual(compiler.call_count, 2)
+
+    def test_rejected_consultation_fails_closed(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import begin_semantic_partition
+
+        text = "What does fake-node mean?"
+        partition = {
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": text,
+                "operation": "consultation",
+                "owner_routes": [{
+                    "owner": "orientation",
+                    "group": "target_mode",
+                }],
+                "reason": "read-only explanation request",
+            }],
+            "reason": "consultation partition",
+        }
+        rejected = {
+            "unit_verdicts": [{
+                "unit_id": "unit-1",
+                "verdict": "unresolved",
+                "supports_unit_id": "",
+                "reason": "reviewer rejected the consultation",
+            }],
+            "clause_verdicts": [{
+                "clause_id": "clause-1",
+                "verdict": "unresolved",
+                "omitted_owner_routes": [],
+                "reason": "the consultation meaning is unresolved",
+            }],
+            "reason": "semantic rejection",
+        }
+        state = {
+            "active_group": "chain_identity",
+            "pending_question": {
+                "id": "chain",
+                "group": "chain_identity",
+                "owner": "chain_rpc",
+                "kind": "chain",
+                "manual_input_allowed": True,
+            },
+        }
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                side_effect=[json.dumps(partition), json.dumps(rejected)],
+            ) as compiler,
+        ):
+            result = begin_semantic_partition(state, text)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["stage_a_calls"], 1)
+        self.assertEqual(result["admission_calls"], 1)
+        self.assertEqual(compiler.call_count, 2)
+
+    def test_independent_unresolved_demand_fails_closed(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import begin_semantic_partition
+
+        text = "Use quick and diagnose the last failed job"
+        partition = {
+            "semantic_units": [
+                {
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "source_text": "quick",
+                    "operation": "domain_request",
+                    "owner_routes": [{
+                        "owner": "performance",
+                        "group": "qps_profile",
+                    }],
+                    "reason": "registered value",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "clause_id": "clause-1",
+                    "source_text": "and diagnose the last failed job",
+                    "operation": "unresolved",
+                    "owner_routes": [],
+                    "reason": "independent demand lacks an owner",
+                },
+            ],
+            "reason": "second demand is unresolved",
+        }
+        rejected = {
+            "unit_verdicts": [
+                {
+                    "unit_id": "unit-1",
+                    "verdict": "complete",
+                    "supports_unit_id": "",
+                    "reason": "mode selection is represented",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "verdict": "unresolved",
+                    "supports_unit_id": "",
+                    "reason": "independent diagnosis demand is unresolved",
+                },
+            ],
+            "clause_verdicts": [{
+                "clause_id": "clause-1",
+                "verdict": "unresolved",
+                "omitted_owner_routes": [],
+                "reason": "an independent demand has no owner",
+            }],
+            "reason": "partition is incomplete",
+        }
+        state = {
+            "active_group": "chain_identity",
+            "pending_question": {
+                "id": "chain",
+                "group": "chain_identity",
+                "owner": "chain_rpc",
+                "kind": "chain",
+                "manual_input_allowed": True,
+            },
+        }
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                side_effect=[json.dumps(partition), json.dumps(rejected)],
+            ) as compiler,
+        ):
+            result = begin_semantic_partition(state, text)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["stage_a_calls"], 1)
+        self.assertEqual(result["admission_calls"], 1)
+        self.assertEqual(compiler.call_count, 2)
+
+    def test_admission_repair_preserves_independent_consultation(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import begin_semantic_partition
+
+        text = "Use quick and explain what it changes"
+        partition = {
+            "semantic_units": [
+                {
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "source_text": "quick",
+                    "operation": "domain_request",
+                    "owner_routes": [{
+                        "owner": "performance",
+                        "group": "qps_profile",
+                    }],
+                    "reason": "registered value",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "clause_id": "clause-1",
+                    "source_text": "and",
+                    "operation": "unresolved",
+                    "owner_routes": [],
+                    "reason": "wrapper",
+                },
+                {
+                    "unit_id": "unit-3",
+                    "clause_id": "clause-1",
+                    "source_text": "explain what it changes",
+                    "operation": "consultation",
+                    "owner_routes": [{
+                        "owner": "orientation",
+                        "group": "qps_profile",
+                    }],
+                    "reason": "read-only sibling demand",
+                },
+            ],
+            "reason": "split partition",
+        }
+        rejected = {
+            "unit_verdicts": [
+                {
+                    "unit_id": "unit-1",
+                    "verdict": "complete",
+                    "supports_unit_id": "",
+                    "reason": "mode selection is represented",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "verdict": "unresolved",
+                    "supports_unit_id": "",
+                    "reason": "wrapper remains unresolved",
+                },
+                {
+                    "unit_id": "unit-3",
+                    "verdict": "complete",
+                    "supports_unit_id": "",
+                    "reason": "consultation is represented",
+                },
+            ],
+            "clause_verdicts": [{
+                "clause_id": "clause-1",
+                "verdict": "complete",
+                "omitted_owner_routes": [],
+                "reason": "all demands have owners",
+            }],
+            "reason": "wrapper defect",
+        }
+        repaired = {
+            "unit_verdicts": [
+                {
+                    "unit_id": "unit-1",
+                    "verdict": "complete",
+                    "supports_unit_id": "",
+                    "reason": "mode selection is represented",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "verdict": "redundant",
+                    "supports_unit_id": "unit-1",
+                    "reason": "connective supports the selection",
+                },
+                {
+                    "unit_id": "unit-3",
+                    "verdict": "complete",
+                    "supports_unit_id": "",
+                    "reason": "consultation remains independent",
+                },
+            ],
+            "clause_verdicts": [{
+                "clause_id": "clause-1",
+                "verdict": "complete",
+                "omitted_owner_routes": [],
+                "reason": "both independent demands are represented",
+            }],
+            "reason": "coherent repaired verdict",
+        }
+        state = {
+            "active_group": "chain_identity",
+            "pending_question": {
+                "id": "chain",
+                "group": "chain_identity",
+                "owner": "chain_rpc",
+                "kind": "chain",
+                "manual_input_allowed": True,
+            },
+        }
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                side_effect=[
+                    json.dumps(partition),
+                    json.dumps(rejected),
+                    json.dumps(repaired),
+                ],
+            ) as compiler,
+        ):
+            result = begin_semantic_partition(state, text)
+
+        self.assertEqual(result["status"], "compile_owner")
+        self.assertEqual(result["stage_a_calls"], 1)
+        self.assertEqual(result["admission_calls"], 2)
+        self.assertEqual(compiler.call_count, 3)
+        self.assertEqual(
+            {
+                unit["operation"]
+                for unit in result["routed_partition"]
+            },
+            {"domain_request", "consultation"},
+        )
+
+    def test_repeated_inconsistent_admission_fails_closed(self) -> None:
+        from agent.harness.hierarchical_planner import begin_semantic_partition
+
+        text = "Use quick profile"
+        partition = {
+            "semantic_units": [
+                {
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "source_text": "quick",
+                    "operation": "domain_request",
+                    "owner_routes": [{
+                        "owner": "performance",
+                        "group": "qps_profile",
+                    }],
+                    "reason": "registered value",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "clause_id": "clause-1",
+                    "source_text": "profile",
+                    "operation": "unresolved",
+                    "owner_routes": [],
+                    "reason": "wrapper was split incorrectly",
+                },
+            ],
+            "reason": "candidate partition",
+        }
+        rejected = {
+            "unit_verdicts": [
+                {
+                    "unit_id": "unit-1",
+                    "verdict": "complete",
+                    "supports_unit_id": "",
+                    "reason": "mode selection is represented",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "verdict": "unresolved",
+                    "supports_unit_id": "",
+                    "reason": "wrapper remains unresolved",
+                },
+            ],
+            "clause_verdicts": [{
+                "clause_id": "clause-1",
+                "verdict": "complete",
+                "omitted_owner_routes": [],
+                "reason": "no independent demand is omitted",
+            }],
+            "reason": "wrapper defect",
+        }
+        state = {
+            "active_group": "chain_identity",
+            "pending_question": {
+                "id": "chain",
+                "group": "chain_identity",
+                "owner": "chain_rpc",
+                "kind": "chain",
+                "manual_input_allowed": True,
+            },
+        }
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                side_effect=[
+                    json.dumps(partition),
+                    json.dumps(rejected),
+                    json.dumps(rejected),
+                ],
+            ) as compiler,
+        ):
+            result = begin_semantic_partition(state, text)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["stage_a_calls"], 1)
+        self.assertEqual(result["admission_calls"], 2)
+        self.assertEqual(compiler.call_count, 3)
+        self.assertTrue(
+            any(
+                "internally inconsistent" in error
+                for error in result["errors"]
+            ),
+            result["errors"],
+        )
+
+    def test_coherent_unresolved_admission_repair_fails_closed(self) -> None:
+        from agent.harness.hierarchical_planner import begin_semantic_partition
+
+        text = "Use quick profile"
+        partition = {
+            "semantic_units": [
+                {
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "source_text": "quick",
+                    "operation": "domain_request",
+                    "owner_routes": [{
+                        "owner": "performance",
+                        "group": "qps_profile",
+                    }],
+                    "reason": "registered value",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "clause_id": "clause-1",
+                    "source_text": "profile",
+                    "operation": "unresolved",
+                    "owner_routes": [],
+                    "reason": "unresolved wrapper",
+                },
+            ],
+            "reason": "incomplete partition",
+        }
+        rejected = {
+            "unit_verdicts": [
+                {
+                    "unit_id": "unit-1",
+                    "verdict": "complete",
+                    "supports_unit_id": "",
+                    "reason": "registered value is represented",
+                },
+                {
+                    "unit_id": "unit-2",
+                    "verdict": "unresolved",
+                    "supports_unit_id": "",
+                    "reason": "wrapper remains unresolved",
+                },
+            ],
+            "clause_verdicts": [{
+                "clause_id": "clause-1",
+                "verdict": "complete",
+                "omitted_owner_routes": [],
+                "reason": "no omitted sibling",
+            }],
+            "reason": "semantic coverage remains incomplete",
+        }
+        repaired = {
+            **rejected,
+            "clause_verdicts": [{
+                "clause_id": "clause-1",
+                "verdict": "unresolved",
+                "omitted_owner_routes": [],
+                "reason": "the second span may contain an independent demand",
+            }],
+            "reason": "coherent unresolved verdict",
+        }
+        state = {
+            "active_group": "chain_identity",
+            "pending_question": {
+                "id": "chain",
+                "group": "chain_identity",
+                "owner": "chain_rpc",
+                "kind": "chain",
+                "manual_input_allowed": True,
+            },
+        }
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                side_effect=[
+                    json.dumps(partition),
+                    json.dumps(rejected),
+                    json.dumps(repaired),
+                ],
+            ) as compiler,
+        ):
+            result = begin_semantic_partition(state, text)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["stage_a_calls"], 1)
+        self.assertEqual(result["admission_calls"], 2)
+        self.assertEqual(compiler.call_count, 3)
+        self.assertTrue(any("unresolved" in row for row in result["errors"]))
 
     def test_product_graph_routes_hypothetical_reset_through_consultation_authority(
         self,
@@ -2618,6 +3422,64 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(errors, ())
         self.assertEqual(len(sizes), 1)
         self.assertEqual(compiler.call_count, 1)
+
+    def test_stage_a_admission_cannot_complete_unresolved_source_unit(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _validate_stage_a_admission_document,
+        )
+
+        payload = {
+            "user_text": "Use a mode and do something else",
+            "clauses": [{
+                "clause_id": "clause-1",
+                "text": "Use a mode and do something else",
+            }],
+            "groups": [{
+                "name": "qps_profile",
+                "owner": "performance",
+            }],
+            "universal_operations": ["unresolved"],
+        }
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": "do something else",
+            "operation": "unresolved",
+            "owner_routes": [],
+            "reason": "no safe owner",
+        }]
+        reviewed = {
+            "unit_verdicts": [{
+                "unit_id": "unit-1",
+                "verdict": "complete",
+                "supports_unit_id": "",
+                "reason": "incorrectly declares unresolved source complete",
+            }],
+            "clause_verdicts": [{
+                "clause_id": "clause-1",
+                "verdict": "complete",
+                "omitted_owner_routes": [],
+                "reason": "incorrectly declares the clause complete",
+            }],
+            "reason": "inconsistent",
+        }
+
+        contract_errors, semantic_errors, redundant = (
+            _validate_stage_a_admission_document(
+                json.dumps(reviewed),
+                payload,
+                partition,
+            )
+        )
+
+        self.assertTrue(any(
+            "unresolved source operation was declared complete" in error
+            for error in contract_errors
+        ))
+        self.assertEqual(semantic_errors, ())
+        self.assertEqual(redundant, frozenset())
 
     def test_stage_a_admission_identifies_redundant_sibling_unit(self) -> None:
         from agent.harness.hierarchical_planner import (

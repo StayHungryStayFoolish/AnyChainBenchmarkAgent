@@ -617,6 +617,54 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertFalse(self._validate(payload).valid)
 
+    def test_identical_duplicate_action_evidence_is_canonicalized(self) -> None:
+        _plan, valid = _immutable_admission_fixture()
+        duplicated = deepcopy(valid)
+        duplicated["action_verdicts"][0]["evidence"].append(
+            deepcopy(duplicated["action_verdicts"][0]["evidence"][0])
+        )
+
+        result = self._validate(duplicated)
+
+        self.assertTrue(result.valid, result.errors)
+        self.assertEqual(len(result.action_verdicts[0]["evidence"]), 1)
+
+    def test_conflicting_duplicate_action_evidence_fails_closed(self) -> None:
+        _plan, valid = _immutable_admission_fixture()
+        conflicting = deepcopy(valid)
+        second = deepcopy(conflicting["action_verdicts"][0]["evidence"][0])
+        second["relation"] = "support"
+        second["support_relation"] = "invented"
+        conflicting["action_verdicts"][0]["evidence"].append(second)
+
+        result = self._validate(conflicting)
+
+        self.assertFalse(result.valid)
+        self.assertIn("duplicates unit id", "; ".join(result.errors))
+
+    def test_duplicate_rejected_or_forged_evidence_is_not_admitted(self) -> None:
+        _plan, valid = _immutable_admission_fixture()
+        rejected = deepcopy(valid)
+        rejected["action_verdicts"][0]["verdict"] = "reject"
+        rejected["action_verdicts"][0]["evidence"].append(
+            deepcopy(rejected["action_verdicts"][0]["evidence"][0])
+        )
+        rejected_result = self._validate(rejected)
+        self.assertFalse(rejected_result.valid)
+        self.assertIn(
+            "duplicates unit id",
+            "; ".join(rejected_result.errors),
+        )
+
+        forged = deepcopy(valid)
+        forged["action_verdicts"][0]["evidence"][0]["unit_id"] = "forged-unit"
+        forged["action_verdicts"][0]["evidence"].append(
+            deepcopy(forged["action_verdicts"][0]["evidence"][0])
+        )
+        forged_result = self._validate(forged)
+        self.assertFalse(forged_result.valid)
+        self.assertIn("forged unit id", "; ".join(forged_result.errors))
+
     def test_reviewer_cannot_reorder_or_modify_the_immutable_plan(self) -> None:
         _plan, valid = _immutable_admission_fixture()
         reordered = deepcopy(valid)

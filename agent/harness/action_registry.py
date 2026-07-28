@@ -377,6 +377,7 @@ class ActionSpec:
     semantic_recovery_source_argument: str = ""
     semantic_support_relations: tuple[str, ...] = ()
     semantic_value_grounding_arguments: tuple[str, ...] = ()
+    semantic_value_representative: bool = False
     exact_source_value_arguments: tuple[str, ...] = ()
     pending_option_semantic: str = ""
     option_navigation_groups: tuple[str, ...] = ()
@@ -480,6 +481,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         required_arguments=("target_mode", "target_mode_explicit", "source_evidence"),
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
         semantic_value_grounding_arguments=("target_mode",),
+        semantic_value_representative=True,
         entry_intake=True,
         entry_intake_purpose="Enter target-mode selection from any active workflow group.",
         entry_intake_fixed_arguments=(("target_mode_explicit", True),),
@@ -498,6 +500,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         crosses_pending_barrier=True,
         required_arguments=("source_evidence",),
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
+        semantic_value_representative=True,
         entry_intake=True,
         entry_intake_purpose="Enter initial chain identity selection from any active workflow group.",
         entry_intake_value_arguments=("chain_text", "chain_candidates"),
@@ -1231,6 +1234,7 @@ def action_registry_contract_hash() -> str:
             "semantic_recovery_source_argument": spec.semantic_recovery_source_argument,
             "semantic_support_relations": list(spec.semantic_support_relations),
             "semantic_value_grounding_arguments": list(spec.semantic_value_grounding_arguments),
+            "semantic_value_representative": spec.semantic_value_representative,
             "exact_source_value_arguments": list(spec.exact_source_value_arguments),
             "pending_option_semantic": spec.pending_option_semantic,
             "option_navigation_groups": list(spec.option_navigation_groups),
@@ -1275,27 +1279,65 @@ def registered_semantic_value_domains() -> tuple[dict[str, Any], ...]:
     """
 
     records: list[dict[str, Any]] = []
+    argument_specs: dict[str, list[ActionSpec]] = {}
     for spec in ACTION_SPECS:
         for argument in spec.semantic_value_grounding_arguments:
-            schema = ACTION_ARGUMENT_SCHEMAS.get(argument) or {}
-            enum = schema.get("enum")
-            if not isinstance(enum, list):
+            argument_specs.setdefault(argument, []).append(spec)
+    for argument, specs in argument_specs.items():
+        schema = ACTION_ARGUMENT_SCHEMAS.get(argument) or {}
+        enum = schema.get("enum")
+        if not isinstance(enum, list):
+            continue
+        canonical_groups = {
+            spec.target_group for spec in specs if spec.target_group
+        }
+        canonical_group = (
+            next(iter(canonical_groups))
+            if len(canonical_groups) == 1
+            else ""
+        )
+        explicit_representatives = [
+            spec for spec in specs if spec.semantic_value_representative
+        ]
+        representatives = explicit_representatives or [
+            spec
+            for spec in specs
+            if (
+                spec.target_group == canonical_group
+                if canonical_group
+                else not spec.target_group
+            )
+        ]
+        if len(representatives) != 1:
+            raise RuntimeError(
+                "semantic value argument requires exactly one canonical "
+                f"representative action: {argument}"
+            )
+        representative = representatives[0]
+        if (
+            canonical_group
+            and representative.target_group != canonical_group
+        ):
+            raise RuntimeError(
+                "semantic value representative does not own the canonical "
+                f"workflow group: {argument}/{representative.action_type}"
+            )
+        for value in enum:
+            canonical = str(value).strip()
+            if not canonical:
                 continue
-            for value in enum:
-                canonical = str(value).strip()
-                if not canonical:
-                    continue
-                records.append({
-                    "action_type": spec.action_type,
-                    "argument": argument,
-                    "target_group": spec.target_group,
-                    "semantic_owner": (
-                        spec.target_group or f"action:{spec.action_type}"
-                    ),
-                    "value": canonical,
-                    "canonical_value": canonical,
-                    "domain_kind": "closed_enum",
-                })
+            records.append({
+                "action_type": representative.action_type,
+                "argument": argument,
+                "target_group": canonical_group,
+                "semantic_owner": (
+                    canonical_group
+                    or f"action:{representative.action_type}"
+                ),
+                "value": canonical,
+                "canonical_value": canonical,
+                "domain_kind": "closed_enum",
+            })
     known_chains = set(repo_chain_names())
     chain_values = {
         chain: chain for chain in known_chains
@@ -1305,12 +1347,19 @@ def registered_semantic_value_domains() -> tuple[dict[str, Any], ...]:
         for alias, canonical in canonical_chain_aliases().items()
         if canonical in known_chains
     })
-    chain_identity_spec = next(
+    chain_identity_specs = [
         spec
         for spec in ACTION_SPECS
         if spec.target_group == "chain_identity"
         and "chain_text" in spec.entry_intake_value_arguments
-    )
+        and spec.semantic_value_representative
+    ]
+    if len(chain_identity_specs) != 1:
+        raise RuntimeError(
+            "known chain identities require exactly one canonical "
+            "semantic-value representative action"
+        )
+    chain_identity_spec = chain_identity_specs[0]
     records.extend({
         "action_type": chain_identity_spec.action_type,
         "argument": "chain_text",
@@ -2491,6 +2540,38 @@ def validate_action_registry() -> None:
     ]
     if len(intake_groups) != len(set(intake_groups)):
         raise RuntimeError("only one incomplete mutation intake action is allowed per group")
+    semantic_argument_groups: dict[str, set[str]] = {}
+    for spec in ACTION_SPECS:
+        if not spec.target_group:
+            continue
+        for argument in spec.semantic_value_grounding_arguments:
+            semantic_argument_groups.setdefault(argument, set()).add(
+                spec.target_group
+            )
+    ambiguous_semantic_arguments = {
+        argument: sorted(groups)
+        for argument, groups in semantic_argument_groups.items()
+        if len(groups) > 1
+    }
+    if ambiguous_semantic_arguments:
+        raise RuntimeError(
+            "semantic value arguments cannot belong to several workflow groups: "
+            f"{ambiguous_semantic_arguments}"
+        )
+    for spec in ACTION_SPECS:
+        if not spec.semantic_value_representative:
+            continue
+        owns_grounded_value = bool(spec.semantic_value_grounding_arguments)
+        owns_chain_identity = (
+            spec.target_group == "chain_identity"
+            and "chain_text" in spec.entry_intake_value_arguments
+        )
+        if not owns_grounded_value and not owns_chain_identity:
+            raise RuntimeError(
+                "semantic value representative has no declared value domain: "
+                f"{spec.action_type}"
+            )
+    registered_semantic_value_domains()
 
 
 validate_action_registry()

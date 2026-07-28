@@ -190,15 +190,15 @@ def begin_semantic_partition(
             document["unit_count"] = len(partition)
             return document
         (
-            stage_a_admission_errors,
+            admission_errors,
             stage_a_admission_sizes,
             redundant_unit_ids,
         ) = _review_stage_a_partition(provider, stage_a_payload, partition)
         document["request_sizes"].extend(stage_a_admission_sizes)
         document["admission_calls"] += len(stage_a_admission_sizes)
-        if stage_a_admission_errors:
+        if admission_errors:
             document["status"] = "failed"
-            document["errors"] = list(stage_a_admission_errors)
+            document["errors"] = list(admission_errors)
             document["unit_count"] = len(partition)
             return document
         source_partition, compilation_partition = (
@@ -642,6 +642,14 @@ def _stage_a_prompt() -> str:
         "because that question is pending. If the source explicitly claims that a registered "
         "value is instead a new identity, "
         "mark that unit unresolved so the user can disambiguate. "
+        "registered_value_mentions contains only registry values that occur in this turn. "
+        "It proves spelling and ownership, not intent. Use the complete source meaning to "
+        "decide whether each mention participates in a mutation, consultation, hypothetical, "
+        "comparison, or context. When one compact phrase uses a registered value plus adjacent "
+        "operation framing to express one domain request, keep the complete phrase in one "
+        "domain_request unit. Do not split its framing into a second pending_answer or "
+        "unresolved demand unless that framing independently answers the active question or "
+        "requests another operation. "
         "A semantic option selection and adjacent prose that only explains the reason, uncertainty, "
         "basis, referential application, or declared completion effect for that same selection form "
         "one pending_answer operation even when punctuation or line breaks create several clauses. "
@@ -701,6 +709,9 @@ def _stage_a_payload(
         "registered_semantic_value_domains": list(
             registered_semantic_value_domains()
         ),
+        "registered_value_mentions": list(
+            _registered_value_mentions(text)
+        ),
         "pending_typed_candidates": [
             value
             for clause in clauses
@@ -733,6 +744,28 @@ def _stage_a_payload(
             for row in group_schema()
         ],
     }
+
+
+def _registered_value_mentions(text: str) -> tuple[dict[str, Any], ...]:
+    """Project only registry values that occur in the complete source turn."""
+
+    records = semantic_value_domain_conflicts(
+        text,
+        owning_group="",
+    )
+    allowed_keys = (
+        "action_type",
+        "argument",
+        "target_group",
+        "semantic_owner",
+        "value",
+        "canonical_value",
+        "domain_kind",
+    )
+    return tuple({
+        key: record.get(key)
+        for key in allowed_keys
+    } for record in records)
 
 
 def _cross_domain_pending_errors(
@@ -1137,6 +1170,10 @@ def _stage_a_admission_prompt() -> str:
         "turn; set supports_unit_id to that exact distinct complete unit id regardless of whether "
         "the supporting prose appears before or after it, and require the redundant unit's clause "
         "to contain no omitted demand. "
+        "registered_value_mentions proves only spelling and owner identity. When one complete "
+        "unit already represents a compact registered-domain request, adjacent operation framing "
+        "that adds no independent value, question, navigation, analysis, or mutation supports "
+        "that unit; it is not a second pending answer or unresolved demand. "
         "clause_verdicts contains exactly one "
         "row per supplied clause in order: {clause_id,verdict:'complete'|'omitted'|'unresolved',"
         "omitted_owner_routes:[{owner,group}],reason}. A clause is complete only when every "
@@ -1182,6 +1219,9 @@ def _review_stage_a_partition(
         "registered_semantic_value_domains": list(
             stage_a_payload.get("registered_semantic_value_domains") or []
         ),
+        "registered_value_mentions": list(
+            stage_a_payload.get("registered_value_mentions") or []
+        ),
         "groups": stage_a_payload["groups"],
         "universal_operations": stage_a_payload["universal_operations"],
         "universal_operation_purposes": dict(
@@ -1203,15 +1243,17 @@ def _review_stage_a_partition(
                 "validation_errors": list(contract_errors),
                 "instruction": (
                     "Return a complete replacement admission document. Preserve "
-                    "the same semantic judgment while correcting every structural "
-                    "contract error."
+                    "the source meaning while correcting every structural and "
+                    "cross-verdict consistency error. Change unit or clause verdicts "
+                    "when the reported inconsistency requires it."
                 ),
             }
             request_prompt = (
                 f"{prompt} This is a contract-repair attempt. The prior document "
                 f"was structurally rejected for: {'; '.join(contract_errors)}. "
                 "Return one complete replacement document with every required row "
-                "and key; do not change a semantic verdict merely to pass."
+                "and key. Do not weaken or invent the source meaning merely to pass; "
+                "make unit and clause verdicts mutually consistent."
             )
         request_sizes.append(_wire_size(request_prompt, request_payload))
         response = request_semantic_compilation(
@@ -1385,10 +1427,35 @@ def _validate_stage_a_admission_document(
         for row in clause_verdicts
         if str(row.get("verdict") or "") == "complete"
     }
+    unresolved_non_context_units = {
+        str(row.get("unit_id") or "")
+        for row in unit_verdicts
+        if (
+            str(row.get("verdict") or "") == "unresolved"
+            and unit_operations.get(str(row.get("unit_id") or "")) != "context"
+        )
+    }
     unit_clause = {
         str(unit["unit_id"]): str(unit.get("clause_id") or "")
         for unit in partition
     }
+    reviewer_complete_units = {
+        str(row.get("unit_id") or "")
+        for row in unit_verdicts
+        if str(row.get("verdict") or "") == "complete"
+    }
+    for unit_id, operation in unit_operations.items():
+        if operation == "unresolved" and unit_id in reviewer_complete_units:
+            contract_errors.append(
+                "Stage A admission is internally inconsistent: unresolved "
+                f"source operation was declared complete: {unit_id}"
+            )
+    for unit_id in unresolved_non_context_units:
+        if unit_clause.get(unit_id, "") in complete_clauses:
+            contract_errors.append(
+                "Stage A admission is internally inconsistent: non-context "
+                f"unresolved unit belongs to a complete clause: {unit_id}"
+            )
     complete_unit_ids = {
         str(row.get("unit_id") or "")
         for row in unit_verdicts

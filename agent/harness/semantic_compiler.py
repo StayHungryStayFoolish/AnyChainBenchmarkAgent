@@ -964,6 +964,22 @@ def _canonicalize_admission_receipts(
         record = action_records.get(action_id)
         if not isinstance(record, Mapping):
             continue
+        raw_evidence = raw_row.get("evidence")
+        if isinstance(raw_evidence, list):
+            unique_evidence: list[Any] = []
+            seen_evidence: set[str] = set()
+            for evidence in raw_evidence:
+                identity = (
+                    _canonical_json(evidence)
+                    if isinstance(evidence, Mapping)
+                    else ""
+                )
+                if identity and identity in seen_evidence:
+                    continue
+                if identity:
+                    seen_evidence.add(identity)
+                unique_evidence.append(evidence)
+            raw_row["evidence"] = unique_evidence
         evidence_rows = [
             item
             for item in raw_row.get("evidence") or []
