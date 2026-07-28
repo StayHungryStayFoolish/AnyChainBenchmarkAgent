@@ -981,6 +981,7 @@ def _real_node_selection_executed_at_source(
         (transition or {}).get("consumer_action_ids") or ()
     )
     admitted = _admitted_actions(event, "choose_target_mode")
+    pending_actions = _admitted_actions(event, "answer_pending")
     matching_actions = [
         action
         for action in admitted
@@ -996,6 +997,15 @@ def _real_node_selection_executed_at_source(
         str(action.get("action_id") or "")
         for action in matching_actions
     }
+    matching_pending_action_ids = {
+        str(action.get("action_id") or "")
+        for action in pending_actions
+        if action.get("owner") == "coordinator"
+        and action.get("effect") == "configuration_mutation"
+        and action.get("group") == ""
+        and str(action.get("action_id") or "")
+        in admitted_ids & execution_order & transition_consumers
+    }
     matching_receipts = [
         item
         for item in valid
@@ -1008,17 +1018,31 @@ def _real_node_selection_executed_at_source(
         and item["receipt"].get("selected_value_hash")
         == _value_hash("real-node")
         and str(item["receipt"].get("resolved_action_id") or "")
-        in matching_action_ids
+        in matching_pending_action_ids
     ]
+    execution_sequence = tuple(
+        dict(getattr(event, "turn_receipt_summary", {}) or {}).get(
+            "execution_order"
+        )
+        or ()
+    ) if event else ()
+    causally_ordered = bool(
+        len(matching_pending_action_ids) == 1
+        and len(matching_action_ids) == 1
+        and execution_sequence.index(next(iter(matching_pending_action_ids)))
+        < execution_sequence.index(next(iter(matching_action_ids)))
+    )
     material_diffs = _valid_material_diffs(event) if event else {}
     material_paths = sorted(material_diffs)
     satisfied = bool(
         transition
+        and transition["transition"] == "replaced"
         and transition["before_id"] == "opening_next_action"
         and transition["before_group"] == "opening"
         and transition["after_id"] == "chain"
         and transition["after_group"] == "chain_identity"
         and len(matching_actions) == 1
+        and causally_ordered
         and len(matching_receipts) == 1
         and (material_diffs.get("target_mode") or {}).get("after")
         == _value_hash("real-node")
@@ -1032,6 +1056,8 @@ def _real_node_selection_executed_at_source(
         turn_index=turn_index,
         pending_transition=dict(transition or {}),
         matching_admitted_action_ids=sorted(matching_action_ids),
+        matching_pending_action_ids=sorted(matching_pending_action_ids),
+        causally_ordered=causally_ordered,
         material_state_paths=material_paths,
     )
 

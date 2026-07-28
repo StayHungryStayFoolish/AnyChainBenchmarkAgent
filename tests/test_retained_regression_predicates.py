@@ -1447,6 +1447,14 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
                 "target_mode": _value_hash("real-node"),
             },
         }
+        pending_action = {
+            "type": "answer_pending",
+            "action_id": "action-0",
+            "owner": "coordinator",
+            "effect": "configuration_mutation",
+            "group": "",
+            "argument_value_hashes": {},
+        }
         selection_receipt = _pending_receipt(
             turn_index=1,
             pending_id="opening_next_action",
@@ -1454,7 +1462,7 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
             pending_contract_hash="1" * 64,
             selected_option_id="2",
             selected_value_hash=_value_hash("real-node"),
-            resolved_action_id="action-1",
+            resolved_action_id="action-0",
         )
         selected = _event(
             selection_receipt,
@@ -1467,13 +1475,13 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
                 "after_id": "chain",
                 "after_group": "chain_identity",
                 "after_hash": "2" * 64,
-                "consumer_action_ids": ["action-1"],
+                "consumer_action_ids": ["action-0", "action-1"],
             },
             turn_receipt={
-                "admitted_action_ids": ["action-1"],
-                "execution_order": ["action-1"],
+                "admitted_action_ids": ["action-0", "action-1"],
+                "execution_order": ["action-0", "action-1"],
             },
-            admitted_actions=(selection_action,),
+            admitted_actions=(pending_action, selection_action),
             material_diffs={
                 "target_mode": {
                     "before": "",
@@ -1543,7 +1551,7 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
         unexecuted_selection = replace(
             selected,
             turn_receipt_summary={
-                "admitted_action_ids": ["action-1"],
+                "admitted_action_ids": ["action-0", "action-1"],
                 "execution_order": [],
             },
         )
@@ -1566,7 +1574,10 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
         selection_ok, details = POSTCONDITION_EVALUATORS[
             "real_node_selection_executed_at_source"
         ](_context(
-            replace(selected, admitted_action_provenance=(wrong_mode_action,)),
+            replace(
+                selected,
+                admitted_action_provenance=(pending_action, wrong_mode_action),
+            ),
             consulted,
             turns=turns,
             verifier_input_contract=contract,
@@ -1591,6 +1602,61 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
             verifier_input_contract=contract,
         ))
         self.assertFalse(selection_ok, details)
+
+        wrong_receipt_action = _pending_receipt(
+            turn_index=1,
+            pending_id="opening_next_action",
+            pending_group="opening",
+            pending_contract_hash="1" * 64,
+            selected_option_id="2",
+            selected_value_hash=_value_hash("real-node"),
+            resolved_action_id="action-1",
+        )
+        invalid_selection_events = {
+            "preserved_transition": replace(
+                selected,
+                pending_transition={
+                    **selected.pending_transition,
+                    "transition": "preserved",
+                },
+            ),
+            "wrong_pending_effect": replace(
+                selected,
+                admitted_action_provenance=({
+                    **pending_action,
+                    "effect": "read_only",
+                }, selection_action),
+            ),
+            "reversed_execution_order": replace(
+                selected,
+                turn_receipt_summary={
+                    "admitted_action_ids": ["action-0", "action-1"],
+                    "execution_order": ["action-1", "action-0"],
+                },
+            ),
+            "missing_transition_consumer": replace(
+                selected,
+                pending_transition={
+                    **selected.pending_transition,
+                    "consumer_action_ids": ["action-0"],
+                },
+            ),
+            "receipt_bound_to_followup": replace(
+                selected,
+                control_receipts=(wrong_receipt_action,),
+            ),
+        }
+        for name, invalid_event in invalid_selection_events.items():
+            with self.subTest(name=name):
+                selection_ok, details = POSTCONDITION_EVALUATORS[
+                    "real_node_selection_executed_at_source"
+                ](_context(
+                    invalid_event,
+                    consulted,
+                    turns=turns,
+                    verifier_input_contract=contract,
+                ))
+                self.assertFalse(selection_ok, details)
 
         mutated_consultation = replace(
             consulted,
