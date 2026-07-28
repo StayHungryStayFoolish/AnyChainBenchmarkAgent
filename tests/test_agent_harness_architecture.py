@@ -315,6 +315,48 @@ def _immutable_admission_fixture() -> tuple[Any, dict[str, Any]]:
     return plan, _whole_plan_admission_payload(request)
 
 
+def _immutable_required_relation_fixture() -> tuple[Any, dict[str, Any]]:
+    from agent.harness.semantic_compiler import freeze_semantic_plan
+
+    source = "fake-node benchmark"
+    action = {"type": "greeting", "source_evidence": "fake-node"}
+    unit = {
+        "unit_id": "unit-1",
+        "clause_id": "clause-1",
+        "source_text": source,
+        "disposition": "action",
+        "action_indexes": [0],
+    }
+    plan = freeze_semantic_plan(
+        {"actions": [action], "semantic_units": [unit]},
+        action_records=[{
+            "action_id": "action-1",
+            "action_index": 0,
+            "action": action,
+            "unit_ids": ["unit-1"],
+            "allowed_support_relations": ["operation_restatement"],
+            "required_evidence_relations": [{
+                "unit_id": "unit-1",
+                "relation": "direct",
+                "support_relation": "",
+            }],
+        }],
+        unit_records=[{
+            "unit_id": "unit-1",
+            "unit_index": 0,
+            "unit": unit,
+            "source_text": source,
+            "disposition": "action",
+            "owner_action_ids": ["action-1"],
+        }],
+        review_context={"pending_question": {}},
+    )
+    request = SimpleNamespace(
+        messages=[None, SimpleNamespace(content=plan.request_json)]
+    )
+    return plan, _whole_plan_admission_payload(request)
+
+
 class BoundedSemanticAdmissionTest(unittest.TestCase):
     def test_strict_json_compilation_disables_provider_reasoning(self) -> None:
         from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
@@ -641,6 +683,133 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
 
         self.assertFalse(result.valid)
         self.assertIn("duplicates unit id", "; ".join(result.errors))
+
+    def test_required_direct_relation_rejects_reviewer_support_duplicate(
+        self,
+    ) -> None:
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import validate_whole_plan_admission
+
+        plan, payload = _immutable_required_relation_fixture()
+        payload["action_verdicts"][0]["evidence"].append({
+            "unit_id": "unit-1",
+            "quote": "benchmark",
+            "relation": "support",
+            "support_relation": "operation_restatement",
+        })
+
+        result = validate_whole_plan_admission(
+            json.dumps(payload, sort_keys=True),
+            plan,
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+
+        self.assertFalse(result.valid)
+        self.assertIn("duplicates unit id", "; ".join(result.errors))
+        self.assertIn("immutable relation contract", "; ".join(result.errors))
+
+    def test_required_relation_without_matching_receipt_fails_closed(self) -> None:
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import validate_whole_plan_admission
+
+        plan, payload = _immutable_required_relation_fixture()
+        payload["action_verdicts"][0]["evidence"] = [{
+            "unit_id": "unit-1",
+            "quote": "benchmark",
+            "relation": "support",
+            "support_relation": "operation_restatement",
+        }]
+        payload["unit_verdicts"][0]["verdict"] = "support"
+
+        result = validate_whole_plan_admission(
+            json.dumps(payload, sort_keys=True),
+            plan,
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+
+        self.assertFalse(result.valid)
+        self.assertIn("immutable relation contract", "; ".join(result.errors))
+
+    def test_required_relation_does_not_hide_inexact_or_forged_receipts(
+        self,
+    ) -> None:
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import validate_whole_plan_admission
+
+        for name, extra in {
+            "inexact": {
+                "unit_id": "unit-1",
+                "quote": "invented",
+                "relation": "support",
+                "support_relation": "operation_restatement",
+            },
+            "forged": {
+                "unit_id": "forged-unit",
+                "quote": "fake-node",
+                "relation": "direct",
+                "support_relation": "",
+            },
+        }.items():
+            with self.subTest(name=name):
+                plan, payload = _immutable_required_relation_fixture()
+                payload["action_verdicts"][0]["evidence"].append(extra)
+                result = validate_whole_plan_admission(
+                    json.dumps(payload, sort_keys=True),
+                    plan,
+                    allowed_action_types=ALLOWED_ACTION_TYPES,
+                )
+                self.assertFalse(result.valid)
+
+    def test_required_relation_does_not_hide_malformed_or_ambiguous_receipts(
+        self,
+    ) -> None:
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import validate_whole_plan_admission
+
+        for name, extra in {
+            "invalid_relation": {
+                "unit_id": "unit-1",
+                "quote": "benchmark",
+                "relation": "invalid",
+                "support_relation": "",
+            },
+            "second_direct": {
+                "unit_id": "unit-1",
+                "quote": "benchmark",
+                "relation": "direct",
+                "support_relation": "",
+            },
+            "missing_field": {
+                "unit_id": "unit-1",
+                "quote": "benchmark",
+                "relation": "support",
+            },
+        }.items():
+            with self.subTest(name=name):
+                plan, payload = _immutable_required_relation_fixture()
+                payload["action_verdicts"][0]["evidence"].append(extra)
+                result = validate_whole_plan_admission(
+                    json.dumps(payload, sort_keys=True),
+                    plan,
+                    allowed_action_types=ALLOWED_ACTION_TYPES,
+                )
+                self.assertFalse(result.valid)
+
+    def test_required_direct_relation_rejects_support_unit_verdict(self) -> None:
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import validate_whole_plan_admission
+
+        plan, payload = _immutable_required_relation_fixture()
+        payload["unit_verdicts"][0]["verdict"] = "support"
+
+        result = validate_whole_plan_admission(
+            json.dumps(payload, sort_keys=True),
+            plan,
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+
+        self.assertFalse(result.valid)
+        self.assertIn("immutable direct relation", "; ".join(result.errors))
 
     def test_duplicate_rejected_or_forged_evidence_is_not_admitted(self) -> None:
         _plan, valid = _immutable_admission_fixture()

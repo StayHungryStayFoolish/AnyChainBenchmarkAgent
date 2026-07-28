@@ -2644,6 +2644,8 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         from tests.agent_live.graph_turn import resolve_product_action_queue_for_test as resolve_product_action_queue
         from agent.harness.state import new_state
 
+        whole_plan_attempts: list[bool] = []
+
         class ContractProvider:
             def complete(self, request):
                 system = request.messages[0].content
@@ -2730,6 +2732,10 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                             "reason": "compiled",
                         }
                 elif "independent admission authority" in system:
+                    is_contract_repair = bool(
+                        payload.get("admission_contract_repair")
+                    )
+                    whole_plan_attempts.append(is_contract_repair)
                     actions = payload["actions"]
                     units = payload["semantic_units"]
                     unit_by_id = {
@@ -2750,7 +2756,18 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                                         "support_relation": "",
                                     }
                                     for unit_id in row["unit_ids"]
-                                ],
+                                ] + (
+                                    [{
+                                        "unit_id": row["unit_ids"][0],
+                                        "quote": "fake-node",
+                                        "relation": "support",
+                                        "support_relation": "operation_restatement",
+                                    }]
+                                    if row["action"]["type"]
+                                    == "choose_target_mode"
+                                    and not is_contract_repair
+                                    else []
+                                ),
                                 "grounded_arguments": [
                                     {
                                         "argument_name": argument,
@@ -2803,8 +2820,9 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             [action["type"] for action in result["actions"]],
             ["choose_target_mode", "choose_chain", "set_qps_mode"],
         )
-        self.assertEqual(result["planner_metrics"]["model_calls"], 5)
-        self.assertEqual(result["planner_metrics"]["admission_calls"], 2)
+        self.assertEqual(whole_plan_attempts, [False, True])
+        self.assertEqual(result["planner_metrics"]["model_calls"], 6)
+        self.assertEqual(result["planner_metrics"]["admission_calls"], 3)
 
     def test_stage_a_partition_is_lossless_and_owner_scoped(self) -> None:
         from agent.harness.hierarchical_planner import _validate_partition_document

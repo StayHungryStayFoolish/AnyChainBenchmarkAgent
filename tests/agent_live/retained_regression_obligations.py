@@ -92,6 +92,8 @@ _CASE_CONTRACTS: Mapping[str, _CaseContract] = {
         (
             "visible_option_action_executed",
             "current_menu_binding_preserved",
+            "real_node_selection_executed_at_source",
+            "mode_consultation_preserves_chain_pending",
             "mode_change_request_routed_from_chain_pending",
             "declined_mode_change_resumes_chain_pending",
         ),

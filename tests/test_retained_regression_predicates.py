@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from agent.harness.action_registry import MODE_COMPARISON_TOPIC
 from agent.harness.domains.rpc_receipts import evidence_hash
 from agent.harness.domains.analysis_receipts import analysis_hash
 from tests.agent_live.coverage_evidence import RuntimeTurnEvent, content_hash
@@ -31,6 +32,17 @@ HASH = "a" * 64
 
 def _hashed(body: dict) -> dict:
     return {**body, "receipt_id": content_hash(body)}
+
+
+def _value_hash(value) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _event(
@@ -1356,6 +1368,14 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
             "mode_request_consumed_as_chain_identity"
         ](context)
         self.assertFalse(misrouted, details)
+        selected, details = POSTCONDITION_EVALUATORS[
+            "real_node_selection_executed_at_source"
+        ](context)
+        self.assertFalse(selected, details)
+        consulted, details = POSTCONDITION_EVALUATORS[
+            "mode_consultation_preserves_chain_pending"
+        ](context)
+        self.assertFalse(consulted, details)
 
         wrong_planner = _hashed({
             **{
@@ -1397,6 +1417,253 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
             "mode_request_consumed_as_chain_identity"
         ](wrong_context)
         self.assertTrue(misrouted, details)
+
+    def test_rr003_source_selection_and_consultation_require_exact_product_lineage(
+        self,
+    ) -> None:
+        messages = ("2", "compare modes", "use fake-node", "2")
+        roles = (
+            "select_real_node",
+            "mode_comparison_consultation",
+            "request_fake_node_change",
+            "decline_mode_change",
+        )
+        turns = tuple(
+            _turn_and_decision(message, turn_index=index)[0]
+            for index, message in enumerate(messages, start=1)
+        )
+        contract = _verifier_input(
+            "exact",
+            messages,
+            semantic_roles=roles,
+        )
+        selection_action = {
+            "type": "choose_target_mode",
+            "action_id": "action-1",
+            "owner": "chain_rpc",
+            "effect": "configuration_mutation",
+            "group": "target_mode",
+            "argument_value_hashes": {
+                "target_mode": _value_hash("real-node"),
+            },
+        }
+        selection_receipt = _pending_receipt(
+            turn_index=1,
+            pending_id="opening_next_action",
+            pending_group="opening",
+            pending_contract_hash="1" * 64,
+            selected_option_id="2",
+            selected_value_hash=_value_hash("real-node"),
+            resolved_action_id="action-1",
+        )
+        selected = _event(
+            selection_receipt,
+            turn_index=1,
+            pending_transition={
+                "transition": "replaced",
+                "before_id": "opening_next_action",
+                "before_group": "opening",
+                "before_hash": "1" * 64,
+                "after_id": "chain",
+                "after_group": "chain_identity",
+                "after_hash": "2" * 64,
+                "consumer_action_ids": ["action-1"],
+            },
+            turn_receipt={
+                "admitted_action_ids": ["action-1"],
+                "execution_order": ["action-1"],
+            },
+            admitted_actions=(selection_action,),
+            material_diffs={
+                "target_mode": {
+                    "before": "",
+                    "after": _value_hash("real-node"),
+                },
+            },
+        )
+        consultation_body = {
+            "receipt_type": "orientation_response",
+            "schema_version": 1,
+            "owner": "orientation",
+            "turn_index": 2,
+            "topic": MODE_COMPARISON_TOPIC,
+            "action_type": "answer_opening_question",
+            "action_id": "action-2",
+            "pending_contract_hash": "2" * 64,
+            "response_hash": "3" * 64,
+            "projection_fields": ["pending_id", "target_mode"],
+            "state_projection_hash": "4" * 64,
+            "read_only": True,
+        }
+        consultation_action = {
+            "type": "answer_opening_question",
+            "action_id": "action-2",
+            "owner": "orientation",
+            "effect": "read_only",
+            "group": "",
+            "argument_value_hashes": {
+                "topic": _value_hash(MODE_COMPARISON_TOPIC),
+            },
+        }
+        consulted = _event(
+            _hashed(consultation_body),
+            turn_index=2,
+            pending_transition={
+                "transition": "preserved",
+                "before_id": "chain",
+                "before_group": "chain_identity",
+                "before_hash": "2" * 64,
+                "after_id": "chain",
+                "after_group": "chain_identity",
+                "after_hash": "2" * 64,
+                "consumer_action_ids": ["action-2"],
+            },
+            turn_receipt={
+                "admitted_action_ids": ["action-2"],
+                "execution_order": ["action-2"],
+            },
+            admitted_actions=(consultation_action,),
+        )
+        context = _context(
+            selected,
+            consulted,
+            turns=turns,
+            verifier_input_contract=contract,
+        )
+
+        selection_ok, details = POSTCONDITION_EVALUATORS[
+            "real_node_selection_executed_at_source"
+        ](context)
+        self.assertTrue(selection_ok, details)
+        consultation_ok, details = POSTCONDITION_EVALUATORS[
+            "mode_consultation_preserves_chain_pending"
+        ](context)
+        self.assertTrue(consultation_ok, details)
+
+        unexecuted_selection = replace(
+            selected,
+            turn_receipt_summary={
+                "admitted_action_ids": ["action-1"],
+                "execution_order": [],
+            },
+        )
+        selection_ok, details = POSTCONDITION_EVALUATORS[
+            "real_node_selection_executed_at_source"
+        ](_context(
+            unexecuted_selection,
+            consulted,
+            turns=turns,
+            verifier_input_contract=contract,
+        ))
+        self.assertFalse(selection_ok, details)
+
+        wrong_mode_action = {
+            **selection_action,
+            "argument_value_hashes": {
+                "target_mode": _value_hash("fake-node"),
+            },
+        }
+        selection_ok, details = POSTCONDITION_EVALUATORS[
+            "real_node_selection_executed_at_source"
+        ](_context(
+            replace(selected, admitted_action_provenance=(wrong_mode_action,)),
+            consulted,
+            turns=turns,
+            verifier_input_contract=contract,
+        ))
+        self.assertFalse(selection_ok, details)
+
+        wrong_committed_mode = replace(
+            selected,
+            material_state_diff_hashes={
+                "target_mode": {
+                    "before": "",
+                    "after": _value_hash("fake-node"),
+                },
+            },
+        )
+        selection_ok, details = POSTCONDITION_EVALUATORS[
+            "real_node_selection_executed_at_source"
+        ](_context(
+            wrong_committed_mode,
+            consulted,
+            turns=turns,
+            verifier_input_contract=contract,
+        ))
+        self.assertFalse(selection_ok, details)
+
+        mutated_consultation = replace(
+            consulted,
+            material_state_diff_hashes={
+                "target_mode": {
+                    "before": _value_hash("real-node"),
+                    "after": _value_hash("fake-node"),
+                },
+            },
+        )
+        consultation_ok, details = POSTCONDITION_EVALUATORS[
+            "mode_consultation_preserves_chain_pending"
+        ](_context(
+            selected,
+            mutated_consultation,
+            turns=turns,
+            verifier_input_contract=contract,
+        ))
+        self.assertFalse(consultation_ok, details)
+
+        changed_pending = replace(
+            consulted,
+            pending_transition={
+                **consulted.pending_transition,
+                "transition": "replaced",
+                "after_hash": "5" * 64,
+            },
+        )
+        consultation_ok, details = POSTCONDITION_EVALUATORS[
+            "mode_consultation_preserves_chain_pending"
+        ](_context(
+            selected,
+            changed_pending,
+            turns=turns,
+            verifier_input_contract=contract,
+        ))
+        self.assertFalse(consultation_ok, details)
+
+        wrong_topic_action = {
+            **consultation_action,
+            "argument_value_hashes": {
+                "topic": _value_hash("capabilities"),
+            },
+        }
+        consultation_ok, details = POSTCONDITION_EVALUATORS[
+            "mode_consultation_preserves_chain_pending"
+        ](_context(
+            selected,
+            replace(
+                consulted,
+                admitted_action_provenance=(wrong_topic_action,),
+            ),
+            turns=turns,
+            verifier_input_contract=contract,
+        ))
+        self.assertFalse(consultation_ok, details)
+
+        wrong_topic_receipt = _hashed({
+            **consultation_body,
+            "topic": "capabilities",
+        })
+        consultation_ok, details = POSTCONDITION_EVALUATORS[
+            "mode_consultation_preserves_chain_pending"
+        ](_context(
+            selected,
+            replace(
+                consulted,
+                control_receipts=(wrong_topic_receipt,),
+            ),
+            turns=turns,
+            verifier_input_contract=contract,
+        ))
+        self.assertFalse(consultation_ok, details)
 
     def test_mode_change_open_variant_uses_attested_source_turns_after_clarification(
         self,

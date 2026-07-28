@@ -458,6 +458,7 @@ def _review_bounded_semantic_candidate(
     whole_plan_contract_repair: bool = False,
     compact_pending_review: bool = False,
     reasoning_mode: ReasoningMode = STRICT_JSON_REASONING_MODE,
+    authoritative_direct_unit_ids: frozenset[str] = frozenset(),
 ) -> tuple[ImmutableSemanticPlan | None, WholePlanAdmission | None, tuple[str, ...]]:
     if not validation.valid:
         return None, None, tuple(validation.errors)
@@ -468,6 +469,7 @@ def _review_bounded_semantic_candidate(
             clauses,
             allowed_action_types=allowed_action_types,
             compact_pending_review=compact_pending_review,
+            authoritative_direct_unit_ids=authoritative_direct_unit_ids,
         )
     except ValueError as exc:
         return None, None, (str(exc),)
@@ -493,6 +495,7 @@ def _freeze_bounded_semantic_plan(
     *,
     allowed_action_types: frozenset[str] | None = None,
     compact_pending_review: bool = False,
+    authoritative_direct_unit_ids: frozenset[str] = frozenset(),
 ) -> ImmutableSemanticPlan:
     payload = _parse_json_object(text)
     actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
@@ -606,6 +609,15 @@ def _freeze_bounded_semantic_plan(
             "declared_purpose": _semantic_action_purpose(action, spec.purpose, state),
             "operation_arguments": operation_arguments,
             "allowed_support_relations": list(spec.semantic_support_relations),
+            "required_evidence_relations": [
+                {
+                    "unit_id": unit_id,
+                    "relation": "direct",
+                    "support_relation": "",
+                }
+                for unit_id in owned_unit_ids
+                if unit_id in authoritative_direct_unit_ids
+            ],
             "required_value_grounding_arguments": list(
                 semantic_grounding_arguments(action)
             ),

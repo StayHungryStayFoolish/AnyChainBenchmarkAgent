@@ -379,6 +379,11 @@ def review_semantic_plan(
         routed_partition,
         owner_documents,
     )
+    authoritative_direct_unit_ids = frozenset(
+        str(unit.get("unit_id") or "")
+        for unit in source_partition
+        if str(unit.get("operation") or "") not in {"context", "unresolved"}
+    )
     candidate_text, validation = prepare_hierarchical_candidate(
         json.dumps(candidate, ensure_ascii=False, sort_keys=True),
         state,
@@ -412,6 +417,7 @@ def review_semantic_plan(
         ),
         whole_plan_contract_repair=True,
         reasoning_mode=STRICT_JSON_REASONING_MODE,
+        authoritative_direct_unit_ids=authoritative_direct_unit_ids,
     )
     admission_calls += (
         int(getattr(admission, "request_count", 1))
@@ -467,6 +473,9 @@ def review_semantic_plan(
                         ),
                         whole_plan_contract_repair=True,
                         reasoning_mode=STRICT_JSON_REASONING_MODE,
+                        authoritative_direct_unit_ids=(
+                            authoritative_direct_unit_ids
+                        ),
                     )
                 )
                 if repaired_admission is not None:

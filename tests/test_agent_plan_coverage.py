@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import unittest
 import sys
+from unittest.mock import patch
 
 from agent.harness.plan_coverage import segment_user_turn, validate_plan_coverage
 
@@ -20,6 +21,69 @@ def _unit(clause, index: int, action_indexes, *, disposition: str = "action", re
         "action_indexes": list(action_indexes),
         "reason": reason,
     }
+
+
+class SemanticValueRegistryContractTest(unittest.TestCase):
+    def test_identical_semantic_value_registration_is_deduplicated(self) -> None:
+        from agent.harness import action_registry
+
+        schemas = dict(action_registry.ACTION_ARGUMENT_SCHEMAS)
+        target_mode_schema = dict(schemas["target_mode"])
+        target_mode_schema["enum"] = [
+            *target_mode_schema["enum"],
+            target_mode_schema["enum"][0],
+        ]
+        schemas["target_mode"] = target_mode_schema
+
+        with patch.object(action_registry, "ACTION_ARGUMENT_SCHEMAS", schemas):
+            records = action_registry.registered_semantic_value_domains()
+
+        duplicate_value = target_mode_schema["enum"][0]
+        matching = [
+            record
+            for record in records
+            if record.get("semantic_owner") == "target_mode"
+            and record.get("value") == duplicate_value
+        ]
+        self.assertEqual(len(matching), 1)
+
+    def test_conflicting_semantic_value_registration_fails_closed(self) -> None:
+        from agent.harness import action_registry
+
+        conflicting_argument = "conflicting_chain_identity"
+        conflicting_spec = action_registry.ActionSpec(
+            "conflicting_chain_identity_action",
+            "chain_rpc",
+            "Test-only conflicting semantic value owner.",
+            (conflicting_argument,),
+            target_group="chain_identity",
+            semantic_value_grounding_arguments=(conflicting_argument,),
+            semantic_value_representative=True,
+        )
+        schemas = {
+            **action_registry.ACTION_ARGUMENT_SCHEMAS,
+            conflicting_argument: {
+                "type": "string",
+                "enum": ["bnb"],
+            },
+        }
+
+        with (
+            patch.object(
+                action_registry,
+                "ACTION_SPECS",
+                (*action_registry.ACTION_SPECS, conflicting_spec),
+            ),
+            patch.object(action_registry, "ACTION_ARGUMENT_SCHEMAS", schemas),
+            self.assertRaisesRegex(
+                RuntimeError,
+                (
+                    "conflicting semantic value domain registration.*"
+                    "action_type, argument, canonical_value"
+                ),
+            ),
+        ):
+            action_registry.validate_action_registry()
 
 
 class PlanCoverageTest(unittest.TestCase):

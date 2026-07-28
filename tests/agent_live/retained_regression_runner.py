@@ -143,6 +143,7 @@ _RULE_CLASSES: Mapping[str, tuple[str, ...]] = {
         "blocking_question_preserved",
         "current_menu_binding_preserved",
         "consultation_preserved_pending_work",
+        "mode_consultation_preserves_chain_pending",
         "unresolved_units_preserved",
         "declined_mode_change_resumes_chain_pending",
     ),
@@ -155,6 +156,7 @@ _RULE_CLASSES: Mapping[str, tuple[str, ...]] = {
     ),
     "action_provenance": (
         "visible_option_action_executed",
+        "real_node_selection_executed_at_source",
         "mode_change_request_routed_from_chain_pending",
         "unknown_chain_identity_resolution_started",
         "chain_mode_change_confirmed",

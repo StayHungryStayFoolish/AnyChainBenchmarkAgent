@@ -956,6 +956,8 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
 )
 
 
+MODE_COMPARISON_TOPIC = "mode_comparison"
+
 CONSULTATION_TOPICS: tuple[str, ...] = (
     "identity",
     "capabilities",
@@ -970,7 +972,7 @@ CONSULTATION_TOPICS: tuple[str, ...] = (
     "environment_readiness",
     "requirements",
     "workflow",
-    "mode_comparison",
+    MODE_COMPARISON_TOPIC,
     "performance_benchmark_guidance",
     "execution_preflight_smoke",
     "recommendation",
@@ -996,7 +998,7 @@ CONSULTATION_TOPIC_PURPOSES: Mapping[str, str] = {
     "environment_readiness": "Report environment and dependency readiness.",
     "requirements": "Explain what the user must prepare for a test.",
     "workflow": "Explain the benchmark workflow and configuration sequence.",
-    "mode_comparison": "Compare fake-node, real-node, and sync-observe modes.",
+    MODE_COMPARISON_TOPIC: "Compare fake-node, real-node, and sync-observe modes.",
     "performance_benchmark_guidance": "Recommend a mode for a stated performance goal.",
     "execution_preflight_smoke": "Explain preflight and smoke execution semantics.",
     "recommendation": "Recommend a safe next benchmark starting path.",
@@ -1027,8 +1029,8 @@ CONSULTATION_TOPIC_ALIASES: Mapping[str, str] = {
     "current_prompt": "current_context",
     "prepare": "requirements",
     "prerequisites": "requirements",
-    "modes": "mode_comparison",
-    "mode": "mode_comparison",
+    "modes": MODE_COMPARISON_TOPIC,
+    "mode": MODE_COMPARISON_TOPIC,
     "restart": "reset_help",
     "start_over": "reset_help",
     "env_readiness": "environment_readiness",
@@ -1373,9 +1375,30 @@ def registered_semantic_value_domains() -> tuple[dict[str, Any], ...]:
     for record in records:
         key = (
             str(record.get("semantic_owner") or ""),
-            str(record.get("value") or "").casefold(),
+            str(record.get("value") or "").strip().casefold(),
         )
-        unique.setdefault(key, record)
+        existing = unique.get(key)
+        if existing is None:
+            unique[key] = record
+            continue
+        authority_fields = (
+            "action_type",
+            "argument",
+            "canonical_value",
+            "target_group",
+        )
+        conflicting_fields = [
+            field
+            for field in authority_fields
+            if str(existing.get(field) or "").strip()
+            != str(record.get(field) or "").strip()
+        ]
+        if conflicting_fields:
+            raise RuntimeError(
+                "conflicting semantic value domain registration for "
+                f"{key[0] or '<missing-owner>'}/{key[1] or '<missing-value>'}: "
+                f"{', '.join(conflicting_fields)}"
+            )
     return tuple(unique.values())
 
 

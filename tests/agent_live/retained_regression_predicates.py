@@ -12,6 +12,7 @@ import hashlib
 import json
 from typing import Any, Callable, Mapping, Sequence
 
+from agent.harness.action_registry import MODE_COMPARISON_TOPIC
 from agent.harness.control_receipts import (
     validate_persisted_domain_control_receipt,
 )
@@ -954,6 +955,159 @@ def _admitted_actions(
         )
         if isinstance(item, Mapping)
         and item.get("type") == action_type
+    )
+
+
+def _real_node_selection_executed_at_source(
+    context: Any,
+) -> PredicateResult:
+    event = _source_step_event(context, 1)
+    transition = _valid_pending_transition(event) if event else None
+    valid, invalid = _valid_receipts(context, "pending_resolution")
+    turn_index = int(getattr(event, "turn_index", -1)) if event else -1
+    execution_order = set(
+        dict(getattr(event, "turn_receipt_summary", {}) or {}).get(
+            "execution_order"
+        )
+        or ()
+    ) if event else set()
+    admitted_ids = set(
+        dict(getattr(event, "turn_receipt_summary", {}) or {}).get(
+            "admitted_action_ids"
+        )
+        or ()
+    ) if event else set()
+    transition_consumers = set(
+        (transition or {}).get("consumer_action_ids") or ()
+    )
+    admitted = _admitted_actions(event, "choose_target_mode")
+    matching_actions = [
+        action
+        for action in admitted
+        if action.get("owner") == "chain_rpc"
+        and action.get("effect") == "configuration_mutation"
+        and action.get("group") == "target_mode"
+        and dict(action.get("argument_value_hashes") or {}).get("target_mode")
+        == _value_hash("real-node")
+        and str(action.get("action_id") or "")
+        in admitted_ids & execution_order & transition_consumers
+    ]
+    matching_action_ids = {
+        str(action.get("action_id") or "")
+        for action in matching_actions
+    }
+    matching_receipts = [
+        item
+        for item in valid
+        if int(item["turn_index"]) == turn_index
+        and item["receipt"].get("resolution_path") == "exact_contract"
+        and item["receipt"].get("pending_id") == "opening_next_action"
+        and item["receipt"].get("pending_group") == "opening"
+        and item["receipt"].get("pending_contract_hash")
+        == (transition or {}).get("before_hash")
+        and item["receipt"].get("selected_value_hash")
+        == _value_hash("real-node")
+        and str(item["receipt"].get("resolved_action_id") or "")
+        in matching_action_ids
+    ]
+    material_diffs = _valid_material_diffs(event) if event else {}
+    material_paths = sorted(material_diffs)
+    satisfied = bool(
+        transition
+        and transition["before_id"] == "opening_next_action"
+        and transition["before_group"] == "opening"
+        and transition["after_id"] == "chain"
+        and transition["after_group"] == "chain_identity"
+        and len(matching_actions) == 1
+        and len(matching_receipts) == 1
+        and (material_diffs.get("target_mode") or {}).get("after")
+        == _value_hash("real-node")
+        and not invalid
+    )
+    return satisfied, _receipt_details(
+        "turn_bound_real_node_selection",
+        matching_receipts,
+        invalid,
+        source_step_position=1,
+        turn_index=turn_index,
+        pending_transition=dict(transition or {}),
+        matching_admitted_action_ids=sorted(matching_action_ids),
+        material_state_paths=material_paths,
+    )
+
+
+def _mode_consultation_preserves_chain_pending(
+    context: Any,
+) -> PredicateResult:
+    event = _source_step_event(context, 2)
+    transition = _valid_pending_transition(event) if event else None
+    valid, invalid = _valid_receipts(context, "orientation_response")
+    turn_index = int(getattr(event, "turn_index", -1)) if event else -1
+    execution_order = set(
+        dict(getattr(event, "turn_receipt_summary", {}) or {}).get(
+            "execution_order"
+        )
+        or ()
+    ) if event else set()
+    admitted_ids = set(
+        dict(getattr(event, "turn_receipt_summary", {}) or {}).get(
+            "admitted_action_ids"
+        )
+        or ()
+    ) if event else set()
+    transition_consumers = set(
+        (transition or {}).get("consumer_action_ids") or ()
+    )
+    admitted = _admitted_actions(event, "answer_opening_question")
+    matching_actions = [
+        action
+        for action in admitted
+        if action.get("owner") == "orientation"
+        and action.get("effect") == "read_only"
+        and dict(action.get("argument_value_hashes") or {}).get("topic")
+        == _value_hash(MODE_COMPARISON_TOPIC)
+        and str(action.get("action_id") or "")
+        in admitted_ids & execution_order & transition_consumers
+    ]
+    matching_action_ids = {
+        str(action.get("action_id") or "")
+        for action in matching_actions
+    }
+    matching_receipts = [
+        item
+        for item in valid
+        if int(item["turn_index"]) == turn_index
+        and item["receipt"].get("read_only") is True
+        and item["receipt"].get("action_type") == "answer_opening_question"
+        and item["receipt"].get("topic") == MODE_COMPARISON_TOPIC
+        and item["receipt"].get("pending_contract_hash")
+        == (transition or {}).get("before_hash")
+        and str(item["receipt"].get("action_id") or "")
+        in matching_action_ids
+    ]
+    material_paths = sorted(_valid_material_diffs(event)) if event else []
+    satisfied = bool(
+        transition
+        and transition["transition"] == "preserved"
+        and transition["before_id"] == "chain"
+        and transition["before_group"] == "chain_identity"
+        and transition["after_id"] == transition["before_id"]
+        and transition["after_group"] == transition["before_group"]
+        and transition["after_hash"] == transition["before_hash"]
+        and len(matching_actions) == 1
+        and len(matching_receipts) == 1
+        and not material_paths
+        and not invalid
+    )
+    return satisfied, _receipt_details(
+        "turn_bound_mode_consultation",
+        matching_receipts,
+        invalid,
+        source_step_position=2,
+        turn_index=turn_index,
+        pending_transition=dict(transition or {}),
+        matching_admitted_action_ids=sorted(matching_action_ids),
+        material_state_paths=material_paths,
     )
 
 
@@ -2352,6 +2506,12 @@ POSTCONDITION_EVALUATORS: Mapping[str, PostconditionEvaluator] = {
     ),
     "visible_option_action_executed": _visible_option_action_executed,
     "current_menu_binding_preserved": _current_menu_binding_preserved,
+    "real_node_selection_executed_at_source": (
+        _real_node_selection_executed_at_source
+    ),
+    "mode_consultation_preserves_chain_pending": (
+        _mode_consultation_preserves_chain_pending
+    ),
     "mode_change_request_routed_from_chain_pending": (
         _mode_change_request_routed_from_chain_pending
     ),

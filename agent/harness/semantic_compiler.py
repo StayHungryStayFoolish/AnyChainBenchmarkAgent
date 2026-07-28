@@ -356,6 +356,36 @@ def freeze_semantic_plan(
         mapped = row.get("unit_ids")
         if not isinstance(mapped, list) or any(str(value) not in unit_ids for value in mapped):
             raise ValueError("semantic plan action record references an unknown unit")
+        required_relations = row.get("required_evidence_relations", [])
+        if (
+            not isinstance(required_relations, list)
+            or any(
+                not isinstance(relation, Mapping)
+                or set(relation)
+                != {"unit_id", "relation", "support_relation"}
+                or str(relation.get("unit_id") or "") not in mapped
+                or str(relation.get("relation") or "")
+                not in {"direct", "support"}
+                or (
+                    str(relation.get("relation") or "") == "direct"
+                    and str(relation.get("support_relation") or "")
+                )
+                or (
+                    str(relation.get("relation") or "") == "support"
+                    and str(relation.get("support_relation") or "")
+                    not in set(row.get("allowed_support_relations") or [])
+                )
+                for relation in required_relations
+            )
+            or len({
+                str(relation.get("unit_id") or "")
+                for relation in required_relations
+                if isinstance(relation, Mapping)
+            }) != len(required_relations)
+        ):
+            raise ValueError(
+                "semantic plan action evidence-relation contract is invalid"
+            )
     for index, row in enumerate(normalized_units):
         if row.get("unit_index") != index or row.get("unit") != units[index]:
             raise ValueError("semantic plan unit record is not bound to the immutable unit")
@@ -400,7 +430,7 @@ def whole_plan_admission_prompt(semantic_policy: str) -> str:
         "Echo plan_hash exactly. Return exactly one action_verdict for every supplied action_id and exactly one unit_verdict for every supplied unit_id; never add an id. "
         "Each action_verdict is {action_id,verdict:'admit'|'reject',unit_ids:[string],evidence:[{unit_id,quote,relation:'direct'|'support',support_relation:string}],grounded_arguments:[{argument_name:string,evidence_quote:string}],pending_answer_argument:string,turn_candidate_verdicts:[{candidate_id:string,verdict:'selected'|'not_selected',evidence_quote:string,reason:string}],reason}. "
         "A pending option may be selected by its number, id, canonical value, label, or a clear natural-language semantic equivalent. Do not require the source to repeat an option number or full label when it directly names the declared value or meaning. "
-        "unit_ids must exactly equal that action's supplied immutable unit_ids. An admitted action needs one evidence row for every unit_id, every quote must be a non-empty exact substring of that unit, at least one relation must be direct, and a support row may use only one supplied allowed_support_relation. Direct rows use an empty support_relation. "
+        "unit_ids must exactly equal that action's supplied immutable unit_ids. An admitted action needs one evidence row for every unit_id, every quote must be a non-empty exact substring of that unit, at least one relation must be direct, and a support row may use only one supplied allowed_support_relation. Direct rows use an empty support_relation. When an action supplies required_evidence_relations, copy each declared relation and support_relation exactly for that unit; this role was already decided by the independent partition authority and is not open to reinterpretation. "
         "grounded_arguments must contain exactly one row for every supplied required_value_grounding_argument and no other row. argument_name is the exact required_value_grounding_argument name copied verbatim, never an explanation or value. Its evidence_quote must be the shortest non-empty exact affirmative substring of one owned source unit that semantically selects the exact immutable operation_arguments value; exclude contrast text and rejected alternatives from the quote. Merely naming the argument or dimension, asking to change it without selecting a value, stating a generic benchmark goal, or relying on workflow state does not ground a concrete value. Natural-language equivalents may ground a value only when they unambiguously select that exact value. Rejecting or excluding one value in a closed enum with multiple remaining values does not select any one remaining value; reject that concrete selection so the registered typed intake can ask the user. Actions with no required value-grounding arguments return an empty list. "
         "pending_answer_argument is an opaque manual-candidate id, never an answer value, option id, option label, number, or paraphrase. Declared options are reviewed through the immutable action and pending_choice_contracts; they do not use pending_answer_argument. If an action record supplies an empty pending_value_candidates list, pending_answer_argument must be exactly the empty string even when that action selects a declared option. Only when the supplied active pending question allows manual input and exactly one supplied pending_value_candidate semantically answers that question, set pending_answer_argument to that candidate's exact candidate_id copied verbatim. Each action record also supplies turn_pending_value_candidates scoped to source units owned by that action. For every action with non-empty pending_value_candidates return exactly one turn_candidate_verdict for every supplied turn candidate in supplied order; actions with no pending_value_candidates return an empty list. Each evidence_quote must be a non-empty exact substring of one candidate source unit. For a parser-derived literal it contains the literal; for a semantically normalized number, map, or enum it must be the exact phrase that selects that canonical value. Each reason must explain the source role rather than repeat the verdict. Exactly one row may be selected, and it must have the same contract-owned identity as the immutable operation value selected by pending_answer_argument; every other row is not_selected. Evaluate the selected operation against the complete scoped set, not only its operation argument. When two or more candidates exist, admit one only when the source explicitly distinguishes it as selected and distinguishes every other value as rejected, old, example-only, or otherwise not selected. A comparison, conjunction, disjunction, slash-separated list, or bare sequence is unresolved and must reject the pending answer rather than arbitrarily labeling one selected. A syntax-compatible value for an unrelated interruption is not an answer. A candidate mentioned only as an example, quotation, rejected option, negated operation, correction target, or value the user says not to apply is not an answer. Never invent a candidate id or rewrite the action. "
         "Each unit_verdict is {unit_id,verdict:'complete'|'support'|'context'|'unresolved'|'omitted',owner_action_ids:[string],evidence_quote:string,omitted_action_type:string,reason}. "
@@ -559,6 +589,18 @@ def validate_whole_plan_admission(
     action_counts: dict[str, int] = {}
     valid_action_rows: list[dict[str, Any]] = []
     admitted_evidence_relations: dict[tuple[str, str], str] = {}
+    required_evidence_relations: dict[tuple[str, str], tuple[str, str]] = {}
+    for action_id, record in action_records.items():
+        for relation in record.get("required_evidence_relations") or []:
+            if not isinstance(relation, Mapping):
+                continue
+            required_evidence_relations[(
+                action_id,
+                str(relation.get("unit_id") or ""),
+            )] = (
+                str(relation.get("relation") or ""),
+                str(relation.get("support_relation") or ""),
+            )
     for raw in action_rows:
         if not isinstance(raw, dict):
             errors.append("whole-plan admission contains a non-object action verdict")
@@ -818,6 +860,17 @@ def validate_whole_plan_admission(
                 errors.append(f"whole-plan action evidence is not exact: {action_id}/{unit_id}")
             relation = str(evidence_row.get("relation") or "")
             support_relation = str(evidence_row.get("support_relation") or "")
+            required_relation = required_evidence_relations.get(
+                (action_id, unit_id)
+            )
+            if (
+                required_relation is not None
+                and (relation, support_relation) != required_relation
+            ):
+                errors.append(
+                    "whole-plan action evidence contradicts its immutable "
+                    f"relation contract: {action_id}/{unit_id}"
+                )
             if relation == "direct":
                 direct_count += 1
                 if support_relation:
@@ -909,6 +962,21 @@ def validate_whole_plan_admission(
             for owner in expected_owners
         ):
             errors.append(f"whole-plan support unit is not support for every owner: {unit_id}")
+        required_unit_relations = {
+            required_evidence_relations[(owner, unit_id)][0]
+            for owner in expected_owners
+            if (owner, unit_id) in required_evidence_relations
+        }
+        if "direct" in required_unit_relations and verdict != "complete":
+            errors.append(
+                "whole-plan unit verdict contradicts its immutable direct "
+                f"relation contract: {unit_id}"
+            )
+        if "support" in required_unit_relations and verdict != "support":
+            errors.append(
+                "whole-plan unit verdict contradicts its immutable support "
+                f"relation contract: {unit_id}"
+            )
         if verdict == "context" and expected_owners:
             errors.append(f"whole-plan context unit has an owner: {unit_id}")
         valid_unit_rows.append(row)
@@ -947,11 +1015,13 @@ def _canonicalize_admission_receipts(
 ) -> dict[str, Any]:
     """Normalize uniquely derivable reviewer wire receipts.
 
-    The reviewer remains the semantic admission authority. This boundary only
-    repairs redundant receipt fields after an explicit ``admit`` verdict when
-    the immutable plan and exact direct evidence leave no choice. Rejections,
-    missing rows, ambiguous candidates, and exact-source values remain
-    untouched so the strict validator can fail closed.
+    The reviewer remains the action-admission authority, while Stage A owns
+    each source unit's immutable evidence role. This boundary removes only
+    byte-identical wire duplicates and uniquely derivable pending-candidate
+    fields after an explicit ``admit`` verdict. Conflicting relations, distinct
+    quotes, rejections, malformed or missing rows, ambiguous candidates, and
+    exact-source values remain untouched so validation and the bounded
+    contract-repair path fail closed.
     """
 
     action_rows = payload.get("action_verdicts")
