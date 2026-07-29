@@ -8046,6 +8046,17 @@ network:
         self.assertEqual(result["active_group"], "workload_rpc")
         self.assertEqual(result["pending_question"]["id"], "workload_confirm")
         self.assertEqual(result["group_history"], ["opening", "provider_deployment"])
+        domain_commit = next(
+            item
+            for item in result["turn_context"]["control_receipts"]
+            if item["receipt_type"] == "domain_commit"
+        )
+        self.assertEqual(domain_commit["navigation_operation"], "go_back")
+        self.assertEqual(domain_commit["navigation_origin_group"], "qps_profile")
+        self.assertEqual(
+            domain_commit["navigation_target_group"],
+            "workload_rpc",
+        )
 
     def test_custom_rpc_choice_transfers_control_to_endpoint_group(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn

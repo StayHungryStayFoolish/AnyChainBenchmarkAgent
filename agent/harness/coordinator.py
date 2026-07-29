@@ -4080,6 +4080,7 @@ def _apply_handler_result(
 
     previous_pending = dict(state.get("pending_question") or {})
     navigation_command = result.navigation_command
+    navigation_binding = navigation_command
     if result.blocker:
         candidate: AgentGraphState = deepcopy(state)
         _append_domain_control_receipts(
@@ -4149,6 +4150,26 @@ def _apply_handler_result(
         navigation_state, navigation_followups = _commit_navigation_command(
             state,
             result.navigation_command,
+        )
+        navigation_origin = (
+            result.navigation_command.origin_group
+            or str(state.get("active_group") or "")
+            or str((state.get("pending_question") or {}).get("group") or "")
+            or "opening"
+        )
+        navigation_target = (
+            result.navigation_command.target_group
+            or str(navigation_state.get("active_group") or "")
+            or str(
+                (navigation_state.get("pending_question") or {}).get("group")
+                or ""
+            )
+            or navigation_origin
+        )
+        navigation_binding = replace(
+            result.navigation_command,
+            origin_group=navigation_origin,
+            target_group=navigation_target,
         )
         result = replace(
             result,
@@ -4420,13 +4441,13 @@ def _apply_handler_result(
             "group_state_transitions": group_state_transitions,
             "material_delta": delta_paths,
             "navigation_operation": str(
-                navigation_command.operation if navigation_command else ""
+                navigation_binding.operation if navigation_binding else ""
             ),
             "navigation_origin_group": str(
-                navigation_command.origin_group if navigation_command else ""
+                navigation_binding.origin_group if navigation_binding else ""
             ),
             "navigation_target_group": str(
-                navigation_command.target_group if navigation_command else ""
+                navigation_binding.target_group if navigation_binding else ""
             ),
             "pending_before_hash": _receipt_hash(previous_pending),
             "pending_after_hash": _receipt_hash(
