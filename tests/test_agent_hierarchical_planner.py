@@ -1583,6 +1583,16 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         )
         self.assertIn("one parser-proven manual value", partition_prompt)
         self.assertIn("pending_typed_candidates proves one candidate", admission_prompt)
+        self.assertIn("present idempotent domain_request", partition_prompt)
+        self.assertIn("will be supplied later is temporal context", partition_prompt)
+        self.assertIn("requirements, format, meaning, or validity", partition_prompt)
+        self.assertIn("equality with current state", admission_prompt)
+        self.assertIn("A unit has exactly one operation", partition_prompt)
+        self.assertIn("operation-specific units", admission_prompt)
+        self.assertIn("each demand has its own exact substring", partition_prompt)
+        self.assertIn("Distinct exact substrings", admission_prompt)
+        self.assertIn("contract_proven_pending_prefixes", partition_prompt)
+        self.assertIn("Reject a planner reason that invents", admission_prompt)
         self.assertIn(
             "hypothetical, counterfactual, consequence",
             partition_prompt,
@@ -1594,6 +1604,54 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertIn(
             "even when the evidence will be pasted later",
             admission_prompt,
+        )
+
+    def test_stage_b_contract_compiles_explicit_existing_value_idempotently(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _stage_b_prompt
+
+        prompt = _stage_b_prompt("chain_rpc")
+
+        self.assertIn("keep, reuse, or reconfirm", prompt)
+        self.assertIn("idempotent proposal", prompt)
+        self.assertIn("would not change state", prompt)
+        self.assertIn("promise to supply a value later", prompt)
+
+    def test_stage_a_rejects_route_without_registered_compiler_action(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _validate_partition_document,
+        )
+        from agent.harness.plan_coverage import segment_user_turn
+
+        text = "Tell me what the endpoint must support."
+        clauses = segment_user_turn(text)
+        document = {
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": clauses[0].clause_id,
+                "source_text": text,
+                "operation": "domain_request",
+                "owner_routes": [{
+                    "owner": "orientation",
+                    "group": "endpoint_process",
+                }],
+                "reason": "incorrectly treated consultation as mutation",
+            }],
+            "reason": "invalid route",
+        }
+
+        _partition, errors = _validate_partition_document(
+            json.dumps(document),
+            clauses,
+        )
+
+        self.assertIn(
+            "Stage A route has no registered compiler action: "
+            "unit-1/domain_request/orientation/endpoint_process",
+            errors,
         )
 
     def test_stage_a_payload_projects_authoritative_operation_purposes(
@@ -2893,6 +2951,377 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(
             compilation[0]["source_text"],
             "http://127.0.0.1:8545",
+        )
+
+    def test_declared_option_matching_tolerates_terminal_punctuation(self) -> None:
+        from agent.harness.questions import (
+            exact_option_answer,
+            exact_option_prefix_answer,
+        )
+
+        question = {
+            "kind": "yes_no",
+            "options": [
+                {"id": "accept", "value": True},
+                {"id": "decline", "value": False},
+            ],
+        }
+
+        self.assertEqual(exact_option_answer("N。", question), (True, False))
+        self.assertEqual(exact_option_answer("yes!", question), (True, True))
+        self.assertEqual(
+            exact_option_prefix_answer(
+                "N, keep the current chain and change target mode.",
+                question,
+            ),
+            (True, False, 3),
+        )
+        self.assertEqual(
+            exact_option_prefix_answer("not yet", question),
+            (False, None, 0),
+        )
+
+    def test_unique_option_prefix_preserves_unresolved_sibling_span(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _canonicalize_unique_option_pending_partition,
+        )
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.state import new_state
+
+        state = new_state("option-prefix-sibling", language="en")
+        state["active_group"] = "opening"
+        state["pending_question"] = {
+            "id": "accept_recommendation",
+            "group": "opening",
+            "kind": "yes_no",
+            "manual_input_allowed": False,
+            "options": [
+                {"id": "accept", "value": True},
+                {"id": "decline", "value": False},
+            ],
+        }
+        clauses = segment_user_turn(
+            "N, keep Solana and configure a real-node benchmark."
+        )
+        partition = [{
+            "unit_id": "unit-unresolved",
+            "clause_id": clauses[0].clause_id,
+            "start": 0,
+            "end": len(clauses[0].text),
+            "source_text": clauses[0].text,
+            "operation": "unresolved",
+            "owner_routes": [],
+            "reason": "model did not resolve the compound turn",
+        }]
+
+        source, compilation = _canonicalize_unique_option_pending_partition(
+            state,
+            clauses,
+            partition,
+            partition,
+        )
+
+        self.assertEqual(
+            [unit["operation"] for unit in source],
+            ["pending_answer", "unresolved"],
+        )
+        self.assertEqual(source, compilation)
+        self.assertEqual(source[0]["source_text"], "N, ")
+        self.assertEqual(
+            source[1]["source_text"],
+            "keep Solana and configure a real-node benchmark.",
+        )
+        self.assertEqual(source[0]["end"], source[1]["start"])
+
+    def test_option_prefix_never_silently_converts_absorbed_sibling_to_context(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _canonicalize_unique_option_pending_partition,
+        )
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.state import new_state
+
+        text = "2, keep Solana and switch to real-node."
+        clauses = segment_user_turn(text)
+        state = new_state("option-prefix-no-silent-loss", language="en")
+        state["active_group"] = "opening"
+        state["pending_question"] = {
+            "id": "accept_recommendation",
+            "group": "opening",
+            "kind": "numbered_choice",
+            "options": [
+                {"id": "1", "value": True},
+                {"id": "2", "value": False},
+            ],
+        }
+        partition = [{
+            "unit_id": "unit-whole",
+            "clause_id": clauses[0].clause_id,
+            "start": 0,
+            "end": len(text),
+            "source_text": text,
+            "operation": "pending_answer",
+            "owner_routes": [{"owner": "coordinator", "group": "opening"}],
+            "reason": "model incorrectly absorbed the complete clause",
+        }]
+
+        source, compilation = _canonicalize_unique_option_pending_partition(
+            state,
+            clauses,
+            partition,
+            partition,
+        )
+
+        self.assertEqual(
+            [unit["operation"] for unit in source],
+            ["pending_answer", "unresolved"],
+        )
+        self.assertEqual(source, compilation)
+        self.assertEqual(
+            source[1]["source_text"],
+            "keep Solana and switch to real-node.",
+        )
+
+    def test_shared_source_routes_preserve_candidate_and_unresolved_atom(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _expand_partition_routes,
+            _merge_owner_documents,
+        )
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.semantic_admission import (
+            prepare_hierarchical_candidate,
+        )
+        from agent.harness.state import new_state
+
+        text = "Use real-node and keep the current QPS goal."
+        clauses = segment_user_turn(text)
+        source = [{
+            "unit_id": "unit-shared",
+            "clause_id": clauses[0].clause_id,
+            "start": 0,
+            "end": len(text),
+            "source_text": text,
+            "operation": "domain_request",
+            "owner_routes": [
+                {"owner": "chain_rpc", "group": "target_mode"},
+                {"owner": "performance", "group": "qps_profile"},
+            ],
+            "reason": "one source span has two independently owned demands",
+        }]
+        expanded = _expand_partition_routes(source)
+        candidate = _merge_owner_documents(
+            expanded,
+            expanded,
+            {
+                "chain_rpc": {
+                    "actions": [{
+                        "type": "choose_target_mode",
+                        "target_mode": "real-node",
+                        "target_mode_explicit": True,
+                        "source_evidence": "real-node",
+                    }],
+                    "bindings": [{
+                        "unit_id": expanded[0]["unit_id"],
+                        "action_indexes": [0],
+                        "disposition": "action",
+                        "reason": "the target mode is explicit",
+                    }],
+                },
+                "performance": {
+                    "actions": [],
+                    "bindings": [{
+                        "unit_id": expanded[1]["unit_id"],
+                        "action_indexes": [],
+                        "disposition": "unresolved",
+                        "reason": "the QPS goal has no concrete profile",
+                    }],
+                },
+            },
+        )
+        state = new_state("shared-source-partial-draft", language="en")
+
+        _prepared, validation = prepare_hierarchical_candidate(
+            json.dumps(candidate),
+            state,
+            clauses,
+            pending_choice_unit_ids=frozenset(),
+        )
+
+        self.assertFalse(validation.valid)
+        self.assertEqual(validation.errors, ())
+        self.assertEqual(len(validation.unresolved_units), 1)
+        self.assertEqual(
+            [
+                unit["disposition"]
+                for unit in candidate["semantic_units"]
+            ],
+            ["action", "unresolved"],
+        )
+        self.assertEqual(
+            candidate["semantic_units"][0]["parent_unit_id"],
+            "unit-shared",
+        )
+        self.assertEqual(
+            candidate["semantic_units"][1]["parent_unit_id"],
+            "unit-shared",
+        )
+
+    def test_stage_a_reviewer_sees_contract_option_before_unresolved_sibling(
+        self,
+    ) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from agent.harness.domains.orientation import recommendation_question
+        from agent.harness.hierarchical_planner import (
+            begin_semantic_partition,
+            compile_next_owner,
+            review_semantic_plan,
+        )
+        from agent.harness.semantic_drafts import semantic_hash
+        from agent.harness.state import new_state
+
+        class Provider:
+            def complete(self, request):
+                system = request.messages[0].content
+                payload = json.loads(request.messages[1].content)
+                if "Stage A semantic partition" in system:
+                    units = [
+                        {
+                            "unit_id": f"unit-{index}",
+                            "clause_id": clause["clause_id"],
+                            "source_text": clause["text"],
+                            "operation": "unresolved",
+                            "owner_routes": [],
+                            "reason": "the model left this source unresolved",
+                        }
+                        for index, clause in enumerate(
+                            payload["clauses"],
+                            start=1,
+                        )
+                    ]
+                    return SimpleNamespace(text=json.dumps({
+                        "semantic_units": units,
+                        "reason": "unresolved compound turn",
+                    }))
+                if "Stage A coverage authority" in system:
+                    units = payload["semantic_units"]
+                    return SimpleNamespace(text=json.dumps({
+                        "unit_verdicts": [
+                            {
+                                "unit_id": unit["unit_id"],
+                                "verdict": (
+                                    "complete"
+                                    if unit["operation"] == "pending_answer"
+                                    else "unresolved"
+                                ),
+                                "supports_unit_id": "",
+                                "reason": "reviewed from the canonical source",
+                            }
+                            for unit in units
+                        ],
+                        "clause_verdicts": [
+                            {
+                                "clause_id": clause["clause_id"],
+                                "verdict": (
+                                    "complete"
+                                    if index == 0
+                                    else "unresolved"
+                                ),
+                                "omitted_owner_routes": [],
+                                "reason": "the sibling still needs semantic work",
+                            }
+                            for index, clause in enumerate(payload["clauses"])
+                        ],
+                        "reason": "canonical pending option retained",
+                    }))
+                if "Stage B command compiler" in system:
+                    unit = payload["semantic_units"][0]
+                    return SimpleNamespace(text=json.dumps({
+                        "actions": [{
+                            "type": "answer_pending",
+                            "selected_value": False,
+                            "source_evidence": unit["source_text"],
+                        }],
+                        "bindings": [{
+                            "unit_id": unit["unit_id"],
+                            "action_indexes": [0],
+                            "disposition": "action",
+                            "reason": "compiled from the signed option contract",
+                        }],
+                        "reason": "compiled pending selection",
+                    }))
+                raise AssertionError(system)
+
+        state = new_state("option-before-stage-a-review", language="zh")
+        state["active_group"] = "opening"
+        state["pending_question"] = recommendation_question(state)
+        text = "N。保留刚才的目标，并告诉我下一步。"
+        state["turn_index"] = 2
+        state["turn_context"] = {
+            "text": text,
+            "product_head": {
+                "product_authority_id": (
+                    "authority:option-before-stage-a-review"
+                ),
+                "revision": 2,
+                "checkpoint_thread_id": (
+                    "checkpoint-thread:option-before-stage-a-review"
+                ),
+                "checkpoint_id": (
+                    "checkpoint:option-before-stage-a-review"
+                ),
+                "state_fingerprint": semantic_hash({
+                    "thread_id": "option-before-stage-a-review",
+                }),
+            },
+        }
+        with patch(
+            "agent.harness.hierarchical_planner.provider_from_config",
+            return_value=Provider(),
+        ):
+            document = begin_semantic_partition(state, text)
+
+        self.assertEqual(document["status"], "compile_owner", document)
+        self.assertEqual(
+            [
+                unit["operation"]
+                for unit in document["source_partition"]
+            ],
+            ["pending_answer", "unresolved"],
+        )
+        self.assertEqual(
+            document["owner_requests"],
+            [{
+                "owner": "coordinator",
+                "unit_ids": [
+                    document["source_partition"][0]["unit_id"],
+                ],
+                "groups": ["opening"],
+            }],
+        )
+        with patch(
+            "agent.harness.hierarchical_planner.provider_from_config",
+            return_value=Provider(),
+        ):
+            while document["status"] == "compile_owner":
+                document = compile_next_owner(state, document)
+            result = review_semantic_plan(state, document)
+
+        self.assertEqual(result["actions"], [])
+        draft = result["semantic_draft"]
+        self.assertEqual(draft["status"], "awaiting_clarification")
+        self.assertEqual(
+            [row["action"]["type"] for row in draft["candidates"]],
+            ["answer_pending"],
+        )
+        self.assertEqual(len(draft["unresolved_atoms"]), 1)
+        self.assertIn(
+            "保留刚才的目标",
+            draft["unresolved_atoms"][0]["source_text"],
         )
 
     def test_stage_a_retains_unclaimed_prose_for_independent_review(self) -> None:

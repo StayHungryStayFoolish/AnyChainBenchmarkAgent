@@ -231,11 +231,17 @@ def validate_plan_coverage(
             unresolved.append(source_text)
             unresolved_units.append({
                 "unit_id": unit_id,
+                "parent_unit_id": str(raw.get("parent_unit_id") or ""),
                 "clause_id": clause_id,
                 "start": start,
                 "end": end,
                 "source_text": source_text,
                 "source_path": str(raw.get("source_path") or ""),
+                "owner_routes": [
+                    dict(route)
+                    for route in raw.get("owner_routes") or ()
+                    if isinstance(route, Mapping)
+                ],
                 "reason": str(raw.get("reason") or ""),
             })
             continue
@@ -297,9 +303,33 @@ def validate_plan_coverage(
             errors.append(f"missing semantic units for {clause_id}")
             unresolved.append(clause.text)
             continue
+        coverage_units: list[Mapping[str, Any]] = []
+        coverage_by_identity: dict[str, Mapping[str, Any]] = {}
+        for unit in units:
+            identity = str(
+                unit.get("parent_unit_id")
+                or unit.get("unit_id")
+                or ""
+            )
+            prior = coverage_by_identity.get(identity)
+            if prior is None:
+                coverage_by_identity[identity] = unit
+                coverage_units.append(unit)
+                continue
+            if (
+                int(prior["start"]) != int(unit["start"])
+                or int(prior["end"]) != int(unit["end"])
+                or str(prior.get("source_text") or "")
+                != str(unit.get("source_text") or "")
+            ):
+                errors.append(
+                    "semantic DemandAtoms sharing a parent have different "
+                    f"source spans: {identity}"
+                )
+        coverage_units.sort(key=lambda item: int(item["start"]))
         structured_paths = [
             str(unit.get("source_path") or "").strip()
-            for unit in units
+            for unit in coverage_units
         ]
         if (
             clause.input_shape == "structured"
@@ -308,12 +338,12 @@ def validate_plan_coverage(
             and all(
                 int(unit["start"]) == 0
                 and int(unit["end"]) == len(clause.text)
-                for unit in units
+                for unit in coverage_units
             )
         ):
             continue
         cursor = 0
-        for unit in units:
+        for unit in coverage_units:
             start = int(unit["start"])
             end = int(unit["end"])
             if start != cursor:

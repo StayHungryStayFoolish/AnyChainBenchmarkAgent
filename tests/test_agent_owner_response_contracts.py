@@ -61,6 +61,28 @@ class OwnerResponseContractTests(unittest.TestCase):
         self.assertIn("AnyChain Benchmark Agent", render_fragment(fragment, "en").text)
         self.assertIn("AnyChain Benchmark Agent", render_fragment(fragment, "zh").text)
 
+    def test_recommendation_completion_does_not_prescribe_stale_next_state(
+        self,
+    ) -> None:
+        from agent.harness.domains.orientation import apply_orientation_answer
+
+        state = new_state("recommendation-local-effect", language="en")
+        question = {
+            "id": "accept_recommendation",
+            "recommended_setup": {"target_mode": "fake-node"},
+        }
+
+        declined = apply_orientation_answer(state, question, False, "N")
+        accepted = apply_orientation_answer(state, question, True, "Y")
+
+        for result in (declined, accepted):
+            for language in ("en", "zh"):
+                text = render_fragment(result.response_fragments[0], language).text
+                self.assertNotIn("Next", text)
+                self.assertNotIn("下一步", text)
+                self.assertNotIn("Tell me which", text)
+                self.assertNotIn("请告诉我", text)
+
     def test_environment_invalid_value_and_failure_are_typed(self) -> None:
         from agent.harness.domains.environment import (
             apply_environment_action,

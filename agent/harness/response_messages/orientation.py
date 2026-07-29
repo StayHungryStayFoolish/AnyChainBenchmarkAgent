@@ -292,14 +292,14 @@ MESSAGES = {
         "kinds": {"message"},
     },
     "harness.orientation.recommendation_declined": {
-        "en": "OK, not using the recommendation. Tell me which chain and mode (fake-node / real-node / sync-observe) you want.",
-        "zh": "好的，不按推荐。你可以直接说要测哪条链、用哪种模式（fake-node / real-node / sync-observe）。",
+        "en": "OK, not using the recommendation.",
+        "zh": "好的，不按推荐。",
         "arguments": {},
         "kinds": {"message"},
     },
     "harness.orientation.recommendation_accepted": {
-        "en": "Starting the recommended `{mode}` path. Next choose the chain to validate; I will confirm the remaining configuration item by item.",
-        "zh": "好的，按推荐进入 `{mode}`。下一步请选择要验证的链，我会逐项确认缺失配置。",
+        "en": "Starting the recommended `{mode}` path.",
+        "zh": "好的，按推荐进入 `{mode}`。",
         "arguments": {"mode": "string"},
         "kinds": {"message"},
     },

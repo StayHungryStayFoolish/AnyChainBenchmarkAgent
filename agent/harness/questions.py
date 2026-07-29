@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
 
@@ -901,40 +902,134 @@ def choice_question(
     })
 
 
+def _declared_option_candidates(
+    question: Mapping[str, Any],
+) -> tuple[tuple[str, Any], ...]:
+    candidates: list[tuple[str, Any]] = []
+    options = list(question.get("options") or [])
+    for index, option in enumerate(options, start=1):
+        literals = {
+            str(index).strip(),
+            str(option.get("id") or "").strip(),
+            str(option.get("value") or "").strip(),
+        }
+        label_ref = option.get("label_ref")
+        if isinstance(label_ref, dict):
+            reference = text_ref_from_dict(label_ref)
+            literals.update(
+                render_text_ref(
+                    reference,
+                    language,
+                    kind="option_label",
+                ).strip()
+                for language in ("en", "zh")
+            )
+        for literal in literals:
+            if literal:
+                candidates.append((literal, option.get("value")))
+    if str(question.get("kind") or "") == "yes_no" and options:
+        candidates.extend(
+            (literal, options[0].get("value"))
+            for literal in ("y", "yes")
+        )
+        if len(options) > 1:
+            candidates.extend(
+                (literal, options[1].get("value"))
+                for literal in ("n", "no")
+            )
+    unique: list[tuple[str, Any]] = []
+    observed: set[tuple[str, str]] = set()
+    for literal, value in candidates:
+        identity = (
+            literal.casefold(),
+            json.dumps(value, ensure_ascii=False, sort_keys=True, default=str),
+        )
+        if identity not in observed:
+            observed.add(identity)
+            unique.append((literal, value))
+    return tuple(unique)
+
+
+def _option_answer_forms(raw: str) -> tuple[str, ...]:
+    forms = [raw]
+    end = len(raw)
+    while end and unicodedata.category(raw[end - 1]).startswith("P"):
+        end -= 1
+    without_terminal_punctuation = raw[:end].rstrip()
+    if without_terminal_punctuation and without_terminal_punctuation != raw:
+        forms.append(without_terminal_punctuation)
+    return tuple(forms)
+
+
 def exact_option_answer(text: str, question: dict[str, Any]) -> tuple[bool, Any]:
-    """Match only an option explicitly declared by the active question."""
+    """Match only one complete option declared by the active question."""
 
     raw = str(text or "").strip()
     if not raw:
         return False, None
-    options = list(question.get("options") or [])
-    if options:
-        normalized = raw.casefold()
-        for index, option in enumerate(options, start=1):
-            candidates = {
-                str(index).casefold(),
-                str(option.get("id") or "").strip().casefold(),
-                str(option.get("value") or "").strip().casefold(),
-            }
-            label_ref = option.get("label_ref")
-            if isinstance(label_ref, dict):
-                reference = text_ref_from_dict(label_ref)
-                candidates.update(
-                    render_text_ref(
-                        reference,
-                        language,
-                        kind="option_label",
-                    ).strip().casefold()
-                    for language in ("en", "zh")
-                )
-            if normalized in candidates:
-                return True, option.get("value")
-        if question.get("kind") == "yes_no":
-            if normalized in {"y", "yes"}:
-                return True, options[0].get("value")
-            if normalized in {"n", "no"} and len(options) > 1:
-                return True, options[1].get("value")
+    normalized_forms = {
+        form.casefold()
+        for form in _option_answer_forms(raw)
+    }
+    for literal, value in _declared_option_candidates(question):
+        if literal.casefold() in normalized_forms:
+            return True, value
     return False, None
+
+
+def exact_option_prefix_answer(
+    text: str,
+    question: dict[str, Any],
+) -> tuple[bool, Any, int]:
+    """Match one declared option at a structurally delimited turn prefix.
+
+    The returned offset includes punctuation and whitespace separating the
+    option from following prose. It does not infer intent or recognize
+    undeclared aliases.
+    """
+
+    raw = str(text or "")
+    leading = len(raw) - len(raw.lstrip())
+    source = raw[leading:]
+    if not source:
+        return False, None, 0
+    matched, value = exact_option_answer(source, question)
+    if matched:
+        return True, value, len(raw)
+
+    matches: list[tuple[int, Any]] = []
+    for literal, candidate_value in _declared_option_candidates(question):
+        if source[:len(literal)].casefold() != literal.casefold():
+            continue
+        boundary = len(literal)
+        if boundary >= len(source):
+            continue
+        separator = source[boundary]
+        if not (
+            separator.isspace()
+            or unicodedata.category(separator).startswith("P")
+        ):
+            continue
+        matches.append((boundary, candidate_value))
+    if not matches:
+        return False, None, 0
+    longest = max(length for length, _value in matches)
+    values = [
+        candidate_value
+        for length, candidate_value in matches
+        if length == longest
+    ]
+    if any(candidate != values[0] for candidate in values[1:]):
+        return False, None, 0
+    end = leading + longest
+    while end < len(raw) and (
+        raw[end].isspace()
+        or unicodedata.category(raw[end]).startswith("P")
+    ):
+        end += 1
+    if end >= len(raw):
+        return True, values[0], len(raw)
+    return True, values[0], end
 
 
 def exact_answer(text: str, question: dict[str, Any]) -> tuple[bool, Any]:

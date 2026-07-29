@@ -49,6 +49,7 @@ from .semantic_admission import (
 )
 from .plan_coverage import TurnClause, segment_user_turn, validate_semantic_partition
 from .questions import (
+    exact_option_prefix_answer,
     pending_option_value_exists,
     pending_value_identity,
     typed_pending_value_candidates,
@@ -234,6 +235,12 @@ def begin_semantic_partition(
                 clauses,
                 state=state,
             )
+            partition, _ = _canonicalize_unique_option_pending_partition(
+                state,
+                clauses,
+                partition,
+                partition,
+            )
             partition_errors = tuple(dict.fromkeys((
                 *partition_errors,
                 *_cross_domain_pending_errors(partition, state),
@@ -270,6 +277,10 @@ def begin_semantic_partition(
                 state, clauses, source_partition, compilation_partition
             )
         )
+        source_partition = _expand_partition_routes(source_partition)
+        compilation_partition = _expand_partition_routes(
+            compilation_partition
+        )
         (
             source_partition,
             compilation_partition,
@@ -284,7 +295,7 @@ def begin_semantic_partition(
             document["errors"] = list(resolution_errors)
             document["unit_count"] = len(source_partition)
             return document
-        routed_partition = _expand_partition_routes(compilation_partition)
+        routed_partition = compilation_partition
         owner_requests = []
         for owner, unit_ids in _owner_requests(routed_partition).items():
             groups = sorted({
@@ -781,6 +792,22 @@ def _stage_a_prompt() -> str:
         "explanation question is consultation and never authorizes the pending action. A request "
         "to analyze logs, errors, traces, or other evidence is evidence_analysis even when the "
         "user has not pasted the evidence yet. "
+        "A source-grounded instruction to keep, reuse, or reconfirm one concrete registered "
+        "value is a present idempotent domain_request even when owner state already contains "
+        "that value. A statement that a value or evidence will be supplied later is temporal "
+        "context, not a present value selection or mutation. Deferral, delay, absence, or later "
+        "submission by itself never requests the workflow to continue without the value and "
+        "must not be marked unresolved merely because the future value is absent. If that "
+        "deferral also explicitly "
+        "asks to enter or continue the owning workflow, route only that workflow request and "
+        "do not invent the missing value. A question about requirements, format, meaning, or "
+        "validity is consultation rather than a mutation merely because it names a group or "
+        "field. "
+        "contract_proven_pending_prefixes contains Harness-proven exact option prefixes from "
+        "the active signed question. Emit each declared prefix as its own coordinator-owned "
+        "pending_answer unit and independently classify every remaining source character. "
+        "Never absorb a remaining mutation, consultation, navigation, analysis, or context "
+        "span into that pending answer. "
         "owner_routes is an ordered list of {owner,group}; use an empty list only for context "
         "or unresolved. A prose unit may route to several owners when one indivisible excerpt "
         "contains independently owned values. A structured clause is one immutable SourceClause; "
@@ -839,9 +866,15 @@ def _stage_a_prompt() -> str:
         "Keep a separate operation only when the prose independently requests another value, "
         "mutation, consultation, navigation, or analysis. "
         "A semantic unit represents one indivisible prose excerpt or one structured DemandAtom. "
-        "Split distinct prose excerpts even when they share an owner. When one compact prose "
-        "excerpt directly supplies several independently owned values, keep one unit with "
-        "several owner routes. For structured input, use separate source_path DemandAtoms "
+        "Split independent demands into separate minimal exact source anchors whenever each "
+        "demand has its own exact substring, even when they occur in one grammatical sentence, "
+        "share an owner, or declare the same operation. Use several owner routes only when the "
+        "same indivisible exact words require several owners and cannot be separated without "
+        "paraphrasing or losing meaning. A unit has exactly one operation: "
+        "when a compact excerpt combines mutation, consultation, navigation, analysis, or "
+        "another different operation, split minimal exact source anchors by operation even "
+        "when they occur in one grammatical sentence. For structured input, use separate "
+        "source_path DemandAtoms "
         "instead of assigning one field to competing semantic owners. "
         "Universal operation ownership is constrained by universal_operation_owners. Select "
         "exactly one owner from the declared list for that operation. The group on a "
@@ -906,6 +939,7 @@ def _stage_a_payload(
         if isinstance(item, Mapping)
         and str(item.get("resolution") or "").strip()
     ] if draft.get("status") == "ready_for_review" else []
+    option_prefix = _unique_option_prefix_candidate(state, clauses)
     return {
         "product": "AnyChain Benchmark Agent",
         "user_text": text,
@@ -924,6 +958,16 @@ def _stage_a_payload(
             value
             for clause in clauses
             for value in typed_pending_value_candidates(clause.text, pending)
+        ],
+        "contract_proven_pending_prefixes": [
+            {
+                "clause_id": clause.clause_id,
+                "start": 0,
+                "end": end,
+                "source_text": clause.text[:end],
+                "selected_value": value,
+            }
+            for clause, value, end in ([option_prefix] if option_prefix else [])
         ],
         "group_readiness": workflow_snapshot(state).get("group_states") or {},
         "interruption_stack": state.get("interruption_stack") or [],
@@ -1258,6 +1302,20 @@ def _validate_partition_document(
                 )
             route_identities.add(identity)
             normalized_routes.append({"owner": owner, "group": group})
+            if operation not in {"context", "unresolved"} and not any(
+                not spec.internal_only
+                and spec.owner == owner
+                and _action_spec_applies(
+                    spec,
+                    groups=frozenset({group}) if group else frozenset(),
+                    operations=frozenset({operation}),
+                )
+                for spec in ACTION_SPECS
+            ):
+                errors.append(
+                    "Stage A route has no registered compiler action: "
+                    f"{unit_id}/{operation}/{owner}/{group}"
+                )
         allowed_owners = _UNIVERSAL_OPERATION_OWNERS.get(operation)
         if allowed_owners is not None and (
             len(normalized_routes) != 1
@@ -1596,6 +1654,126 @@ def _canonicalize_unique_manual_pending_partition(
     )
 
 
+def _canonicalize_unique_option_pending_partition(
+    state: AgentGraphState,
+    clauses: Sequence[TurnClause],
+    source_partition: Sequence[Mapping[str, Any]],
+    compilation_partition: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Bind one contract-exact option while retaining every sibling source span."""
+
+    pending = dict(state.get("pending_question") or {})
+    candidate = _unique_option_prefix_candidate(state, clauses)
+    if candidate is None:
+        return (
+            [dict(unit) for unit in source_partition],
+            [dict(unit) for unit in compilation_partition],
+        )
+    clause, _selected_value, answer_end = candidate
+    if answer_end <= 0 or answer_end > len(clause.text):
+        return (
+            [dict(unit) for unit in source_partition],
+            [dict(unit) for unit in compilation_partition],
+        )
+    used_ids = {
+        str(unit.get("unit_id") or "")
+        for unit in (*source_partition, *compilation_partition)
+    }
+    sequence = 1
+    while True:
+        pending_unit_id = (
+            f"__harness_pending_option_{clause.clause_id}_{sequence}"
+        )
+        if pending_unit_id not in used_ids:
+            break
+        sequence += 1
+    atomic = {
+        "unit_id": pending_unit_id,
+        "clause_id": clause.clause_id,
+        "start": 0,
+        "end": answer_end,
+        "source_text": clause.text[:answer_end],
+        "operation": "pending_answer",
+        "owner_routes": [{
+            "owner": "coordinator",
+            "group": str(
+                pending.get("group")
+                or state.get("active_group")
+                or ""
+            ),
+        }],
+        "reason": (
+            "The active signed question contract proves one structurally "
+            "delimited option selection."
+        ),
+    }
+
+    def canonicalize(
+        partition: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        output: list[dict[str, Any]] = []
+        emitted = False
+        for raw in partition:
+            unit = dict(raw)
+            if str(unit.get("clause_id") or "") != clause.clause_id:
+                output.append(unit)
+                continue
+            if not emitted:
+                output.append(dict(atomic))
+                emitted = True
+            start = unit.get("start")
+            end = unit.get("end")
+            if (
+                not isinstance(start, int)
+                or isinstance(start, bool)
+                or not isinstance(end, int)
+                or isinstance(end, bool)
+            ):
+                continue
+            if end <= answer_end:
+                continue
+            if start < answer_end:
+                unit["start"] = answer_end
+                unit["source_text"] = clause.text[answer_end:end]
+            if str(unit.get("operation") or "") == "pending_answer":
+                unit["operation"] = "unresolved"
+                unit["owner_routes"] = []
+                unit["reason"] = (
+                    "Stage A absorbed source after the contract-proven option "
+                    "prefix instead of classifying the remaining demand."
+                )
+            if str(unit.get("source_text") or ""):
+                output.append(unit)
+        if not emitted:
+            output.append(dict(atomic))
+        return output
+
+    return (
+        canonicalize(source_partition),
+        canonicalize(compilation_partition),
+    )
+
+
+def _unique_option_prefix_candidate(
+    state: Mapping[str, Any],
+    clauses: Sequence[TurnClause],
+) -> tuple[TurnClause, Any, int] | None:
+    """Return one uniquely contract-proven option prefix for this turn."""
+
+    pending = dict(state.get("pending_question") or {})
+    if not pending.get("options"):
+        return None
+    candidates = [
+        (clause, value, end)
+        for clause in clauses
+        for matched, value, end in (
+            exact_option_prefix_answer(clause.text, pending),
+        )
+        if matched
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def _stage_a_admission_prompt() -> str:
     return (
         "You are the independent Stage A coverage authority for AnyChain Benchmark Agent. "
@@ -1617,6 +1795,22 @@ def _stage_a_admission_prompt() -> str:
         "unit already represents a compact registered-domain request, adjacent operation framing "
         "that adds no independent value, question, navigation, analysis, or mutation supports "
         "that unit; it is not a second pending answer or unresolved demand. "
+        "An explicit keep, reuse, or reconfirm instruction for one concrete registered value "
+        "is complete only when routed as the owning idempotent domain request; equality with "
+        "current state does not make it context or redundant. A statement that a value or "
+        "evidence will be supplied later adds no present value mutation. A question about a "
+        "field's requirements, format, meaning, or validity is an independent consultation, "
+        "not a domain mutation. Because every semantic unit declares exactly one operation, "
+        "a source span combining independently actionable operations must be split into "
+        "minimal exact operation-specific units; several owner routes on one unit are valid "
+        "only when every route compiles that same declared operation and the same exact words "
+        "cannot be divided into independent source-grounded demands. Distinct exact substrings "
+        "must remain distinct units even when they share an owner or operation. "
+        "A temporal deferral, delay, absence, or later-submission statement does not become a "
+        "domain request without exact source words that separately request entry, continuation, "
+        "or skipping a required value. Reject a planner reason that invents such a request. "
+        "contract_proven_pending_prefixes are signed Harness facts: each prefix must remain one "
+        "complete pending_answer and all source after it must be independently represented. "
         "clause_verdicts contains exactly one "
         "row per supplied clause in order: {clause_id,verdict:'complete'|'omitted'|'unresolved',"
         "omitted_owner_routes:[{owner,group}],reason}. A clause is complete only when every "
@@ -1662,6 +1856,9 @@ def _review_stage_a_partition(
         ),
         "pending_typed_candidates": list(
             stage_a_payload.get("pending_typed_candidates") or []
+        ),
+        "contract_proven_pending_prefixes": list(
+            stage_a_payload.get("contract_proven_pending_prefixes") or []
         ),
         "registered_semantic_value_domains": list(
             stage_a_payload.get("registered_semantic_value_domains") or []
@@ -2048,7 +2245,12 @@ def _stage_b_prompt(owner: str) -> str:
         "affirmative source span that semantically selects that value; exclude contrast text and "
         "rejected alternatives from source_evidence. Configuration values remain proposals until the owning workflow "
         "validates and confirms them. Do not copy a value from owner_state "
-        "unless the source unit explicitly supplies or confirms it. Do not add inferred "
+        "unless the source unit explicitly supplies or confirms it. When the source explicitly "
+        "asks to keep, reuse, or reconfirm one concrete value already present in owner_state, "
+        "emit the same owning selection action as an idempotent proposal; never mark it "
+        "unresolved merely because applying it would not change state. A promise to supply a "
+        "value later does not supply that value and must not be compiled as a mutation. "
+        "Do not add inferred "
         "identity, existence, protocol, canonical-name, or evidence-summary arguments to a "
         "selection action; downstream domain validation owns those facts. Questions and "
         "explanations are read-only actions. A concrete request owned by another group has "
@@ -2529,6 +2731,16 @@ def _merge_owner_documents(
             "start": unit.get("start"),
             "end": unit.get("end"),
             "source_text": str(unit["source_text"]),
+            **(
+                {"parent_unit_id": str(unit["parent_unit_id"])}
+                if str(unit.get("parent_unit_id") or "")
+                else {}
+            ),
+            "owner_routes": [
+                dict(route)
+                for route in unit.get("owner_routes") or ()
+                if isinstance(route, Mapping)
+            ],
             **(
                 {
                     "resolution_evidence": str(
