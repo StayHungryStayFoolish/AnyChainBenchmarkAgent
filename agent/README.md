@@ -109,6 +109,17 @@ LLM output is never executed directly. The semantic path checkpoints
 pending-contract validation. Repository tools own configuration
 materialization, execution, monitoring, and evidence-backed analysis.
 
+If an atomized turn contains both valid candidate actions and exact unresolved
+atoms, the coordinator persists one non-executable `SemanticPlanDraft`.
+Candidates remain outside business state and `action_queue`; one question is
+bound to the exact draft revision and atom. After the last answer, the Harness
+restores the original source contract and recompiles the complete turn with
+the resolution evidence. Only a fresh whole-plan review and deterministic
+admission can enqueue the complete action set. Back, cancel, reset, migration,
+session/schema/registry changes, and workflow-precondition changes are handled
+by the draft lifecycle rather than conversational branches. A draft can never
+authorize an external execution action.
+
 For a single source-anchored scalar pending value,
 `harness/bounded_semantic_lane.py` may map once into a finite typed catalog.
 Its immutable receipt binds source, candidate, question/registry/catalog,
@@ -190,28 +201,63 @@ interruption.
 The product compiles one checkpointer-backed graph. Each execution transition
 selects, routes, and commits at most one durable action. Side effects are
 persisted as an intent before invocation and as a receipt afterward. Checkpoint
-schema version 18 is the current contract. Version 12 crosses the isolated
+schema version 23 is the current contract. Version 12 crosses the isolated
 migration boundary; version 13 migrates deferred-queue retention into the typed
 pending-question contract; version 14 initializes typed response fragments
 before persistence as version 15; version 16 materializes the explicit
 pending-question owner and typed Chain/RPC case context; version 17 introduces
-checkpointed semantic-planning state; and version 18 retires persisted
+checkpointed semantic-planning state; version 18 retires persisted
 turn-local response text/manifests in favor of the current response authority.
-Migration to version 18 clears incompatible turn-local response and planning
-scratch while retaining compatible durable workflow state. Older state is
-quarantined for explicit reconfirmation.
+Version 19 introduces the durable, non-executable semantic-draft boundary.
+Migration to version 19 clears incompatible in-flight semantic planning,
+draft state, and any draft-bound question while retaining compatible durable
+workflow configuration. Version 20 binds every new draft and finalization
+receipt to the real Product Head checkpoint lineage and to the complete
+group/action/question contract authority. Migration from version 19 clears
+in-flight drafts that cannot prove those bindings. A current-version
+checkpoint whose contract authority has changed invalidates the draft
+fail-closed instead of attempting to execute it under the new registry.
+Version 21 adds atom-level semantic evidence, opaque secret references, signed
+question scheduling fields, and atomic finalization receipts; incompatible
+version 20 in-flight finalizations are quarantined as complete transactions.
+Version 22 adds the durable-state secret-binding registry. Version 23 makes
+input sensitivity part of the signed question/group contract, separates
+deterministic semantic hashes from salted memory-hard secret verifiers, and
+commits process-local registry mutations with the Product Head transaction.
+An exact sensitive scalar is projected as one opaque reference before the LLM
+or checkpoint boundary. For compound input, deterministic typed candidates
+such as endpoint URLs and explicitly structured credentials are projected
+individually so sibling demands remain available to semantic planning.
+Declared numbered/Y-N options remain ordinary contract values.
+Checkpoints and durable preparation/execution plans persist only references
+and verifiers. Raw values are materialized only at the job-local execution
+boundary; job directories are owner-only (`0700`) and secret-capable files are
+owner read/write (`0600`). Runtime close uses a cached ownership index and is
+observable, idempotent, and retryable. A version 21 checkpoint containing raw
+credentials or secret references, and a version 22 checkpoint containing old
+secret bindings or references, is quarantined rather than guessed or resumed.
+Missing current-version material installs a signed question-contract-v6
+re-entry request before any dependent action can run.
+Older state is quarantined for explicit reconfirmation.
 
 ## Main Modules
 
 - `harness/graph.py`: the single LangGraph runtime and checkpoint wiring,
   including distinct `partition`, `compile_owner`, `review_plan`, `admit`,
   owner, commit, side-effect, fallback, composition, and validation nodes.
-- `harness/coordinator.py`: graph-node transitions and the sole typed commit
-  boundary; it does not interpret natural language or own terminal/domain
-  business rules.
-- `harness/hierarchical_planner.py`: the sole semantic-planning entry; Stage A
+- `harness/coordinator.py`: graph-node transitions, the sole semantic-routing
+  authority, and the sole typed commit boundary. It chooses exact
+  deterministic handling, finite-catalog bounded mapping, or general planning
+  without owning terminal/domain business rules.
+- `harness/hierarchical_planner.py`: the sole general semantic planner; Stage A
   partitions the complete turn and Stage B compiles actions through
   owner-scoped schemas before whole-plan admission.
+- `harness/bounded_semantic_lane.py`: the finite-catalog, source-anchored
+  semantic mapper. It has no general routing, state-mutation, or commit
+  authority.
+- `harness/semantic_drafts.py`: the sole pure authority for non-admitted draft
+  construction, content identities, lifecycle transitions, stale detection,
+  validation, and finalization receipts.
 - `harness/admission.py`: action validation, conflicts, prerequisites, and
   semantic-coverage reconciliation.
 - `harness/queue.py`: dependency-safe durable action ordering and pending
@@ -340,7 +386,8 @@ Detached benchmark jobs write:
 ```
 
 `runtime.env` is the per-job final configuration artifact. Users should not edit
-it by hand.
+it by hand. The job directory is mode `0700`; `runtime.env`, `plan.json`,
+`job.json`, and job-local logs are mode `0600`.
 
 ## Verification
 

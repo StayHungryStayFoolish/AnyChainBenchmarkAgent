@@ -8,6 +8,7 @@ not execute the CLI, choose future response-driven turns, or claim outcomes.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import inspect
 import json
@@ -38,6 +39,7 @@ from tests.agent_live.chaos_scheduler import (
 )
 from tests.agent_live.codex_simulator_bridge import validate_simulator_attestation
 from tests.agent_live.completed_journey_batch import (
+    CompletedJourneySource,
     G3_ARTIFACT_TYPE,
     convert_completed_journey_batch,
 )
@@ -874,6 +876,7 @@ def build_product_obligation_evidence_artifact(
     revision: Mapping[str, str],
     execution: Mapping[str, Any],
     artifact_paths: Mapping[str, str | Path],
+    artifact_display_paths: Mapping[str, str | Path] | None = None,
 ) -> dict[str, Any]:
     """Run the authoritative evaluator and adapt its results to admission."""
 
@@ -894,6 +897,7 @@ def build_product_obligation_evidence_artifact(
         target=target,
         revision=active_revision,
         execution=execution_payload,
+        artifact_display_paths=artifact_display_paths,
     )
     artifact_hashes = [item["sha256"] for item in artifacts]
     expected_ids = _expected_verifier_ids(obligation)
@@ -1452,7 +1456,42 @@ def convert_completed_retained_journey_to_product_evidence(
     obligation: Mapping[str, Any],
     target: Mapping[str, Any],
     revision: Mapping[str, str],
+    source: CompletedJourneySource,
+    evidence_path: str | Path,
+    provider: str | None = None,
+    model: str | None = None,
+) -> Path:
+    """Convert only a controller-admitted completed-batch source."""
+
+    obligation_id = str(obligation.get("obligation_id") or "")
+    source.require_authority(obligation_id=obligation_id)
+    with tempfile.TemporaryDirectory(
+        prefix="anychain-completed-retained-"
+    ) as temporary:
+        snapshot_root = source.materialize_runtime(Path(temporary))
+        return _convert_retained_journey_runtime_to_product_evidence(
+            obligation=obligation,
+            target=target,
+            revision=revision,
+            runtime_root=snapshot_root,
+            source_runtime_root=source.runtime_root,
+            controller_candidate=(
+                source.controller_snapshot.candidate_payload()
+            ),
+            evidence_path=evidence_path,
+            provider=provider,
+            model=model,
+        )
+
+
+def _convert_retained_journey_runtime_to_product_evidence(
+    *,
+    obligation: Mapping[str, Any],
+    target: Mapping[str, Any],
+    revision: Mapping[str, str],
     runtime_root: str | Path,
+    source_runtime_root: str | Path | None = None,
+    controller_candidate: Mapping[str, Any] | None = None,
     evidence_path: str | Path,
     provider: str | None = None,
     model: str | None = None,
@@ -1469,6 +1508,7 @@ def convert_completed_retained_journey_to_product_evidence(
             "G3 Journey evidence requires an explicit DeepSeek provider/model"
         )
     root = Path(runtime_root).resolve()
+    artifact_root = Path(source_runtime_root or root).resolve()
     result = _load_mapping(root / "journey-result.json", "Journey result")
     schedule_payload = _load_mapping(
         root / "journey-schedule.json",
@@ -1481,12 +1521,20 @@ def convert_completed_retained_journey_to_product_evidence(
     )
     if schedule_payload != journey_schedule_payload(expected_schedule):
         raise ValueError("completed Journey schedule does not match G3")
-    evidence_source = _resolve_runtime_artifact(
-        root,
-        str(result.get("evidence_path") or ""),
-        label="Journey evidence",
+    evidence_source = (
+        root / "journey-controller-admission" / "candidate.json"
+        if controller_candidate is not None
+        else _resolve_runtime_artifact(
+            root,
+            str(result.get("evidence_path") or ""),
+            label="Journey evidence",
+        )
     )
-    source_evidence = _load_mapping(evidence_source, "Journey evidence")
+    source_evidence = (
+        dict(controller_candidate)
+        if controller_candidate is not None
+        else _load_mapping(evidence_source, "Journey evidence")
+    )
     validate_journey_evidence_artifact(
         source_evidence,
         schedule=expected_schedule,
@@ -1521,6 +1569,7 @@ def convert_completed_retained_journey_to_product_evidence(
             root,
             str(reference.get("path") or ""),
             label=f"retained G3 {role}",
+            source_root=artifact_root,
         )
         if hashlib.sha256(path.read_bytes()).hexdigest() != reference.get(
             "sha256"
@@ -1544,6 +1593,10 @@ def convert_completed_retained_journey_to_product_evidence(
         for turn in turns
         if isinstance(turn, Mapping)
     )
+    display_paths = {
+        role: artifact_root / path.relative_to(root)
+        for role, path in artifact_paths.items()
+    }
     payload = build_product_obligation_evidence_artifact(
         obligation=obligation,
         target=target,
@@ -1558,6 +1611,7 @@ def convert_completed_retained_journey_to_product_evidence(
             "finished_at": str(finished_at),
         },
         artifact_paths=artifact_paths,
+        artifact_display_paths=display_paths,
     )
     return _write_json_once(Path(evidence_path).resolve(), payload)
 
@@ -2029,6 +2083,7 @@ def _reconstruct_verifier_context(
     target: Mapping[str, Any],
     revision: Mapping[str, str],
     execution: Mapping[str, str],
+    artifact_display_paths: Mapping[str, str | Path] | None = None,
 ) -> tuple[list[dict[str, str]], JourneyVerifierContext]:
     variant = str(target.get("variant") or "")
     required_roles = (
@@ -2085,7 +2140,9 @@ def _reconstruct_verifier_context(
         payloads[role] = payload
         references.append({
             "role": role,
-            "path": str(path),
+            "path": str(Path(
+                (artifact_display_paths or {}).get(role, path)
+            ).expanduser().resolve()),
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         })
     if variant == "exact":
@@ -2098,7 +2155,12 @@ def _reconstruct_verifier_context(
             )
         references.append({
             "role": "process_guard_receipt",
-            "path": str(process_path),
+            "path": str(Path(
+                (artifact_display_paths or {}).get(
+                    "process_guard_receipt",
+                    process_path,
+                )
+            ).expanduser().resolve()),
             "sha256": hashlib.sha256(process_path.read_bytes()).hexdigest(),
         })
     transcript_rows = payloads["transcript"].get("turns")
@@ -2619,13 +2681,28 @@ def _reject_future_turns(value: Any) -> None:
             _reject_future_turns(nested)
 
 
-def _resolve_runtime_artifact(root: Path, raw_path: str, *, label: str) -> Path:
+def _resolve_runtime_artifact(
+    root: Path,
+    raw_path: str,
+    *,
+    label: str,
+    source_root: Path | None = None,
+) -> Path:
     declared = Path(raw_path).expanduser()
-    candidates = (
-        declared,
+    translated = None
+    if source_root is not None and declared.is_absolute():
+        try:
+            translated = root / declared.resolve().relative_to(
+                source_root.resolve()
+            )
+        except ValueError as exc:
+            raise ValueError(f"{label} is outside its runtime root") from exc
+    candidates = tuple(path for path in (
+        translated,
+        declared if source_root is None else None,
         root / "evidence" / declared.name,
         root / "retained-artifacts" / declared.name,
-    )
+    ) if path is not None)
     matches = tuple(
         path.resolve()
         for path in candidates
@@ -2727,6 +2804,9 @@ def _parser() -> argparse.ArgumentParser:
     batch.add_argument("--targets-dir", required=True, type=Path)
     batch.add_argument("--output", required=True, type=Path)
     batch.add_argument("--runtime-base", required=True, type=Path)
+    batch.add_argument("--broker-root", type=Path)
+    batch.add_argument("--result-index", type=Path)
+    batch.add_argument("--decision-timeout-seconds", type=float, default=120.0)
     batch.add_argument("--max-concurrency", type=int)
     batch.add_argument(
         "--worker-runtime",
@@ -2734,20 +2814,12 @@ def _parser() -> argparse.ArgumentParser:
         default="linux",
     )
 
-    evidence = commands.add_parser("evidence")
-    evidence.add_argument("--repo-root", required=True, type=Path)
-    evidence.add_argument("--provider", required=True, type=Path)
-    evidence.add_argument("--obligation-id", required=True)
-    evidence.add_argument("--runtime-root", required=True, type=Path)
-    evidence.add_argument("--output", required=True, type=Path)
-    evidence.add_argument("--provider-name")
-    evidence.add_argument("--model")
-
     evidence_batch = commands.add_parser("evidence-batch")
     evidence_batch.add_argument("--repo-root", required=True, type=Path)
     evidence_batch.add_argument("--provider", required=True, type=Path)
     evidence_batch.add_argument("--manifest", required=True, type=Path)
     evidence_batch.add_argument("--result-index", required=True, type=Path)
+    evidence_batch.add_argument("--authority-trust-root-id", required=True)
     evidence_batch.add_argument("--output-dir", required=True, type=Path)
     evidence_batch.add_argument("--provider-name")
     evidence_batch.add_argument("--model")
@@ -2807,7 +2879,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
     if args.command == "batch":
-        freeze_retained_regression_open_batch(
+        manifest = freeze_retained_regression_open_batch(
             repo_root=args.repo_root,
             provider=provider,
             targets_dir=args.targets_dir,
@@ -2816,6 +2888,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_concurrency=args.max_concurrency,
             worker_runtime=args.worker_runtime,
         )
+        print(json.dumps({
+            "manifest_id": manifest.manifest_id,
+            "authority_trust_root_id": manifest.pty_authority_trust_root_id,
+        }, sort_keys=True))
+        if bool(args.broker_root) != bool(args.result_index):
+            raise ValueError(
+                "--broker-root and --result-index must be supplied together"
+            )
+        if args.broker_root and args.result_index:
+            from tests.agent_live.filesystem_decision_broker import (
+                FilesystemDecisionBroker,
+                _run_with_signal_cleanup,
+            )
+
+            broker = FilesystemDecisionBroker(
+                args.broker_root,
+                batch_id=manifest.batch_id,
+                timeout_seconds=args.decision_timeout_seconds,
+            )
+            asyncio.run(_run_with_signal_cleanup(
+                manifest,
+                broker=broker,
+                result_index_path=args.result_index,
+                authority_signer=manifest._authority_signer,
+            ))
         return 0
 
     if args.command == "evidence-batch":
@@ -2829,7 +2926,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         def convert_one(
             obligation: Mapping[str, Any],
-            runtime_root: Path,
+            source: CompletedJourneySource,
             evidence_path: Path,
             _checkpoint_diff: Path | None,
         ) -> Path:
@@ -2837,7 +2934,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 obligation=obligation,
                 target=target_index[str(obligation["obligation_id"])],
                 revision=revision,
-                runtime_root=runtime_root,
+                source=source,
                 evidence_path=evidence_path,
                 provider=evidence_provider,
                 model=evidence_model,
@@ -2851,36 +2948,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             revision=revision,
             artifact_type=G3_ARTIFACT_TYPE,
             round_id="",
+            expected_authority_trust_root_id=args.authority_trust_root_id,
             convert_one=convert_one,
         )
         return 0
 
-    obligation_index = {
-        str(row["obligation_id"]): dict(row)
-        for row in obligations
-    }
-    target_index = {
-        str(row["obligation_id"]): dict(row)
-        for row in provider["targets"]
-    }
-    obligation = obligation_index.get(args.obligation_id)
-    target = target_index.get(args.obligation_id)
-    if (
-        obligation is None
-        or target is None
-        or obligation.get("variant") == "exact"
-    ):
-        raise ValueError(f"unknown open G3 obligation: {args.obligation_id}")
-    convert_completed_retained_journey_to_product_evidence(
-        obligation=obligation,
-        target=target,
-        revision=revision,
-        runtime_root=args.runtime_root,
-        evidence_path=args.output,
-        provider=evidence_provider,
-        model=evidence_model,
-    )
-    return 0
+    raise ValueError(f"unsupported retained-regression command: {args.command}")
 
 
 if __name__ == "__main__":

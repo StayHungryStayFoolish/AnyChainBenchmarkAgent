@@ -22,6 +22,7 @@ from tests.agent_live.product_chaos_factors import (
     ProductCoveringArrayResult,
     build_product_factor_model,
     build_state_control_factor_model,
+    factor_row_group_applicable,
     generate_product_covering_array,
 )
 from tests.agent_live.runtime_checkpoint import reviewed_scenario
@@ -160,6 +161,11 @@ def validate_product_chaos_obligations(
             raise ValueError(f"unknown product Chaos source row: {source_key}")
         if model != expected_row["model"] or dict(row.get("factors") or {}) != expected_row["factors"]:
             raise ValueError(f"product Chaos source row drifted: {obligation_id}")
+        if not factor_row_group_applicable(dict(row.get("factors") or {})):
+            raise ValueError(
+                "product Chaos row targets a group outside its product path: "
+                f"{obligation_id}"
+            )
         row_seed = _row_seed(PRODUCT_CHAOS_SEED, model_id, source_row_id)
         if row.get("seed") != row_seed:
             raise ValueError(f"product Chaos seed drifted: {obligation_id}")
@@ -386,7 +392,7 @@ def _start_scenario_for(factors: Mapping[str, str]) -> str:
 
 
 def _required_postconditions(factors: Mapping[str, str]) -> tuple[str, ...]:
-    required = ["committed_state"]
+    required = ["committed_state", "subject_group_path_coherent"]
     if factors.get("pending_state") in {"manual", "choice"}:
         required.append("pending_advanced")
     if factors.get("recovery") in {"back", "jump"}:

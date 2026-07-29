@@ -237,19 +237,43 @@ def critical_sequence_denominator_report(
 
 
 def observed_coverage_turn_from_artifact(
-    artifact: Mapping[str, Any],
     *,
+    bundle_path: str | Path,
+    artifact_id: str,
     edge: Mapping[str, Any],
     revision: Mapping[str, str],
+    trusted_public_key_b64: str,
 ) -> ObservedCoverageTurn:
-    """Create sequence input only from a validated PTY TurnObservation artifact."""
+    """Create sequence input only from a validated shard-bundle member."""
 
-    from tests.agent_live.coverage_evidence import validate_pty_cli_evidence_artifact
+    from tests.agent_live.coverage_evidence import (
+        load_validated_pty_artifact_bundle,
+        validate_pty_cli_evidence_artifact,
+    )
 
+    try:
+        items, _digest = load_validated_pty_artifact_bundle(
+            bundle_path,
+            trusted_public_key_b64=trusted_public_key_b64,
+        )
+    except ValueError as exc:
+        reason = str(exc)
+        raise ValueError(f"invalid PTY shard bundle: {reason}")
+    matches = [
+        item
+        for item in items
+        if str(item["artifact"].get("evidence_id") or "") == artifact_id
+    ]
+    if len(matches) != 1:
+        raise ValueError("PTY observation is not a unique shard-bundle member")
+    item = matches[0]
+    artifact = item["artifact"]
     valid, reason = validate_pty_cli_evidence_artifact(
         artifact,
         edge=edge,
         revision=revision,
+        authority=item["authority"],
+        trusted_public_key_b64=trusted_public_key_b64,
     )
     if not valid:
         raise ValueError(f"invalid PTY observation artifact: {reason}")

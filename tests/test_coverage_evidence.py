@@ -8,6 +8,8 @@ import struct
 import tempfile
 import unittest
 import zlib
+from copy import deepcopy
+from functools import wraps
 from pathlib import Path
 from unittest.mock import patch
 
@@ -555,6 +557,29 @@ class CoverageEvidenceTest(unittest.TestCase):
         valid, reason = validate_evidence_artifact(self._artifact(), edge=self.edge, revision=self.revision)
         self.assertTrue(valid, reason)
 
+    def test_rehashed_source_boundary_forgery_is_rejected(self) -> None:
+        artifact = self._artifact()
+        forged = "f" * 64
+        artifact["source_input_hash"] = forged
+        artifact["source_boundary_hashes"]["input_hash"] = forged
+        for event in artifact["event_trace"]:
+            details = event.get("details") or {}
+            if "input_hash" in details:
+                details["input_hash"] = forged
+        artifact["event_trace_hash"] = content_hash(artifact["event_trace"])
+        artifact.pop("artifact_hash", None)
+        artifact.pop("evidence_id", None)
+        artifact["evidence_id"] = content_hash(artifact)
+        artifact["artifact_hash"] = content_hash(artifact)
+
+        valid, reason = validate_evidence_artifact(
+            artifact,
+            edge=self.edge,
+            revision=self.revision,
+        )
+        self.assertFalse(valid)
+        self.assertIn("source input hash", reason)
+
     def test_deterministic_artifact_redacts_nested_state_before_hashing(self) -> None:
         secret = "abcdefghijklmnopqrstuvwxyz123456"
         seed = new_state("coverage-secret", language="en", session_purpose="coverage")
@@ -576,12 +601,19 @@ class CoverageEvidenceTest(unittest.TestCase):
         }
         from tests.agent_live.graph_turn import reviewed_execution_planner
 
+        @wraps(invoke_product_graph_turn)
+        def invoke_without_artifact_only_secret(payload):
+            safe = deepcopy(dict(payload))
+            safe["confirmed_config"].pop("LOCAL_RPC_URL", None)
+            safe.pop("runtime_secret", None)
+            return invoke_product_graph_turn(safe)
+
         with capture_coverage_events() as captured, reviewed_execution_planner(
             expected_input="n2-standard-16",
             expected_admitted=True,
         ):
             observation = observe_compiled_graph_turn(
-                invoke_product_graph_turn,
+                invoke_without_artifact_only_secret,
                 before,
                 edge_key=self.edge["edge_key"],
                 input_value="n2-standard-16",

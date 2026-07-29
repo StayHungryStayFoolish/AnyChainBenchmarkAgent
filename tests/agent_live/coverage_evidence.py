@@ -3,19 +3,33 @@
 from __future__ import annotations
 
 import csv
+import base64
+import ctypes
+import errno
+import fcntl
 import hashlib
 import json
 import os
 import re
+import shutil
 import struct
 import time
 import urllib.parse
 import zlib
+from collections.abc import Iterator
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 
 from tests.agent_live.coverage_events import state_diff_between
 from agent.harness.runtime_identity import repository_revision
@@ -25,6 +39,7 @@ from agent.runners.artifact_ownership import (
     required_artifact_owner,
     validate_owned_artifact_path,
 )
+
 from agent.harness.control_receipts import (
     validate_persisted_domain_control_receipt,
 )
@@ -35,6 +50,10 @@ from agent.runners.execution_scenarios import (
 )
 from agent.runners.plan_projection import validate_execution_plan_projection
 from agent.runners.runtime_env_projection import validate_runtime_env_projection
+from agent.harness.secret_refs import (
+    redact_secret_references,
+    secret_references_in_value,
+)
 from agent.utils.redaction import redact
 from tests.agent_live.real_execution_host_attestation import (
     validate_host_attestation_file,
@@ -47,13 +66,35 @@ ARTIFACT_SCHEMA_VERSION = 4
 CLI_ARTIFACT_SCHEMA_VERSION = 6
 REAL_EXECUTION_ARTIFACT_SCHEMA_VERSION = 4
 TURN_OBSERVATION_SCHEMA_VERSION = 2
-PTY_DIAGNOSTIC_SCHEMA_VERSION = 1
+PTY_DIAGNOSTIC_SCHEMA_VERSION = 2
+PTY_AUTHORITY_SCHEMA_VERSION = 2
+PTY_ARTIFACT_BUNDLE_SCHEMA_VERSION = 1
+SENSITIVE_INPUT_MARKER = "***SENSITIVE_INPUT***"
 PTY_DIAGNOSTIC_STATUSES = {
     "failed_attempt": frozenset({
         "verification_pending", "verification_error", "postcondition_failed",
     }),
     "interruption": frozenset({"interrupted"}),
 }
+
+
+@dataclass(frozen=True)
+class _PtyBundleAuthorityView(Mapping[str, Any]):
+    """Authority receipt proven to be a member of one committed shard bundle."""
+
+    receipt: Mapping[str, Any]
+    bundle_digest: str
+    artifact_id: str
+    artifact_hash: str
+
+    def __getitem__(self, key: str) -> Any:
+        return self.receipt[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.receipt)
+
+    def __len__(self) -> int:
+        return len(self.receipt)
 
 
 @dataclass(frozen=True)
@@ -268,6 +309,7 @@ class PtyDiagnosticRecord:
     session_id: str
     reason: str
     last_complete_response: str
+    input_baseline_event: RuntimeTurnEvent
     last_complete_event: RuntimeTurnEvent
     completed_turn: PtyCliTurnRecord | None = None
     dynamic_selection: DynamicTurnSelection | None = None
@@ -287,6 +329,1278 @@ def canonical_json(value: Any) -> str:
 
 def content_hash(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _pty_authority_event_bindings(
+    artifact: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    if artifact.get("artifact_type") == "pty_cli_turn":
+        observation = artifact.get("turn_observation") or {}
+        events = (
+            observation.get("runtime_events") or ()
+            if isinstance(observation, Mapping)
+            else ()
+        )
+    elif artifact.get("artifact_type") == "pty_diagnostic":
+        boundary = artifact.get("last_complete_boundary") or {}
+        events = (
+            (
+                boundary.get("input_baseline_event"),
+                boundary.get("runtime_event"),
+            )
+            if isinstance(boundary, Mapping)
+            else ()
+        )
+    else:
+        raise ValueError("PTY authority requires a CLI or diagnostic artifact")
+    bindings = []
+    for event in events:
+        if not isinstance(event, Mapping):
+            raise ValueError("PTY authority source has an invalid runtime event")
+        bindings.append({
+            "runtime_event_id": str(event.get("runtime_event_id") or ""),
+            "runtime_event_payload_hash": str(
+                event.get("runtime_event_payload_hash") or ""
+            ),
+            "terminal_event_id": str(event.get("terminal_event_id") or ""),
+            "turn_index": int(event.get("turn_index") or 0),
+            "before_fingerprint": str(event.get("before_fingerprint") or ""),
+            "after_fingerprint": str(event.get("after_fingerprint") or ""),
+        })
+    return bindings
+
+
+@dataclass(frozen=True)
+class PtyAuthoritySigner:
+    """Controller-held signer. Never serialize or pass this object to a worker."""
+
+    private_key: Ed25519PrivateKey
+    public_key_b64: str
+    trust_root_id: str
+
+
+def create_pty_authority_signer() -> PtyAuthoritySigner:
+    private_key = Ed25519PrivateKey.generate()
+    public_bytes = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    public_key_b64 = base64.b64encode(public_bytes).decode("ascii")
+    return PtyAuthoritySigner(
+        private_key=private_key,
+        public_key_b64=public_key_b64,
+        trust_root_id=content_hash({"ed25519_public_key": public_key_b64}),
+    )
+
+
+def export_pty_authority_private_key(
+    signer: PtyAuthoritySigner,
+) -> bytes:
+    """Serialize a signer only for an inherited controller-only pipe."""
+
+    return signer.private_key.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+
+def import_pty_authority_private_key(
+    private_bytes: bytes,
+    *,
+    expected_public_key_b64: str,
+) -> PtyAuthoritySigner:
+    """Rebuild a signer from controller-private bytes received over a pipe."""
+
+    private_key = Ed25519PrivateKey.from_private_bytes(private_bytes)
+    public_key_b64 = base64.b64encode(
+        private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+    ).decode("ascii")
+    if public_key_b64 != expected_public_key_b64:
+        raise ValueError("controller private key differs from frozen trust root")
+    return PtyAuthoritySigner(
+        private_key=private_key,
+        public_key_b64=public_key_b64,
+        trust_root_id=content_hash({"ed25519_public_key": public_key_b64}),
+    )
+
+
+def sign_controller_payload(
+    signer: PtyAuthoritySigner,
+    payload: Mapping[str, Any],
+) -> str:
+    return base64.b64encode(
+        signer.private_key.sign(canonical_json(payload).encode("utf-8"))
+    ).decode("ascii")
+
+
+def verify_controller_payload_signature(
+    payload: Mapping[str, Any],
+    *,
+    signature_b64: str,
+    trusted_public_key_b64: str,
+) -> bool:
+    try:
+        public_key = Ed25519PublicKey.from_public_bytes(
+            base64.b64decode(trusted_public_key_b64, validate=True)
+        )
+        public_key.verify(
+            base64.b64decode(signature_b64, validate=True),
+            canonical_json(payload).encode("utf-8"),
+        )
+    except (InvalidSignature, TypeError, ValueError):
+        return False
+    return True
+
+
+def _pty_authority_unsigned_payload(
+    artifact: Mapping[str, Any],
+    *,
+    trust_root_id: str,
+    controller_context: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    artifact_type = str(artifact.get("artifact_type") or "")
+    identity_field = (
+        "evidence_id"
+        if artifact_type == "pty_cli_turn"
+        else "diagnostic_id"
+    )
+    body = {
+        "schema_version": PTY_AUTHORITY_SCHEMA_VERSION,
+        "signature_algorithm": "ed25519",
+        "trust_root_id": str(trust_root_id),
+        "artifact_type": artifact_type,
+        "artifact_id": str(artifact.get(identity_field) or ""),
+        "artifact_hash": str(artifact.get("artifact_hash") or ""),
+        "target_edge_key": str(artifact.get("edge_key") or artifact.get(
+            "target_edge_key"
+        ) or ""),
+        "revision": dict(artifact.get("revision") or {}),
+        "runtime_event_bindings": _pty_authority_event_bindings(artifact),
+        "controller_context": dict(controller_context or {}),
+    }
+    if (
+        not body["artifact_id"]
+        or not body["artifact_hash"]
+        or not body["target_edge_key"]
+        or not body["runtime_event_bindings"]
+        or not body["trust_root_id"]
+    ):
+        raise ValueError("PTY authority identity is incomplete")
+    return body
+
+
+def build_pty_authority_receipt(
+    artifact: Mapping[str, Any],
+    *,
+    signer: PtyAuthoritySigner,
+    controller_context: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Sign an already validated candidate from the controller boundary."""
+
+    body = _pty_authority_unsigned_payload(
+        artifact,
+        trust_root_id=signer.trust_root_id,
+        controller_context=controller_context,
+    )
+    signature = signer.private_key.sign(canonical_json(body).encode("utf-8"))
+    receipt = {
+        **body,
+        "signature": base64.b64encode(signature).decode("ascii"),
+    }
+    receipt["authority_hash"] = content_hash(receipt)
+    return receipt
+
+
+def validate_pty_authority_receipt(
+    artifact: Mapping[str, Any],
+    authority: Mapping[str, Any],
+    *,
+    trusted_public_key_b64: str,
+    expected_controller_context: Mapping[str, Any] | None = None,
+) -> tuple[bool, str]:
+    """Validate a receipt signature without granting shard qualification."""
+
+    raw = dict(authority)
+    observed_hash = str(raw.pop("authority_hash", "") or "")
+    signature_b64 = str(raw.pop("signature", "") or "")
+    if (
+        authority.get("schema_version") != PTY_AUTHORITY_SCHEMA_VERSION
+        or content_hash({**raw, "signature": signature_b64}) != observed_hash
+    ):
+        return False, "PTY authority receipt hash is invalid"
+    try:
+        expected = _pty_authority_unsigned_payload(
+            artifact,
+            trust_root_id=content_hash({
+                "ed25519_public_key": trusted_public_key_b64,
+            }),
+            controller_context=expected_controller_context,
+        )
+        if raw != expected:
+            return False, "PTY artifact differs from its signed authority receipt"
+        public_key = Ed25519PublicKey.from_public_bytes(
+            base64.b64decode(trusted_public_key_b64, validate=True)
+        )
+        public_key.verify(
+            base64.b64decode(signature_b64, validate=True),
+            canonical_json(raw).encode("utf-8"),
+        )
+    except (InvalidSignature, TypeError, ValueError) as exc:
+        return False, f"PTY authority source is invalid: {exc}"
+    return True, ""
+
+
+def _pty_authority_path(artifact_path: Path) -> Path:
+    return artifact_path.with_suffix(".admitted") / "authority.json"
+
+
+def _pty_pair_commit_path(artifact_path: Path) -> Path:
+    return artifact_path.with_suffix(".admitted") / "COMMIT.json"
+
+
+def _pty_admitted_artifact_path(artifact_path: Path) -> Path:
+    return artifact_path.with_suffix(".admitted") / "artifact.json"
+
+
+def _rename_directory_noreplace(source: Path, destination: Path) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise RuntimeError("atomic PTY admission requires renameat2")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    if renameat2(
+        -100,
+        os.fsencode(source),
+        -100,
+        os.fsencode(destination),
+        1,
+    ) != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(
+                f"PTY admission bundle already exists: {destination}"
+            )
+        raise OSError(error, os.strerror(error), str(destination))
+
+
+def _load_pty_admitted_bundle(
+    artifact_path: str | Path,
+) -> tuple[dict[str, Any], dict[str, Any], str]:
+    candidate = Path(artifact_path)
+    bundle = candidate.with_suffix(".admitted")
+    artifact_file = _pty_admitted_artifact_path(candidate)
+    authority_file = _pty_authority_path(candidate)
+    commit_file = _pty_pair_commit_path(candidate)
+    if (
+        bundle.is_symlink()
+        or not bundle.is_dir()
+        or bundle.stat().st_mode & 0o222
+        or {entry.name for entry in bundle.iterdir()}
+        != {"artifact.json", "authority.json", "COMMIT.json"}
+    ):
+        raise ValueError("PTY artifact has no admitted bundle")
+    if any(
+        item.is_symlink()
+        or not item.is_file()
+        or item.stat().st_mode & 0o222
+        for item in (artifact_file, authority_file, commit_file)
+    ):
+        raise ValueError("PTY admitted bundle must be immutable")
+    try:
+        artifact_bytes = artifact_file.read_bytes()
+        authority_bytes = authority_file.read_bytes()
+        commit_bytes = commit_file.read_bytes()
+        artifact = json.loads(artifact_bytes)
+        authority = json.loads(authority_bytes)
+        commit = json.loads(commit_bytes)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("PTY admitted bundle is incomplete") from exc
+    if not all(isinstance(item, dict) for item in (artifact, authority, commit)):
+        raise ValueError("PTY admitted bundle contains a non-object")
+    expected_commit = {
+        "schema_version": 1,
+        "artifact_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+        "authority_sha256": hashlib.sha256(authority_bytes).hexdigest(),
+        "authority_hash": str(authority.get("authority_hash") or ""),
+    }
+    if commit != expected_commit:
+        raise ValueError("PTY admitted bundle commit marker is stale")
+    bundle_digest = content_hash({
+        **expected_commit,
+        "commit_sha256": hashlib.sha256(commit_bytes).hexdigest(),
+    })
+    return artifact, authority, bundle_digest
+
+
+def load_pty_authority_receipt(artifact_path: str | Path) -> dict[str, Any]:
+    _artifact, authority, _digest = _load_pty_admitted_bundle(artifact_path)
+    return authority
+
+
+def load_pty_admitted_artifact(artifact_path: str | Path) -> dict[str, Any]:
+    artifact, _authority, _digest = _load_pty_admitted_bundle(artifact_path)
+    return artifact
+
+
+def pty_admitted_bundle_digest(artifact_path: str | Path) -> str:
+    _artifact, _authority, digest = _load_pty_admitted_bundle(artifact_path)
+    return digest
+
+
+def _pty_staging_paths(artifact_path: Path) -> tuple[Path, ...]:
+    return tuple(
+        artifact_path.parent.glob(f"{artifact_path.stem}.admitted.tmp.*")
+    )
+
+
+def _remove_pty_directory(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        for root, directories, files in os.walk(path, followlinks=False):
+            root_path = Path(root)
+            root_path.chmod(0o700)
+            for name in directories:
+                child = root_path / name
+                if not child.is_symlink():
+                    child.chmod(0o700)
+            for name in files:
+                child = root_path / name
+                if not child.is_symlink():
+                    child.chmod(0o600)
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def recover_pty_artifact_pair(
+    artifact_path: str | Path,
+    *,
+    expected_artifact: Mapping[str, Any] | None = None,
+    signer: PtyAuthoritySigner | None = None,
+    controller_context: Mapping[str, Any] | None = None,
+) -> Path | None:
+    """Remove abandoned staging and recognize one completed commit point."""
+
+    path = Path(artifact_path)
+    bundle_path = path.with_suffix(".admitted")
+    with _pty_artifact_bundle_lock(bundle_path):
+        return _recover_pty_artifact_pair_unlocked(
+            path,
+            expected_artifact=expected_artifact,
+            signer=signer,
+            controller_context=controller_context,
+        )
+
+
+def _recover_pty_artifact_pair_unlocked(
+    path: Path,
+    *,
+    expected_artifact: Mapping[str, Any] | None = None,
+    signer: PtyAuthoritySigner | None = None,
+    controller_context: Mapping[str, Any] | None = None,
+) -> Path | None:
+    for staging in _pty_staging_paths(path):
+        _remove_pty_directory(staging)
+    bundle_path = path.with_suffix(".admitted")
+    if not bundle_path.exists():
+        _fsync_directory(path.parent)
+        return None
+    artifact, authority, _digest = _load_pty_admitted_bundle(path)
+    if expected_artifact is not None and artifact != dict(expected_artifact):
+        raise FileExistsError(
+            f"PTY admission bundle belongs to another artifact: {bundle_path}"
+        )
+    if signer is not None:
+        valid, reason = validate_pty_authority_receipt(
+            artifact,
+            authority,
+            trusted_public_key_b64=signer.public_key_b64,
+            expected_controller_context=controller_context,
+        )
+        if not valid:
+            raise ValueError(
+                f"PTY admitted bundle has invalid controller authority: {reason}"
+            )
+    _fsync_directory(bundle_path)
+    _fsync_directory(bundle_path.parent)
+    return bundle_path
+
+
+def _write_pty_artifact_pair(
+    artifact: Mapping[str, Any],
+    artifact_path: Path,
+    *,
+    signer: PtyAuthoritySigner,
+    controller_context: Mapping[str, Any] | None = None,
+) -> Path:
+    """Publish an artifact and controller receipt as one recoverable pair."""
+
+    authority = build_pty_authority_receipt(
+        artifact,
+        signer=signer,
+        controller_context=controller_context,
+    )
+    bundle_path = artifact_path.with_suffix(".admitted")
+    staging = artifact_path.with_suffix(
+        f".admitted.tmp.{os.getpid()}.{time.time_ns()}"
+    )
+    artifact_bytes = (
+        json.dumps(dict(artifact), ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n"
+    ).encode("utf-8")
+    published = False
+    try:
+        staging.mkdir(mode=0o700)
+        admitted_artifact = staging / "artifact.json"
+        admitted_authority = staging / "authority.json"
+        admitted_commit = staging / "COMMIT.json"
+        admitted_artifact.write_bytes(artifact_bytes)
+        admitted_authority.write_text(
+            json.dumps(authority, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+        commit = {
+            "schema_version": 1,
+            "artifact_sha256": hashlib.sha256(
+                admitted_artifact.read_bytes()
+            ).hexdigest(),
+            "authority_sha256": hashlib.sha256(
+                admitted_authority.read_bytes()
+            ).hexdigest(),
+            "authority_hash": str(authority.get("authority_hash") or ""),
+        }
+        admitted_commit.write_text(
+            json.dumps(commit, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n",
+            encoding="utf-8",
+        )
+        for path in (admitted_artifact, admitted_authority, admitted_commit):
+            path.chmod(0o400)
+            with path.open("rb") as handle:
+                os.fsync(handle.fileno())
+        _fsync_directory(staging)
+        staging.chmod(0o500)
+        _rename_directory_noreplace(staging, bundle_path)
+        published = True
+        _fsync_directory(bundle_path)
+        _fsync_directory(bundle_path.parent)
+    except Exception:
+        if published:
+            raise RuntimeError(
+                "PTY artifact pair durability is uncertain; "
+                "retry reconciliation is required"
+            )
+        if staging.exists():
+            _remove_pty_directory(staging)
+            _fsync_directory(staging.parent)
+        raise
+    return bundle_path
+
+
+def admit_pty_artifact_pair(
+    artifact_path: str | Path,
+    *,
+    signer: PtyAuthoritySigner,
+    controller_context: Mapping[str, Any] | None = None,
+) -> Path:
+    path = Path(artifact_path)
+    artifact = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(artifact, dict):
+        raise ValueError("PTY artifact candidate is not an object")
+    with _pty_artifact_bundle_lock(path.with_suffix(".admitted")):
+        recovered = _recover_pty_artifact_pair_unlocked(
+            path,
+            expected_artifact=artifact,
+            signer=signer,
+            controller_context=controller_context,
+        )
+        if recovered is not None:
+            return recovered
+        return _write_pty_artifact_pair(
+            artifact,
+            path,
+            signer=signer,
+            controller_context=controller_context,
+        )
+
+
+def remove_pty_artifact_pair(artifact_path: str | Path) -> None:
+    path = Path(artifact_path)
+    path.with_suffix(".json.tmp").unlink(missing_ok=True)
+    rollback_pty_artifact_admission(path)
+    path.unlink(missing_ok=True)
+    _fsync_directory(path.parent)
+
+
+def rollback_pty_artifact_admission(artifact_path: str | Path) -> None:
+    """Remove publication state while preserving the unsigned candidate."""
+
+    path = Path(artifact_path)
+    bundle_path = path.with_suffix(".admitted")
+    with _pty_artifact_bundle_lock(bundle_path):
+        for staging in _pty_staging_paths(path):
+            _remove_pty_directory(staging)
+        _remove_pty_directory(bundle_path)
+        _fsync_directory(path.parent)
+
+
+def _json_file_bytes(value: Mapping[str, Any]) -> bytes:
+    return (
+        json.dumps(dict(value), ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n"
+    ).encode("utf-8")
+
+
+def _pty_artifact_bundle_staging_paths(bundle_path: Path) -> tuple[Path, ...]:
+    return tuple(bundle_path.parent.glob(f"{bundle_path.name}.tmp.*"))
+
+
+def _pty_artifact_bundle_recovery_marker(bundle_path: Path) -> Path:
+    return bundle_path.with_name(f".{bundle_path.name}.recovery-required")
+
+
+def _create_pty_artifact_bundle_recovery_marker(bundle_path: Path) -> Path:
+    """Persist the fail-closed gate before the publication commit point."""
+
+    marker = _pty_artifact_bundle_recovery_marker(bundle_path)
+    descriptor = os.open(
+        marker,
+        os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+        0o400,
+    )
+    try:
+        payload = _json_file_bytes({
+            "schema_version": 1,
+            "bundle_path": bundle_path.name,
+            "created_at_ns": time.time_ns(),
+        })
+        written = 0
+        while written < len(payload):
+            written += os.write(descriptor, payload[written:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    _fsync_directory(marker.parent)
+    return marker
+
+
+def _clear_pty_artifact_bundle_recovery_marker(bundle_path: Path) -> None:
+    """Durably move recovery state from required to clear.
+
+    Directory entry removal is not committed until its parent fsync succeeds.
+    If that commit fails, restore the required marker before reporting failure.
+    A failed restore is surfaced explicitly; it is never treated as a clear
+    state.
+    """
+
+    marker = _pty_artifact_bundle_recovery_marker(bundle_path)
+    if not marker.exists():
+        return
+    marker.unlink()
+    try:
+        _fsync_directory(marker.parent)
+    except Exception as clear_error:
+        try:
+            _create_pty_artifact_bundle_recovery_marker(bundle_path)
+        except Exception as restore_error:
+            raise RuntimeError(
+                "PTY artifact bundle recovery marker clear failed and "
+                "required-state restoration failed"
+            ) from restore_error
+        raise RuntimeError(
+            "PTY artifact bundle recovery marker clear was not durable; "
+            "recovery remains required"
+        ) from clear_error
+
+
+def _pty_artifact_bundle_item_name(
+    index: int,
+    artifact: Mapping[str, Any],
+) -> str:
+    artifact_id = str(
+        artifact.get("evidence_id") or artifact.get("diagnostic_id") or ""
+    )
+    if not _is_sha256(artifact_id):
+        raise ValueError("PTY bundle artifact identity is incomplete")
+    return f"{index:04d}-{artifact_id}"
+
+
+def _pty_artifact_bundle_unsigned_commit(
+    items: Iterable[Mapping[str, Any]],
+    *,
+    trust_root_id: str,
+    controller_context: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    item_list = [dict(item) for item in items]
+    if not item_list:
+        raise ValueError("PTY artifact bundle requires at least one item")
+    return {
+        "schema_version": PTY_ARTIFACT_BUNDLE_SCHEMA_VERSION,
+        "bundle_type": "pty_artifact_authority_shard",
+        "signature_algorithm": "ed25519",
+        "trust_root_id": trust_root_id,
+        "controller_context": dict(controller_context or {}),
+        "items": item_list,
+    }
+
+
+def _build_pty_artifact_bundle_commit(
+    items: Iterable[Mapping[str, Any]],
+    *,
+    signer: PtyAuthoritySigner,
+    controller_context: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    unsigned = _pty_artifact_bundle_unsigned_commit(
+        items,
+        trust_root_id=signer.trust_root_id,
+        controller_context=controller_context,
+    )
+    commit = {
+        **unsigned,
+        "signature": sign_controller_payload(signer, unsigned),
+    }
+    commit["commit_hash"] = content_hash(commit)
+    return commit
+
+
+def _validate_pty_artifact_bundle_commit(
+    commit: Mapping[str, Any],
+    *,
+    trusted_public_key_b64: str,
+    expected_controller_context: Mapping[str, Any] | None,
+) -> tuple[bool, str]:
+    raw = dict(commit)
+    observed_hash = str(raw.pop("commit_hash", "") or "")
+    signature = str(raw.pop("signature", "") or "")
+    if (
+        commit.get("schema_version") != PTY_ARTIFACT_BUNDLE_SCHEMA_VERSION
+        or content_hash({**raw, "signature": signature}) != observed_hash
+    ):
+        return False, "PTY artifact bundle commit hash is invalid"
+    expected_trust_root = content_hash({
+        "ed25519_public_key": trusted_public_key_b64,
+    })
+    if str(raw.get("trust_root_id") or "") != expected_trust_root:
+        return False, "PTY artifact bundle uses another trust root"
+    if dict(raw.get("controller_context") or {}) != dict(
+        expected_controller_context or {}
+    ):
+        return False, "PTY artifact bundle controller context differs"
+    if not verify_controller_payload_signature(
+        raw,
+        signature_b64=signature,
+        trusted_public_key_b64=trusted_public_key_b64,
+    ):
+        return False, "PTY artifact bundle commit signature is invalid"
+    return True, ""
+
+
+def _stage_pty_artifact_bundle_item(
+    items_path: Path,
+    *,
+    index: int,
+    artifact: Mapping[str, Any],
+    signer: PtyAuthoritySigner,
+    controller_context: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Write and sync one non-qualifying shard inside top-level staging."""
+
+    item_name = _pty_artifact_bundle_item_name(index, artifact)
+    item_path = items_path / item_name
+    item_path.mkdir(mode=0o700)
+    artifact_bytes = _json_file_bytes(artifact)
+    authority = build_pty_authority_receipt(
+        artifact,
+        signer=signer,
+        controller_context=controller_context,
+    )
+    authority_bytes = _json_file_bytes(authority)
+    artifact_path = item_path / "artifact.json"
+    authority_path = item_path / "authority.json"
+    commit_path = item_path / "COMMIT.json"
+    artifact_path.write_bytes(artifact_bytes)
+    authority_path.write_bytes(authority_bytes)
+    item_commit = {
+        "schema_version": 1,
+        "artifact_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+        "authority_sha256": hashlib.sha256(authority_bytes).hexdigest(),
+        "authority_hash": str(authority.get("authority_hash") or ""),
+    }
+    commit_bytes = _json_file_bytes(item_commit)
+    commit_path.write_bytes(commit_bytes)
+    for path in (artifact_path, authority_path, commit_path):
+        path.chmod(0o400)
+        with path.open("rb") as handle:
+            os.fsync(handle.fileno())
+    _fsync_directory(item_path)
+    item_path.chmod(0o500)
+    _fsync_directory(item_path)
+    _fsync_directory(items_path)
+    return {
+        "index": index,
+        "item_name": item_name,
+        "artifact_id": str(
+            artifact.get("evidence_id") or artifact.get("diagnostic_id") or ""
+        ),
+        "artifact_hash": str(artifact.get("artifact_hash") or ""),
+        "authority_hash": str(authority.get("authority_hash") or ""),
+        "item_commit_sha256": hashlib.sha256(commit_bytes).hexdigest(),
+    }
+
+
+def _read_pty_artifact_bundle(
+    bundle_path: Path,
+    *,
+    allow_recovery_marker: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
+    if (
+        not allow_recovery_marker
+        and _pty_artifact_bundle_recovery_marker(bundle_path).exists()
+    ):
+        raise ValueError(
+            "PTY artifact bundle requires durability reconciliation"
+        )
+    if bundle_path.is_symlink() or not bundle_path.is_dir():
+        raise ValueError("PTY artifact bundle is not committed")
+    if bundle_path.stat().st_mode & 0o222:
+        raise ValueError("PTY artifact bundle must be immutable")
+    root_names = {entry.name for entry in bundle_path.iterdir()}
+    if root_names != {"items", "COMMIT.json"}:
+        raise ValueError("PTY artifact bundle root layout is invalid")
+    items_path = bundle_path / "items"
+    commit_path = bundle_path / "COMMIT.json"
+    if (
+        items_path.is_symlink()
+        or not items_path.is_dir()
+        or commit_path.is_symlink()
+        or items_path.stat().st_mode & 0o222
+        or commit_path.stat().st_mode & 0o222
+    ):
+        raise ValueError("PTY artifact bundle contains an invalid path")
+    try:
+        commit_bytes = commit_path.read_bytes()
+        commit = json.loads(commit_bytes)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("PTY artifact bundle commit is incomplete") from exc
+    if not isinstance(commit, dict) or not isinstance(commit.get("items"), list):
+        raise ValueError("PTY artifact bundle commit is invalid")
+    declared_items = commit["items"]
+    declared_names = [
+        str(item.get("item_name") or "")
+        for item in declared_items
+        if isinstance(item, Mapping)
+    ]
+    observed_names = sorted(entry.name for entry in items_path.iterdir())
+    if (
+        len(declared_names) != len(declared_items)
+        or declared_names != observed_names
+        or len(set(declared_names)) != len(declared_names)
+    ):
+        raise ValueError("PTY artifact bundle membership differs from its commit")
+    loaded_items: list[dict[str, Any]] = []
+    for expected_index, (item_manifest, item_name) in enumerate(
+        zip(declared_items, declared_names, strict=True)
+    ):
+        item_path = items_path / item_name
+        if (
+            not isinstance(item_manifest, Mapping)
+            or item_manifest.get("index") != expected_index
+            or item_name != _pty_artifact_bundle_item_name(
+                expected_index,
+                {"evidence_id": item_manifest.get("artifact_id")},
+            )
+            or item_path.is_symlink()
+            or not item_path.is_dir()
+            or item_path.stat().st_mode & 0o222
+            or {entry.name for entry in item_path.iterdir()}
+            != {"artifact.json", "authority.json", "COMMIT.json"}
+        ):
+            raise ValueError("PTY artifact bundle item layout is invalid")
+        if any(
+            (item_path / name).stat().st_mode & 0o222
+            for name in ("artifact.json", "authority.json", "COMMIT.json")
+        ):
+            raise ValueError("PTY artifact bundle item must be immutable")
+        try:
+            artifact_bytes = (item_path / "artifact.json").read_bytes()
+            authority_bytes = (item_path / "authority.json").read_bytes()
+            item_commit_bytes = (item_path / "COMMIT.json").read_bytes()
+            artifact = json.loads(artifact_bytes)
+            authority = json.loads(authority_bytes)
+            item_commit = json.loads(item_commit_bytes)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("PTY artifact bundle item is incomplete") from exc
+        if not all(
+            isinstance(value, dict)
+            for value in (artifact, authority, item_commit)
+        ):
+            raise ValueError("PTY artifact bundle item contains a non-object")
+        expected_item_commit = {
+            "schema_version": 1,
+            "artifact_sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+            "authority_sha256": hashlib.sha256(authority_bytes).hexdigest(),
+            "authority_hash": str(authority.get("authority_hash") or ""),
+        }
+        expected_manifest = {
+            "index": expected_index,
+            "item_name": item_name,
+            "artifact_id": str(
+                artifact.get("evidence_id")
+                or artifact.get("diagnostic_id")
+                or ""
+            ),
+            "artifact_hash": str(artifact.get("artifact_hash") or ""),
+            "authority_hash": str(authority.get("authority_hash") or ""),
+            "item_commit_sha256": hashlib.sha256(
+                item_commit_bytes
+            ).hexdigest(),
+        }
+        if (
+            item_commit != expected_item_commit
+            or dict(item_manifest) != expected_manifest
+        ):
+            raise ValueError("PTY artifact bundle item commit is stale")
+        loaded_items.append({
+            "artifact": artifact,
+            "authority": authority,
+            "commit": item_commit,
+        })
+    digest = hashlib.sha256(commit_bytes).hexdigest()
+    for item in loaded_items:
+        artifact = item["artifact"]
+        item["authority"] = _PtyBundleAuthorityView(
+            receipt=deepcopy(item["authority"]),
+            bundle_digest=digest,
+            artifact_id=str(
+                artifact.get("evidence_id")
+                or artifact.get("diagnostic_id")
+                or ""
+            ),
+            artifact_hash=str(artifact.get("artifact_hash") or ""),
+        )
+    return loaded_items, commit, digest
+
+
+def load_pty_artifact_bundle(
+    bundle_path: str | Path,
+) -> tuple[list[dict[str, Any]], str]:
+    """Load structurally committed shards without granting qualification."""
+
+    items, _commit, digest = _read_pty_artifact_bundle(Path(bundle_path))
+    return items, digest
+
+
+def load_validated_pty_artifact_bundle(
+    bundle_path: str | Path,
+    *,
+    trusted_public_key_b64: str,
+    expected_digest: str = "",
+    expected_controller_context: Mapping[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], str]:
+    """Return one validated immutable snapshot eligible for qualification."""
+
+    items, commit, digest = _read_pty_artifact_bundle(Path(bundle_path))
+    if expected_digest and digest != expected_digest:
+        raise ValueError("PTY artifact bundle digest differs")
+    valid, reason = _validate_pty_artifact_bundle_commit(
+        commit,
+        trusted_public_key_b64=trusted_public_key_b64,
+        expected_controller_context=expected_controller_context,
+    )
+    if not valid:
+        raise ValueError(reason)
+    for item in items:
+        valid, reason = validate_pty_authority_receipt(
+            item["artifact"],
+            item["authority"],
+            trusted_public_key_b64=trusted_public_key_b64,
+            expected_controller_context=expected_controller_context,
+        )
+        if not valid:
+            raise ValueError(reason)
+    return items, digest
+
+
+def validate_pty_artifact_bundle(
+    bundle_path: str | Path,
+    *,
+    trusted_public_key_b64: str,
+    expected_digest: str = "",
+    expected_controller_context: Mapping[str, Any] | None = None,
+) -> tuple[bool, str]:
+    """Validate membership, all item authorities, and the bundle commit."""
+
+    try:
+        load_validated_pty_artifact_bundle(
+            bundle_path,
+            trusted_public_key_b64=trusted_public_key_b64,
+            expected_digest=expected_digest,
+            expected_controller_context=expected_controller_context,
+        )
+    except ValueError as exc:
+        return False, str(exc)
+    return True, ""
+
+
+def pty_artifact_bundle_digest(bundle_path: str | Path) -> str:
+    _items, _commit, digest = _read_pty_artifact_bundle(Path(bundle_path))
+    return digest
+
+
+def recover_pty_artifact_bundle(
+    bundle_path: str | Path,
+    *,
+    expected_artifacts: Iterable[Mapping[str, Any]] | None = None,
+    signer: PtyAuthoritySigner | None = None,
+    controller_context: Mapping[str, Any] | None = None,
+) -> Path | None:
+    """Clean abandoned staging or recognize the one published commit point."""
+
+    path = Path(bundle_path)
+    with _pty_artifact_bundle_lock(path):
+        return _recover_pty_artifact_bundle_unlocked(
+            path,
+            expected_artifacts=expected_artifacts,
+            signer=signer,
+            controller_context=controller_context,
+        )
+
+
+def _recover_pty_artifact_bundle_unlocked(
+    path: Path,
+    *,
+    expected_artifacts: Iterable[Mapping[str, Any]] | None = None,
+    signer: PtyAuthoritySigner | None = None,
+    controller_context: Mapping[str, Any] | None = None,
+) -> Path | None:
+    for staging in _pty_artifact_bundle_staging_paths(path):
+        _remove_pty_directory(staging)
+    if not path.exists():
+        _clear_pty_artifact_bundle_recovery_marker(path)
+        _fsync_directory(path.parent)
+        return None
+    _fsync_directory(path)
+    _fsync_directory(path.parent)
+    items, commit, _digest = _read_pty_artifact_bundle(
+        path,
+        allow_recovery_marker=True,
+    )
+    artifacts = [item["artifact"] for item in items]
+    if expected_artifacts is not None and artifacts != [
+        dict(artifact) for artifact in expected_artifacts
+    ]:
+        raise FileExistsError(
+            f"PTY artifact bundle belongs to other candidates: {path}"
+        )
+    if signer is not None:
+        valid, reason = _validate_pty_artifact_bundle_commit(
+            commit,
+            trusted_public_key_b64=signer.public_key_b64,
+            expected_controller_context=controller_context,
+        )
+        if not valid:
+            raise ValueError(
+                f"PTY artifact bundle has invalid controller authority: {reason}"
+            )
+        for item in items:
+            valid, reason = validate_pty_authority_receipt(
+                item["artifact"],
+                item["authority"],
+                trusted_public_key_b64=signer.public_key_b64,
+                expected_controller_context=controller_context,
+            )
+            if not valid:
+                raise ValueError(
+                    "PTY artifact bundle has invalid item authority: "
+                    f"{reason}"
+                )
+    _clear_pty_artifact_bundle_recovery_marker(path)
+    return path
+
+
+@contextmanager
+def _pty_artifact_bundle_lock(bundle_path: Path):
+    """Serialize recovery and publication for one shard-level bundle."""
+
+    lock_path = bundle_path.with_name(f".{bundle_path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def admit_pty_artifact_bundle(
+    bundle_path: str | Path,
+    artifact_paths: Iterable[str | Path],
+    *,
+    signer: PtyAuthoritySigner,
+    controller_context: Mapping[str, Any] | None = None,
+) -> Path:
+    """Atomically publish multiple unsigned PTY candidates as one shard bundle."""
+
+    path = Path(bundle_path)
+    candidates = [Path(candidate) for candidate in artifact_paths]
+    if not candidates:
+        raise ValueError("PTY artifact bundle requires at least one candidate")
+    if len(set(candidates)) != len(candidates):
+        raise ValueError("PTY artifact bundle candidate paths must be unique")
+    artifacts = []
+    for candidate in candidates:
+        artifact = json.loads(candidate.read_text(encoding="utf-8"))
+        if not isinstance(artifact, dict):
+            raise ValueError("PTY artifact bundle candidate is not an object")
+        artifacts.append(artifact)
+    artifact_ids = [
+        str(artifact.get("evidence_id") or artifact.get("diagnostic_id") or "")
+        for artifact in artifacts
+    ]
+    if any(not artifact_id for artifact_id in artifact_ids):
+        raise ValueError("PTY artifact bundle candidate identity is incomplete")
+    if len(set(artifact_ids)) != len(artifact_ids):
+        raise ValueError("PTY artifact bundle candidate identities must be unique")
+    with _pty_artifact_bundle_lock(path):
+        if _pty_artifact_bundle_recovery_marker(path).exists():
+            raise RuntimeError(
+                "PTY artifact bundle requires explicit durability recovery"
+            )
+        recovered = _recover_pty_artifact_bundle_unlocked(
+            path,
+            expected_artifacts=artifacts,
+            signer=signer,
+            controller_context=controller_context,
+        )
+        if recovered is not None:
+            return recovered
+        staging = path.with_name(
+            f"{path.name}.tmp.{os.getpid()}.{time.time_ns()}"
+        )
+        published = False
+        try:
+            staging.mkdir(mode=0o700)
+            items_path = staging / "items"
+            items_path.mkdir(mode=0o700)
+            item_manifests = [
+                _stage_pty_artifact_bundle_item(
+                    items_path,
+                    index=index,
+                    artifact=artifact,
+                    signer=signer,
+                    controller_context=controller_context,
+                )
+                for index, artifact in enumerate(artifacts)
+            ]
+            _fsync_directory(items_path)
+            items_path.chmod(0o500)
+            _fsync_directory(items_path)
+            commit = _build_pty_artifact_bundle_commit(
+                item_manifests,
+                signer=signer,
+                controller_context=controller_context,
+            )
+            commit_path = staging / "COMMIT.json"
+            commit_path.write_bytes(_json_file_bytes(commit))
+            commit_path.chmod(0o400)
+            with commit_path.open("rb") as handle:
+                os.fsync(handle.fileno())
+            _fsync_directory(staging)
+            staging.chmod(0o500)
+            _fsync_directory(staging)
+            _create_pty_artifact_bundle_recovery_marker(path)
+            _rename_directory_noreplace(staging, path)
+            published = True
+            _fsync_directory(path)
+            _fsync_directory(path.parent)
+            _clear_pty_artifact_bundle_recovery_marker(path)
+        except Exception:
+            if published:
+                raise RuntimeError(
+                    "PTY artifact bundle durability is uncertain; "
+                    "retry reconciliation is required"
+                )
+            if staging.exists():
+                _remove_pty_directory(staging)
+                _fsync_directory(staging.parent)
+            _clear_pty_artifact_bundle_recovery_marker(path)
+            raise
+        return path
+
+
+def rollback_pty_artifact_bundle(bundle_path: str | Path) -> None:
+    """Remove bundle publication state while preserving unsigned candidates."""
+
+    path = Path(bundle_path)
+    with _pty_artifact_bundle_lock(path):
+        for staging in _pty_artifact_bundle_staging_paths(path):
+            _remove_pty_directory(staging)
+        _remove_pty_directory(path)
+        _clear_pty_artifact_bundle_recovery_marker(path)
+        _fsync_directory(path.parent)
+
+
+def remove_pty_artifact_bundle(
+    bundle_path: str | Path,
+    artifact_paths: Iterable[str | Path] = (),
+) -> None:
+    """Remove committed/staging state and the explicitly supplied candidates."""
+
+    rollback_pty_artifact_bundle(bundle_path)
+    candidate_parents: set[Path] = set()
+    for candidate_value in artifact_paths:
+        candidate = Path(candidate_value)
+        candidate.with_suffix(".json.tmp").unlink(missing_ok=True)
+        candidate.unlink(missing_ok=True)
+        candidate_parents.add(candidate.parent)
+    for parent in candidate_parents:
+        _fsync_directory(parent)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _project_sensitive_turn_values(
+    value: Any,
+    protected_values: tuple[str, ...],
+    marker: str,
+) -> Any:
+    """Project exact tainted values without rewriting unrelated substrings."""
+
+    if isinstance(value, Mapping):
+        projected: dict[Any, Any] = {}
+        for key, item in value.items():
+            projected_key = _project_sensitive_turn_values(
+                key,
+                protected_values,
+                marker,
+            )
+            if projected_key in projected:
+                raise ValueError(
+                    "sensitive-value projection creates a mapping key collision"
+                )
+            projected[projected_key] = _project_sensitive_turn_values(
+                item,
+                protected_values,
+                marker,
+            )
+        return projected
+    if isinstance(value, list):
+        return [
+            _project_sensitive_turn_values(item, protected_values, marker)
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _project_sensitive_turn_values(item, protected_values, marker)
+            for item in value
+        )
+    if isinstance(value, str):
+        return marker if value in protected_values else value
+    return value
+
+
+def _project_tainted_free_text(
+    value: Any,
+    protected_values: tuple[str, ...],
+) -> Any:
+    """Replace a tainted free-text leaf as a unit, never edit identifiers."""
+
+    if isinstance(value, Mapping):
+        projected: dict[Any, Any] = {}
+        for key, item in value.items():
+            projected_key = _project_tainted_free_text(key, protected_values)
+            if projected_key in projected:
+                raise ValueError(
+                    "tainted-text projection creates a mapping key collision"
+                )
+            projected[projected_key] = _project_tainted_free_text(
+                item,
+                protected_values,
+            )
+        return projected
+    if isinstance(value, list):
+        return [
+            _project_tainted_free_text(item, protected_values)
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _project_tainted_free_text(item, protected_values)
+            for item in value
+        )
+    if isinstance(value, str) and any(
+        protected and protected in value
+        for protected in protected_values
+    ):
+        return SENSITIVE_INPUT_MARKER
+    return value
+
+
+def _contains_tainted_free_text(
+    value: Any,
+    protected_values: tuple[str, ...],
+) -> bool:
+    if isinstance(value, Mapping):
+        return any(
+            _contains_tainted_free_text(candidate, protected_values)
+            for key, item in value.items()
+            for candidate in (key, item)
+        )
+    if isinstance(value, (list, tuple)):
+        return any(
+            _contains_tainted_free_text(item, protected_values)
+            for item in value
+        )
+    return isinstance(value, str) and any(
+        protected and protected in value
+        for protected in protected_values
+    )
+
+
+def _evidence_projection(value: Any) -> Any:
+    """Remove raw secrets and non-owning secret capabilities from evidence."""
+
+    return redact_secret_references(redact(value))
+
+
+def _contains_owning_secret_reference(value: Any) -> bool:
+    """Reject process-local secret capabilities at persisted boundaries."""
+
+    return bool(secret_references_in_value(value))
+
+
+def _sensitive_event_hash(*, identity: Mapping[str, Any]) -> str:
+    """Bind a sensitive event without deriving a verifier from secret bytes."""
+
+    return content_hash({
+        "classification": "sensitive-input",
+        "identity": dict(identity),
+    })
+
+
+def _pending_contract_is_sensitive(question: Mapping[str, Any]) -> bool:
+    return bool(
+        question.get("sensitive_input")
+        or question.get("secret_reentry_binding")
+    )
 
 
 def pty_transcript_hash(
@@ -359,16 +1673,87 @@ def build_evidence_artifact(
     raw_after = deepcopy(dict(after_state))
     if raw_before.get("last_user_input") != input_value:
         raise ValueError("input does not match the compiled-graph invocation state")
-    seed = redact(raw_seed)
-    before = redact(raw_before)
-    after = redact(raw_after)
-    safe_input = redact(deepcopy(input_value))
+    raw_question = deepcopy(dict(raw_before.get("pending_question") or {}))
+    sensitive_manual_input = (
+        str(edge.get("edge_type") or "") == "manual_input"
+        and _pending_contract_is_sensitive(raw_question)
+    )
+    if sensitive_manual_input:
+        safe_input = SENSITIVE_INPUT_MARKER
+        protected_values = tuple(dict.fromkeys((
+            str(input_value),
+            _normalize_scalar(input_value),
+        )))
+        evidence_seed = _project_sensitive_turn_values(
+            raw_seed,
+            protected_values,
+            safe_input,
+        )
+        evidence_before = _project_sensitive_turn_values(
+            raw_before,
+            protected_values,
+            safe_input,
+        )
+        evidence_after = _project_sensitive_turn_values(
+            raw_after,
+            protected_values,
+            safe_input,
+        )
+    else:
+        safe_input = redact(deepcopy(input_value))
+        evidence_seed = raw_seed
+        evidence_before = raw_before
+        evidence_after = raw_after
+    source_input_hash = (
+        _sensitive_event_hash(identity={
+            "edge_key": str(edge.get("edge_key") or ""),
+            "scenario_id": str(scenario_id),
+            "question_id": str(raw_question.get("id") or ""),
+        })
+        if sensitive_manual_input
+        else content_hash(_evidence_projection(safe_input))
+    )
+    seed = _evidence_projection(evidence_seed)
+    before = _evidence_projection(evidence_before)
+    after = _evidence_projection(evidence_after)
     question = deepcopy(dict(before.get("pending_question") or {}))
+    raw_response = deepcopy(list(raw_after.get("visible_response") or []))
+    raw_next_question = deepcopy(dict(raw_after.get("pending_question") or {}))
+    state_diff = state_diff_between(before, after)
+    response = deepcopy(list(after.get("visible_response") or []))
+    next_question = deepcopy(dict(after.get("pending_question") or {}))
+    source_boundary_hashes = {
+        "before_hash": content_hash(before),
+        "input_hash": source_input_hash,
+        "question_hash": content_hash(question),
+        "after_hash": content_hash(after),
+        "state_diff_hash": content_hash(_evidence_projection(state_diff)),
+        "response_hash": content_hash(_evidence_projection(raw_response)),
+        "next_question_hash": content_hash(
+            _evidence_projection(raw_next_question)
+        ),
+    }
     event_trace = []
     for event in events:
-        safe_event = deepcopy(dict(event))
-        safe_event["details"] = redact(dict(safe_event.get("details") or {}))
-        event_trace.append(safe_event)
+        safe_event = (
+            _project_sensitive_turn_values(
+                deepcopy(dict(event)),
+                protected_values,
+                safe_input,
+            )
+            if sensitive_manual_input
+            else deepcopy(dict(event))
+        )
+        safe_details = _evidence_projection(
+            _project_tainted_free_text(
+                dict(safe_event.get("details") or {}),
+                protected_values if sensitive_manual_input else (),
+            )
+        )
+        for key in set(safe_details) & set(source_boundary_hashes):
+            safe_details[key] = source_boundary_hashes[key]
+        safe_event["details"] = safe_details
+        event_trace.append(redact_secret_references(safe_event))
     returned = _has_event(event_trace, "compiled_graph_turn_returned", edge)
     raised = _has_event(event_trace, "compiled_graph_turn_raised", edge)
     if outcome == "passed" and not returned:
@@ -381,13 +1766,6 @@ def build_evidence_artifact(
     ):
         raise ValueError("runner-declared edge outcome events are forbidden")
 
-    raw_question = deepcopy(dict(raw_before.get("pending_question") or {}))
-    raw_state_diff = state_diff_between(raw_before, raw_after)
-    raw_response = deepcopy(list(raw_after.get("visible_response") or []))
-    raw_next_question = deepcopy(dict(raw_after.get("pending_question") or {}))
-    state_diff = state_diff_between(before, after)
-    response = deepcopy(list(after.get("visible_response") or []))
-    next_question = deepcopy(dict(after.get("pending_question") or {}))
     admitted_action = _action_admission(
         edge,
         question,
@@ -426,16 +1804,8 @@ def build_evidence_artifact(
             "worktree_hash": str(revision.get("worktree_hash") or ""),
         },
         "input_hash": content_hash(safe_input),
-        "source_input_hash": content_hash(input_value),
-        "source_boundary_hashes": {
-            "before_hash": content_hash(raw_before),
-            "input_hash": content_hash(input_value),
-            "question_hash": content_hash(raw_question),
-            "after_hash": content_hash(raw_after),
-            "state_diff_hash": content_hash(raw_state_diff),
-            "response_hash": content_hash(raw_response),
-            "next_question_hash": content_hash(raw_next_question),
-        },
+        "source_input_hash": source_input_hash,
+        "source_boundary_hashes": source_boundary_hashes,
         "seed_state_hash": content_hash(seed),
         "before_state_hash": content_hash(before),
         "after_state_hash": content_hash(after),
@@ -445,24 +1815,47 @@ def build_evidence_artifact(
         "event_trace_hash": content_hash(event_trace),
         "exit_status": int(exit_status),
         "outcome": str(outcome),
-        "error": str(redact(error or "")),
+        "error": str(_evidence_projection(
+            _project_tainted_free_text(
+                error or "",
+                protected_values if sensitive_manual_input else (),
+            )
+        )),
         "content_redacted": True,
         "started_at": started_at or _utc_timestamp(),
         "finished_at": finished_at or _utc_timestamp(),
     }
+    if sensitive_manual_input and _contains_tainted_free_text(
+        {
+            "input": payload["turn_evidence"]["input"],
+            "response": payload["turn_evidence"]["response"],
+            "state_diff": payload["turn_evidence"]["state_diff"],
+            "turn_context": payload["turn_evidence"]["turn_context"],
+            "event_details": [
+                item.get("details") for item in payload["event_trace"]
+            ],
+            "error": payload["error"],
+        },
+        protected_values,
+    ):
+        raise ValueError("sensitive deterministic evidence retains tainted text")
     payload["evidence_id"] = content_hash(payload)
     payload["artifact_hash"] = content_hash(payload)
     return payload
 
 
 def write_evidence_artifact(artifact: Mapping[str, Any], directory: str | Path) -> Path:
+    """Persist a worker candidate; only the controller may admit PTY evidence."""
+
     target_dir = Path(directory)
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / f"{artifact['evidence_id']}.json"
-    target.write_text(
+    temporary = target.with_suffix(".json.tmp")
+    temporary.write_text(
         json.dumps(dict(artifact), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    temporary.replace(target)
     return target
 
 
@@ -490,11 +1883,16 @@ def build_pty_diagnostic_artifact(record: PtyDiagnosticRecord) -> dict[str, Any]
     missing = sorted(name for name, value in required.items() if not str(value or "").strip())
     if missing:
         raise ValueError(f"PTY diagnostic identity is missing: {', '.join(missing)}")
+    _validate_runtime_event(record.input_baseline_event)
     _validate_runtime_event(record.last_complete_event)
     if dict(record.last_complete_event.revision) != dict(record.revision):
         raise ValueError("PTY diagnostic runtime revision mismatch")
+    if dict(record.input_baseline_event.revision) != dict(record.revision):
+        raise ValueError("PTY diagnostic input-baseline revision mismatch")
     if record.last_complete_event.thread_id != record.session_id:
         raise ValueError("PTY diagnostic runtime event belongs to another session")
+    if record.input_baseline_event.thread_id != record.session_id:
+        raise ValueError("PTY diagnostic input baseline belongs to another session")
     if record.diagnostic_kind == "failed_attempt" and record.completed_turn is None:
         raise ValueError("failed-attempt diagnostic requires a completed turn")
     if record.dynamic_selection is not None and record.completed_turn is None:
@@ -503,28 +1901,84 @@ def build_pty_diagnostic_artifact(record: PtyDiagnosticRecord) -> dict[str, Any]
         _validate_pty_turn_record(record.completed_turn)
         if record.completed_turn.session_id != record.session_id:
             raise ValueError("PTY diagnostic turn belongs to another session")
+        if (
+            record.input_baseline_event.after_fingerprint
+            != record.completed_turn.before_fingerprint
+            or record.last_complete_event.before_fingerprint
+            != record.input_baseline_event.after_fingerprint
+            or record.last_complete_event.after_fingerprint
+            != record.completed_turn.after_fingerprint
+            or record.input_baseline_event.turn_index + 1
+            != record.completed_turn.turn_index
+            or record.last_complete_event.turn_index
+            != record.completed_turn.turn_index
+        ):
+            raise ValueError(
+                "PTY diagnostic input, turn, and committed boundary are not adjacent"
+            )
     if record.dynamic_selection is not None:
         _validate_dynamic_selection(record.completed_turn, record.dynamic_selection)  # type: ignore[arg-type]
+        if record.target_edge_key not in set(
+            record.dynamic_selection.target_coverage_ids
+        ):
+            raise ValueError(
+                "PTY diagnostic target is not bound to the dynamic selection"
+            )
+    elif record.completed_turn is not None:
+        raise ValueError("PTY diagnostic completed turn has no dynamic selection")
     if record.verification_status == "postcondition_failed":
         if record.verified_postcondition is None or record.verified_postcondition.passed:
             raise ValueError("postcondition-failed diagnostic requires a failed verification")
     elif record.verified_postcondition is not None:
         raise ValueError("PTY diagnostic carries a postcondition before verification failed")
 
-    safe_response = str(redact(record.last_complete_response))
-    safe_event = redact(_runtime_event_payload(record.last_complete_event))
+    sensitive_input = _pending_contract_is_sensitive(
+        record.input_baseline_event.pending_contract
+    )
+    protected_values = (
+        (record.completed_turn.user_message,)
+        if (
+            sensitive_input
+            and record.completed_turn is not None
+            and record.completed_turn.user_message
+        )
+        else ()
+    )
+    safe_response = str(redact(_project_tainted_free_text(
+        record.last_complete_response,
+        protected_values,
+    )))
+    safe_baseline_event = _project_runtime_event_payload(
+        record.input_baseline_event,
+        protected_values=protected_values,
+    )
+    safe_event = _project_runtime_event_payload(
+        record.last_complete_event,
+        protected_values=protected_values,
+    )
     safe_turn = (
-        _redacted_pty_turn_payload(record.completed_turn)
+        _redacted_pty_turn_payload(
+            record.completed_turn,
+            sensitive_input=sensitive_input,
+            protected_values=protected_values,
+        )
         if record.completed_turn is not None
         else None
     )
     safe_selection = (
-        _redacted_dynamic_selection_payload(record.dynamic_selection)
+        _redacted_dynamic_selection_payload(
+            record.dynamic_selection,
+            sensitive_input=sensitive_input,
+            protected_values=protected_values,
+        )
         if record.dynamic_selection is not None
         else None
     )
     safe_postcondition = (
-        _redacted_verified_postcondition_payload(record.verified_postcondition)
+        _redacted_verified_postcondition_payload(
+            record.verified_postcondition,
+            protected_values=protected_values,
+        )
         if record.verified_postcondition is not None
         else None
     )
@@ -538,8 +1992,14 @@ def build_pty_diagnostic_artifact(record: PtyDiagnosticRecord) -> dict[str, Any]
         "target_edge_key": record.target_edge_key,
         "revision": dict(record.revision),
         "session_id": record.session_id,
-        "reason": str(redact(record.reason)),
+        "reason": str(redact(_project_tainted_free_text(
+            record.reason,
+            protected_values,
+        ))),
         "last_complete_boundary": {
+            "input_sensitive": sensitive_input,
+            "input_baseline_event": safe_baseline_event,
+            "input_baseline_event_hash": content_hash(safe_baseline_event),
             "agent_response": safe_response,
             "agent_response_hash": content_hash(safe_response),
             "runtime_event": safe_event,
@@ -558,6 +2018,16 @@ def build_pty_diagnostic_artifact(record: PtyDiagnosticRecord) -> dict[str, Any]
         "content_redacted": True,
         "created_at": _utc_timestamp(),
     }
+    if sensitive_input and _contains_tainted_free_text(
+        {
+            "reason": body["reason"],
+            "last_complete_boundary": body["last_complete_boundary"],
+        },
+        protected_values,
+    ):
+        raise ValueError("sensitive PTY diagnostic retains tainted free text")
+    if _contains_owning_secret_reference(body):
+        raise ValueError("PTY diagnostic retains an owning secret capability")
     body["diagnostic_id"] = content_hash(body)
     body["artifact_hash"] = content_hash(body)
     return body
@@ -567,11 +2037,8 @@ def write_pty_diagnostic_artifact(
     artifact: Mapping[str, Any],
     directory: str | Path,
 ) -> Path:
-    """Atomically persist a validated diagnostic outside evidence lanes."""
+    """Persist a worker diagnostic candidate outside qualifying evidence lanes."""
 
-    valid, reason = validate_pty_diagnostic_artifact(artifact)
-    if not valid:
-        raise ValueError(f"invalid PTY diagnostic artifact: {reason}")
     target_dir = Path(directory)
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / f"{artifact['diagnostic_id']}.json"
@@ -584,7 +2051,15 @@ def write_pty_diagnostic_artifact(
     return target
 
 
-def validate_pty_diagnostic_artifact(artifact: Mapping[str, Any]) -> tuple[bool, str]:
+def validate_pty_diagnostic_artifact(
+    artifact: Mapping[str, Any],
+    *,
+    authority: Mapping[str, Any] | None = None,
+    trusted_public_key_b64: str = "",
+    expected_controller_context: Mapping[str, Any] | None = None,
+    expected_target_edge_key: str = "",
+    _candidate_only: bool = False,
+) -> tuple[bool, str]:
     """Validate diagnostics while keeping them ineligible for pass evidence."""
 
     if artifact.get("artifact_type") != "pty_diagnostic":
@@ -593,6 +2068,23 @@ def validate_pty_diagnostic_artifact(artifact: Mapping[str, Any]) -> tuple[bool,
         return False, "unsupported PTY diagnostic schema"
     if artifact.get("qualifying_evidence") is not False:
         return False, "PTY diagnostic must not qualify as evidence"
+    if not _candidate_only:
+        if authority is None or not trusted_public_key_b64:
+            return False, "PTY diagnostic requires controller authority"
+        authority_valid, authority_reason = validate_pty_authority_receipt(
+            artifact,
+            authority,
+            trusted_public_key_b64=trusted_public_key_b64,
+            expected_controller_context=expected_controller_context,
+        )
+        if not authority_valid:
+            return False, authority_reason
+    if (
+        expected_target_edge_key
+        and str(artifact.get("target_edge_key") or "")
+        != str(expected_target_edge_key)
+    ):
+        return False, "PTY diagnostic target differs from scheduled authority"
     kind = str(artifact.get("diagnostic_kind") or "")
     status = str(artifact.get("verification_status") or "")
     if kind not in PTY_DIAGNOSTIC_STATUSES or status not in PTY_DIAGNOSTIC_STATUSES[kind]:
@@ -613,41 +2105,74 @@ def validate_pty_diagnostic_artifact(artifact: Mapping[str, Any]) -> tuple[bool,
     boundary = artifact.get("last_complete_boundary")
     if not isinstance(boundary, Mapping):
         return False, "PTY diagnostic has no complete boundary"
+    if not isinstance(boundary.get("input_sensitive"), bool):
+        return False, "PTY diagnostic has no input sensitivity classification"
     response = boundary.get("agent_response")
+    baseline_event = boundary.get("input_baseline_event")
     event = boundary.get("runtime_event")
-    if not isinstance(response, str) or not response.strip() or not isinstance(event, Mapping):
+    if (
+        not isinstance(response, str)
+        or not response.strip()
+        or not isinstance(baseline_event, Mapping)
+        or not isinstance(event, Mapping)
+    ):
         return False, "PTY diagnostic complete boundary is invalid"
+    if content_hash(baseline_event) != str(
+        boundary.get("input_baseline_event_hash") or ""
+    ):
+        return False, "PTY diagnostic input-baseline hash mismatch"
     if content_hash(response) != str(boundary.get("agent_response_hash") or ""):
         return False, "PTY diagnostic response hash mismatch"
     if content_hash(event) != str(boundary.get("runtime_event_hash") or ""):
         return False, "PTY diagnostic runtime-event hash mismatch"
     try:
+        baseline_event_values = dict(baseline_event)
         runtime_event_values = dict(event)
-        runtime_event_values["action_queue_types"] = tuple(
-            runtime_event_values.get("action_queue_types") or ()
-        )
-        runtime_event_values["admitted_action_types"] = tuple(
-            runtime_event_values.get("admitted_action_types") or ()
-        )
-        runtime_event_values["admitted_action_targets"] = tuple(
-            dict(item) for item in runtime_event_values.get("admitted_action_targets") or ()
-        )
-        runtime_event_values["admitted_action_provenance"] = tuple(
-            dict(item)
-            for item in runtime_event_values.get("admitted_action_provenance") or ()
-        )
-        runtime_event_values["control_receipts"] = tuple(
-            dict(item)
-            for item in runtime_event_values.get("control_receipts") or ()
-        )
+        for values in (baseline_event_values, runtime_event_values):
+            values["action_queue_types"] = tuple(
+                values.get("action_queue_types") or ()
+            )
+            values["admitted_action_types"] = tuple(
+                values.get("admitted_action_types") or ()
+            )
+            values["admitted_action_targets"] = tuple(
+                dict(item) for item in values.get("admitted_action_targets") or ()
+            )
+            values["admitted_action_provenance"] = tuple(
+                dict(item)
+                for item in values.get("admitted_action_provenance") or ()
+            )
+            values["control_receipts"] = tuple(
+                dict(item) for item in values.get("control_receipts") or ()
+            )
+        input_baseline_event = RuntimeTurnEvent(**baseline_event_values)
         runtime_event = RuntimeTurnEvent(**runtime_event_values)
+        if (
+            input_baseline_event.schema_version != 6
+            or runtime_event.schema_version != 6
+        ):
+            return False, "PTY diagnostic contains a legacy runtime boundary"
+        if (
+            not _runtime_event_payload_hash_is_valid(input_baseline_event)
+            or not _runtime_event_payload_hash_is_valid(runtime_event)
+        ):
+            return False, "PTY diagnostic runtime payload hash is invalid"
+        _validate_runtime_event(input_baseline_event)
         _validate_runtime_event(runtime_event)
     except (TypeError, ValueError) as exc:
         return False, f"PTY diagnostic runtime event is invalid: {exc}"
     if runtime_event.thread_id != str(artifact.get("session_id") or ""):
         return False, "PTY diagnostic runtime event belongs to another session"
+    if input_baseline_event.thread_id != str(artifact.get("session_id") or ""):
+        return False, "PTY diagnostic input baseline belongs to another session"
     if dict(runtime_event.revision) != dict(revision):
         return False, "PTY diagnostic runtime revision mismatch"
+    if dict(input_baseline_event.revision) != dict(revision):
+        return False, "PTY diagnostic input-baseline revision mismatch"
+    if boundary.get("input_sensitive") is not _pending_contract_is_sensitive(
+        input_baseline_event.pending_contract
+    ):
+        return False, "PTY diagnostic input sensitivity is not provenance-derived"
     completed_turn = boundary.get("completed_turn")
     if kind == "failed_attempt" and not isinstance(completed_turn, Mapping):
         return False, "failed-attempt diagnostic has no completed turn"
@@ -679,6 +2204,16 @@ def validate_pty_diagnostic_artifact(artifact: Mapping[str, Any]) -> tuple[bool,
             return False, "PTY diagnostic completed turn belongs to another session"
         if typed_turn.turn_index != runtime_event.turn_index:
             return False, "PTY diagnostic turn and runtime boundary disagree"
+        if (
+            input_baseline_event.after_fingerprint
+            != typed_turn.before_fingerprint
+            or runtime_event.before_fingerprint
+            != input_baseline_event.after_fingerprint
+            or runtime_event.after_fingerprint
+            != typed_turn.after_fingerprint
+            or input_baseline_event.turn_index + 1 != typed_turn.turn_index
+        ):
+            return False, "PTY diagnostic input boundary is not adjacent"
         if typed_turn.agent_response != response:
             return False, "PTY diagnostic response and completed turn disagree"
     raw_selection = boundary.get("dynamic_selection")
@@ -694,6 +2229,10 @@ def validate_pty_diagnostic_artifact(artifact: Mapping[str, Any]) -> tuple[bool,
                 typed_turn,
                 DynamicTurnSelection(**selection_values),
             )
+            if str(artifact.get("target_edge_key") or "") not in set(
+                selection_values["target_coverage_ids"]
+            ):
+                return False, "PTY diagnostic target is not selection-bound"
         except (TypeError, ValueError) as exc:
             return False, f"PTY diagnostic dynamic selection is invalid: {exc}"
     if status == "postcondition_failed":
@@ -704,6 +2243,8 @@ def validate_pty_diagnostic_artifact(artifact: Mapping[str, Any]) -> tuple[bool,
         return False, "PTY diagnostic has an unexpected postcondition"
     if artifact.get("content_redacted") is not True:
         return False, "PTY diagnostic does not declare redaction"
+    if _contains_owning_secret_reference(artifact):
+        return False, "PTY diagnostic contains an owning secret capability"
     unsigned = dict(artifact)
     artifact_hash = str(unsigned.pop("artifact_hash", ""))
     if content_hash(unsigned) != artifact_hash:
@@ -713,6 +2254,20 @@ def validate_pty_diagnostic_artifact(artifact: Mapping[str, Any]) -> tuple[bool,
     if content_hash(identity) != diagnostic_id:
         return False, "PTY diagnostic id mismatch"
     return True, ""
+
+
+def validate_pty_diagnostic_candidate(
+    artifact: Mapping[str, Any],
+    *,
+    expected_target_edge_key: str,
+) -> tuple[bool, str]:
+    """Validate an unsigned worker candidate before controller admission."""
+
+    return validate_pty_diagnostic_artifact(
+        artifact,
+        expected_target_edge_key=expected_target_edge_key,
+        _candidate_only=True,
+    )
 
 
 def _runtime_event_payload(event: RuntimeTurnEvent) -> dict[str, Any]:
@@ -729,11 +2284,49 @@ def _runtime_event_payload(event: RuntimeTurnEvent) -> dict[str, Any]:
     return payload
 
 
-def _redacted_pty_turn_payload(turn: PtyCliTurnRecord) -> dict[str, Any]:
-    previous_response = str(redact(turn.previous_agent_response))
-    user_message = str(redact(turn.user_message))
-    agent_response = str(redact(turn.agent_response))
-    payload = asdict(turn)
+def _project_runtime_event_payload(
+    event: RuntimeTurnEvent,
+    *,
+    protected_values: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Project one event and rebind its complete-payload integrity hash."""
+
+    payload = _evidence_projection(_project_tainted_free_text(
+        _runtime_event_payload(event),
+        protected_values,
+    ))
+    if int(payload.get("schema_version") or 0) >= 5:
+        unsigned = dict(payload)
+        unsigned.pop("runtime_event_payload_hash", None)
+        payload["runtime_event_payload_hash"] = content_hash(unsigned)
+    return payload
+
+
+def _runtime_event_payload_hash_is_valid(
+    event: RuntimeTurnEvent,
+) -> bool:
+    if event.schema_version < 5:
+        return False
+    payload = _runtime_event_payload(event)
+    expected = str(payload.pop("runtime_event_payload_hash", "") or "")
+    return _is_sha256(expected) and content_hash(payload) == expected
+
+
+def _redacted_pty_turn_payload(
+    turn: PtyCliTurnRecord,
+    *,
+    sensitive_input: bool = False,
+    protected_values: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    safe_turn = _redacted_pty_turn(
+        turn,
+        sensitive_input=sensitive_input,
+        protected_values=protected_values,
+    )
+    previous_response = safe_turn.previous_agent_response
+    user_message = safe_turn.user_message
+    agent_response = safe_turn.agent_response
+    payload = asdict(safe_turn)
     payload.update({
         "previous_agent_response": previous_response,
         "user_message": user_message,
@@ -752,8 +2345,17 @@ def _redacted_pty_turn_payload(turn: PtyCliTurnRecord) -> dict[str, Any]:
     return payload
 
 
-def _redacted_dynamic_selection_payload(selection: DynamicTurnSelection) -> dict[str, Any]:
-    payload = redact(asdict(selection))
+def _redacted_dynamic_selection_payload(
+    selection: DynamicTurnSelection,
+    *,
+    sensitive_input: bool = False,
+    protected_values: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    payload = asdict(_redacted_dynamic_selection(
+        selection,
+        sensitive_input=sensitive_input,
+        protected_values=protected_values,
+    ))
     payload["target_coverage_ids"] = list(selection.target_coverage_ids)
     return payload
 
@@ -768,27 +2370,54 @@ def _verified_postcondition_payload(postcondition: VerifiedPostcondition) -> dic
 
 def _redacted_verified_postcondition_payload(
     postcondition: VerifiedPostcondition,
+    *,
+    protected_values: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Redact business content while preserving immutable coverage identity."""
 
     payload = _verified_postcondition_payload(postcondition)
-    payload["state_diff"] = redact(dict(postcondition.state_diff))
-    payload["next_question_or_result"] = redact(
-        dict(postcondition.next_question_or_result)
+    payload["state_diff"] = _evidence_projection(
+        _project_tainted_free_text(
+            dict(postcondition.state_diff),
+            protected_values,
+        )
+    )
+    payload["next_question_or_result"] = _evidence_projection(
+        _project_tainted_free_text(
+            dict(postcondition.next_question_or_result),
+            protected_values,
+        )
     )
     details = dict(postcondition.details)
     declared = details.pop("declared_target_results", None)
-    safe_details = redact(details)
+    safe_details = _evidence_projection(
+        _project_tainted_free_text(details, protected_values)
+    )
     if isinstance(declared, Mapping):
         safe_details["declared_target_results"] = {
-            str(coverage_id): redact(dict(result))
+            str(coverage_id): _evidence_projection(
+                _project_tainted_free_text(
+                    dict(result),
+                    protected_values,
+                )
+            )
             if isinstance(result, Mapping)
-            else redact(result)
+            else _evidence_projection(
+                _project_tainted_free_text(result, protected_values)
+            )
             for coverage_id, result in declared.items()
         }
     payload["details"] = safe_details
-    payload["job_artifacts"] = [redact(dict(item)) for item in postcondition.job_artifacts]
-    return payload
+    payload["job_artifacts"] = [
+        _evidence_projection(
+            _project_tainted_free_text(
+                dict(item),
+                protected_values,
+            )
+        )
+        for item in postcondition.job_artifacts
+    ]
+    return redact_secret_references(payload)
 
 
 def build_pty_cli_evidence_artifact(
@@ -866,30 +2495,19 @@ def build_pty_cli_evidence_artifact(
         dynamic_selection=dynamic_selection,
     )
 
-    safe_turn = _redacted_pty_turn(turn)
-    safe_selection = (
-        _redacted_dynamic_selection(dynamic_selection)
-        if dynamic_selection is not None
+    canonical_facts = canonical_controller_turn_facts(
+        edge=edge,
+        turn=turn,
+        observation=observation,
+        dynamic_selection=dynamic_selection,
+    )
+    turn_payload = dict(canonical_facts["turn"])
+    selection_payload = (
+        dict(canonical_facts["dynamic_selection"])
+        if isinstance(canonical_facts.get("dynamic_selection"), Mapping)
         else None
     )
-    safe_observation = _redacted_turn_observation(observation)
-    turn_payload = asdict(safe_turn)
-    turn_payload.update({
-        "previous_response_hash": content_hash(safe_turn.previous_agent_response),
-        "user_message_hash": content_hash(safe_turn.user_message),
-        "agent_response_hash": content_hash(safe_turn.agent_response),
-        "source_previous_response_hash": content_hash(turn.previous_agent_response),
-        "source_user_message_hash": content_hash(turn.user_message),
-        "source_agent_response_hash": content_hash(turn.agent_response),
-    })
-    selection_payload = None
-    if safe_selection is not None:
-        selection_payload = asdict(safe_selection)
-        selection_payload["target_coverage_ids"] = list(safe_selection.target_coverage_ids)
-        selection_payload["previous_response_hash"] = content_hash(
-            safe_turn.previous_agent_response
-        )
-    observation_payload = _turn_observation_payload(safe_observation)
+    observation_payload = dict(canonical_facts["turn_observation"])
     payload: dict[str, Any] = {
         "artifact_type": "pty_cli_turn",
         "schema_version": CLI_ARTIFACT_SCHEMA_VERSION,
@@ -905,10 +2523,14 @@ def build_pty_cli_evidence_artifact(
         "turn": turn_payload,
         "turn_hash": content_hash(turn_payload),
         "dynamic_selection": selection_payload,
-        "execution_case": dict(execution_case or {}),
-        "execution_case_hash": content_hash(dict(execution_case or {})) if execution_case else "",
-        "seed_receipt": dict(seed_receipt or {}),
-        "seed_receipt_hash": content_hash(dict(seed_receipt or {})) if seed_receipt else "",
+        "execution_case": _evidence_projection(dict(execution_case or {})),
+        "execution_case_hash": content_hash(
+            _evidence_projection(dict(execution_case or {}))
+        ) if execution_case else "",
+        "seed_receipt": _evidence_projection(dict(seed_receipt or {})),
+        "seed_receipt_hash": content_hash(
+            _evidence_projection(dict(seed_receipt or {}))
+        ) if seed_receipt else "",
         "turn_observation": observation_payload,
         "turn_observation_hash": content_hash(observation_payload),
         "outcome": "passed",
@@ -918,15 +2540,150 @@ def build_pty_cli_evidence_artifact(
         "started_at": _utc_timestamp(),
         "finished_at": _utc_timestamp(),
     }
+    if _contains_owning_secret_reference(payload):
+        raise ValueError("PTY evidence retains an owning secret capability")
     payload["evidence_id"] = content_hash(payload)
     payload["artifact_hash"] = content_hash(payload)
     return payload
 
 
-def _redacted_pty_turn(turn: PtyCliTurnRecord) -> PtyCliTurnRecord:
-    previous = str(redact(turn.previous_agent_response))
-    user_message = str(redact(turn.user_message))
-    response = str(redact(turn.agent_response))
+def canonical_controller_turn_facts(
+    *,
+    edge: Mapping[str, Any],
+    turn: PtyCliTurnRecord,
+    observation: TurnObservation,
+    dynamic_selection: DynamicTurnSelection | None,
+) -> dict[str, Any]:
+    """Project an in-memory PTY turn through the canonical evidence redactor."""
+
+    sensitive_turn = _pending_contract_is_sensitive(observation.pending_contract)
+    protected_inputs = [
+        turn.user_message
+        for is_sensitive in (sensitive_turn,)
+        if is_sensitive and turn.user_message
+    ]
+    for index, continuation_turn in enumerate(
+        observation.continuation_turns
+    ):
+        preceding_event = observation.runtime_events[index + 1]
+        if (
+            _pending_contract_is_sensitive(
+                preceding_event.pending_contract
+            )
+            and continuation_turn.user_message
+        ):
+            protected_inputs.append(continuation_turn.user_message)
+    protected_turn_values = tuple(dict.fromkeys(protected_inputs))
+    safe_turn = _redacted_pty_turn(
+        turn,
+        sensitive_input=sensitive_turn,
+        protected_values=protected_turn_values,
+    )
+    safe_selection = (
+        _redacted_dynamic_selection(
+            dynamic_selection,
+            sensitive_input=sensitive_turn,
+            protected_values=protected_turn_values,
+        )
+        if dynamic_selection is not None
+        else None
+    )
+    safe_observation = _redacted_turn_observation(
+        observation,
+        sensitive_input=sensitive_turn,
+        protected_values=protected_turn_values,
+    )
+    turn_payload = redact_secret_references(asdict(safe_turn))
+    sensitive_source_hash = _sensitive_event_hash(identity={
+        "edge_key": str(edge.get("edge_key") or ""),
+        "session_id": safe_turn.session_id,
+        "turn_index": safe_turn.turn_index,
+        "question_id": str(
+            observation.pending_contract.get("id") or ""
+        ),
+    })
+    turn_payload.update({
+        "previous_response_hash": content_hash(safe_turn.previous_agent_response),
+        "user_message_hash": content_hash(safe_turn.user_message),
+        "agent_response_hash": content_hash(safe_turn.agent_response),
+        "source_previous_response_hash": content_hash(
+            safe_turn.previous_agent_response
+        ),
+        "source_user_message_hash": (
+            sensitive_source_hash
+            if sensitive_turn
+            else content_hash(safe_turn.user_message)
+        ),
+        "source_agent_response_hash": content_hash(safe_turn.agent_response),
+    })
+    selection_payload = None
+    if safe_selection is not None:
+        selection_payload = redact_secret_references(asdict(safe_selection))
+        selection_payload["target_coverage_ids"] = list(safe_selection.target_coverage_ids)
+        selection_payload["previous_response_hash"] = content_hash(
+            safe_turn.previous_agent_response
+        )
+    observation_payload = redact_secret_references(
+        _turn_observation_payload(safe_observation)
+    )
+    if sensitive_turn and _contains_tainted_free_text(
+        {
+            "turn": {
+                "previous_agent_response": turn_payload[
+                    "previous_agent_response"
+                ],
+                "user_message": turn_payload["user_message"],
+                "agent_response": turn_payload["agent_response"],
+            },
+            "dynamic_selection": selection_payload or {},
+            "observation": {
+                "prior_agent_response": observation_payload[
+                    "prior_agent_response"
+                ],
+                "exact_user_turn": observation_payload["exact_user_turn"],
+                "simulator_decision": observation_payload[
+                    "simulator_decision"
+                ],
+                "continuation_turns": observation_payload[
+                    "continuation_turns"
+                ],
+                "continuation_simulator_decisions": observation_payload[
+                    "continuation_simulator_decisions"
+                ],
+                "verified_postcondition": observation_payload[
+                    "verified_postcondition"
+                ],
+            },
+        },
+        protected_turn_values,
+    ):
+        raise ValueError("sensitive PTY evidence retains tainted free text")
+    return {
+        "turn": turn_payload,
+        "dynamic_selection": selection_payload,
+        "turn_observation": observation_payload,
+    }
+
+
+def _redacted_pty_turn(
+    turn: PtyCliTurnRecord,
+    *,
+    sensitive_input: bool = False,
+    protected_values: tuple[str, ...] = (),
+) -> PtyCliTurnRecord:
+    previous = str(redact(_project_tainted_free_text(
+        turn.previous_agent_response,
+        protected_values,
+    )))
+    user_message = (
+        SENSITIVE_INPUT_MARKER
+        if sensitive_input
+        else str(redact(turn.user_message))
+    )
+    response = str(redact(_project_tainted_free_text(
+        turn.agent_response,
+        protected_values,
+    )))
     return replace(
         turn,
         previous_agent_response=previous,
@@ -944,42 +2701,101 @@ def _redacted_pty_turn(turn: PtyCliTurnRecord) -> PtyCliTurnRecord:
 
 def _redacted_dynamic_selection(
     selection: DynamicTurnSelection,
+    *,
+    sensitive_input: bool = False,
+    protected_values: tuple[str, ...] = (),
 ) -> DynamicTurnSelection:
     return replace(
         selection,
-        selected_message=str(redact(selection.selected_message)),
-        persona=str(redact(selection.persona)),
-        goal=str(redact(selection.goal)),
-        rationale=str(redact(selection.rationale)),
+        selected_message=(
+            SENSITIVE_INPUT_MARKER
+            if sensitive_input
+            else str(redact(selection.selected_message))
+        ),
+        persona=str(redact(_project_tainted_free_text(
+            selection.persona,
+            protected_values,
+        ))),
+        goal=str(redact(_project_tainted_free_text(
+            selection.goal,
+            protected_values,
+        ))),
+        rationale=str(redact(_project_tainted_free_text(
+            selection.rationale,
+            protected_values,
+        ))),
     )
 
 
-def _redacted_turn_observation(observation: TurnObservation) -> TurnObservation:
+def _redacted_turn_observation(
+    observation: TurnObservation,
+    *,
+    sensitive_input: bool = False,
+    protected_values: tuple[str, ...] = (),
+) -> TurnObservation:
     payload = _turn_observation_payload(observation)
-    payload["prior_agent_response"] = str(redact(observation.prior_agent_response))
-    payload["exact_user_turn"] = str(redact(observation.exact_user_turn))
-    payload["simulator_decision"] = _redacted_simulator_decision(
-        observation.simulator_decision
+    payload["prior_agent_response"] = str(redact(
+        _project_tainted_free_text(
+            observation.prior_agent_response,
+            protected_values,
+        )
+    ))
+    payload["exact_user_turn"] = (
+        SENSITIVE_INPUT_MARKER
+        if sensitive_input
+        else str(redact(observation.exact_user_turn))
     )
-    payload["continuation_turns"] = [
-        asdict(_redacted_pty_turn(turn))
-        for turn in observation.continuation_turns
+    payload["simulator_decision"] = _redacted_simulator_decision(
+        observation.simulator_decision,
+        protected_values=protected_values,
+    )
+    payload["runtime_events"] = [
+        _project_runtime_event_payload(
+            event,
+            protected_values=protected_values,
+        )
+        for event in observation.runtime_events
     ]
+    if sensitive_input and "selected_message" in payload["simulator_decision"]:
+        payload["simulator_decision"]["selected_message"] = (
+            SENSITIVE_INPUT_MARKER
+        )
+    payload["continuation_turns"] = []
+    for index, turn in enumerate(observation.continuation_turns):
+        preceding_event = observation.runtime_events[index + 1]
+        payload["continuation_turns"].append(asdict(_redacted_pty_turn(
+            turn,
+            sensitive_input=_pending_contract_is_sensitive(
+                preceding_event.pending_contract
+            ),
+            protected_values=protected_values,
+        )))
     payload["continuation_simulator_decisions"] = [
-        _redacted_simulator_decision(decision)
+        _redacted_simulator_decision(
+            decision,
+            protected_values=protected_values,
+        )
         for decision in observation.continuation_simulator_decisions
     ]
     payload["verified_postcondition"] = _redacted_verified_postcondition_payload(
-        observation.verified_postcondition
+        observation.verified_postcondition,
+        protected_values=protected_values,
     )
-    return _turn_observation_from_payload(payload)
+    return _turn_observation_from_payload(redact_secret_references(payload))
 
 
-def _redacted_simulator_decision(decision: Mapping[str, Any]) -> dict[str, Any]:
+def _redacted_simulator_decision(
+    decision: Mapping[str, Any],
+    *,
+    protected_values: tuple[str, ...] = (),
+) -> dict[str, Any]:
     """Project simulator content separately from coverage identity."""
 
     payload = {
-        str(key): redact(value)
+        str(key): redact(_project_tainted_free_text(
+            value,
+            protected_values,
+        ))
         for key, value in decision.items()
         if str(key) != "target_coverage_ids"
     }
@@ -995,8 +2811,16 @@ def validate_pty_cli_evidence_artifact(
     *,
     edge: Mapping[str, Any],
     revision: Mapping[str, str],
+    authority: Mapping[str, Any] | None = None,
+    trusted_public_key_b64: str = "",
+    expected_controller_context: Mapping[str, Any] | None = None,
+    _candidate_only: bool = False,
 ) -> tuple[bool, str]:
-    """Validate PTY evidence without confusing scripted and dynamic turns."""
+    """Validate a candidate or one proven shard-bundle member.
+
+    A legacy per-item authority receipt proves signature integrity only. It
+    cannot qualify evidence without immutable shard-bundle membership.
+    """
 
     if artifact.get("artifact_type") != "pty_cli_turn":
         return False, "artifact is not PTY CLI evidence"
@@ -1004,15 +2828,33 @@ def validate_pty_cli_evidence_artifact(
         return False, "unsupported PTY CLI evidence schema"
     if artifact.get("content_redacted") is not True:
         return False, "PTY CLI evidence does not declare redaction"
+    if not _candidate_only:
+        if authority is None or not trusted_public_key_b64:
+            return False, "PTY evidence requires controller authority"
+        if not isinstance(authority, _PtyBundleAuthorityView):
+            return (
+                False,
+                "legacy per-item authority receipt is non-qualifying; "
+                "PTY evidence requires shard-bundle membership",
+            )
+        artifact_id = str(artifact.get("evidence_id") or "")
+        if (
+            not _is_sha256(authority.bundle_digest)
+            or authority.artifact_id != artifact_id
+            or authority.artifact_hash != str(artifact.get("artifact_hash") or "")
+        ):
+            return False, "PTY shard-bundle membership binding is invalid"
+        authority_valid, authority_reason = validate_pty_authority_receipt(
+            artifact,
+            authority,
+            trusted_public_key_b64=trusted_public_key_b64,
+            expected_controller_context=expected_controller_context,
+        )
+        if not authority_valid:
+            return False, authority_reason
     turn_payload = artifact.get("turn")
     if not isinstance(turn_payload, Mapping):
         return False, "PTY evidence has no turn payload"
-    for name in (
-        "source_previous_response_hash", "source_user_message_hash",
-        "source_agent_response_hash",
-    ):
-        if not _is_sha256(str(turn_payload.get(name) or "")):
-            return False, f"PTY source boundary hash is invalid: {name}"
     evidence_class = str(artifact.get("evidence_class") or "")
     lane_error = _lane_error(edge, evidence_class)
     if lane_error:
@@ -1093,6 +2935,191 @@ def validate_pty_cli_evidence_artifact(
     if content_hash(turn_payload) != str(artifact.get("turn_hash") or ""):
         return False, "PTY turn hash mismatch"
 
+    controller_context = (
+        expected_controller_context
+        if expected_controller_context is not None
+        else {}
+    )
+    observed_turns = controller_context.get("observed_turns")
+    if controller_context and not isinstance(observed_turns, list):
+        return False, "controller observation ledger is missing"
+    if isinstance(observed_turns, list):
+        previous_controller_hash = ""
+        for item in observed_turns:
+            if not isinstance(item, Mapping):
+                return False, "controller observation ledger is malformed"
+            if item.get("controller_observation_hash"):
+                unsigned_item = dict(item)
+                item_hash = str(
+                    unsigned_item.pop("controller_observation_hash", "") or ""
+                )
+                if (
+                    content_hash(unsigned_item) != item_hash
+                    or item.get("previous_controller_observation_hash")
+                    != previous_controller_hash
+                ):
+                    return False, "controller observation chain is invalid"
+                previous_controller_hash = item_hash
+        matching_observations = [
+            dict(item)
+            for item in observed_turns
+            if isinstance(item, Mapping)
+            and item.get("previous_response_hash")
+            == turn_payload.get("previous_response_hash")
+            and (
+                "turn_index" not in item
+                or int(item.get("turn_index") or 0) == turn.turn_index
+            )
+            and (
+                "edge_key" not in item
+                or str(item.get("edge_key") or "")
+                == str(artifact.get("edge_key") or "")
+            )
+        ]
+        if len(matching_observations) != 1:
+            return False, "PTY turn is not bound to one controller observation"
+        controller_observation = matching_observations[0]
+        raw_observation = artifact.get("turn_observation")
+        simulator_decision = (
+            raw_observation.get("simulator_decision")
+            if isinstance(raw_observation, Mapping)
+            else None
+        )
+        if (
+            not isinstance(simulator_decision, Mapping)
+            or content_hash(simulator_decision)
+            != controller_observation.get("simulator_decision_hash")
+        ):
+            return False, "PTY simulator decision differs from controller observation"
+        if controller_observation.get("controller_observation_hash"):
+            unsigned_controller_observation = dict(controller_observation)
+            controller_observation_hash = str(
+                unsigned_controller_observation.pop(
+                    "controller_observation_hash",
+                    "",
+                )
+                or ""
+            )
+            if (
+                content_hash(unsigned_controller_observation)
+                != controller_observation_hash
+            ):
+                return False, "controller observation receipt hash is invalid"
+            submitted_input_commitment = str(
+                controller_observation.get(
+                    "submitted_input_commitment"
+                )
+                or ""
+            )
+            if not _is_sha256(submitted_input_commitment):
+                return False, "controller input commitment is invalid"
+            approved_hashes = controller_observation.get(
+                "approved_decision_hashes"
+            )
+            context_hashes = controller_observation.get(
+                "simulator_context_hashes"
+            )
+            submission_sequences = controller_observation.get(
+                "submission_sequences"
+            )
+            if (
+                not isinstance(approved_hashes, list)
+                or not approved_hashes
+                or any(
+                    not _is_sha256(str(value or ""))
+                    for value in approved_hashes
+                )
+                or not isinstance(context_hashes, list)
+                or len(context_hashes) != len(approved_hashes)
+                or any(
+                    not _is_sha256(str(value or ""))
+                    for value in context_hashes
+                )
+                or not isinstance(submission_sequences, list)
+                or len(submission_sequences) != len(approved_hashes)
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 1
+                    for value in submission_sequences
+                )
+            ):
+                return False, "controller decision/submission binding is invalid"
+            terminal_outcome_hashes = controller_observation.get(
+                "terminal_outcome_hashes"
+            )
+            if (
+                not isinstance(terminal_outcome_hashes, list)
+                or not terminal_outcome_hashes
+                or any(
+                    not _is_sha256(str(value or ""))
+                    for value in terminal_outcome_hashes
+                )
+            ):
+                return False, "controller terminal outcome binding is invalid"
+            runtime_events = (
+                raw_observation.get("runtime_events")
+                if isinstance(raw_observation, Mapping)
+                else None
+            )
+            verified_postcondition = (
+                raw_observation.get("verified_postcondition")
+                if isinstance(raw_observation, Mapping)
+                else None
+            )
+            if not isinstance(runtime_events, list) or not isinstance(
+                verified_postcondition,
+                Mapping,
+            ):
+                return False, "PTY controller observation payload is incomplete"
+            exact_bindings = {
+                "turn_index": turn.turn_index,
+                "edge_key": str(artifact.get("edge_key") or ""),
+                "previous_response_hash": turn_payload.get(
+                    "source_previous_response_hash"
+                ),
+                "user_message_hash": turn_payload.get(
+                    "source_user_message_hash"
+                ),
+                "agent_response_hash": turn_payload.get(
+                    "source_agent_response_hash"
+                ),
+                "runtime_event_payload_hashes": [
+                    str(item.get("runtime_event_payload_hash") or "")
+                    for item in runtime_events
+                    if isinstance(item, Mapping)
+                ],
+                "terminal_runtime_event_id": str(
+                    (
+                        runtime_events[-1]
+                        if runtime_events
+                        and isinstance(runtime_events[-1], Mapping)
+                        else {}
+                    ).get("runtime_event_id")
+                    or ""
+                ),
+                "terminal_runtime_event_sequence": (
+                    (
+                        runtime_events[-1]
+                        if runtime_events
+                        and isinstance(runtime_events[-1], Mapping)
+                        else {}
+                    ).get("runtime_event_sequence")
+                ),
+                "verified_postcondition_hash": content_hash(
+                    verified_postcondition
+                ),
+                "turn_observation_hash": content_hash(raw_observation),
+                "candidate_artifact_hash": str(
+                    artifact.get("artifact_hash") or ""
+                ),
+            }
+            if any(
+                controller_observation.get(name) != value
+                for name, value in exact_bindings.items()
+            ):
+                return False, "PTY artifact differs from controller-owned observation"
+
     selection_payload = artifact.get("dynamic_selection")
     if evidence_class == "dynamic_dual_ai":
         if not isinstance(selection_payload, Mapping):
@@ -1115,6 +3142,13 @@ def validate_pty_cli_evidence_artifact(
         return False, "PTY evidence has no turn observation"
     try:
         observation = _turn_observation_from_payload(raw_observation)
+        if any(event.schema_version != 6 for event in observation.runtime_events):
+            return False, "qualifying PTY evidence has a legacy runtime event"
+        if any(
+            not _runtime_event_payload_hash_is_valid(event)
+            for event in observation.runtime_events
+        ):
+            return False, "qualifying PTY runtime payload hash is invalid"
         _validate_turn_observation(
             observation,
             edge=edge,
@@ -1126,6 +3160,34 @@ def validate_pty_cli_evidence_artifact(
         return False, f"invalid turn observation: {exc}"
     if content_hash(raw_observation) != str(artifact.get("turn_observation_hash") or ""):
         return False, "turn observation hash mismatch"
+    sensitive_turn = _pending_contract_is_sensitive(
+        observation.pending_contract
+    )
+    expected_source_hashes = {
+        "source_previous_response_hash": content_hash(
+            turn.previous_agent_response
+        ),
+        "source_user_message_hash": (
+            _sensitive_event_hash(identity={
+                "edge_key": str(edge.get("edge_key") or ""),
+                "session_id": turn.session_id,
+                "turn_index": turn.turn_index,
+                "question_id": str(
+                    observation.pending_contract.get("id") or ""
+                ),
+            })
+            if sensitive_turn
+            else content_hash(turn.user_message)
+        ),
+        "source_agent_response_hash": content_hash(turn.agent_response),
+    }
+    if any(
+        turn_payload.get(name) != expected
+        for name, expected in expected_source_hashes.items()
+    ):
+        return False, "PTY source boundary hash is not content-derived"
+    if _contains_owning_secret_reference(artifact):
+        return False, "PTY evidence contains an owning secret capability"
 
     outcome = str(artifact.get("outcome") or "")
     try:
@@ -1144,6 +3206,24 @@ def validate_pty_cli_evidence_artifact(
     if content_hash(evidence_payload) != evidence_id:
         return False, "evidence id mismatch"
     return True, ""
+
+
+def validate_pty_cli_candidate_artifact(
+    artifact: Mapping[str, Any],
+    *,
+    edge: Mapping[str, Any],
+    revision: Mapping[str, str],
+    controller_context: Mapping[str, Any] | None = None,
+) -> tuple[bool, str]:
+    """Validate an unsigned worker candidate before controller admission."""
+
+    return validate_pty_cli_evidence_artifact(
+        artifact,
+        edge=edge,
+        revision=revision,
+        expected_controller_context=controller_context,
+        _candidate_only=True,
+    )
 
 
 def _validate_real_cli_provenance(
@@ -1279,6 +3359,12 @@ def _turn_observation_payload(observation: TurnObservation) -> dict[str, Any]:
     ]
     payload["verified_postcondition"] = postcondition
     return payload
+
+
+def turn_observation_payload(observation: TurnObservation) -> dict[str, Any]:
+    """Return the canonical public serialization for a turn observation."""
+
+    return _turn_observation_payload(observation)
 
 
 def _turn_observation_from_payload(payload: Mapping[str, Any]) -> TurnObservation:
@@ -2254,6 +4340,38 @@ def validate_evidence_artifact(
     expected_diff = state_diff_between(before, after)
     if dict(turn.get("state_diff") or {}) != expected_diff:
         return False, "recorded state diff is not reproducible"
+    sensitive_manual_input = (
+        str(edge.get("edge_type") or "") == "manual_input"
+        and _pending_contract_is_sensitive(question)
+    )
+    expected_source_input_hash = (
+        _sensitive_event_hash(identity={
+            "edge_key": str(edge.get("edge_key") or ""),
+            "scenario_id": str(artifact.get("scenario_id") or ""),
+            "question_id": str(question.get("id") or ""),
+        })
+        if sensitive_manual_input
+        else content_hash(turn.get("input"))
+    )
+    expected_source_boundary_hashes = {
+        "before_hash": content_hash(before),
+        "input_hash": expected_source_input_hash,
+        "question_hash": content_hash(question),
+        "after_hash": content_hash(after),
+        "state_diff_hash": content_hash(_evidence_projection(expected_diff)),
+        "response_hash": content_hash(
+            _evidence_projection(list(turn.get("response") or ()))
+        ),
+        "next_question_hash": content_hash(
+            _evidence_projection(dict(turn.get("next_question") or {}))
+        ),
+    }
+    if str(artifact.get("source_input_hash") or "") != expected_source_input_hash:
+        return False, "compiled-graph source input hash is not content-derived"
+    if dict(source_boundary_hashes) != expected_source_boundary_hashes:
+        return False, "compiled-graph source boundary hashes are not reproducible"
+    if _contains_owning_secret_reference(artifact):
+        return False, "compiled-graph evidence contains an owning secret capability"
     raw_expected_admitted = edge.get("expected_admitted")
     expected_admitted = True if raw_expected_admitted is None else bool(raw_expected_admitted)
     expected_action = _action_admission(
@@ -2288,8 +4406,15 @@ def validate_evidence_artifact(
         if context and expected_admitted:
             if context.get("kind") != "pending":
                 return False, "compiled turn did not admit the pending-question path"
-            if context.get("text") != str(turn.get("input") or "").strip():
-                return False, "turn context input mismatch"
+            input_reason = _validate_admitted_turn_context_input(
+                artifact,
+                edge,
+                turn,
+                question,
+                context,
+            )
+            if input_reason:
+                return False, input_reason
             if dict(context.get("pending_snapshot") or {}) != dict(question):
                 return False, "turn context question snapshot mismatch"
         if not expected_admitted:
@@ -2317,19 +4442,26 @@ def load_valid_evidence_reference(
     *,
     edge: Mapping[str, Any],
     revision: Mapping[str, str],
+    trusted_public_key_b64: str = "",
+    expected_controller_context: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, str]:
     path = Path(reference)
-    try:
-        artifact = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        return None, f"cannot load evidence artifact: {exc}"
-    if not isinstance(artifact, dict):
-        return None, "evidence artifact is not an object"
+    if path.with_suffix(".admitted").is_dir():
+        try:
+            artifact, _authority, _digest = _load_pty_admitted_bundle(path)
+        except ValueError as exc:
+            return None, str(exc)
+    else:
+        try:
+            artifact = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return None, f"cannot load evidence artifact: {exc}"
+        if not isinstance(artifact, dict):
+            return None, "evidence artifact is not an object"
     if artifact.get("artifact_type") == "pty_cli_turn":
-        valid, reason = validate_pty_cli_evidence_artifact(
-            artifact,
-            edge=edge,
-            revision=revision,
+        return (
+            None,
+            "PTY evidence qualifies only as a validated shard-bundle member",
         )
     elif artifact.get("artifact_type") == "real_execution":
         valid, reason = validate_real_execution_evidence_artifact(
@@ -4050,6 +6182,37 @@ def _action_admission(
             },
         }
     return {}
+
+
+def _validate_admitted_turn_context_input(
+    artifact: Mapping[str, Any],
+    edge: Mapping[str, Any],
+    turn: Mapping[str, Any],
+    question: Mapping[str, Any],
+    context: Mapping[str, Any],
+) -> str:
+    recorded_input = str(turn.get("input") or "").strip()
+    context_text = str(context.get("text") or "")
+    sensitive_manual_input = (
+        str(edge.get("edge_type") or "") == "manual_input"
+        and bool(
+            question.get("sensitive_input")
+            or question.get("secret_reentry_binding")
+        )
+    )
+    if not sensitive_manual_input:
+        return (
+            "turn context input mismatch"
+            if context_text != recorded_input
+            else ""
+        )
+    if recorded_input != SENSITIVE_INPUT_MARKER:
+        return "sensitive turn input is not structurally projected"
+    if not context_text.startswith("secret-reference-hash:"):
+        return "sensitive turn context has no projected reference identity"
+    if "semantic-secret:" in canonical_json(turn):
+        return "sensitive turn evidence contains an owning secret capability"
+    return ""
 
 
 def _validate_return_event(

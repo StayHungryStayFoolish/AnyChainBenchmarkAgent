@@ -270,6 +270,120 @@ def _response_receipt(turn_index, language):
 
 
 class ProductChaosObligationCatalogTest(unittest.TestCase):
+    def test_subject_group_and_workflow_path_must_coexist_in_one_event(
+        self,
+    ) -> None:
+        definition = FORMAL_JOURNEY_VERIFIER_REGISTRY.definitions[
+            "subject_group_path_coherent"
+        ]
+        transition = {
+            "group": "chain_auxiliary_endpoints",
+            "before": "in_progress",
+            "after": "completed",
+        }
+        real_event = _event(
+            1,
+            actions=("change_group",),
+            receipts=(_domain_commit(
+                1,
+                ("active_group",),
+                owner="coordinator",
+                navigation="change_group",
+                origin="opening",
+                target="chain_auxiliary_endpoints",
+                group_state_transitions=(transition,),
+            ),),
+            material=("active_group",),
+            values={
+                "workflow_mode": "rpc_benchmark",
+                "target_mode": "real-node",
+            },
+            active_group="chain_auxiliary_endpoints",
+        )
+        context = _factor_context(
+            "subject_group",
+            subject_group="chain_auxiliary_endpoints",
+            events=(real_event,),
+        )
+        schedule = SimpleNamespace(
+            start_scenario="opening",
+            subject_group="chain_auxiliary_endpoints",
+            allowed_risk_factors=(
+                "workflow_mode:real",
+                "chain_case:known",
+                "subject_group:chain_auxiliary_endpoints",
+            ),
+        )
+        coherent = definition.verifier(JourneyVerifierContext(
+            **{
+                **context.__dict__,
+                "schedule": schedule,
+                "evaluating_postcondition_id": (
+                    "subject_group_path_coherent"
+                ),
+            }
+        ))
+        self.assertTrue(coherent.satisfied, coherent.details)
+
+        sync_group_event = _event(
+            1,
+            actions=("change_group",),
+            receipts=(_domain_commit(
+                1,
+                ("active_group",),
+                owner="coordinator",
+                navigation="change_group",
+                origin="opening",
+                target="chain_auxiliary_endpoints",
+                group_state_transitions=(transition,),
+            ),),
+            material=("active_group",),
+            values={
+                "workflow_mode": "sync_observe",
+                "target_mode": "sync-observe",
+            },
+            active_group="chain_auxiliary_endpoints",
+        )
+        later_fake_event = _event(
+            2,
+            actions=("choose_target_mode",),
+            receipts=(_domain_commit(
+                2,
+                ("workflow_mode", "target_mode"),
+                owner="chain_rpc",
+            ),),
+            material=("workflow_mode", "target_mode"),
+            values={
+                "workflow_mode": "rpc_benchmark",
+                "target_mode": "fake-node",
+            },
+            active_group="target_mode",
+        )
+        split_context = _factor_context(
+            "subject_group",
+            subject_group="chain_auxiliary_endpoints",
+            events=(sync_group_event, later_fake_event),
+        )
+        fake_schedule = SimpleNamespace(
+            start_scenario="opening",
+            subject_group="chain_auxiliary_endpoints",
+            allowed_risk_factors=(
+                "workflow_mode:fake",
+                "chain_case:known",
+                "subject_group:chain_auxiliary_endpoints",
+            ),
+        )
+        split = definition.verifier(JourneyVerifierContext(
+            **{
+                **split_context.__dict__,
+                "schedule": fake_schedule,
+                "evaluating_postcondition_id": (
+                    "subject_group_path_coherent"
+                ),
+            }
+        ))
+        self.assertFalse(split.satisfied, split.details)
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.rows = build_product_chaos_obligations(revision=REVISION)

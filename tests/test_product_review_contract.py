@@ -65,7 +65,7 @@ class ProductReviewContractTest(unittest.TestCase):
             "migration.json",
             "migration_cutoff",
             {
-                "current_schema_version": 18,
+                "current_schema_version": 23,
                 "minimum_supported_schema_version": 12,
                 "legacy_fixture_count": 3,
                 "accepted_legacy_fixture_count": 0,
@@ -78,16 +78,16 @@ class ProductReviewContractTest(unittest.TestCase):
                                 "quarantined"
                                 if version <= 11
                                 else "migrated"
-                                if version <= 17
+                                if version <= 22
                                 else "current"
-                                if version == 18
+                                if version == 23
                                 else "rejected-future"
                             )
                         ),
                         "outcome": "passed",
                         "evidence_path": str(self.migration_check),
                     }
-                    for version in range(1, 20)
+                    for version in range(1, 25)
                 ],
             },
         )
@@ -222,11 +222,11 @@ class ProductReviewContractTest(unittest.TestCase):
                     }],
                 },
                 "migration": {
-                    "current_schema_version": 18,
+                    "current_schema_version": 23,
                     "quarantine_versions": list(range(1, 12)),
-                    "migrate_versions": list(range(12, 18)),
-                    "current_versions": [18],
-                    "future_version_probe": 19,
+                    "migrate_versions": list(range(12, 23)),
+                    "current_versions": [23],
+                    "future_version_probe": 24,
                 },
                 "external_capabilities": [{
                     "capability_id": "gemini.google_search",

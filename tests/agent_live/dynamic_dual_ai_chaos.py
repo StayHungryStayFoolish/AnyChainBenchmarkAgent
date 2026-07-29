@@ -58,6 +58,7 @@ from tests.agent_live.coverage_evidence import (
     verify_runtime_postcondition,
     write_evidence_artifact,
     write_pty_diagnostic_artifact,
+    remove_pty_artifact_pair,
 )
 from tests.agent_live.harness_contract_scenarios import (
     canonical_question_contract,
@@ -108,6 +109,35 @@ class SimulatorDecision:
     goal: str
     rationale: str
     target_coverage_ids: tuple[str, ...]
+
+
+class ControllerTurnObserver(Protocol):
+    """Receive authoritative turn facts before candidate evidence is written."""
+
+    def __call__(
+        self,
+        *,
+        edge: Mapping[str, Any],
+        turn: PtyCliTurnRecord,
+        observation: TurnObservation,
+        selection: DynamicTurnSelection,
+        terminal_outcomes: tuple[TerminalOutcomeObservation, ...],
+    ) -> None: ...
+
+
+class ControllerJourneyTurnObserver(Protocol):
+    """Receive one verified Journey turn before candidate serialization."""
+
+    def __call__(
+        self,
+        *,
+        initial_event: RuntimeTurnEvent,
+        turn: PtyCliTurnRecord,
+        baseline_event: RuntimeTurnEvent,
+        committed_event: RuntimeTurnEvent,
+        terminal_outcome: TerminalOutcomeObservation,
+        decision: "JourneyDecisionProvenance",
+    ) -> None: ...
 
 
 class SimulatorTerminalClassification(str, Enum):
@@ -463,6 +493,190 @@ class JourneyOutcomeVerification:
     satisfied: bool
     postconditions: tuple[JourneyPostconditionResult, ...]
     verifier_bindings: tuple[JourneyVerifierBinding, ...]
+
+
+def build_journey_verifier_context(
+    *,
+    schedule: JourneySchedule,
+    initial_event: RuntimeTurnEvent,
+    current_event: RuntimeTurnEvent,
+    turns: Sequence[PtyCliTurnRecord],
+    events: Sequence[RuntimeTurnEvent],
+    decisions: Sequence[JourneyDecisionProvenance],
+    transcript: Sequence[tuple[str, str]],
+    observed_edge_keys: Sequence[str],
+    latest_turn: PtyCliTurnRecord | None,
+) -> JourneyVerifierContext:
+    """Build verifier input from controller-observed immutable facts."""
+
+    return JourneyVerifierContext(
+        schedule=schedule,
+        initial_event=initial_event,
+        current_event=current_event,
+        completed_turns=tuple(turns),
+        transcript=tuple(transcript),
+        observed_edge_keys=tuple(observed_edge_keys),
+        latest_turn=latest_turn,
+        completed_events=tuple(events),
+        completed_decisions=tuple(decisions),
+        verifier_input_contract=dict(schedule.verifier_input_contract),
+    )
+
+
+def verify_journey_outcome(
+    outcome: JourneyOutcomeContract,
+    context: JourneyVerifierContext,
+    registry: JourneyOutcomeVerifierRegistry,
+) -> JourneyOutcomeVerification:
+    """Evaluate one outcome against the frozen named-verifier registry."""
+
+    results: list[JourneyPostconditionResult] = []
+    bindings: list[JourneyVerifierBinding] = []
+    for postcondition_id in outcome.required_postcondition_ids:
+        definition = registry.definitions[postcondition_id]
+        result = definition.verifier(replace(
+            context,
+            evaluating_postcondition_id=postcondition_id,
+        ))
+        if not isinstance(result, JourneyPostconditionResult):
+            raise TypeError(
+                "journey postcondition verifier must return "
+                "JourneyPostconditionResult: "
+                + postcondition_id
+            )
+        if result.postcondition_id != postcondition_id:
+            raise ValueError(
+                "journey postcondition verifier returned the wrong id: "
+                f"expected {postcondition_id}, got {result.postcondition_id}"
+            )
+        results.append(result)
+        bindings.append(JourneyVerifierBinding(
+            postcondition_id=postcondition_id,
+            verifier_id=definition.verifier_id,
+            verifier_version=definition.verifier_version,
+            implementation_hash=definition.implementation_hash,
+        ))
+    return JourneyOutcomeVerification(
+        outcome_id=outcome.outcome_id,
+        satisfied=all(item.satisfied for item in results),
+        postconditions=tuple(results),
+        verifier_bindings=tuple(bindings),
+    )
+
+
+def verify_journey_forbidden_outcomes(
+    schedule: JourneySchedule,
+    context: JourneyVerifierContext,
+    registry: JourneyOutcomeVerifierRegistry,
+) -> tuple[JourneyOutcomeVerification, ...]:
+    """Evaluate every forbidden outcome from the same frozen facts."""
+
+    return tuple(
+        verify_journey_outcome(outcome, context, registry)
+        for outcome in schedule.forbidden_outcomes
+    )
+
+
+def build_journey_turn_result(
+    *,
+    turn: PtyCliTurnRecord,
+    decision: JourneyDecisionProvenance,
+    observed_edges: Sequence[JourneyObservedEdge],
+    terminal: JourneyOutcomeVerification,
+    forbidden: Sequence[JourneyOutcomeVerification],
+) -> dict[str, Any]:
+    """Serialize one turn from independently verified typed facts."""
+
+    return {
+        "turn_index": turn.turn_index,
+        "selected_at_ns": decision.selected_at_ns,
+        "turn_identity": {
+            "transcript_hash": turn.transcript_hash,
+            "before_fingerprint": turn.before_fingerprint,
+            "after_fingerprint": turn.after_fingerprint,
+            "previous_response_received_at_ns": (
+                turn.previous_response_received_at_ns
+            ),
+            "user_message_submitted_at_ns": (
+                turn.user_message_submitted_at_ns
+            ),
+            "agent_response_received_at_ns": (
+                turn.agent_response_received_at_ns
+            ),
+        },
+        "decision": redact({
+            "user_message": turn.user_message,
+            "persona": decision.persona,
+            "mission": decision.mission,
+            "rationale": decision.rationale,
+            "risk_factor_ids": list(decision.risk_factor_ids),
+        }),
+        "decision_provenance": {
+            "execution_id": decision.execution_id,
+            "obligation_id": decision.obligation_id,
+            "broker_request_id": decision.broker_request_id,
+            "previous_response_hash": decision.previous_response_hash,
+            "user_message_hash": decision.user_message_hash,
+            "selected_at_ns": decision.selected_at_ns,
+            "submitted_at_ns": decision.submitted_at_ns,
+            "simulator_context_binding": redact(
+                dict(decision.simulator_context_binding)
+            ),
+            "simulator_attestation": redact(
+                dict(decision.simulator_attestation)
+            ),
+            "variant_attestation": redact(
+                dict(decision.variant_attestation)
+            ),
+        },
+        "observed_edges": [
+            {
+                "edge_key": item.edge_key,
+                "verifier_id": item.verifier_id,
+                "observed_coverage_ids": list(item.observed_coverage_ids),
+                "details": redact(dict(item.details)),
+            }
+            for item in observed_edges
+        ],
+        "terminal_outcome": _journey_outcome_verification_payload(terminal),
+        "forbidden_outcomes": [
+            _journey_outcome_verification_payload(item)
+            for item in forbidden
+        ],
+    }
+
+
+def observe_journey_edges(
+    edge_index: Mapping[str, Mapping[str, Any]],
+    baseline_event: RuntimeTurnEvent,
+    committed_event: RuntimeTurnEvent,
+    turn: PtyCliTurnRecord,
+) -> tuple[JourneyObservedEdge, ...]:
+    """Derive observed Journey edges from typed runtime facts."""
+
+    observed: list[JourneyObservedEdge] = []
+    for edge_key, edge in edge_index.items():
+        if edge.get("applicable") is False:
+            continue
+        try:
+            _require_scheduled_baseline_contract(baseline_event, edge)
+        except RuntimeError:
+            continue
+        verified = verify_runtime_postcondition(
+            edge,
+            baseline_event,
+            committed_event,
+            turn,
+        )
+        if not verified.passed or edge_key not in verified.observed_coverage_ids:
+            continue
+        observed.append(JourneyObservedEdge(
+            edge_key=edge_key,
+            verifier_id=verified.verifier_id,
+            observed_coverage_ids=tuple(verified.observed_coverage_ids),
+            details=dict(verified.details),
+        ))
+    return tuple(observed)
 
 
 class JourneyTerminalClassification(str, Enum):
@@ -2148,6 +2362,7 @@ class DynamicDualAiChaosRunner:
         transport: PtyTransport | None = None,
         event_stream: RuntimeEventStream | None = None,
         terminal_outcome_stream: TerminalOutcomeStream | None = None,
+        controller_turn_observer: ControllerTurnObserver | None = None,
         revision: Mapping[str, str] | None = None,
         clock_ns: Callable[[], int] = time.time_ns,
     ) -> None:
@@ -2200,6 +2415,7 @@ class DynamicDualAiChaosRunner:
                 poll_interval_seconds=config.poll_interval_seconds,
             )
         )
+        self.controller_turn_observer = controller_turn_observer
         self.clock_ns = clock_ns
 
     def run(self) -> ChaosRunResult:
@@ -2242,6 +2458,7 @@ class DynamicDualAiChaosRunner:
         last_complete_event: RuntimeTurnEvent | None = None
         last_complete_turn: PtyCliTurnRecord | None = None
         last_complete_selection: DynamicTurnSelection | None = None
+        last_complete_input_baseline_event: RuntimeTurnEvent | None = None
         active_user_message = ""
 
         self.terminal_outcome_stream.mark_process_start()
@@ -2488,13 +2705,18 @@ class DynamicDualAiChaosRunner:
                 transcript_lines.extend((f"User> {decision.user_message}", response))
                 root_previous_response = previous_response
                 root_committed_event = committed_event
+                root_terminal_outcome = completion.terminal_outcome
                 continuation_events: list[RuntimeTurnEvent] = []
+                continuation_terminal_outcomes: list[
+                    TerminalOutcomeObservation
+                ] = []
                 continuation_turns: list[PtyCliTurnRecord] = []
                 continuation_selections: list[DynamicTurnSelection] = []
                 last_complete_response = response
                 last_complete_event = committed_event
                 last_complete_turn = turn
                 last_complete_selection = selection
+                last_complete_input_baseline_event = baseline_event
                 active_user_message = ""
 
                 pending_diagnostic = build_pty_diagnostic_artifact(
@@ -2507,6 +2729,7 @@ class DynamicDualAiChaosRunner:
                         session_id=self.config.session_id,
                         reason="completed PTY boundary awaiting postcondition verification",
                         last_complete_response=response,
+                        input_baseline_event=last_complete_input_baseline_event,
                         last_complete_event=committed_event,
                         completed_turn=turn,
                         dynamic_selection=selection,
@@ -2517,7 +2740,7 @@ class DynamicDualAiChaosRunner:
                     diagnostic_dir,
                 )
                 try:
-                    verified_postcondition = _verify_declared_postconditions(
+                    verified_postcondition = verify_declared_postconditions(
                         baseline_event,
                         committed_event,
                         turn,
@@ -2525,7 +2748,7 @@ class DynamicDualAiChaosRunner:
                         target_coverage_ids=selection.target_coverage_ids,
                     )
                 except Exception as exc:
-                    pending_diagnostic_path.unlink(missing_ok=True)
+                    remove_pty_artifact_pair(pending_diagnostic_path)
                     verification_error = build_pty_diagnostic_artifact(
                         PtyDiagnosticRecord(
                             diagnostic_kind="failed_attempt",
@@ -2536,6 +2759,7 @@ class DynamicDualAiChaosRunner:
                             session_id=self.config.session_id,
                             reason=f"{type(exc).__name__}: {exc}",
                             last_complete_response=response,
+                            input_baseline_event=last_complete_input_baseline_event,
                             last_complete_event=committed_event,
                             completed_turn=turn,
                             dynamic_selection=selection,
@@ -2714,6 +2938,9 @@ class DynamicDualAiChaosRunner:
                         selected_at_ns=continuation_selected_at_ns,
                     )
                     continuation_events.append(continuation_event)
+                    continuation_terminal_outcomes.append(
+                        continuation_completion.terminal_outcome
+                    )
                     continuation_turns.append(continuation_turn)
                     continuation_selections.append(continuation_selection)
                     turns.append(continuation_turn)
@@ -2726,13 +2953,14 @@ class DynamicDualAiChaosRunner:
                     ))
                     response = continuation_response
                     response_received_ns = continuation_received_ns
+                    last_complete_input_baseline_event = committed_event
                     committed_event = continuation_event
                     last_complete_response = response
                     last_complete_event = committed_event
                     last_complete_turn = continuation_turn
                     last_complete_selection = continuation_selection
                     active_user_message = ""
-                    verified_postcondition = _verify_declared_postconditions(
+                    verified_postcondition = verify_declared_postconditions(
                         baseline_event,
                         root_committed_event,
                         turn,
@@ -2746,7 +2974,7 @@ class DynamicDualAiChaosRunner:
                         "turn observation postcondition did not pass: "
                         + "; ".join(str(item) for item in errors)
                     )
-                    pending_diagnostic_path.unlink(missing_ok=True)
+                    remove_pty_artifact_pair(pending_diagnostic_path)
                     failed_diagnostic = build_pty_diagnostic_artifact(
                         PtyDiagnosticRecord(
                             diagnostic_kind="failed_attempt",
@@ -2757,6 +2985,7 @@ class DynamicDualAiChaosRunner:
                             session_id=self.config.session_id,
                             reason=failure_reason,
                             last_complete_response=response,
+                            input_baseline_event=last_complete_input_baseline_event,
                             last_complete_event=committed_event,
                             completed_turn=last_complete_turn,
                             dynamic_selection=last_complete_selection,
@@ -2779,7 +3008,7 @@ class DynamicDualAiChaosRunner:
                     raise ValueError(
                         failure_reason
                     )
-                pending_diagnostic_path.unlink(missing_ok=True)
+                remove_pty_artifact_pair(pending_diagnostic_path)
                 observation = TurnObservation(
                     seed=self.schedule.seed,
                     revision=self.revision,
@@ -2823,6 +3052,17 @@ class DynamicDualAiChaosRunner:
                         "selection_mode": item.selection_mode,
                     } for item in continuation_selections),
                 )
+                if self.controller_turn_observer is not None:
+                    self.controller_turn_observer(
+                        edge=edge,
+                        turn=turn,
+                        observation=observation,
+                        selection=selection,
+                        terminal_outcomes=(
+                            root_terminal_outcome,
+                            *continuation_terminal_outcomes,
+                        ),
+                    )
                 artifact = build_pty_cli_evidence_artifact(
                     edge=edge,
                     evidence_class="dynamic_dual_ai",
@@ -2933,6 +3173,7 @@ class DynamicDualAiChaosRunner:
                     if (
                         terminal_diagnostic_path is None
                         and last_complete_event is not None
+                        and last_complete_input_baseline_event is not None
                         and last_complete_response
                     ):
                         interruption = build_pty_diagnostic_artifact(
@@ -2945,6 +3186,7 @@ class DynamicDualAiChaosRunner:
                                 session_id=self.config.session_id,
                                 reason=interruption_reason,
                                 last_complete_response=last_complete_response,
+                                input_baseline_event=last_complete_input_baseline_event,
                                 last_complete_event=last_complete_event,
                                 completed_turn=last_complete_turn,
                                 dynamic_selection=last_complete_selection,
@@ -3038,6 +3280,7 @@ class DynamicDualAiJourneyRunner:
         transport: PtyTransport | None = None,
         event_stream: RuntimeEventStream | None = None,
         terminal_outcome_stream: TerminalOutcomeStream | None = None,
+        controller_turn_observer: ControllerJourneyTurnObserver | None = None,
         revision: Mapping[str, str] | None = None,
         clock_ns: Callable[[], int] = time.time_ns,
     ) -> None:
@@ -3097,6 +3340,7 @@ class DynamicDualAiJourneyRunner:
                 poll_interval_seconds=config.poll_interval_seconds,
             )
         )
+        self.controller_turn_observer = controller_turn_observer
         self.clock_ns = clock_ns
 
     def run(self) -> JourneyRunResult:
@@ -3284,6 +3528,18 @@ class DynamicDualAiJourneyRunner:
                     for item in initial_forbidden
                 ],
             }
+            if (
+                self.controller_turn_observer is not None
+                and hasattr(
+                    self.controller_turn_observer,
+                    "observe_initial",
+                )
+            ):
+                self.controller_turn_observer.observe_initial(  # type: ignore[attr-defined]
+                    initial_event=initial_event,
+                    terminal=initial_terminal,
+                    forbidden=initial_forbidden,
+                )
             initial_violation = _satisfied_journey_outcome(initial_forbidden)
             if initial_violation is not None:
                 raise JourneyProductFailure(
@@ -3464,62 +3720,23 @@ class DynamicDualAiJourneyRunner:
                     self.schedule.terminal_outcome,
                     verifier_context,
                 )
-                turn_results.append({
-                    "turn_index": committed_event.turn_index,
-                    "selected_at_ns": selected_at_ns,
-                    "turn_identity": {
-                        "transcript_hash": turn.transcript_hash,
-                        "before_fingerprint": turn.before_fingerprint,
-                        "after_fingerprint": turn.after_fingerprint,
-                        "previous_response_received_at_ns": (
-                            turn.previous_response_received_at_ns
-                        ),
-                        "user_message_submitted_at_ns": (
-                            turn.user_message_submitted_at_ns
-                        ),
-                        "agent_response_received_at_ns": (
-                            turn.agent_response_received_at_ns
-                        ),
-                    },
-                    "decision": redact({
-                        "user_message": decision.user_message,
-                        "persona": decision.persona,
-                        "mission": decision.mission,
-                        "rationale": decision.rationale,
-                        "risk_factor_ids": list(decision.risk_factor_ids),
-                    }),
-                    "decision_provenance": {
-                        "execution_id": decisions[-1].execution_id,
-                        "obligation_id": decisions[-1].obligation_id,
-                        "broker_request_id": decisions[-1].broker_request_id,
-                        "previous_response_hash": decisions[-1].previous_response_hash,
-                        "user_message_hash": decisions[-1].user_message_hash,
-                        "selected_at_ns": decisions[-1].selected_at_ns,
-                        "submitted_at_ns": decisions[-1].submitted_at_ns,
-                        "simulator_context_binding": redact(
-                            dict(decisions[-1].simulator_context_binding)
-                        ),
-                        "simulator_attestation": redact(
-                            dict(decisions[-1].simulator_attestation)
-                        ),
-                        "variant_attestation": redact(
-                            dict(decisions[-1].variant_attestation)
-                        ),
-                    },
-                    "observed_edges": [
-                        {
-                            "edge_key": item.edge_key,
-                            "verifier_id": item.verifier_id,
-                            "observed_coverage_ids": list(item.observed_coverage_ids),
-                            "details": redact(dict(item.details)),
-                        }
-                        for item in observed
-                    ],
-                    "terminal_outcome": _journey_outcome_verification_payload(terminal),
-                    "forbidden_outcomes": [
-                        _journey_outcome_verification_payload(item) for item in forbidden
-                    ],
-                })
+                turn_result = build_journey_turn_result(
+                    turn=turn,
+                    decision=decisions[-1],
+                    observed_edges=observed,
+                    terminal=terminal,
+                    forbidden=forbidden,
+                )
+                if self.controller_turn_observer is not None:
+                    self.controller_turn_observer(
+                        initial_event=initial_event,
+                        turn=turn,
+                        baseline_event=baseline_event,
+                        committed_event=committed_event,
+                        terminal_outcome=completion.terminal_outcome,
+                        decision=decisions[-1],
+                    )
+                turn_results.append(turn_result)
                 violated = _satisfied_journey_outcome(forbidden)
                 if violated is not None:
                     raise JourneyProductFailure(
@@ -3724,45 +3941,20 @@ class DynamicDualAiJourneyRunner:
         outcome: JourneyOutcomeContract,
         context: JourneyVerifierContext,
     ) -> JourneyOutcomeVerification:
-        results: list[JourneyPostconditionResult] = []
-        bindings: list[JourneyVerifierBinding] = []
-        for postcondition_id in outcome.required_postcondition_ids:
-            definition = self.postcondition_verifier_registry.definitions[postcondition_id]
-            result = definition.verifier(replace(
-                context,
-                evaluating_postcondition_id=postcondition_id,
-            ))
-            if not isinstance(result, JourneyPostconditionResult):
-                raise TypeError(
-                    "journey postcondition verifier must return JourneyPostconditionResult: "
-                    + postcondition_id
-                )
-            if result.postcondition_id != postcondition_id:
-                raise ValueError(
-                    "journey postcondition verifier returned the wrong id: "
-                    f"expected {postcondition_id}, got {result.postcondition_id}"
-                )
-            results.append(result)
-            bindings.append(JourneyVerifierBinding(
-                postcondition_id=postcondition_id,
-                verifier_id=definition.verifier_id,
-                verifier_version=definition.verifier_version,
-                implementation_hash=definition.implementation_hash,
-            ))
-        return JourneyOutcomeVerification(
-            outcome_id=outcome.outcome_id,
-            satisfied=all(item.satisfied for item in results),
-            postconditions=tuple(results),
-            verifier_bindings=tuple(bindings),
+        return verify_journey_outcome(
+            outcome,
+            context,
+            self.postcondition_verifier_registry,
         )
 
     def _verify_forbidden_outcomes(
         self,
         context: JourneyVerifierContext,
     ) -> tuple[JourneyOutcomeVerification, ...]:
-        return tuple(
-            self._verify_outcome(outcome, context)
-            for outcome in self.schedule.forbidden_outcomes
+        return verify_journey_forbidden_outcomes(
+            self.schedule,
+            context,
+            self.postcondition_verifier_registry,
         )
 
     def _observe_edges(
@@ -3771,29 +3963,12 @@ class DynamicDualAiJourneyRunner:
         committed_event: RuntimeTurnEvent,
         turn: PtyCliTurnRecord,
     ) -> tuple[JourneyObservedEdge, ...]:
-        observed: list[JourneyObservedEdge] = []
-        for edge_key, edge in self.edge_index.items():
-            if edge.get("applicable") is False:
-                continue
-            try:
-                _require_scheduled_baseline_contract(baseline_event, edge)
-            except RuntimeError:
-                continue
-            verified = verify_runtime_postcondition(
-                edge,
-                baseline_event,
-                committed_event,
-                turn,
-            )
-            if not verified.passed or edge_key not in verified.observed_coverage_ids:
-                continue
-            observed.append(JourneyObservedEdge(
-                edge_key=edge_key,
-                verifier_id=verified.verifier_id,
-                observed_coverage_ids=tuple(verified.observed_coverage_ids),
-                details=dict(verified.details),
-            ))
-        return tuple(observed)
+        return observe_journey_edges(
+            self.edge_index,
+            baseline_event,
+            committed_event,
+            turn,
+        )
 
     def _verifier_context(
         self,
@@ -3807,17 +3982,16 @@ class DynamicDualAiJourneyRunner:
         observed_edge_keys: Sequence[str],
         latest_turn: PtyCliTurnRecord | None,
     ) -> JourneyVerifierContext:
-        return JourneyVerifierContext(
+        return build_journey_verifier_context(
             schedule=self.schedule,
             initial_event=initial_event,
             current_event=current_event,
-            completed_turns=tuple(turns),
-            transcript=tuple(transcript),
-            observed_edge_keys=tuple(observed_edge_keys),
+            turns=turns,
+            events=events,
+            decisions=decisions,
+            transcript=transcript,
+            observed_edge_keys=observed_edge_keys,
             latest_turn=latest_turn,
-            completed_events=tuple(events),
-            completed_decisions=tuple(decisions),
-            verifier_input_contract=dict(self.schedule.verifier_input_contract),
         )
 
     def _validated_decision_attestations(
@@ -4378,7 +4552,7 @@ def _validate_declared_input_class(
             )
 
 
-def _verify_declared_postconditions(
+def verify_declared_postconditions(
     baseline_event: RuntimeTurnEvent,
     committed_event: RuntimeTurnEvent,
     turn: PtyCliTurnRecord,

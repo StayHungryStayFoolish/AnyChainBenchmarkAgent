@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from typing import Any, Callable
 from unittest.mock import Mock, patch
 
+from agent.harness.questions import QUESTION_CONTRACT_VERSION
+
 
 def _state(**updates: Any) -> dict[str, Any]:
     from agent.harness.state import new_state
@@ -561,7 +563,15 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         ) as probe:
             result = invoke_product_graph_turn(state)
 
-        self.assertEqual((result.get("custom_rpc") or {}).get("endpoint"), endpoint)
+        from agent.harness.secret_refs import materialize_state_secret_references
+
+        self.assertEqual(
+            materialize_state_secret_references(
+                (result.get("custom_rpc") or {}).get("endpoint"),
+                result,
+            ),
+            endpoint,
+        )
         self.assertEqual(probe.call_args.kwargs["endpoint"], endpoint)
 
     def test_admitted_semantic_weight_mapping_reaches_domain_as_one_typed_value(self) -> None:
@@ -897,7 +907,8 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         self.assertEqual(migrated["pending_question"], {})
         self.assertTrue(any(
             event.get("event") == "checkpoint_pending_actions_quarantined"
-            and "contract_version 3" in str(event.get("contract_error") or "")
+            and f"contract_version {QUESTION_CONTRACT_VERSION}"
+            in str(event.get("contract_error") or "")
             for event in migrated.get("audit_events") or []
         ))
 
@@ -936,7 +947,8 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
         self.assertEqual(migrated["pending_question"], {})
         self.assertTrue(any(
             event.get("event") == "checkpoint_pending_actions_quarantined"
-            and "contract_version 3" in str(event.get("contract_error") or "")
+            and f"contract_version {QUESTION_CONTRACT_VERSION}"
+            in str(event.get("contract_error") or "")
             for event in migrated.get("audit_events") or []
         ))
 

@@ -98,6 +98,171 @@ class ActionContractAuthorityTest(unittest.TestCase):
             self.assertEqual(rendered[spec.action_type]["required_arguments"], list(spec.required_arguments))
             self.assertEqual(rendered[spec.action_type]["constraints"], list(spec.constraints))
 
+    def test_structured_intake_contract_is_registry_owned_and_projected(self) -> None:
+        from agent.harness.action_registry import ACTION_SPECS
+        from agent.harness.context import action_schema
+
+        rpc_spec = next(
+            spec for spec in ACTION_SPECS
+            if spec.action_type == "rpc_catalog_command"
+        )
+        self.assertEqual(len(rpc_spec.structured_intake), 1)
+        intake = rpc_spec.structured_intake[0]
+        self.assertEqual(intake.alias, "custom_rpc")
+        self.assertEqual(
+            dict(intake.fixed_arguments),
+            {"catalog_command": "enter"},
+        )
+        self.assertEqual(intake.value_semantics, "boolean_true")
+
+        rendered = {
+            item["type"]: item["structured_intake"]
+            for item in action_schema()
+        }
+        self.assertEqual(rendered["rpc_catalog_command"], [{
+            "alias": "custom_rpc",
+            "fixed_arguments": {"catalog_command": "enter"},
+            "value_semantics": "boolean_true",
+        }])
+        self.assertTrue(all(
+            not metadata
+            for action_type, metadata in rendered.items()
+            if action_type != "rpc_catalog_command"
+        ))
+
+    def test_structured_intake_registry_validation_is_centralized(self) -> None:
+        from dataclasses import replace
+        from unittest.mock import patch
+
+        from agent.harness import action_registry
+
+        rpc_spec = next(
+            spec for spec in action_registry.ACTION_SPECS
+            if spec.action_type == "rpc_catalog_command"
+        )
+        intake = rpc_spec.structured_intake[0]
+
+        cases = (
+            (
+                "globally unique",
+                tuple(
+                    replace(
+                        spec,
+                        structured_intake=(
+                            intake,
+                            replace(intake, alias="CUSTOM_RPC"),
+                        ),
+                    )
+                    if spec.action_type == "rpc_catalog_command"
+                    else spec
+                    for spec in action_registry.ACTION_SPECS
+                ),
+            ),
+            (
+                "fixed arguments must be allowed",
+                tuple(
+                    replace(
+                        spec,
+                        structured_intake=(
+                            replace(
+                                intake,
+                                fixed_arguments=(("invented", True),),
+                            ),
+                        ),
+                    )
+                    if spec.action_type == "rpc_catalog_command"
+                    else spec
+                    for spec in action_registry.ACTION_SPECS
+                ),
+            ),
+            (
+                "invalid structured intake value semantics",
+                tuple(
+                    replace(
+                        spec,
+                        structured_intake=(
+                            replace(intake, value_semantics="truthy"),
+                        ),
+                    )
+                    if spec.action_type == "rpc_catalog_command"
+                    else spec
+                    for spec in action_registry.ACTION_SPECS
+                ),
+            ),
+            (
+                "invalid structured intake fixed argument",
+                tuple(
+                    replace(
+                        spec,
+                        structured_intake=(
+                            replace(
+                                intake,
+                                fixed_arguments=(
+                                    ("catalog_command", "not-a-command"),
+                                ),
+                            ),
+                        ),
+                    )
+                    if spec.action_type == "rpc_catalog_command"
+                    else spec
+                    for spec in action_registry.ACTION_SPECS
+                ),
+            ),
+            (
+                "invalid structured intake contract",
+                tuple(
+                    replace(
+                        spec,
+                        structured_intake=(
+                            replace(
+                                intake,
+                                fixed_arguments=(
+                                    ("catalog_command", "set_endpoint"),
+                                ),
+                            ),
+                        ),
+                    )
+                    if spec.action_type == "rpc_catalog_command"
+                    else spec
+                    for spec in action_registry.ACTION_SPECS
+                ),
+            ),
+        )
+        for error, specs in cases:
+            with self.subTest(error=error):
+                with patch.object(action_registry, "ACTION_SPECS", specs):
+                    with self.assertRaisesRegex(RuntimeError, error):
+                        action_registry.validate_action_registry()
+
+    def test_structured_intake_participates_in_registry_identity(self) -> None:
+        from dataclasses import replace
+        from unittest.mock import patch
+
+        from agent.harness import action_registry
+
+        rpc_spec = next(
+            spec for spec in action_registry.ACTION_SPECS
+            if spec.action_type == "rpc_catalog_command"
+        )
+        modified = tuple(
+            replace(
+                spec,
+                structured_intake=(
+                    replace(
+                        rpc_spec.structured_intake[0],
+                        alias="custom_rpc_v2",
+                    ),
+                ),
+            )
+            if spec.action_type == "rpc_catalog_command"
+            else spec
+            for spec in action_registry.ACTION_SPECS
+        )
+        baseline = action_registry.action_registry_contract_hash()
+        with patch.object(action_registry, "ACTION_SPECS", modified):
+            changed = action_registry.action_registry_contract_hash()
+        self.assertNotEqual(baseline, changed)
+
     def test_action_contract_rejects_missing_and_undeclared_arguments(self) -> None:
         from agent.harness.action_registry import validate_action_contract
 

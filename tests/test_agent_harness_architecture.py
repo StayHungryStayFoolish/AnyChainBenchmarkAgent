@@ -14,6 +14,8 @@ from types import SimpleNamespace
 from typing import Any, Callable
 from unittest.mock import Mock, patch
 
+from agent.harness.questions import QUESTION_CONTRACT_VERSION
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DOMAIN_ROOT = REPO_ROOT / "agent" / "harness" / "domains"
@@ -1760,7 +1762,8 @@ class HarnessArchitectureTest(unittest.TestCase):
         )
         self.assertTrue(any(
             event.get("event") == "checkpoint_pending_actions_quarantined"
-            and "contract_version 3" in str(event.get("contract_error") or "")
+            and f"contract_version {QUESTION_CONTRACT_VERSION}"
+            in str(event.get("contract_error") or "")
             for event in migrated["audit_events"]
         ))
 
@@ -1818,7 +1821,8 @@ class HarnessArchitectureTest(unittest.TestCase):
             {"top_level", "resume_context"},
         )
         self.assertTrue(all(
-            "contract_version 3" in str(event.get("contract_error") or "")
+            f"contract_version {QUESTION_CONTRACT_VERSION}"
+            in str(event.get("contract_error") or "")
             for event in events
         ))
 
@@ -2470,6 +2474,57 @@ class HarnessArchitectureTest(unittest.TestCase):
             [item.get("type") for item in result.get("proposed_actions") or []],
             ["clarify_unresolved"],
         )
+
+    def test_semantic_planner_receipt_projects_duplicate_action_types_once(
+        self,
+    ) -> None:
+        from agent.harness.control_receipts import (
+            validate_persisted_domain_control_receipt,
+        )
+        from agent.harness.coordinator import _consume_planner_queue
+
+        text = "What can you do, and how should I start?"
+        state = _state(
+            last_user_input=text,
+            turn_context={"text": text},
+        )
+        queue = {
+            "actions": [
+                {
+                    "type": "clarify_unresolved",
+                    "clauses": ["What can you do?"],
+                    "confidence": "high",
+                },
+                {
+                    "type": "clarify_unresolved",
+                    "clauses": ["How should I start?"],
+                    "confidence": "high",
+                },
+            ],
+            "semantic_units": [
+                {"unit_id": "unit-1", "disposition": "action"},
+                {"unit_id": "unit-2", "disposition": "action"},
+            ],
+            "planner_metrics": {"unit_count": 2},
+            "reason": "two units share one action type",
+        }
+
+        result = _consume_planner_queue(state, queue)
+
+        receipt = next(
+            item
+            for item in result["turn_context"]["control_receipts"]
+            if item.get("receipt_type") == "semantic_planner"
+        )
+        self.assertEqual(
+            receipt["planned_action_types"],
+            ["clarify_unresolved"],
+        )
+        valid, reason = validate_persisted_domain_control_receipt(
+            receipt,
+            turn_index=int(result.get("turn_index") or 0),
+        )
+        self.assertTrue(valid, reason)
 
     def test_clarification_is_a_whole_turn_transaction_barrier(self) -> None:
         from agent.harness.action_registry import validate_action_transaction_contract
@@ -4229,7 +4284,10 @@ class HarnessQuestionContractTest(unittest.TestCase):
                 self.assertEqual(english.get("id"), chinese.get("id"))
                 for language, question in questions.items():
                     assert question is not None
-                    self.assertEqual(question.get("contract_version"), 3)
+                    self.assertEqual(
+                        question.get("contract_version"),
+                        QUESTION_CONTRACT_VERSION,
+                    )
                     self.assertTrue(question.get("options"))
                     for option in question["options"]:
                         action = option.get("action") or {}

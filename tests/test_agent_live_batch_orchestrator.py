@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import os
 import signal
@@ -24,7 +25,18 @@ from tests.agent_live.chaos_scheduler import (
     journey_schedule_payload,
     schedule_payload,
 )
-from tests.agent_live.coverage_evidence import content_hash
+from tests.agent_live.coverage_evidence import (
+    DynamicTurnSelection,
+    PtyCliTurnRecord,
+    RuntimeTurnEvent,
+    TurnObservation,
+    VerifiedPostcondition,
+    content_hash,
+    create_pty_authority_signer,
+    export_pty_authority_private_key,
+    rollback_pty_artifact_admission,
+)
+from tests.agent_live.codex_simulator_bridge import simulator_context_hash
 from tests.agent_live.generate_harness_coverage_ledger import build_ledger
 
 from tests.agent_live.batch_orchestrator import (
@@ -33,12 +45,17 @@ from tests.agent_live.batch_orchestrator import (
     ExternalDecisionBlocked,
     ShardResult,
     TimeoutPolicy,
+    _ControllerTurnLedger,
     _RunState,
+    _approved_submission_bindings,
+    _append_controller_fact,
     _append_discovery_results,
     _classify,
+    _controller_fact_payloads,
     _scan_batch_execution_ids,
     _validate_context_frame,
     _validate_result_frame,
+    _write_immutable_json,
     freeze_batch_manifest,
     load_frozen_manifest,
     run_batch,
@@ -440,8 +457,15 @@ class BatchOrchestratorTests(unittest.TestCase):
         return factory
 
     @staticmethod
-    def _accept_fake_evidence(reference, *, edge, revision):
-        del edge, revision
+    def _accept_fake_evidence(
+        reference,
+        *,
+        edge,
+        revision,
+        trusted_public_key_b64="",
+        expected_controller_context=None,
+    ):
+        del edge, revision, trusted_public_key_b64, expected_controller_context
         return json.loads(Path(reference).read_text(encoding="utf-8")), ""
 
     def test_default_shard_count_and_manifest_tamper_detection(self) -> None:
@@ -461,10 +485,414 @@ class BatchOrchestratorTests(unittest.TestCase):
         self.assertNotIn("super-secret", manifest_path.read_text(encoding="utf-8"))
         loaded = load_frozen_manifest(manifest_path)
         self.assertEqual(loaded.manifest_id, manifest.manifest_id)
+        self.assertFalse(manifest.controller_owned_execution)
+        self.assertNotIn("controller_owned", inspect.signature(run_batch).parameters)
+        controller_manifest = freeze_batch_manifest(
+            repo_root=self.root,
+            targets_dir=self.targets,
+            manifest_path=self.root / ".agent" / "controller-manifest.json",
+            runtime_base=self.root / ".agent" / "controller-runtime",
+            required_env_names=(),
+        )
+        self.assertTrue(controller_manifest.controller_owned_execution)
         os.chmod(self.targets / "01.json", 0o644)
         (self.targets / "01.json").write_text('{"targets": []}', encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "frozen target changed"):
             validate_frozen_manifest(manifest)
+
+    def test_controller_publication_failure_leaves_no_partial_authority(
+        self,
+    ) -> None:
+        authority_path = self.root / ".agent" / "controller-authority.json"
+        with patch(
+            "tests.agent_live.batch_orchestrator.os.link",
+            side_effect=OSError("injected publication interruption"),
+        ):
+            with self.assertRaisesRegex(
+                OSError,
+                "injected publication interruption",
+            ):
+                _write_immutable_json(
+                    authority_path,
+                    {"authority": "controller-owned"},
+                )
+
+        self.assertFalse(authority_path.exists())
+        self.assertEqual(
+            list(authority_path.parent.glob(f".{authority_path.name}.*.tmp")),
+            [],
+        )
+        with patch(
+            "tests.agent_live.batch_orchestrator.os.fsync",
+            side_effect=[
+                None,
+                OSError("injected post-link interruption"),
+                None,
+            ],
+        ):
+            with self.assertRaisesRegex(
+                OSError,
+                "injected post-link interruption",
+            ):
+                _write_immutable_json(
+                    authority_path,
+                    {"authority": "controller-owned"},
+                )
+        self.assertFalse(authority_path.exists())
+        _write_immutable_json(
+            authority_path,
+            {"authority": "controller-owned"},
+        )
+        self.assertFalse(authority_path.stat().st_mode & stat.S_IWUSR)
+
+    def test_controller_submission_binding_skips_runtime_navigation(self) -> None:
+        decision = {
+            "user_message": "回到 QPS 配置",
+            "persona": "operator",
+            "goal": "navigate",
+            "rationale": "response driven",
+            "target_coverage_ids": ["edge"],
+        }
+        context = {
+            "session_id": "session-1",
+            "turn_index": 1,
+            "previous_response_hash": "a" * 64,
+            "previous_response_received_at_ns": 1,
+            "scheduled_target": {
+                "target_id": "target-1",
+                "edge_key": "edge",
+            },
+            "observed_edge_keys": [],
+        }
+        state = _RunState(
+            approved_decisions=[{
+                "sequence": 1,
+                "decision": decision,
+                "decision_hash": content_hash(decision),
+                "context_hash": simulator_context_hash(context),
+                "context": context,
+            }],
+            submitted_inputs=[
+                {
+                    "sequence": 1,
+                    "message": "1",
+                    "message_hash": content_hash("1"),
+                    "source": "controller_runtime",
+                    "approval_sequence": 0,
+                },
+                {
+                    "sequence": 2,
+                    "message": decision["user_message"],
+                    "message_hash": content_hash(decision["user_message"]),
+                    "source": "simulator_decision",
+                    "approval_sequence": 1,
+                },
+            ],
+        )
+
+        bindings = _approved_submission_bindings(
+            state, (decision["user_message"],)
+        )
+
+        self.assertEqual(bindings[0]["decision_hash"], content_hash(decision))
+        self.assertEqual(
+            bindings[0]["context_hash"],
+            simulator_context_hash(context),
+        )
+        self.assertEqual(bindings[0]["submission_sequence"], 2)
+        self.assertEqual(state.observation_submission_cursor, 2)
+
+    def test_controller_submission_binding_rejects_unsubmitted_approval(
+        self,
+    ) -> None:
+        state = _RunState(
+            approved_decisions=[{
+                "sequence": 1,
+                "decision": {"user_message": "missing"},
+                "decision_hash": "d" * 64,
+                "context_hash": "c" * 64,
+            }],
+            submitted_inputs=[{
+                "sequence": 1,
+                "message": "1",
+                "message_hash": content_hash("1"),
+                "source": "controller_runtime",
+                "approval_sequence": 0,
+            }],
+        )
+
+        with self.assertRaisesRegex(ValueError, "unbound decision"):
+            _approved_submission_bindings(state, ("missing",))
+
+        replayed = _RunState(
+            approved_decisions=[
+                {
+                    "sequence": 1,
+                    "decision": {"user_message": "first"},
+                },
+                {
+                    "sequence": 1,
+                    "decision": {"user_message": "replayed"},
+                },
+            ],
+            submitted_inputs=[],
+        )
+        with self.assertRaisesRegex(ValueError, "order is invalid"):
+            _approved_submission_bindings(replayed, ("first",))
+
+    def test_controller_submission_commitment_precedes_secret_projection(
+        self,
+    ) -> None:
+        key = b"k" * 32
+        commitments = []
+        for raw_message in (
+            "https://user:secret-one@example.com",
+            "https://user:secret-two@example.com",
+        ):
+            decision = {
+                "user_message": raw_message,
+                "persona": "operator",
+                "mission": "configure endpoint",
+                "rationale": "response bound",
+                "risk_factor_ids": [],
+            }
+            state = _RunState(
+                approved_decisions=[{
+                    "sequence": 1,
+                    "decision": decision,
+                    "context": {
+                        "session_id": "session-1",
+                        "turn_index": 1,
+                        "previous_response_hash": "a" * 64,
+                        "previous_response_received_at_ns": 1,
+                        "schedule": {"schedule_id": "schedule-1"},
+                        "observed_edge_keys": [],
+                    },
+                }],
+                submitted_inputs=[{
+                    "sequence": 1,
+                    "message": raw_message,
+                    "message_hash": content_hash(raw_message),
+                    "source": "simulator_decision",
+                    "approval_sequence": 1,
+                }],
+            )
+            binding = _approved_submission_bindings(
+                state,
+                ("https://***:***@example.com",),
+                input_commitment_key=key,
+            )[0]
+            serialized = json.dumps(binding, sort_keys=True)
+            self.assertNotIn(raw_message, serialized)
+            commitments.append(
+                binding["submitted_input_commitment"]
+            )
+        self.assertNotEqual(commitments[0], commitments[1])
+
+    def test_controller_submission_identity_disambiguates_equal_secret_projection(
+        self,
+    ) -> None:
+        key = b"k" * 32
+        raw_messages = (
+            "https://user:secret-one@example.com",
+            "https://user:secret-two@example.com",
+        )
+        projected = "https://***:***@example.com"
+        decisions = [
+            {
+                "sequence": index,
+                "decision": {
+                    "user_message": message,
+                    "persona": "operator",
+                    "mission": "configure endpoint",
+                    "rationale": "response bound",
+                    "risk_factor_ids": [],
+                },
+                "context": {
+                    "session_id": "session-1",
+                    "turn_index": index,
+                    "previous_response_hash": f"{index}" * 64,
+                    "previous_response_received_at_ns": index,
+                    "schedule": {"schedule_id": "schedule-1"},
+                    "observed_edge_keys": [],
+                },
+            }
+            for index, message in enumerate(raw_messages, start=1)
+        ]
+        state = _RunState(
+            approved_decisions=decisions,
+            submitted_inputs=[
+                {
+                    "sequence": 2,
+                    "message": raw_messages[0],
+                    "message_hash": content_hash(raw_messages[0]),
+                    "source": "simulator_decision",
+                    "approval_sequence": 1,
+                },
+                {
+                    "sequence": 4,
+                    "message": raw_messages[1],
+                    "message_hash": content_hash(raw_messages[1]),
+                    "source": "simulator_decision",
+                    "approval_sequence": 2,
+                },
+            ],
+        )
+
+        bindings = _approved_submission_bindings(
+            state,
+            (projected, projected),
+            input_commitment_key=key,
+        )
+
+        self.assertEqual(
+            [binding["submission_sequence"] for binding in bindings],
+            [2, 4],
+        )
+        self.assertNotEqual(
+            bindings[0]["submitted_input_commitment"],
+            bindings[1]["submitted_input_commitment"],
+        )
+
+    def test_zero_turn_startup_journey_is_a_complete_decision_ledger(
+        self,
+    ) -> None:
+        state = _RunState()
+        _append_controller_fact(
+            state,
+            lane="journey_initial",
+            fact={
+                "initial_event": {"runtime_event_id": "startup"},
+                "initial_verification": {
+                    "terminal_outcome": {"satisfied": True},
+                    "forbidden_outcomes": [],
+                },
+            },
+        )
+        classification, reason = _classify(
+            SimpleNamespace(controller_owned_execution=True),
+            SimpleNamespace(lane="journey"),
+            state,
+            0,
+            True,
+            {"execution_status": "passed"},
+        )
+        self.assertEqual(classification, "passed")
+        self.assertIn("terminal postconditions", reason)
+
+    def test_controller_callback_deep_freezes_and_chains_mutable_inputs(
+        self,
+    ) -> None:
+        state = _RunState()
+        mutable_edge = {
+            "edge_key": "edge-1",
+            "nested": {"value": "original"},
+        }
+        mutable_pending = {"id": "question-1"}
+        mutable_details = {"result": {"value": "original"}}
+        event = RuntimeTurnEvent(
+            schema_version=6,
+            event_type="turn_committed",
+            thread_id="thread-1",
+            session_purpose="dynamic-dual-ai-chaos",
+            before_fingerprint="a" * 64,
+            after_fingerprint="b" * 64,
+            turn_index=1,
+            active_group="opening",
+            pending_question_id="question-1",
+            action_queue_types=(),
+            pending_contract=mutable_pending,
+            revision=self.revision,
+            runtime_event_id="runtime-1",
+            runtime_event_sequence=1,
+            runtime_event_payload_hash="c" * 64,
+        )
+        turn = PtyCliTurnRecord(
+            session_id="thread-1",
+            turn_index=1,
+            previous_agent_response="before",
+            user_message="select",
+            agent_response="after",
+            provider="deepseek",
+            model="deepseek-chat",
+            before_fingerprint="a" * 64,
+            after_fingerprint="b" * 64,
+            transcript_hash="d" * 64,
+            previous_response_received_at_ns=1,
+            user_message_submitted_at_ns=2,
+            agent_response_received_at_ns=3,
+        )
+        observation = TurnObservation(
+            seed=1,
+            revision=self.revision,
+            target_edge_key="edge-1",
+            target_contract_hash="e" * 64,
+            target_variant_hash="f" * 64,
+            prior_agent_response="before",
+            simulator_decision={"selected_message": "select"},
+            exact_user_turn="select",
+            provider="deepseek",
+            model="deepseek-chat",
+            before_turn_index=0,
+            after_turn_index=1,
+            before_state_fingerprint="a" * 64,
+            after_state_fingerprint="b" * 64,
+            pending_contract=mutable_pending,
+            runtime_events=(event,),
+            verified_postcondition=VerifiedPostcondition(
+                verifier_id="verifier",
+                passed=True,
+                observed_coverage_ids=("edge-1",),
+                admitted_typed_actions=("answer_pending",),
+                state_diff={},
+                next_question_or_result={},
+                details=mutable_details,
+            ),
+        )
+        selection = DynamicTurnSelection(
+            persona="operator",
+            goal="select",
+            selected_message="select",
+            rationale="response-bound",
+            target_coverage_ids=("edge-1",),
+            selected_at_ns=2,
+        )
+
+        _ControllerTurnLedger(state)(
+            edge=mutable_edge,
+            turn=turn,
+            observation=observation,
+            selection=selection,
+            terminal_outcomes=(),
+        )
+        mutable_edge["nested"]["value"] = "mutated"
+        mutable_pending["id"] = "mutated"
+        mutable_details["result"]["value"] = "mutated"
+
+        frozen = _controller_fact_payloads(state, lane="edge")[0]
+        self.assertEqual(frozen["edge"]["nested"]["value"], "original")
+        self.assertEqual(
+            frozen["observation"]["pending_contract"]["id"],
+            "question-1",
+        )
+        self.assertEqual(
+            frozen["observation"]["verified_postcondition"]["details"][
+                "result"
+            ]["value"],
+            "original",
+        )
+        frozen["edge"]["nested"]["value"] = "consumer-mutation"
+        self.assertEqual(
+            _controller_fact_payloads(state, lane="edge")[0]["edge"][
+                "nested"
+            ]["value"],
+            "original",
+        )
+
+        state.controller_turn_facts.append(state.controller_turn_facts[0])
+        with self.assertRaisesRegex(ValueError, "hash chain"):
+            _controller_fact_payloads(state, lane="edge")
+
 
     def test_max_concurrency_is_frozen_validated_and_tamper_evident(self) -> None:
         self._write_targets(4)
@@ -532,7 +960,7 @@ class BatchOrchestratorTests(unittest.TestCase):
         first_wave_ready = asyncio.Event()
         release_first_wave = asyncio.Event()
 
-        async def controlled_run(_manifest, shard, _broker):
+        async def controlled_run(_manifest, shard, _broker, _authority_signer):
             nonlocal active, peak
             active += 1
             peak = max(peak, active)
@@ -1215,6 +1643,12 @@ class BatchOrchestratorTests(unittest.TestCase):
         source_root = Path(__file__).resolve().parents[1]
         environment = os.environ.copy()
         environment["PYTHONPATH"] = str(source_root)
+        authority_read_fd, authority_write_fd = os.pipe()
+        os.write(
+            authority_write_fd,
+            export_pty_authority_private_key(manifest._authority_signer),
+        )
+        os.close(authority_write_fd)
         process = subprocess.Popen(
             (
                 sys.executable,
@@ -1229,13 +1663,17 @@ class BatchOrchestratorTests(unittest.TestCase):
                 str(broker_root),
                 "--decision-timeout",
                 "10",
+                "--authority-key-fd",
+                str(authority_read_fd),
             ),
             cwd=source_root,
             env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            pass_fds=(authority_read_fd,),
         )
+        os.close(authority_read_fd)
         try:
             deadline = time.monotonic() + 8
             request_dir = broker_root / "requests"

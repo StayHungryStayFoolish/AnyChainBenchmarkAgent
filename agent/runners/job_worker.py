@@ -16,6 +16,10 @@ from .artifacts import write_artifact_index
 from .guardrails import build_benchmark_command
 from .job_manager import _discover_completed_artifacts
 from .materialize import benchmark_subprocess_env, load_runtime_env_file
+from .private_files import (
+    atomic_write_private_text,
+    PRIVATE_FILE_MODE,
+)
 from .result_status import classify_benchmark_result
 
 
@@ -39,7 +43,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         env = load_runtime_env_file(runtime_env_file)
         command = plan["execution"]["command"]
-        with log_file.open("w", encoding="utf-8") as handle:
+        log_descriptor = os.open(
+            log_file,
+            os.O_CREAT | os.O_TRUNC | os.O_WRONLY,
+            PRIVATE_FILE_MODE,
+        )
+        os.fchmod(log_descriptor, PRIVATE_FILE_MODE)
+        with os.fdopen(log_descriptor, "w", encoding="utf-8") as handle:
             handle.write(f"[anychain-agent] detached worker pid={os.getpid()} started at {_now()}\n")
             handle.flush()
             completed = subprocess.run(
@@ -74,7 +84,10 @@ def _read_json(path: str | Path) -> dict:
 
 
 def _write_json(path: str | Path, payload: dict) -> None:
-    Path(path).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    atomic_write_private_text(
+        path,
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+    )
 
 
 def _now() -> str:

@@ -45,7 +45,7 @@ LangGraph Harness 是唯一的对话与 workflow 控制平面：
 -> 通过 graph transition 继续处理已 admission 的工作
 -> canonical fallback
 -> 每轮最多一个 blocking question
--> 校验并 checkpoint schema version 18
+-> 校验并 checkpoint schema version 23
 ```
 
 任意手动输入值、自然语言、multi-intent prose 或需要语义归属的结构化内容都
@@ -97,8 +97,11 @@ control action。它不拥有 `GroupSpec`，不是第 9 个 domain owner。
 关键实现职责：
 
 - `graph.py`：唯一 checkpointer-backed LangGraph runtime；
-- `coordinator.py`：graph transition 与唯一 typed commit boundary；
-- `hierarchical_planner.py`：唯一语义规划入口；
+- `coordinator.py`：graph transition、唯一语义路由权威与唯一 typed commit
+  boundary；
+- `hierarchical_planner.py`：唯一通用语义规划器；
+- `bounded_semantic_lane.py`：有限目录语义 mapper，不拥有通用路由、状态修改或
+  commit 权限；
 - `semantic_admission.py`：不可变 semantic document 的准备与校验；
 - `admission.py`：action、冲突、前置条件和 coverage 校验；
 - `queue.py`：依赖安全排序和 pending barrier；
@@ -112,11 +115,18 @@ control action。它不拥有 `GroupSpec`，不是第 9 个 domain owner。
 
 runtime 只能编译一个带 SQLite checkpointer 的 graph。禁止第二个
 uncheckpointed turn graph，禁止在一个 Python node 中 drain 完整 durable
-queue。checkpoint schema version 18 是当前契约：v12 是隔离 migration
+queue。checkpoint schema version 23 是当前契约：v12 是隔离 migration
 边界，v13 迁移 deferred queue retention，v14/v15 初始化 typed response，
 v16 增加显式 pending owner 与 Chain/RPC case context，v17 增加
 checkpointed semantic planning，v18 移除持久化的 turn-local response
-文本与旧 response manifest。旧 state 必须 fail closed、迁移或 quarantine。
+文本与旧 response manifest，v19 增加不可执行的 semantic draft 边界并清除
+不兼容的 in-flight draft，v20 绑定 Product Head 与 contract authority，
+v21 增加 atom 级 evidence、secret reference 和原子 finalization，v22 增加
+durable-state secret-binding registry，v23 增加签名 sensitivity、salted
+memory-hard verifier、与 Product Head 同事务的 registry，以及
+reference-only durable plan。v21 的原始凭据/reference 与 v22 的旧
+binding/reference 必须 quarantine；当前版本缺失 secret 时使用 question
+contract v6 重录入。旧 state 必须 fail closed、迁移或 quarantine。
 
 ## 历史问题迁移
 
@@ -205,6 +215,23 @@ Codex 必须先读取本轮真实 Agent response，再决定下一轮输入。�
 与状态权威。Phase 8 接收下级 provider 生成的 revision-bound evidence，但
 不自己伪造 conversation 或 job。
 
+PTY worker 只持久化 candidate JSON。worker 启动前，不可变 batch manifest
+冻结 Ed25519 公钥信任根；私钥只在 batch controller 内存中生成，不写入共享
+文件系统或环境变量。跨 controller 子进程时只通过继承 pipe descriptor 传递，
+并在 worker 启动前关闭。controller 将 candidate 与冻结的 shard、schedule、
+target、revision 和 runtime boundary 独立校验后，才签发 authority receipt。
+已接纳 artifact 快照、receipt 与 commit marker 作为一个不可变 `.admitted`
+目录原子发布；缺失、陈旧、部分发布或
+由其他密钥签发的组合全部 fail closed。验证还会重新推导投影后的 source hash，
+并拒绝 Mapping key 或 value 中的旧 runtime event 与 owning secret capability。
+batch result 绑定已提交 bundle 摘要和公钥信任根；evidence 转换还必须由
+orchestrator 显式传入该 trust-root ID，manifest 不能自行指定可信身份。
+artifact 内部 self-hash 永远不能充当 source authority。
+completed-batch source 只捕获一次转换所需 runtime 文件，后续转换只消费该
+只读快照。产品证据记录原始 source path 与快照 hash，但后续 admission 不再
+重读可变 runtime 文件。G3/G4 只公开 `evidence-batch` 转换命令；standalone
+runtime-root 转换不能形成合格证据。
+
 固定分母：
 
 - G3：60 个 retained-regression obligation；
@@ -251,11 +278,16 @@ transcript、local coverage ledger、cache 或开发 key。
 PYTHONDONTWRITEBYTECODE=1 python3 tests/run_offline_python_suite.py
 python3 tools/check_agent_boundaries.py --root .
 git diff --check
-python3 tests/agent_live/run_product_acceptance.py --through-phase 8
+python3 tests/agent_live/run_product_acceptance.py --through-phase 8 \
+  --g3-authority-trust-root-id "$G3_AUTHORITY_TRUST_ROOT_ID" \
+  --g4-round-1-authority-trust-root-id "$G4_ROUND_1_AUTHORITY_TRUST_ROOT_ID" \
+  --g4-round-2-authority-trust-root-id "$G4_ROUND_2_AUTHORITY_TRUST_ROOT_ID"
 ```
 
 单元测试或脚本 transcript 不能单独证明产品完成。必须补充动态
 DeepSeek-backed conversation 与 4 个真实 execution lane。
+三个 trust-root ID 必须来自冻结对应 batch 的 controller，禁止从当前待接纳
+的 evidence manifest 中反向读取并自证。
 
 ## 修复规则
 

@@ -213,6 +213,33 @@ class BoundedSemanticLaneTest(unittest.TestCase):
         self.assertEqual(action["answer"], "100")
         self.assertNotIn("selected_value", action)
 
+    def test_free_form_scalar_token_escalates_to_hierarchical_authority(self):
+        from agent.harness.bounded_semantic_lane import (
+            build_candidate_catalog,
+            compile_bounded_semantic_value,
+        )
+
+        state = {
+            "pending_question": {
+                "id": "CLOUD_REGION",
+                "group": "provider_deployment",
+                "owner": "environment",
+                "kind": "manual_value",
+                "manual_input_allowed": True,
+                "validation": {"value_type": "scalar_token"},
+            }
+        }
+        provider = _Provider()
+
+        self.assertFalse(any(
+            row["source_kind"] == "pending_manual"
+            for row in build_candidate_catalog(state, "back")
+        ))
+        self.assertIsNone(
+            compile_bounded_semantic_value(state, "back", provider=provider)
+        )
+        self.assertEqual(provider.requests, [])
+
     def test_registered_value_materializes_registry_action_and_required_explicitness(self):
         from agent.harness.bounded_semantic_lane import (
             build_candidate_catalog,

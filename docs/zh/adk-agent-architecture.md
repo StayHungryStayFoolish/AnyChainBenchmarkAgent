@@ -111,6 +111,18 @@ whole-plan semantic admission。其后的 `admit` 是不同的信任边界：在
 进入 durable queue 前，确定性校验 action schema、provenance、冲突、前置条件、
 pending-question contract 和 queue eligibility。
 
+当原子化后的 turn 仍有精确 DemandAtom 无法解析时，`review_plan` 可以创建一个
+持久但不可执行的 `SemanticPlanDraft`。其中已通过本地校验的 candidate 只是证据，
+不是 admitted action，不能进入 benchmark 配置、group readiness 或
+`action_queue`。coordinator 每次只询问一个绑定 draft revision 与 atom identity
+的问题。最后一个 atom 解决后，Harness 恢复原始 pending contract 和 active
+group，带着 resolution evidence 重新编译完整原始输入，再次执行 coverage、
+whole-plan review 和确定性 admission；本次新 admission 的每个 envelope 都携带
+同一份 finalization receipt。session、schema、registry、pending contract 或
+workflow precondition 发生变化都会使 draft 失效；reset/cancel 不得提交其中的
+candidate。外部执行必须由后续独立 turn 重新授权，不能从 draft finalization
+获得授权。
+
 持久化 semantic-partition receipt 必须把 `planning_lane` 明确记录为
 `bounded_semantic_value` 或 `hierarchical`。生产者、runtime-event validator、
 retained-regression verifier 和审计导出共用同一严格 schema；lane 缺失或未知时
@@ -231,16 +243,19 @@ blocked startup session 必须使用 terminal protocol 的封闭
 
 - `admission.py` 在 action 持久化前校验 proposal、冲突、前置条件和 semantic
   coverage；
-- `hierarchical_planner.py` 是唯一产品语义规划入口；Stage A 对完整 turn
-  分区并分配受限 owner/group route，Stage B 使用 owner-scoped schema 编译
-  action，随后执行 whole-plan admission；
+- `coordinator.py` 是唯一产品语义路由权威；它在精确 deterministic 处理、
+  finite-catalog bounded semantic mapping 与通用 hierarchical planner 之间
+  选择，但不创建第二条 commit 路径；
+- `hierarchical_planner.py` 是唯一通用语义规划器；Stage A 对完整 turn 分区并
+  分配受限 owner/group route，Stage B 使用 owner-scoped schema 编译 action，
+  随后执行 whole-plan admission；
 - `semantic_admission.py` 在 owner-scoped 编译后准备并校验不可变的 semantic
   document；它不暴露 planner 入口，也不选择 provider；checkpointed
   `review_plan` transition 会为受限的 whole-plan semantic review 提供当前配置的
   provider；
 - `bounded_semantic_lane.py` 只负责 finite-catalog、source-anchored semantic
   mapping 及其不可变 evidence receipt；它不拥有通用 intent routing 或状态修改
-  权限；
+  权限，也不能绕过 whole-plan admission；
 - `turn_transactions.py` 持有 logical Product Head、隔离 physical attempt、
   reconciliation 和 terminal outbox；
 - `terminal_protocol.py` 持有版本化非敏感 terminal projection schema 与 durable
@@ -336,16 +351,36 @@ flowchart TD
 先前答案，Harness 必须更新或失效受影响的 group state，并通过确定性工具重新
 生成下游 runtime 产物。
 
-checkpoint state 当前使用 schema version 18。当前版本的新 turn 绝不调用 legacy
+checkpoint state 当前使用 schema version 23。当前版本的新 turn 绝不调用 legacy
 action compiler。version 12 checkpoint 只通过明确的 migration boundary；version 13
 会把 deferred queue 保留语义迁移到 typed pending-question contract；version 14
 初始化 typed response fragments，并持久化为 version 15；version 16 物化显式的
 pending-question owner 与类型化 Chain/RPC case context；version 17 引入可
 checkpoint 的 `semantic_planning` contract；version 18 则淘汰持久化的 turn-local
-response 文本与 manifest，统一由当前 response authority 负责。迁移到 version 18
-时，不会恢复使用旧 contract 编译到一半的 owner cursor 或 response contract，而是
-清除不兼容的 in-flight planning/response scratch，同时保留兼容的 durable
-workflow state。
+response 文本与 manifest，统一由当前 response authority 负责；version 19 引入
+coordinator 持有的 `SemanticPlanDraft`。迁移到 version 19 时，不会恢复使用旧
+contract 编译到一半的 owner cursor、draft-bound question 或 response contract，
+而是清除不兼容的 in-flight planning、draft 和 response scratch，同时保留兼容的
+durable workflow state。version 20 进一步把 draft 的创建与 finalization receipt
+绑定到真实 Product Head checkpoint lineage，以及当前 group、action、question
+三类 contract authority。version 19 的 draft 因无法证明这些绑定而在迁移时失效；
+version 20 draft 若跨越任何 contract authority 变化，也必须先标记为 stale，不能
+在新 registry 下进入 admission。version 21 增加 atom 级 semantic evidence、
+不透明 secret reference、带签名的 question 调度字段和原子 finalization
+receipt；未完成的 version 20 finalization transaction 必须整体 quarantine。
+version 22 增加 durable-state secret-binding registry。version 23 将敏感性纳入
+group/question 签名契约，使用带 salt 的 memory-hard secret verifier，并让进程内
+registry 变更与 Product Head commit 同事务。checkpoint 与 durable execution
+plan 只能保存 reference 与 verifier。敏感的完整标量答案必须在进入 LLM 和首次
+checkpoint 前投影为不透明 reference；复合输入中的确定性 typed candidate（例如
+endpoint URL 和结构化凭据）分别投影，从而保留同轮其他需求供 semantic planning
+处理；声明的编号与 Y/N 选项仍是普通 contract value，不作为 secret。明文只允许在
+job-local invocation 边界短暂物化。job 目录权限为 `0700`，secret-capable 文件为
+`0600`。runtime cleanup
+必须使用缓存 ownership index，且失败可观察、幂等、可重试。当前版本若明文缺失，
+必须安装符合 question contract v6 的精确重录入问题。version 21 中的原始凭据或
+reference，以及 version 22 中旧 verifier 对应的 binding/reference，必须整体
+quarantine，不能猜测恢复。
 更老的 checkpoint 必须进入 quarantine：仅允许列入白名单的环境事实供
 用户重新确认，旧 pending action 或通过文件路径猜测出的 plan 绝不能恢复为可执行任务。
 

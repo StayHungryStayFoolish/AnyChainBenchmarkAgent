@@ -8,6 +8,10 @@ import shlex
 from pathlib import Path
 from typing import Any
 
+from agent.runners.private_files import (
+    atomic_write_private_text,
+    ensure_private_directory,
+)
 
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -59,8 +63,7 @@ def build_runtime_env(plan: dict[str, Any]) -> dict[str, str]:
 
 def materialize_runtime_env(plan: dict[str, Any], run_dir: str | Path) -> str:
     """Write a sourceable runtime env file and return its path."""
-    run_dir = Path(run_dir)
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = ensure_private_directory(run_dir)
     path = run_dir / "runtime.env"
     env = build_runtime_env(plan)
     override_path = _materialize_chain_config_override(plan, run_dir)
@@ -72,7 +75,7 @@ def materialize_runtime_env(plan: dict[str, Any], run_dir: str | Path) -> str:
     ]
     for key in sorted(env):
         lines.append(f"export {key}={_shell_quote(env[key])}")
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    atomic_write_private_text(path, "\n".join(lines) + "\n")
     return str(path)
 
 
@@ -110,5 +113,8 @@ def _materialize_chain_config_override(plan: dict[str, Any], run_dir: Path) -> P
     path = run_dir / "chain_template.override.json"
     import json
 
-    path.write_text(json.dumps(override, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    atomic_write_private_text(
+        path,
+        json.dumps(override, indent=2, sort_keys=True) + "\n",
+    )
     return path

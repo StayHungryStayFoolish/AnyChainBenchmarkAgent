@@ -455,6 +455,7 @@ def _phase8_g3_gate(
     phase_root: Path,
     obligations: Sequence[dict[str, Any]],
     revision: dict[str, str],
+    expected_authority_trust_root_id: str,
 ) -> dict[str, Any]:
     provider_path = phase_root / "g3" / "provider.json"
     manifest_path = phase_root / "g3" / "evidence-set" / "manifest.json"
@@ -480,6 +481,7 @@ def _phase8_g3_gate(
             provider=provider,
             obligations=obligations,
             revision=revision,
+            expected_authority_trust_root_id=expected_authority_trust_root_id,
         )
         passed = int(manifest["obligation_count"])
         exact_count = int(manifest["exact_count"])
@@ -511,6 +513,7 @@ def _phase8_g4_gate(
     phase_root: Path,
     obligations: Sequence[dict[str, Any]],
     revision: dict[str, str],
+    expected_authority_trust_root_ids: Mapping[str, str],
 ) -> dict[str, Any]:
     evidence_by_round: dict[str, tuple[Path, ...]] = {}
     missing: list[str] = []
@@ -533,6 +536,9 @@ def _phase8_g4_gate(
                 revision=revision,
                 artifact_type=G4_ARTIFACT_TYPE,
                 round_id=round_id,
+                expected_authority_trust_root_id=str(
+                    expected_authority_trust_root_ids.get(round_id) or ""
+                ),
             )
         if missing:
             return {
@@ -659,7 +665,11 @@ def _phase8_g5_gate(
         }
 
 
-def _phase8_source(inventory: dict[str, Any]) -> dict[str, Any]:
+def _phase8_source(
+    inventory: dict[str, Any],
+    *,
+    authority_trust_roots: Mapping[str, str],
+) -> dict[str, Any]:
     revision = dict(inventory.get("revision") or {})
     phase_root = (
         REPO_ROOT
@@ -687,11 +697,18 @@ def _phase8_source(inventory: dict[str, Any]) -> dict[str, Any]:
         phase_root=phase_root,
         obligations=g3_obligations,
         revision=revision,
+        expected_authority_trust_root_id=str(
+            authority_trust_roots.get("g3") or ""
+        ),
     )
     g4_summary = _phase8_g4_gate(
         phase_root=phase_root,
         obligations=g4_obligations,
         revision=revision,
+        expected_authority_trust_root_ids={
+            "round-1": str(authority_trust_roots.get("g4_round_1") or ""),
+            "round-2": str(authority_trust_roots.get("g4_round_2") or ""),
+        },
     )
 
     execution_ledger, g5_summary = _phase8_g5_gate(
@@ -947,7 +964,11 @@ def _aggregate_status(
     return "passed"
 
 
-def build_report(through_phase: int) -> dict[str, Any]:
+def build_report(
+    through_phase: int,
+    *,
+    authority_trust_roots: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
     inventory = build_ledger(None)
     g0 = _g0_source()
     phase_sources = {
@@ -958,7 +979,10 @@ def build_report(through_phase: int) -> dict[str, Any]:
         5: _phase5_source,
         6: lambda: _phase6_source(inventory),
         7: _phase7_source,
-        8: lambda: _phase8_source(inventory),
+        8: lambda: _phase8_source(
+            inventory,
+            authority_trust_roots=dict(authority_trust_roots or {}),
+        ),
     }
     phase_checks = {
         str(phase): phase_sources[phase]()
@@ -1043,8 +1067,22 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--through-phase", type=int, required=True, choices=range(1, 9))
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--g3-authority-trust-root-id")
+    parser.add_argument("--g4-round-1-authority-trust-root-id")
+    parser.add_argument("--g4-round-2-authority-trust-root-id")
     args = parser.parse_args()
-    report = build_report(args.through_phase)
+    report = build_report(
+        args.through_phase,
+        authority_trust_roots={
+            "g3": str(args.g3_authority_trust_root_id or ""),
+            "g4_round_1": str(
+                args.g4_round_1_authority_trust_root_id or ""
+            ),
+            "g4_round_2": str(
+                args.g4_round_2_authority_trust_root_id or ""
+            ),
+        },
+    )
     output = args.output or (
         REPO_ROOT
         / ".agent"

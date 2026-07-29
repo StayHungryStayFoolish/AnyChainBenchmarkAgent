@@ -698,6 +698,7 @@ class FilesystemDecisionBrokerTest(unittest.TestCase):
                             object(),
                             broker=object(),
                             result_index_path="unused.json",
+                            authority_signer=object(),
                         )
                     await task
                     return interrupted_by

@@ -59,10 +59,72 @@ def invoke_actions(
         side_effect=lambda planner_state, planner_text: reviewed_action_plan(
             planner_state,
             planner_text,
-            actions,
+            _project_reviewed_actions_to_turn_input(
+                planner_state,
+                planner_text,
+                actions,
+            ),
         ),
     ):
         return invoke_product_graph_turn(current)
+
+
+def _project_reviewed_actions_to_turn_input(
+    state: Mapping[str, Any],
+    text: str,
+    actions: list[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Make deterministic planner fixtures obey product ingress projection."""
+
+    from agent.harness.secret_refs import resolve_secret_reference
+
+    projected = [deepcopy(dict(item)) for item in actions]
+    bindings = [
+        dict(item)
+        for item in (
+            (state.get("turn_context") or {}).get("input_secret_bindings")
+            or ()
+        )
+        if isinstance(item, Mapping)
+        and str(item.get("reference") or "")
+        and str(item.get("reference") or "") in str(text)
+    ]
+    if not bindings:
+        return projected
+    replacements: list[tuple[str, str]] = []
+    for binding in bindings:
+        reference = str(binding.get("reference") or "")
+        materialized = resolve_secret_reference(
+            reference,
+            draft_id=str(binding.get("draft_id") or ""),
+            atom_id=str(binding.get("atom_id") or ""),
+            expected_hash=str(binding.get("value_hash") or ""),
+        )
+        if materialized is None:
+            raise AssertionError("reviewed fixture cannot resolve projected input")
+        replacements.append((materialized, reference))
+
+    def replace(value: Any) -> Any:
+        if isinstance(value, str):
+            result = value
+            for materialized, reference in replacements:
+                result = result.replace(materialized, reference)
+            return result
+        if isinstance(value, Mapping):
+            return {key: replace(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [replace(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(replace(item) for item in value)
+        return value
+
+    for action in projected:
+        replacement = replace(action)
+        action.clear()
+        action.update(replacement)
+        if "source_evidence" in action:
+            action["source_evidence"] = replace(action["source_evidence"])
+    return projected
 
 
 def invoke_action(
@@ -126,13 +188,56 @@ def reviewed_execution_planner(
     """
 
     def resolve(state: Mapping[str, Any], text: str) -> dict[str, Any]:
-        if text != expected_input.strip():
+        expected = expected_input.strip()
+        projected_secret = False
+        if text != expected:
+            from agent.harness.questions import coerce_pending_answer
+            from agent.harness.secret_refs import resolve_secret_reference
+
+            binding = next(
+                (
+                    dict(item)
+                    for item in (
+                        (state.get("turn_context") or {}).get(
+                            "input_secret_bindings"
+                        )
+                        or ()
+                    )
+                    if isinstance(item, Mapping)
+                    and str(item.get("reference") or "") == text
+                ),
+                {},
+            )
+            materialized = (
+                resolve_secret_reference(
+                    text,
+                    draft_id=str(binding.get("draft_id") or ""),
+                    atom_id=str(binding.get("atom_id") or ""),
+                    expected_hash=str(binding.get("value_hash") or ""),
+                )
+                if binding
+                else None
+            )
+            expected = str(
+                coerce_pending_answer(
+                    expected_input,
+                    dict(state.get("pending_question") or {}),
+                )
+            )
+            projected_secret = materialized == expected
+        if text != expected_input.strip() and not projected_secret:
             raise AssertionError(
                 "reviewed execution planner received a different input"
             )
         actions: list[dict[str, Any]] = []
         if expected_admitted:
-            value = expected_input if reviewed_value is None else reviewed_value
+            value = (
+                text
+                if projected_secret
+                else expected_input
+                if reviewed_value is None
+                else reviewed_value
+            )
             actions.append({
                 "type": "answer_pending",
                 "answer": value,
@@ -578,6 +683,11 @@ def invoke_product_graph_turn(
         STATE_SCHEMA_VERSION,
         migrate_state,
     )
+    from agent.harness.graph import project_turn_input
+    from agent.harness.secret_refs import (
+        release_unowned_input_secret_bindings,
+        secret_registry_transaction,
+    )
     from agent.harness import advisory
     from agent.harness.domains import analysis, chain_identity, recovery, rpc_endpoint
 
@@ -614,12 +724,44 @@ def invoke_product_graph_turn(
         ),
     )
     with ExitStack() as stack:
+        secret_transaction = stack.enter_context(secret_registry_transaction())
+        safe_input, input_secret_bindings = project_turn_input(
+            current,
+            str(current.get("last_user_input") or ""),
+            scope_id=(
+                f"turn:test:{current.get('thread_id') or 'fixture'}:"
+                f"{int(current.get('turn_index') or 0) + 1}"
+            ),
+        )
+        current["last_user_input"] = safe_input
         active_resolver = TEST_SEMANTIC_PLANNER
         if callable(active_resolver):
             def reviewed_partition(
                 planner_state: Mapping[str, Any],
                 planner_text: str,
             ) -> dict[str, Any]:
+                reviewed_queue = dict(
+                    active_resolver(
+                        planner_state,
+                        planner_text,
+                    )
+                )
+                reviewed_actions = [
+                    dict(item)
+                    for item in reviewed_queue.get("actions") or ()
+                    if isinstance(item, Mapping)
+                ]
+                if reviewed_actions and not all(
+                    str(item.get("_plan_transaction_hash") or "")
+                    for item in reviewed_actions
+                ):
+                    reviewed_queue["actions"] = (
+                        _project_reviewed_actions_to_turn_input(
+                            planner_state,
+                            planner_text,
+                            reviewed_actions,
+                        )
+                    )
                 return {
                     "contract_version": 1,
                     "status": "review_plan",
@@ -630,10 +772,7 @@ def invoke_product_graph_turn(
                         ).get("clauses") or []
                         if isinstance(item, Mapping)
                     ],
-                    "reviewed_queue": active_resolver(
-                        planner_state,
-                        planner_text,
-                    ),
+                    "reviewed_queue": reviewed_queue,
                 }
 
             stack.enter_context(patch(
@@ -675,13 +814,19 @@ def invoke_product_graph_turn(
             key: deepcopy(current.get(key) or {})
             for key in ("discovery", "framework_summary", "web_research")
         }
+        invocation_context["input_secret_bindings"] = {
+            "items": [dict(item) for item in input_secret_bindings],
+        }
         result = dict(
             build_graph(None).invoke(
                 current,
                 context=invocation_context,
             )
         )
-    validate_state(result)
+        validate_state(result)
+        release_unowned_input_secret_bindings(input_secret_bindings, result)
+        secret_transaction.prepare()
+        secret_transaction.commit()
     return result
 
 

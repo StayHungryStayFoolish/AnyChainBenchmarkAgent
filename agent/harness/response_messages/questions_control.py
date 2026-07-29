@@ -7,6 +7,39 @@ _COMPLETION = {"completion_effect"}
 
 
 MESSAGES = {
+    "question.control.secret_reentry.prompt": {
+        "en": (
+            "Secret material required by the pending plan is no longer "
+            "available after the Agent process restarted. Re-enter the same "
+            "secret-bearing value. It will be verified against the saved hash "
+            "and kept only in process memory."
+        ),
+        "zh": (
+            "Agent 进程重启后，待处理计划所需的敏感值已不在内存中。"
+            "请重新输入同一个包含敏感信息的值；系统会使用已保存的 hash "
+            "校验，并且只在当前进程内存中保留该值。"
+        ),
+        "arguments": {},
+        "kinds": _PROMPT,
+    },
+    "question.control.semantic_draft_atom.prompt": {
+        "en": "I could not safely determine this part of your request: {source}. Please clarify what you want this item to mean or do. The other understood items are preserved but will not be applied until the complete plan passes validation.",
+        "zh": "我无法安全确定这部分需求的含义：{source}。请说明你希望这一项表达什么或执行什么。其他已理解的内容会被保留，但在完整计划通过校验前不会应用。",
+        "arguments": {"source": "string"},
+        "kinds": _PROMPT,
+    },
+    "question.control.semantic_draft_atom.cancel": {
+        "en": "Cancel the complete pending plan",
+        "zh": "取消整个待确认计划",
+        "arguments": {},
+        "kinds": _LABEL,
+    },
+    "question.control.semantic_draft_atom.previous": {
+        "en": "Return to the previous clarification item",
+        "zh": "返回上一个待澄清项",
+        "arguments": {},
+        "kinds": _LABEL,
+    },
     "question.control.option.yes": {
         "en": "Y",
         "zh": "Y",

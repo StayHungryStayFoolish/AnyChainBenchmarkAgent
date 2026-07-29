@@ -21,6 +21,10 @@ from ..planners.preflight import run_preflight as _run_preflight
 from ..planners.strategy_planner import generate_plan as _generate_plan
 from ..planners.strategy_planner import write_json
 from .job_manager import submit_job as _submit_job
+from .private_files import (
+    atomic_write_private_text,
+    ensure_private_directory,
+)
 from .runbook import render_runbook as _render_runbook
 from .tool_result import tool_result as _tool_result
 from .execution_scenarios import RPC_BENCHMARK_WORKFLOW, workflow_type_from_plan
@@ -144,12 +148,11 @@ def prepare_benchmark_run(
     preflight = _run_preflight(plan)
     runbook = _render_runbook(plan)
 
-    prepared_dir = Path(output_dir)
-    prepared_dir.mkdir(parents=True, exist_ok=True)
+    prepared_dir = ensure_private_directory(output_dir)
     plan_file = prepared_dir / f"{plan['plan_id']}.json"
     runbook_file = prepared_dir / f"{plan['plan_id']}_runbook.md"
     write_json(plan_file, plan)
-    runbook_file.write_text(runbook, encoding="utf-8")
+    atomic_write_private_text(runbook_file, runbook)
 
     data = {
         "request": request,
@@ -205,7 +208,7 @@ def run_fake_node_smoke_benchmark(
     )
     if not smoke_root.is_absolute():
         smoke_root = repo / smoke_root
-    smoke_root.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(smoke_root)
     source_plan = dict(execution_plan) if execution_plan is not None else None
     smoke_plan = _fake_node_smoke_plan(plan_path, smoke_root, plan=source_plan)
 
@@ -263,7 +266,7 @@ def run_real_node_smoke_benchmark(
     )
     if not smoke_root.is_absolute():
         smoke_root = repo / smoke_root
-    smoke_root.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(smoke_root)
     source_plan = dict(execution_plan) if execution_plan is not None else None
     smoke_plan = _real_node_smoke_plan(plan_path, smoke_root, plan=source_plan)
 

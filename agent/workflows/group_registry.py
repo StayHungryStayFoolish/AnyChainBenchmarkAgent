@@ -43,6 +43,8 @@ class GroupSpec:
     owner: str
     fields: tuple[str, ...] = ()
     questions: tuple[str, ...] = ()
+    sensitive_fields: tuple[str, ...] = ()
+    sensitive_questions: tuple[str, ...] = ()
     reconfiguration_questions: tuple[tuple[str, str], ...] = ()
     immutable_fields: tuple[str, ...] = ()
     depends_on: tuple[str, ...] = ()
@@ -221,6 +223,20 @@ GROUPS: tuple[GroupSpec, ...] = (
             "new_chain_single_method",
             "new_chain_custom_weights",
         ),
+        sensitive_fields=(
+            "LOCAL_RPC_URL",
+            "MAINNET_RPC_URL",
+            "SYNC_OBSERVE_RPC_URL",
+            "custom_rpc_endpoint",
+            "new_chain_endpoint",
+        ),
+        sensitive_questions=(
+            "LOCAL_RPC_URL",
+            "SYNC_OBSERVE_RPC_URL",
+            "MAINNET_RPC_URL_REVIEWED",
+            "custom_rpc_endpoint",
+            "new_chain_endpoint",
+        ),
         depends_on=("target_mode", "chain_identity"),
         invalidates=("target_samples_fixtures", "preflight_smoke_execution", "job_monitoring"),
         product_node="endpoint_process",
@@ -241,6 +257,18 @@ GROUPS: tuple[GroupSpec, ...] = (
         depends_on=("chain_identity",),
         invalidates=("preflight_smoke_execution", "job_monitoring"),
         questions=(
+            "RPC_API_KEY",
+        ),
+        sensitive_fields=(
+            "CHAIN_REST_URL",
+            "CHAIN_INDEXER_URL",
+            "CHAIN_SIDECAR_URL",
+            "CHAIN_EVM_RPC_URL",
+            "CHAIN_JSON_RPC_URL",
+            "CHAIN_MIRROR_URL",
+            "RPC_API_KEY",
+        ),
+        sensitive_questions=(
             "RPC_API_KEY",
         ),
         product_node="real_node_endpoint",
@@ -406,6 +434,30 @@ def validate_group_registry(groups: Iterable[GroupSpec]) -> tuple[GroupSpec, ...
 
     known = set(names)
     for group in registry:
+        duplicate_sensitive_fields = sorted({
+            field
+            for field in group.sensitive_fields
+            if group.sensitive_fields.count(field) > 1
+        })
+        duplicate_sensitive_questions = sorted({
+            question
+            for question in group.sensitive_questions
+            if group.sensitive_questions.count(question) > 1
+        })
+        unknown_sensitive_questions = sorted(
+            set(group.sensitive_questions) - set(group.questions)
+        )
+        if (
+            duplicate_sensitive_fields
+            or duplicate_sensitive_questions
+            or unknown_sensitive_questions
+        ):
+            raise RuntimeError(
+                f"invalid sensitive intake metadata for GroupSpec {group.name}: "
+                f"fields={duplicate_sensitive_fields}, "
+                f"questions={duplicate_sensitive_questions}, "
+                f"unknown_questions={unknown_sensitive_questions}"
+            )
         if group.navigation_entry not in {"question_or_status", "action_only"}:
             raise RuntimeError(
                 f"invalid navigation entry for GroupSpec {group.name}: {group.navigation_entry}"
@@ -580,6 +632,22 @@ def group_for_field(field_name: str) -> str:
     return FIELD_GROUP.get(field, "") if field else ""
 
 
+def is_sensitive_question(
+    group_name: object,
+    question_id: object,
+    field_name: object,
+) -> bool:
+    """Return the registry-owned sensitivity contract for one intake."""
+
+    spec = GROUP_SPEC_BY_NAME.get(normalize_group_name(group_name))
+    if spec is None:
+        return False
+    return (
+        str(question_id or "").strip() in spec.sensitive_questions
+        or str(field_name or "").strip() in spec.sensitive_fields
+    )
+
+
 def reconfiguration_question_for_field(field_name: str) -> str:
     """Return the registered typed question for an explicitly edited field."""
 
@@ -596,6 +664,8 @@ def group_registry_contract_hash() -> str:
             "owner": group.owner,
             "fields": list(group.fields),
             "questions": list(group.questions),
+            "sensitive_fields": list(group.sensitive_fields),
+            "sensitive_questions": list(group.sensitive_questions),
             "reconfiguration_questions": list(group.reconfiguration_questions),
             "immutable_fields": list(group.immutable_fields),
             "depends_on": list(group.depends_on),

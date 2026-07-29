@@ -92,9 +92,14 @@ python3 tools/check_agent_boundaries.py --root .
 git diff --check
 ```
 
-checkpoint schema version 18 是当前契约。migration 必须覆盖 v16 pending
-owner/Chain-RPC context、v17 semantic planning、v18 response authority，
-并安全移除旧的 in-flight planning/response scratch。
+checkpoint schema version 23 是当前契约。migration 必须覆盖 v16 pending
+owner/Chain-RPC context、v17 semantic planning、v18 response authority，以及
+v19 non-executable semantic draft boundary、v20 Product Head/contract
+authority、v21 atom evidence/secret reference/finalization、v22
+durable-state secret binding，以及 v23 签名 sensitivity、memory-hard
+verifier、registry transaction 与 reference-only durable plan；并安全移除或
+quarantine 不兼容的 in-flight planning、response scratch、v21
+raw/reference 与 v22 legacy binding/reference。
 
 直接构造 `review_plan` state 的 test adapter 不能证明 graph split。证据必须
 经过真实 `partition`、所有 scheduled `compile_owner`、`review_plan` 和

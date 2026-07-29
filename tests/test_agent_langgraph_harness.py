@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import tempfile
 import unittest
@@ -100,7 +101,15 @@ def _admitted_mock_plan(state, text, payload):
         build_proposal_field_receipt,
     )
 
-    actions = deepcopy(list(payload.get("actions") or []))
+    from tests.agent_live.graph_turn import (
+        _project_reviewed_actions_to_turn_input,
+    )
+
+    actions = _project_reviewed_actions_to_turn_input(
+        state,
+        text,
+        deepcopy(list(payload.get("actions") or [])),
+    )
     for action in actions:
         if not isinstance(action, dict):
             continue
@@ -159,7 +168,12 @@ def _admitted_mock_plan(state, text, payload):
     session_id = str((state.get("session") or {}).get("id") or thread_id)
     turn_index = int(state.get("turn_index") or 0)
     action_ids = [f"test-admission-{index}" for index in range(len(actions))]
-    semantic_units = [{
+    supplied_units = [
+        deepcopy(item)
+        for item in payload.get("semantic_units") or []
+        if isinstance(item, dict)
+    ]
+    semantic_units = supplied_units or [{
         "unit_id": f"test-unit-{index}",
         "clause_id": f"test-clause-{index}",
         "source_text": str(text),
@@ -220,6 +234,7 @@ def _admitted_mock_plan(state, text, payload):
     ]
     return {
         "actions": actions,
+        "semantic_units": semantic_units,
         "pending_choice_contracts": pending_choice_contracts,
     }
 
@@ -301,6 +316,12 @@ def _catalog_methods(state):
     from agent.harness.domains.rpc_catalog import validated_contracts_view
 
     return validated_contracts_view(state)
+
+
+def _materialized_state_value(state, value):
+    from agent.harness.secret_refs import materialize_state_secret_references
+
+    return materialize_state_secret_references(value, state)
 
 
 @unittest.skipUnless(LANGGRAPH_AVAILABLE, "langgraph is not installed in this Python environment")
@@ -580,6 +601,872 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         opening = state["visible_response"][0]
         self.assertIn("AnyChain Benchmark Agent", opening)
         self.assertIn("State a test goal", opening)
+
+    def test_secret_input_never_crosses_sqlite_checkpoint_boundary(self) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+        from tests.agent_live.graph_turn import reviewed_stage_planner
+
+        cases = (
+            (
+                "assignment",
+                "abcdefghijklmnopqrstuvwxyz123456",
+                "Hi API_KEY=abcdefghijklmnopqrstuvwxyz123456",
+            ),
+            (
+                "basic-authorization",
+                "dXNlcjpwYXNzd29yZA==",
+                "Authorization: Basic dXNlcjpwYXNzd29yZA==",
+            ),
+            (
+                "quoted-json",
+                "short-secret",
+                'Config copied from another system: {"api_key": "short-secret"}',
+            ),
+        )
+        for label, token, text in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmpdir:
+                checkpoint_path = Path(tmpdir) / "checkpoints.sqlite"
+                runtime = AnyChainGraphRuntime(
+                    thread_id=f"secret-checkpoint-{label}",
+                    checkpoint_path=checkpoint_path,
+                )
+                with reviewed_stage_planner(_admitted_mock_resolver(
+                    {"actions": [{"type": "greeting", "confidence": "high"}]}
+                )):
+                    state = runtime.invoke(text, language="en")
+                snapshot = runtime.snapshot()
+                runtime.close()
+                checkpoint_bytes = checkpoint_path.read_bytes()
+
+            self.assertNotIn(token, json.dumps(state, ensure_ascii=False))
+            self.assertNotIn(token, json.dumps(snapshot, ensure_ascii=False))
+            self.assertNotIn(token.encode(), checkpoint_bytes)
+
+    def test_sensitive_pending_contract_projects_short_scalar_before_planner(
+        self,
+    ) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.questions import manual_question, question_text
+        from agent.harness.state import new_state
+        from tests.agent_live.graph_turn import reviewed_stage_planner
+
+        raw_secret = "short-secret"
+        observed_inputs: list[str] = []
+
+        def resolver(state, text):
+            observed_inputs.append(str(text))
+            return _admitted_mock_plan(
+                state,
+                text,
+                {
+                    "actions": [{
+                        "type": "answer_pending",
+                        "answer": text,
+                        "selected_value": text,
+                        "source_evidence": text,
+                        "confidence": "high",
+                    }],
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_path = Path(tmpdir) / "checkpoints.sqlite"
+            runtime = AnyChainGraphRuntime(
+                thread_id="sensitive-pending-scalar",
+                checkpoint_path=checkpoint_path,
+            )
+            state = new_state(
+                "sensitive-pending-scalar",
+                language="en",
+            )
+            state["active_group"] = "chain_auxiliary_endpoints"
+            state["pending_question"] = manual_question(
+                "chain_auxiliary_endpoints",
+                "RPC_API_KEY",
+                question_text(
+                    "question.chain_rpc.auxiliary_endpoint.prompt",
+                    chain="hedera",
+                    field="RPC_API_KEY",
+                ),
+                owner="chain_rpc",
+                field="RPC_API_KEY",
+            )
+            self.assertTrue(state["pending_question"]["sensitive_input"])
+            runtime._persist_state(state)
+            with reviewed_stage_planner(resolver):
+                result = runtime.invoke(raw_secret, language="en")
+            snapshot = runtime.snapshot()
+            runtime.close()
+            checkpoint_bytes = checkpoint_path.read_bytes()
+
+        self.assertTrue(observed_inputs)
+        self.assertNotIn(raw_secret, observed_inputs[-1])
+        self.assertIn("semantic-secret:", observed_inputs[-1])
+        self.assertNotIn(raw_secret, json.dumps(result, ensure_ascii=False))
+        self.assertNotIn(raw_secret, json.dumps(snapshot, ensure_ascii=False))
+        self.assertNotIn(raw_secret.encode(), checkpoint_bytes)
+
+    def test_sensitive_pending_projection_preserves_options_and_projects_manual_values(
+        self,
+    ) -> None:
+        from agent.harness.coordinator import _question_for_group
+        from agent.harness.graph import project_turn_input
+        from agent.harness.secret_refs import (
+            release_unowned_input_secret_bindings,
+            resolve_secret_reference,
+        )
+        from agent.harness.state import new_state
+
+        state = new_state("sensitive-projection-contract", language="en")
+        state["target_mode"] = "real-node"
+        state["workflow_mode"] = "rpc_benchmark"
+        state["chain_identity"] = {
+            "raw": "dogecoin",
+            "canonical": "dogecoin",
+            "status": "confirmed",
+            "case": "known",
+        }
+        state["active_group"] = "chain_auxiliary_endpoints"
+        state["pending_question"] = _question_for_group(
+            state,
+            "chain_auxiliary_endpoints",
+        )
+
+        option_text, option_bindings = project_turn_input(
+            state,
+            "1",
+            scope_id="turn:test:sensitive-option",
+        )
+        self.assertEqual(option_text, "1")
+        self.assertEqual(option_bindings, ())
+
+        projected, bindings = project_turn_input(
+            state,
+            "  n2-standard-16,  ",
+            scope_id="turn:test:sensitive-manual",
+        )
+        self.assertTrue(projected.startswith("semantic-secret:"))
+        self.assertEqual(len(bindings), 1)
+        binding = bindings[0]
+        self.assertEqual(
+            resolve_secret_reference(
+                projected,
+                draft_id=binding["draft_id"],
+                atom_id=binding["atom_id"],
+                expected_hash=binding["value_hash"],
+            ),
+            "n2-standard-16",
+        )
+        release_unowned_input_secret_bindings(bindings, {})
+
+        from agent.harness.questions import manual_question, question_text
+
+        endpoint_state = new_state(
+            "sensitive-compound-contract",
+            language="en",
+        )
+        endpoint_state["pending_question"] = manual_question(
+            "endpoint_process",
+            "custom_rpc_endpoint",
+            question_text("question.chain_rpc.custom_endpoint.prompt"),
+            owner="chain_rpc",
+            field="custom_rpc_endpoint",
+            kind="url",
+        )
+        compound = (
+            "Docs: https://docs.example.invalid/rpc. "
+            "Use http://fake-node:8545 and then open observability."
+        )
+        safe_compound, compound_bindings = project_turn_input(
+            endpoint_state,
+            compound,
+            scope_id="turn:test:sensitive-compound",
+        )
+        self.assertNotIn("https://docs.example.invalid/rpc", safe_compound)
+        self.assertNotIn("http://fake-node:8545", safe_compound)
+        self.assertIn("then open observability", safe_compound)
+        self.assertEqual(len(compound_bindings), 2)
+        release_unowned_input_secret_bindings(compound_bindings, {})
+
+        semantic_decline, decline_bindings = project_turn_input(
+            state,
+            "Skip this optional value and continue.",
+            scope_id="turn:test:sensitive-decline",
+        )
+        self.assertEqual(
+            semantic_decline,
+            "Skip this optional value and continue.",
+        )
+        self.assertEqual(decline_bindings, ())
+
+    def test_secret_registry_write_rolls_back_when_product_head_rejects(
+        self,
+    ) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.questions import manual_question, question_text
+        from agent.harness.secret_refs import (
+            secret_reference_available,
+            secret_value_verifier,
+        )
+        from agent.harness.state import new_state
+        from tests.agent_live.graph_turn import reviewed_stage_planner
+
+        captured_references: list[str] = []
+
+        def resolver(state, text):
+            captured_references.append(str(text))
+            return _admitted_mock_plan(
+                state,
+                text,
+                {
+                    "actions": [{
+                        "type": "answer_pending",
+                        "answer": text,
+                        "selected_value": text,
+                        "source_evidence": text,
+                        "confidence": "high",
+                    }],
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = AnyChainGraphRuntime(
+                thread_id="secret-registry-rollback",
+                checkpoint_path=Path(tmpdir) / "checkpoints.sqlite",
+            )
+            state = new_state("secret-registry-rollback", language="en")
+            state["active_group"] = "chain_auxiliary_endpoints"
+            state["pending_question"] = manual_question(
+                "chain_auxiliary_endpoints",
+                "RPC_API_KEY",
+                question_text(
+                    "question.chain_rpc.auxiliary_endpoint.prompt",
+                    chain="hedera",
+                    field="RPC_API_KEY",
+                ),
+                owner="chain_rpc",
+                field="RPC_API_KEY",
+            )
+            runtime._persist_state(state)
+            with (
+                reviewed_stage_planner(resolver),
+                patch.object(
+                    runtime.turn_transactions,
+                    "commit_attempt",
+                    side_effect=RuntimeError("Product Head rejected"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "Product Head rejected"),
+            ):
+                runtime.invoke("rollback-secret", language="en")
+            reference = captured_references[-1]
+            available = secret_reference_available(
+                reference,
+                draft_id="turn:user:secret-registry-rollback:1",
+                atom_id="input-secret-1",
+                expected_hash=secret_value_verifier(
+                    "rollback-secret",
+                    reference,
+                ),
+            )
+            runtime.close()
+
+        self.assertFalse(available)
+
+    def test_snapshot_migration_rolls_back_secret_cleanup_when_product_head_rejects(
+        self,
+    ) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.secret_refs import (
+            discard_secret_reference,
+            secret_reference_available,
+            store_secret_reference,
+        )
+        from agent.harness.state import new_state
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = AnyChainGraphRuntime(
+                thread_id="snapshot-migration-rollback",
+                checkpoint_path=Path(tmpdir) / "checkpoints.sqlite",
+            )
+            runtime._persist_state(new_state(
+                "snapshot-migration-rollback",
+                language="en",
+            ))
+            reference, value_hash = store_secret_reference(
+                "migration-secret",
+                draft_id="draft-before-migration",
+                atom_id="input-secret-1",
+            )
+
+            def migrate_and_release(raw, **_kwargs):
+                from agent.harness.secret_refs import discard_secret_reference
+
+                discard_secret_reference(reference)
+                migrated = deepcopy(raw)
+                migrated["audit_events"] = [
+                    *list(migrated.get("audit_events") or ()),
+                    {"event": "test_migration"},
+                ]
+                return migrated
+
+            with (
+                patch(
+                    "agent.harness.graph.migrate_state",
+                    side_effect=migrate_and_release,
+                ),
+                patch.object(
+                    runtime,
+                    "_persist_state",
+                    side_effect=RuntimeError("Product Head rejected migration"),
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "Product Head rejected migration",
+                ),
+            ):
+                runtime.snapshot()
+
+            available = secret_reference_available(
+                reference,
+                draft_id="draft-before-migration",
+                atom_id="input-secret-1",
+                expected_hash=value_hash,
+            )
+            discard_secret_reference(reference)
+            runtime.close()
+
+        self.assertTrue(available)
+
+    def test_snapshot_does_not_hide_quarantine_product_head_failure(self) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = AnyChainGraphRuntime(
+                thread_id="snapshot-quarantine-failure",
+                checkpoint_path=Path(tmpdir) / "checkpoints.sqlite",
+            )
+            try:
+                runtime.snapshot()
+                with (
+                    patch.object(
+                        runtime.graph,
+                        "get_state",
+                        side_effect=RuntimeError("checkpoint unreadable"),
+                    ),
+                    patch.object(
+                        runtime,
+                        "_persist_state",
+                        side_effect=RuntimeError(
+                            "Product Head rejected quarantine"
+                        ),
+                    ),
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        "Product Head rejected quarantine",
+                    ),
+                ):
+                    runtime.snapshot()
+            finally:
+                runtime.close()
+
+    def test_committed_migration_registry_cleanup_survives_later_turn_failure(
+        self,
+    ) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.secret_refs import (
+            secret_reference_available,
+            store_secret_reference,
+        )
+        from agent.harness.state import new_state
+
+        for operation in ("user_turn", "runtime_action"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as tmpdir:
+                thread_id = f"migration-before-{operation}"
+                runtime = AnyChainGraphRuntime(
+                    thread_id=thread_id,
+                    checkpoint_path=Path(tmpdir) / "checkpoints.sqlite",
+                )
+                runtime._persist_state(new_state(thread_id, language="en"))
+                reference, value_hash = store_secret_reference(
+                    f"{operation}-secret",
+                    draft_id="draft-before-migration",
+                    atom_id="input-secret-1",
+                )
+
+                def migrate_and_release(raw, **_kwargs):
+                    from agent.harness.secret_refs import discard_secret_reference
+
+                    discard_secret_reference(reference)
+                    migrated = deepcopy(raw)
+                    migrated["audit_events"] = [
+                        *list(migrated.get("audit_events") or ()),
+                        {"event": "test_migration"},
+                    ]
+                    return migrated
+
+                with (
+                    patch(
+                        "agent.harness.graph.migrate_state",
+                        side_effect=migrate_and_release,
+                    ),
+                    patch.object(
+                        runtime.graph,
+                        "invoke",
+                        side_effect=RuntimeError("later turn failed"),
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "later turn failed"),
+                ):
+                    if operation == "user_turn":
+                        runtime.invoke("continue", language="en")
+                    else:
+                        runtime._invoke_runtime_action(
+                            {"type": "prepare_session_entry"},
+                            language="en",
+                            observation="test_runtime_failure",
+                        )
+
+                available = secret_reference_available(
+                    reference,
+                    draft_id="draft-before-migration",
+                    atom_id="input-secret-1",
+                    expected_hash=value_hash,
+                )
+                runtime.close()
+
+            self.assertFalse(available)
+
+    def test_secret_registry_commit_survives_post_commit_observation_failure(
+        self,
+    ) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.questions import manual_question, question_text
+        from agent.harness.secret_refs import secret_reference_available
+        from agent.harness.state import new_state
+        from tests.agent_live.graph_turn import reviewed_stage_planner
+
+        def resolver(state, text):
+            return _admitted_mock_plan(
+                state,
+                text,
+                {
+                    "actions": [{
+                        "type": "answer_pending",
+                        "answer": text,
+                        "selected_value": text,
+                        "source_evidence": text,
+                        "confidence": "high",
+                    }],
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = AnyChainGraphRuntime(
+                thread_id="secret-registry-post-commit",
+                checkpoint_path=Path(tmpdir) / "checkpoints.sqlite",
+            )
+            state = new_state("secret-registry-post-commit", language="en")
+            state["active_group"] = "chain_auxiliary_endpoints"
+            state["pending_question"] = manual_question(
+                "chain_auxiliary_endpoints",
+                "RPC_API_KEY",
+                question_text(
+                    "question.chain_rpc.auxiliary_endpoint.prompt",
+                    chain="hedera",
+                    field="RPC_API_KEY",
+                ),
+                owner="chain_rpc",
+                field="RPC_API_KEY",
+            )
+            runtime._persist_state(state)
+            with (
+                reviewed_stage_planner(resolver),
+                patch.object(
+                    runtime,
+                    "_write_turn_observation",
+                    side_effect=RuntimeError("observation unavailable"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "observation unavailable"),
+            ):
+                runtime.invoke("committed-secret", language="en")
+            snapshot = runtime.snapshot()
+            binding = snapshot["secret_bindings"][0]
+            available = secret_reference_available(
+                binding["reference"],
+                draft_id=binding["scope_id"],
+                atom_id=binding["atom_id"],
+                expected_hash=binding["value_hash"],
+            )
+            runtime.close()
+
+        self.assertTrue(available)
+        self.assertEqual(
+            snapshot["confirmed_config"]["RPC_API_KEY"],
+            binding["reference"],
+        )
+
+    def test_runtime_close_uses_cached_secret_ownership_when_head_is_unreadable(
+        self,
+    ) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.secret_refs import (
+            register_state_secret_bindings,
+            secret_reference_available,
+            store_secret_reference,
+        )
+        from agent.harness.state import new_state
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = AnyChainGraphRuntime(
+                thread_id="close-cached-secret",
+                checkpoint_path=Path(tmpdir) / "checkpoints.sqlite",
+            )
+            reference, value_hash = store_secret_reference(
+                "close-secret",
+                draft_id="turn:close-cached-secret",
+                atom_id="input-secret-1",
+            )
+            state = new_state("close-cached-secret", language="en")
+            state["confirmed_config"]["RPC_API_KEY"] = reference
+            register_state_secret_bindings(state, [{
+                "reference": reference,
+                "scope_id": "turn:close-cached-secret",
+                "atom_id": "input-secret-1",
+                "value_hash": value_hash,
+            }])
+            runtime._persist_state(state)
+            self.assertTrue(secret_reference_available(
+                reference,
+                draft_id="turn:close-cached-secret",
+                atom_id="input-secret-1",
+                expected_hash=value_hash,
+            ))
+            with patch.object(
+                runtime.graph,
+                "get_state",
+                side_effect=RuntimeError("head temporarily unreadable"),
+            ):
+                runtime.close()
+
+        self.assertFalse(secret_reference_available(
+            reference,
+            draft_id="turn:close-cached-secret",
+            atom_id="input-secret-1",
+            expected_hash=value_hash,
+        ))
+
+    def test_runtime_close_failure_is_observable_and_retryable(self) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = AnyChainGraphRuntime(
+                thread_id="close-retry",
+                checkpoint_path=Path(tmpdir) / "checkpoints.sqlite",
+            )
+            runtime.snapshot()
+            with (
+                patch.object(
+                    runtime.graph,
+                    "get_state",
+                    side_effect=RuntimeError("head temporarily unreadable"),
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "secret cleanup could not read Product Head state",
+                ),
+            ):
+                runtime.close()
+            self.assertFalse(runtime._closed)
+            runtime.close()
+            self.assertTrue(runtime._closed)
+
+    def test_durable_secret_reentry_survives_real_graph_restart(self) -> None:
+        from agent.harness.domains.execution_runtime import _prepare_kwargs
+        from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.secret_refs import (
+            register_state_secret_bindings,
+            store_secret_reference,
+        )
+        from agent.harness.state import new_state
+        from tests.agent_live.graph_turn import reviewed_stage_planner
+
+        endpoint = (
+            "https://rpc.example.invalid/"
+            "durable-reentry-credential-123456789"
+        )
+
+        def answer_reentry(state, text):
+            return _admitted_mock_plan(
+                state,
+                text,
+                {
+                    "actions": [{
+                        "type": "answer_pending",
+                        "answer": text,
+                        "selected_value": text,
+                        "source_evidence": text,
+                        "confidence": "high",
+                    }],
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_path = Path(tmpdir) / "checkpoints.sqlite"
+            runtime = AnyChainGraphRuntime(
+                thread_id="durable-secret-restart",
+                checkpoint_path=checkpoint_path,
+            )
+            state = new_state("durable-secret-restart", language="en")
+            state["target_mode"] = "real-node"
+            reference, value_hash = store_secret_reference(
+                endpoint,
+                draft_id="turn:durable-graph",
+                atom_id="input-secret-1",
+            )
+            state["confirmed_config"]["LOCAL_RPC_URL"] = reference
+            register_state_secret_bindings(
+                state,
+                [{
+                    "reference": reference,
+                    "draft_id": "turn:durable-graph",
+                    "atom_id": "input-secret-1",
+                    "value_hash": value_hash,
+                }],
+            )
+            runtime._persist_state(state)
+            runtime.close()
+            self.assertNotIn(endpoint.encode(), checkpoint_path.read_bytes())
+
+            resumed = AnyChainGraphRuntime(
+                thread_id="durable-secret-restart",
+                checkpoint_path=checkpoint_path,
+            )
+            requested = resumed.invoke("continue", language="en")
+            self.assertEqual(
+                requested["pending_question"]["manual_action"]["type"],
+                "reenter_secret_reference",
+            )
+            self.assertEqual(
+                requested["pending_question"]["secret_reentry_binding"][
+                    "owner_kind"
+                ],
+                "durable_state",
+            )
+            with reviewed_stage_planner(answer_reentry):
+                restored = resumed.invoke(endpoint, language="en")
+
+            self.assertEqual(
+                restored["confirmed_config"]["LOCAL_RPC_URL"],
+                reference,
+            )
+            self.assertEqual(
+                _prepare_kwargs(restored)["target_rpc_url"],
+                endpoint,
+            )
+            self.assertNotIn(
+                "secret_reentry_binding",
+                restored["pending_question"],
+            )
+            self.assertEqual(
+                restored["pending_question"]["group"],
+                "chain_identity",
+            )
+            self.assertNotIn(
+                "reenter_secret_reference",
+                [
+                    item.get("action_type")
+                    for item in restored["action_queue"]
+                ],
+            )
+            self.assertNotIn(
+                "semantic-secret:",
+                json.dumps(
+                    restored["completed_actions"],
+                    ensure_ascii=False,
+                ),
+            )
+            self.assertEqual(len(restored["secret_bindings"]), 1)
+            runtime.close()
+            self.assertEqual(
+                _prepare_kwargs(restored)["target_rpc_url"],
+                endpoint,
+            )
+            self.assertNotIn(endpoint, json.dumps(restored, ensure_ascii=False))
+            self.assertNotIn(endpoint.encode(), checkpoint_path.read_bytes())
+            resumed.close()
+
+    def test_product_head_lineage_survives_draft_consultation_and_restart(
+        self,
+    ) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.semantic_drafts import build_semantic_plan_draft
+        from tests.agent_live.graph_turn import reviewed_stage_planner
+
+        original = "Explain fake-node and change the mystery setting."
+
+        def resolver(state, text):
+            draft = dict(state.get("semantic_plan_draft") or {})
+            if draft.get("status") == "ready_for_review":
+                return _admitted_mock_plan(
+                    state,
+                    draft["original_input"],
+                    {
+                        "actions": [{
+                            "type": "answer_opening_question",
+                            "topic": "mode_comparison",
+                            "source_evidence": "Explain fake-node",
+                        }],
+                        "semantic_units": [{
+                            "unit_id": "unit-1",
+                            "clause_id": "clause-1",
+                            "source_text": "Explain fake-node",
+                            "disposition": "action",
+                            "action_indexes": [0],
+                        }],
+                    },
+                )
+            if text == original and not draft:
+                semantic_draft = build_semantic_plan_draft(
+                    state,
+                    original_input=original,
+                    source_clauses=[{
+                        "clause_id": "clause-1",
+                        "text": original,
+                        "input_shape": "prose",
+                    }],
+                    source_partition=[
+                        {
+                            "unit_id": "unit-1",
+                            "clause_id": "clause-1",
+                            "source_text": "Explain fake-node",
+                            "operation": "consultation",
+                            "owner_routes": [{
+                                "owner": "orientation",
+                                "group": "opening",
+                            }],
+                            "reason": "read-only explanation",
+                        },
+                        {
+                            "unit_id": "unit-2",
+                            "clause_id": "clause-1",
+                            "source_text": "change the mystery setting",
+                            "operation": "unresolved",
+                            "owner_routes": [],
+                            "reason": "target is ambiguous",
+                        },
+                    ],
+                    semantic_units=[
+                        {
+                            "unit_id": "unit-1",
+                            "clause_id": "clause-1",
+                            "source_text": "Explain fake-node",
+                            "disposition": "action",
+                            "action_indexes": [0],
+                        },
+                        {
+                            "unit_id": "unit-2",
+                            "clause_id": "clause-1",
+                            "source_text": "change the mystery setting",
+                            "disposition": "unresolved",
+                            "action_indexes": [],
+                        },
+                    ],
+                    candidate_actions=[{
+                        "type": "answer_opening_question",
+                        "topic": "mode_comparison",
+                        "source_evidence": "Explain fake-node",
+                    }],
+                    validation=PlanCoverageResult(
+                        valid=False,
+                        errors=(),
+                        unresolved_clauses=("change the mystery setting",),
+                        unresolved_units=({
+                            "unit_id": "unit-2",
+                            "clause_id": "clause-1",
+                            "source_text": "change the mystery setting",
+                            "source_path": "",
+                            "reason": "target is ambiguous",
+                        },),
+                    ),
+                )
+                return {
+                    "actions": [],
+                    "semantic_units": [],
+                    "semantic_draft": semantic_draft,
+                    "reason": "semantic plan requires atom clarification",
+                }
+            return _admitted_mock_plan(
+                state,
+                text,
+                {"actions": [{"type": "ask_capabilities"}]},
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir, reviewed_stage_planner(
+            resolver
+        ):
+            checkpoint_path = Path(tmpdir) / "checkpoints.sqlite"
+            runtime = AnyChainGraphRuntime(
+                thread_id="product-head-draft",
+                checkpoint_path=checkpoint_path,
+            )
+            first = runtime.invoke(original, language="en")
+            source_draft = deepcopy(first["semantic_plan_draft"])
+            self.assertEqual(source_draft["source_checkpoint_revision"], 0)
+            runtime.invoke("What can this Agent do?", language="en")
+            runtime.close()
+
+            resumed = AnyChainGraphRuntime(
+                thread_id="product-head-draft",
+                checkpoint_path=checkpoint_path,
+            )
+            before_resolution = resumed.snapshot()
+            self.assertEqual(
+                before_resolution["semantic_plan_draft"]["draft_id"],
+                source_draft["draft_id"],
+            )
+            self.assertEqual(
+                before_resolution["semantic_plan_draft"]["revision"],
+                source_draft["revision"],
+            )
+            resolved = resumed._invoke_runtime_action(
+                {
+                    "type": "resolve_semantic_draft_atom",
+                    "draft_id": source_draft["draft_id"],
+                    "revision": source_draft["revision"],
+                    "atom_id": source_draft["active_atom_id"],
+                    "resolution": "QPS profile",
+                    "source_evidence": "QPS profile",
+                },
+                language="en",
+                observation="test_bound_draft_resolution",
+            )
+            head = resumed.product_head()
+            resumed.close()
+
+        self.assertEqual(
+            resolved["semantic_plan_draft"],
+            {},
+            {
+                "action_errors": resolved.get("action_errors"),
+                "failure_recovery": resolved.get("failure_recovery"),
+                "audit_tail": list(resolved.get("audit_events") or [])[-6:],
+            },
+        )
+        finalization = next(
+            item
+            for item in resolved["audit_events"]
+            if item.get("event") == "semantic_draft_finalized"
+        )
+        self.assertEqual(
+            finalization["source_product_authority_id"],
+            source_draft["source_product_authority_id"],
+        )
+        self.assertEqual(
+            finalization["source_checkpoint_id"],
+            source_draft["source_checkpoint_id"],
+        )
+        self.assertIsNotNone(head)
+        self.assertGreater(head.revision, source_draft["source_checkpoint_revision"])
 
     def test_split_planner_resumes_owner_cursor_from_sqlite_checkpoint(self) -> None:
         """The product graph checkpoints each owner compilation transition.
@@ -1691,9 +2578,9 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         })
         actions = [
             {"type": "set_rpc_mode", "rpc_mode": "single", "mutation_explicit": True, "source_evidence": "single", "confidence": "high"},
+            {"type": "rpc_catalog_command", "catalog_command": "enter", "source_evidence": "custom RPC", "confidence": "high"},
             {"type": "set_qps_mode", "qps_mode": "quick", "mutation_explicit": True, "source_evidence": "quick", "confidence": "high"},
             {"type": "set_observability", "observability_mode": "disabled", "mutation_explicit": True, "source_evidence": "observability disabled", "confidence": "high"},
-            {"type": "rpc_catalog_command", "catalog_command": "enter", "source_evidence": "custom RPC", "confidence": "high"},
         ]
 
         result = invoke_actions(state, actions, "single, custom RPC, quick, observability disabled")
@@ -1702,7 +2589,7 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
         self.assertEqual((result.get("pending_question") or {}).get("id"), "custom_rpc_endpoint")
         self.assertEqual(
             [item.get("action_type") or item.get("type") for item in result.get("action_queue") or []],
-            ["set_qps_mode", "set_observability"],
+            ["set_rpc_mode", "set_qps_mode", "set_observability"],
         )
         prompt = _render_question(result["pending_question"], "en")
         self.assertEqual(sum(prompt in item for item in result.get("visible_response") or []), 1)
@@ -2395,6 +3282,83 @@ network:
             ],
             ["propose_config_values"],
         )
+
+    def test_structured_sibling_demands_resume_in_dependency_order(self) -> None:
+        from agent.harness.state import new_state
+        from tests.agent_live.graph_turn import (
+            action_types,
+            answer_pending,
+            invoke_actions,
+        )
+
+        state = new_state("structured-sibling-resume", language="en")
+        state["target_mode"] = "fake-node"
+        state["workflow_mode"] = "rpc_benchmark"
+        state["active_group"] = "chain_identity"
+        state["pending_question"] = {
+            "contract_version": 2,
+            "id": "chain",
+            "group": "chain_identity",
+            "owner": "chain_rpc",
+            "kind": "chain",
+            "field": "chain",
+            "manual_input_allowed": True,
+            "options": [],
+            "queue_barrier": True,
+            "barrier_policy": "exclusive_owner",
+            "value_domain": "researched_identity",
+        }
+        text = (
+            '{"CHAIN":"solana","CLOUD_REGION":"us-1",'
+            '"RPC_MODE":"single","custom_rpc":true}'
+        )
+        reviewed = invoke_actions(
+            state,
+            [
+                {
+                    "type": "answer_pending",
+                    "answer": "solana",
+                    "source_evidence": "solana",
+                },
+                {
+                    "type": "propose_config_values",
+                    "source_format": "json",
+                    "config_values": {"CLOUD_REGION": "us-1"},
+                    "source_evidence": "us-1",
+                },
+                {
+                    "type": "set_rpc_mode",
+                    "rpc_mode": "single",
+                    "mutation_explicit": True,
+                    "source_evidence": "single",
+                },
+                {
+                    "type": "rpc_catalog_command",
+                    "catalog_command": "enter",
+                    "source_evidence": "true",
+                },
+            ],
+            text,
+        )
+
+        self.assertEqual(
+            reviewed["pending_question"]["id"],
+            "inferred_config_review",
+        )
+        self.assertEqual(
+            action_types(reviewed),
+            ["rpc_catalog_command", "set_rpc_mode"],
+        )
+
+        resumed = answer_pending(reviewed, "Y", selected_value=True)
+
+        self.assertEqual(
+            resumed["pending_question"]["id"],
+            "custom_rpc_endpoint",
+        )
+        self.assertEqual(action_types(resumed), ["set_rpc_mode"])
+        self.assertEqual(resumed["confirmed_config"]["CLOUD_REGION"], "us-1")
+        self.assertEqual(resumed["custom_rpc"]["status"], "needs_endpoint")
 
     def test_standalone_yaml_config_uses_the_same_review_transaction(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
@@ -3270,7 +4234,6 @@ network:
             ("DATA_VOL_MAX_IOPS", "20000", "DATA_VOL_MAX_IOPS=20000"),
             ("BLOCKCHAIN_PROCESS_NAMES", "geth", "BLOCKCHAIN_PROCESS_NAMES=geth"),
             ("LOCAL_RPC_URL", "http://node:8545", "LOCAL_RPC_URL=http://node:8545"),
-            ("RPC_API_KEY", "unit-secret-value", "RPC_API_KEY=unit-secret-value"),
             ("SYNC_OBSERVE_DURATION_SECONDS", "600", "sync_observe_duration_seconds: 600"),
         )
         for field, value, user_text in cases:
@@ -3305,10 +4268,6 @@ network:
                 self.assertEqual(result["input_shape"], "structured")
                 self.assertEqual(result["inferred_config"]["pending_review"]["config_values"][field], value)
                 self.assertNotIn(field, result["confirmed_config"])
-                if field == "RPC_API_KEY":
-                    response = "\n".join(result.get("visible_response") or [])
-                    self.assertNotIn(value, response)
-                    self.assertIn("***REDACTED***", response)
 
     def test_assignments_embedded_in_natural_language_do_not_bypass_other_actions(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
@@ -3377,7 +4336,180 @@ network:
 
         self.assertEqual(result.get("pending_question"), {})
         self.assertFalse(result["preflight"]["approved"])
+        self.assertEqual(result["preflight"]["decision"], "declined")
+        self.assertEqual(result["preflight"]["status"], "declined")
         self.assertIn("已暂停", "\n".join(result.get("visible_response") or []))
+
+    def test_declined_preflight_precedes_and_survives_sibling_qps_change(
+        self,
+    ) -> None:
+        from tests.agent_live.graph_turn import (
+            invoke_product_graph_turn as process_turn,
+        )
+        from agent.harness.questions import choice_question, question_text
+        from agent.harness.state import new_state
+
+        state = new_state("preflight-decline-qps-sibling", language="en")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "active_group": "preflight_smoke_execution",
+            "qps_profile": {"mode": "quick", "confirmed": True},
+            "last_user_input": "N, first change QPS.",
+        })
+        state["pending_question"] = choice_question(
+            "preflight_smoke_execution",
+            "preflight_smoke_confirm",
+            question_text("question.execution.preflight_smoke.prompt"),
+            owner="execution",
+            field="preflight_smoke_confirmed",
+            kind="yes_no",
+            options=[
+                {
+                    "label": question_text("question.control.option.yes"),
+                    "value": True,
+                    "action": {"type": "approve_preflight_smoke"},
+                    "expected_patch": {"preflight.approved": True},
+                },
+                {
+                    "label": question_text("question.control.option.no"),
+                    "value": False,
+                    "action": {"type": "reject_preflight_smoke"},
+                    "expected_patch": {"preflight.approved": False},
+                },
+            ],
+            queue_barrier=True,
+            rejection_evidence_value=False,
+        )
+        actions = [
+            {
+                "type": "request_qps_customization",
+                "source_evidence": "change QPS",
+            },
+            {
+                "type": "reject_preflight_smoke",
+                "source_evidence": "N",
+            },
+        ]
+
+        with patch(
+            "tests.agent_live.graph_turn.TEST_SEMANTIC_PLANNER",
+            side_effect=_admitted_mock_resolver({"actions": actions}),
+        ):
+            result = process_turn(state)
+
+        self.assertEqual(result["active_group"], "qps_profile")
+        self.assertEqual(
+            result["pending_question"]["id"],
+            "qps_adjust_field",
+        )
+        self.assertEqual(result["preflight"]["decision"], "declined")
+        self.assertEqual(result["preflight"]["status"], "declined")
+        self.assertFalse(result["preflight"]["approved"])
+
+    def test_approved_preflight_cannot_share_a_turn_with_upstream_qps_change(
+        self,
+    ) -> None:
+        from tests.agent_live.graph_turn import (
+            invoke_product_graph_turn as process_turn,
+        )
+        from agent.harness.questions import choice_question, question_text
+        from agent.harness.state import new_state
+
+        state = new_state("preflight-approve-qps-sibling", language="en")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "active_group": "preflight_smoke_execution",
+            "qps_profile": {"mode": "quick", "confirmed": True},
+            "last_user_input": "Y, and change QPS first.",
+        })
+        state["pending_question"] = choice_question(
+            "preflight_smoke_execution",
+            "preflight_smoke_confirm",
+            question_text("question.execution.preflight_smoke.prompt"),
+            owner="execution",
+            field="preflight_smoke_confirmed",
+            kind="yes_no",
+            options=[
+                {
+                    "label": question_text("question.control.option.yes"),
+                    "value": True,
+                    "action": {"type": "approve_preflight_smoke"},
+                    "expected_patch": {"preflight.approved": True},
+                },
+                {
+                    "label": question_text("question.control.option.no"),
+                    "value": False,
+                    "action": {"type": "reject_preflight_smoke"},
+                    "expected_patch": {"preflight.approved": False},
+                },
+            ],
+            queue_barrier=True,
+            rejection_evidence_value=False,
+        )
+        actions = [
+            {
+                "type": "request_qps_customization",
+                "source_evidence": "change QPS",
+            },
+            {
+                "type": "approve_preflight_smoke",
+                "source_evidence": "Y",
+            },
+        ]
+
+        with patch(
+            "tests.agent_live.graph_turn.TEST_SEMANTIC_PLANNER",
+            side_effect=_admitted_mock_resolver({"actions": actions}),
+        ):
+            result = process_turn(state)
+
+        self.assertEqual(result["active_group"], "preflight_smoke_execution")
+        self.assertEqual(result["pending_question"]["id"], "preflight_smoke_confirm")
+        self.assertEqual(result.get("preflight"), {})
+        self.assertFalse(result.get("completed_actions"))
+        self.assertEqual(
+            [item["code"] for item in result.get("action_errors") or []],
+            ["pending_answer_invalidated"],
+        )
+
+    def test_declined_preflight_can_be_explicitly_reopened(self) -> None:
+        from tests.agent_live.graph_turn import (
+            invoke_product_graph_turn as process_turn,
+        )
+
+        state = self._fully_configured_state_before_advanced_tuning()
+        state.update({
+            "active_group": "job_monitoring",
+            "advanced_tuning": {
+                "default_decision_made": True,
+                "confirmed": True,
+            },
+            "preflight": {
+                "approved": False,
+                "decision": "declined",
+                "status": "declined",
+            },
+            "last_user_input": "run preflight now",
+        })
+        actions = [{
+            "type": "change_group",
+            "group": "preflight_smoke_execution",
+            "source_evidence": "run preflight now",
+            "navigation_explicit": True,
+            "confidence": "high",
+        }]
+
+        with patch(
+            "tests.agent_live.graph_turn.TEST_SEMANTIC_PLANNER",
+            side_effect=_admitted_mock_resolver({"actions": actions}),
+        ):
+            result = process_turn(state)
+
+        self.assertEqual(result["active_group"], "preflight_smoke_execution")
+        self.assertEqual(result["pending_question"]["id"], "preflight_smoke_confirm")
+        self.assertEqual(result["preflight"]["decision"], "declined")
 
     def test_reviewed_queue_omits_target_mode_not_explicit_in_user_text(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
@@ -4145,7 +5277,13 @@ network:
         ):
             result = process_turn(state)
 
-        self.assertEqual((result.get("confirmed_config") or {}).get("RPC_API_KEY"), "none")
+        self.assertEqual(
+            _materialized_state_value(
+                result,
+                (result.get("confirmed_config") or {}).get("RPC_API_KEY"),
+            ),
+            "none",
+        )
         # It must not have stored the user's literal sentence as the "key".
         self.assertNotIn("skip", str((result.get("confirmed_config") or {}).get("RPC_API_KEY") or ""))
 
@@ -6695,6 +7833,50 @@ network:
         self.assertEqual(result["active_group"], "provider_deployment")
         self.assertEqual(result["pending_question"]["id"], "CLOUD_ZONE")
 
+    def test_go_back_reopens_completed_previous_group_for_reconfiguration(self) -> None:
+        from tests.agent_live.graph_turn import (
+            invoke_product_graph_turn as process_turn,
+        )
+        from agent.harness.domains.environment import question_for_environment
+        from agent.harness.state import new_state
+
+        state = new_state("go-back-completed-group", language="en")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "active_group": "provider_deployment",
+            "group_history": ["chain_identity"],
+            "chain_identity": {
+                "raw": "bsc",
+                "canonical": "bsc",
+                "adapter_family": "jsonrpc",
+                "status": "confirmed",
+                "case": "known",
+            },
+            "confirmed_config": {"BLOCKCHAIN_NODE": "bsc"},
+            "last_user_input": "back",
+        })
+        state["pending_question"] = (
+            question_for_environment(state, "provider_deployment") or {}
+        )
+
+        with patch(
+            "tests.agent_live.graph_turn.TEST_SEMANTIC_PLANNER",
+            return_value={"actions": [{
+                "type": "go_back",
+                "source_evidence": "back",
+            }]},
+        ):
+            result = process_turn(state)
+
+        self.assertEqual(result["active_group"], "chain_identity")
+        self.assertEqual(result["pending_question"]["id"], "chain")
+        self.assertEqual(
+            result["confirmed_config"].get("BLOCKCHAIN_NODE"),
+            "bsc",
+        )
+        self.assertEqual(result["chain_identity"]["canonical"], "bsc")
+
     def test_completed_group_jump_resumes_default_missing_group(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
         from agent.harness.state import new_state
@@ -8013,7 +9195,7 @@ network:
 
         rpc_question = question_for_chain_rpc(base, "workload_rpc")
         assert rpc_question is not None
-        self.assertEqual(rpc_question["contract_version"], 3)
+        self.assertEqual(rpc_question["contract_version"], 6)
         base["pending_question"] = rpc_question
         state = answer_pending(deepcopy(base), "1", rpc_question)
         self.assertEqual(state["rpc_mode"], "single")
@@ -8765,7 +9947,13 @@ response:
                 manual_value=state["last_user_input"],
             )
 
-        self.assertEqual(state["confirmed_config"]["LOCAL_RPC_URL"], "https://example.invalid/rpc")
+        self.assertEqual(
+            _materialized_state_value(
+                state,
+                state["confirmed_config"]["LOCAL_RPC_URL"],
+            ),
+            "https://example.invalid/rpc",
+        )
         self.assertTrue(state["endpoint_evidence"]["local_rpc_url_ready"])
         self.assertEqual(state["pending_question"]["id"], "BLOCKCHAIN_PROCESS_NAMES")
 
@@ -8899,7 +10087,13 @@ response:
         self.assertEqual(state["chain_identity"]["status"], "confirmed")
         self.assertEqual(state["chain_identity"]["case"], "case2_runtime_override")
         self.assertEqual(state["confirmed_config"]["BLOCKCHAIN_NODE"], "flow-evm")
-        self.assertEqual(state["confirmed_config"]["LOCAL_RPC_URL"], "https://example.invalid/rpc")
+        self.assertEqual(
+            _materialized_state_value(
+                state,
+                state["confirmed_config"]["LOCAL_RPC_URL"],
+            ),
+            "https://example.invalid/rpc",
+        )
         self.assertEqual(state["workload"]["methods"], ["eth_blockNumber"])
         self.assertTrue(state["workload"]["job_local_override"])
         self.assertEqual(state["pending_question"]["id"], "CLOUD_REGION")
@@ -9272,7 +10466,13 @@ response:
             )
 
         self.assertEqual(state["chain_identity"]["status"], "existing_family_needs_method")
-        self.assertEqual(state["endpoint_evidence"]["candidate_endpoint"], "https://example.invalid/rpc")
+        self.assertEqual(
+            _materialized_state_value(
+                state,
+                state["endpoint_evidence"]["candidate_endpoint"],
+            ),
+            "https://example.invalid/rpc",
+        )
         self.assertEqual(state["pending_question"]["id"], "new_chain_method")
 
     def test_unsupported_family_stops_with_development_handoff_message(self) -> None:
@@ -9378,7 +10578,13 @@ response:
             )
 
         self.assertTrue(state["endpoint_evidence"]["sync_rpc_url_ready"])
-        self.assertEqual(state["confirmed_config"]["SYNC_OBSERVE_RPC_URL"], "https://example.invalid/rpc")
+        self.assertEqual(
+            _materialized_state_value(
+                state,
+                state["confirmed_config"]["SYNC_OBSERVE_RPC_URL"],
+            ),
+            "https://example.invalid/rpc",
+        )
         self.assertNotIn("LOCAL_RPC_URL", state["confirmed_config"])
         self.assertNotEqual(state.get("pending_question", {}).get("id"), "BLOCKCHAIN_PROCESS_NAMES")
         self.assertEqual(state["pending_question"]["id"], "MAINNET_RPC_URL_REVIEWED")
@@ -12214,9 +13420,14 @@ response:
     def test_current_context_during_evidence_collection_reports_redacted_buffer(self) -> None:
         from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
         from agent.harness.state import new_state
+        from agent.utils.redaction import redact
 
         state = new_state("evidence-current-context", language="en")
-        original_lines = ["curl https://rpc.example/v1/abcdefghijklmnopqrstuvwxyz123456"]
+        original_lines = [
+            str(redact(
+                "curl https://rpc.example/v1/abcdefghijklmnopqrstuvwxyz123456"
+            ))
+        ]
         state["evidence_collection"] = {
             "question": {"id": "new_chain_schema_evidence", "kind": "evidence"},
             "lines": list(original_lines),
@@ -14364,7 +15575,13 @@ response:
         ):
             result = process_turn(state)
 
-        self.assertEqual((result.get("custom_rpc") or {}).get("endpoint"), "http://fake-node:19000")
+        self.assertEqual(
+            _materialized_state_value(
+                result,
+                (result.get("custom_rpc") or {}).get("endpoint"),
+            ),
+            "http://fake-node:19000",
+        )
         self.assertNotIn("example.invalid", str(result.get("confirmed_config") or {}))
         self.assertNotIn("example.invalid", str(result.get("endpoint_evidence") or {}))
 

@@ -400,10 +400,36 @@ def extract_structured_input_candidates(text: str) -> dict[str, Any] | None:
     config_values, workflow_values, unmapped_values = classify_flat_input_values(flattened)
     if not config_values and not workflow_values and not unmapped_values:
         return None
+    field_candidates: list[dict[str, Any]] = []
+    for raw_path, raw_value in flattened.items():
+        path = str(raw_path or "").strip()
+        if not path:
+            continue
+        field_config, field_workflow, field_unmapped = classify_flat_input_values(
+            {path: raw_value}
+        )
+        if field_config:
+            kind = "config"
+            canonical = next(iter(field_config))
+        elif field_workflow:
+            kind = "workflow"
+            canonical = next(iter(field_workflow))
+        elif field_unmapped:
+            kind = "unmapped"
+            canonical = path
+        else:
+            continue
+        field_candidates.append({
+            "source_path": path,
+            "raw_value": raw_value,
+            "candidate_kind": kind,
+            "canonical_key": canonical,
+        })
     return {
         "config_values": config_values,
         "workflow_values": workflow_values,
         "unmapped_values": unmapped_values,
+        "field_candidates": field_candidates,
         "source_format": next(iter(detected_formats)) if len(detected_formats) == 1 else "mixed",
     }
 

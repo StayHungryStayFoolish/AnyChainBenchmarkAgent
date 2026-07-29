@@ -22,6 +22,12 @@ from agent.runners.execution_scenarios import (
 )
 from agent.runners.guardrails import build_benchmark_command, validate_execution_plan
 from agent.runners.materialize import benchmark_subprocess_env, load_runtime_env_file, materialize_runtime_env
+from agent.runners.private_files import (
+    atomic_write_private_bytes,
+    atomic_write_private_text,
+    ensure_private_directory,
+    PRIVATE_FILE_MODE,
+)
 from agent.runners.result_status import classify_benchmark_result
 from agent.utils.redaction import redact
 
@@ -83,12 +89,17 @@ def submit_job(
     plan_file = Path(plan_file).resolve()
     source_plan = _read_json(plan_file)
     plan = dict(execution_plan) if execution_plan is not None else source_plan
-    jobs_dir = Path(jobs_dir)
-    jobs_dir.mkdir(parents=True, exist_ok=True)
+    jobs_dir = ensure_private_directory(jobs_dir)
 
     execution_key = str((plan.get("execution") or {}).get("idempotency_key") or "").strip()
     lock_path = jobs_dir / ".submission.lock"
-    with lock_path.open("a+", encoding="utf-8") as lock_handle:
+    lock_descriptor = os.open(
+        lock_path,
+        os.O_CREAT | os.O_RDWR,
+        PRIVATE_FILE_MODE,
+    )
+    os.fchmod(lock_descriptor, PRIVATE_FILE_MODE)
+    with os.fdopen(lock_descriptor, "a+", encoding="utf-8") as lock_handle:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
         matching_jobs = _jobs_by_execution_key(jobs_dir, execution_key) if execution_key else []
         existing = matching_jobs[0] if matching_jobs else None
@@ -111,7 +122,7 @@ def submit_job(
 
         job_id = _new_job_id()
         run_dir = jobs_dir / job_id
-        run_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(run_dir)
         copied_plan = run_dir / "plan.json"
 
         provenance = plan.get("execution_provenance")
@@ -205,7 +216,10 @@ def submit_job(
             stderr=subprocess.STDOUT,
             check=False,
         )
-        (run_dir / "benchmark.log").write_text(completed.stdout, encoding="utf-8")
+        atomic_write_private_text(
+            run_dir / "benchmark.log",
+            completed.stdout,
+        )
         job["artifacts"].update(_discover_completed_artifacts(plan, env))
         result = classify_benchmark_result(plan, completed.returncode, job["artifacts"])
         job["status"] = result["status"]
@@ -325,7 +339,7 @@ def migrate_legacy_job_result(
         original_bytes = job_file.read_bytes()
         backup_file = job_file.with_name("job.json.pre-result-migration-v1.bak")
         if not backup_file.exists():
-            backup_file.write_bytes(original_bytes)
+            atomic_write_private_bytes(backup_file, original_bytes)
         elif backup_file.read_bytes() != original_bytes:
             raise RuntimeError(f"legacy migration backup conflicts with current source: {backup_file}")
         migrated["migration_provenance"] = {
@@ -359,17 +373,10 @@ def _read_json(path: str | Path) -> dict[str, Any]:
 
 
 def _write_json(path: str | Path, payload: dict[str, Any]) -> None:
-    target = Path(path)
-    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        with temporary.open("x", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, target)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write_private_text(
+        path,
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+    )
 
 
 def _atomic_write_json(path: str | Path, payload: dict[str, Any]) -> None:

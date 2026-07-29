@@ -4,11 +4,188 @@ import json
 import threading
 import time
 import unittest
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import patch
 
 
 class HierarchicalPlannerContractTest(unittest.TestCase):
+    def test_stage_a_structured_demand_atoms_can_use_distinct_operations(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _stage_b_payload,
+            _validate_partition_document,
+        )
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.state import new_state
+
+        text = '{"CHAIN":"Flow","CLOUD_REGION":"us-1"}'
+        clauses = segment_user_turn(text)
+        document = {
+            "semantic_units": [
+                {
+                    "unit_id": "chain-atom",
+                    "clause_id": clauses[0].clause_id,
+                    "source_text": text,
+                    "source_path": "CHAIN",
+                    "operation": "pending_answer",
+                    "owner_routes": [{
+                        "owner": "coordinator",
+                        "group": "chain_identity",
+                    }],
+                    "reason": "answers the active chain question",
+                },
+                {
+                    "unit_id": "region-atom",
+                    "clause_id": clauses[0].clause_id,
+                    "source_text": text,
+                    "source_path": "CLOUD_REGION",
+                    "operation": "domain_request",
+                    "owner_routes": [{
+                        "owner": "environment",
+                        "group": "provider_deployment",
+                    }],
+                    "reason": "supplies an environment value",
+                },
+            ],
+            "reason": "structured demands",
+        }
+
+        partition, errors = _validate_partition_document(
+            json.dumps(document),
+            clauses,
+        )
+
+        self.assertFalse(errors, errors)
+        self.assertEqual(
+            [unit["source_path"] for unit in partition],
+            ["CHAIN", "CLOUD_REGION"],
+        )
+        payload = _stage_b_payload(
+            new_state("structured-demand-atoms", language="en"),
+            "coordinator",
+            frozenset({"chain_identity"}),
+            partition,
+            ("chain-atom",),
+        )
+        self.assertEqual(
+            payload["semantic_units"][0]["semantic_source"],
+            '{"CHAIN": "Flow"}',
+        )
+        self.assertEqual(
+            payload["semantic_units"][0]["semantic_value"],
+            "Flow",
+        )
+        self.assertEqual(
+            payload["semantic_units"][0]["source_text"],
+            text,
+        )
+
+    def test_stage_a_structured_demand_atoms_must_cover_every_field_path(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _validate_partition_document,
+        )
+        from agent.harness.plan_coverage import segment_user_turn
+
+        text = '{"CHAIN":"Flow","CLOUD_REGION":"us-1"}'
+        clauses = segment_user_turn(text)
+        document = {
+            "semantic_units": [{
+                "unit_id": "chain-atom",
+                "clause_id": clauses[0].clause_id,
+                "source_text": text,
+                "source_path": "CHAIN",
+                "operation": "domain_request",
+                "owner_routes": [{
+                    "owner": "chain_rpc",
+                    "group": "chain_identity",
+                }],
+                "reason": "chain demand",
+            }],
+            "reason": "incomplete structured demands",
+        }
+
+        _partition, errors = _validate_partition_document(
+            json.dumps(document),
+            clauses,
+        )
+
+        self.assertTrue(
+            any("omit source paths" in error for error in errors),
+            errors,
+        )
+
+    def test_cross_domain_validation_scopes_registered_values_to_demand_atom(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _cross_domain_pending_errors,
+        )
+        from agent.harness.questions import manual_question, question_text
+        from agent.harness.state import new_state
+
+        text = '{"CHAIN":"solana","RPC_MODE":"single"}'
+        state = new_state("structured-cross-domain", language="en")
+        state["pending_question"] = manual_question(
+            "chain_identity",
+            "chain",
+            question_text("question.chain_rpc.chain.prompt"),
+            owner="chain_rpc",
+            field="chain",
+            kind="scalar_token",
+        )
+        partition = [
+            {
+                "unit_id": "chain-atom",
+                "clause_id": "clause-1",
+                "source_text": text,
+                "source_path": "CHAIN",
+                "operation": "pending_answer",
+                "owner_routes": [{
+                    "owner": "coordinator",
+                    "group": "chain_identity",
+                }],
+                "reason": "chain answer",
+            },
+            {
+                "unit_id": "rpc-atom",
+                "clause_id": "clause-1",
+                "source_text": text,
+                "source_path": "RPC_MODE",
+                "operation": "domain_request",
+                "owner_routes": [{
+                    "owner": "chain_rpc",
+                    "group": "workload_rpc",
+                }],
+                "reason": "RPC mode request",
+            },
+        ]
+
+        self.assertEqual(_cross_domain_pending_errors(partition, state), ())
+
+    def test_universal_operation_owners_are_derived_from_reachable_actions(
+        self,
+    ) -> None:
+        from agent.harness.action_registry import (
+            universal_semantic_operation_owners,
+        )
+
+        owners = universal_semantic_operation_owners()
+
+        self.assertEqual(owners["pending_answer"], ("coordinator",))
+        self.assertEqual(owners["consultation"], ("orientation",))
+        self.assertEqual(owners["navigation"], ("coordinator",))
+        self.assertEqual(
+            owners["administrative"],
+            ("coordinator", "orientation"),
+        )
+        self.assertEqual(owners["evidence_analysis"], ("analysis",))
+        self.assertEqual(owners["report_analysis"], ("analysis",))
+        self.assertNotIn("recovery", owners["administrative"])
+
     def test_registered_semantic_domains_include_chain_aliases(self) -> None:
         from agent.harness.action_registry import (
             ACTION_BY_TYPE,
@@ -503,6 +680,81 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertFalse(validation.valid)
         self.assertTrue(
             any("registered semantic value" in error for error in validation.errors),
+            validation.errors,
+        )
+
+    def test_structured_pending_atom_does_not_inherit_sibling_config_review(
+        self,
+    ) -> None:
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.semantic_admission import prepare_hierarchical_candidate
+        from agent.harness.state import new_state
+
+        text = '{"CHAIN":"solana","CLOUD_REGION":"us-1"}'
+        clauses = segment_user_turn(text)
+        state = new_state("structured-pending-sibling-config", language="en")
+        state["active_group"] = "chain_identity"
+        state["pending_question"] = {
+            "id": "chain",
+            "group": "chain_identity",
+            "owner": "chain_rpc",
+            "manual_input_allowed": True,
+            "options": [],
+            "value_domain": "researched_identity",
+        }
+        candidate = {
+            "actions": [
+                {
+                    "type": "answer_pending",
+                    "answer": "solana",
+                    "source_evidence": "solana",
+                },
+                {
+                    "type": "propose_config_values",
+                    "source_format": "json",
+                    "config_values": {"CLOUD_REGION": "us-1"},
+                    "source_evidence": "us-1",
+                },
+            ],
+            "semantic_units": [
+                {
+                    "unit_id": "chain-atom",
+                    "clause_id": clauses[0].clause_id,
+                    "start": 0,
+                    "end": len(text),
+                    "source_text": text,
+                    "source_path": "CHAIN",
+                    "disposition": "action",
+                    "action_indexes": [0],
+                    "reason": "answers the open chain question",
+                },
+                {
+                    "unit_id": "region-atom",
+                    "clause_id": clauses[0].clause_id,
+                    "start": 0,
+                    "end": len(text),
+                    "source_text": text,
+                    "source_path": "CLOUD_REGION",
+                    "disposition": "action",
+                    "action_indexes": [1],
+                    "reason": "routes configuration through review",
+                },
+            ],
+            "reason": "structured DemandAtoms preserve independent ownership",
+        }
+
+        _prepared, validation = prepare_hierarchical_candidate(
+            json.dumps(candidate),
+            state,
+            clauses,
+            pending_choice_unit_ids=frozenset({"chain-atom"}),
+        )
+
+        self.assertFalse(
+            any(
+                "bypasses structured configuration review" in error
+                for error in validation.errors
+            ),
             validation.errors,
         )
 
@@ -1211,6 +1463,90 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             prompt,
         )
 
+    def test_administrative_reset_route_reaches_orientation_schema(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _stage_b_payload,
+            _validate_partition_document,
+        )
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.state import new_state
+
+        text = "Clear the configuration and start over."
+        clauses = segment_user_turn(text)
+        partition = {
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": clauses[0].clause_id,
+                "source_text": text,
+                "operation": "administrative",
+                "owner_routes": [{
+                    "owner": "orientation",
+                    "group": "opening",
+                }],
+                "reason": "explicit session reset",
+            }],
+            "reason": "reset",
+        }
+
+        validated, errors = _validate_partition_document(
+            json.dumps(partition),
+            clauses,
+        )
+        self.assertFalse(errors, errors)
+        payload = _stage_b_payload(
+            new_state("administrative-reset", language="en"),
+            "orientation",
+            frozenset({"opening"}),
+            validated,
+            ("unit-1",),
+        )
+        self.assertIn(
+            "reset_session",
+            {row["type"] for row in payload["owner_action_schema"]},
+        )
+
+    def test_administrative_queue_route_reaches_coordinator_schema(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _stage_b_payload,
+            _validate_partition_document,
+        )
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.state import new_state
+
+        text = "Queue a real-node benchmark for later."
+        clauses = segment_user_turn(text)
+        partition = {
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": clauses[0].clause_id,
+                "source_text": text,
+                "operation": "administrative",
+                "owner_routes": [{
+                    "owner": "coordinator",
+                    "group": "",
+                }],
+                "reason": "queue a later workflow goal",
+            }],
+            "reason": "queue",
+        }
+
+        validated, errors = _validate_partition_document(
+            json.dumps(partition),
+            clauses,
+        )
+        self.assertFalse(errors, errors)
+        payload = _stage_b_payload(
+            new_state("administrative-queue", language="en"),
+            "coordinator",
+            frozenset(),
+            validated,
+            ("unit-1",),
+        )
+        self.assertIn(
+            "queue_workflow_goal",
+            {row["type"] for row in payload["owner_action_schema"]},
+        )
+
     def test_stage_a_contract_keeps_pending_selection_rationale_atomic(
         self,
     ) -> None:
@@ -1638,7 +1974,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(result["admission_calls"], 1)
         self.assertEqual(compiler.call_count, 2)
 
-    def test_independent_unresolved_demand_fails_closed(
+    def test_independent_unresolved_demand_reaches_draft_compilation(
         self,
     ) -> None:
         from agent.harness.hierarchical_planner import begin_semantic_partition
@@ -1714,7 +2050,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         ):
             result = begin_semantic_partition(state, text)
 
-        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["status"], "compile_owner")
         self.assertEqual(result["stage_a_calls"], 1)
         self.assertEqual(result["admission_calls"], 1)
         self.assertEqual(compiler.call_count, 2)
@@ -1947,7 +2283,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             result["errors"],
         )
 
-    def test_coherent_unresolved_admission_repair_fails_closed(self) -> None:
+    def test_coherent_unresolved_admission_repair_reaches_draft_compilation(self) -> None:
         from agent.harness.hierarchical_planner import begin_semantic_partition
 
         text = "Use quick profile"
@@ -2035,11 +2371,11 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         ):
             result = begin_semantic_partition(state, text)
 
-        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["status"], "compile_owner")
         self.assertEqual(result["stage_a_calls"], 1)
         self.assertEqual(result["admission_calls"], 2)
         self.assertEqual(compiler.call_count, 3)
-        self.assertTrue(any("unresolved" in row for row in result["errors"]))
+        self.assertEqual(result["errors"], [])
 
     def test_product_graph_routes_hypothetical_reset_through_consultation_authority(
         self,
@@ -2823,6 +3159,481 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(whole_plan_attempts, [False, True])
         self.assertEqual(result["planner_metrics"]["model_calls"], 6)
         self.assertEqual(result["planner_metrics"]["admission_calls"], 3)
+
+    def test_semantic_draft_recompiles_clarification_through_real_admission(
+        self,
+    ) -> None:
+        from agent.harness.contracts import ActionProposal
+        from agent.harness.coordinator import (
+            _apply_handler_result,
+            _consume_planner_queue,
+            _prepare_ready_semantic_draft_finalization,
+            admit_turn_step,
+            apply_coordinator_action,
+        )
+        from agent.harness.hierarchical_planner import (
+            begin_semantic_partition,
+            compile_next_owner,
+            review_semantic_plan,
+        )
+        from agent.harness.invariants import validate_state
+        from agent.harness.semantic_drafts import semantic_hash
+        from agent.harness.state import new_state
+
+        model_calls: list[tuple[str, bool]] = []
+
+        class ContractProvider:
+            def complete(self, request):
+                system = request.messages[0].content
+                payload = json.loads(request.messages[1].content)
+                has_resolution = bool(
+                    payload.get("semantic_draft_resolutions")
+                )
+                clarification_turn = bool(
+                    (payload.get("pending_question") or {}).get(
+                        "semantic_draft_binding"
+                    )
+                ) and str(payload.get("user_text") or "").strip() == "quick"
+                model_calls.append((system, has_resolution))
+                if "Stage A semantic partition" in system:
+                    clauses = payload["clauses"]
+                    response = {
+                        "semantic_units": [{
+                            "unit_id": "unit-draft-answer",
+                            "clause_id": clauses[0]["clause_id"],
+                            "source_text": clauses[0]["text"],
+                            "operation": "pending_answer",
+                            "owner_routes": [{
+                                "owner": "coordinator",
+                                "group": str(
+                                    payload["pending_question"]["group"]
+                                ),
+                            }],
+                            "reason": "answers the active draft atom",
+                        }],
+                        "reason": "draft clarification answer",
+                    } if clarification_turn else {
+                        "semantic_units": [
+                            {
+                                "unit_id": "unit-chain",
+                                "clause_id": clauses[0]["clause_id"],
+                                "source_text": clauses[0]["text"],
+                                "operation": "domain_request",
+                                "owner_routes": [{
+                                    "owner": "chain_rpc",
+                                    "group": "chain_identity",
+                                }],
+                                "reason": "explicit chain selection",
+                            },
+                            {
+                                "unit_id": "unit-profile",
+                                "clause_id": clauses[1]["clause_id"],
+                                "source_text": clauses[1]["text"],
+                                "operation": (
+                                    "domain_request"
+                                    if has_resolution
+                                    else "unresolved"
+                                ),
+                                "owner_routes": (
+                                    [{
+                                        "owner": "performance",
+                                        "group": "qps_profile",
+                                    }]
+                                    if has_resolution
+                                    else []
+                                ),
+                                "reason": (
+                                    "the user clarified the QPS profile"
+                                    if has_resolution
+                                    else "the QPS profile value is missing"
+                                ),
+                            },
+                        ],
+                        "reason": "lossless two-demand partition",
+                    }
+                elif "Stage A coverage authority" in system:
+                    response = {
+                        "unit_verdicts": [{
+                            "unit_id": "unit-draft-answer",
+                            "verdict": "complete",
+                            "supports_unit_id": "",
+                            "reason": "the pending answer is represented",
+                        }],
+                        "clause_verdicts": [{
+                            "clause_id": payload["clauses"][0]["clause_id"],
+                            "verdict": "complete",
+                            "omitted_owner_routes": [],
+                            "reason": "the clarification clause is complete",
+                        }],
+                        "reason": "clarification coverage reviewed",
+                    } if clarification_turn else {
+                        "unit_verdicts": [
+                            {
+                                "unit_id": "unit-chain",
+                                "verdict": "complete",
+                                "supports_unit_id": "",
+                                "reason": "chain demand is represented",
+                            },
+                            {
+                                "unit_id": "unit-profile",
+                                "verdict": (
+                                    "complete"
+                                    if has_resolution
+                                    else "unresolved"
+                                ),
+                                "supports_unit_id": "",
+                                "reason": (
+                                    "clarified profile demand is represented"
+                                    if has_resolution
+                                    else "profile value still needs evidence"
+                                ),
+                            },
+                        ],
+                        "clause_verdicts": [
+                            {
+                                "clause_id": payload["clauses"][0][
+                                    "clause_id"
+                                ],
+                                "verdict": "complete",
+                                "omitted_owner_routes": [],
+                                "reason": "chain clause is complete",
+                            },
+                            {
+                                "clause_id": payload["clauses"][1][
+                                    "clause_id"
+                                ],
+                                "verdict": (
+                                    "complete"
+                                    if has_resolution
+                                    else "unresolved"
+                                ),
+                                "omitted_owner_routes": [],
+                                "reason": (
+                                    "profile clause is complete"
+                                    if has_resolution
+                                    else "profile clause needs clarification"
+                                ),
+                            },
+                        ],
+                        "reason": "coverage reviewed",
+                    }
+                elif "Stage B command compiler" in system:
+                    unit = payload["semantic_units"][0]
+                    if payload["owner"] == "coordinator":
+                        binding = payload["pending_question"][
+                            "semantic_draft_binding"
+                        ]
+                        action = {
+                            "type": "resolve_semantic_draft_atom",
+                            "draft_id": binding["draft_id"],
+                            "revision": binding["revision"],
+                            "atom_id": binding["atom_id"],
+                            "resolution": "quick",
+                            "source_evidence": "quick",
+                        }
+                    elif payload["owner"] == "chain_rpc":
+                        action = {
+                            "type": "choose_chain",
+                            "chain_text": "solana",
+                            "source_evidence": "solana",
+                        }
+                    else:
+                        self_resolution = str(
+                            unit.get("resolution_evidence") or ""
+                        )
+                        if self_resolution != "quick":
+                            raise AssertionError(
+                                "Stage B did not receive bound clarification"
+                            )
+                        action = {
+                            "type": "set_qps_mode",
+                            "qps_mode": "quick",
+                            "mutation_explicit": True,
+                            "source_evidence": self_resolution,
+                        }
+                    response = {
+                        "actions": [action],
+                        "bindings": [{
+                            "unit_id": unit["unit_id"],
+                            "action_indexes": [0],
+                            "disposition": "action",
+                            "reason": "compiled by authoritative owner",
+                        }],
+                        "reason": "compiled",
+                    }
+                elif "independent admission authority" in system:
+                    unit_by_id = {
+                        row["unit_id"]: row
+                        for row in payload["semantic_units"]
+                    }
+                    response = {
+                        "plan_hash": payload["plan_hash"],
+                        "action_verdicts": [
+                            {
+                                "action_id": row["action_id"],
+                                "verdict": "admit",
+                                "unit_ids": row["unit_ids"],
+                                "evidence": [
+                                    {
+                                        "unit_id": unit_id,
+                                        "quote": unit_by_id[unit_id][
+                                            "source_text"
+                                        ],
+                                        "relation": "direct",
+                                        "support_relation": "",
+                                    }
+                                    for unit_id in row["unit_ids"]
+                                ],
+                                "grounded_arguments": [
+                                    {
+                                        "argument_name": argument,
+                                        "evidence_quote": row["action"][
+                                            "source_evidence"
+                                        ],
+                                    }
+                                    for argument in row[
+                                        "required_value_grounding_arguments"
+                                    ]
+                                ],
+                                "pending_answer_argument": "",
+                                "turn_candidate_verdicts": [],
+                                "reason": "all values have exact evidence",
+                            }
+                            for row in payload["actions"]
+                        ],
+                        "unit_verdicts": [
+                            {
+                                "unit_id": row["unit_id"],
+                                "verdict": "complete",
+                                "owner_action_ids": row[
+                                    "owner_action_ids"
+                                ],
+                                "evidence_quote": row["source_text"],
+                                "omitted_action_type": "",
+                                "reason": "the complete demand is owned",
+                            }
+                            for row in payload["semantic_units"]
+                        ],
+                        "reason": "complete plan admitted",
+                    }
+                else:
+                    raise AssertionError(system)
+                return SimpleNamespace(text=json.dumps(response))
+
+        def compile_plan(state, text):
+            document = begin_semantic_partition(state, text)
+            while document["status"] == "compile_owner":
+                document = compile_next_owner(state, document)
+            return review_semantic_plan(state, document)
+
+        text = "Use solana.\nConfigure the benchmark profile."
+        state = new_state("draft-real-admission", language="en")
+        state["turn_index"] = 4
+        state["turn_context"] = {
+            "text": text,
+            "product_head": {
+                "product_authority_id": "authority:draft-real-admission",
+                "revision": 4,
+                "checkpoint_thread_id": (
+                    "checkpoint-thread:draft-real-admission"
+                ),
+                "checkpoint_id": "checkpoint:draft-real-admission",
+                "state_fingerprint": semantic_hash({
+                    "thread_id": "draft-real-admission",
+                }),
+            },
+        }
+        with patch(
+            "agent.harness.hierarchical_planner.provider_from_config",
+            return_value=ContractProvider(),
+        ):
+            first_queue = compile_plan(state, text)
+            self.assertIn("semantic_draft", first_queue)
+            state = _consume_planner_queue(state, first_queue)
+            draft = state["semantic_plan_draft"]
+            result = apply_coordinator_action(
+                state,
+                ActionProposal(
+                    action_id="resolve-profile",
+                    action_type="resolve_semantic_draft_atom",
+                    arguments={
+                        "draft_id": draft["draft_id"],
+                        "revision": draft["revision"],
+                        "atom_id": draft["active_atom_id"],
+                        "resolution": "quick",
+                        "source_evidence": "quick",
+                    },
+                    confidence="high",
+                ),
+            )
+            state = _apply_handler_result(
+                state,
+                result,
+                owner="coordinator",
+            )
+            transition = _prepare_ready_semantic_draft_finalization(state)
+            self.assertEqual(transition["phase"], "plan")
+            final_queue = compile_plan(
+                state,
+                state["turn_context"]["text"],
+            )
+            self.assertNotIn("semantic_draft", final_queue)
+            self.assertEqual(
+                [row["type"] for row in final_queue["actions"]],
+                ["choose_chain", "set_qps_mode"],
+                final_queue,
+            )
+            state = _consume_planner_queue(state, final_queue)
+            admitted = admit_turn_step(state)
+
+        self.assertEqual(admitted["semantic_plan_draft"], {})
+        self.assertEqual(
+            [
+                row["action_type"]
+                for row in admitted["action_queue"]
+            ],
+            ["choose_chain", "set_qps_mode"],
+        )
+        receipts = {
+            json.dumps(
+                row["admission_metadata"][
+                    "semantic_draft_finalization_receipt"
+                ],
+                sort_keys=True,
+            )
+            for row in admitted["action_queue"]
+        }
+        self.assertEqual(len(receipts), 1)
+        self.assertTrue(any(
+            "independent admission authority" in system
+            for system, _has_resolution in model_calls
+        ))
+        validate_state(admitted)
+        import tempfile
+        from pathlib import Path
+
+        from agent.harness.graph import AnyChainGraphRuntime
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "agent.harness.hierarchical_planner.provider_from_config",
+            return_value=ContractProvider(),
+        ):
+            checkpoint_path = Path(tmpdir) / "semantic-runtime.sqlite"
+            runtime = AnyChainGraphRuntime(
+                thread_id="semantic-runtime-e2e",
+                checkpoint_path=checkpoint_path,
+            )
+            first = runtime.invoke(text, language="en")
+            from agent.harness.state import STATE_SCHEMA_VERSION
+
+            self.assertEqual(first["schema_version"], STATE_SCHEMA_VERSION)
+            self.assertTrue(first["semantic_plan_draft"], first)
+            self.assertEqual(
+                {
+                    unit["unit_id"]
+                    for unit in first["turn_receipt"]["semantic_units"]
+                    if unit["disposition"] == "unresolved"
+                },
+                set(first["turn_receipt"]["unresolved_units"]),
+            )
+            self.assertFalse(first["turn_receipt"]["admitted_action_ids"])
+            runtime_draft = deepcopy(first["semantic_plan_draft"])
+            self.assertEqual(
+                runtime.snapshot()["semantic_plan_draft"]["draft_id"],
+                runtime_draft["draft_id"],
+            )
+            runtime.close()
+
+            resumed = AnyChainGraphRuntime(
+                thread_id="semantic-runtime-e2e",
+                checkpoint_path=checkpoint_path,
+            )
+            restored = resumed.snapshot()
+            self.assertTrue(
+                restored["semantic_plan_draft"],
+                {
+                    "checkpoint_recovery": restored.get(
+                        "checkpoint_recovery"
+                    ),
+                    "audit_events": restored.get("audit_events"),
+                },
+            )
+            self.assertEqual(
+                restored["semantic_plan_draft"]["draft_id"],
+                runtime_draft["draft_id"],
+            )
+            final = resumed.invoke("quick", language="en")
+            resumed.close()
+
+        self.assertEqual(final["semantic_plan_draft"], {}, final)
+        receipt = next(
+            item
+            for item in final["audit_events"]
+            if item.get("event") == "semantic_draft_finalized"
+        )
+        self.assertEqual(
+            set(receipt["final_action_ids"]),
+            {
+                item["action_id"]
+                for item in final["action_queue"]
+            }
+            | {
+                item["action_id"]
+                for item in final["audit_events"]
+                if item.get("event")
+                == "semantic_draft_finalization_action_applied"
+            },
+        )
+        validate_state(final)
+
+        from agent.harness.contracts import FailureDescriptor, HandlerResult
+        from agent.harness.domains.runtime import DOMAIN_RUNTIME, DomainRuntime
+
+        blocked_performance = DomainRuntime(
+            apply_action=lambda _state, _action: HandlerResult(
+                blocker=FailureDescriptor(
+                    code="harness.failure.test.finalization_blocked",
+                    source=__name__,
+                ),
+                completion="blocked",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "agent.harness.hierarchical_planner.provider_from_config",
+            return_value=ContractProvider(),
+        ):
+            checkpoint_path = Path(tmpdir) / "semantic-rollback.sqlite"
+            runtime = AnyChainGraphRuntime(
+                thread_id="semantic-runtime-rollback",
+                checkpoint_path=checkpoint_path,
+            )
+            awaiting = runtime.invoke(text, language="en")
+            self.assertEqual(
+                awaiting["semantic_plan_draft"]["status"],
+                "awaiting_clarification",
+            )
+            with patch.dict(
+                DOMAIN_RUNTIME,
+                {"performance": blocked_performance},
+            ):
+                recovered = runtime.invoke("quick", language="en")
+            runtime.close()
+
+        self.assertFalse(
+            recovered["chain_identity"],
+            {
+                "chain_identity": recovered.get("chain_identity"),
+                "failure_recovery": recovered.get("failure_recovery"),
+                "pending_question": recovered.get("pending_question"),
+                "action_queue": recovered.get("action_queue"),
+            },
+        )
+        self.assertEqual(recovered["failure_recovery"]["status"], "pending")
+        self.assertEqual(
+            recovered["semantic_plan_draft"]["status"],
+            "stale",
+        )
+        validate_state(recovered)
 
     def test_stage_a_partition_is_lossless_and_owner_scoped(self) -> None:
         from agent.harness.hierarchical_planner import _validate_partition_document
@@ -4486,50 +5297,134 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
 
     def test_consultation_cannot_claim_a_pending_option_by_action_type(self) -> None:
         from agent.harness.domains.orientation import opening_question
+        from agent.harness.admission import validate_action_plan
         from agent.harness.semantic_admission import (
+            _admitted_action_queue,
+            _freeze_bounded_semantic_plan,
             prepare_hierarchical_candidate,
         )
+        from agent.harness.semantic_compiler import WholePlanAdmission
         from agent.harness.plan_coverage import segment_user_turn
         from agent.harness.state import new_state
 
-        text = "Explain the supported capabilities."
-        clauses = segment_user_turn(text)
-        state = new_state("consultation-pending", language="en")
+        for topic, text in (
+            ("capabilities", "Explain the supported capabilities."),
+            ("recommendation", "Recommend a safe way to start."),
+        ):
+            with self.subTest(topic=topic):
+                clauses = segment_user_turn(text)
+                state = new_state(
+                    f"consultation-pending-{topic}",
+                    language="en",
+                )
+                state["pending_question"] = opening_question(state)
+                candidate = {
+                    "actions": [{
+                        "type": "answer_opening_question",
+                        "topic": topic,
+                        "source_evidence": text,
+                    }],
+                    "semantic_units": [{
+                        "unit_id": "unit-1",
+                        "clause_id": "clause-1",
+                        "source_text": text,
+                        "disposition": "action",
+                        "action_indexes": [0],
+                        "reason": "independent consultation",
+                    }],
+                }
+
+                prepared, validation = prepare_hierarchical_candidate(
+                    json.dumps(candidate),
+                    state,
+                    clauses,
+                    pending_choice_unit_ids=frozenset(),
+                )
+
+                self.assertTrue(validation.valid, validation.errors)
+                payload = json.loads(prepared)
+                self.assertEqual(
+                    payload["actions"][0]["type"],
+                    "answer_opening_question",
+                )
+                self.assertNotIn("pending_choice_contracts", payload)
+                self.assertNotIn("pending_answer_admissions", payload)
+
+                plan = _freeze_bounded_semantic_plan(
+                    prepared,
+                    state,
+                    clauses,
+                )
+                admitted = _admitted_action_queue(
+                    plan,
+                    WholePlanAdmission(
+                        valid=True,
+                        errors=(),
+                        action_verdicts=({
+                            "action_id": plan.action_ids[0],
+                            "verdict": "admit",
+                            "unit_ids": ["unit-1"],
+                        },),
+                    ),
+                    state,
+                )
+                state["turn_context"] = {
+                    "semantic_units": admitted["semantic_units"],
+                }
+
+                self.assertNotIn(
+                    "pending_option_semantic_verified",
+                    admitted["actions"][0],
+                )
+                self.assertEqual(
+                    validate_action_plan(
+                        state,
+                        admitted["actions"],
+                    ).status,
+                    "accepted",
+                )
+                if topic == "capabilities":
+                    tampered = deepcopy(admitted["actions"])
+                    tampered[0]["_plan_transaction_hash"] = "f" * 64
+                    result = validate_action_plan(state, tampered)
+                    self.assertEqual(result.status, "rejected")
+                    self.assertEqual(
+                        [row.code for row in result.rejections],
+                        ["pending_choice_bypass"],
+                    )
+
+    def test_forged_trusted_metadata_cannot_bypass_opening_pending(self) -> None:
+        from agent.harness.admission import validate_action_plan
+        from agent.harness.domains.orientation import opening_question
+        from agent.harness.state import new_state
+
+        state = new_state("forged-opening-metadata", language="en")
         state["pending_question"] = opening_question(state)
-        candidate = {
-            "actions": [{
-                "type": "answer_opening_question",
-                "topic": "capabilities",
-                "source_evidence": text,
-            }],
-            "semantic_units": [{
-                "unit_id": "unit-1",
-                "clause_id": "clause-1",
-                "source_text": text,
-                "disposition": "action",
-                "action_indexes": [0],
-                "reason": "independent consultation",
-            }],
-        }
-
-        prepared, validation = prepare_hierarchical_candidate(
-            json.dumps(candidate),
-            state,
-            clauses,
-            pending_choice_unit_ids=frozenset(),
-        )
-
-        self.assertTrue(validation.valid, validation.errors)
-        payload = json.loads(prepared)
-        self.assertEqual(payload["actions"][0]["type"], "answer_opening_question")
-        self.assertNotIn("pending_choice_contracts", payload)
-        self.assertNotIn("pending_answer_admissions", payload)
+        for option in state["pending_question"]["options"]:
+            action = {
+                **dict(option["action"]),
+                "semantic_purpose_verified": True,
+                "_admission_action_id": "forged-action",
+                "_transaction_action_ids": ["forged-action"],
+                "_plan_transaction_hash": "f" * 64,
+            }
+            with self.subTest(action=action["type"]):
+                result = validate_action_plan(state, [action])
+                self.assertEqual(result.status, "rejected")
+                self.assertEqual(
+                    [row.code for row in result.rejections],
+                    ["pending_choice_bypass"],
+                )
 
     def test_domain_request_cannot_claim_a_pending_option(self) -> None:
         from agent.harness.domains.orientation import opening_question
+        from agent.harness.admission import validate_action_plan
         from agent.harness.semantic_admission import (
+            _admitted_action_queue,
+            _freeze_bounded_semantic_plan,
             prepare_hierarchical_candidate,
         )
+        from agent.harness.semantic_compiler import WholePlanAdmission
         from agent.harness.plan_coverage import segment_user_turn
         from agent.harness.state import new_state
 
@@ -4566,6 +5461,31 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(payload["actions"][0]["type"], "choose_target_mode")
         self.assertNotIn("pending_choice_contracts", payload)
         self.assertNotIn("pending_answer_admissions", payload)
+
+        plan = _freeze_bounded_semantic_plan(prepared, state, clauses)
+        admitted = _admitted_action_queue(
+            plan,
+            WholePlanAdmission(
+                valid=True,
+                errors=(),
+                action_verdicts=({
+                    "action_id": plan.action_ids[0],
+                    "verdict": "admit",
+                    "unit_ids": ["unit-1"],
+                },),
+            ),
+            state,
+        )
+        state["turn_context"] = {
+            "semantic_units": admitted["semantic_units"],
+        }
+        result = validate_action_plan(state, admitted["actions"])
+
+        self.assertEqual(result.status, "rejected")
+        self.assertEqual(
+            [row.code for row in result.rejections],
+            ["pending_choice_bypass"],
+        )
 
     def test_product_resolver_runs_partition_then_owner_compilers(self) -> None:
         from tests.agent_live.graph_turn import resolve_product_action_queue_for_test as resolve_product_action_queue

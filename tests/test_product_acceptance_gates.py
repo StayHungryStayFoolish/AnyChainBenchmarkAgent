@@ -69,7 +69,10 @@ class ProductAcceptanceGateWiringTests(unittest.TestCase):
         provider_path.parent.mkdir(parents=True)
         manifest_path.parent.mkdir(parents=True)
         provider_path.write_text('{"provider_id":"provider"}', encoding="utf-8")
-        manifest_path.write_text('{"manifest":"typed"}', encoding="utf-8")
+        manifest_path.write_text(
+            '{"manifest":"typed","authority_trust_root_id":"trusted-root"}',
+            encoding="utf-8",
+        )
         loaded = {
             "obligation_count": 60,
             "exact_count": 15,
@@ -86,6 +89,7 @@ class ProductAcceptanceGateWiringTests(unittest.TestCase):
                 phase_root=self.phase_root,
                 obligations=[{"obligation_id": "one"}],
                 revision=REVISION,
+                expected_authority_trust_root_id="trusted-root",
             )
 
         self.assertEqual(result["status"], "passed")
@@ -95,6 +99,7 @@ class ProductAcceptanceGateWiringTests(unittest.TestCase):
             provider={"provider_id": "provider"},
             obligations=[{"obligation_id": "one"}],
             revision=REVISION,
+            expected_authority_trust_root_id="trusted-root",
         )
 
     def test_g4_malformed_declared_evidence_becomes_a_failed_gate(self) -> None:
@@ -117,6 +122,10 @@ class ProductAcceptanceGateWiringTests(unittest.TestCase):
                 phase_root=self.phase_root,
                 obligations=({"obligation_id": "obligation-1"},),
                 revision=REVISION,
+                expected_authority_trust_root_ids={
+                    "round-1": "root-1",
+                    "round-2": "root-2",
+                },
             )
         self.assertEqual(result["status"], "failed")
         self.assertFalse(result["complete"])
@@ -127,6 +136,7 @@ class ProductAcceptanceGateWiringTests(unittest.TestCase):
             phase_root=self.phase_root,
             obligations=[],
             revision=REVISION,
+            expected_authority_trust_root_id="trusted-root",
         )
         self.assertEqual(missing["status"], "incomplete")
         self.assertFalse(missing["complete"])
@@ -148,6 +158,7 @@ class ProductAcceptanceGateWiringTests(unittest.TestCase):
                 phase_root=self.phase_root,
                 obligations=[],
                 revision=REVISION,
+                expected_authority_trust_root_id="trusted-root",
             )
         self.assertEqual(rejected["status"], "failed")
         self.assertIn("hash drift", rejected["reason"])

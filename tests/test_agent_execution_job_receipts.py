@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -119,6 +120,38 @@ class JobManagerReceiptTest(unittest.TestCase):
         )
         self.assertNotEqual(first["receipt_id"], second["receipt_id"])
         self.assertNotIn("token-a", json.dumps(first, sort_keys=True))
+
+    def test_job_local_secret_material_is_owner_only(self) -> None:
+        from agent.runners.job_manager import submit_job
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            plan_file = self._write_plan(root)
+            jobs_dir = root / "jobs"
+            submitted = submit_job(
+                plan_file,
+                jobs_dir=jobs_dir,
+                mock=True,
+                approved=True,
+            )
+            run_dir = Path(submitted["run_dir"])
+            private_files = (
+                jobs_dir / ".submission.lock",
+                run_dir / "plan.json",
+                run_dir / "runtime.env",
+                run_dir / "job.json",
+            )
+            directory_modes = {
+                path: stat.S_IMODE(path.stat().st_mode)
+                for path in (jobs_dir, run_dir)
+            }
+            file_modes = {
+                path: stat.S_IMODE(path.stat().st_mode)
+                for path in private_files
+            }
+
+        self.assertEqual(set(directory_modes.values()), {0o700})
+        self.assertEqual(set(file_modes.values()), {0o600})
 
     def test_job_read_receipt_binds_status_to_job_file(self) -> None:
         from agent.runners.job_manager import get_job, submit_job, verify_job_receipt

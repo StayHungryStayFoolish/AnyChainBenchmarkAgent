@@ -7,16 +7,25 @@ import json
 import os
 import ctypes
 import errno
+import fcntl
+import shutil
 import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from tests.agent_live.batch_orchestrator import (
     BATCH_RESULT_SCHEMA_VERSION,
+    JourneyControllerAuthoritySnapshot,
     load_frozen_manifest,
+    load_validated_journey_controller_authority,
     validate_completed_shard_result,
 )
-from tests.agent_live.coverage_evidence import content_hash
+from tests.agent_live.coverage_evidence import (
+    content_hash,
+    verify_controller_payload_signature,
+)
 from tests.agent_live.product_obligation_evidence import (
     admit_product_obligation_evidence,
 )
@@ -27,6 +36,58 @@ G3_ARTIFACT_TYPE = "g3_open_completed_batch_evidence"
 G4_ARTIFACT_TYPE = "g4_completed_batch_evidence"
 _RENAME_NOREPLACE = 1
 _AT_FDCWD = -100
+_COMPLETED_JOURNEY_SOURCE_AUTHORITY = object()
+
+
+@dataclass(frozen=True)
+class CompletedJourneyRuntimeArtifact:
+    relative_path: str
+    content: bytes
+    mtime_ns: int
+
+
+@dataclass(frozen=True)
+class CompletedJourneySource:
+    """Controller-admitted source passed only by completed-batch conversion."""
+
+    runtime_root: Path
+    obligation_id: str
+    shard_id: str
+    execution_id: str
+    controller_snapshot: JourneyControllerAuthoritySnapshot
+    runtime_artifacts: tuple[CompletedJourneyRuntimeArtifact, ...]
+    _authority: object = field(repr=False, compare=False)
+
+    def require_authority(self, *, obligation_id: str) -> None:
+        if (
+            self._authority is not _COMPLETED_JOURNEY_SOURCE_AUTHORITY
+            or self.obligation_id != obligation_id
+            or not self.shard_id
+            or not self.execution_id
+        ):
+            raise ValueError(
+                "Journey conversion requires completed-batch authority"
+            )
+
+    def materialize_runtime(self, destination: Path) -> Path:
+        self.require_authority(obligation_id=self.obligation_id)
+        root = destination.resolve()
+        root.mkdir(mode=0o700, parents=True)
+        for artifact in self.runtime_artifacts:
+            path = root / artifact.relative_path
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            path.write_bytes(artifact.content)
+            os.utime(
+                path,
+                ns=(artifact.mtime_ns, artifact.mtime_ns),
+            )
+            path.chmod(0o400)
+        candidate = root / "journey-controller-admission" / "candidate.json"
+        candidate.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        candidate.write_bytes(self.controller_snapshot.candidate_bytes)
+        candidate.chmod(0o400)
+        candidate.parent.chmod(0o500)
+        return root
 
 
 def convert_completed_journey_batch(
@@ -38,7 +99,84 @@ def convert_completed_journey_batch(
     revision: Mapping[str, str],
     artifact_type: str,
     round_id: str,
-    convert_one: Callable[[Mapping[str, Any], Path, Path, Path | None], Path],
+    expected_authority_trust_root_id: str,
+    convert_one: Callable[
+        [Mapping[str, Any], CompletedJourneySource, Path, Path | None],
+        Path,
+    ],
+) -> Path:
+    """Convert and publish a completed batch under one lifecycle lock."""
+
+    destination = Path(output_dir).expanduser().resolve()
+    with _completed_batch_lock(destination):
+        for staging in _completed_batch_staging_paths(destination):
+            _remove_completed_batch_path(staging)
+        orphan_marker = _reconciliation_marker(destination)
+        if not destination.exists() and orphan_marker.exists():
+            _clear_reconciliation_marker(orphan_marker)
+        if destination.exists():
+            try:
+                _validate_recovery_source_binding(
+                    destination / "manifest.json",
+                    manifest_path=manifest_path,
+                    result_index_path=result_index_path,
+                    obligations=obligations,
+                    revision=revision,
+                    expected_authority_trust_root_id=(
+                        expected_authority_trust_root_id
+                    ),
+                )
+                load_completed_journey_batch_evidence(
+                    destination / "manifest.json",
+                    obligations=obligations,
+                    revision=revision,
+                    artifact_type=artifact_type,
+                    round_id=round_id,
+                    expected_authority_trust_root_id=(
+                        expected_authority_trust_root_id
+                    ),
+                    _allow_durability_uncertain=True,
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                raise FileExistsError(
+                    "completed-batch destination is not the same "
+                    "recoverable publication"
+                ) from exc
+            _reconcile_completed_batch_publication(destination)
+            return destination / "manifest.json"
+        try:
+            return _convert_completed_journey_batch_locked(
+                manifest_path=manifest_path,
+                result_index_path=result_index_path,
+                output_dir=destination,
+                obligations=obligations,
+                revision=revision,
+                artifact_type=artifact_type,
+                round_id=round_id,
+                expected_authority_trust_root_id=(
+                    expected_authority_trust_root_id
+                ),
+                convert_one=convert_one,
+            )
+        finally:
+            for staging in _completed_batch_staging_paths(destination):
+                _remove_completed_batch_path(staging)
+
+
+def _convert_completed_journey_batch_locked(
+    *,
+    manifest_path: str | Path,
+    result_index_path: str | Path,
+    output_dir: str | Path,
+    obligations: Sequence[Mapping[str, Any]],
+    revision: Mapping[str, str],
+    artifact_type: str,
+    round_id: str,
+    expected_authority_trust_root_id: str,
+    convert_one: Callable[
+        [Mapping[str, Any], CompletedJourneySource, Path, Path | None],
+        Path,
+    ],
 ) -> Path:
     """Convert every passed Journey shard and publish one declared evidence index."""
 
@@ -49,11 +187,12 @@ def convert_completed_journey_batch(
     }
     if not expected or len(expected) != len(obligations):
         raise ValueError("completed-batch obligations are incomplete or duplicated")
-    manifest, runtime_roots, execution_ids, result_index = _validated_completed_batch(
+    manifest, sources, execution_ids, result_index = _validated_completed_batch(
         manifest_path=manifest_path,
         result_index_path=result_index_path,
         expected_obligation_ids=set(expected),
         revision=revision,
+        expected_authority_trust_root_id=expected_authority_trust_root_id,
     )
     destination = Path(output_dir).expanduser().resolve()
     if destination.exists():
@@ -81,7 +220,7 @@ def convert_completed_journey_batch(
         )
         converted = convert_one(
             expected[obligation_id],
-            runtime_roots[obligation_id],
+            sources[obligation_id],
             evidence_path,
             checkpoint_diff,
         )
@@ -128,6 +267,7 @@ def convert_completed_journey_batch(
         "artifact_type": artifact_type,
         "revision_binding": dict(revision),
         "round_id": str(round_id),
+        "authority_trust_root_id": expected_authority_trust_root_id,
         "batch_manifest": _source_reference(
             Path(manifest_path), "manifest_id", manifest.manifest_id
         ),
@@ -154,11 +294,239 @@ def convert_completed_journey_batch(
     index = {**unsigned, "index_hash": content_hash(unsigned)}
     index_path = staging / "manifest.json"
     _write_once(index_path, index)
+    _fsync_completed_batch_tree(staging)
     for path in staging.rglob("*"):
         path.chmod(0o500 if path.is_dir() else 0o400)
     staging.chmod(0o500)
-    _rename_directory_noreplace(staging, destination)
+    _fsync_completed_batch_tree(staging)
+    marker = _write_reconciliation_marker(
+        destination,
+        index_hash=str(index["index_hash"]),
+    )
+    try:
+        _rename_directory_noreplace(staging, destination)
+        _fsync_directory(destination)
+        _fsync_directory(destination.parent)
+        _clear_reconciliation_marker(marker)
+    except OSError as exc:
+        if destination.exists():
+            _ensure_reconciliation_marker(
+                destination,
+                index_hash=str(index["index_hash"]),
+            )
+            raise RuntimeError(
+                "completed-batch publication durability is uncertain; "
+                "retry with the same sources to reconcile"
+            ) from exc
+        marker.unlink(missing_ok=True)
+        raise
     return destination / "manifest.json"
+
+
+@contextmanager
+def _completed_batch_lock(destination: Path):
+    lock_path = destination.with_name(f".{destination.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _completed_batch_staging_paths(
+    destination: Path,
+) -> tuple[Path, ...]:
+    return tuple(
+        destination.parent.glob(f".{destination.name}.staging-*")
+    )
+
+
+def _remove_completed_batch_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        path.chmod(0o700)
+        for child in path.rglob("*"):
+            if not child.is_symlink():
+                child.chmod(0o700 if child.is_dir() else 0o600)
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_completed_batch_tree(root: Path) -> None:
+    for path in root.rglob("*"):
+        if path.is_file():
+            with path.open("rb") as handle:
+                os.fsync(handle.fileno())
+    for path in sorted(
+        (item for item in root.rglob("*") if item.is_dir()),
+        key=lambda item: len(item.parts),
+        reverse=True,
+    ):
+        _fsync_directory(path)
+    _fsync_directory(root)
+
+
+def _reconciliation_marker(destination: Path) -> Path:
+    return destination.with_name(
+        f".{destination.name}.durability-uncertain.json"
+    )
+
+
+def _write_reconciliation_marker(
+    destination: Path,
+    *,
+    index_hash: str,
+) -> Path:
+    marker = _reconciliation_marker(destination)
+    payload = {
+        "schema_version": 1,
+        "destination": str(destination),
+        "index_hash": index_hash,
+        "state": "durability_uncertain",
+    }
+    if marker.exists():
+        existing = _load_mapping(marker)
+        if existing != payload:
+            raise RuntimeError(
+                "completed-batch reconciliation marker conflicts with "
+                "the publication"
+            )
+        return marker
+    _write_once(marker, payload)
+    marker.chmod(0o400)
+    with marker.open("rb") as handle:
+        os.fsync(handle.fileno())
+    _fsync_directory(marker.parent)
+    return marker
+
+
+def _ensure_reconciliation_marker(
+    destination: Path,
+    *,
+    index_hash: str,
+) -> None:
+    try:
+        _write_reconciliation_marker(
+            destination,
+            index_hash=index_hash,
+        )
+    except OSError:
+        # The visible marker still protects the live filesystem namespace.
+        # A retry must reconcile the destination before qualification.
+        pass
+
+
+def _clear_reconciliation_marker(marker: Path) -> None:
+    marker.unlink(missing_ok=True)
+    _fsync_directory(marker.parent)
+
+
+def _validate_reconciliation_marker(
+    destination: Path,
+    *,
+    index_hash: str,
+) -> Path | None:
+    marker = _reconciliation_marker(destination)
+    if not marker.exists():
+        return None
+    _require_immutable_regular(
+        marker,
+        description="completed-batch reconciliation marker",
+    )
+    payload = _load_mapping(marker)
+    if payload != {
+        "schema_version": 1,
+        "destination": str(destination),
+        "index_hash": index_hash,
+        "state": "durability_uncertain",
+    }:
+        raise ValueError(
+            "completed-batch reconciliation marker is invalid"
+        )
+    return marker
+
+
+def _reconcile_completed_batch_publication(destination: Path) -> None:
+    index_payload = _load_mapping(destination / "manifest.json")
+    index_hash = str(index_payload.get("index_hash") or "")
+    marker = _validate_reconciliation_marker(
+        destination,
+        index_hash=index_hash,
+    )
+    try:
+        _fsync_directory(destination)
+        _fsync_directory(destination.parent)
+    except OSError as exc:
+        _ensure_reconciliation_marker(
+            destination,
+            index_hash=index_hash,
+        )
+        raise RuntimeError(
+            "completed-batch publication durability remains uncertain; "
+            "reconciliation did not complete"
+        ) from exc
+    if marker is not None:
+        try:
+            _clear_reconciliation_marker(marker)
+        except OSError as exc:
+            _ensure_reconciliation_marker(
+                destination,
+                index_hash=index_hash,
+            )
+            raise RuntimeError(
+                "completed-batch reconciliation marker could not be "
+                "durably cleared"
+            ) from exc
+
+
+def _validate_recovery_source_binding(
+    index_path: Path,
+    *,
+    manifest_path: str | Path,
+    result_index_path: str | Path,
+    obligations: Sequence[Mapping[str, Any]],
+    revision: Mapping[str, str],
+    expected_authority_trust_root_id: str,
+) -> None:
+    payload = _load_mapping(index_path)
+    manifest, _, _, result = _validated_completed_batch(
+        manifest_path=manifest_path,
+        result_index_path=result_index_path,
+        expected_obligation_ids={
+            str(row.get("obligation_id") or "") for row in obligations
+        },
+        revision=revision,
+        expected_authority_trust_root_id=expected_authority_trust_root_id,
+    )
+    expected_manifest = _source_reference(
+        Path(manifest_path),
+        "manifest_id",
+        str(manifest.manifest_id),
+    )
+    expected_result = _source_reference(
+        Path(result_index_path),
+        "index_id",
+        str(result.get("index_id") or ""),
+    )
+    if (
+        payload.get("batch_manifest") != expected_manifest
+        or payload.get("batch_result") != expected_result
+    ):
+        raise ValueError(
+            "completed-batch retry sources do not match the published "
+            "manifest/result path, digest, and identity"
+        )
 
 
 def load_completed_journey_batch_evidence(
@@ -168,6 +536,8 @@ def load_completed_journey_batch_evidence(
     revision: Mapping[str, str],
     artifact_type: str,
     round_id: str,
+    expected_authority_trust_root_id: str,
+    _allow_durability_uncertain: bool = False,
 ) -> tuple[Path, ...]:
     raw_path = Path(index_path).expanduser()
     if raw_path.is_symlink():
@@ -178,12 +548,23 @@ def load_completed_journey_batch_evidence(
     if path.stat().st_mode & 0o222 or path.parent.stat().st_mode & 0o222:
         raise ValueError("completed-batch evidence index must be immutable")
     payload = _load_mapping(path)
+    marker = _validate_reconciliation_marker(
+        path.parent,
+        index_hash=str(payload.get("index_hash") or ""),
+    )
+    if marker is not None and not _allow_durability_uncertain:
+        raise ValueError(
+            "completed-batch publication durability is uncertain; "
+            "reconciliation is required"
+        )
     unsigned = {key: value for key, value in payload.items() if key != "index_hash"}
     if (
         payload.get("schema_version") != SCHEMA_VERSION
         or payload.get("artifact_type") != artifact_type
         or dict(payload.get("revision_binding") or {}) != dict(revision)
         or str(payload.get("round_id") or "") != str(round_id)
+        or payload.get("authority_trust_root_id")
+        != expected_authority_trust_root_id
         or payload.get("index_hash") != content_hash(unsigned)
     ):
         raise ValueError("completed-batch evidence index contract is invalid")
@@ -193,7 +574,7 @@ def load_completed_journey_batch_evidence(
         raise ValueError("completed-batch source references are invalid")
     manifest_source = Path(str(manifest_ref.get("path") or ""))
     result_source = Path(str(result_ref.get("path") or ""))
-    manifest, runtime_roots, execution_ids, result_index = (
+    manifest, sources, execution_ids, result_index = (
         _validated_completed_batch(
         manifest_path=manifest_source,
         result_index_path=result_source,
@@ -201,6 +582,7 @@ def load_completed_journey_batch_evidence(
             str(row.get("obligation_id") or "") for row in obligations
         },
         revision=revision,
+        expected_authority_trust_root_id=expected_authority_trust_root_id,
         )
     )
     if (
@@ -252,7 +634,7 @@ def load_completed_journey_batch_evidence(
             raise ValueError("completed-batch evidence row binding is invalid")
         evidence_document = _load_mapping(evidence_path)
         execution = evidence_document.get("execution")
-        runtime_root = runtime_roots.get(obligation_id)
+        source = sources.get(obligation_id)
         artifact_rows = evidence_document.get("artifacts")
         if (
             evidence_document.get("obligation_id") != obligation_id
@@ -262,26 +644,31 @@ def load_completed_journey_batch_evidence(
             or not isinstance(execution, Mapping)
             or execution.get("execution_id") != row.get("execution_id")
             or execution.get("execution_id") != execution_ids.get(obligation_id)
-            or runtime_root is None
+            or source is None
             or not isinstance(artifact_rows, list)
         ):
             raise ValueError("completed-batch evidence row binding is invalid")
-        resolved_runtime = runtime_root.resolve()
+        resolved_runtime = source.runtime_root.resolve()
         for artifact_row in artifact_rows:
-            if not isinstance(artifact_row, Mapping):
+            artifact_sha = str(
+                artifact_row.get("sha256") or ""
+            ) if isinstance(artifact_row, Mapping) else ""
+            if (
+                not isinstance(artifact_row, Mapping)
+                or set(artifact_row) != {"role", "path", "sha256"}
+                or not str(artifact_row.get("role") or "")
+                or len(artifact_sha) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in artifact_sha
+                )
+            ):
                 raise ValueError(
                     "completed-batch runtime artifact binding is invalid"
                 )
             artifact_path = Path(str(artifact_row.get("path") or ""))
-            if artifact_path.is_symlink():
-                raise ValueError(
-                    "completed-batch runtime artifact binding is invalid"
-                )
             resolved_artifact = artifact_path.resolve()
-            if (
-                not resolved_artifact.is_relative_to(resolved_runtime)
-                or not resolved_artifact.is_file()
-            ):
+            if not resolved_artifact.is_relative_to(resolved_runtime):
                 raise ValueError(
                     "completed-batch runtime artifact binding is invalid"
                 )
@@ -305,7 +692,13 @@ def _validated_completed_batch(
     result_index_path: str | Path,
     expected_obligation_ids: set[str],
     revision: Mapping[str, str],
-) -> tuple[Any, dict[str, Path], dict[str, str], dict[str, Any]]:
+    expected_authority_trust_root_id: str,
+) -> tuple[
+    Any,
+    dict[str, CompletedJourneySource],
+    dict[str, str],
+    dict[str, Any],
+]:
     _require_immutable_regular(
         Path(manifest_path),
         description="completed-batch manifest",
@@ -315,6 +708,16 @@ def _validated_completed_batch(
         description="completed-batch result index",
     )
     manifest = load_frozen_manifest(manifest_path)
+    if not manifest.controller_owned_execution:
+        raise ValueError(
+            "completed-batch evidence is not controller-owned"
+        )
+    if (
+        not expected_authority_trust_root_id
+        or manifest.pty_authority_trust_root_id
+        != expected_authority_trust_root_id
+    ):
+        raise ValueError("completed-batch manifest trust root is not externally trusted")
     if dict(manifest.revision) != dict(revision):
         raise ValueError("completed-batch manifest revision mismatch")
     shards = tuple(manifest.shards)
@@ -325,12 +728,34 @@ def _validated_completed_batch(
     ):
         raise ValueError("completed-batch manifest obligation set mismatch")
     result = _load_mapping(Path(result_index_path))
-    unsigned = {key: value for key, value in result.items() if key != "index_id"}
+    signed_payload = {
+        key: value
+        for key, value in result.items()
+        if key not in {"index_id", "controller_signature_b64"}
+    }
+    signed_index = {
+        **signed_payload,
+        "controller_signature_b64": str(
+            result.get("controller_signature_b64") or ""
+        ),
+    }
     if (
         result.get("schema_version") != BATCH_RESULT_SCHEMA_VERSION
-        or result.get("index_id") != content_hash(unsigned)
+        or result.get("index_id") != content_hash(signed_index)
         or result.get("batch_id") != manifest.batch_id
         or result.get("manifest_id") != manifest.manifest_id
+        or result.get("execution_authority_mode") != "controller_owned_v1"
+        or result.get("pty_authority_trust_root_id")
+        != manifest.pty_authority_trust_root_id
+        or result.get("pty_authority_public_key_b64")
+        != manifest.pty_authority_public_key_b64
+        or not verify_controller_payload_signature(
+            signed_payload,
+            signature_b64=str(
+                result.get("controller_signature_b64") or ""
+            ),
+            trusted_public_key_b64=manifest.pty_authority_public_key_b64,
+        )
         or dict(result.get("revision") or {}) != dict(revision)
         or result.get("execution_status") != "discovery_complete"
         or result.get("scheduled") != len(shards)
@@ -349,28 +774,136 @@ def _validated_completed_batch(
     }
     if len(by_shard) != len(shards):
         raise ValueError("completed-batch result shard identities are invalid")
-    roots: dict[str, Path] = {}
+    sources: dict[str, CompletedJourneySource] = {}
     execution_ids: dict[str, str] = {}
     for shard in shards:
         row = by_shard.get(shard.shard_id)
+        response_hashes = row.get("response_hashes") if row else None
+        decision_hashes = row.get("decision_hashes") if row else None
         if (
             row is None
             or row.get("classification") != "passed"
             or row.get("target_hash") != shard.target_hash
             or int(row.get("finished_at_ns") or 0)
             <= int(row.get("started_at_ns") or 0)
-            or not row.get("response_hashes")
-            or len(row.get("response_hashes") or ())
-            != len(row.get("decision_hashes") or ())
+            or not isinstance(response_hashes, list)
+            or not isinstance(decision_hashes, list)
+            or len(response_hashes) != len(decision_hashes)
             or not row.get("evidence_hashes")
         ):
             raise ValueError(
                 f"completed-batch shard is not qualifying: {shard.shard_id}"
             )
         validate_completed_shard_result(shard, row)
-        roots[shard.obligation_id] = Path(shard.runtime_root).resolve()
+        runtime_root = Path(shard.runtime_root).resolve()
+        journey_result_path = runtime_root / "journey-result.json"
+        transcript_path = runtime_root / "transcript.txt"
+        authority_path = runtime_root / "journey-controller-admission"
+        journey_result = _load_mapping(journey_result_path)
+        controller_snapshot = load_validated_journey_controller_authority(
+            manifest=manifest,
+            shard=shard,
+            bundle_path=authority_path,
+        )
+        authority_candidate = controller_snapshot.candidate_payload()
+        if (
+            row.get("evidence_hashes") != [
+                controller_snapshot.bundle_digest
+            ]
+            or str(
+                authority_candidate.get("evidence_id")
+                or ""
+            )
+            != str(journey_result.get("evidence_id") or "")
+            or row.get("schedule_result_hash") != _sha256(journey_result_path)
+            or row.get("transcript_hash") != _sha256(transcript_path)
+        ):
+            raise ValueError(
+                f"completed-batch shard evidence digest is stale: {shard.shard_id}"
+            )
+        sources[shard.obligation_id] = CompletedJourneySource(
+            runtime_root=runtime_root,
+            obligation_id=shard.obligation_id,
+            shard_id=shard.shard_id,
+            execution_id=str(shard.execution_id),
+            controller_snapshot=controller_snapshot,
+            runtime_artifacts=_capture_completed_runtime(
+                runtime_root,
+                authority_candidate,
+            ),
+            _authority=_COMPLETED_JOURNEY_SOURCE_AUTHORITY,
+        )
         execution_ids[shard.obligation_id] = str(shard.execution_id)
-    return manifest, roots, execution_ids, result
+    return manifest, sources, execution_ids, result
+
+
+def _capture_completed_runtime(
+    runtime_root: Path,
+    controller_candidate: Mapping[str, Any],
+) -> tuple[CompletedJourneyRuntimeArtifact, ...]:
+    paths = {
+        runtime_root / name
+        for name in (
+            "journey-result.json",
+            "journey-schedule.json",
+            "transcript.txt",
+            "turn-events.jsonl",
+            "checkpoints.sqlite",
+        )
+    }
+    proof = controller_candidate.get("execution_proof")
+    if isinstance(proof, Mapping) and str(proof.get("path") or ""):
+        paths.add(Path(str(proof["path"])).expanduser())
+    retained = controller_candidate.get("retained_artifacts")
+    if isinstance(retained, Mapping):
+        for reference in retained.values():
+            if isinstance(reference, Mapping) and str(
+                reference.get("path") or ""
+            ):
+                paths.add(Path(str(reference["path"])).expanduser())
+
+    captured: list[CompletedJourneyRuntimeArtifact] = []
+    root = runtime_root.resolve()
+    for declared in sorted(paths, key=str):
+        path = declared if declared.is_absolute() else root / declared
+        if path.is_symlink():
+            raise ValueError("completed Journey runtime contains a symlink")
+        resolved = path.resolve()
+        if not resolved.is_relative_to(root):
+            raise ValueError(
+                "completed Journey runtime artifact is outside its root"
+            )
+        if not resolved.exists():
+            continue
+        if not resolved.is_file():
+            raise ValueError(
+                "completed Journey runtime artifact is not a regular file"
+            )
+        before = resolved.stat()
+        content = resolved.read_bytes()
+        after = resolved.stat()
+        identity_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        )
+        identity_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        )
+        if identity_before != identity_after or len(content) != after.st_size:
+            raise ValueError(
+                "completed Journey runtime changed during snapshot capture"
+            )
+        captured.append(CompletedJourneyRuntimeArtifact(
+            relative_path=str(resolved.relative_to(root)),
+            content=content,
+            mtime_ns=after.st_mtime_ns,
+        ))
+    return tuple(captured)
 
 
 def _source_reference(path: Path, identity_field: str, identity: str) -> dict[str, Any]:

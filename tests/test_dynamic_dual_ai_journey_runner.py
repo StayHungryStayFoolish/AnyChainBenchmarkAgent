@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 from agent.harness.input_identity import user_input_hash
 from agent.harness.terminal_protocol import (
+    TerminalProtocolError,
     TerminalSessionEvent,
     build_terminal_session_event,
     presentation_hash,
@@ -24,17 +25,21 @@ from tests.agent_live.chaos_scheduler import (
     journey_schedule_payload,
 )
 from tests.agent_live.coverage_evidence import (
+    PtyCliTurnRecord,
     RuntimeTurnEvent,
     VerifiedPostcondition,
     content_hash,
+    pty_transcript_hash,
 )
 from tests.agent_live.codex_simulator_bridge import (
     build_simulator_attestation,
+    simulator_context_binding,
     simulator_context_hash,
 )
 from tests.agent_live.dynamic_dual_ai_chaos import (
     ChaosRunConfig,
     DynamicDualAiJourneyRunner,
+    JourneyDecisionProvenance,
     JourneyExternallyBlockedError,
     JourneyInfrastructureInterruptedError,
     JourneyPostconditionResult,
@@ -46,7 +51,16 @@ from tests.agent_live.dynamic_dual_ai_chaos import (
     JourneyTerminalClassification,
     TerminalOutcomeObservation,
     build_journey_outcome_verifier_registry,
+    build_journey_verifier_context,
     validate_journey_evidence_artifact,
+    verify_journey_forbidden_outcomes,
+    verify_journey_outcome,
+)
+from tests.agent_live.batch_orchestrator import (
+    _ControllerJourneyLedger,
+    _RunState,
+    _controller_fact_payloads,
+    _validate_and_recompute_journey_controller_facts,
 )
 from tests.agent_live.generate_harness_coverage_ledger import contract_variant_hash
 from tests.agent_live.retained_regression_attestations import (
@@ -158,6 +172,14 @@ def state_lost_at_turn_two(context):
         "state_lost",
         context.current_event.turn_index >= 2,
         {"turn_index": context.current_event.turn_index},
+    )
+
+
+def ready_at_start(context):
+    return JourneyPostconditionResult(
+        postcondition_id="ready_state",
+        satisfied=context.latest_turn is None,
+        details={"source": "startup"},
     )
 
 
@@ -488,6 +510,447 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
             ),
         ))
 
+    def test_controller_journey_callback_recomputes_and_deep_freezes(
+        self,
+    ) -> None:
+        schedule = self._schedule()
+        state = _RunState()
+        ledger = _ControllerJourneyLedger(
+            state,
+            schedule=schedule,
+            registry=self._registry(),
+            edge_index={EDGE_KEY: dict(EDGE)},
+        )
+        initial = self._event(1)
+        committed = self._event(2, "continue")
+        mutable_context = {"nested": {"value": "original"}}
+        turn = PtyCliTurnRecord(
+            session_id="journey-session",
+            turn_index=2,
+            previous_agent_response="Agent> choose",
+            user_message="continue",
+            agent_response="Agent> not ready",
+            provider="deepseek",
+            model="deepseek-chat",
+            before_fingerprint=initial.after_fingerprint,
+            after_fingerprint=committed.after_fingerprint,
+            transcript_hash=pty_transcript_hash(
+                session_id="journey-session",
+                turn_index=2,
+                previous_agent_response="Agent> choose",
+                user_message="continue",
+                agent_response="Agent> not ready",
+            ),
+            previous_response_received_at_ns=100,
+            user_message_submitted_at_ns=110,
+            agent_response_received_at_ns=120,
+        )
+        decision = JourneyDecisionProvenance(
+            turn_index=2,
+            previous_response_hash=content_hash(
+                turn.previous_agent_response
+            ),
+            selected_at_ns=105,
+            submitted_at_ns=110,
+            user_message_hash=content_hash(turn.user_message),
+            persona=schedule.persona,
+            mission=schedule.mission,
+            rationale="response-bound",
+            risk_factor_ids=(),
+            execution_id="e" * 64,
+            obligation_id=schedule.journey_id,
+            broker_request_id="request-1",
+            simulator_context_binding=mutable_context,
+        )
+
+        ledger(
+            initial_event=initial,
+            turn=turn,
+            baseline_event=initial,
+            committed_event=committed,
+            terminal_outcome=_independent_journey_outcome(
+                2,
+                response=turn.agent_response,
+            ),
+            decision=decision,
+        )
+        mutable_context["nested"]["value"] = "mutated"
+
+        frozen = _controller_fact_payloads(state, lane="journey")[0]
+        self.assertFalse(
+            frozen["turn_result"]["terminal_outcome"]["satisfied"]
+        )
+        self.assertEqual(
+            frozen["decision"]["simulator_context_binding"]["nested"][
+                "value"
+            ],
+            "original",
+        )
+        with self.assertRaises(TypeError):
+            ledger(
+                initial_event=initial,
+                turn=turn,
+                baseline_event=initial,
+                committed_event=committed,
+                terminal_outcome=_independent_journey_outcome(
+                    2,
+                    response=turn.agent_response,
+                ),
+                decision=decision,
+                turn_result={
+                    "terminal_outcome": {"satisfied": True},
+                },
+            )
+
+    def test_persisted_controller_facts_are_independently_recomputed(
+        self,
+    ) -> None:
+        schedule = self._schedule()
+        registry = self._registry()
+        state = _RunState()
+        ledger = _ControllerJourneyLedger(
+            state,
+            schedule=schedule,
+            registry=registry,
+            edge_index={EDGE_KEY: dict(EDGE)},
+        )
+        initial = self._event(1)
+        committed = self._event(2, "continue")
+        turn = PtyCliTurnRecord(
+            session_id="journey-session",
+            turn_index=2,
+            previous_agent_response="Agent> choose",
+            user_message="continue",
+            agent_response="Agent> not ready",
+            provider="deepseek",
+            model="deepseek-chat",
+            before_fingerprint=initial.after_fingerprint,
+            after_fingerprint=committed.after_fingerprint,
+            transcript_hash=pty_transcript_hash(
+                session_id="journey-session",
+                turn_index=2,
+                previous_agent_response="Agent> choose",
+                user_message="continue",
+                agent_response="Agent> not ready",
+            ),
+            previous_response_received_at_ns=100,
+            user_message_submitted_at_ns=110,
+            agent_response_received_at_ns=120,
+        )
+        simulator_context = {
+            "session_id": turn.session_id,
+            "turn_index": turn.turn_index,
+            "previous_response_hash": content_hash(
+                turn.previous_agent_response
+            ),
+            "previous_response_received_at_ns": (
+                turn.previous_response_received_at_ns
+            ),
+            "schedule": {"schedule_id": schedule.schedule_id},
+            "observed_edge_keys": [],
+        }
+        decision = JourneyDecisionProvenance(
+            turn_index=2,
+            previous_response_hash=content_hash(
+                turn.previous_agent_response
+            ),
+            selected_at_ns=105,
+            submitted_at_ns=110,
+            user_message_hash=content_hash(turn.user_message),
+            persona=schedule.persona,
+            mission=schedule.mission,
+            rationale="response-bound",
+            risk_factor_ids=(),
+            execution_id="e" * 64,
+            obligation_id=schedule.journey_id,
+            broker_request_id="request-1",
+            simulator_context_binding=simulator_context_binding(
+                simulator_context
+            ),
+        )
+        terminal_outcome = _independent_journey_outcome(
+            2,
+            response=turn.agent_response,
+        )
+        initial_context = build_journey_verifier_context(
+            schedule=schedule,
+            initial_event=initial,
+            current_event=initial,
+            turns=(),
+            events=(),
+            decisions=(),
+            transcript=(),
+            observed_edge_keys=(),
+            latest_turn=None,
+        )
+        ledger.observe_initial(
+            initial_event=initial,
+            terminal=verify_journey_outcome(
+                schedule.terminal_outcome,
+                initial_context,
+                registry,
+            ),
+            forbidden=verify_journey_forbidden_outcomes(
+                schedule,
+                initial_context,
+                registry,
+            ),
+        )
+        ledger(
+            initial_event=initial,
+            turn=turn,
+            baseline_event=initial,
+            committed_event=committed,
+            terminal_outcome=terminal_outcome,
+            decision=decision,
+        )
+        fact = dict(_controller_fact_payloads(state, lane="journey")[0])
+        initial_fact = dict(
+            _controller_fact_payloads(
+                state,
+                lane="journey_initial",
+            )[0]
+        )
+        for field_name in (
+            "initial_event",
+            "baseline_event",
+            "committed_event",
+        ):
+            event_payload = dict(fact[field_name])
+            event_payload.pop("runtime_event_payload_hash", None)
+            event_payload["runtime_event_payload_hash"] = content_hash(
+                event_payload
+            )
+            fact[field_name] = event_payload
+        initial_event_payload = dict(initial_fact["initial_event"])
+        initial_event_payload.pop("runtime_event_payload_hash", None)
+        initial_event_payload["runtime_event_payload_hash"] = content_hash(
+            initial_event_payload
+        )
+        initial_fact["initial_event"] = initial_event_payload
+        fact["initial_event"] = dict(initial_event_payload)
+        fact["baseline_event"] = dict(initial_event_payload)
+        terminal_payload = dict(fact["terminal_outcome"])
+        terminal_payload["runtime_event_payload_hash"] = fact[
+            "committed_event"
+        ]["runtime_event_payload_hash"]
+        terminal_payload.pop("record_hash", None)
+        terminal_payload["record_hash"] = content_hash(terminal_payload)
+        fact["terminal_outcome"] = terminal_payload
+        candidate = dict(fact["turn_result"])
+        submitted_input_commitment = content_hash(
+            "raw-submitted-input"
+        )
+        approved_decision = {
+            "user_message": turn.user_message,
+            "persona": decision.persona,
+            "mission": decision.mission,
+            "rationale": decision.rationale,
+            "risk_factor_ids": [],
+            "simulator_attestation": {},
+            "variant_binding": {},
+            "_controller_submitted_input_commitment": (
+                submitted_input_commitment
+            ),
+            "_controller_source_user_message_hash": content_hash(
+                turn.user_message
+            ),
+        }
+        observation = {
+            "turn_index": turn.turn_index,
+            "previous_response_hash": content_hash(
+                fact["turn"]["previous_agent_response"]
+            ),
+            "user_message_hash": content_hash(
+                fact["turn"]["user_message"]
+            ),
+            "agent_response_hash": content_hash(
+                fact["turn"]["agent_response"]
+            ),
+            "approved_decision": approved_decision,
+            "approved_decision_hash": content_hash(approved_decision),
+            "simulator_context": simulator_context,
+            "simulator_context_hash": simulator_context_hash(
+                simulator_context
+            ),
+            "submitted_input_commitment": (
+                submitted_input_commitment
+            ),
+            "baseline_runtime_event_hash": fact["baseline_event"][
+                "runtime_event_payload_hash"
+            ],
+            "committed_runtime_event_hash": fact["committed_event"][
+                "runtime_event_payload_hash"
+            ],
+            "terminal_runtime_event_id": fact["committed_event"][
+                "runtime_event_id"
+            ],
+            "terminal_runtime_event_sequence": (
+                fact["committed_event"]["runtime_event_sequence"]
+            ),
+            "terminal_outcome_hash": content_hash(
+                terminal_payload
+            ),
+            "turn_result_hash": content_hash(candidate),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            target_path = Path(temporary) / "target.json"
+            target_path.write_text("{}\n", encoding="utf-8")
+            shard = SimpleNamespace(
+                target_path=str(target_path),
+                target_hash=hashlib.sha256(
+                    target_path.read_bytes()
+                ).hexdigest(),
+                verifier_registry_import="tests.fixture.registry",
+                verifier_registry_id=registry.registry_id,
+                schedule_id=schedule.schedule_id,
+                seed=31,
+                session_id="journey-session",
+                execution_id="e" * 64,
+            )
+            manifest = SimpleNamespace(revision=REVISION)
+            with (
+                patch(
+                    "tests.agent_live.batch_orchestrator._journey_target",
+                    return_value=({}, shard.verifier_registry_import),
+                ),
+                patch(
+                    "tests.agent_live.batch_orchestrator.build_journey_schedule",
+                    return_value=schedule,
+                ),
+                patch(
+                    "tests.agent_live.batch_orchestrator."
+                    "validate_journey_schedule"
+                ),
+                patch(
+                    "tests.agent_live.batch_orchestrator."
+                    "load_verifier_registry",
+                    return_value=registry,
+                ),
+                patch(
+                    "tests.agent_live.batch_orchestrator.build_ledger",
+                    return_value={
+                        "revision": REVISION,
+                        "edges": [dict(EDGE)],
+                    },
+                ),
+            ):
+                _validate_and_recompute_journey_controller_facts(
+                    manifest=manifest,
+                    shard=shard,
+                    candidate_turns=[candidate],
+                    observations=[observation],
+                    controller_facts=[fact],
+                    controller_initial_fact=initial_fact,
+                    candidate_initial_verification=initial_fact[
+                        "initial_verification"
+                    ],
+                )
+                for field_name in (
+                    "previous_response_hash",
+                    "user_message_hash",
+                    "agent_response_hash",
+                    "baseline_runtime_event_hash",
+                    "committed_runtime_event_hash",
+                    "approved_decision_hash",
+                    "simulator_context_hash",
+                ):
+                    forged_observation = dict(observation)
+                    forged_observation[field_name] = "0" * 64
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "differs from its observation",
+                    ):
+                        _validate_and_recompute_journey_controller_facts(
+                            manifest=manifest,
+                            shard=shard,
+                            candidate_turns=[candidate],
+                            observations=[forged_observation],
+                            controller_facts=[fact],
+                            controller_initial_fact=initial_fact,
+                            candidate_initial_verification=initial_fact[
+                                "initial_verification"
+                            ],
+                        )
+                forged = json.loads(json.dumps(fact))
+                forged["turn_result"]["terminal_outcome"][
+                    "satisfied"
+                ] = True
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "failed recomputation",
+                ):
+                    _validate_and_recompute_journey_controller_facts(
+                        manifest=manifest,
+                        shard=shard,
+                        candidate_turns=[forged["turn_result"]],
+                        observations=[{
+                            **observation,
+                            "turn_result_hash": content_hash(
+                                forged["turn_result"]
+                            ),
+                        }],
+                        controller_facts=[forged],
+                        controller_initial_fact=initial_fact,
+                        candidate_initial_verification=initial_fact[
+                            "initial_verification"
+                        ],
+                    )
+
+                forged_session = json.loads(json.dumps(fact))
+                forged_committed = forged_session["committed_event"]
+                forged_committed["thread_id"] = "another-session"
+                forged_committed["product_authority_id"] = (
+                    f"{forged_committed['session_purpose']}:"
+                    "another-session"
+                )
+                forged_committed.pop(
+                    "runtime_event_payload_hash",
+                    None,
+                )
+                forged_committed[
+                    "runtime_event_payload_hash"
+                ] = content_hash(forged_committed)
+                forged_terminal = forged_session["terminal_outcome"]
+                forged_terminal["logical_thread_id"] = (
+                    "another-session"
+                )
+                forged_terminal["product_authority_id"] = (
+                    forged_committed["product_authority_id"]
+                )
+                forged_terminal["runtime_event_payload_hash"] = (
+                    forged_committed["runtime_event_payload_hash"]
+                )
+                forged_terminal.pop("record_hash", None)
+                forged_terminal["record_hash"] = content_hash(
+                    forged_terminal
+                )
+                forged_observation = {
+                    **observation,
+                    "committed_runtime_event_hash": (
+                        forged_committed[
+                            "runtime_event_payload_hash"
+                        ]
+                    ),
+                    "terminal_outcome_hash": content_hash(
+                        forged_terminal
+                    ),
+                }
+                with self.assertRaises(
+                    (ValueError, TerminalProtocolError),
+                ):
+                    _validate_and_recompute_journey_controller_facts(
+                        manifest=manifest,
+                        shard=shard,
+                        candidate_turns=[candidate],
+                        observations=[forged_observation],
+                        controller_facts=[forged_session],
+                        controller_initial_fact=initial_fact,
+                        candidate_initial_verification=initial_fact[
+                            "initial_verification"
+                        ],
+                    )
+
     def _runner(
         self,
         root,
@@ -499,6 +962,7 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
         registry=None,
         startup_product_revision=1,
         startup_product_fingerprint="b" * 64,
+        controller_turn_observer=None,
     ):
         return DynamicDualAiJourneyRunner(
             ChaosRunConfig.linux(root, session_id="journey-session"),
@@ -507,6 +971,7 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
             schedule=schedule,
             postcondition_verifier_registry=registry or self._registry(),
             transport=transport,
+            controller_turn_observer=controller_turn_observer,
             event_stream=FakeRuntimeEventStream(events),
             terminal_outcome_stream=FakeTerminalOutcomeStream(
                 turn_count=max(len(events), startup_product_revision),
@@ -517,6 +982,89 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
             revision=REVISION,
             clock_ns=OrderedClock(),
         )
+
+    def test_startup_satisfied_journey_persists_controller_initial_fact(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = _RunState()
+            schedule = self._schedule(max_turns=1)
+            registry = self._registry(ready=ready_at_start)
+            observer = _ControllerJourneyLedger(
+                state,
+                schedule=schedule,
+                registry=registry,
+                edge_index={EDGE_KEY: dict(EDGE)},
+            )
+            runner = self._runner(
+                Path(tmpdir),
+                schedule=schedule,
+                simulator=lambda context: self._decision(context),
+                transport=FakeTransport(["Agent> Ready at startup."]),
+                events=[self._event(1)],
+                registry=registry,
+                controller_turn_observer=observer,
+            )
+
+            result = self._run(runner)
+
+            self.assertEqual(
+                result.terminal_classification,
+                JourneyTerminalClassification.PASSED,
+            )
+            self.assertEqual(len(result.turns), 0)
+            self.assertEqual(
+                len(_controller_fact_payloads(
+                    state,
+                    lane="journey_initial",
+                )),
+                1,
+            )
+            self.assertEqual(
+                _controller_fact_payloads(
+                    state,
+                    lane="journey",
+                ),
+                (),
+            )
+
+    def test_initial_controller_fact_never_persists_raw_secrets(
+        self,
+    ) -> None:
+        schedule = self._schedule(max_turns=1)
+        registry = self._registry(ready=ready_at_start)
+        state = _RunState()
+        ledger = _ControllerJourneyLedger(
+            state,
+            schedule=schedule,
+            registry=registry,
+            edge_index={EDGE_KEY: dict(EDGE)},
+        )
+        secret = "https://user:secret-value@example.com"
+        initial = replace(
+            self._event(1),
+            pending_contract={
+                "id": "opening_next_action",
+                "api_key": secret,
+                "secret_ref": "semantic-secret:owning-capability",
+            },
+        )
+
+        ledger.observe_initial(
+            initial_event=initial,
+            terminal=None,
+            forbidden=(),
+        )
+
+        serialized = json.dumps(
+            _controller_fact_payloads(
+                state,
+                lane="journey_initial",
+            ),
+            sort_keys=True,
+        )
+        self.assertNotIn(secret, serialized)
+        self.assertNotIn("semantic-secret:", serialized)
 
     def _run(self, runner, *, reviewed_question=None):
         seed_state = {}

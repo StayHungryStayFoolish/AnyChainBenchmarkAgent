@@ -178,6 +178,8 @@ def _canonicalize_pending_choice_actions(
                 source in str(unit.get("source_text") or "") for unit in units
             ):
                 continue
+            if _action_answers_bound_semantic_draft(action, pending):
+                continue
             canonical = {
                 "type": "answer_pending",
                 "answer": manual_value,
@@ -395,6 +397,8 @@ def _action_owns_pending_candidate(
     pending = dict(state.get("pending_question") or {})
     if not pending:
         return False
+    if _action_answers_bound_semantic_draft(action, pending):
+        return True
     if str(action.get("type") or "") != "answer_pending":
         option = _matching_pending_option(action, state)
         spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
@@ -435,7 +439,11 @@ def _validate_action_source_grounding(
                 )
             continue
         units = _source_units_for_action(payload, index)
-        if not any(source in str(unit.get("source_text") or "") for unit in units):
+        if not any(
+            source in evidence_source
+            for unit in units
+            for evidence_source in _semantic_unit_evidence_sources(unit)
+        ):
             errors.append(f"action {index} source_evidence is not an exact mapped-unit quote")
             continue
         for value_argument in exact_arguments:
@@ -445,6 +453,21 @@ def _validate_action_source_grounding(
                     f"action {index} {value_argument} is not present in its exact source_evidence"
                 )
     return _merge_plan_errors(validation, tuple(errors)) if errors else validation
+
+
+def _semantic_unit_evidence_sources(
+    unit: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Return original and Harness-bound clarification evidence."""
+
+    return tuple(
+        value
+        for value in (
+            str(unit.get("source_text") or ""),
+            str(unit.get("resolution_evidence") or ""),
+        )
+        if value
+    )
 
 
 def _review_bounded_semantic_candidate(
@@ -644,6 +667,18 @@ def _freeze_bounded_semantic_plan(
             "unit": unit,
             "clause_id": str(unit.get("clause_id") or ""),
             "source_text": str(unit.get("source_text") or ""),
+            "resolution_evidence": str(
+                unit.get("resolution_evidence") or ""
+            ),
+            "resolution_atom_id": str(
+                unit.get("resolution_atom_id") or ""
+            ),
+            "resolution_binding_hash": str(
+                unit.get("resolution_binding_hash") or ""
+            ),
+            "evidence_sources": list(
+                _semantic_unit_evidence_sources(unit)
+            ),
             "input_shape": clause_shapes.get(str(unit.get("clause_id") or ""), ""),
             "disposition": str(unit.get("disposition") or ""),
             "owner_action_ids": [action_ids[action_index] for action_index in unit_owner_indexes[index]],
@@ -788,43 +823,6 @@ def _semantic_unit_owner_indexes(
     return []
 
 
-_NO_REVIEWED_PENDING_VALUE = object()
-
-
-def _reviewer_selected_pending_value(
-    plan: ImmutableSemanticPlan,
-    admission: WholePlanAdmission,
-    action_index: int,
-    state: AgentGraphState,
-) -> Any:
-    """Return the exact typed candidate explicitly selected by the reviewer."""
-
-    if action_index >= len(admission.action_verdicts):
-        return _NO_REVIEWED_PENDING_VALUE
-    row = admission.action_verdicts[action_index]
-    candidate_id = str(row.get("pending_answer_argument") or "")
-    if not candidate_id:
-        return _NO_REVIEWED_PENDING_VALUE
-    records = plan.request_payload().get("actions") or []
-    if action_index >= len(records) or not isinstance(records[action_index], Mapping):
-        return _NO_REVIEWED_PENDING_VALUE
-    candidate = next(
-        (
-            item
-            for item in records[action_index].get("pending_value_candidates") or []
-            if isinstance(item, Mapping)
-            and str(item.get("candidate_id") or "") == candidate_id
-        ),
-        None,
-    )
-    if candidate is None:
-        return _NO_REVIEWED_PENDING_VALUE
-    value = candidate.get("value")
-    if not value_satisfies_pending_contract(value, dict(state.get("pending_question") or {})):
-        return _NO_REVIEWED_PENDING_VALUE
-    return value
-
-
 def _admitted_action_queue(
     plan: ImmutableSemanticPlan,
     admission: WholePlanAdmission,
@@ -836,7 +834,23 @@ def _admitted_action_queue(
         str(row.get("action_id") or ""): row
         for row in admission.action_verdicts
     }
-    pending_indexes: list[int] = []
+    pending_indexes = [
+        int(index)
+        for index in payload.get("pending_answer_admissions") or []
+        if (
+            isinstance(index, int)
+            and not isinstance(index, bool)
+            and 0 <= index < len(actions)
+        )
+    ]
+    if len(pending_indexes) != len(
+        [
+            index
+            for index in payload.get("pending_answer_admissions") or []
+            if isinstance(index, int) and not isinstance(index, bool)
+        ]
+    ) or len(pending_indexes) != len(set(pending_indexes)):
+        raise ValueError("frozen pending admission indexes are invalid")
     chain_indexes: list[int] = []
     target_indexes: list[int] = []
     consultation_indexes: list[int] = []
@@ -856,30 +870,6 @@ def _admitted_action_queue(
         row = action_rows.get(action_ids[index])
         if row is None:
             raise ValueError("admitted immutable plan is missing an action verdict")
-        reviewed_pending_value = _reviewer_selected_pending_value(
-            plan,
-            admission,
-            index,
-            state,
-        )
-        if (
-            (
-                (
-                    action_type != "answer_pending"
-                    or bool(_declared_option_for_pending_answer(action, dict(state.get("pending_question") or {})))
-                )
-                and _action_owns_pending_candidate(action, state)
-            )
-            or _admitted_manual_answer_owns_pending(
-                action,
-                state,
-                payload,
-                index,
-                row,
-                reviewed_pending_value,
-            )
-        ):
-            pending_indexes.append(index)
         if action_type in {"choose_chain", "change_chain"}:
             chain_indexes.append(index)
         if action_type in {"choose_target_mode", "queue_workflow_goal"}:
@@ -971,43 +961,6 @@ def _admitted_action_queue(
     return _parse_action_queue(
         json.dumps(admitted_payload, ensure_ascii=False, sort_keys=True),
         trusted_metadata=True,
-    )
-
-
-def _admitted_manual_answer_owns_pending(
-    action: Mapping[str, Any],
-    state: AgentGraphState,
-    payload: Mapping[str, Any],
-    action_index: int,
-    admission_row: Mapping[str, Any],
-    reviewed_pending_value: Any,
-) -> bool:
-    """Bind a semantically normalized value after independent admission."""
-
-    pending = dict(state.get("pending_question") or {})
-    if (
-        str(action.get("type") or "") != "answer_pending"
-        or pending.get("manual_input_allowed") is not True
-        or not value_satisfies_pending_contract(action.get("answer"), pending)
-        or reviewed_pending_value is _NO_REVIEWED_PENDING_VALUE
-        or reviewed_pending_value != action.get("answer")
-    ):
-        return False
-    source = str(action.get("source_evidence") or "").strip()
-    units = _source_units_for_action(payload, action_index)
-    admitted_unit_ids = {
-        str(unit_id)
-        for unit_id in admission_row.get("unit_ids") or []
-        if str(unit_id)
-    }
-    return bool(
-        source
-        and _manual_answer_has_literal_source(dict(action), source)
-        and any(
-            str(unit.get("unit_id") or "") in admitted_unit_ids
-            and source in str(unit.get("source_text") or "")
-            for unit in units
-        )
     )
 
 
@@ -1262,8 +1215,20 @@ def _validate_action_document(
         candidates = extract_structured_input_candidates(clause.text) or {}
         if not candidates.get("config_values"):
             continue
+        config_paths = {
+            str(candidate.get("source_path") or "")
+            for candidate in candidates.get("field_candidates") or []
+            if (
+                isinstance(candidate, Mapping)
+                and str(candidate.get("candidate_kind") or "") == "config"
+                and str(candidate.get("source_path") or "")
+            )
+        }
         for unit in units:
             if not isinstance(unit, Mapping) or str(unit.get("clause_id") or "") != clause.clause_id:
+                continue
+            source_path = str(unit.get("source_path") or "")
+            if source_path and source_path not in config_paths:
                 continue
             for index in unit.get("action_indexes") or []:
                 if (
@@ -1311,6 +1276,8 @@ def _pending_value_domain_error(
 
     if not pending:
         return ""
+    if _action_answers_bound_semantic_draft(action, pending):
+        return ""
     value = _raw_pending_candidate(action, pending)
     if not isinstance(value, str) or not value.strip():
         return ""
@@ -1329,6 +1296,30 @@ def _pending_value_domain_error(
     return (
         "uses a registered semantic value as an unrelated pending answer "
         f"({owners})"
+    )
+
+
+def _action_answers_bound_semantic_draft(
+    action: Mapping[str, Any],
+    pending: Mapping[str, Any],
+) -> bool:
+    """Honor the exact draft atom contract before ordinary value ownership."""
+
+    binding = dict(pending.get("semantic_draft_binding") or {})
+    if (
+        not binding
+        or str(action.get("type") or "") != "resolve_semantic_draft_atom"
+    ):
+        return False
+    identity_matches = (
+        str(action.get("draft_id") or "") == str(binding.get("draft_id") or "")
+        and int(action.get("revision") or 0) == int(binding.get("revision") or 0)
+        and str(action.get("atom_id") or "") == str(binding.get("atom_id") or "")
+    )
+    return (
+        identity_matches
+        and isinstance(action.get("resolution"), str)
+        and bool(str(action.get("resolution") or "").strip())
     )
 
 

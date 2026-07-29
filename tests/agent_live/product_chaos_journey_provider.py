@@ -9,6 +9,7 @@ contract.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import os
@@ -33,6 +34,7 @@ from tests.agent_live.coverage_evidence import content_hash
 from tests.agent_live.coverage_evidence import PtyCliTurnRecord, RuntimeTurnEvent
 from tests.agent_live.codex_simulator_bridge import validate_simulator_attestation
 from tests.agent_live.completed_journey_batch import (
+    CompletedJourneySource,
     G4_ARTIFACT_TYPE,
     convert_completed_journey_batch,
 )
@@ -52,6 +54,10 @@ from tests.agent_live.product_chaos_obligations import (
     build_product_chaos_obligations,
     validate_product_chaos_obligations,
 )
+from tests.agent_live.product_chaos_factors import (
+    factor_row_group_applicable,
+    product_state_for_factor_row,
+)
 from tests.agent_live.product_obligation_evidence import (
     PRODUCT_OBLIGATION_EVIDENCE_SCHEMA_VERSION,
 )
@@ -59,6 +65,7 @@ from tests.agent_live.runtime_checkpoint import (
     reviewed_scenario,
     seed_runtime_checkpoint,
 )
+from agent.workflows.group_registry import group_registry_contract_hash
 
 
 PRODUCT_CHAOS_JOURNEY_MANIFEST_SCHEMA_VERSION = 1
@@ -78,6 +85,24 @@ _SOURCE_CLASSIFICATION_TO_OUTCOME = {
     "infrastructure_interrupted": "failed",
     "externally_blocked": "externally_blocked",
 }
+
+
+def _journey_factors(journey: Mapping[str, Any]) -> dict[str, str]:
+    factors: dict[str, str] = {}
+    for raw in journey.get("allowed_risk_factors") or ():
+        name, separator, value = str(raw).partition(":")
+        if (
+            not separator
+            or not name
+            or not value
+            or name in factors
+        ):
+            raise ValueError("G4 journey has an invalid factor contract")
+        factors[name] = value
+    required = {"workflow_mode", "chain_case", "subject_group"}
+    if not required.issubset(factors):
+        raise ValueError("G4 journey lacks product-path factors")
+    return factors
 
 
 def load_frozen_product_chaos_catalog(
@@ -333,12 +358,34 @@ def write_product_chaos_target_set(
             frozen = payload["frozen_execution"]
             scenario_id = str(payload["journey"]["start_scenario"])
             scenario_preflight = scenario_preflights[scenario_id]
+            factors = _journey_factors(payload["journey"])
+            applicability_receipt = {
+                "schema_version": 1,
+                "obligation_id": frozen["obligation_id"],
+                "schedule_id": frozen["schedule_id"],
+                "subject_group": frozen["subject_group"],
+                "factors": factors,
+                "product_state": product_state_for_factor_row(factors),
+                "group_registry_contract_hash": (
+                    group_registry_contract_hash()
+                ),
+                "applicable": factor_row_group_applicable(factors),
+            }
+            if applicability_receipt["applicable"] is not True:
+                raise ValueError(
+                    "G4 target is outside the product group path: "
+                    f"{frozen['obligation_id']}"
+                )
+            applicability_receipt_hash = content_hash(
+                applicability_receipt
+            )
             preflight_id = content_hash({
                 "obligation_id": frozen["obligation_id"],
                 "schedule_id": frozen["schedule_id"],
                 "subject_group": frozen["subject_group"],
                 "scenario_id": scenario_id,
                 "seed_receipt_hash": scenario_preflight["seed_receipt_hash"],
+                "applicability_receipt_hash": applicability_receipt_hash,
             })
             targets.append({
                 "index": index,
@@ -348,6 +395,8 @@ def write_product_chaos_target_set(
                 "subject_group": frozen["subject_group"],
                 "scenario_id": scenario_id,
                 "preflight_id": preflight_id,
+                "applicability_receipt": applicability_receipt,
+                "applicability_receipt_hash": applicability_receipt_hash,
                 "path": name,
                 "sha256": hashlib.sha256(encoded).hexdigest(),
             })
@@ -500,11 +549,32 @@ def freeze_product_chaos_batch(
             "seed_receipt_hash": (
                 preflight.get("seed_receipt_hash") if preflight else ""
             ),
+            "applicability_receipt_hash": row.get(
+                "applicability_receipt_hash"
+            ),
         })
+        applicability_receipt = row.get("applicability_receipt")
+        factors = _journey_factors(payload.get("journey") or {})
         if (
             preflight is None
             or row.get("scenario_id") != scenario_id
             or row.get("preflight_id") != expected_preflight_id
+            or not isinstance(applicability_receipt, Mapping)
+            or content_hash(applicability_receipt)
+            != row.get("applicability_receipt_hash")
+            or applicability_receipt.get("obligation_id")
+            != frozen.get("obligation_id")
+            or applicability_receipt.get("schedule_id")
+            != frozen.get("schedule_id")
+            or applicability_receipt.get("subject_group")
+            != frozen.get("subject_group")
+            or applicability_receipt.get("factors") != factors
+            or applicability_receipt.get("product_state")
+            != product_state_for_factor_row(factors)
+            or applicability_receipt.get("group_registry_contract_hash")
+            != group_registry_contract_hash()
+            or applicability_receipt.get("applicable") is not True
+            or not factor_row_group_applicable(factors)
         ):
             raise ValueError("G4 target has no matching reachability preflight")
     obligation_set = [
@@ -641,7 +711,44 @@ def convert_completed_journey_to_product_evidence(
     *,
     revision: Mapping[str, str],
     round_id: str,
+    source: CompletedJourneySource,
+    evidence_path: str | Path,
+    checkpoint_diff_path: str | Path | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+) -> Path:
+    """Convert only a controller-admitted completed-batch source."""
+
+    obligation_id = str(obligation.get("obligation_id") or "")
+    source.require_authority(obligation_id=obligation_id)
+    with tempfile.TemporaryDirectory(
+        prefix="anychain-completed-journey-"
+    ) as temporary:
+        snapshot_root = source.materialize_runtime(Path(temporary))
+        return _convert_journey_runtime_to_product_evidence(
+            obligation,
+            revision=revision,
+            round_id=round_id,
+            runtime_root=snapshot_root,
+            source_runtime_root=source.runtime_root,
+            controller_candidate=(
+                source.controller_snapshot.candidate_payload()
+            ),
+            evidence_path=evidence_path,
+            checkpoint_diff_path=checkpoint_diff_path,
+            provider=provider,
+            model=model,
+        )
+
+
+def _convert_journey_runtime_to_product_evidence(
+    obligation: Mapping[str, Any],
+    *,
+    revision: Mapping[str, str],
+    round_id: str,
     runtime_root: str | Path,
+    source_runtime_root: str | Path | None = None,
+    controller_candidate: Mapping[str, Any] | None = None,
     evidence_path: str | Path,
     checkpoint_diff_path: str | Path | None = None,
     provider: str | None = None,
@@ -663,6 +770,7 @@ def convert_completed_journey_to_product_evidence(
     if provider != DEFAULT_PROVIDER or not model:
         raise ValueError("G4 product evidence requires an explicit DeepSeek provider/model")
     root = Path(runtime_root).resolve()
+    artifact_root = Path(source_runtime_root or root).resolve()
     output = Path(evidence_path).resolve()
     diff_output = Path(
         checkpoint_diff_path
@@ -687,12 +795,38 @@ def convert_completed_journey_to_product_evidence(
         _require_nonempty_file(source_path, role=role)
 
     result = _load_mapping(source_paths["journey_result"], "journey result")
-    source_evidence_path = _resolve_source_evidence_path(
-        root,
-        str(result.get("evidence_path") or ""),
+    source_evidence_path = (
+        root
+        / "journey-controller-admission"
+        / "candidate.json"
+    ).resolve()
+    if (
+        not source_evidence_path.parent.is_dir()
+        or not source_evidence_path.is_file()
+        or source_evidence_path.parent.parent != root
+        or source_evidence_path.parent.is_symlink()
+        or source_evidence_path.parent.stat().st_mode & 0o222
+        or source_evidence_path.is_symlink()
+        or source_evidence_path.stat().st_mode & 0o222
+    ):
+        raise ValueError(
+            "Journey controller candidate is missing or mutable"
+        )
+    _require_nonempty_file(
+        source_evidence_path,
+        role="journey_controller_candidate",
     )
-    _require_nonempty_file(source_evidence_path, role="journey_evidence")
-    source_evidence = _load_mapping(source_evidence_path, "Journey evidence")
+    source_evidence = (
+        dict(controller_candidate)
+        if controller_candidate is not None
+        else _load_mapping(source_evidence_path, "Journey evidence")
+    )
+    if str(source_evidence.get("evidence_id") or "") != str(
+        result.get("evidence_id") or ""
+    ):
+        raise ValueError(
+            "Journey result differs from the admitted controller candidate"
+        )
     source_schedule = _load_mapping(
         source_paths["journey_schedule"],
         "Journey schedule",
@@ -715,6 +849,7 @@ def convert_completed_journey_to_product_evidence(
         provider=provider,
         model=model,
         runtime_root=root,
+        source_runtime_root=artifact_root,
     )
     actor_declarations = _validate_response_bound_attestations(
         source_evidence=source_evidence,
@@ -761,11 +896,18 @@ def convert_completed_journey_to_product_evidence(
         "journey_evidence": source_evidence_path,
     }
     if execution_proof:
-        artifact_sources["process_guard_receipt"] = Path(
+        original_proof_path = Path(
             str(execution_proof["path"])
+        ).resolve()
+        artifact_sources["process_guard_receipt"] = (
+            root / original_proof_path.relative_to(artifact_root)
         )
     artifact_descriptors = [
-        _artifact_descriptor(role, path)
+        _artifact_descriptor(
+            role,
+            path,
+            source_path=artifact_root / path.relative_to(root),
+        )
         for role, path in artifact_sources.items()
     ]
 
@@ -886,6 +1028,7 @@ def _validate_source_journey(
     provider: str,
     model: str,
     runtime_root: Path,
+    source_runtime_root: Path,
 ) -> dict[str, Any]:
     evidence_unsigned = dict(source_evidence)
     artifact_hash = str(evidence_unsigned.pop("artifact_hash", "") or "")
@@ -959,6 +1102,7 @@ def _validate_source_journey(
         return _validate_source_execution_proof(
             source_evidence,
             runtime_root=runtime_root,
+            source_runtime_root=source_runtime_root,
         )
     return {}
 
@@ -967,6 +1111,7 @@ def _validate_source_execution_proof(
     source_evidence: Mapping[str, Any],
     *,
     runtime_root: Path,
+    source_runtime_root: Path,
 ) -> dict[str, Any]:
     execution_id = str(source_evidence.get("execution_id") or "")
     proof = source_evidence.get("execution_proof")
@@ -980,12 +1125,16 @@ def _validate_source_execution_proof(
         or proof.get("execution_id") != execution_id
     ):
         raise ValueError("source Journey lacks a trusted execution-bound PTY proof")
-    proof_path = Path(str(proof.get("path") or ""))
-    expected_receipt_root = (
+    declared_proof_path = Path(str(proof.get("path") or "")).resolve()
+    source_receipt_root = (
+        source_runtime_root.resolve() / "container-cleanup-receipts"
+    )
+    if declared_proof_path.parent != source_receipt_root:
+        raise ValueError("source Journey PTY proof is outside its runtime root")
+    snapshot_receipt_root = (
         runtime_root.resolve() / "container-cleanup-receipts"
     )
-    if proof_path.parent.resolve() != expected_receipt_root:
-        raise ValueError("source Journey PTY proof is outside its runtime root")
+    proof_path = snapshot_receipt_root / declared_proof_path.name
     validated = validate_cleanup_receipt_artifact(
         proof_path,
         execution_id=execution_id,
@@ -993,8 +1142,9 @@ def _validate_source_execution_proof(
             "container_bridge",
             "agent_process_group_leader",
         ),
-        allowed_roots=(expected_receipt_root,),
+        allowed_roots=(snapshot_receipt_root,),
     )
+    validated["path"] = str(declared_proof_path)
     expected = {
         "proof_type": "container_pty_process_guard",
         "transport_kind": "container_pty_bridge",
@@ -1569,9 +1719,18 @@ def _load_runtime_events(path: Path) -> tuple[dict[str, Any], ...]:
     return tuple(rows)
 
 
-def _artifact_descriptor(role: str, path: Path) -> dict[str, str]:
+def _artifact_descriptor(
+    role: str,
+    path: Path,
+    *,
+    source_path: Path | None = None,
+) -> dict[str, str]:
     _require_nonempty_file(path, role=role)
-    return {"role": role, "path": str(path.resolve()), "sha256": _sha256_file(path)}
+    return {
+        "role": role,
+        "path": str((source_path or path).resolve()),
+        "sha256": _sha256_file(path),
+    }
 
 
 def _resolve_source_evidence_path(root: Path, raw_path: str) -> Path:
@@ -1691,6 +1850,8 @@ def _parser() -> argparse.ArgumentParser:
     batch.add_argument("--targets-dir", required=True, type=Path)
     batch.add_argument("--output", required=True, type=Path)
     batch.add_argument("--runtime-base", required=True, type=Path)
+    batch.add_argument("--broker-root", type=Path)
+    batch.add_argument("--result-index", type=Path)
     batch.add_argument("--worker-runtime", choices=("linux", "docker"), default="linux")
     batch.add_argument("--max-concurrency", type=_positive_int)
     batch.add_argument(
@@ -1709,19 +1870,6 @@ def _parser() -> argparse.ArgumentParser:
         default=TimeoutPolicy().cleanup_seconds,
     )
 
-    evidence = subparsers.add_parser(
-        "evidence",
-        help="Convert an already completed Journey runtime into G4 evidence.",
-    )
-    evidence.add_argument("--catalog", required=True, type=Path)
-    evidence.add_argument("--obligation-id", required=True)
-    evidence.add_argument("--round-id", required=True)
-    evidence.add_argument("--runtime-root", required=True, type=Path)
-    evidence.add_argument("--output", required=True, type=Path)
-    evidence.add_argument("--checkpoint-diff", type=Path)
-    evidence.add_argument("--provider")
-    evidence.add_argument("--model")
-
     evidence_batch = subparsers.add_parser(
         "evidence-batch",
         help="Convert one complete response-driven G4 batch into declared evidence.",
@@ -1729,6 +1877,7 @@ def _parser() -> argparse.ArgumentParser:
     evidence_batch.add_argument("--catalog", required=True, type=Path)
     evidence_batch.add_argument("--manifest", required=True, type=Path)
     evidence_batch.add_argument("--result-index", required=True, type=Path)
+    evidence_batch.add_argument("--authority-trust-root-id", required=True)
     evidence_batch.add_argument("--round-id", required=True)
     evidence_batch.add_argument("--output-dir", required=True, type=Path)
     evidence_batch.add_argument("--provider")
@@ -1760,7 +1909,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         write_product_chaos_target_set(definition_manifest, args.output_dir)
         return 0
     if args.command == "batch":
-        freeze_product_chaos_batch(
+        manifest = freeze_product_chaos_batch(
             repo_root=args.repo_root,
             targets_dir=args.targets_dir,
             manifest_path=args.output,
@@ -1773,6 +1922,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                 cleanup_seconds=args.cleanup_timeout_seconds,
             ),
         )
+        print(json.dumps({
+            "manifest_id": manifest.manifest_id,
+            "authority_trust_root_id": manifest.pty_authority_trust_root_id,
+        }, sort_keys=True))
+        if bool(args.broker_root) != bool(args.result_index):
+            raise ValueError(
+                "--broker-root and --result-index must be supplied together"
+            )
+        if args.broker_root and args.result_index:
+            from tests.agent_live.filesystem_decision_broker import (
+                FilesystemDecisionBroker,
+                _run_with_signal_cleanup,
+            )
+
+            broker = FilesystemDecisionBroker(
+                args.broker_root,
+                batch_id=manifest.batch_id,
+                timeout_seconds=args.decision_timeout_seconds,
+            )
+            asyncio.run(_run_with_signal_cleanup(
+                manifest,
+                broker=broker,
+                result_index_path=args.result_index,
+                authority_signer=manifest._authority_signer,
+            ))
         return 0
 
     rows, revision = load_frozen_product_chaos_catalog(args.catalog)
@@ -1790,7 +1964,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "evidence-batch":
         def convert_one(
             obligation: Mapping[str, Any],
-            runtime_root: Path,
+            source: CompletedJourneySource,
             evidence_path: Path,
             checkpoint_diff: Path | None,
         ) -> Path:
@@ -1798,7 +1972,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 obligation,
                 revision=revision,
                 round_id=args.round_id,
-                runtime_root=runtime_root,
+                source=source,
                 evidence_path=evidence_path,
                 checkpoint_diff_path=checkpoint_diff,
                 provider=evidence_provider,
@@ -1813,26 +1987,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             revision=revision,
             artifact_type=G4_ARTIFACT_TYPE,
             round_id=args.round_id,
+            expected_authority_trust_root_id=args.authority_trust_root_id,
             convert_one=convert_one,
         )
         return 0
 
-    matches = tuple(
-        row for row in rows if row["obligation_id"] == args.obligation_id
-    )
-    if len(matches) != 1:
-        raise ValueError(f"unknown G4 obligation: {args.obligation_id}")
-    convert_completed_journey_to_product_evidence(
-        matches[0],
-        revision=revision,
-        round_id=args.round_id,
-        runtime_root=args.runtime_root,
-        evidence_path=args.output,
-        checkpoint_diff_path=args.checkpoint_diff,
-        provider=evidence_provider,
-        model=evidence_model,
-    )
-    return 0
+    raise ValueError(f"unsupported G4 command: {args.command}")
 
 
 if __name__ == "__main__":

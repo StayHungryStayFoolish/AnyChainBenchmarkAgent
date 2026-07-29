@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Literal, Mapping, Sequence
 
 from agent.knowledge.chain_identity import canonical_chain_aliases, repo_chain_names
+from agent.workflows.group_registry import GROUP_SPEC_BY_NAME
 
 from .input_values import (
     extract_json_object_or_array,
@@ -33,6 +34,9 @@ StateTransitionResolver = Callable[
     [Mapping[str, Any], Mapping[str, Any]],
     tuple[tuple[str, ...], Any] | None,
 ]
+STRUCTURED_INTAKE_VALUE_SEMANTICS = frozenset({
+    "boolean_true",
+})
 
 SEMANTIC_SUPPORT_RELATIONS = frozenset({
     "explanatory_context",
@@ -64,6 +68,14 @@ SEMANTIC_OPERATIONS = frozenset({
     "report_analysis",
     "context",
     "unresolved",
+})
+ROUTED_UNIVERSAL_SEMANTIC_OPERATIONS = frozenset({
+    "pending_answer",
+    "consultation",
+    "navigation",
+    "administrative",
+    "evidence_analysis",
+    "report_analysis",
 })
 SEMANTIC_OPERATION_PURPOSES: Mapping[str, str] = {
     "pending_answer": (
@@ -347,6 +359,13 @@ def _content_hash(value: Any) -> str:
 
 
 @dataclass(frozen=True)
+class StructuredIntakeSpec:
+    alias: str
+    fixed_arguments: tuple[tuple[str, Any], ...]
+    value_semantics: str
+
+
+@dataclass(frozen=True)
 class ActionSpec:
     action_type: str
     owner: str
@@ -392,6 +411,8 @@ class ActionSpec:
     entry_intake_purpose: str = ""
     entry_intake_fixed_arguments: tuple[tuple[str, Any], ...] = ()
     entry_intake_value_arguments: tuple[str, ...] = ()
+    structured_intake: tuple[StructuredIntakeSpec, ...] = ()
+    invalidates_groups: tuple[str, ...] = ()
     internal_only: bool = False
     validator: ActionValidator | None = None
 
@@ -704,6 +725,14 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         entry_intake=True,
         entry_intake_purpose="Enter custom RPC method catalog setup and collect its endpoint, method, and schema evidence.",
         entry_intake_fixed_arguments=(("catalog_command", "enter"),),
+        structured_intake=(
+            StructuredIntakeSpec(
+                alias="custom_rpc",
+                fixed_arguments=(("catalog_command", "enter"),),
+                value_semantics="boolean_true",
+            ),
+        ),
+        invalidates_groups=("workload_rpc",),
         incompatible_target_modes=("sync-observe",),
         semantic_support_relations=EVIDENCE_OPERATION_SUPPORT_RELATIONS,
         semantic_value_grounding_arguments=("rpc_endpoint", "rpc_method", "rpc_schema_evidence"),
@@ -951,6 +980,81 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         required_arguments=("failure_record",),
         internal_only=True,
     ),
+    ActionSpec(
+        "reenter_secret_reference",
+        "coordinator",
+        "Restore one exact process-local secret reference after restart without changing durable workflow state.",
+        (
+            "scope_id",
+            "owner_kind",
+            "owner_id",
+            "owner_revision",
+            "reference",
+            "atom_id",
+            "value_hash",
+            "secret_value",
+            "source_evidence",
+        ),
+        execution_phase=0,
+        effect="workflow_state_mutation",
+        preserve_pending=True,
+        crosses_pending_barrier=True,
+        semantic_operations=("pending_answer",),
+        required_arguments=(
+            "scope_id",
+            "owner_kind",
+            "owner_id",
+            "owner_revision",
+            "reference",
+            "atom_id",
+            "value_hash",
+            "secret_value",
+            "source_evidence",
+        ),
+        internal_only=True,
+    ),
+    ActionSpec(
+        "resolve_semantic_draft_atom",
+        "coordinator",
+        "Resolve exactly one pending semantic draft atom under its bound draft identity and revision.",
+        ("draft_id", "revision", "atom_id", "resolution", "source_evidence"),
+        execution_phase=0,
+        effect="workflow_state_mutation",
+        crosses_pending_barrier=True,
+        semantic_operations=("pending_answer",),
+        required_arguments=(
+            "draft_id",
+            "revision",
+            "atom_id",
+            "resolution",
+            "source_evidence",
+        ),
+        internal_only=True,
+    ),
+    ActionSpec(
+        "previous_semantic_draft_atom",
+        "coordinator",
+        "Reopen exactly the preceding semantic draft atom under its bound draft identity and revision.",
+        ("draft_id", "revision", "atom_id", "source_evidence"),
+        execution_phase=0,
+        effect="workflow_state_mutation",
+        crosses_pending_barrier=True,
+        semantic_operations=("navigation",),
+        required_arguments=("draft_id", "revision", "atom_id", "source_evidence"),
+        internal_only=True,
+    ),
+    ActionSpec(
+        "cancel_semantic_draft",
+        "coordinator",
+        "Cancel the complete pending semantic draft without applying candidate actions.",
+        ("draft_id", "revision", "reason", "source_evidence"),
+        execution_phase=0,
+        effect="workflow_state_mutation",
+        crosses_pending_barrier=True,
+        semantic_operations=("pending_answer",),
+        required_arguments=("draft_id", "revision", "reason", "source_evidence"),
+        internal_only=True,
+    ),
     ActionSpec("answer_pending", "coordinator", "Answer the active typed question after interpreting non-exact user language.", ("answer", "selected_value", "source_evidence"), 0, required_arguments=("source_evidence",), semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS, semantic_operations=("pending_answer",)),
     ActionSpec("unknown", "orientation", "Report that no safe action could be resolved.", ("reason",), effect="read_only", required_arguments=("reason",), semantic_operations=("unresolved",)),
 )
@@ -1067,6 +1171,14 @@ def project_action_specs(
 
 
 for _spec in ACTION_SPECS:
+    _unknown_invalidated_groups = (
+        set(_spec.invalidates_groups) - set(GROUP_SPEC_BY_NAME)
+    )
+    if _unknown_invalidated_groups:
+        raise ValueError(
+            f"{_spec.action_type} declares unknown invalidated groups: "
+            + ", ".join(sorted(_unknown_invalidated_groups))
+        )
     _unknown_support_relations = (
         set(_spec.semantic_support_relations) - SEMANTIC_SUPPORT_RELATIONS
     )
@@ -1230,6 +1342,18 @@ def action_registry_contract_hash() -> str:
             "entry_intake_value_arguments": list(
                 spec.entry_intake_value_arguments
             ),
+            "structured_intake": [
+                {
+                    "alias": intake.alias,
+                    "fixed_arguments": [
+                        [key, value]
+                        for key, value in intake.fixed_arguments
+                    ],
+                    "value_semantics": intake.value_semantics,
+                }
+                for intake in spec.structured_intake
+            ],
+            "invalidates_groups": list(spec.invalidates_groups),
             "required_arguments": list(spec.required_arguments),
             "constraints": list(spec.constraints),
             "suppressed_by": list(spec.suppressed_by),
@@ -1980,6 +2104,23 @@ ACTION_ARGUMENT_SCHEMAS: dict[str, Mapping[str, Any]] = {
     "qps_mode": {"type": "string", "enum": ["quick", "standard", "intensive"]},
     "qps_overrides": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 1}, "minProperties": 1},
     "reason": {"type": "string", "minLength": 1},
+    "revision": {"type": "integer", "minimum": 1},
+    "draft_id": {"type": "string", "minLength": 1},
+    "scope_id": {"type": "string", "minLength": 1},
+    "owner_kind": {
+        "type": "string",
+        "enum": ["semantic_draft", "durable_state"],
+    },
+    "owner_id": {"type": "string", "minLength": 1},
+    "owner_revision": {"type": "integer", "minimum": 0},
+    "atom_id": {"type": "string", "minLength": 1},
+    "resolution": {"type": "string", "minLength": 1},
+    "reference": {
+        "type": "string",
+        "pattern": r"^semantic-secret:[A-Za-z0-9_-]+$",
+    },
+    "secret_value": {"type": "string", "minLength": 1, "maxLength": 65536},
+    "value_hash": {"type": "string", "pattern": r"^[0-9a-f]{64}$"},
     "rpc_endpoint": {"type": "string", "minLength": 1},
     "rpc_method": {"type": "string", "minLength": 1},
     "rpc_mode": {"type": "string", "enum": ["single", "mixed"]},
@@ -2428,6 +2569,7 @@ def validate_action_registry() -> None:
     names = [spec.action_type for spec in ACTION_SPECS]
     if len(names) != len(set(names)):
         raise RuntimeError("duplicate Harness action type")
+    structured_alias_owners: dict[str, str] = {}
     for spec in ACTION_SPECS:
         undeclared_required = set(spec.required_arguments) - set(spec.allowed_arguments)
         if undeclared_required:
@@ -2548,6 +2690,70 @@ def validate_action_registry() -> None:
             raise RuntimeError(
                 f"entry intake metadata requires entry_intake=true: {spec.action_type}"
             )
+        for intake in spec.structured_intake:
+            alias = intake.alias.strip()
+            normalized_alias = alias.casefold()
+            if not alias:
+                raise RuntimeError(
+                    f"structured intake alias cannot be empty: {spec.action_type}"
+                )
+            previous_owner = structured_alias_owners.get(normalized_alias)
+            if previous_owner is not None:
+                raise RuntimeError(
+                    "structured intake aliases must be globally unique: "
+                    f"{alias} belongs to {previous_owner} and {spec.action_type}"
+                )
+            structured_alias_owners[normalized_alias] = spec.action_type
+            if intake.value_semantics not in STRUCTURED_INTAKE_VALUE_SEMANTICS:
+                raise RuntimeError(
+                    "invalid structured intake value semantics for "
+                    f"{spec.action_type}.{alias}: {intake.value_semantics}"
+                )
+            fixed_argument_names = [key for key, _value in intake.fixed_arguments]
+            if len(fixed_argument_names) != len(set(fixed_argument_names)):
+                raise RuntimeError(
+                    f"duplicate structured intake fixed argument: {spec.action_type}.{alias}"
+                )
+            undeclared_fixed = set(fixed_argument_names) - set(spec.allowed_arguments)
+            if undeclared_fixed:
+                raise RuntimeError(
+                    "structured intake fixed arguments must be allowed for "
+                    f"{spec.action_type}.{alias}: {sorted(undeclared_fixed)}"
+                )
+            for argument, value in intake.fixed_arguments:
+                try:
+                    _validate_argument_value(
+                        value,
+                        ACTION_ARGUMENT_SCHEMAS[argument],
+                        f"{spec.action_type}.{argument}",
+                    )
+                except ValueError as exc:
+                    raise RuntimeError(
+                        "invalid structured intake fixed argument for "
+                        f"{spec.action_type}.{alias}: {exc}"
+                    ) from exc
+            uncovered_required = (
+                set(spec.required_arguments)
+                - set(fixed_argument_names)
+                - {"source_evidence"}
+            )
+            if uncovered_required:
+                raise RuntimeError(
+                    "structured intake metadata does not cover required arguments for "
+                    f"{spec.action_type}.{alias}: {sorted(uncovered_required)}"
+                )
+            probe: dict[str, Any] = {
+                "type": spec.action_type,
+                **dict(intake.fixed_arguments),
+            }
+            if "source_evidence" in spec.required_arguments:
+                probe["source_evidence"] = alias
+            try:
+                validate_action_contract(probe)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"invalid structured intake contract for {spec.action_type}.{alias}: {exc}"
+                ) from exc
         if bool(spec.required_state_path) != bool(spec.required_state_values):
             raise RuntimeError(
                 f"state lifecycle requirements must declare both path and values: {spec.action_type}"
@@ -2598,6 +2804,34 @@ def validate_action_registry() -> None:
 
 
 validate_action_registry()
+
+
+def universal_semantic_operation_owners() -> dict[str, tuple[str, ...]]:
+    """Return model-reachable owners for non-domain semantic operations."""
+
+    owners = {
+        operation: tuple(sorted({
+            spec.owner
+            for spec in ACTION_SPECS
+            if not spec.internal_only
+            and operation in spec.semantic_operations
+        }))
+        for operation in ROUTED_UNIVERSAL_SEMANTIC_OPERATIONS
+    }
+    missing = sorted(
+        operation
+        for operation, operation_owners in owners.items()
+        if not operation_owners
+    )
+    if missing:
+        raise RuntimeError(
+            "routed universal semantic operations require a model-reachable "
+            f"action owner: {missing}"
+        )
+    return owners
+
+
+UNIVERSAL_SEMANTIC_OPERATION_OWNERS = universal_semantic_operation_owners()
 
 
 def assign_action_ids(thread_id: str, user_text: str, actions: list[dict[str, Any]]) -> list[dict[str, Any]]:

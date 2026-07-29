@@ -27,6 +27,10 @@ from tests.agent_live.batch_orchestrator import (
     load_frozen_manifest,
     run_batch,
 )
+from tests.agent_live.coverage_evidence import (
+    PtyAuthoritySigner,
+    import_pty_authority_private_key,
+)
 from tests.agent_live.codex_simulator_bridge import (
     build_simulator_attestation,
     simulator_context_hash,
@@ -552,6 +556,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--result-index", required=True)
     run.add_argument("--broker-root", required=True)
     run.add_argument("--decision-timeout", type=float, default=230.0)
+    run.add_argument("--authority-key-fd", type=int, required=True)
     pending = subparsers.add_parser("pending")
     pending.add_argument("--broker-root", required=True)
     submit = subparsers.add_parser("submit")
@@ -588,6 +593,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         ))
         return 0
     manifest = load_frozen_manifest(args.manifest)
+    try:
+        private_key = os.read(args.authority_key_fd, 33)
+    finally:
+        os.close(args.authority_key_fd)
+    if len(private_key) != 32:
+        raise ValueError("controller authority pipe did not contain one Ed25519 key")
+    authority_signer = import_pty_authority_private_key(
+        private_key,
+        expected_public_key_b64=manifest.pty_authority_public_key_b64,
+    )
     broker = FilesystemDecisionBroker(
         args.broker_root,
         batch_id=manifest.batch_id,
@@ -597,6 +612,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         manifest,
         broker=broker,
         result_index_path=args.result_index,
+        authority_signer=authority_signer,
     ))
     return 128 + interrupted_by if interrupted_by else 0
 
@@ -606,6 +622,7 @@ async def _run_with_signal_cleanup(
     *,
     broker: FilesystemDecisionBroker,
     result_index_path: str | Path,
+    authority_signer: PtyAuthoritySigner,
 ) -> int:
     """Translate process signals into one awaited batch cancellation path."""
 
@@ -633,6 +650,7 @@ async def _run_with_signal_cleanup(
             broker=broker,
             result_index_path=result_index_path,
             interruption_event=interruption_event,
+            authority_signer=authority_signer,
         )
     finally:
         for signum in installed:

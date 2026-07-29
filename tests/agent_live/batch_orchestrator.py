@@ -8,18 +8,24 @@ coverage, discovery, or bridge protocols.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import fcntl
 import hashlib
+import hmac
 import inspect
 import json
 import os
+import shutil
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence
 
 from agent.harness.runtime_identity import repository_revision
+from agent.harness.terminal_protocol import presentation_hash
 from agent.utils.redaction import redact
 from tests.agent_live.chaos_scheduler import (
     CHAOS_SCHEDULE_SCHEMA_VERSION,
@@ -34,6 +40,7 @@ from tests.agent_live.codex_simulator_bridge import (
     CONTEXT_FRAME,
     DECISION_FRAME,
     RESULT_FRAME,
+    simulator_context_binding,
     simulator_context_hash,
     validate_simulator_attestation,
 )
@@ -44,9 +51,34 @@ from tests.agent_live.journey_simulator_bridge import (
     load_verifier_registry,
 )
 from tests.agent_live.dynamic_dual_ai_chaos import (
+    ChaosRunConfig,
+    ContainerPtyBridgeTransport,
+    DynamicDualAiChaosRunner,
+    DynamicDualAiJourneyRunner,
+    JourneyDecisionProvenance,
+    JourneyExternallyBlockedError,
+    JourneyObservedEdge,
+    JourneyOutcomeVerifierRegistry,
+    JourneyRunError,
+    JourneySimulatorInvalidError,
+    JourneySimulatorContext,
+    JourneySimulatorDecision,
     JourneyTerminalClassification,
+    SimulatorContext,
+    SimulatorDecision,
+    SimulatorDecisionInvalid,
     SimulatorTerminalClassification,
+    TerminalOutcomeObservation,
+    _runtime_event_from_mapping,
+    _terminal_outcome_from_mapping,
+    _journey_outcome_verification_payload,
+    build_journey_turn_result,
+    build_journey_verifier_context,
+    observe_journey_edges,
     validate_journey_evidence_artifact,
+    verify_journey_forbidden_outcomes,
+    verify_journey_outcome,
+    verify_declared_postconditions,
 )
 from tests.agent_live.container_process_guard import (
     EXECUTION_ID_ENV,
@@ -61,14 +93,40 @@ from tests.agent_live.discovery_ledger import (
     build_discovery_attempt,
 )
 from tests.agent_live.coverage_evidence import (
+    DynamicTurnSelection,
+    PtyCliTurnRecord,
+    PtyAuthoritySigner,
+    TurnObservation,
+    _evidence_projection,
+    _project_runtime_event_payload,
+    _turn_observation_from_payload,
+    admit_pty_artifact_bundle,
+    canonical_controller_turn_facts,
+    create_pty_authority_signer,
+    load_pty_admitted_artifact,
+    load_validated_pty_artifact_bundle,
+    load_pty_authority_receipt,
     load_valid_evidence_reference,
+    pty_admitted_bundle_digest,
+    pty_artifact_bundle_digest,
+    rollback_pty_artifact_bundle,
+    rollback_pty_artifact_admission,
+    turn_observation_payload,
+    sign_controller_payload,
+    pty_transcript_hash,
+    validate_pty_cli_candidate_artifact,
+    validate_pty_cli_evidence_artifact,
+    validate_pty_diagnostic_candidate,
     validate_pty_diagnostic_artifact,
+    verify_controller_payload_signature,
+    validate_runtime_turn_event,
+    verify_runtime_postcondition,
 )
 from tests.agent_live.generate_harness_coverage_ledger import build_ledger
 
 
-BATCH_MANIFEST_SCHEMA_VERSION = 5
-BATCH_RESULT_SCHEMA_VERSION = 2
+BATCH_MANIFEST_SCHEMA_VERSION = 7
+BATCH_RESULT_SCHEMA_VERSION = 5
 CLEANUP_RECEIPT_SCHEMA_VERSION = 2
 BATCH_SURVIVOR_PROOF_SCHEMA_VERSION = 1
 DEFAULT_SHARD_COUNT = 32
@@ -76,6 +134,27 @@ DEFAULT_MAX_CONCURRENCY = 4
 FORMAL_EDGE_SHARD_COUNT = 24
 FORMAL_JOURNEY_SHARD_COUNT = 8
 SHARD_LANES = frozenset({"edge", "journey"})
+JOURNEY_CONTROLLER_OBSERVATION_FIELDS = frozenset({
+    "shard_turn_ordinal",
+    "turn_index",
+    "previous_response_hash",
+    "user_message_hash",
+    "approved_decision_hash",
+    "simulator_context_hash",
+    "approved_decision",
+    "simulator_context",
+    "submission_sequence",
+    "submitted_input_commitment",
+    "agent_response_hash",
+    "baseline_runtime_event_hash",
+    "committed_runtime_event_hash",
+    "terminal_runtime_event_id",
+    "terminal_runtime_event_sequence",
+    "terminal_outcome_hash",
+    "turn_result_hash",
+    "previous_controller_observation_hash",
+    "controller_observation_hash",
+})
 
 
 class ExternalDecisionBlocked(RuntimeError):
@@ -138,6 +217,8 @@ class FrozenBatchManifest:
     revision: Mapping[str, str]
     shard_count: int
     max_concurrency: int
+    pty_authority_trust_root_id: str
+    pty_authority_public_key_b64: str
     shards: tuple[FrozenShardSpec, ...]
     required_env_names: tuple[str, ...]
     timeout_policy: TimeoutPolicy
@@ -145,9 +226,15 @@ class FrozenBatchManifest:
     expected_obligation_set_hash: str = ""
     worker_runtime: str = "docker"
     formal_profile: bool = False
+    controller_owned_execution: bool = True
     scheduler_schema_version: int = CHAOS_SCHEDULE_SCHEMA_VERSION
     discovery_schema_version: int = DISCOVERY_LEDGER_SCHEMA_VERSION
     schema_version: int = BATCH_MANIFEST_SCHEMA_VERSION
+    _authority_signer: PtyAuthoritySigner | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -198,6 +285,7 @@ class BatchResultIndex:
     batch_id: str
     manifest_id: str
     revision: Mapping[str, str]
+    execution_authority_mode: str
     execution_status: str
     release_status: str
     scheduled: int
@@ -206,14 +294,47 @@ class BatchResultIndex:
     discovery_attempt_ids: tuple[str, ...]
     classification_counts: Mapping[str, int]
     batch_survivor_proof: Mapping[str, Any]
+    pty_authority_trust_root_id: str
+    pty_authority_public_key_b64: str
+    controller_signature_b64: str
     shards: tuple[ShardResult, ...]
     schema_version: int = BATCH_RESULT_SCHEMA_VERSION
+
+
+@dataclass(frozen=True)
+class JourneyControllerAuthoritySnapshot:
+    """Immutable bytes admitted by one controller-owned Journey bundle."""
+
+    candidate_bytes: bytes
+    authority_bytes: bytes
+    bundle_digest: str
+
+    def candidate_payload(self) -> dict[str, Any]:
+        payload = json.loads(self.candidate_bytes)
+        if not isinstance(payload, dict):
+            raise ValueError("Journey controller candidate must be an object")
+        return payload
+
+    def authority_payload(self) -> dict[str, Any]:
+        payload = json.loads(self.authority_bytes)
+        if not isinstance(payload, dict):
+            raise ValueError("Journey controller authority must be an object")
+        return payload
 
 
 @dataclass
 class _RunState:
     response_hashes: list[str] = field(default_factory=list)
     decision_hashes: list[str] = field(default_factory=list)
+    controller_turn_observations: list[Mapping[str, Any]] = field(
+        default_factory=list
+    )
+    controller_turn_facts: list[bytes] = field(
+        default_factory=list
+    )
+    approved_decisions: list[Mapping[str, Any]] = field(default_factory=list)
+    submitted_inputs: list[Mapping[str, Any]] = field(default_factory=list)
+    observation_submission_cursor: int = 0
     context_turn_indices: list[int] = field(default_factory=list)
     result_payload: Mapping[str, Any] | None = None
     forced_classification: str = ""
@@ -229,6 +350,706 @@ class _HostCleanupOutcome:
     errors: tuple[str, ...]
 
 
+class _ControllerOwnedPtyTransport(ContainerPtyBridgeTransport):
+    """Expose the controller-owned PTY bridge to the outer process guard."""
+
+    def __init__(
+        self,
+        *args: Any,
+        process_guard: ContainerProcessGuard,
+        state: _RunState,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._controller_process_guard = process_guard
+        self._controller_state = state
+        self.controller_worker_identity: Mapping[str, Any] = {}
+
+    def start(self, *, env: Mapping[str, str]) -> None:
+        super().start(env=env)
+        process = self._process
+        if process is None:
+            raise RuntimeError("controller-owned PTY bridge did not start")
+        identity = self._controller_process_guard.register_pid(
+            process.pid,
+            role="controller_pty_bridge",
+        )
+        self._controller_process_guard.register_pid(
+            process.pid,
+            role="host_worker",
+        )
+        self.controller_worker_identity = identity.payload()
+
+    def submit_bracketed_paste(self, message: str) -> None:
+        bound_approval: Mapping[str, Any] | None = None
+        bound_sequences = {
+            int(item.get("approval_sequence") or 0)
+            for item in self._controller_state.submitted_inputs
+            if int(item.get("approval_sequence") or 0) > 0
+        }
+        for approved in self._controller_state.approved_decisions:
+            approval_sequence = int(approved.get("sequence") or 0)
+            if approval_sequence in bound_sequences:
+                continue
+            decision = dict(approved.get("decision") or {})
+            if str(decision.get("user_message") or "") != message:
+                raise ValueError(
+                    "PTY submission differs from the pending approved "
+                    "simulator decision"
+                )
+            bound_approval = approved
+            break
+        self._controller_state.submitted_inputs.append({
+            "sequence": len(self._controller_state.submitted_inputs) + 1,
+            "message": message,
+            "message_hash": _content_hash(message),
+            "source": (
+                "simulator_decision"
+                if bound_approval is not None
+                else "controller_runtime"
+            ),
+            "approval_sequence": (
+                int(bound_approval.get("sequence") or 0)
+                if bound_approval is not None
+                else 0
+            ),
+            "submitted_at_ns": time.time_ns(),
+        })
+        super().submit_bracketed_paste(message)
+
+
+class _ControllerDecisionAdapter:
+    """Synchronously bridge a controller-owned runner to the async broker."""
+
+    def __init__(
+        self,
+        *,
+        loop: asyncio.AbstractEventLoop,
+        broker: DecisionBroker,
+        manifest: FrozenBatchManifest,
+        shard: FrozenShardSpec,
+        state: _RunState,
+    ) -> None:
+        self.loop = loop
+        self.broker = broker
+        self.manifest = manifest
+        self.shard = shard
+        self.state = state
+
+    def __call__(
+        self,
+        context: SimulatorContext | JourneySimulatorContext,
+    ) -> SimulatorDecision | JourneySimulatorDecision:
+        payload = self._context_payload(context)
+        _validate_context_frame(
+            self.shard,
+            payload,
+            len(self.state.response_hashes),
+            previous_turn_index=(
+                self.state.context_turn_indices[-1]
+                if self.state.context_turn_indices
+                else None
+            ),
+        )
+        response_hash = str(payload["previous_response_hash"])
+        self.state.response_hashes.append(response_hash)
+        if self.shard.lane == "journey":
+            self.state.context_turn_indices.append(int(payload["turn_index"]))
+        future = asyncio.run_coroutine_threadsafe(
+            _call_broker_with_timeout(
+                self.broker,
+                self.shard.shard_id,
+                payload,
+                timeout_seconds=self.manifest.timeout_policy.decision_seconds,
+            ),
+            self.loop,
+        )
+        try:
+            decision = future.result(
+                timeout=(
+                    self.manifest.timeout_policy.decision_seconds
+                    + max(self.manifest.timeout_policy.cleanup_seconds, 1.0)
+                )
+            )
+        except concurrent.futures.TimeoutError as exc:
+            future.cancel()
+            raise ExternalDecisionBlocked(
+                "simulator decision timed out"
+            ) from exc
+        try:
+            normalized = _validate_decision(
+                payload,
+                decision,
+                lane=self.shard.lane,
+                simulator_attestation_required=(
+                    self.shard.simulator_attestation_required
+                ),
+            )
+        except _SimulatorInvalid as exc:
+            if self.shard.lane == "journey":
+                raise JourneySimulatorInvalidError(str(exc)) from exc
+            raise SimulatorDecisionInvalid(str(exc)) from exc
+        self.state.decision_hashes.append(_content_hash(normalized))
+        self.state.approved_decisions.append({
+            "sequence": len(self.state.approved_decisions) + 1,
+            "decision": dict(normalized),
+            "decision_hash": _content_hash(normalized),
+            "context_hash": simulator_context_hash(payload),
+            "context": json.loads(
+                _canonical_json(redact(payload))
+            ),
+            "approved_at_ns": time.time_ns(),
+        })
+        if self.shard.lane == "journey":
+            return JourneySimulatorDecision(
+                user_message=str(normalized["user_message"]),
+                persona=str(normalized["persona"]),
+                mission=str(normalized["mission"]),
+                rationale=str(normalized["rationale"]),
+                risk_factor_ids=tuple(
+                    str(item)
+                    for item in normalized.get("risk_factor_ids") or ()
+                ),
+                broker_request_id=(
+                    str(normalized.get("broker_request_id") or "")
+                    if normalized.get("simulator_attestation")
+                    else ""
+                ),
+                simulator_attestation=dict(
+                    normalized.get("simulator_attestation") or {}
+                ),
+                variant_binding={
+                    str(key): str(value)
+                    for key, value in dict(
+                        normalized.get("variant_binding") or {}
+                    ).items()
+                },
+            )
+        return SimulatorDecision(
+            user_message=str(normalized["user_message"]),
+            persona=str(normalized["persona"]),
+            goal=str(normalized["goal"]),
+            rationale=str(normalized["rationale"]),
+            target_coverage_ids=tuple(
+                str(item)
+                for item in normalized.get("target_coverage_ids") or ()
+            ),
+        )
+
+    def _context_payload(
+        self,
+        context: SimulatorContext | JourneySimulatorContext,
+    ) -> dict[str, Any]:
+        response_hash = _content_hash(context.previous_agent_response)
+        common = {
+            "schema_version": 1,
+            "session_id": context.session_id,
+            "turn_index": context.turn_index,
+            "previous_agent_response": str(
+                redact(context.previous_agent_response)
+            ),
+            "previous_response_hash": response_hash,
+            "previous_response_received_at_ns": (
+                context.previous_response_received_at_ns
+            ),
+            "transcript": [
+                [str(redact(user)), str(redact(agent))]
+                for user, agent in context.transcript
+            ],
+        }
+        if isinstance(context, JourneySimulatorContext):
+            return {
+                **common,
+                "schedule": journey_schedule_payload(context.schedule),
+                "observed_edge_keys": list(context.observed_edge_keys),
+            }
+        return {
+            **common,
+            "scheduled_target": asdict(context.scheduled_target),
+            "coverage_contract": dict(context.coverage_contract),
+        }
+
+
+def _append_controller_fact(
+    state: _RunState,
+    *,
+    lane: str,
+    fact: Mapping[str, Any],
+) -> None:
+    """Deep-freeze one callback fact as canonical bytes and a hash-chain link."""
+
+    previous_hash = ""
+    if state.controller_turn_facts:
+        previous = json.loads(state.controller_turn_facts[-1])
+        previous_hash = str(previous.get("controller_fact_hash") or "")
+    unsigned = {
+        "ordinal": len(state.controller_turn_facts) + 1,
+        "lane": lane,
+        "previous_controller_fact_hash": previous_hash,
+        "fact": json.loads(_canonical_json(fact)),
+    }
+    frozen = {
+        **unsigned,
+        "controller_fact_hash": _content_hash(unsigned),
+    }
+    state.controller_turn_facts.append(
+        _canonical_json(frozen).encode("utf-8")
+    )
+
+
+def _controller_fact_payloads(
+    state: _RunState,
+    *,
+    lane: str,
+) -> tuple[Mapping[str, Any], ...]:
+    """Decode and validate the immutable controller callback ledger."""
+
+    decoded: list[Mapping[str, Any]] = []
+    previous_hash = ""
+    for ordinal, raw in enumerate(state.controller_turn_facts, start=1):
+        if not isinstance(raw, bytes):
+            raise ValueError("controller turn ledger retained a mutable record")
+        try:
+            envelope = json.loads(raw)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("controller turn ledger is not canonical") from exc
+        if not isinstance(envelope, Mapping):
+            raise ValueError("controller turn ledger record is not an object")
+        unsigned = {
+            key: value
+            for key, value in envelope.items()
+            if key != "controller_fact_hash"
+        }
+        if (
+            int(envelope.get("ordinal") or 0) != ordinal
+            or envelope.get("previous_controller_fact_hash") != previous_hash
+            or envelope.get("controller_fact_hash") != _content_hash(unsigned)
+            or _canonical_json(envelope).encode("utf-8") != raw
+        ):
+            raise ValueError("controller turn ledger hash chain is invalid")
+        previous_hash = str(envelope["controller_fact_hash"])
+        if envelope.get("lane") == lane:
+            fact = envelope.get("fact")
+            if not isinstance(fact, Mapping):
+                raise ValueError("controller turn ledger fact is malformed")
+            decoded.append(dict(fact))
+    return tuple(decoded)
+
+
+def _turn_from_payload(payload: Mapping[str, Any]) -> PtyCliTurnRecord:
+    return PtyCliTurnRecord(**dict(payload))
+
+
+def _selection_from_payload(
+    payload: Mapping[str, Any],
+) -> DynamicTurnSelection:
+    values = dict(payload)
+    values["target_coverage_ids"] = tuple(
+        values.get("target_coverage_ids") or ()
+    )
+    return DynamicTurnSelection(**values)
+
+
+def _journey_decision_from_payload(
+    payload: Mapping[str, Any],
+) -> JourneyDecisionProvenance:
+    values = dict(payload)
+    values["risk_factor_ids"] = tuple(values.get("risk_factor_ids") or ())
+    for field_name in (
+        "simulator_context_binding",
+        "simulator_attestation",
+        "variant_attestation",
+    ):
+        values[field_name] = dict(values.get(field_name) or {})
+    return JourneyDecisionProvenance(**values)
+
+
+def _safe_terminal_outcome_projection(
+    outcome: TerminalOutcomeObservation,
+    *,
+    runtime_event_payload_hash: str,
+) -> TerminalOutcomeObservation:
+    payload = dict(_evidence_projection(asdict(outcome)))
+    payload["runtime_event_payload_hash"] = runtime_event_payload_hash
+    unsigned = {
+        key: value
+        for key, value in payload.items()
+        if key != "record_hash"
+    }
+    payload["record_hash"] = _content_hash(unsigned)
+    return _terminal_outcome_from_mapping(payload)
+
+
+class _ControllerTurnLedger:
+    """Capture canonical Edge facts before candidate serialization."""
+
+    def __init__(self, state: _RunState) -> None:
+        self.state = state
+
+    def __call__(
+        self,
+        *,
+        edge: Mapping[str, Any],
+        turn: PtyCliTurnRecord,
+        observation: TurnObservation,
+        selection: DynamicTurnSelection,
+        terminal_outcomes: tuple[TerminalOutcomeObservation, ...],
+    ) -> None:
+        _append_controller_fact(
+            self.state,
+            lane="edge",
+            fact={
+                "edge": dict(edge),
+                "turn": asdict(turn),
+                "observation": turn_observation_payload(observation),
+                "selection": asdict(selection),
+                "terminal_outcomes": [
+                    asdict(item) for item in terminal_outcomes
+                ],
+            },
+        )
+
+
+class _ControllerJourneyLedger:
+    """Independently verify and freeze one Journey callback boundary."""
+
+    def __init__(
+        self,
+        state: _RunState,
+        *,
+        schedule: Any,
+        registry: JourneyOutcomeVerifierRegistry,
+        edge_index: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        self.state = state
+        self.schedule = schedule
+        self.registry = registry
+        self.edge_index = edge_index
+
+    def observe_initial(
+        self,
+        *,
+        initial_event: Any,
+        terminal: Any,
+        forbidden: Sequence[Any],
+    ) -> None:
+        del terminal, forbidden
+        safe_initial = _runtime_event_from_mapping(
+            _project_runtime_event_payload(initial_event)
+        )
+        validate_runtime_turn_event(safe_initial)
+        context = build_journey_verifier_context(
+            schedule=self.schedule,
+            initial_event=safe_initial,
+            current_event=safe_initial,
+            turns=(),
+            events=(),
+            decisions=(),
+            transcript=(),
+            observed_edge_keys=(),
+            latest_turn=None,
+        )
+        safe_forbidden = verify_journey_forbidden_outcomes(
+            self.schedule,
+            context,
+            self.registry,
+        )
+        safe_terminal = verify_journey_outcome(
+            self.schedule.terminal_outcome,
+            context,
+            self.registry,
+        )
+        _append_controller_fact(
+            self.state,
+            lane="journey_initial",
+            fact={
+                "initial_event": asdict(safe_initial),
+                "initial_verification": {
+                    "terminal_outcome": (
+                        _journey_outcome_verification_payload(safe_terminal)
+                    ),
+                    "forbidden_outcomes": [
+                        _journey_outcome_verification_payload(item)
+                        for item in safe_forbidden
+                    ],
+                },
+            },
+        )
+
+    def __call__(
+        self,
+        *,
+        initial_event: Any,
+        turn: PtyCliTurnRecord,
+        baseline_event: Any,
+        committed_event: Any,
+        terminal_outcome: TerminalOutcomeObservation,
+        decision: JourneyDecisionProvenance,
+    ) -> None:
+        protected_values = (
+            (turn.user_message,)
+            if turn.user_message
+            else ()
+        )
+        safe_initial = _runtime_event_from_mapping(
+            _project_runtime_event_payload(
+                initial_event,
+                protected_values=protected_values,
+            )
+        )
+        safe_baseline = _runtime_event_from_mapping(
+            _project_runtime_event_payload(
+                baseline_event,
+                protected_values=protected_values,
+            )
+        )
+        safe_committed = _runtime_event_from_mapping(
+            _project_runtime_event_payload(
+                committed_event,
+                protected_values=protected_values,
+            )
+        )
+        for event in (safe_initial, safe_baseline, safe_committed):
+            validate_runtime_turn_event(event)
+        frozen_turn = replace(
+            turn,
+            previous_agent_response=str(
+                _evidence_projection(turn.previous_agent_response)
+            ),
+            user_message=str(_evidence_projection(turn.user_message)),
+            agent_response=str(_evidence_projection(turn.agent_response)),
+        )
+        frozen_turn = replace(
+            frozen_turn,
+            transcript_hash=pty_transcript_hash(
+                session_id=frozen_turn.session_id,
+                turn_index=frozen_turn.turn_index,
+                previous_agent_response=(
+                    frozen_turn.previous_agent_response
+                ),
+                user_message=frozen_turn.user_message,
+                agent_response=frozen_turn.agent_response,
+            ),
+        )
+        frozen_decision = _journey_decision_from_payload(
+            _evidence_projection(asdict(decision))
+        )
+        frozen_terminal_outcome = _safe_terminal_outcome_projection(
+            terminal_outcome,
+            runtime_event_payload_hash=(
+                safe_committed.runtime_event_payload_hash
+            ),
+        )
+        prior = _controller_fact_payloads(self.state, lane="journey")
+        turns = [
+            _turn_from_payload(item["turn"])
+            for item in prior
+        ] + [frozen_turn]
+        events = [
+            _runtime_event_from_mapping(item["committed_event"])
+            for item in prior
+        ] + [safe_committed]
+        decisions = [
+            _journey_decision_from_payload(item["decision"])
+            for item in prior
+        ] + [frozen_decision]
+        transcript = [
+            (item.user_message, item.agent_response)
+            for item in turns
+        ]
+        observed_edge_keys: list[str] = []
+        observed_current = observe_journey_edges(
+            self.edge_index,
+            safe_baseline,
+            safe_committed,
+            frozen_turn,
+        )
+        for item in prior:
+            for edge_key in item.get("observed_edge_keys") or ():
+                if edge_key not in observed_edge_keys:
+                    observed_edge_keys.append(str(edge_key))
+        for item in observed_current:
+            if item.edge_key not in observed_edge_keys:
+                observed_edge_keys.append(item.edge_key)
+        context = build_journey_verifier_context(
+            schedule=self.schedule,
+            initial_event=safe_initial,
+            current_event=safe_committed,
+            turns=turns,
+            events=events,
+            decisions=decisions,
+            transcript=transcript,
+            observed_edge_keys=observed_edge_keys,
+            latest_turn=frozen_turn,
+        )
+        forbidden = verify_journey_forbidden_outcomes(
+            self.schedule,
+            context,
+            self.registry,
+        )
+        terminal = verify_journey_outcome(
+            self.schedule.terminal_outcome,
+            context,
+            self.registry,
+        )
+        turn_result = build_journey_turn_result(
+            turn=frozen_turn,
+            decision=frozen_decision,
+            observed_edges=observed_current,
+            terminal=terminal,
+            forbidden=forbidden,
+        )
+        _append_controller_fact(
+            self.state,
+            lane="journey",
+            fact={
+                "initial_event": asdict(safe_initial),
+                "turn": asdict(frozen_turn),
+                "baseline_event": asdict(safe_baseline),
+                "committed_event": asdict(safe_committed),
+                "terminal_outcome": asdict(frozen_terminal_outcome),
+                "decision": asdict(frozen_decision),
+                "observed_edge_keys": observed_edge_keys,
+                "turn_result": turn_result,
+            },
+        )
+
+
+def _approved_submission_bindings(
+    state: _RunState,
+    messages: Sequence[str],
+    *,
+    input_commitment_key: bytes | None = None,
+) -> tuple[Mapping[str, Any], ...]:
+    """Resolve qualifying messages against ordered approval/submission facts."""
+
+    approval_rows = tuple(state.approved_decisions)
+    approvals = {
+        int(item.get("sequence") or 0): item
+        for item in approval_rows
+    }
+    submitted_sequences = [
+        int(item.get("sequence") or 0)
+        for item in state.submitted_inputs
+    ]
+    if (
+        len(approvals) != len(approval_rows)
+        or any(sequence < 1 for sequence in approvals)
+        or submitted_sequences != sorted(set(submitted_sequences))
+        or any(sequence < 1 for sequence in submitted_sequences)
+    ):
+        raise ValueError(
+            "controller approval/submission ledger order is invalid"
+        )
+    bound_approval_sequences = {
+        int(item.get("approval_sequence") or 0)
+        for item in state.submitted_inputs
+        if int(item.get("approval_sequence") or 0) > 0
+    }
+    expected_approval_sequences = set(approvals)
+    if bound_approval_sequences != expected_approval_sequences:
+        raise ValueError(
+            "controller approval/submission ledger has an unbound decision"
+        )
+    bindings: list[Mapping[str, Any]] = []
+    cursor = state.observation_submission_cursor
+    for message in messages:
+        matched: Mapping[str, Any] | None = None
+        while cursor < len(state.submitted_inputs):
+            submitted = state.submitted_inputs[cursor]
+            cursor += 1
+            approval_sequence = int(
+                submitted.get("approval_sequence") or 0
+            )
+            if approval_sequence <= 0:
+                continue
+            approved = approvals.get(approval_sequence)
+            if approved is None:
+                raise ValueError(
+                    "PTY submission references an unknown simulator approval"
+                )
+            decision = dict(approved.get("decision") or {})
+            if (
+                submitted.get("source") != "simulator_decision"
+                or
+                submitted.get("message") != decision.get("user_message")
+                or submitted.get("message_hash")
+                != _content_hash(str(decision.get("user_message") or ""))
+            ):
+                raise ValueError(
+                    "approved simulator decision differs from PTY submission"
+                )
+            projected_message = str(
+                _evidence_projection(submitted.get("message") or "")
+            )
+            if projected_message != message:
+                raise ValueError(
+                    "next approved PTY submission differs from the "
+                    "controller-observed qualifying turn"
+                )
+            frozen_decision = json.loads(
+                _canonical_json(
+                    _evidence_projection(
+                        approved.get("decision") or {}
+                    )
+                )
+            )
+            frozen_context = json.loads(
+                _canonical_json(
+                    _evidence_projection(
+                        approved.get("context") or {}
+                    )
+                )
+            )
+            raw_input_commitment = (
+                hmac.new(
+                    input_commitment_key,
+                    _canonical_json({
+                        "submission_sequence": int(
+                            submitted.get("sequence") or 0
+                        ),
+                        "user_message": str(
+                            submitted.get("message") or ""
+                        ),
+                    }).encode("utf-8"),
+                    hashlib.sha256,
+                ).hexdigest()
+                if input_commitment_key is not None
+                else ""
+            )
+            if raw_input_commitment:
+                frozen_decision[
+                    "_controller_submitted_input_commitment"
+                ] = raw_input_commitment
+                frozen_decision[
+                    "_controller_source_user_message_hash"
+                ] = _content_hash(
+                    str(submitted.get("message") or "")
+                )
+            matched = {
+                "decision_hash": _content_hash(frozen_decision),
+                "context_hash": simulator_context_hash(
+                    frozen_context
+                ),
+                "decision": frozen_decision,
+                "context": frozen_context,
+                "submission_sequence": int(
+                    submitted.get("sequence") or 0
+                ),
+                "submitted_input_commitment": (
+                    raw_input_commitment
+                ),
+            }
+            break
+        if matched is None:
+            raise ValueError(
+                "qualifying turn has no controller-observed PTY submission"
+            )
+        bindings.append(matched)
+    state.observation_submission_cursor = cursor
+    return tuple(bindings)
+
+
 def freeze_batch_manifest(
     *,
     repo_root: str | Path,
@@ -237,6 +1058,7 @@ def freeze_batch_manifest(
     runtime_base: str | Path,
     shard_count: int = DEFAULT_SHARD_COUNT,
     max_concurrency: int | None = None,
+    authority_signer: PtyAuthoritySigner | None = None,
     seed_base: int = 10_000,
     command_factory: CommandFactory | None = None,
     expected_revision: Mapping[str, str] | None = None,
@@ -290,6 +1112,7 @@ def freeze_batch_manifest(
         str(edge.get("edge_key") or ""): edge
         for edge in ledger.get("edges") or ()
     }
+    controller_owned_execution = command_factory is None
     factory = command_factory or _default_command_factory(
         root,
         worker_runtime=worker_runtime,
@@ -483,6 +1306,7 @@ def freeze_batch_manifest(
             "batch Journey obligation set differs from the expected set"
         )
 
+    frozen_signer = authority_signer or create_pty_authority_signer()
     unsigned = {
         "created_at_ns": time.time_ns(),
         "manifest_path": str(output),
@@ -491,6 +1315,8 @@ def freeze_batch_manifest(
         "revision": revision,
         "shard_count": shard_count,
         "max_concurrency": resolved_max_concurrency,
+        "pty_authority_trust_root_id": frozen_signer.trust_root_id,
+        "pty_authority_public_key_b64": frozen_signer.public_key_b64,
         "shards": [_shard_payload(item) for item in shards],
         "required_env_names": sorted({str(item) for item in required_env_names}),
         "timeout_policy": asdict(timeout_policy),
@@ -498,6 +1324,7 @@ def freeze_batch_manifest(
         "expected_obligation_set_hash": expected_obligation_set_hash,
         "worker_runtime": worker_runtime,
         "formal_profile": formal_profile,
+        "controller_owned_execution": controller_owned_execution,
         "scheduler_schema_version": CHAOS_SCHEDULE_SCHEMA_VERSION,
         "discovery_schema_version": DISCOVERY_LEDGER_SCHEMA_VERSION,
         "schema_version": BATCH_MANIFEST_SCHEMA_VERSION,
@@ -514,6 +1341,8 @@ def freeze_batch_manifest(
         revision=revision,
         shard_count=shard_count,
         max_concurrency=resolved_max_concurrency,
+        pty_authority_trust_root_id=frozen_signer.trust_root_id,
+        pty_authority_public_key_b64=frozen_signer.public_key_b64,
         shards=tuple(shards),
         required_env_names=tuple(unsigned["required_env_names"]),
         timeout_policy=timeout_policy,
@@ -521,6 +1350,8 @@ def freeze_batch_manifest(
         expected_obligation_set_hash=expected_obligation_set_hash,
         worker_runtime=worker_runtime,
         formal_profile=formal_profile,
+        controller_owned_execution=controller_owned_execution,
+        _authority_signer=frozen_signer,
     )
     _write_immutable_json(output, manifest_payload(manifest))
     validate_frozen_manifest(manifest, manifest_path=output)
@@ -539,6 +1370,12 @@ def load_frozen_manifest(path: str | Path) -> FrozenBatchManifest:
         revision=dict(payload["revision"]),
         shard_count=int(payload["shard_count"]),
         max_concurrency=int(payload["max_concurrency"]),
+        pty_authority_trust_root_id=str(
+            payload.get("pty_authority_trust_root_id") or ""
+        ),
+        pty_authority_public_key_b64=str(
+            payload.get("pty_authority_public_key_b64") or ""
+        ),
         shards=tuple(FrozenShardSpec(
             **{**row, "command": tuple(row["command"]),
                "target_ids": tuple(row["target_ids"]),
@@ -557,6 +1394,9 @@ def load_frozen_manifest(path: str | Path) -> FrozenBatchManifest:
         ),
         worker_runtime=str(payload.get("worker_runtime") or "docker"),
         formal_profile=bool(payload.get("formal_profile", False)),
+        controller_owned_execution=bool(
+            payload.get("controller_owned_execution", False)
+        ),
         scheduler_schema_version=int(payload["scheduler_schema_version"]),
         discovery_schema_version=int(payload["discovery_schema_version"]),
         schema_version=int(payload["schema_version"]),
@@ -587,10 +1427,22 @@ def validate_frozen_manifest(
         raise ValueError("manifest max_concurrency must be a positive integer")
     if manifest.max_concurrency > manifest.shard_count:
         raise ValueError("manifest max_concurrency exceeds shard_count")
+    if (
+        not manifest.pty_authority_public_key_b64
+        or _content_hash({
+            "ed25519_public_key": manifest.pty_authority_public_key_b64,
+        })
+        != manifest.pty_authority_trust_root_id
+    ):
+        raise ValueError("manifest PTY authority trust root is invalid")
     if manifest.worker_runtime not in {"docker", "linux"}:
         raise ValueError("manifest worker runtime is invalid")
     if manifest.formal_profile and manifest.worker_runtime != "linux":
         raise ValueError("formal manifest escaped the Linux control plane")
+    if manifest.formal_profile and not manifest.controller_owned_execution:
+        raise ValueError(
+            "formal manifest requires controller-owned execution"
+        )
     if any(shard.lane not in SHARD_LANES for shard in manifest.shards):
         raise ValueError("manifest contains an unsupported shard lane")
     lane_counts = {
@@ -743,12 +1595,24 @@ async def run_batch(
     result_index_path: str | Path,
     verify_revision: bool = True,
     interruption_event: asyncio.Event | None = None,
+    authority_signer: PtyAuthoritySigner | None = None,
 ) -> BatchResultIndex:
     """Run every frozen shard once and wait for every shard to terminate."""
 
     frozen = load_frozen_manifest(manifest) if isinstance(manifest, (str, Path)) else manifest
     _require_linux_control_plane()
     validate_frozen_manifest(frozen, verify_revision=verify_revision)
+    authority_signer = authority_signer or frozen._authority_signer
+    if authority_signer is None:
+        raise ValueError(
+            "a loaded batch manifest requires its controller authority signer"
+        )
+    if (
+        authority_signer.trust_root_id != frozen.pty_authority_trust_root_id
+        or authority_signer.public_key_b64
+        != frozen.pty_authority_public_key_b64
+    ):
+        raise ValueError("controller signer differs from the frozen trust root")
     index_path = Path(result_index_path).resolve()
     if index_path.exists():
         raise FileExistsError(f"batch result index is immutable: {index_path}")
@@ -758,7 +1622,14 @@ async def run_batch(
     async def run_bounded(shard: FrozenShardSpec) -> ShardResult:
         try:
             async with semaphore:
-                return await _run_shard(frozen, shard, broker)
+                runner = (
+                    _run_controller_owned_shard
+                    if frozen.controller_owned_execution
+                    else _run_shard
+                )
+                return await runner(
+                    frozen, shard, broker, authority_signer
+                )
         except asyncio.CancelledError as exc:
             return _not_started_interruption_result(frozen, shard, exc)
 
@@ -849,6 +1720,11 @@ async def run_batch(
         "batch_id": frozen.batch_id,
         "manifest_id": frozen.manifest_id,
         "revision": dict(frozen.revision),
+        "execution_authority_mode": (
+            "controller_owned_v1"
+            if frozen.controller_owned_execution
+            else "diagnostic_worker_v1"
+        ),
         "execution_status": execution_status,
         "release_status": "not_evaluated",
         "scheduled": frozen.shard_count,
@@ -857,14 +1733,24 @@ async def run_batch(
         "discovery_attempt_ids": list(attempt_ids),
         "classification_counts": counts,
         "batch_survivor_proof": batch_survivor_proof,
+        "pty_authority_trust_root_id": authority_signer.trust_root_id,
+        "pty_authority_public_key_b64": authority_signer.public_key_b64,
         "shards": [_result_payload(item) for item in results],
         "schema_version": BATCH_RESULT_SCHEMA_VERSION,
     }
+    controller_signature_b64 = sign_controller_payload(
+        authority_signer,
+        unsigned,
+    )
     index = BatchResultIndex(
-        index_id=_content_hash(unsigned),
+        index_id=_content_hash({
+            **unsigned,
+            "controller_signature_b64": controller_signature_b64,
+        }),
         batch_id=frozen.batch_id,
         manifest_id=frozen.manifest_id,
         revision=dict(frozen.revision),
+        execution_authority_mode=unsigned["execution_authority_mode"],
         execution_status=execution_status,
         release_status="not_evaluated",
         scheduled=frozen.shard_count,
@@ -873,6 +1759,9 @@ async def run_batch(
         discovery_attempt_ids=tuple(attempt_ids),
         classification_counts=counts,
         batch_survivor_proof=batch_survivor_proof,
+        pty_authority_trust_root_id=authority_signer.trust_root_id,
+        pty_authority_public_key_b64=authority_signer.public_key_b64,
+        controller_signature_b64=controller_signature_b64,
         shards=tuple(results),
     )
     _write_immutable_json(index_path, result_index_payload(index))
@@ -883,6 +1772,7 @@ async def _run_shard(
     manifest: FrozenBatchManifest,
     shard: FrozenShardSpec,
     broker: DecisionBroker,
+    authority_signer: PtyAuthoritySigner,
 ) -> ShardResult:
     started = time.time_ns()
     runtime_root = Path(shard.runtime_root)
@@ -1043,7 +1933,25 @@ async def _run_shard(
         finished_at_ns=receipt_unsigned["finished_at_ns"],
     )
     _write_immutable_json(receipt_path, asdict(receipt))
-    artifacts = _artifact_hashes(manifest, state.result_payload, shard)
+    artifacts = _artifact_hashes(
+        manifest,
+        state.result_payload,
+        shard,
+        authority_signer=authority_signer,
+        observed_response_hashes=tuple(state.response_hashes),
+        observed_decision_hashes=tuple(state.decision_hashes),
+        controller_turn_observations=tuple(
+            state.controller_turn_observations
+        ),
+        controller_turn_facts=_controller_fact_payloads(
+            state,
+            lane=shard.lane,
+        ),
+        controller_initial_facts=_controller_fact_payloads(
+            state,
+            lane="journey_initial",
+        ),
+    )
     classification, reason = _classify(
         manifest, shard, state, exit_code, receipt.cleaned, artifacts
     )
@@ -1067,6 +1975,639 @@ async def _run_shard(
         stderr_hash=_sha256_file(stderr_path),
         stderr_path=str(stderr_path),
         stderr_truncated=stderr_truncated,
+        cleanup_receipt_path=str(receipt_path),
+        cleanup_receipt_hash=_sha256_file(receipt_path),
+        reason=str(redact(reason))[:1000],
+    )
+
+
+def _controller_observations_from_edge_result(
+    *,
+    result: Any,
+    state: _RunState,
+    edge_index: Mapping[str, Mapping[str, Any]],
+    input_commitment_key: bytes,
+) -> tuple[Mapping[str, Any], ...]:
+    """Freeze exact in-process PTY facts before any artifact admission."""
+
+    observations: list[Mapping[str, Any]] = []
+    dynamic_paths = []
+    for path in tuple(result.evidence_paths):
+        artifact = _load_json(Path(path))
+        if (
+            artifact.get("artifact_type") == "pty_cli_turn"
+            and artifact.get("evidence_class") == "dynamic_dual_ai"
+        ):
+            dynamic_paths.append((Path(path), artifact))
+    trusted_facts = _controller_fact_payloads(state, lane="edge")
+    if (
+        len(dynamic_paths) != len(trusted_facts)
+    ):
+        raise ValueError(
+            "controller-owned PTY run did not produce one observation and "
+            "candidate per approved simulator decision"
+        )
+    previous_receipt_hash = ""
+    for ordinal, (_path, artifact) in enumerate(dynamic_paths):
+        trusted = trusted_facts[ordinal]
+        trusted_turn = _turn_from_payload(trusted["turn"])
+        trusted_observation = _turn_observation_from_payload(
+            trusted["observation"]
+        )
+        trusted_edge = dict(trusted["edge"])
+        trusted_selection = _selection_from_payload(trusted["selection"])
+        terminal_outcomes = tuple(
+            _terminal_outcome_from_mapping(item)
+            for item in trusted["terminal_outcomes"]
+        )
+        submission_bindings = _approved_submission_bindings(
+            state,
+            (
+                trusted_turn.user_message,
+                *(
+                    item.user_message
+                    for item in trusted_observation.continuation_turns
+                ),
+            ),
+            input_commitment_key=input_commitment_key,
+        )
+        canonical_facts = canonical_controller_turn_facts(
+            edge=trusted_edge,
+            turn=trusted_turn,
+            observation=trusted_observation,
+            dynamic_selection=trusted_selection,
+        )
+        trusted_turn_payload = dict(canonical_facts["turn"])
+        trusted_observation_payload = dict(
+            canonical_facts["turn_observation"]
+        )
+        turn_payload = dict(artifact.get("turn") or {})
+        turn_index = int(trusted_turn.turn_index)
+        if (
+            int(turn_payload.get("turn_index") or 0) != turn_index
+            or str(
+                trusted_turn_payload.get("source_previous_response_hash") or ""
+            )
+            != str(turn_payload.get("source_previous_response_hash") or "")
+            or str(
+                trusted_turn_payload.get("source_agent_response_hash") or ""
+            )
+            != str(turn_payload.get("source_agent_response_hash") or "")
+        ):
+            raise ValueError(
+                "candidate response differs from the controller-owned PTY"
+            )
+        raw_observation = dict(artifact.get("turn_observation") or {})
+        if _content_hash(raw_observation) != _content_hash(
+            trusted_observation_payload
+        ):
+            raise ValueError(
+                "candidate turn observation differs from controller memory"
+            )
+        edge_key = str(trusted_edge.get("edge_key") or "")
+        if str(artifact.get("edge_key") or "") != edge_key:
+            raise ValueError("candidate edge differs from controller memory")
+        edge = edge_index.get(edge_key)
+        if edge is None:
+            raise ValueError(
+                "controller-owned candidate references an unknown edge"
+            )
+        baseline, committed, *continuations = trusted_observation.runtime_events
+        recomputed = verify_declared_postconditions(
+            baseline,
+            committed,
+            trusted_turn,
+            edge_index=edge_index,
+            target_coverage_ids=(
+                trusted_selection.target_coverage_ids
+            ),
+            continuation_events=continuations,
+        )
+        if _content_hash(asdict(recomputed)) != _content_hash(
+            trusted_observation_payload.get("verified_postcondition") or {}
+        ):
+            raise ValueError(
+                "candidate postcondition differs from controller recomputation"
+            )
+        runtime_hashes = [
+            str(event.runtime_event_payload_hash or "")
+            for event in trusted_observation.runtime_events
+        ]
+        if not runtime_hashes or any(
+            len(value) != 64 for value in runtime_hashes
+        ):
+            raise ValueError(
+                "controller-owned runtime observation is incomplete"
+            )
+        unsigned_receipt = {
+            "shard_turn_ordinal": ordinal + 1,
+            "turn_index": turn_index,
+            "edge_key": edge_key,
+            "previous_response_hash": str(
+                trusted_turn_payload.get("source_previous_response_hash") or ""
+            ),
+            "simulator_decision_hash": _content_hash(
+                trusted_observation_payload.get("simulator_decision") or {}
+            ),
+            "approved_decision_hashes": [
+                str(item["decision_hash"])
+                for item in submission_bindings
+            ],
+            "simulator_context_hashes": [
+                str(item["context_hash"])
+                for item in submission_bindings
+            ],
+            "submission_sequences": [
+                int(item["submission_sequence"])
+                for item in submission_bindings
+            ],
+            "user_message_hash": str(
+                trusted_turn_payload.get("source_user_message_hash") or ""
+            ),
+            "submitted_input_commitment": str(
+                submission_bindings[0][
+                    "submitted_input_commitment"
+                ]
+            ),
+            "agent_response_hash": str(
+                trusted_turn_payload.get("source_agent_response_hash") or ""
+            ),
+            "runtime_event_payload_hashes": runtime_hashes,
+            "terminal_runtime_event_id": str(
+                trusted_observation.runtime_events[-1].runtime_event_id or ""
+            ),
+            "terminal_runtime_event_sequence": (
+                trusted_observation.runtime_events[-1].runtime_event_sequence
+            ),
+            "terminal_outcome_hashes": [
+                _content_hash(asdict(outcome))
+                for outcome in terminal_outcomes
+            ],
+            "verified_postcondition_hash": _content_hash(
+                asdict(recomputed)
+            ),
+            "turn_observation_hash": _content_hash(
+                trusted_observation_payload
+            ),
+            "candidate_artifact_hash": str(
+                artifact.get("artifact_hash") or ""
+            ),
+            "previous_controller_observation_hash": (
+                previous_receipt_hash
+            ),
+        }
+        receipt_hash = _content_hash(unsigned_receipt)
+        observations.append({
+            **unsigned_receipt,
+            "controller_observation_hash": receipt_hash,
+        })
+        previous_receipt_hash = receipt_hash
+    return tuple(observations)
+
+
+def _controller_observations_from_journey_result(
+    *,
+    result: Any,
+    state: _RunState,
+    input_commitment_key: bytes,
+) -> tuple[Mapping[str, Any], ...]:
+    """Bind Journey candidate rows to controller-owned in-memory boundaries."""
+
+    artifact = _load_json(Path(result.evidence_path))
+    candidate_turns = list(artifact.get("turns") or ())
+    trusted_facts = list(
+        _controller_fact_payloads(state, lane="journey")
+    )
+    if len(candidate_turns) != len(trusted_facts):
+        raise ValueError(
+            "controller-owned Journey has an incomplete observation ledger"
+        )
+    observations: list[Mapping[str, Any]] = []
+    submission_bindings = _approved_submission_bindings(
+        state,
+        [str(item["turn"]["user_message"]) for item in trusted_facts],
+        input_commitment_key=input_commitment_key,
+    )
+    previous_receipt_hash = ""
+    for ordinal, (candidate, trusted, binding) in enumerate(
+        zip(
+            candidate_turns,
+            trusted_facts,
+            submission_bindings,
+            strict=True,
+        )
+    ):
+        trusted_result = dict(trusted["turn_result"])
+        if _content_hash(candidate) != _content_hash(trusted_result):
+            raise ValueError(
+                "Journey candidate differs from controller memory"
+            )
+        turn = _turn_from_payload(trusted["turn"])
+        baseline = _runtime_event_from_mapping(trusted["baseline_event"])
+        committed = _runtime_event_from_mapping(trusted["committed_event"])
+        terminal_outcome = _terminal_outcome_from_mapping(
+            trusted["terminal_outcome"]
+        )
+        unsigned = {
+            "shard_turn_ordinal": ordinal + 1,
+            "turn_index": int(turn.turn_index),
+            "previous_response_hash": _content_hash(
+                turn.previous_agent_response
+            ),
+            "user_message_hash": _content_hash(turn.user_message),
+            "approved_decision_hash": str(binding["decision_hash"]),
+            "simulator_context_hash": str(binding["context_hash"]),
+            "approved_decision": dict(binding["decision"]),
+            "simulator_context": dict(binding["context"]),
+            "submission_sequence": int(binding["submission_sequence"]),
+            "submitted_input_commitment": str(
+                binding["submitted_input_commitment"]
+            ),
+            "agent_response_hash": _content_hash(turn.agent_response),
+            "baseline_runtime_event_hash": str(
+                baseline.runtime_event_payload_hash or ""
+            ),
+            "committed_runtime_event_hash": str(
+                committed.runtime_event_payload_hash or ""
+            ),
+            "terminal_runtime_event_id": str(
+                committed.runtime_event_id or ""
+            ),
+            "terminal_runtime_event_sequence": (
+                committed.runtime_event_sequence
+            ),
+            "terminal_outcome_hash": _content_hash(
+                asdict(terminal_outcome)
+            ),
+            "turn_result_hash": _content_hash(trusted_result),
+            "previous_controller_observation_hash": (
+                previous_receipt_hash
+            ),
+        }
+        receipt_hash = _content_hash(unsigned)
+        observations.append({
+            **unsigned,
+            "controller_observation_hash": receipt_hash,
+        })
+        previous_receipt_hash = receipt_hash
+    return tuple(observations)
+
+
+def _execute_controller_owned_runner(
+    *,
+    manifest: FrozenBatchManifest,
+    shard: FrozenShardSpec,
+    broker: DecisionBroker,
+    state: _RunState,
+    loop: asyncio.AbstractEventLoop,
+    transport: _ControllerOwnedPtyTransport,
+    input_commitment_key: bytes,
+) -> None:
+    """Run the real Agent PTY inside the controller process."""
+
+    target_payload = _load_json(Path(shard.target_path))
+    ledger = build_ledger(revision=manifest.revision)
+    adapter = _ControllerDecisionAdapter(
+        loop=loop,
+        broker=broker,
+        manifest=manifest,
+        shard=shard,
+        state=state,
+    )
+    runtime_root = Path(shard.runtime_root)
+    extra_env = {
+        EXECUTION_ID_ENV: shard.execution_id,
+        RECEIPT_DIR_ENV: shard.container_cleanup_receipt_dir,
+    }
+    if shard.lane == "edge":
+        schedule = build_chaos_schedule(
+            ledger,
+            revision=manifest.revision,
+            seed=shard.seed,
+            targets=_target_rows(target_payload),
+        )
+        max_turns = sum(
+            1 + int(target.continuation_turn_budget)
+            for target in schedule.targets
+        )
+        config = ChaosRunConfig.linux(
+            manifest.repo_root,
+            session_id=shard.session_id,
+            execution_id=shard.execution_id,
+            max_turns=max_turns,
+            response_timeout_seconds=manifest.timeout_policy.shard_seconds,
+            runtime_root=runtime_root,
+            runtime_root_in_process=runtime_root,
+            extra_env=extra_env,
+        )
+        runner = DynamicDualAiChaosRunner(
+            config,
+            adapter,
+            ledger=ledger,
+            schedule=schedule,
+            transport=transport,
+            controller_turn_observer=_ControllerTurnLedger(state),
+            revision=manifest.revision,
+        )
+        result = runner.run()
+        state.controller_turn_observations.extend(
+            _controller_observations_from_edge_result(
+                result=result,
+                state=state,
+                edge_index={
+                    str(edge.get("edge_key") or ""): edge
+                    for edge in ledger.get("edges") or ()
+                },
+                input_commitment_key=input_commitment_key,
+            )
+        )
+        state.result_payload = {
+            "session_id": result.session_id,
+            "execution_status": result.execution_status,
+            "terminal_classification": (
+                SimulatorTerminalClassification.PASSED.value
+            ),
+            "failure_reason": "",
+            "schedule_path": str(result.schedule_path),
+            "schedule_result_path": str(result.schedule_result_path),
+            "transcript_path": str(result.transcript_path),
+            "evidence_paths": [
+                str(path) for path in result.evidence_paths
+            ],
+        }
+        return
+
+    journey, registry_import = _journey_target(target_payload)
+    schedule = build_journey_schedule(
+        revision=manifest.revision,
+        seed=shard.seed,
+        journey=journey,
+    )
+    registry = load_verifier_registry(registry_import)
+    config = ChaosRunConfig.linux(
+        manifest.repo_root,
+        session_id=shard.session_id,
+        execution_id=shard.execution_id,
+        max_turns=schedule.max_turns,
+        response_timeout_seconds=manifest.timeout_policy.shard_seconds,
+        runtime_root=runtime_root,
+        runtime_root_in_process=runtime_root,
+        extra_env=extra_env,
+    )
+    runner = DynamicDualAiJourneyRunner(
+        config,
+        adapter,
+        ledger=ledger,
+        schedule=schedule,
+        postcondition_verifier_registry=registry,
+        transport=transport,
+        controller_turn_observer=_ControllerJourneyLedger(
+            state,
+            schedule=schedule,
+            registry=registry,
+            edge_index={
+                str(edge.get("edge_key") or ""): edge
+                for edge in ledger.get("edges") or ()
+            },
+        ),
+        revision=manifest.revision,
+    )
+    result = runner.run()
+    state.controller_turn_observations.extend(
+        _controller_observations_from_journey_result(
+            result=result,
+            state=state,
+            input_commitment_key=input_commitment_key,
+        )
+    )
+    state.result_payload = {
+        "session_id": result.session_id,
+        "terminal_classification": result.terminal_classification.value,
+        "schedule_id": schedule.schedule_id,
+        "schedule_path": str(result.schedule_path),
+        "journey_result_path": str(result.journey_result_path),
+        "transcript_path": str(result.transcript_path),
+        "evidence_id": result.evidence_id,
+        "evidence_path": str(result.evidence_path),
+    }
+
+
+async def _run_controller_owned_shard(
+    manifest: FrozenBatchManifest,
+    shard: FrozenShardSpec,
+    broker: DecisionBroker,
+    authority_signer: PtyAuthoritySigner,
+) -> ShardResult:
+    """Produce qualifying evidence without a worker-owned observation path."""
+
+    started = time.time_ns()
+    runtime_root = Path(shard.runtime_root)
+    runtime_root.mkdir(parents=True, exist_ok=False)
+    stderr_path = runtime_root / "controller-runner.stderr.redacted.txt"
+    receipt_path = runtime_root / "cleanup-receipt.json"
+    host_receipt_dir = runtime_root / "host-cleanup-receipts"
+    host_guard = ContainerProcessGuard(
+        shard.execution_id,
+        receipt_dir=host_receipt_dir,
+        term_grace_seconds=max(
+            manifest.timeout_policy.cleanup_seconds / 2,
+            0.01,
+        ),
+        kill_grace_seconds=max(
+            manifest.timeout_policy.cleanup_seconds / 2,
+            0.01,
+        ),
+        scan_interval_seconds=min(
+            0.05,
+            max(manifest.timeout_policy.cleanup_seconds / 20, 0.005),
+        ),
+    )
+    config = ChaosRunConfig.linux(
+        manifest.repo_root,
+        session_id=shard.session_id,
+        execution_id=shard.execution_id,
+        runtime_root=runtime_root,
+        runtime_root_in_process=runtime_root,
+        extra_env={
+            EXECUTION_ID_ENV: shard.execution_id,
+            RECEIPT_DIR_ENV: shard.container_cleanup_receipt_dir,
+        },
+    )
+    state = _RunState()
+    transport = _ControllerOwnedPtyTransport(
+        config.command,
+        cwd=config.repo_root,
+        poll_interval_seconds=config.poll_interval_seconds,
+        execution_id=shard.execution_id,
+        cleanup_receipt_dir=shard.container_cleanup_receipt_dir,
+        process_guard=host_guard,
+        state=state,
+    )
+    input_commitment_key = os.urandom(32)
+    loop = asyncio.get_running_loop()
+    runner_task = asyncio.create_task(asyncio.to_thread(
+        _execute_controller_owned_runner,
+        manifest=manifest,
+        shard=shard,
+        broker=broker,
+        state=state,
+        loop=loop,
+        transport=transport,
+        input_commitment_key=input_commitment_key,
+    ))
+    exit_code: int | None = None
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(runner_task),
+            timeout=manifest.timeout_policy.shard_seconds,
+        )
+        exit_code = 0
+    except ExternalDecisionBlocked as exc:
+        state.forced_classification = "externally_blocked"
+        state.reason = str(exc)
+    except (SimulatorDecisionInvalid, JourneySimulatorInvalidError) as exc:
+        state.forced_classification = "simulator_invalid"
+        state.reason = str(exc)
+    except JourneyRunError as exc:
+        state.forced_classification = exc.classification.value
+        state.reason = str(exc)
+    except asyncio.TimeoutError:
+        state.forced_classification = "infrastructure_interrupted"
+        state.reason = "controller-owned shard wall-clock timeout"
+    except BaseException as exc:
+        state.forced_classification = "infrastructure_interrupted"
+        state.reason = f"{type(exc).__name__}: {exc}"
+    finally:
+        if not runner_task.done():
+            try:
+                transport.close()
+            except BaseException:
+                pass
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(runner_task),
+                    timeout=manifest.timeout_policy.cleanup_seconds,
+                )
+            except BaseException:
+                runner_task.cancel()
+
+    process = transport._process
+    reapers = (
+        {process.pid: process.poll}
+        if process is not None
+        else {}
+    )
+    cleanup_errors: list[str] = []
+    host_proof: Mapping[str, Any] = {}
+    container_proof: Mapping[str, Any] = {}
+    try:
+        host_artifact = await asyncio.to_thread(
+            host_guard.cleanup,
+            reapers=reapers,
+        )
+        host_proof = _validated_guard_proof(
+            host_artifact.path,
+            execution_id=shard.execution_id,
+            required_roles=("host_worker", "controller_pty_bridge"),
+            allowed_roots=(host_receipt_dir,),
+        )
+    except BaseException as exc:
+        cleanup_errors.append(
+            f"controller process guard failed: {type(exc).__name__}: {exc}"
+        )
+    try:
+        inner_path = _single_guard_receipt_path(
+            Path(shard.container_cleanup_receipt_dir)
+        )
+        container_proof = _validated_guard_proof(
+            inner_path,
+            execution_id=shard.execution_id,
+            required_roles=(
+                "container_bridge",
+                "agent_process_group_leader",
+            ),
+            allowed_roots=(
+                Path(shard.container_cleanup_receipt_dir),
+            ),
+        )
+    except BaseException as exc:
+        cleanup_errors.append(
+            f"Agent process guard failed: {type(exc).__name__}: {exc}"
+        )
+    cleaned = bool(
+        host_proof.get("cleaned")
+        and container_proof.get("cleaned")
+        and not cleanup_errors
+    )
+    receipt_unsigned = {
+        "schema_version": CLEANUP_RECEIPT_SCHEMA_VERSION,
+        "shard_id": shard.shard_id,
+        "execution_id": shard.execution_id,
+        "host_proof": host_proof,
+        "container_proof": container_proof,
+        "worker_identity": dict(transport.controller_worker_identity),
+        "exit_code": exit_code,
+        "actions": ["controller_owned_runner_reaped"],
+        "errors": cleanup_errors,
+        "cleaned": cleaned,
+        "started_at_ns": started,
+        "finished_at_ns": time.time_ns(),
+    }
+    receipt = {
+        "receipt_id": _content_hash(receipt_unsigned),
+        **receipt_unsigned,
+    }
+    _write_immutable_json(receipt_path, receipt)
+    _atomic_write(stderr_path, b"", mode=0o600)
+    artifacts = _artifact_hashes(
+        manifest,
+        state.result_payload,
+        shard,
+        authority_signer=authority_signer,
+        observed_response_hashes=tuple(state.response_hashes),
+        observed_decision_hashes=tuple(state.decision_hashes),
+        controller_turn_observations=tuple(
+            state.controller_turn_observations
+        ),
+        controller_turn_facts=_controller_fact_payloads(
+            state,
+            lane=shard.lane,
+        ),
+        controller_initial_facts=_controller_fact_payloads(
+            state,
+            lane="journey_initial",
+        ),
+    )
+    classification, reason = _classify(
+        manifest,
+        shard,
+        state,
+        exit_code,
+        cleaned,
+        artifacts,
+    )
+    diagnostic_ids = tuple(artifacts["diagnostic_ids"]) or (
+        str(receipt["receipt_id"]),
+    )
+    return ShardResult(
+        shard_id=shard.shard_id,
+        classification=classification,
+        attempt_count=1,
+        started_at_ns=started,
+        finished_at_ns=time.time_ns(),
+        exit_code=exit_code,
+        target_hash=shard.target_hash,
+        response_hashes=tuple(state.response_hashes),
+        decision_hashes=tuple(state.decision_hashes),
+        transcript_hash=artifacts["transcript_hash"],
+        schedule_result_hash=artifacts["schedule_result_hash"],
+        evidence_hashes=tuple(artifacts["evidence_hashes"]),
+        diagnostic_hashes=tuple(artifacts["diagnostic_hashes"]),
+        evidence_ids=tuple(artifacts["evidence_ids"]),
+        diagnostic_ids=diagnostic_ids,
+        stderr_hash=_sha256_file(stderr_path),
+        stderr_path=str(stderr_path),
+        stderr_truncated=False,
         cleanup_receipt_path=str(receipt_path),
         cleanup_receipt_hash=_sha256_file(receipt_path),
         reason=str(redact(reason))[:1000],
@@ -1411,6 +2952,14 @@ async def _read_capped(
     return bytes(retained), truncated
 
 
+def _fsync_parent_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _classify(
     manifest: FrozenBatchManifest,
     shard: FrozenShardSpec,
@@ -1432,8 +2981,23 @@ def _classify(
     if shard.lane == "journey":
         status = str(artifacts.get("execution_status") or "")
         if status == JourneyTerminalClassification.PASSED.value and exit_code == 0:
-            if not state.response_hashes or len(state.response_hashes) != len(
-                state.decision_hashes
+            has_zero_turn_startup_proof = (
+                not state.response_hashes
+                and not state.decision_hashes
+                and len(
+                    _controller_fact_payloads(
+                        state,
+                        lane="journey_initial",
+                    )
+                )
+                == 1
+            )
+            if (
+                len(state.response_hashes) != len(state.decision_hashes)
+                or (
+                    not state.response_hashes
+                    and not has_zero_turn_startup_proof
+                )
             ):
                 return "infrastructure_interrupted", "Journey decision ledger is incomplete"
             return "passed", "Journey terminal postconditions passed"
@@ -1447,8 +3011,18 @@ def _classify(
     if (
         exit_code == 0
         and artifacts.get("execution_status") == "complete"
-        and len(state.response_hashes) == len(shard.target_ids)
-        and len(state.decision_hashes) == len(shard.target_ids)
+        and (
+            (
+                manifest.controller_owned_execution
+                and len(state.controller_turn_observations)
+                == len(shard.target_ids)
+            )
+            or (
+                not manifest.controller_owned_execution
+                and len(state.response_hashes) == len(shard.target_ids)
+                and len(state.decision_hashes) == len(shard.target_ids)
+            )
+        )
     ):
         return "passed", "all scheduled targets passed"
     return "infrastructure_interrupted", state.reason or "worker did not complete cleanly"
@@ -1458,6 +3032,13 @@ def _artifact_hashes(
     manifest: FrozenBatchManifest,
     payload: Mapping[str, Any] | None,
     shard: FrozenShardSpec | None = None,
+    *,
+    authority_signer: PtyAuthoritySigner | None = None,
+    observed_response_hashes: tuple[str, ...] = (),
+    observed_decision_hashes: tuple[str, ...] = (),
+    controller_turn_observations: tuple[Mapping[str, Any], ...] = (),
+    controller_turn_facts: tuple[Mapping[str, Any], ...] = (),
+    controller_initial_facts: tuple[Mapping[str, Any], ...] = (),
 ) -> dict[str, Any]:
     data = payload if isinstance(payload, Mapping) else {}
     empty = {
@@ -1469,8 +3050,57 @@ def _artifact_hashes(
     }
     if shard is None:
         return empty
+    if authority_signer is None:
+        raise ValueError("batch controller authority signer is required")
+    if (
+        manifest.controller_owned_execution
+        and shard.lane != "journey"
+        and not controller_turn_observations
+    ):
+        return {
+            **empty,
+            "validation_error": (
+                "controller-owned execution has no authoritative turn "
+                "observation ledger"
+            ),
+        }
+    observed_turns = (
+        [dict(item) for item in controller_turn_observations]
+        if controller_turn_observations
+        else [
+            {
+                "previous_response_hash": response_hash,
+                "simulator_decision_hash": decision_hash,
+            }
+            for response_hash, decision_hash in zip(
+                observed_response_hashes,
+                observed_decision_hashes,
+            )
+        ]
+    )
+    authority_context = {
+        "batch_id": manifest.batch_id,
+        "manifest_id": manifest.manifest_id,
+        "shard_id": shard.shard_id,
+        "execution_id": shard.execution_id,
+        "schedule_id": shard.schedule_id,
+        "target_hash": shard.target_hash,
+        "observed_turns": observed_turns,
+    }
     if shard.lane == "journey":
-        return _journey_artifact_hashes(manifest, data, shard, empty)
+        return _journey_artifact_hashes(
+            manifest,
+            data,
+            shard,
+            empty,
+            authority_signer=authority_signer,
+            controller_turn_observations=controller_turn_observations,
+            controller_turn_facts=controller_turn_facts,
+            controller_initial_facts=controller_initial_facts,
+        )
+    artifact_bundle_path = (
+        Path(shard.runtime_root) / "controller-pty-artifacts.admitted"
+    )
     try:
         runtime_roots = _worker_runtime_roots(manifest, shard)
         schedule_path = _known_artifact_path(
@@ -1511,8 +3141,9 @@ def _artifact_hashes(
             _resolve_required_path(manifest, item, runtime_roots, label="evidence")
             for item in data.get("evidence_paths") or ()
         ]
-        evidence_hashes: list[str] = []
-        evidence_ids: list[str] = []
+        evidence_candidates: list[
+            tuple[Path, Mapping[str, Any], Mapping[str, Any]]
+        ] = []
         for path in evidence_paths:
             artifact = _load_json(path)
             edge_key = str(artifact.get("edge_key") or "")
@@ -1521,38 +3152,173 @@ def _artifact_hashes(
             edge = edge_index.get(edge_key)
             if edge is None:
                 raise ValueError("evidence references an unknown authoritative edge")
-            validated, reason = load_valid_evidence_reference(
-                str(path), edge=edge, revision=manifest.revision
-            )
-            if validated is None:
-                raise ValueError(f"invalid evidence artifact: {reason}")
-            evidence_id = str(validated.get("evidence_id") or "")
-            if not evidence_id:
-                raise ValueError("validated evidence has no evidence_id")
-            evidence_ids.append(evidence_id)
-            evidence_hashes.append(_sha256_file(path))
+            if artifact.get("artifact_type") == "pty_cli_turn":
+                candidate_valid, candidate_reason = (
+                    validate_pty_cli_candidate_artifact(
+                        artifact,
+                        edge=edge,
+                        revision=manifest.revision,
+                        controller_context=authority_context,
+                    )
+                )
+                if not candidate_valid:
+                    raise ValueError(
+                        f"invalid unsigned PTY candidate: {candidate_reason}"
+                    )
+            evidence_candidates.append((path, artifact, edge))
 
         diagnostic_paths = _diagnostic_paths_from_result(
             manifest, schedule_result, runtime_roots
         )
-        diagnostic_hashes: list[str] = []
-        diagnostic_ids: list[str] = []
+        diagnostic_candidates: list[
+            tuple[Mapping[str, Any], Path, Mapping[str, Any]]
+        ] = []
         product_failure = ""
         for row, path in diagnostic_paths:
             artifact = _load_json(path)
-            valid, reason = validate_pty_diagnostic_artifact(artifact)
-            if not valid:
-                raise ValueError(f"invalid diagnostic artifact: {reason}")
+            if artifact.get("artifact_type") == "pty_diagnostic":
+                candidate_valid, candidate_reason = (
+                    validate_pty_diagnostic_candidate(
+                        artifact,
+                        expected_target_edge_key=str(
+                            row.get("edge_key") or ""
+                        ),
+                    )
+                )
+                if not candidate_valid:
+                    raise ValueError(
+                        f"invalid unsigned PTY diagnostic: {candidate_reason}"
+                    )
             if dict(artifact.get("revision") or {}) != dict(manifest.revision):
                 raise ValueError("diagnostic repository revision mismatch")
             if str(artifact.get("target_id") or "") != str(row.get("target_id") or ""):
                 raise ValueError("diagnostic target identity mismatch")
             if str(artifact.get("target_edge_key") or "") != str(row.get("edge_key") or ""):
                 raise ValueError("diagnostic target edge mismatch")
-            diagnostic_ids.append(str(artifact["diagnostic_id"]))
-            diagnostic_hashes.append(_sha256_file(path))
+            diagnostic_candidates.append((row, path, artifact))
             if artifact.get("verification_status") == "postcondition_failed":
                 product_failure = str(row.get("reason") or "postcondition failed")
+
+        pty_paths = [
+            path
+            for path, artifact, _edge in evidence_candidates
+            if artifact.get("artifact_type") == "pty_cli_turn"
+        ] + [
+            path
+            for _row, path, artifact in diagnostic_candidates
+            if artifact.get("artifact_type") == "pty_diagnostic"
+        ]
+        for path in pty_paths:
+            if path.with_suffix(".admitted").exists():
+                rollback_pty_artifact_admission(path)
+        if pty_paths:
+            admit_pty_artifact_bundle(
+                artifact_bundle_path,
+                pty_paths,
+                signer=authority_signer,
+                controller_context=authority_context,
+            )
+            bundle_items, bundle_digest = (
+                load_validated_pty_artifact_bundle(
+                    artifact_bundle_path,
+                    trusted_public_key_b64=(
+                        authority_signer.public_key_b64
+                    ),
+                    expected_controller_context=authority_context,
+                )
+            )
+            admitted_by_id = {
+                str(
+                    item["artifact"].get("evidence_id")
+                    or item["artifact"].get("diagnostic_id")
+                    or ""
+                ): item
+                for item in bundle_items
+            }
+        else:
+            bundle_digest = ""
+            admitted_by_id = {}
+
+        evidence_hashes: list[str] = []
+        evidence_ids: list[str] = []
+        for path, candidate, edge in evidence_candidates:
+            if candidate.get("artifact_type") == "pty_cli_turn":
+                evidence_id = str(candidate.get("evidence_id") or "")
+                item = admitted_by_id.get(evidence_id)
+                if item is None:
+                    raise ValueError(
+                        "PTY evidence is absent from the shard bundle"
+                    )
+                validated = item["artifact"]
+                valid, reason = validate_pty_cli_evidence_artifact(
+                    validated,
+                    edge=edge,
+                    revision=manifest.revision,
+                    authority=item["authority"],
+                    trusted_public_key_b64=(
+                        authority_signer.public_key_b64
+                    ),
+                    expected_controller_context=authority_context,
+                )
+                if not valid:
+                    raise ValueError(
+                        f"invalid evidence artifact: {reason}"
+                    )
+                evidence_hashes.append(_content_hash({
+                    "artifact_bundle_digest": bundle_digest,
+                    "artifact_id": evidence_id,
+                }))
+            else:
+                validated, reason = load_valid_evidence_reference(
+                    str(path),
+                    edge=edge,
+                    revision=manifest.revision,
+                    trusted_public_key_b64=(
+                        authority_signer.public_key_b64
+                    ),
+                    expected_controller_context=authority_context,
+                )
+                if validated is None:
+                    raise ValueError(
+                        f"invalid evidence artifact: {reason}"
+                    )
+                evidence_id = str(validated.get("evidence_id") or "")
+                evidence_hashes.append(_sha256_file(path))
+            if not evidence_id:
+                raise ValueError("validated evidence has no evidence_id")
+            evidence_ids.append(evidence_id)
+
+        diagnostic_hashes: list[str] = []
+        diagnostic_ids: list[str] = []
+        for row, path, candidate in diagnostic_candidates:
+            if candidate.get("artifact_type") == "pty_diagnostic":
+                diagnostic_id = str(candidate.get("diagnostic_id") or "")
+                item = admitted_by_id.get(diagnostic_id)
+                if item is None:
+                    raise ValueError(
+                        "PTY diagnostic is absent from the shard bundle"
+                    )
+                artifact = item["artifact"]
+                authority = item["authority"]
+                diagnostic_hashes.append(_content_hash({
+                    "artifact_bundle_digest": bundle_digest,
+                    "artifact_id": diagnostic_id,
+                }))
+            else:
+                diagnostic_id = str(candidate.get("diagnostic_id") or "")
+                artifact = candidate
+                authority = {}
+                diagnostic_hashes.append(_sha256_file(path))
+            valid, reason = validate_pty_diagnostic_artifact(
+                artifact,
+                authority=authority,
+                trusted_public_key_b64=authority_signer.public_key_b64,
+                expected_controller_context=authority_context,
+                expected_target_edge_key=str(row.get("edge_key") or ""),
+            )
+            if not valid:
+                raise ValueError(f"invalid diagnostic artifact: {reason}")
+            diagnostic_ids.append(diagnostic_id)
 
         status = str(schedule_result.get("execution_status") or "")
         if status == "complete" and not evidence_ids:
@@ -1570,7 +3336,8 @@ def _artifact_hashes(
             "product_failure": product_failure,
             "validation_error": "",
         }
-    except (KeyError, OSError, TypeError, ValueError) as exc:
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        rollback_pty_artifact_bundle(artifact_bundle_path)
         return {**empty, "validation_error": f"artifact validation failed: {exc}"}
 
 
@@ -1579,7 +3346,15 @@ def _journey_artifact_hashes(
     data: Mapping[str, Any],
     shard: FrozenShardSpec,
     empty: Mapping[str, Any],
+    *,
+    authority_signer: PtyAuthoritySigner,
+    controller_turn_observations: tuple[Mapping[str, Any], ...],
+    controller_turn_facts: tuple[Mapping[str, Any], ...],
+    controller_initial_facts: tuple[Mapping[str, Any], ...],
 ) -> dict[str, Any]:
+    authority_bundle_path = (
+        Path(shard.runtime_root) / "journey-controller-admission"
+    )
     try:
         roots = _worker_runtime_roots(manifest, shard)
         schedule_path = _resolve_required_path(
@@ -1626,6 +3401,42 @@ def _journey_artifact_hashes(
         evidence_ids: tuple[str, ...] = ()
         evidence_hashes: tuple[str, ...] = ()
         if status == JourneyTerminalClassification.PASSED.value:
+            candidate_turns = list(evidence.get("turns") or ())
+            if manifest.controller_owned_execution:
+                if (
+                    len(candidate_turns)
+                    != len(controller_turn_observations)
+                    or len(controller_initial_facts) != 1
+                ):
+                    raise ValueError(
+                        "Journey evidence has no complete controller observation ledger"
+                    )
+                previous_receipt_hash = ""
+                for candidate, observation in zip(
+                    candidate_turns,
+                    controller_turn_observations,
+                    strict=True,
+                ):
+                    unsigned_observation = dict(observation)
+                    receipt_hash = str(
+                        unsigned_observation.pop(
+                            "controller_observation_hash",
+                            "",
+                        )
+                        or ""
+                    )
+                    if (
+                        _content_hash(unsigned_observation) != receipt_hash
+                        or observation.get(
+                            "previous_controller_observation_hash"
+                        ) != previous_receipt_hash
+                        or observation.get("turn_result_hash")
+                        != _content_hash(candidate)
+                    ):
+                        raise ValueError(
+                            "Journey controller observation chain is invalid"
+                        )
+                    previous_receipt_hash = receipt_hash
             validate_journey_evidence_artifact(
                 evidence,
                 schedule=schedule,
@@ -1633,7 +3444,62 @@ def _journey_artifact_hashes(
                 revision=manifest.revision,
             )
             evidence_ids = (str(evidence["evidence_id"]),)
-            evidence_hashes = (_sha256_file(evidence_path),)
+            if not manifest.controller_owned_execution:
+                evidence_hashes = (_sha256_file(evidence_path),)
+                return {
+                    "transcript_hash": _sha256_file(transcript_path),
+                    "schedule_result_hash": _sha256_file(result_path),
+                    "evidence_hashes": evidence_hashes,
+                    "diagnostic_hashes": (),
+                    "evidence_ids": evidence_ids,
+                    "diagnostic_ids": (),
+                    "execution_status": status,
+                    "product_failure": product_failure,
+                    "validation_error": "",
+                }
+            authority_unsigned = {
+                "batch_id": manifest.batch_id,
+                "manifest_id": manifest.manifest_id,
+                "shard_id": shard.shard_id,
+                "execution_id": shard.execution_id,
+                "schedule_id": shard.schedule_id,
+                "candidate_artifact_sha256": _sha256_file(evidence_path),
+                "controller_turn_observations": [
+                    dict(item)
+                    for item in controller_turn_observations
+                ],
+                "controller_turn_facts": [
+                    dict(item)
+                    for item in controller_turn_facts
+                ],
+                "controller_initial_fact": (
+                    dict(controller_initial_facts[0])
+                    if len(controller_initial_facts) == 1
+                    else {}
+                ),
+            }
+            authority_payload = {
+                **authority_unsigned,
+                "controller_signature_b64": sign_controller_payload(
+                    authority_signer,
+                    authority_unsigned,
+                ),
+            }
+            authority_payload["authority_id"] = _content_hash(
+                authority_payload
+            )
+            _publish_journey_controller_bundle(
+                evidence_path=evidence_path,
+                authority=authority_payload,
+                bundle_path=authority_bundle_path,
+            )
+            evidence_hashes = (
+                validate_journey_controller_authority(
+                    manifest=manifest,
+                    shard=shard,
+                    bundle_path=authority_bundle_path,
+                ),
+            )
         elif status == JourneyTerminalClassification.PRODUCT_FAILED.value:
             product_failure = str(result.get("failure_reason") or "Journey product failure")
         return {
@@ -1647,8 +3513,958 @@ def _journey_artifact_hashes(
             "product_failure": product_failure,
             "validation_error": "",
         }
-    except (KeyError, OSError, TypeError, ValueError) as exc:
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
         return {**empty, "validation_error": f"artifact validation failed: {exc}"}
+
+
+@contextmanager
+def _journey_controller_bundle_lock(bundle_path: Path):
+    lock_path = bundle_path.with_name(f".{bundle_path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _remove_journey_controller_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        path.chmod(0o700)
+        for child in path.iterdir():
+            if not child.is_symlink():
+                child.chmod(0o600)
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _journey_controller_staging_paths(
+    bundle_path: Path,
+) -> tuple[Path, ...]:
+    return tuple(
+        bundle_path.parent.glob(f"{bundle_path.name}.tmp.*")
+    )
+
+
+def _journey_controller_recovery_marker(
+    bundle_path: Path,
+) -> Path:
+    return bundle_path.with_name(
+        f".{bundle_path.name}.recovery-required"
+    )
+
+
+def _create_journey_controller_recovery_marker(
+    bundle_path: Path,
+) -> None:
+    marker = _journey_controller_recovery_marker(bundle_path)
+    descriptor = os.open(
+        marker,
+        os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+        0o400,
+    )
+    try:
+        payload = (
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "bundle_path": bundle_path.name,
+                    "created_at_ns": time.time_ns(),
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        written = 0
+        while written < len(payload):
+            written += os.write(descriptor, payload[written:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    _fsync_parent_directory(marker.parent)
+
+
+def _clear_journey_controller_recovery_marker(
+    bundle_path: Path,
+) -> None:
+    marker = _journey_controller_recovery_marker(bundle_path)
+    if not marker.exists():
+        return
+    marker.unlink()
+    try:
+        _fsync_parent_directory(marker.parent)
+    except Exception as clear_error:
+        try:
+            _create_journey_controller_recovery_marker(bundle_path)
+        except Exception as restore_error:
+            raise RuntimeError(
+                "Journey controller recovery marker clear failed and "
+                "required-state restoration failed"
+            ) from restore_error
+        raise RuntimeError(
+            "Journey controller recovery marker clear was not durable; "
+            "recovery remains required"
+        ) from clear_error
+
+
+def _load_journey_controller_bundle(
+    bundle_path: Path,
+    *,
+    allow_recovery_marker: bool = False,
+) -> tuple[Path, Path, JourneyControllerAuthoritySnapshot, str]:
+    if (
+        not allow_recovery_marker
+        and _journey_controller_recovery_marker(bundle_path).exists()
+    ):
+        raise ValueError(
+            "Journey controller bundle requires durability reconciliation"
+        )
+    path = bundle_path.resolve()
+    if (
+        path.is_symlink()
+        or not path.is_dir()
+        or path.stat().st_mode & 0o222
+        or {entry.name for entry in path.iterdir()}
+        != {"candidate.json", "authority.json", "COMMIT.json"}
+    ):
+        raise ValueError(
+            "Journey controller admission bundle is missing or mutable"
+        )
+    candidate = path / "candidate.json"
+    authority_file = path / "authority.json"
+    commit_file = path / "COMMIT.json"
+    if any(
+        item.is_symlink()
+        or not item.is_file()
+        or item.stat().st_mode & 0o222
+        for item in (candidate, authority_file, commit_file)
+    ):
+        raise ValueError(
+            "Journey controller admission bundle contains an invalid file"
+        )
+    try:
+        candidate_bytes = candidate.read_bytes()
+        authority_bytes = authority_file.read_bytes()
+        commit_bytes = commit_file.read_bytes()
+        authority = json.loads(authority_bytes)
+        commit = json.loads(commit_bytes)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "Journey controller admission bundle is incomplete"
+        ) from exc
+    if not isinstance(authority, Mapping) or not isinstance(commit, Mapping):
+        raise ValueError(
+            "Journey controller admission bundle is malformed"
+        )
+    expected_commit = {
+        "schema_version": 1,
+        "candidate_sha256": hashlib.sha256(candidate_bytes).hexdigest(),
+        "authority_sha256": hashlib.sha256(authority_bytes).hexdigest(),
+        "authority_id": str(authority.get("authority_id") or ""),
+    }
+    if dict(commit) != expected_commit:
+        raise ValueError(
+            "Journey controller admission commit marker is stale"
+        )
+    snapshot = JourneyControllerAuthoritySnapshot(
+        candidate_bytes=candidate_bytes,
+        authority_bytes=authority_bytes,
+        bundle_digest=_content_hash({
+            **expected_commit,
+            "commit_sha256": hashlib.sha256(commit_bytes).hexdigest(),
+        }),
+    )
+    return (
+        candidate,
+        authority_file,
+        snapshot,
+        snapshot.bundle_digest,
+    )
+
+
+def _publish_journey_controller_bundle(
+    *,
+    evidence_path: Path,
+    authority: Mapping[str, Any],
+    bundle_path: Path,
+) -> Path:
+    candidate_bytes = evidence_path.read_bytes()
+    authority_bytes = (
+        json.dumps(
+            dict(authority),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    with _journey_controller_bundle_lock(bundle_path):
+        for staging in _journey_controller_staging_paths(bundle_path):
+            _remove_journey_controller_path(staging)
+        if _journey_controller_recovery_marker(bundle_path).exists():
+            raise RuntimeError(
+                "Journey controller bundle requires explicit "
+                "durability recovery"
+            )
+        if bundle_path.exists():
+            candidate, authority_file, existing_snapshot, _digest = (
+                _load_journey_controller_bundle(bundle_path)
+            )
+            existing = existing_snapshot.authority_payload()
+            if (
+                candidate.read_bytes() == candidate_bytes
+                and authority_file.read_bytes() == authority_bytes
+                and existing == dict(authority)
+            ):
+                _fsync_parent_directory(bundle_path)
+                _fsync_parent_directory(bundle_path.parent)
+                return bundle_path
+            raise FileExistsError(
+                "Journey controller bundle belongs to another "
+                "candidate or authority"
+            )
+        staging = bundle_path.with_name(
+            f"{bundle_path.name}.tmp.{os.getpid()}.{time.time_ns()}"
+        )
+        published = False
+        try:
+            staging.mkdir(mode=0o700)
+            candidate = staging / "candidate.json"
+            authority_file = staging / "authority.json"
+            commit_file = staging / "COMMIT.json"
+            candidate.write_bytes(candidate_bytes)
+            authority_file.write_bytes(authority_bytes)
+            commit_file.write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "candidate_sha256": hashlib.sha256(
+                        candidate_bytes
+                    ).hexdigest(),
+                    "authority_sha256": hashlib.sha256(
+                        authority_bytes
+                    ).hexdigest(),
+                    "authority_id": str(
+                        authority.get("authority_id") or ""
+                    ),
+                }, indent=2, sort_keys=True)
+                + "\n",
+                encoding="utf-8",
+            )
+            for item in (candidate, authority_file, commit_file):
+                item.chmod(0o400)
+                with item.open("rb") as handle:
+                    os.fsync(handle.fileno())
+            _fsync_parent_directory(staging)
+            staging.chmod(0o500)
+            _fsync_parent_directory(staging)
+            _create_journey_controller_recovery_marker(bundle_path)
+            if bundle_path.exists():
+                raise FileExistsError(
+                    f"Journey controller bundle exists: {bundle_path}"
+                )
+            staging.rename(bundle_path)
+            published = True
+            _fsync_parent_directory(bundle_path)
+            _fsync_parent_directory(bundle_path.parent)
+            _clear_journey_controller_recovery_marker(bundle_path)
+        except Exception:
+            if published and bundle_path.exists():
+                raise RuntimeError(
+                    "Journey controller bundle durability is uncertain; "
+                    "retry reconciliation is required"
+                )
+            if staging.exists():
+                _remove_journey_controller_path(staging)
+                _fsync_parent_directory(staging.parent)
+            _clear_journey_controller_recovery_marker(bundle_path)
+            raise
+        return bundle_path
+
+
+def recover_journey_controller_bundle(
+    bundle_path: str | Path,
+    *,
+    expected_candidate: Mapping[str, Any] | None = None,
+    expected_authority: Mapping[str, Any] | None = None,
+) -> Path | None:
+    """Reconcile one uncertain Journey publication without replacing it."""
+
+    path = Path(bundle_path)
+    with _journey_controller_bundle_lock(path):
+        for staging in _journey_controller_staging_paths(path):
+            _remove_journey_controller_path(staging)
+        if not path.exists():
+            _clear_journey_controller_recovery_marker(path)
+            return None
+        _fsync_parent_directory(path)
+        _fsync_parent_directory(path.parent)
+        candidate, _authority_path, snapshot, _digest = (
+            _load_journey_controller_bundle(
+                path,
+                allow_recovery_marker=True,
+            )
+        )
+        authority = snapshot.authority_payload()
+        if (
+            expected_candidate is not None
+            and snapshot.candidate_payload() != dict(expected_candidate)
+        ):
+            raise FileExistsError(
+                "Journey controller bundle candidate changed"
+            )
+        if (
+            expected_authority is not None
+            and dict(authority) != dict(expected_authority)
+        ):
+            raise FileExistsError(
+                "Journey controller bundle authority changed"
+            )
+        _clear_journey_controller_recovery_marker(path)
+        return path
+
+
+def _rollback_journey_controller_bundle(bundle_path: Path) -> None:
+    with _journey_controller_bundle_lock(bundle_path):
+        for staging in _journey_controller_staging_paths(bundle_path):
+            _remove_journey_controller_path(staging)
+        _remove_journey_controller_path(bundle_path)
+        _clear_journey_controller_recovery_marker(bundle_path)
+        _fsync_parent_directory(bundle_path.parent)
+
+
+def validate_journey_controller_authority(
+    *,
+    manifest: FrozenBatchManifest,
+    shard: FrozenShardSpec,
+    bundle_path: str | Path,
+) -> str:
+    """Validate one Journey candidate against its controller-owned receipt."""
+
+    return load_validated_journey_controller_authority(
+        manifest=manifest,
+        shard=shard,
+        bundle_path=bundle_path,
+    ).bundle_digest
+
+
+def load_validated_journey_controller_authority(
+    *,
+    manifest: FrozenBatchManifest,
+    shard: FrozenShardSpec,
+    bundle_path: str | Path,
+) -> JourneyControllerAuthoritySnapshot:
+    """Validate and return the same immutable Journey bundle snapshot."""
+
+    _candidate, _authority_file, snapshot, _digest = _load_journey_controller_bundle(
+        Path(bundle_path)
+    )
+    authority = snapshot.authority_payload()
+    candidate_payload = snapshot.candidate_payload()
+    expected_fields = {
+        "batch_id",
+        "manifest_id",
+        "shard_id",
+        "execution_id",
+        "schedule_id",
+        "candidate_artifact_sha256",
+        "controller_turn_observations",
+        "controller_turn_facts",
+        "controller_initial_fact",
+        "controller_signature_b64",
+        "authority_id",
+    }
+    if not isinstance(authority, Mapping) or set(authority) != expected_fields:
+        raise ValueError("Journey controller authority schema is invalid")
+    signed_payload = {
+        key: value
+        for key, value in authority.items()
+        if key not in {"controller_signature_b64", "authority_id"}
+    }
+    authority_identity_payload = {
+        key: value
+        for key, value in authority.items()
+        if key != "authority_id"
+    }
+    if (
+        authority.get("batch_id") != manifest.batch_id
+        or authority.get("manifest_id") != manifest.manifest_id
+        or authority.get("shard_id") != shard.shard_id
+        or authority.get("execution_id") != shard.execution_id
+        or authority.get("schedule_id") != shard.schedule_id
+        or authority.get("candidate_artifact_sha256")
+        != hashlib.sha256(snapshot.candidate_bytes).hexdigest()
+        or authority.get("authority_id")
+        != _content_hash(authority_identity_payload)
+        or not verify_controller_payload_signature(
+            signed_payload,
+            signature_b64=str(
+                authority.get("controller_signature_b64") or ""
+            ),
+            trusted_public_key_b64=(
+                manifest.pty_authority_public_key_b64
+            ),
+        )
+    ):
+        raise ValueError("Journey controller authority binding is invalid")
+    observations = authority.get("controller_turn_observations")
+    controller_facts = authority.get("controller_turn_facts")
+    controller_initial_fact = authority.get("controller_initial_fact")
+    journey, registry_import = _journey_target(
+        _load_json(Path(shard.target_path))
+    )
+    schedule = build_journey_schedule(
+        revision=manifest.revision,
+        seed=shard.seed,
+        journey=journey,
+    )
+    validate_journey_schedule(schedule, revision=manifest.revision)
+    registry = load_verifier_registry(registry_import)
+    if (
+        schedule.schedule_id != shard.schedule_id
+        or registry_import != shard.verifier_registry_import
+        or registry.registry_id != shard.verifier_registry_id
+    ):
+        raise ValueError(
+            "Journey controller candidate authority changed"
+        )
+    validate_journey_evidence_artifact(
+        candidate_payload,
+        schedule=schedule,
+        verifier_registry=registry,
+        revision=manifest.revision,
+    )
+    candidate_turns = candidate_payload.get("turns")
+    if (
+        not isinstance(observations, Sequence)
+        or isinstance(observations, (str, bytes))
+        or not isinstance(candidate_turns, list)
+        or len(candidate_turns) != len(observations)
+        or not isinstance(controller_facts, Sequence)
+        or isinstance(controller_facts, (str, bytes))
+        or len(controller_facts) != len(observations)
+        or not isinstance(controller_initial_fact, Mapping)
+        or not controller_initial_fact
+    ):
+        raise ValueError(
+            "Journey controller authority observation cardinality is invalid"
+        )
+    previous_receipt_hash = ""
+    previous_turn_index = 0
+    previous_submission_sequence = 0
+    previous_runtime_sequence = 0
+    for ordinal, (raw, candidate_turn) in enumerate(
+        zip(observations, candidate_turns, strict=True),
+        start=1,
+    ):
+        if not isinstance(raw, Mapping):
+            raise ValueError(
+                "Journey controller authority observation is invalid"
+            )
+        if set(raw) != JOURNEY_CONTROLLER_OBSERVATION_FIELDS:
+            raise ValueError(
+                "Journey controller authority observation schema is invalid"
+            )
+        observation = dict(raw)
+        receipt_hash = str(
+            observation.pop("controller_observation_hash", "") or ""
+        )
+        turn_index = int(observation.get("turn_index") or 0)
+        submission_sequence = int(
+            observation.get("submission_sequence") or 0
+        )
+        runtime_sequence = int(
+            observation.get("terminal_runtime_event_sequence") or 0
+        )
+        digest_fields = (
+            "previous_response_hash",
+            "user_message_hash",
+            "approved_decision_hash",
+            "simulator_context_hash",
+            "submitted_input_commitment",
+            "agent_response_hash",
+            "baseline_runtime_event_hash",
+            "committed_runtime_event_hash",
+            "terminal_outcome_hash",
+            "turn_result_hash",
+        )
+        if (
+            int(observation.get("shard_turn_ordinal") or 0) != ordinal
+            or turn_index <= previous_turn_index
+            or submission_sequence <= previous_submission_sequence
+            or runtime_sequence <= previous_runtime_sequence
+            or (
+                ordinal > 1
+                and turn_index != previous_turn_index + 1
+            )
+            or (
+                ordinal > 1
+                and runtime_sequence != previous_runtime_sequence + 1
+            )
+            or not str(
+                observation.get("terminal_runtime_event_id") or ""
+            )
+            or any(
+                len(str(observation.get(field) or "")) != 64
+                for field in digest_fields
+            )
+            or len(receipt_hash) != 64
+            or _content_hash(observation) != receipt_hash
+            or observation.get("previous_controller_observation_hash")
+            != previous_receipt_hash
+            or not isinstance(candidate_turn, Mapping)
+            or int(candidate_turn.get("turn_index") or 0) != turn_index
+            or observation.get("turn_result_hash")
+            != _content_hash(candidate_turn)
+        ):
+            raise ValueError(
+                "Journey controller authority observation chain is invalid"
+            )
+        previous_receipt_hash = receipt_hash
+        previous_turn_index = turn_index
+        previous_submission_sequence = submission_sequence
+        previous_runtime_sequence = runtime_sequence
+    _validate_and_recompute_journey_controller_facts(
+        manifest=manifest,
+        shard=shard,
+        candidate_turns=candidate_turns,
+        observations=observations,
+        controller_facts=controller_facts,
+        controller_initial_fact=controller_initial_fact,
+        candidate_initial_verification=(
+            candidate_payload.get("initial_verification")
+        ),
+    )
+    return snapshot
+
+
+def _validate_and_recompute_journey_controller_facts(
+    *,
+    manifest: FrozenBatchManifest,
+    shard: FrozenShardSpec,
+    candidate_turns: Sequence[Mapping[str, Any]],
+    observations: Sequence[Mapping[str, Any]],
+    controller_facts: Sequence[Mapping[str, Any]],
+    controller_initial_fact: Mapping[str, Any],
+    candidate_initial_verification: Any,
+) -> None:
+    """Re-run Journey verifiers from signed, persisted controller facts."""
+
+    target_path = Path(shard.target_path).resolve()
+    if (
+        not target_path.is_file()
+        or _sha256_file(target_path) != shard.target_hash
+    ):
+        raise ValueError("Journey frozen target binding is invalid")
+    journey, registry_import = _journey_target(_load_json(target_path))
+    if registry_import != shard.verifier_registry_import:
+        raise ValueError("Journey verifier registry import changed")
+    schedule = build_journey_schedule(
+        revision=manifest.revision,
+        seed=shard.seed,
+        journey=journey,
+    )
+    validate_journey_schedule(schedule, revision=manifest.revision)
+    if schedule.schedule_id != shard.schedule_id:
+        raise ValueError("Journey frozen schedule identity changed")
+    registry = load_verifier_registry(registry_import)
+    if registry.registry_id != shard.verifier_registry_id:
+        raise ValueError("Journey verifier registry identity changed")
+    edge_index = {
+        str(edge.get("edge_key") or ""): edge
+        for edge in build_ledger(revision=manifest.revision).get("edges") or ()
+    }
+
+    if set(controller_initial_fact) != {
+        "initial_event",
+        "initial_verification",
+    }:
+        raise ValueError("Journey initial controller fact is invalid")
+    initial_event_payload = controller_initial_fact.get("initial_event")
+    persisted_initial_verification = controller_initial_fact.get(
+        "initial_verification"
+    )
+    if (
+        not isinstance(initial_event_payload, Mapping)
+        or not isinstance(persisted_initial_verification, Mapping)
+        or not isinstance(candidate_initial_verification, Mapping)
+    ):
+        raise ValueError("Journey initial verification is incomplete")
+    initial_event = _runtime_event_from_mapping(initial_event_payload)
+    validate_runtime_turn_event(initial_event)
+    if (
+        initial_event.thread_id != shard.session_id
+        or dict(initial_event.revision) != dict(manifest.revision)
+    ):
+        raise ValueError(
+            "Journey initial runtime event authority is invalid"
+        )
+    initial_context = build_journey_verifier_context(
+        schedule=schedule,
+        initial_event=initial_event,
+        current_event=initial_event,
+        turns=(),
+        events=(),
+        decisions=(),
+        transcript=(),
+        observed_edge_keys=(),
+        latest_turn=None,
+    )
+    recomputed_initial = {
+        "terminal_outcome": _journey_outcome_verification_payload(
+            verify_journey_outcome(
+                schedule.terminal_outcome,
+                initial_context,
+                registry,
+            )
+        ),
+        "forbidden_outcomes": [
+            _journey_outcome_verification_payload(item)
+            for item in verify_journey_forbidden_outcomes(
+                schedule,
+                initial_context,
+                registry,
+            )
+        ],
+    }
+    if (
+        recomputed_initial != persisted_initial_verification
+        or recomputed_initial != candidate_initial_verification
+    ):
+        raise ValueError(
+            "Journey initial verification failed recomputation"
+        )
+
+    turns: list[PtyCliTurnRecord] = []
+    events: list[Any] = []
+    decisions: list[JourneyDecisionProvenance] = []
+    observed_edge_keys: list[str] = []
+    previous_committed_payload: Mapping[str, Any] | None = None
+    runtime_event_ids: set[str] = {
+        str(initial_event.runtime_event_id or "")
+    }
+    terminal_event_ids: set[str] = {
+        str(initial_event.terminal_event_id or "")
+    }
+    observed_provider = ""
+    observed_model = ""
+    for ordinal, (raw_fact, candidate_turn, observation) in enumerate(
+        zip(
+            controller_facts,
+            candidate_turns,
+            observations,
+            strict=True,
+        ),
+        start=1,
+    ):
+        if not isinstance(raw_fact, Mapping):
+            raise ValueError("Journey controller fact is not an object")
+        required = {
+            "initial_event",
+            "turn",
+            "baseline_event",
+            "committed_event",
+            "terminal_outcome",
+            "decision",
+            "observed_edge_keys",
+            "turn_result",
+        }
+        if set(raw_fact) != required:
+            raise ValueError("Journey controller fact schema is invalid")
+        fact = json.loads(_canonical_json(raw_fact))
+        initial_payload = fact["initial_event"]
+        baseline_payload = fact["baseline_event"]
+        committed_payload = fact["committed_event"]
+        if not all(
+            isinstance(item, Mapping)
+            for item in (
+                initial_payload,
+                baseline_payload,
+                committed_payload,
+                fact["turn"],
+                fact["decision"],
+                fact["terminal_outcome"],
+                fact["turn_result"],
+            )
+        ):
+            raise ValueError("Journey controller fact payload is malformed")
+        if initial_payload != initial_event_payload:
+            raise ValueError("Journey initial runtime event changed")
+        if ordinal == 1 and baseline_payload != initial_event_payload:
+            raise ValueError("Journey first baseline is not the initial event")
+        if (
+            previous_committed_payload is not None
+            and baseline_payload != previous_committed_payload
+        ):
+            raise ValueError("Journey runtime event adjacency is invalid")
+
+        turn = _turn_from_payload(fact["turn"])
+        baseline = _runtime_event_from_mapping(baseline_payload)
+        committed = _runtime_event_from_mapping(committed_payload)
+        validate_runtime_turn_event(baseline)
+        validate_runtime_turn_event(committed)
+        decision = _journey_decision_from_payload(fact["decision"])
+        terminal_outcome = _terminal_outcome_from_mapping(
+            fact["terminal_outcome"]
+        )
+        approved_decision = observation.get("approved_decision")
+        simulator_context = observation.get("simulator_context")
+        try:
+            expected_context_binding = simulator_context_binding(
+                simulator_context
+                if isinstance(simulator_context, Mapping)
+                else {}
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Journey simulator context binding is invalid"
+            ) from exc
+        approved_commitment = (
+            str(
+                approved_decision.get(
+                    "_controller_submitted_input_commitment"
+                )
+                or ""
+            )
+            if isinstance(approved_decision, Mapping)
+            else ""
+        )
+        approved_risk_factors = tuple(
+            str(item)
+            for item in (
+                approved_decision.get("risk_factor_ids") or ()
+                if isinstance(approved_decision, Mapping)
+                else ()
+            )
+        )
+        if (
+            turn.turn_index
+            != int(observation.get("turn_index") or 0)
+            or turn.session_id != shard.session_id
+            or not turn.provider
+            or not turn.model
+            or (
+                observed_provider
+                and turn.provider != observed_provider
+            )
+            or (
+                observed_model
+                and turn.model != observed_model
+            )
+            or turn.transcript_hash
+            != pty_transcript_hash(
+                session_id=turn.session_id,
+                turn_index=turn.turn_index,
+                previous_agent_response=turn.previous_agent_response,
+                user_message=turn.user_message,
+                agent_response=turn.agent_response,
+            )
+            or any(
+                event.thread_id != shard.session_id
+                or dict(event.revision) != dict(manifest.revision)
+                or event.session_purpose
+                != initial_event.session_purpose
+                for event in (baseline, committed)
+            )
+            or committed.base_revision != baseline.product_revision
+            or committed.base_checkpoint_thread_id
+            != baseline.product_checkpoint_thread_id
+            or committed.base_checkpoint_id
+            != baseline.product_checkpoint_id
+            or decision.turn_index != turn.turn_index
+            or decision.execution_id != shard.execution_id
+            or decision.obligation_id != schedule.journey_id
+            or decision.previous_response_hash
+            != str(
+                expected_context_binding.get(
+                    "previous_response_hash"
+                )
+                or ""
+            )
+            or decision.user_message_hash
+            != str(
+                approved_decision.get(
+                    "_controller_source_user_message_hash"
+                )
+                or ""
+            )
+            or not isinstance(approved_decision, Mapping)
+            or _content_hash(approved_decision)
+            != observation.get("approved_decision_hash")
+            or not isinstance(simulator_context, Mapping)
+            or simulator_context_hash(simulator_context)
+            != observation.get("simulator_context_hash")
+            or dict(decision.simulator_context_binding)
+            != expected_context_binding
+            or str(approved_decision.get("user_message") or "")
+            != turn.user_message
+            or str(approved_decision.get("persona") or "")
+            != decision.persona
+            or str(approved_decision.get("mission") or "")
+            != decision.mission
+            or str(approved_decision.get("rationale") or "")
+            != decision.rationale
+            or approved_risk_factors != tuple(decision.risk_factor_ids)
+            or dict(
+                approved_decision.get("simulator_attestation") or {}
+            )
+            != dict(decision.simulator_attestation)
+            or (
+                dict(approved_decision.get("variant_binding") or {})
+                and (
+                    str(
+                        decision.variant_attestation.get(
+                            "source_step_id"
+                        )
+                        or ""
+                    )
+                    != str(
+                        dict(
+                            approved_decision.get(
+                                "variant_binding"
+                            )
+                            or {}
+                        ).get("source_step_id")
+                        or ""
+                    )
+                    or str(
+                        decision.variant_attestation.get(
+                            "semantic_role"
+                        )
+                        or ""
+                    )
+                    != str(
+                        dict(
+                            approved_decision.get(
+                                "variant_binding"
+                            )
+                            or {}
+                        ).get("semantic_role")
+                        or ""
+                    )
+                )
+            )
+            or approved_commitment
+            != str(
+                observation.get("submitted_input_commitment") or ""
+            )
+            or observation.get("previous_response_hash")
+            != _content_hash(turn.previous_agent_response)
+            or observation.get("user_message_hash")
+            != _content_hash(turn.user_message)
+            or observation.get("agent_response_hash")
+            != _content_hash(turn.agent_response)
+            or observation.get("baseline_runtime_event_hash")
+            != baseline.runtime_event_payload_hash
+            or observation.get("committed_runtime_event_hash")
+            != committed.runtime_event_payload_hash
+            or turn.before_fingerprint != baseline.after_fingerprint
+            or turn.after_fingerprint != committed.after_fingerprint
+            or turn.user_message_submitted_at_ns != decision.submitted_at_ns
+            or not (
+                turn.previous_response_received_at_ns
+                <= decision.selected_at_ns
+                <= decision.submitted_at_ns
+                <= turn.agent_response_received_at_ns
+            )
+            or str(committed.runtime_event_id or "")
+            != str(observation.get("terminal_runtime_event_id") or "")
+            or committed.runtime_event_sequence
+            != int(
+                observation.get("terminal_runtime_event_sequence") or 0
+            )
+            or _content_hash(asdict(terminal_outcome))
+            != observation.get("terminal_outcome_hash")
+            or terminal_outcome.transaction_id
+            != committed.transaction_id
+            or terminal_outcome.runtime_event_id
+            != committed.runtime_event_id
+            or terminal_outcome.runtime_event_sequence
+            != committed.runtime_event_sequence
+            or terminal_outcome.runtime_event_payload_hash
+            != committed.runtime_event_payload_hash
+            or terminal_outcome.product_authority_id
+            != committed.product_authority_id
+            or terminal_outcome.product_fingerprint
+            != committed.after_fingerprint
+            or terminal_outcome.event_id != committed.terminal_event_id
+            or committed.runtime_event_id in runtime_event_ids
+            or committed.terminal_event_id in terminal_event_ids
+        ):
+            raise ValueError(
+                "Journey controller fact differs from its observation"
+            )
+        if ordinal == 1 and (
+            committed.runtime_event_sequence
+            != initial_event.runtime_event_sequence + 1
+            or turn.turn_index != initial_event.turn_index + 1
+        ):
+            raise ValueError(
+                "Journey first committed event is not adjacent to startup"
+            )
+        runtime_event_ids.add(committed.runtime_event_id)
+        terminal_event_ids.add(committed.terminal_event_id)
+        observed_provider = turn.provider
+        observed_model = turn.model
+
+        turns.append(turn)
+        events.append(committed)
+        decisions.append(decision)
+        observed_current = observe_journey_edges(
+            edge_index,
+            baseline,
+            committed,
+            turn,
+        )
+        for item in observed_current:
+            if item.edge_key not in observed_edge_keys:
+                observed_edge_keys.append(item.edge_key)
+        if list(fact["observed_edge_keys"]) != observed_edge_keys:
+            raise ValueError("Journey observed edge history is invalid")
+        transcript = [
+            (item.user_message, item.agent_response)
+            for item in turns
+        ]
+        context = build_journey_verifier_context(
+            schedule=schedule,
+            initial_event=initial_event,
+            current_event=committed,
+            turns=turns,
+            events=events,
+            decisions=decisions,
+            transcript=transcript,
+            observed_edge_keys=observed_edge_keys,
+            latest_turn=turn,
+        )
+        forbidden = verify_journey_forbidden_outcomes(
+            schedule,
+            context,
+            registry,
+        )
+        terminal = verify_journey_outcome(
+            schedule.terminal_outcome,
+            context,
+            registry,
+        )
+        recomputed = build_journey_turn_result(
+            turn=turn,
+            decision=decision,
+            observed_edges=observed_current,
+            terminal=terminal,
+            forbidden=forbidden,
+        )
+        if (
+            recomputed != fact["turn_result"]
+            or recomputed != candidate_turn
+            or _content_hash(recomputed)
+            != observation.get("turn_result_hash")
+        ):
+            raise ValueError(
+                f"Journey controller fact {ordinal} failed recomputation"
+            )
+        previous_committed_payload = committed_payload
 
 
 def _validate_result_frame(
@@ -2030,6 +4846,7 @@ def result_index_payload(index: BatchResultIndex) -> dict[str, Any]:
         "batch_id": index.batch_id,
         "manifest_id": index.manifest_id,
         "revision": dict(index.revision),
+        "execution_authority_mode": index.execution_authority_mode,
         "execution_status": index.execution_status,
         "release_status": index.release_status,
         "scheduled": index.scheduled,
@@ -2038,6 +4855,9 @@ def result_index_payload(index: BatchResultIndex) -> dict[str, Any]:
         "discovery_attempt_ids": list(index.discovery_attempt_ids),
         "classification_counts": dict(index.classification_counts),
         "batch_survivor_proof": dict(index.batch_survivor_proof),
+        "pty_authority_trust_root_id": index.pty_authority_trust_root_id,
+        "pty_authority_public_key_b64": index.pty_authority_public_key_b64,
+        "controller_signature_b64": index.controller_signature_b64,
         "shards": [_result_payload(item) for item in index.shards],
         "schema_version": index.schema_version,
     }
@@ -2083,6 +4903,8 @@ def _manifest_unsigned_payload(manifest: FrozenBatchManifest) -> dict[str, Any]:
         "revision": dict(manifest.revision),
         "shard_count": manifest.shard_count,
         "max_concurrency": manifest.max_concurrency,
+        "pty_authority_trust_root_id": manifest.pty_authority_trust_root_id,
+        "pty_authority_public_key_b64": manifest.pty_authority_public_key_b64,
         "shards": [_shard_payload(item) for item in manifest.shards],
         "required_env_names": list(manifest.required_env_names),
         "timeout_policy": asdict(manifest.timeout_policy),
@@ -2092,6 +4914,9 @@ def _manifest_unsigned_payload(manifest: FrozenBatchManifest) -> dict[str, Any]:
         ),
         "worker_runtime": manifest.worker_runtime,
         "formal_profile": manifest.formal_profile,
+        "controller_owned_execution": (
+            manifest.controller_owned_execution
+        ),
         "scheduler_schema_version": manifest.scheduler_schema_version,
         "discovery_schema_version": manifest.discovery_schema_version,
         "schema_version": manifest.schema_version,
@@ -2816,6 +5641,7 @@ def _write_immutable_json(path: Path, payload: Mapping[str, Any]) -> None:
     ) + "\n").encode("utf-8")
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+    published = False
     try:
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(content)
@@ -2825,11 +5651,21 @@ def _write_immutable_json(path: Path, payload: Mapping[str, Any]) -> None:
             os.link(temporary, path)
         except FileExistsError as exc:
             raise FileExistsError(f"immutable artifact already exists: {path}") from exc
+        published = True
         os.chmod(path, 0o444)
         directory = os.open(path.parent, os.O_RDONLY)
         try:
             os.fsync(directory)
         finally:
             os.close(directory)
+    except Exception:
+        if published and path.exists():
+            os.chmod(path, 0o600)
+            path.unlink()
+            try:
+                _fsync_parent_directory(path.parent)
+            except OSError:
+                pass
+        raise
     finally:
         temporary.unlink(missing_ok=True)

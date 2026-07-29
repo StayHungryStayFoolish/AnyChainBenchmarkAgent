@@ -225,7 +225,10 @@ def _advanced_readiness(state: dict[str, Any]) -> GroupReadiness:
 
 
 def _preflight_readiness(state: dict[str, Any]) -> GroupReadiness:
-    return _ready() if (state.get("preflight") or {}).get("approved") else _missing("approve preflight/smoke")
+    preflight = state.get("preflight") or {}
+    if preflight.get("decision") == "declined":
+        return _ready()
+    return _ready() if preflight.get("approved") else _missing("approve preflight/smoke")
 
 
 GROUP_READINESS: dict[str, ReadinessPredicate] = {

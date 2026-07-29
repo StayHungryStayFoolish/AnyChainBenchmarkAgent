@@ -56,6 +56,7 @@ def question_for_execution(state: AgentGraphState, group: str) -> dict[str, Any]
                 },
             ],
             queue_barrier=True,
+            rejection_evidence_value=False,
         )
         question["execution_request_id"] = str((state.get("preflight") or {}).get("execution_request_id") or uuid.uuid4().hex)
         return question
@@ -87,6 +88,7 @@ def question_for_execution(state: AgentGraphState, group: str) -> dict[str, Any]
                 },
             ],
             queue_barrier=True,
+            rejection_evidence_value=False,
         )
         question["execution_request_id"] = uuid.uuid4().hex
         return question
@@ -116,6 +118,7 @@ def question_for_execution(state: AgentGraphState, group: str) -> dict[str, Any]
             },
         ],
         queue_barrier=True,
+        rejection_evidence_value=False,
     )
     question["execution_request_id"] = uuid.uuid4().hex
     return question
@@ -137,6 +140,9 @@ def apply_execution_answer(
     request_id = str(active_question.get("execution_request_id") or "").strip()
     approved = bool(value)
     next_state.setdefault("preflight", {})["approved"] = approved
+    next_state["preflight"]["decision"] = (
+        "approved" if approved else "declined"
+    )
     if request_id:
         next_state["preflight"]["execution_request_id"] = request_id
     if approved:
@@ -146,6 +152,7 @@ def apply_execution_answer(
             delta=_merge_deltas(StateDelta.between(state, next_state), runtime_result.delta),
             clear_pending=True,
         )
+    next_state["preflight"]["status"] = "declined"
     return HandlerResult(
         delta=StateDelta.between(state, next_state),
         response_fragments=(_fragment("execution.response.preflight_paused"),),

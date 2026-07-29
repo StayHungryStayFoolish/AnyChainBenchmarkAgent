@@ -281,6 +281,15 @@ class RegistryDrivenReadinessTests(unittest.TestCase):
         self.assertEqual(next_group_and_reason(state)[0], "preflight_smoke_execution")
         state["preflight"] = {"approved": True}
         self.assertEqual(next_group_and_reason(state), ("job_monitoring", "monitor benchmark job"))
+        state["preflight"] = {
+            "approved": False,
+            "decision": "declined",
+            "status": "declined",
+        }
+        self.assertEqual(
+            next_group_and_reason(state),
+            ("job_monitoring", "monitor benchmark job"),
+        )
 
     def test_sync_observe_contract_routes_source_endpoint_and_stop_condition(self) -> None:
         state = _sync_state()

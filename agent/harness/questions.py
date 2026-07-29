@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Mapping
 
 from agent.knowledge.chain_identity import canonicalize_chain_scalar, repo_chain_names
 from agent.workflows.group_registry import GROUP_OWNER
+from agent.workflows.group_registry import (
+    group_registry_contract_hash,
+    is_sensitive_question,
+)
 from .action_registry import (
     ACTION_BY_TYPE,
+    action_registry_contract_hash,
     pending_barrier_semantics,
     semantic_value_domain_conflicts,
     validate_candidate_binding_contract,
@@ -31,9 +37,11 @@ from .input_values import (
     parse_weight_spec,
 )
 from .response_catalog import render_text_ref
+from .secret_refs import normalize_secret_reentry_binding
 
 
-QUESTION_CONTRACT_VERSION = 3
+QUESTION_CONTRACT_VERSION = 6
+_SEMANTIC_DRAFT_QUESTION_HASH_FIELD = "semantic_draft_question_hash"
 
 _DOMAIN_CONTEXT_KEYS = {
     "config_field",
@@ -47,6 +55,159 @@ _RPC_ENDPOINT_CONTRACTS = {
     ("validation", "custom_rpc", ""),
     ("validation", "new_chain", ""),
 }
+
+
+def semantic_draft_question_template() -> dict[str, Any]:
+    """Return the sole static authority for draft clarification questions."""
+
+    return {
+        "prompt_message_id": "question.control.semantic_draft_atom.prompt",
+        "field": "semantic_draft_resolution",
+        "kind": "numbered_choice",
+        "options": (
+            {
+                "id": "previous",
+                "value": "previous",
+                "label_message_id": (
+                    "question.control.semantic_draft_atom.previous"
+                ),
+                "action_type": "previous_semantic_draft_atom",
+                "return_policy": "stay",
+            },
+            {
+                "id": "cancel",
+                "value": "cancel",
+                "label_message_id": (
+                    "question.control.semantic_draft_atom.cancel"
+                ),
+                "action_type": "cancel_semantic_draft",
+                "return_policy": "fallback",
+            },
+        ),
+        "manual_action_type": "resolve_semantic_draft_atom",
+        "manual_value_argument": "resolution",
+        "queue_barrier": True,
+        "barrier_policy": "exclusive_owner",
+        "validation": {
+            "value_type": "evidence_contribution",
+            "max_length": 65536,
+        },
+    }
+
+
+def secret_reentry_question_template() -> dict[str, Any]:
+    """Return the sole authority for restart-time secret re-entry."""
+
+    return {
+        "prompt_message_id": "question.control.secret_reentry.prompt",
+        "field": "semantic_secret_value",
+        "kind": "manual_value",
+        "manual_action_type": "reenter_secret_reference",
+        "manual_value_argument": "secret_value",
+        "queue_barrier": True,
+        "barrier_policy": "exclusive_owner",
+        "validation": {
+            "value_type": "scalar_token",
+            "max_length": 65536,
+        },
+    }
+
+
+def question_contract_authority_hash() -> str:
+    """Return the versioned authority shared by every pending question."""
+
+    payload = {
+        "question_contract_version": QUESTION_CONTRACT_VERSION,
+        "domain_context_keys": sorted(_DOMAIN_CONTEXT_KEYS),
+        "rpc_endpoint_contracts": sorted(
+            [list(item) for item in _RPC_ENDPOINT_CONTRACTS]
+        ),
+        "group_registry_hash": group_registry_contract_hash(),
+        "action_registry_hash": action_registry_contract_hash(),
+        "semantic_draft_question_template": semantic_draft_question_template(),
+        "secret_reentry_question_template": (
+            secret_reentry_question_template()
+        ),
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def semantic_draft_question_integrity_hash(
+    question: Mapping[str, Any],
+) -> str:
+    """Hash the complete durable clarification contract."""
+
+    payload = {
+        key: value
+        for key, value in question.items()
+        if key != _SEMANTIC_DRAFT_QUESTION_HASH_FIELD
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _finalize_pending_question(
+    question: dict[str, Any],
+) -> dict[str, Any]:
+    normalized = validate_pending_question_contract(
+        question,
+        require_semantic_draft_hash=False,
+    )
+    if (
+        normalized.get("semantic_draft_binding")
+        or normalized.get("secret_reentry_binding")
+    ):
+        normalized[_SEMANTIC_DRAFT_QUESTION_HASH_FIELD] = (
+            semantic_draft_question_integrity_hash(normalized)
+        )
+    return validate_pending_question_contract(normalized)
+
+
+def with_pending_question_behavior(
+    question: Mapping[str, Any],
+    *,
+    resume_action_queue: bool | None = None,
+) -> dict[str, Any]:
+    """Return a validated question after one signed behavior transition."""
+
+    normalized = validate_pending_question_contract(dict(question))
+    if resume_action_queue is not None:
+        if resume_action_queue:
+            normalized["resume_action_queue"] = True
+        else:
+            normalized.pop("resume_action_queue", None)
+    normalized.pop(_SEMANTIC_DRAFT_QUESTION_HASH_FIELD, None)
+    return _finalize_pending_question(normalized)
+
+
+def with_pending_question_created_turn(
+    question: Mapping[str, Any],
+    *,
+    created_turn_index: int,
+) -> dict[str, Any]:
+    """Bind one signed question to the turn that installs its barrier."""
+
+    normalized = validate_pending_question_contract(dict(question))
+    normalized["created_turn_index"] = int(created_turn_index)
+    if (
+        normalized.get("semantic_draft_binding")
+        or normalized.get("secret_reentry_binding")
+    ):
+        normalized.pop(_SEMANTIC_DRAFT_QUESTION_HASH_FIELD, None)
+    return _finalize_pending_question(normalized)
 
 
 def question_text(message_id: str, **arguments: Any) -> TextRef:
@@ -134,7 +295,11 @@ def _candidate_binding_contract(
     return declared
 
 
-def validate_pending_question_contract(question: dict[str, Any]) -> dict[str, Any]:
+def validate_pending_question_contract(
+    question: dict[str, Any],
+    *,
+    require_semantic_draft_hash: bool = True,
+) -> dict[str, Any]:
     """Validate one complete pending-question contract at every trust boundary."""
 
     if int(question.get("contract_version") or 0) != QUESTION_CONTRACT_VERSION:
@@ -172,7 +337,8 @@ def validate_pending_question_contract(question: dict[str, Any]) -> dict[str, An
         raise ValueError(f"pending question has unknown group: {group or '<missing>'}")
     if not owner:
         raise ValueError("pending question requires an explicit owner")
-    if owner not in set(GROUP_OWNER.values()):
+    allowed_owners = {*GROUP_OWNER.values(), "coordinator"}
+    if owner not in allowed_owners:
         raise ValueError(f"pending question has unknown owner: {owner!r}")
     domain_context = question.get("domain_context") or {}
     if not isinstance(domain_context, dict):
@@ -210,6 +376,97 @@ def validate_pending_question_contract(question: dict[str, Any]) -> dict[str, An
     elif endpoint_role or config_field:
         raise ValueError(
             "endpoint_role and config_field require contract_type=rpc_endpoint"
+        )
+    semantic_draft_binding = question.get("semantic_draft_binding") or {}
+    if not isinstance(semantic_draft_binding, dict):
+        raise ValueError("semantic_draft_binding must be an object")
+    secret_reentry_binding = question.get("secret_reentry_binding") or {}
+    if not isinstance(secret_reentry_binding, dict):
+        raise ValueError("secret_reentry_binding must be an object")
+    if semantic_draft_binding and secret_reentry_binding:
+        raise ValueError(
+            "pending question cannot bind clarification and secret re-entry"
+        )
+    expected_sensitive_input = bool(
+        secret_reentry_binding
+        or semantic_draft_binding.get("sensitive_input") is True
+        or is_sensitive_question(
+            group,
+            question.get("id"),
+            question.get("field"),
+        )
+    )
+    if (question.get("sensitive_input") is True) != expected_sensitive_input:
+        raise ValueError(
+            "pending question sensitivity conflicts with the group registry"
+        )
+    if semantic_draft_binding:
+        if owner != "coordinator":
+            raise ValueError(
+                "semantic draft clarification requires coordinator ownership"
+            )
+        if set(semantic_draft_binding) != {
+            "draft_id",
+            "revision",
+            "atom_id",
+            "sensitive_input",
+        }:
+            raise ValueError("semantic_draft_binding has an invalid contract")
+        if (
+            not str(semantic_draft_binding.get("draft_id") or "")
+            or int(semantic_draft_binding.get("revision") or 0) < 1
+            or not str(semantic_draft_binding.get("atom_id") or "")
+            or not isinstance(
+                semantic_draft_binding.get("sensitive_input"),
+                bool,
+            )
+        ):
+            raise ValueError("semantic_draft_binding requires exact identities")
+        question_hash = str(
+            question.get(_SEMANTIC_DRAFT_QUESTION_HASH_FIELD) or ""
+        )
+        if question_hash and (
+            len(question_hash) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in question_hash
+            )
+            or question_hash
+            != semantic_draft_question_integrity_hash(question)
+        ):
+            raise ValueError(
+                "semantic draft question integrity hash is invalid"
+            )
+        if require_semantic_draft_hash and not question_hash:
+            raise ValueError(
+                "semantic draft question integrity hash is missing"
+            )
+    elif secret_reentry_binding:
+        if owner != "coordinator":
+            raise ValueError(
+                "semantic secret re-entry requires coordinator ownership"
+            )
+        secret_reentry_binding = normalize_secret_reentry_binding(
+            secret_reentry_binding
+        )
+        question_hash = str(
+            question.get(_SEMANTIC_DRAFT_QUESTION_HASH_FIELD) or ""
+        )
+        if question_hash and (
+            not re.fullmatch(r"[0-9a-f]{64}", question_hash)
+            or question_hash
+            != semantic_draft_question_integrity_hash(question)
+        ):
+            raise ValueError(
+                "semantic secret re-entry question integrity hash is invalid"
+            )
+        if require_semantic_draft_hash and not question_hash:
+            raise ValueError(
+                "semantic secret re-entry question integrity hash is missing"
+            )
+    elif question.get(_SEMANTIC_DRAFT_QUESTION_HASH_FIELD):
+        raise ValueError(
+            "semantic draft question hash requires a draft binding"
         )
     candidate_bindings = tuple(
         dict(value)
@@ -293,6 +550,10 @@ def validate_pending_question_contract(question: dict[str, Any]) -> dict[str, An
         normalized["completion_effect_ref"] = completion_effect_ref
     normalized["owner"] = owner
     normalized["domain_context"] = dict(domain_context)
+    if semantic_draft_binding:
+        normalized["semantic_draft_binding"] = dict(semantic_draft_binding)
+    if secret_reentry_binding:
+        normalized["secret_reentry_binding"] = dict(secret_reentry_binding)
     options = list(question.get("options") or [])
     if options and question.get("manual_input_allowed") is not True:
         value_domain = "closed_options"
@@ -340,6 +601,8 @@ def manual_question(
     structured_input_owner: bool = False,
     structured_config_key: str = "",
     candidate_bindings: tuple[dict[str, Any], ...] = (),
+    semantic_draft_binding: dict[str, Any] | None = None,
+    secret_reentry_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(prompt, TextRef):
         raise TypeError("manual_question prompt must be a TextRef")
@@ -361,7 +624,12 @@ def manual_question(
         str(binding["type"]) for binding in declared_bindings
     }
     structured_key = str(structured_config_key or "").strip()
-    return validate_pending_question_contract({
+    sensitive_input = bool(
+        secret_reentry_binding
+        or (semantic_draft_binding or {}).get("sensitive_input") is True
+        or is_sensitive_question(group, question_id, field)
+    )
+    return _finalize_pending_question({
         "contract_version": QUESTION_CONTRACT_VERSION,
         "id": question_id,
         "group": group,
@@ -370,6 +638,7 @@ def manual_question(
         "prompt_ref": text_ref_to_dict(prompt),
         "field": field,
         "manual_input_allowed": True,
+        "sensitive_input": sensitive_input,
         **({"structured_input_owner": True} if structured_input_owner else {}),
         **({"structured_config_key": structured_key} if structured_key else {}),
         **({"candidate_bindings": declared_bindings} if declared_bindings else {}),
@@ -392,6 +661,16 @@ def manual_question(
         "validation": field_validation,
         "requires_capabilities": list(requires_capabilities),
         "domain_context": dict(domain_context or {}),
+        **(
+            {"semantic_draft_binding": dict(semantic_draft_binding)}
+            if semantic_draft_binding
+            else {}
+        ),
+        **(
+            {"secret_reentry_binding": dict(secret_reentry_binding)}
+            if secret_reentry_binding
+            else {}
+        ),
         **(
             {"help_ref": _optional_text_ref(help_text, field="help_text")}
             if help_text is not None
@@ -439,6 +718,7 @@ def choice_question(
     rejection_evidence_value: Any = None,
     structured_config_key: str = "",
     candidate_bindings: tuple[dict[str, Any], ...] = (),
+    semantic_draft_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(prompt, TextRef):
         raise TypeError("choice_question prompt must be a TextRef")
@@ -461,6 +741,11 @@ def choice_question(
     structured_key = str(structured_config_key or "").strip()
     if structured_key and not manual_input_allowed:
         raise ValueError("structured_config_key requires manual_input_allowed")
+    sensitive_input = bool(
+        (semantic_draft_binding or {}).get("sensitive_input") is True
+        or
+        is_sensitive_question(group, question_id, field)
+    )
     contracts: list[OptionContract] = []
     rendered: list[dict[str, Any]] = []
     for index, raw in enumerate(options, start=1):
@@ -553,7 +838,7 @@ def choice_question(
         help_text=help_text,
         completion_effect=completion_effect,
     )
-    return validate_pending_question_contract({
+    return _finalize_pending_question({
         "contract_version": QUESTION_CONTRACT_VERSION,
         "id": question_id,
         "group": group,
@@ -562,6 +847,7 @@ def choice_question(
         "prompt_ref": text_ref_to_dict(prompt),
         "field": field,
         "manual_input_allowed": manual_input_allowed,
+        "sensitive_input": sensitive_input,
         **({"structured_config_key": structured_key} if structured_key else {}),
         **({"candidate_bindings": declared_bindings} if declared_bindings else {}),
         "options": rendered,
@@ -586,6 +872,11 @@ def choice_question(
         "validation": _question_validation(kind, validation),
         "requires_capabilities": list(requires_capabilities),
         "domain_context": dict(domain_context or {}),
+        **(
+            {"semantic_draft_binding": dict(semantic_draft_binding)}
+            if semantic_draft_binding
+            else {}
+        ),
         **(
             {"help_ref": _optional_text_ref(help_text, field="help_text")}
             if help_text is not None
@@ -769,6 +1060,48 @@ def value_satisfies_pending_contract(value: Any, question: dict[str, Any]) -> bo
     return answer_fits_pending(raw, question)
 
 
+def action_settles_pending_contract(
+    action: Mapping[str, Any],
+    question: Mapping[str, Any],
+) -> bool:
+    """Return whether one typed action is the declared resolution of a question."""
+
+    action_type = str(action.get("type") or "").strip()
+    if action_type == "answer_pending":
+        return True
+    candidates: list[dict[str, Any]] = []
+    manual = question.get("manual_action")
+    if isinstance(manual, Mapping):
+        candidates.append(dict(manual))
+    candidates.extend(
+        dict(option_action)
+        for option in question.get("options") or []
+        if isinstance(option, Mapping)
+        and isinstance((option_action := option.get("action")), Mapping)
+    )
+    if not candidates:
+        return action_type in {
+            str(item).strip()
+            for item in question.get("accepted_action_types") or []
+            if str(item).strip()
+        }
+    for candidate in candidates:
+        if str(candidate.get("type") or "").strip() != action_type:
+            continue
+        value_argument = str(candidate.get("value_argument") or "").strip()
+        fixed = {
+            str(key): value
+            for key, value in candidate.items()
+            if key not in {"type", "value_argument"}
+        }
+        if not all(action.get(key) == value for key, value in fixed.items()):
+            continue
+        if value_argument and value_argument not in action:
+            continue
+        return True
+    return False
+
+
 def pending_value_identity(value: Any, question: dict[str, Any]) -> str:
     """Return one contract-owned identity for an already valid value."""
 
@@ -848,6 +1181,29 @@ def typed_pending_value_candidates(
     if literal_matches_validation(literal, validation):
         return (literal,)
     return ()
+
+
+def pending_manual_value_is_bounded_semantic(
+    question: Mapping[str, Any],
+) -> bool:
+    """Return whether syntax alone gives a manual value one unambiguous meaning.
+
+    Free-form scalar tokens can also express navigation, consultation, or a
+    cross-group mutation. They therefore require the hierarchical planner even
+    when they happen to satisfy the active field's lexical validation.
+    """
+
+    if question.get("manual_input_allowed") is not True:
+        return False
+    validation = dict(question.get("validation") or {})
+    if str(validation.get("input_mode") or "") == "rpc_weights":
+        return True
+    return str(validation.get("value_type") or "") in {
+        "positive_number",
+        "positive_integer",
+        "json",
+        "url",
+    }
 
 
 def pending_contract_allows_semantic_scalar_normalization(

@@ -24,6 +24,7 @@ if str(REPO_ROOT) not in sys.path:
 from tests.agent_live.coverage_events import capture_coverage_events, observe_compiled_graph_turn
 from agent.harness.invariants import validate_state
 from agent.harness.questions import normalize_scalar
+from agent.harness.secret_refs import materialize_state_secret_references
 from tests.agent_live.coverage_evidence import (
     COMPILED_GRAPH_RUNNER,
     build_evidence_artifact,
@@ -158,6 +159,7 @@ def _verify_postcondition(
             raise AssertionError("manual edge has no expected field")
         path = str(expected.get("path") or f"confirmed_config.{field}")
         actual = _read_path(after, path)
+        actual = materialize_state_secret_references(actual, after)
         if "value" in expected:
             if actual != expected["value"]:
                 raise AssertionError(f"manual postcondition {path} mismatch: {actual!r}")

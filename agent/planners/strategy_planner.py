@@ -10,6 +10,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from agent.runners.private_files import atomic_write_private_text
+
 from .chain_template_requirements import inspect_chain_template
 from .config_checklist import build_configuration_checklist, missing_required_from_checklist
 from .risk import score_plan_risk
@@ -45,10 +47,10 @@ def load_json(path: str | Path) -> dict[str, Any]:
 
 
 def write_json(path: str | Path, payload: dict[str, Any]) -> None:
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
+    atomic_write_private_text(
+        path,
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+    )
 
 
 def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = None) -> dict[str, Any]:

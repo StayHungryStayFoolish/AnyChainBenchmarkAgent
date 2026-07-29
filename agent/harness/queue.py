@@ -16,6 +16,7 @@ from .action_registry import (
     pending_barrier_semantics,
     state_has_capability,
 )
+from .questions import action_settles_pending_contract
 from .state import AgentGraphState
 
 
@@ -59,18 +60,53 @@ def order_action_queue(
                 outgoing=outgoing,
             )
 
+    pending_settlers = [
+        index
+        for index, action in enumerate(actions)
+        if _action_settles_current_pending(state, action)
+    ]
+    for settler_index in pending_settlers:
+        for sibling_index, sibling in enumerate(actions):
+            if (
+                sibling_index == settler_index
+                or not _same_action_transaction(
+                    actions[settler_index],
+                    sibling,
+                )
+            ):
+                continue
+            missing = {
+                item
+                for item in requirements[settler_index]
+                if not state_has_capability(state, item)
+            }
+            if missing & providers[sibling_index]:
+                continue
+            _add_dependency(
+                settler_index,
+                sibling_index,
+                incoming=incoming,
+                outgoing=outgoing,
+            )
+
     for mutator_index, mutated_groups in enumerate(target_groups):
         if not mutated_groups or not _action_mutates_workflow(actions[mutator_index]):
             continue
-        invalidated_groups = {
-            invalidated
-            for group in mutated_groups
-            for invalidated in _group_invalidations(group)
-        }
+        invalidated_groups = _action_invalidations(actions[mutator_index])
         for consumer_index, consumer_groups in enumerate(target_groups):
             if (
                 consumer_index == mutator_index
                 or not consumer_groups
+                or (
+                    _action_settles_current_pending(
+                        state,
+                        actions[consumer_index],
+                    )
+                    and not _action_settles_current_pending(
+                        state,
+                        actions[mutator_index],
+                    )
+                )
                 or not _same_action_transaction(
                     actions[mutator_index],
                     actions[consumer_index],
@@ -184,9 +220,32 @@ def _action_mutates_workflow(action: Mapping[str, Any]) -> bool:
     )
 
 
+def _action_settles_current_pending(
+    state: AgentGraphState,
+    action: Mapping[str, Any],
+) -> bool:
+    pending = dict(state.get("pending_question") or {})
+    if not pending:
+        return False
+    return action_settles_pending_contract(action, pending)
+
+
 def _group_invalidations(group: str) -> tuple[str, ...]:
     spec = GROUP_SPEC_BY_NAME.get(group)
     return spec.invalidates if spec else ()
+
+
+def _action_invalidations(action: Mapping[str, Any]) -> set[str]:
+    spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
+    declared = set(spec.invalidates_groups if spec is not None else ())
+    return {
+        *declared,
+        *(
+            invalidated
+            for group in action_target_groups(action)
+            for invalidated in _group_invalidations(group)
+        ),
+    }
 
 
 def _transitive_group_dependencies(group: str) -> set[str]:

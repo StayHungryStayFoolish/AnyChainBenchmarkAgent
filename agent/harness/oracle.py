@@ -135,6 +135,8 @@ def _execution_status(state: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         return f"smoke_{smoke.get('status')}", {}
     if preflight.get("status"):
         return f"preflight_{preflight.get('status')}", {}
+    if preflight.get("decision") == "declined":
+        return "preflight_declined", {}
     if preflight.get("approved"):
         return "approval_recorded", {}
     pending = state.get("pending_question") or {}

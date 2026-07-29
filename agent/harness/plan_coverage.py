@@ -47,6 +47,7 @@ class PlanCoverageResult:
     unresolved_clauses: tuple[str, ...]
     rejected_action_indexes: tuple[int, ...] = ()
     incomplete_unit_ids: tuple[str, ...] = ()
+    unresolved_units: tuple[Mapping[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -180,6 +181,7 @@ def validate_plan_coverage(
     errors: list[str] = list(span_errors)
     errors.extend(_entry_intake_exclusivity_errors(action_list))
     unresolved: list[str] = []
+    unresolved_units: list[dict[str, Any]] = []
     referenced_actions: set[int] = set()
     incomplete_unit_ids: set[str] = set()
 
@@ -227,6 +229,15 @@ def validate_plan_coverage(
             if indexes:
                 errors.append(f"unresolved semantic unit has action indexes: {unit_id}")
             unresolved.append(source_text)
+            unresolved_units.append({
+                "unit_id": unit_id,
+                "clause_id": clause_id,
+                "start": start,
+                "end": end,
+                "source_text": source_text,
+                "source_path": str(raw.get("source_path") or ""),
+                "reason": str(raw.get("reason") or ""),
+            })
             continue
         if disposition == "context":
             if (
@@ -267,7 +278,7 @@ def validate_plan_coverage(
                 incomplete_unit_ids.add(unit_id)
         _validate_literal_anchors(
             unit_id,
-            source_text,
+            _structured_atom_source(raw, source_text),
             mapped_actions,
             errors,
             input_shape=expected[clause_id].input_shape,
@@ -277,6 +288,7 @@ def validate_plan_coverage(
                 and value in pending_answer_action_indexes
                 for value in indexes
             ),
+            source_path=str(raw.get("source_path") or ""),
         )
 
     for clause_id, clause in expected.items():
@@ -284,6 +296,21 @@ def validate_plan_coverage(
         if not units:
             errors.append(f"missing semantic units for {clause_id}")
             unresolved.append(clause.text)
+            continue
+        structured_paths = [
+            str(unit.get("source_path") or "").strip()
+            for unit in units
+        ]
+        if (
+            clause.input_shape == "structured"
+            and all(structured_paths)
+            and len(set(structured_paths)) == len(structured_paths)
+            and all(
+                int(unit["start"]) == 0
+                and int(unit["end"]) == len(clause.text)
+                for unit in units
+            )
+        ):
             continue
         cursor = 0
         for unit in units:
@@ -316,6 +343,7 @@ def validate_plan_coverage(
         errors=tuple(errors),
         unresolved_clauses=tuple(dict.fromkeys(unresolved)),
         incomplete_unit_ids=tuple(sorted(incomplete_unit_ids)),
+        unresolved_units=tuple(unresolved_units),
     )
 
 
@@ -398,6 +426,24 @@ def _canonicalize_semantic_units(
             errors.append(f"semantic unit has an empty source anchor in {clause_id}")
             continue
         if clause.input_shape == "structured":
+            source_paths = [
+                str(unit.get("source_path") or "").strip()
+                for unit in units
+            ]
+            if (
+                all(anchor == clause.text for anchor in anchors)
+                and all(source_paths)
+                and len(set(source_paths)) == len(source_paths)
+            ):
+                for raw_index in indexes:
+                    normalized = dict(raw_units[raw_index])
+                    normalized.update({
+                        "start": 0,
+                        "end": len(clause.text),
+                        "source_text": clause.text,
+                    })
+                    canonical[raw_index] = normalized
+                continue
             if len(units) > 1 and all(anchor == clause.text for anchor in anchors):
                 dispositions = {str(unit.get("disposition") or "").strip() for unit in units}
                 scopes = {str(unit.get("scope_constraint") or "").strip() for unit in units}
@@ -580,6 +626,7 @@ def _validate_literal_anchors(
     *,
     input_shape: str,
     allow_pending_answer: bool,
+    source_path: str = "",
 ) -> None:
     """Protect exact facts in atomic data without interpreting prose roles.
 
@@ -614,6 +661,12 @@ def _validate_literal_anchors(
     for method in _WIRE_METHOD_CANDIDATE_RE.findall(source_without_urls):
         if method == method.upper():
             continue
+        if _mapped_action_preserves_structured_intake(
+            method,
+            source_path,
+            actions,
+        ):
+            continue
         if not _mapped_action_preserves_wire_method(
             method,
             actions,
@@ -622,6 +675,58 @@ def _validate_literal_anchors(
             errors.append(
                 f"wire method {method!r} from {unit_id} is absent from its mapped actions"
             )
+
+
+def _structured_atom_source(
+    unit: Mapping[str, Any],
+    source_text: str,
+) -> str:
+    """Project one structured DemandAtom without losing its SourceClause."""
+
+    source_path = str(unit.get("source_path") or "").strip()
+    if not source_path:
+        return source_text
+    from .domains.environment import extract_structured_input_candidates
+
+    candidates = extract_structured_input_candidates(source_text) or {}
+    matching = [
+        candidate
+        for candidate in candidates.get("field_candidates") or []
+        if isinstance(candidate, Mapping)
+        and str(candidate.get("source_path") or "") == source_path
+    ]
+    if len(matching) != 1:
+        return source_text
+    return json.dumps(
+        {source_path: matching[0].get("raw_value")},
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+
+
+def _mapped_action_preserves_structured_intake(
+    token: str,
+    source_path: str,
+    actions: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Recognize a registry-declared structured action alias as control syntax."""
+
+    leaf = str(source_path or "").rsplit(".", 1)[-1].casefold()
+    if token.casefold() != leaf:
+        return False
+    from .action_registry import ACTION_BY_TYPE
+
+    for action in actions:
+        spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
+        if spec is None:
+            continue
+        for intake in spec.structured_intake:
+            if intake.alias.casefold() != leaf:
+                continue
+            if all(action.get(key) == value for key, value in intake.fixed_arguments):
+                return True
+    return False
 
 
 def _mapped_action_preserves_wire_method(

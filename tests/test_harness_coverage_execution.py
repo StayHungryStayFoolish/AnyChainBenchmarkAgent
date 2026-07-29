@@ -52,6 +52,14 @@ class HarnessCoverageExecutionTest(unittest.TestCase):
                 self.assertEqual(turn["before"]["last_user_input"], turn["input"])
                 self.assertEqual(turn["before"]["pending_question"], turn["question"])
                 self.assertEqual(turn["after"]["visible_response"], turn["response"])
+                if (
+                    edge.get("edge_type") == "manual_input"
+                    and turn["question"].get("sensitive_input")
+                ):
+                    self.assertEqual(
+                        turn["input"],
+                        "***SENSITIVE_INPUT***",
+                    )
                 self.assertTrue(turn["admitted_action"])
                 graph_returned = "compiled_graph_turn_returned" in {
                     event["event_type"] for event in artifact["event_trace"]

@@ -79,6 +79,15 @@ def _action_spec_schema(spec: ActionSpec) -> dict[str, Any]:
         "entry_intake_value_arguments": list(
             spec.entry_intake_value_arguments
         ),
+        "structured_intake": [
+            {
+                "alias": intake.alias,
+                "fixed_arguments": dict(intake.fixed_arguments),
+                "value_semantics": intake.value_semantics,
+            }
+            for intake in spec.structured_intake
+        ],
+        "invalidates_groups": list(spec.invalidates_groups),
         "incompatible_target_modes": list(spec.incompatible_target_modes),
         "required_state_path": list(spec.required_state_path),
         "required_state_values": list(spec.required_state_values),

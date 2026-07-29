@@ -277,8 +277,8 @@ class ControlPlaneResponseContractTest(unittest.TestCase):
             session_purpose="user",
         )
 
-        self.assertEqual(STATE_SCHEMA_VERSION, 18)
-        self.assertEqual(migrated["schema_version"], 18)
+        self.assertEqual(STATE_SCHEMA_VERSION, 23)
+        self.assertEqual(migrated["schema_version"], STATE_SCHEMA_VERSION)
         self.assertEqual(migrated["response_fragments"], [])
         self.assertEqual(migrated["visible_response"], [])
         self.assertEqual(migrated["turn_context"], {"text": "current user input"})

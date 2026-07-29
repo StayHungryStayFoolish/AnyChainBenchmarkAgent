@@ -82,6 +82,12 @@ MESSAGES = {
         "arguments": {"operation": "string"},
         "kinds": {"error"},
     },
+    "harness.failure.coordinator.semantic_draft_unavailable": {
+        "en": "The semantic plan draft is unavailable or no longer matches this {operation} request. No configuration was changed.",
+        "zh": "语义计划草案不存在，或已不再匹配本次 {operation} 请求。配置没有发生变化。",
+        "arguments": {"operation": "string"},
+        "kinds": {"error"},
+    },
     "harness.failure.coordinator.field_not_registered": {
         "en": "Field `{field}` is not registered for typed reconfiguration.",
         "zh": "字段 `{field}` 未注册 typed reconfiguration。",

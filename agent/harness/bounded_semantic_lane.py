@@ -24,6 +24,7 @@ from .action_registry import (
 )
 from .plan_coverage import TurnClause, segment_user_turn
 from .questions import (
+    pending_manual_value_is_bounded_semantic,
     pending_value_identity,
     typed_pending_value_candidates,
     value_satisfies_pending_contract,
@@ -60,12 +61,15 @@ _CLAUSE_VERDICTS = frozenset({"direct", "support", "unrelated"})
 _SIBLING_VERDICTS = frozenset({"none", "present", "ambiguous"})
 _ADMISSION_VERDICTS = frozenset({"accept", "reject"})
 _IDENTIFIER_CHARACTER = r"\w.-"
-_BOUNDED_RECEIPT_VERSION = 3
+_BOUNDED_RECEIPT_VERSION = 4
 _BOUNDED_ELIGIBILITY_CONTRACT = (
     "One non-empty clause; the complete stripped turn case-insensitively equals "
     "one immutable candidate matched_value; exactly one candidate identity is "
-    "eligible. All prose, context, comparisons, negation, hypotheticals, and "
-    "multi-clause input escalate to the hierarchical semantic authority."
+    "eligible. Manual values are eligible only when their declared syntax is "
+    "semantically closed; free-form scalar tokens always escalate because they "
+    "may express navigation, consultation, or another group mutation. All prose, "
+    "context, comparisons, negation, hypotheticals, and multi-clause input "
+    "escalate to the hierarchical semantic authority."
 )
 
 
@@ -201,25 +205,26 @@ def build_candidate_catalog(
                 value_identity=identity,
             ))
 
-    for value in typed_pending_value_candidates(source, pending):
-        if not value_satisfies_pending_contract(value, pending):
-            continue
-        identity = pending_value_identity(value, pending)
-        if not identity:
-            continue
-        candidates.append(_candidate(
-            source_kind="pending_manual",
-            canonical_value=value,
-            matched_value=value,
-            action_type="answer_pending",
-            action_argument="answer",
-            owner="coordinator",
-            group=str(pending.get("group") or ""),
-            source_hash=source_hash,
-            question_hash=question_hash,
-            registry_hash=registry_hash,
-            value_identity=identity,
-        ))
+    if pending_manual_value_is_bounded_semantic(pending):
+        for value in typed_pending_value_candidates(source, pending):
+            if not value_satisfies_pending_contract(value, pending):
+                continue
+            identity = pending_value_identity(value, pending)
+            if not identity:
+                continue
+            candidates.append(_candidate(
+                source_kind="pending_manual",
+                canonical_value=value,
+                matched_value=value,
+                action_type="answer_pending",
+                action_argument="answer",
+                owner="coordinator",
+                group=str(pending.get("group") or ""),
+                source_hash=source_hash,
+                question_hash=question_hash,
+                registry_hash=registry_hash,
+                value_identity=identity,
+            ))
 
     for record in registered_semantic_value_domains():
         action_type = str(record.get("action_type") or "")

@@ -15,6 +15,14 @@ from .contracts import DOMAIN_CONTROL_ROOTS, StateDelta, StatePath
 from .domains.registry import GROUP_OWNER
 from .state import AgentGraphState
 from .input_values import normalize_target_mode
+from .questions import validate_pending_question_contract
+from .semantic_drafts import (
+    semantic_action_secret_binding_hash,
+    semantic_draft_question_binding,
+    semantic_draft_uses_current_authority,
+    validate_semantic_draft_finalization_receipt_body,
+    validate_semantic_plan_draft,
+)
 
 
 class StateInvariantError(RuntimeError):
@@ -175,7 +183,154 @@ def _validate_provider_attempt_evidence(evidence: Any) -> None:
             ) from exc
 
 
+def _validate_semantic_finalization_action_sets(
+    state: AgentGraphState,
+) -> None:
+    """Prove that an in-flight finalized draft retains its complete action set."""
+
+    session_id = str(
+        (state.get("session") or {}).get("id")
+        or state.get("thread_id")
+        or ""
+    )
+    queued_ids: set[str] = set()
+    queue_receipts: list[dict[str, Any]] = []
+    for envelope in [
+        *(
+            item
+            for item in state.get("action_queue") or ()
+            if isinstance(item, Mapping)
+        ),
+        *(
+            [state.get("selected_action")]
+            if isinstance(state.get("selected_action"), Mapping)
+            and state.get("selected_action")
+            else []
+        ),
+    ]:
+        action_id = str(envelope.get("action_id") or "")
+        if action_id:
+            queued_ids.add(action_id)
+        receipt = dict(
+            (envelope.get("admission_metadata") or {}).get(
+                "semantic_draft_finalization_receipt"
+            )
+            or {}
+        )
+        if receipt:
+            expected_binding_hash = str(
+                (receipt.get("secret_binding_hashes") or {}).get(action_id)
+                or ""
+            )
+            observed_binding_hash = semantic_action_secret_binding_hash({
+                "_semantic_secret_bindings": (
+                    envelope.get("admission_metadata") or {}
+                ).get("semantic_secret_bindings")
+                or (),
+            })
+            if expected_binding_hash != observed_binding_hash:
+                raise StateInvariantError(
+                    "semantic draft finalization secret binding changed"
+                )
+            queue_receipts.append(receipt)
+
+    audit_receipts = [
+        {
+            key: value
+            for key, value in item.items()
+            if key != "event"
+        }
+        for item in state.get("audit_events") or ()
+        if isinstance(item, Mapping)
+        and str(item.get("event") or "") == "semantic_draft_finalized"
+    ]
+    receipts = [*queue_receipts, *audit_receipts]
+    by_transaction: dict[tuple[str, str], dict[str, Any]] = {}
+    for receipt in receipts:
+        try:
+            receipt = validate_semantic_draft_finalization_receipt_body(
+                receipt,
+                session_id=session_id,
+            )
+        except ValueError as exc:
+            raise StateInvariantError(str(exc)) from exc
+        key = (
+            str(receipt.get("draft_id") or ""),
+            str(receipt.get("admission_transaction_hash") or ""),
+        )
+        if not all(key):
+            raise StateInvariantError(
+                "semantic draft finalization receipt identity is incomplete"
+            )
+        existing = by_transaction.get(key)
+        if existing and existing != receipt:
+            raise StateInvariantError(
+                "semantic draft finalization receipts are inconsistent"
+            )
+        by_transaction[key] = receipt
+
+    applied_by_transaction: dict[tuple[str, str], set[str]] = {}
+    for item in state.get("audit_events") or ():
+        if (
+            not isinstance(item, Mapping)
+            or str(item.get("event") or "")
+            != "semantic_draft_finalization_action_applied"
+        ):
+            continue
+        key = (
+            str(item.get("draft_id") or ""),
+            str(item.get("admission_transaction_hash") or ""),
+        )
+        receipt = by_transaction.get(key)
+        if receipt is None or str(item.get("receipt_hash") or "") != str(
+            receipt.get("receipt_hash") or ""
+        ):
+            raise StateInvariantError(
+                "semantic draft finalization application receipt is invalid"
+            )
+        action_id = str(item.get("action_id") or "")
+        if action_id not in {
+            str(value)
+            for value in receipt.get("final_action_ids") or ()
+        }:
+            raise StateInvariantError(
+                "semantic draft finalization applied an unknown action"
+            )
+        applied_by_transaction.setdefault(key, set()).add(action_id)
+
+    for receipt in by_transaction.values():
+        key = (
+            str(receipt.get("draft_id") or ""),
+            str(receipt.get("admission_transaction_hash") or ""),
+        )
+        expected_ids = {
+            str(item)
+            for item in receipt.get("final_action_ids") or ()
+            if str(item)
+        }
+        accounted_ids = queued_ids | applied_by_transaction.get(key, set())
+        if not expected_ids <= accounted_ids:
+            raise StateInvariantError(
+                "semantic draft finalization action set is incomplete"
+            )
+
+
 def validate_state(state: AgentGraphState) -> None:
+    from .secret_refs import (
+        raw_secret_paths_in_state,
+        validate_state_secret_bindings,
+    )
+
+    try:
+        validate_state_secret_bindings(state)
+        raw_secret_paths = raw_secret_paths_in_state(state)
+        if raw_secret_paths:
+            raise ValueError(
+                "durable state contains unprojected secret material: "
+                + ", ".join(raw_secret_paths)
+            )
+    except ValueError as exc:
+        raise StateInvariantError(str(exc)) from exc
     declared_roots = (
         set(AgentGraphState.__optional_keys__)
         | set(AgentGraphState.__required_keys__)
@@ -251,34 +406,168 @@ def validate_state(state: AgentGraphState) -> None:
                 "semantic planning reached review before every owner compiled"
             )
 
+    draft = state.get("semantic_plan_draft") or {}
+    if draft:
+        try:
+            validate_semantic_plan_draft(
+                draft,
+                validate_current_authority=semantic_draft_uses_current_authority(
+                    draft
+                ),
+            )
+        except ValueError as exc:
+            raise StateInvariantError(str(exc)) from exc
+
     active_group = str(state.get("active_group") or "opening")
     if active_group not in GROUP_OWNER:
         raise StateInvariantError(f"unknown active group: {active_group}")
 
     pending = state.get("pending_question") or {}
+    if (
+        draft
+        and draft.get("status") == "awaiting_clarification"
+        and dict(pending.get("semantic_draft_binding") or {})
+        != semantic_draft_question_binding(draft)
+    ):
+        raise StateInvariantError(
+            "awaiting semantic draft has no matching pending question"
+        )
     if pending:
+        draft_binding = dict(pending.get("semantic_draft_binding") or {})
+        secret_reentry_binding = dict(
+            pending.get("secret_reentry_binding") or {}
+        )
+        if draft_binding or secret_reentry_binding:
+            try:
+                validate_pending_question_contract(dict(pending))
+            except (TypeError, ValueError) as exc:
+                raise StateInvariantError(str(exc)) from exc
+        if draft_binding:
+            if not draft or draft.get("status") != "awaiting_clarification":
+                raise StateInvariantError(
+                    "semantic draft question has no awaiting draft"
+                )
+            expected_binding = semantic_draft_question_binding(draft)
+            if draft_binding != expected_binding:
+                raise StateInvariantError(
+                    "semantic draft question binding does not match its draft"
+                )
+        if secret_reentry_binding:
+            owner_kind = str(secret_reentry_binding.get("owner_kind") or "")
+            if owner_kind == "semantic_draft":
+                if not draft or draft.get("status") != "ready_for_review":
+                    raise StateInvariantError(
+                        "semantic secret re-entry has no ready draft"
+                    )
+                durable_bindings = {
+                    (
+                        str(item.get("reference") or ""),
+                        str(item.get("atom_id") or ""),
+                        str(item.get("value_hash") or ""),
+                    )
+                    for item in (
+                        list(draft.get("source_secret_bindings") or ())
+                        + [
+                            {
+                                "reference": atom.get("resolution_ref"),
+                                "atom_id": atom.get("atom_id"),
+                                "value_hash": atom.get("resolution_hash"),
+                            }
+                            for atom in draft.get("unresolved_atoms") or ()
+                            if isinstance(atom, Mapping)
+                            and str(atom.get("resolution_ref") or "")
+                        ]
+                    )
+                    if isinstance(item, Mapping)
+                }
+                valid_binding = bool(
+                    str(secret_reentry_binding.get("scope_id") or "")
+                    == str(draft.get("draft_id") or "")
+                    and str(secret_reentry_binding.get("owner_id") or "")
+                    == str(draft.get("draft_id") or "")
+                    and int(
+                        secret_reentry_binding.get("owner_revision") or 0
+                    )
+                    == int(draft.get("revision") or 0)
+                    and (
+                        str(secret_reentry_binding.get("reference") or ""),
+                        str(secret_reentry_binding.get("atom_id") or ""),
+                        str(secret_reentry_binding.get("value_hash") or ""),
+                    )
+                    in durable_bindings
+                )
+            else:
+                binding_tuple = (
+                    str(secret_reentry_binding.get("reference") or ""),
+                    str(secret_reentry_binding.get("scope_id") or ""),
+                    str(secret_reentry_binding.get("atom_id") or ""),
+                    str(secret_reentry_binding.get("value_hash") or ""),
+                )
+                valid_binding = bool(
+                    owner_kind == "durable_state"
+                    and str(secret_reentry_binding.get("owner_id") or "")
+                    == binding_tuple[0]
+                    and int(
+                        secret_reentry_binding.get("owner_revision") or 0
+                    )
+                    == 0
+                    and binding_tuple
+                    in {
+                        (
+                            str(item.get("reference") or ""),
+                            str(item.get("scope_id") or ""),
+                            str(item.get("atom_id") or ""),
+                            str(item.get("value_hash") or ""),
+                        )
+                        for item in state.get("secret_bindings") or ()
+                        if isinstance(item, Mapping)
+                    }
+                )
+            if not valid_binding:
+                raise StateInvariantError(
+                    "secret re-entry binding does not match its owner"
+                )
         pending_group = str(pending.get("group") or "")
         pending_owner = str(pending.get("owner") or "")
         if pending_group not in GROUP_OWNER:
             raise StateInvariantError(f"pending question has unknown group: {pending_group}")
         if not pending_owner:
             raise StateInvariantError("pending question is missing its explicit owner")
-        if pending_owner not in set(GROUP_OWNER.values()):
+        if pending_owner not in {*GROUP_OWNER.values(), "coordinator"}:
             raise StateInvariantError(
                 f"pending question has unknown owner: {pending_owner!r}"
             )
-        if pending_group != active_group:
+        if (
+            (draft_binding or secret_reentry_binding)
+            and pending_owner != "coordinator"
+        ):
+            raise StateInvariantError(
+                "semantic draft question requires coordinator ownership"
+            )
+        if (
+            pending_group != active_group
+            and not draft_binding
+            and not secret_reentry_binding
+        ):
             raise StateInvariantError(
                 f"pending question owner {pending_group} differs from active group {active_group}"
             )
         invalidated = set(state.get("invalidated_groups") or [])
         group_state = (state.get("group_states") or {}).get(pending_group) or {}
-        if pending_group in invalidated and str(group_state.get("status") or "").lower() not in {
+        if (
+            not draft_binding
+            and pending_group in invalidated
+            and str(group_state.get("status") or "").lower() not in {
             "in_progress",
             "reconfiguring",
-        }:
+            }
+        ):
             raise StateInvariantError(f"pending question belongs to invalidated group: {pending_group}")
-        if str(group_state.get("status") or "").lower() in {"complete", "completed"}:
+        if (
+            not draft_binding
+            and str(group_state.get("status") or "").lower()
+            in {"complete", "completed"}
+        ):
             raise StateInvariantError(f"pending question belongs to completed group: {pending_group}")
         for capability in pending.get("requires_capabilities") or []:
             if str(capability) == "chain_identity":
@@ -314,6 +603,7 @@ def validate_state(state: AgentGraphState) -> None:
     non_empty_ids = [item for item in action_ids if item]
     if len(non_empty_ids) != len(set(non_empty_ids)):
         raise StateInvariantError("action queue contains duplicate action ids")
+    _validate_semantic_finalization_action_sets(state)
 
     selected = state.get("selected_action") or {}
     if selected:

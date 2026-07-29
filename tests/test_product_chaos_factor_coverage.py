@@ -13,6 +13,36 @@ from tests.agent_live.product_chaos_factors import (
 
 
 class ProductChaosFactorCoverageTest(unittest.TestCase):
+    def test_group_mode_feasibility_is_derived_from_product_registry(self) -> None:
+        model = build_product_factor_model()
+        forbidden = {
+            tuple(sorted(constraint.values))
+            for constraint in model.forbidden
+        }
+
+        self.assertIn(
+            tuple(sorted({
+                "workflow_mode": "fake",
+                "subject_group": "chain_auxiliary_endpoints",
+            }.items())),
+            forbidden,
+        )
+        self.assertIn(
+            tuple(sorted({
+                "workflow_mode": "sync",
+                "subject_group": "qps_profile",
+            }.items())),
+            forbidden,
+        )
+        self.assertNotIn(
+            tuple(sorted({
+                "workflow_mode": "fake",
+                "chain_case": "case1",
+                "subject_group": "endpoint_process",
+            }.items())),
+            forbidden,
+        )
+
     def test_model_contains_every_required_product_dimension(self) -> None:
         model = build_product_factor_model()
         domains = {factor.name: set(factor.values) for factor in model.factors}

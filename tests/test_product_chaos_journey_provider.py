@@ -16,7 +16,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent.harness.runtime_identity import repository_revision
-from tests.agent_live.batch_orchestrator import TimeoutPolicy, validate_frozen_manifest
+from tests.agent_live.batch_orchestrator import (
+    JourneyControllerAuthoritySnapshot,
+    TimeoutPolicy,
+    validate_frozen_manifest,
+)
 from tests.agent_live.chaos_scheduler import (
     build_journey_schedule,
     journey_schedule_payload,
@@ -27,11 +31,13 @@ from tests.agent_live.container_process_guard import (
     ContainerProcessGuard,
     validate_cleanup_receipt_artifact,
 )
+from tests.agent_live.completed_journey_batch import CompletedJourneySource
 from tests.agent_live.product_chaos_journey_provider import (
     build_product_chaos_journey_definition,
     build_product_chaos_journey_manifest,
     build_product_chaos_target_payloads,
-    convert_completed_journey_to_product_evidence as _convert_completed_journey_to_product_evidence,
+    convert_completed_journey_to_product_evidence as convert_authorized_journey_to_product_evidence,
+    _convert_journey_runtime_to_product_evidence as _convert_completed_journey_to_product_evidence,
     freeze_product_chaos_batch,
     load_frozen_product_chaos_catalog,
     main,
@@ -73,7 +79,38 @@ class ProductChaosJourneyProviderTest(unittest.TestCase):
         self.obligation = self.obligations[0]
 
     def tearDown(self) -> None:
+        for path in sorted(self.root.rglob("*"), reverse=True):
+            path.chmod(0o700 if path.is_dir() else 0o600)
         self.temp.cleanup()
+
+    def test_product_conversion_rejects_forged_completed_batch_source(
+        self,
+    ) -> None:
+        source = CompletedJourneySource(
+            runtime_root=self.root / "missing-runtime",
+            obligation_id=str(self.obligation["obligation_id"]),
+            shard_id="shard-1",
+            execution_id="execution-1",
+            controller_snapshot=JourneyControllerAuthoritySnapshot(
+                candidate_bytes=b"{}",
+                authority_bytes=b"{}",
+                bundle_digest="a" * 64,
+            ),
+            runtime_artifacts=(),
+            _authority=object(),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "completed-batch authority",
+        ):
+            convert_authorized_journey_to_product_evidence(
+                self.obligation,
+                revision=REVISION,
+                round_id="round-1",
+                source=source,
+                evidence_path=self.root / "evidence.json",
+            )
 
     def _write_catalog(self) -> Path:
         path = self.root / "catalog.json"
@@ -480,13 +517,15 @@ class ProductChaosJourneyProviderTest(unittest.TestCase):
         journey_evidence_id = content_hash(journey_payload)
         journey_evidence = {**journey_payload, "evidence_id": journey_evidence_id}
         journey_evidence["artifact_hash"] = content_hash(journey_evidence)
-        evidence_dir = runtime / "evidence"
+        evidence_dir = runtime / "journey-controller-admission"
         evidence_dir.mkdir()
-        source_evidence_path = evidence_dir / f"journey-{journey_evidence_id}.json"
+        source_evidence_path = evidence_dir / "candidate.json"
         source_evidence_path.write_text(
             json.dumps(journey_evidence),
             encoding="utf-8",
         )
+        source_evidence_path.chmod(0o400)
+        evidence_dir.chmod(0o500)
         result = {
             "schema_version": 1,
             "schedule_id": schedule.schedule_id,
@@ -516,6 +555,8 @@ class ProductChaosJourneyProviderTest(unittest.TestCase):
         result_path = runtime / "journey-result.json"
         result = json.loads(result_path.read_text(encoding="utf-8"))
         evidence_path = Path(result["evidence_path"])
+        evidence_path.parent.chmod(0o700)
+        evidence_path.chmod(0o600)
         evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
         mutate(evidence)
         unsigned = {
@@ -527,6 +568,8 @@ class ProductChaosJourneyProviderTest(unittest.TestCase):
         evidence = {**unsigned, "evidence_id": evidence_id}
         evidence["artifact_hash"] = content_hash(evidence)
         evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+        evidence_path.chmod(0o400)
+        evidence_path.parent.chmod(0o500)
         result["evidence_id"] = evidence_id
         result["turns"] = evidence["turns"]
         result_path.write_text(json.dumps(result), encoding="utf-8")
@@ -630,6 +673,12 @@ class ProductChaosJourneyProviderTest(unittest.TestCase):
             [row["seed"] for row in target_manifest["targets"]],
             [row["schedule"]["seed"] for row in manifest["definitions"]],
         )
+        self.assertTrue(all(
+            row["applicability_receipt"]["applicable"] is True
+            and row["applicability_receipt_hash"]
+            == content_hash(row["applicability_receipt"])
+            for row in target_manifest["targets"]
+        ))
         with patch(
             "tests.agent_live.product_chaos_journey_provider.freeze_batch_manifest"
         ) as freeze:
@@ -663,13 +712,17 @@ class ProductChaosJourneyProviderTest(unittest.TestCase):
             "--definitions", str(definitions_path),
             "--output-dir", str(cli_target_dir),
         ]), 0)
+
         with (
             patch.dict(os.environ, {"DEEPSEEK_API_KEY": "cli-test-secret"}),
             patch(
                 "tests.agent_live.product_chaos_journey_provider.freeze_batch_manifest"
             ) as freeze,
         ):
-            freeze.return_value = object()
+            freeze.return_value = SimpleNamespace(
+                manifest_id="frozen-manifest",
+                pty_authority_trust_root_id="frozen-trust-root",
+            )
             self.assertEqual(main([
                 "batch",
                 "--repo-root", str(self.root),
@@ -697,6 +750,64 @@ class ProductChaosJourneyProviderTest(unittest.TestCase):
             ),
         )
         self.assertNotIn("cli-test-secret", repr(freeze.call_args.kwargs))
+
+    def test_batch_recomputes_target_applicability_instead_of_trusting_manifest(
+        self,
+    ) -> None:
+        manifest = build_product_chaos_journey_manifest(
+            self.obligations,
+            revision=REVISION,
+        )
+        target_dir = self.root / "tampered-applicability-targets"
+        target_manifest_path = write_product_chaos_target_set(
+            manifest,
+            target_dir,
+        )
+        target_manifest = json.loads(
+            target_manifest_path.read_text(encoding="utf-8")
+        )
+        row = target_manifest["targets"][0]
+        row["applicability_receipt"]["applicable"] = False
+        row["applicability_receipt_hash"] = content_hash(
+            row["applicability_receipt"]
+        )
+        scenario = next(
+            item
+            for item in target_manifest["scenario_preflights"]
+            if item["scenario_id"] == row["scenario_id"]
+        )
+        row["preflight_id"] = content_hash({
+            "obligation_id": row["obligation_id"],
+            "schedule_id": row["schedule_id"],
+            "subject_group": row["subject_group"],
+            "scenario_id": row["scenario_id"],
+            "seed_receipt_hash": scenario["seed_receipt_hash"],
+            "applicability_receipt_hash": (
+                row["applicability_receipt_hash"]
+            ),
+        })
+        unsigned = {
+            key: value
+            for key, value in target_manifest.items()
+            if key != "manifest_hash"
+        }
+        target_manifest["manifest_hash"] = content_hash(unsigned)
+        target_manifest_path.write_text(
+            json.dumps(target_manifest),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "matching reachability preflight",
+        ):
+            freeze_product_chaos_batch(
+                repo_root=self.root,
+                targets_dir=target_dir,
+                manifest_path=self.root / "tampered-batch.json",
+                runtime_base=self.root / "tampered-runtime",
+                environment={"DEEPSEEK_API_KEY": "unit-test-secret"},
+            )
 
     def test_batch_fails_fast_when_required_provider_environment_is_missing(self) -> None:
         manifest = build_product_chaos_journey_manifest(
@@ -726,12 +837,12 @@ class ProductChaosJourneyProviderTest(unittest.TestCase):
             self.obligations,
             revision=REVISION,
         )
-        self.assertEqual(report["required_denominator"], 625)
+        self.assertEqual(report["required_denominator"], 732)
         self.assertEqual(
             report["by_model"],
             {
-                "anychain-agent-product-chaos": 176,
-                "anychain-agent-product-chaos-state-control": 449,
+                "anychain-agent-product-chaos": 177,
+                "anychain-agent-product-chaos-state-control": 555,
             },
         )
 

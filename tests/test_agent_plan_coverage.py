@@ -87,6 +87,54 @@ class SemanticValueRegistryContractTest(unittest.TestCase):
 
 
 class PlanCoverageTest(unittest.TestCase):
+    def test_unresolved_coverage_retains_exact_atom_identity(self) -> None:
+        from agent.harness.plan_coverage import (
+            TurnClause,
+            validate_plan_coverage,
+        )
+
+        text = "Use quick, but change the unclear setting"
+        result = validate_plan_coverage(
+            {
+                "actions": [{
+                    "type": "set_qps_mode",
+                    "qps_mode": "quick",
+                    "source_evidence": "quick",
+                }],
+                "semantic_units": [
+                    {
+                        "unit_id": "unit-1",
+                        "clause_id": "clause-1",
+                        "start": 0,
+                        "end": 9,
+                        "source_text": "Use quick",
+                        "disposition": "action",
+                        "action_indexes": [0],
+                    },
+                    {
+                        "unit_id": "unit-2",
+                        "clause_id": "clause-1",
+                        "start": 9,
+                        "end": len(text),
+                        "source_text": text[9:],
+                        "disposition": "unresolved",
+                        "action_indexes": [],
+                        "reason": "configuration target is ambiguous",
+                    },
+                ],
+            },
+            (TurnClause("clause-1", text),),
+        )
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.errors, ())
+        self.assertEqual(result.unresolved_units[0]["unit_id"], "unit-2")
+        self.assertEqual(result.unresolved_units[0]["start"], 9)
+        self.assertEqual(
+            result.unresolved_units[0]["source_text"],
+            text[9:],
+        )
+
     def test_untrusted_duplicate_source_spans_are_rejected(self) -> None:
         clauses = segment_user_turn("help")
         payload = {
@@ -1213,6 +1261,80 @@ class PlanCoverageTest(unittest.TestCase):
                         "reason": "workflow-owned RPC mode",
                     },
                 ],
+            },
+            clauses,
+        )
+
+        self.assertTrue(result.valid, result.errors)
+
+    def test_structured_demand_atoms_share_source_clause_without_span_overlap(
+        self,
+    ) -> None:
+        clauses = segment_user_turn(
+            '{"CHAIN":"Flow","CLOUD_REGION":"us-1"}'
+        )
+        source = clauses[0].text
+        result = validate_plan_coverage(
+            {
+                "actions": [
+                    {
+                        "type": "choose_chain",
+                        "chain_text": "Flow",
+                        "source_evidence": source,
+                    },
+                    {
+                        "type": "propose_config_values",
+                        "config_values": {"CLOUD_REGION": "us-1"},
+                        "source_evidence": source,
+                    },
+                ],
+                "semantic_units": [
+                    {
+                        "unit_id": "chain-atom",
+                        "clause_id": "clause-1",
+                        "source_text": source,
+                        "source_path": "CHAIN",
+                        "disposition": "action",
+                        "action_indexes": [0],
+                        "reason": "chain demand",
+                    },
+                    {
+                        "unit_id": "region-atom",
+                        "clause_id": "clause-1",
+                        "source_text": source,
+                        "source_path": "CLOUD_REGION",
+                        "disposition": "action",
+                        "action_indexes": [1],
+                        "reason": "region demand",
+                    },
+                ],
+            },
+            clauses,
+        )
+
+        self.assertTrue(result.valid, result.errors)
+
+    def test_registered_structured_intake_alias_is_not_an_rpc_method_literal(
+        self,
+    ) -> None:
+        clauses = segment_user_turn('{"custom_rpc":true}')
+        source = clauses[0].text
+        result = validate_plan_coverage(
+            {
+                "actions": [{
+                    "type": "rpc_catalog_command",
+                    "catalog_command": "enter",
+                    "source_evidence": source,
+                }],
+                "semantic_units": [{
+                    "unit_id": "custom-rpc-atom",
+                    "clause_id": "clause-1",
+                    "source_text": source,
+                    "source_path": "custom_rpc",
+                    "disposition": "action",
+                    "action_indexes": [0],
+                    "reason": "registered custom RPC intake",
+                }],
             },
             clauses,
         )

@@ -74,6 +74,33 @@ class ActionQueueOrderingTests(unittest.TestCase):
             ["change_chain", "set_rpc_mode"],
         )
 
+    def test_catalog_intake_precedes_same_transaction_workload_replacement(
+        self,
+    ) -> None:
+        state = _configured_state()
+        actions = [
+            {
+                "type": "set_rpc_mode",
+                "rpc_mode": "single",
+                "_plan_index": 0,
+                "_plan_scope": "structured-custom-rpc",
+            },
+            {
+                "type": "rpc_catalog_command",
+                "catalog_command": "enter",
+                "source_evidence": "true",
+                "_plan_index": 1,
+                "_plan_scope": "structured-custom-rpc",
+            },
+        ]
+
+        ordered = order_action_queue(state, actions)
+
+        self.assertEqual(
+            _types(ordered),
+            ["rpc_catalog_command", "set_rpc_mode"],
+        )
+
     def test_negative_independent_mutations_preserve_semantic_order(self) -> None:
         state = _configured_state()
         actions = [
@@ -219,6 +246,37 @@ class ActionQueueOrderingTests(unittest.TestCase):
         self.assertEqual(
             _types(ordered),
             ["choose_target_mode", "rpc_catalog_command"],
+        )
+
+    def test_current_pending_settlement_precedes_same_turn_sibling_mutation(self) -> None:
+        state = _configured_state()
+        state["pending_question"] = {
+            "id": "preflight_smoke_confirm",
+            "group": "preflight_smoke_execution",
+            "accepted_action_types": [
+                "approve_preflight_smoke",
+                "reject_preflight_smoke",
+            ],
+        }
+        actions = [
+            {
+                "type": "request_qps_customization",
+                "source_evidence": "change QPS",
+                "_plan_index": 0,
+                "_plan_scope": "turn-15",
+            },
+            {
+                "type": "reject_preflight_smoke",
+                "_plan_index": 1,
+                "_plan_scope": "turn-15",
+            },
+        ]
+
+        ordered = order_action_queue(state, actions)
+
+        self.assertEqual(
+            _types(ordered),
+            ["reject_preflight_smoke", "request_qps_customization"],
         )
 
 

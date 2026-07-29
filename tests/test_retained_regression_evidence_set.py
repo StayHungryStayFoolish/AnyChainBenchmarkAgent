@@ -15,7 +15,11 @@ from tests.agent_live.batch_orchestrator import (
     BATCH_MANIFEST_SCHEMA_VERSION,
     BATCH_RESULT_SCHEMA_VERSION,
 )
-from tests.agent_live.coverage_evidence import content_hash
+from tests.agent_live.coverage_evidence import (
+    content_hash,
+    create_pty_authority_signer,
+    sign_controller_payload,
+)
 from tests.agent_live.retained_regression_evidence_set import (
     EXACT_RUNNER,
     OPEN_RUNNER,
@@ -52,6 +56,7 @@ class RetainedRegressionEvidenceSetTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
+        self.authority_signer = create_pty_authority_signer()
         self.evidence_paths = self._write_evidence()
         self.exact_index = self._write_exact_index()
         self.open_manifest, self.open_result = self._write_open_batch()
@@ -73,6 +78,7 @@ class RetainedRegressionEvidenceSetTests(unittest.TestCase):
                 provider=self.provider,
                 obligations=self.obligations,
                 revision=REVISION,
+                expected_authority_trust_root_id=self.authority_signer.trust_root_id,
             )
         self.assertEqual(manifest["obligation_count"], 60)
         self.assertEqual(manifest["exact_count"], 15)
@@ -80,6 +86,17 @@ class RetainedRegressionEvidenceSetTests(unittest.TestCase):
         self.assertEqual(len(manifest["evidence"]), 60)
         self.assertFalse(manifest_path.stat().st_mode & 0o222)
         self.assertFalse(destination.stat().st_mode & 0o222)
+        with self._admission_passes(), self.assertRaisesRegex(
+            ValueError,
+            "trust root",
+        ):
+            load_retained_regression_evidence_set(
+                manifest_path,
+                provider=self.provider,
+                obligations=self.obligations,
+                revision=REVISION,
+                expected_authority_trust_root_id="wrong-root",
+            )
 
     def test_existing_destination_and_concurrent_publish_cannot_overwrite(self) -> None:
         destination = self.root / "published"
@@ -177,7 +194,7 @@ class RetainedRegressionEvidenceSetTests(unittest.TestCase):
         result = self._read(self.open_result)
         result["batch_id"] = manifest["batch_id"]
         result["manifest_id"] = manifest["manifest_id"]
-        self._rehash(result, "index_id")
+        self._rehash_batch_result(result)
         self._write(self.open_result, result, mode=0o400)
         with self._admission_passes():
             with self.assertRaisesRegex(ValueError, "shard contract"):
@@ -200,6 +217,7 @@ class RetainedRegressionEvidenceSetTests(unittest.TestCase):
                     provider=self.provider,
                     obligations=self.obligations,
                     revision=REVISION,
+                    expected_authority_trust_root_id=self.authority_signer.trust_root_id,
                 )
 
         evidence.write_text(
@@ -215,6 +233,7 @@ class RetainedRegressionEvidenceSetTests(unittest.TestCase):
                     provider=self.provider,
                     obligations=self.obligations,
                     revision=wrong_revision,
+                    expected_authority_trust_root_id=self.authority_signer.trust_root_id,
                 )
 
         manifest_path.chmod(0o600)
@@ -228,6 +247,7 @@ class RetainedRegressionEvidenceSetTests(unittest.TestCase):
                     provider=self.provider,
                     obligations=self.obligations,
                     revision=REVISION,
+                    expected_authority_trust_root_id=self.authority_signer.trust_root_id,
                 )
 
     def test_provider_and_open_result_hash_drift_fail_closed(self) -> None:
@@ -244,6 +264,7 @@ class RetainedRegressionEvidenceSetTests(unittest.TestCase):
                     open_batch_manifest_path=self.open_manifest,
                     open_batch_result_path=self.open_result,
                     evidence_paths=self.evidence_paths,
+                    expected_authority_trust_root_id=self.authority_signer.trust_root_id,
                 )
 
         result = self._read(self.open_result)
@@ -268,6 +289,7 @@ class RetainedRegressionEvidenceSetTests(unittest.TestCase):
                     provider=self.provider,
                     obligations=self.obligations,
                     revision=REVISION,
+                    expected_authority_trust_root_id=self.authority_signer.trust_root_id,
                 )
 
         extra.unlink()
@@ -283,6 +305,7 @@ class RetainedRegressionEvidenceSetTests(unittest.TestCase):
                     provider=self.provider,
                     obligations=drifted,
                     revision=REVISION,
+                    expected_authority_trust_root_id=self.authority_signer.trust_root_id,
                 )
 
     def test_interrupted_publish_never_exposes_partial_destination(self) -> None:
@@ -314,6 +337,7 @@ class RetainedRegressionEvidenceSetTests(unittest.TestCase):
             open_batch_manifest_path=self.open_manifest,
             open_batch_result_path=self.open_result,
             evidence_paths=evidence_paths or self.evidence_paths,
+            expected_authority_trust_root_id=self.authority_signer.trust_root_id,
         )
 
     def _admission_passes(self):
@@ -443,6 +467,9 @@ class RetainedRegressionEvidenceSetTests(unittest.TestCase):
             "revision": REVISION,
             "shard_count": 45,
             "worker_runtime": "linux",
+            "controller_owned_execution": True,
+            "pty_authority_trust_root_id": self.authority_signer.trust_root_id,
+            "pty_authority_public_key_b64": self.authority_signer.public_key_b64,
             "expected_obligation_set_hash": obligation_set_hash,
             "shards": shards,
         }
@@ -459,11 +486,14 @@ class RetainedRegressionEvidenceSetTests(unittest.TestCase):
             "batch_id": manifest["batch_id"],
             "manifest_id": manifest["manifest_id"],
             "revision": REVISION,
+            "execution_authority_mode": "controller_owned_v1",
             "execution_status": "discovery_complete",
             "release_status": "not_evaluated",
             "scheduled": 45,
             "started": 45,
             "completed": 45,
+            "pty_authority_trust_root_id": self.authority_signer.trust_root_id,
+            "pty_authority_public_key_b64": self.authority_signer.public_key_b64,
             "shards": [
                 {
                     "shard_id": row["shard_id"],
@@ -475,10 +505,7 @@ class RetainedRegressionEvidenceSetTests(unittest.TestCase):
         result_path = (self.root / "open-batch-result.json").resolve()
         self._write(
             result_path,
-            {
-                **result_unsigned,
-                "index_id": content_hash(result_unsigned),
-            },
+            self._signed_batch_result(result_unsigned),
             mode=0o400,
         )
         return manifest_path, result_path
@@ -554,6 +581,23 @@ class RetainedRegressionEvidenceSetTests(unittest.TestCase):
             **unsigned,
             "batch_id": payload["batch_id"],
         })
+
+    def _signed_batch_result(self, payload: dict) -> dict:
+        signature = sign_controller_payload(self.authority_signer, payload)
+        signed = {
+            **payload,
+            "controller_signature_b64": signature,
+        }
+        return {**signed, "index_id": content_hash(signed)}
+
+    def _rehash_batch_result(self, payload: dict) -> None:
+        unsigned = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"index_id", "controller_signature_b64"}
+        }
+        payload.clear()
+        payload.update(self._signed_batch_result(unsigned))
 
 
 if __name__ == "__main__":

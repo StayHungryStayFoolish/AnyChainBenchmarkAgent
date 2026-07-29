@@ -9,6 +9,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field as dataclass_field, is_dataclass
 import math
+import re
 from typing import Any, Literal, Mapping
 
 
@@ -17,7 +18,9 @@ CompletionStatus = Literal["unchanged", "in_progress", "completed", "blocked"]
 RecoveryOperation = Literal["activate", "resolve"]
 NavigationOperation = Literal["change_group", "go_back"]
 WorkflowGoalOperation = Literal["enqueue", "remove_first"]
+SemanticDraftOperation = Literal["resolve", "cancel", "previous", "invalidate"]
 ActionEffect = Literal["pure", "read_only", "external"]
+SECRET_REFERENCE_RE = re.compile(r"semantic-secret:[A-Za-z0-9_-]+")
 ActionEnvelopeStatus = Literal[
     "admitted",
     "selected",
@@ -26,12 +29,28 @@ ActionEnvelopeStatus = Literal[
     "blocked",
     "failed",
 ]
+
+
+def is_secret_reference(value: Any) -> bool:
+    """Return whether a value is exactly one opaque secret capability."""
+
+    return SECRET_REFERENCE_RE.fullmatch(str(value or "")) is not None
 AdmissionStatus = Literal["accepted", "rejected"]
 ResponseFragmentKind = Literal["message", "status", "evidence", "warning", "error"]
 ResponseArgument = str | int | float | bool | None
 FailureSeverity = Literal["info", "warning", "blocking", "critical"]
 SideEffectStatus = Literal["prepared", "invoking", "succeeded", "reused", "blocked", "failed"]
 TurnReceiptStatus = Literal["prepared", "planned", "executing", "completed", "blocked", "failed"]
+SemanticPlanDraftStatus = Literal[
+    "awaiting_clarification",
+    "ready_for_review",
+    "stale",
+    "cancelled",
+]
+SemanticUnresolvedReason = Literal[
+    "semantic_ambiguity",
+    "missing_user_evidence",
+]
 StatePath = tuple[str, ...]
 
 
@@ -150,6 +169,47 @@ class WorkflowGoalCommand:
     def __post_init__(self) -> None:
         if self.operation == "change_group" and not self.target_group:
             raise ValueError("change_group navigation requires target_group")
+
+
+@dataclass(frozen=True)
+class SemanticDraftCommand:
+    """Mutate only the coordinator-owned semantic draft."""
+
+    operation: SemanticDraftOperation
+    draft_id: str
+    revision: int
+    atom_id: str = ""
+    resolution: str = ""
+    resolution_hash: str = ""
+    resolution_ref: str = ""
+    reason: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.draft_id or self.revision < 1:
+            raise ValueError("semantic draft command requires bound identity")
+        if self.operation == "resolve" and (
+            not self.atom_id or not self.resolution.strip()
+        ):
+            raise ValueError("resolve semantic draft command requires atom and value")
+        if self.operation == "resolve" and (
+            len(self.resolution_hash) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.resolution_hash
+            )
+        ):
+            raise ValueError(
+                "resolve semantic draft command requires a value hash"
+            )
+        if self.resolution_ref and (
+            not is_secret_reference(self.resolution_ref)
+            or "***REDACTED***" not in self.resolution
+        ):
+            raise ValueError(
+                "semantic draft secret resolution reference is invalid"
+            )
+        if self.operation == "previous" and not self.atom_id:
+            raise ValueError("previous semantic draft command requires atom")
 
 
 def _diff_mapping(
@@ -399,6 +459,7 @@ class HandlerResult:
     navigation_command: NavigationCommand | None = None
     field_reconfiguration_command: FieldReconfigurationCommand | None = None
     workflow_goal_command: WorkflowGoalCommand | None = None
+    semantic_draft_command: SemanticDraftCommand | None = None
     completion: CompletionStatus = "unchanged"
     blocker: FailureDescriptor | None = None
     stop_after_response: bool = False
@@ -510,6 +571,97 @@ class TurnReceipt:
     pending_after: Mapping[str, Any] = dataclass_field(default_factory=dict)
     response_count: int = 0
     status: TurnReceiptStatus = "prepared"
+
+
+@dataclass(frozen=True)
+class SemanticDraftCandidate:
+    """One validated but deliberately non-admitted draft action."""
+
+    candidate_id: str
+    source_atom_ids: tuple[str, ...]
+    owner: str
+    group: str
+    action: Mapping[str, Any]
+    validation_hash: str
+    contract_hashes: Mapping[str, str] = dataclass_field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SemanticUnresolvedAtom:
+    """One exact semantic atom that requires user clarification."""
+
+    atom_id: str
+    unit_id: str
+    clause_id: str
+    source_text: str
+    source_path: str
+    semantic_source: str
+    owner: str
+    group: str
+    sensitive_input: bool
+    reason: SemanticUnresolvedReason
+    reason_detail: str
+    resolution: str = ""
+    resolution_hash: str = ""
+    resolution_ref: str = ""
+
+
+@dataclass(frozen=True)
+class SemanticPlanDraft:
+    """Durable coordinator-owned plan that has not crossed admission."""
+
+    draft_id: str
+    revision: int
+    status: SemanticPlanDraftStatus
+    session_id: str
+    creation_turn: int
+    source_product_authority_id: str
+    source_checkpoint_revision: int
+    source_checkpoint_thread_id: str
+    source_checkpoint_id: str
+    source_schema_version: int
+    source_checkpoint_fingerprint: str
+    original_input: str
+    original_input_hash: str
+    source_clauses: tuple[Mapping[str, Any], ...]
+    source_partition: tuple[Mapping[str, Any], ...]
+    source_partition_hash: str
+    source_active_group: str
+    source_pending_question: Mapping[str, Any]
+    source_secret_bindings: tuple[Mapping[str, str], ...]
+    candidates: tuple[SemanticDraftCandidate, ...]
+    unresolved_atoms: tuple[SemanticUnresolvedAtom, ...]
+    active_atom_id: str
+    registry_hash: str
+    action_registry_hash: str
+    pending_contract_hash: str
+    pending_authority_hash: str
+    workflow_precondition_hash: str
+    lifecycle_receipts: tuple[Mapping[str, Any], ...] = ()
+
+
+@dataclass(frozen=True)
+class SemanticDraftFinalizationReceipt:
+    """Proof binding a resolved draft to its later admission transaction."""
+
+    draft_id: str
+    draft_revision: int
+    session_id: str
+    source_product_authority_id: str
+    source_checkpoint_revision: int
+    source_checkpoint_thread_id: str
+    source_checkpoint_id: str
+    source_checkpoint_fingerprint: str
+    source_partition_hash: str
+    candidate_ids: tuple[str, ...]
+    candidate_convergence_hash: str
+    secret_binding_manifest_hash: str
+    secret_binding_hashes: Mapping[str, str]
+    resolution_hash: str
+    final_plan_hash: str
+    admission_transaction_hash: str
+    final_action_ids: tuple[str, ...]
+    receipt_hash: str
 
 
 def action_envelope_to_dict(envelope: ActionEnvelope) -> dict[str, Any]:
@@ -700,6 +852,20 @@ def handler_result_to_dict(result: HandlerResult) -> dict[str, Any]:
             if result.workflow_goal_command
             else None
         ),
+        "semantic_draft_command": (
+            {
+                "operation": result.semantic_draft_command.operation,
+                "draft_id": result.semantic_draft_command.draft_id,
+                "revision": result.semantic_draft_command.revision,
+                "atom_id": result.semantic_draft_command.atom_id,
+                "resolution": result.semantic_draft_command.resolution,
+                "resolution_hash": result.semantic_draft_command.resolution_hash,
+                "resolution_ref": result.semantic_draft_command.resolution_ref,
+                "reason": result.semantic_draft_command.reason,
+            }
+            if result.semantic_draft_command
+            else None
+        ),
         "completion": result.completion,
         "blocker": (
             failure_descriptor_to_dict(result.blocker) if result.blocker else None
@@ -728,6 +894,7 @@ def handler_result_from_dict(payload: Mapping[str, Any]) -> HandlerResult:
     navigation = payload.get("navigation_command")
     field_reconfiguration = payload.get("field_reconfiguration_command")
     workflow_goal = payload.get("workflow_goal_command")
+    semantic_draft = payload.get("semantic_draft_command")
     raw_response_fragments = tuple(payload.get("response_fragments") or ())
     if not all(isinstance(item, Mapping) for item in raw_response_fragments):
         raise TypeError("handler result response_fragments must contain mappings")
@@ -798,6 +965,24 @@ def handler_result_from_dict(payload: Mapping[str, Any]) -> HandlerResult:
                 goal=deepcopy(dict(workflow_goal.get("goal") or {})),
             )
             if isinstance(workflow_goal, Mapping)
+            else None
+        ),
+        semantic_draft_command=(
+            SemanticDraftCommand(
+                operation=str(semantic_draft.get("operation") or ""),  # type: ignore[arg-type]
+                draft_id=str(semantic_draft.get("draft_id") or ""),
+                revision=int(semantic_draft.get("revision") or 0),
+                atom_id=str(semantic_draft.get("atom_id") or ""),
+                resolution=str(semantic_draft.get("resolution") or ""),
+                resolution_hash=str(
+                    semantic_draft.get("resolution_hash") or ""
+                ),
+                resolution_ref=str(
+                    semantic_draft.get("resolution_ref") or ""
+                ),
+                reason=str(semantic_draft.get("reason") or ""),
+            )
+            if isinstance(semantic_draft, Mapping)
             else None
         ),
         completion=str(payload.get("completion") or "unchanged"),  # type: ignore[arg-type]

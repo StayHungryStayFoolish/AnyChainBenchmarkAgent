@@ -42,14 +42,41 @@ from .failures import build_failure_record
 from .invariants import StateInvariantError, validate_state
 from .domains.recovery import question_for_recovery
 from .response import finalize_turn_response, reset_turn_response
+from .questions import (
+    answer_fits_pending,
+    coerce_pending_answer,
+    exact_option_answer,
+    typed_pending_value_candidates,
+)
 from .runtime_identity import repository_revision
+from .secret_refs import (
+    all_owned_secret_references,
+    discard_secret_reference,
+    discard_draft_secret_references,
+    discard_state_secret_references,
+    project_secret_input,
+    reconcile_state_secret_bindings,
+    release_unowned_input_secret_bindings,
+    SecretRegistryTransaction,
+    secret_registry_transaction,
+)
+from .semantic_drafts import mark_semantic_plan_draft_stale
 from .terminal_protocol import (
     append_jsonl_record,
     claim_jsonl_authority,
     quarantine_jsonl_file,
     read_jsonl_records,
 )
-from .state import AgentGraphState, RESET_PRESERVED_KEYS, ensure_session_metadata, migrate_state, new_state, project_checkpoint_state
+from .state import (
+    AgentGraphState,
+    RESET_PRESERVED_KEYS,
+    ensure_session_metadata,
+    has_incomplete_semantic_finalization,
+    migrate_state,
+    new_state,
+    project_checkpoint_state,
+    quarantine_inflight_semantic_finalization,
+)
 from .turn_transactions import (
     ProductAuthorityLease,
     ProductHead,
@@ -65,6 +92,66 @@ _EXECUTION_APPROVAL_QUESTIONS = frozenset({
     "real_node_smoke_confirm",
     "real_node_final_benchmark_confirm",
 })
+
+
+def project_turn_input(
+    state: Mapping[str, Any],
+    text: str,
+    *,
+    scope_id: str,
+) -> tuple[str, tuple[dict[str, str], ...]]:
+    """Project one user turn using the active signed question contract."""
+
+    pending = dict(state.get("pending_question") or {})
+    sensitive = bool(
+        pending.get("sensitive_input")
+        or pending.get("secret_reentry_binding")
+    )
+    option_matched, _option_value = exact_option_answer(text, pending)
+    if not sensitive or option_matched:
+        return project_secret_input(
+            str(text),
+            scope_id=scope_id,
+            force_secret=False,
+        )
+    if pending.get("secret_reentry_binding"):
+        return project_secret_input(
+            str(text),
+            scope_id=scope_id,
+            force_secret=True,
+        )
+    if answer_fits_pending(str(text), pending):
+        return project_secret_input(
+            str(coerce_pending_answer(str(text), pending)),
+            scope_id=scope_id,
+            force_secret=True,
+        )
+
+    candidates = typed_pending_value_candidates(str(text), pending)
+    if candidates:
+        projected = str(text)
+        bindings: list[dict[str, str]] = []
+        for index, candidate in enumerate(candidates, start=1):
+            reference, candidate_bindings = project_secret_input(
+                candidate,
+                scope_id=f"{scope_id}:candidate:{index}",
+                force_secret=True,
+            )
+            projected = projected.replace(candidate, reference)
+            bindings.extend(dict(item) for item in candidate_bindings)
+        return projected, tuple(bindings)
+
+    projected, bindings = project_secret_input(
+        str(text),
+        scope_id=scope_id,
+        force_secret=False,
+    )
+    if bindings:
+        return projected, bindings
+    # Compound prose with no deterministic value candidate remains semantic
+    # input. Bare scalar answers were already projected above, while explicit
+    # credentials in prose/JSON were projected by the lexical secret boundary.
+    return projected, ()
 _EXECUTION_APPROVAL_ACTIONS = frozenset({
     "approve_preflight_smoke",
     "approve_final_benchmark",
@@ -81,6 +168,8 @@ class AnyChainGraphRuntime:
         checkpointer: Any | None = None,
         session_purpose: str = "user",
     ) -> None:
+        self._closed = False
+        self._owned_secret_references: set[str] = set()
         self.thread_id = thread_id
         self.session_purpose = session_purpose or "user"
         self.transaction_authority_id = product_authority_id(
@@ -101,10 +190,48 @@ class AnyChainGraphRuntime:
             self._recover_interrupted_attempts()
             self._recover_missing_runtime_observations()
         except BaseException:
-            self.close()
+            try:
+                self.close()
+            except BaseException:
+                pass
             raise
 
     def close(self) -> None:
+        if getattr(self, "_closed", False):
+            return
+        references = set(
+            getattr(self, "_owned_secret_references", set())
+        )
+        graph = getattr(self, "graph", None)
+        if graph is not None:
+            try:
+                transaction_store = getattr(self, "turn_transactions", None)
+                head = (
+                    transaction_store.get_product_head(
+                        self.transaction_authority_id
+                    )
+                    if transaction_store is not None
+                    else None
+                )
+                if head is not None:
+                    snapshot = graph.get_state({
+                        "configurable": {
+                            "thread_id": head.checkpoint_thread_id,
+                            "checkpoint_ns": "",
+                            "checkpoint_id": head.checkpoint_id,
+                        }
+                    })
+                    references.update(all_owned_secret_references(
+                        dict(getattr(snapshot, "values", None) or {})
+                    ))
+            except BaseException as exc:
+                if not references:
+                    raise RuntimeError(
+                        "secret cleanup could not read Product Head state"
+                    ) from exc
+        for reference in references:
+            discard_secret_reference(reference)
+        self._owned_secret_references.clear()
         lease = getattr(self, "authority_lease", None)
         if lease is not None:
             lease.close()
@@ -112,6 +239,15 @@ class AnyChainGraphRuntime:
         if manager is not None:
             manager.__exit__(None, None, None)
             delattr(self.checkpointer, "_anychain_context_manager")
+        self._closed = True
+
+    def _remember_owned_secret_references(
+        self,
+        state: Mapping[str, Any],
+    ) -> None:
+        self._owned_secret_references.update(
+            all_owned_secret_references(state)
+        )
 
     @property
     def last_terminal_outcome(self) -> TerminalOutcome | None:
@@ -254,9 +390,36 @@ class AnyChainGraphRuntime:
             pass
 
     def invoke(self, text: str, language: str = "en", context: dict[str, Any] | None = None) -> AgentGraphState:
-        state = self._load_state(language=language)
+        state = self._load_state_transactionally(language=language)
+        with secret_registry_transaction() as transaction:
+            return self._invoke_product_turn(
+                text,
+                language,
+                context,
+                state=state,
+                registry_transaction=transaction,
+            )
+
+    def _invoke_product_turn(
+        self,
+        text: str,
+        language: str,
+        context: dict[str, Any] | None,
+        *,
+        state: AgentGraphState,
+        registry_transaction: SecretRegistryTransaction,
+    ) -> AgentGraphState:
         before = deepcopy(state)
-        state["last_user_input"] = text
+        input_scope = (
+            f"turn:{self.transaction_authority_id}:"
+            f"{int(state.get('turn_index') or 0) + 1}"
+        )
+        safe_text, input_secret_bindings = project_turn_input(
+            state,
+            text,
+            scope_id=input_scope,
+        )
+        state["last_user_input"] = safe_text
         state["language"] = language
         invocation_context: InvocationContext = {
             key: deepcopy((context or {}).get(key) or {})
@@ -275,8 +438,16 @@ class AnyChainGraphRuntime:
         # clear the field for user turns so a checkpointer/runtime cannot carry
         # a prior startup command into the next graph invocation.
         invocation_context["runtime_action"] = {}
+        invocation_context["input_secret_bindings"] = {
+            "items": [dict(item) for item in input_secret_bindings],
+        }
         state = ensure_session_metadata(state, self.thread_id, self.session_purpose)
         attempt = self._begin_turn_attempt(before)
+        self._bind_registry_to_attempt(registry_transaction, attempt)
+        invocation_context["product_head"] = _attempt_product_head_context(
+            self.transaction_authority_id,
+            attempt,
+        )
         config = {"configurable": {"thread_id": attempt.physical_thread_id}}
         with llm_turn_scope(load_llm_config().turn_timeout_seconds):
             ensure_turn_active()
@@ -295,14 +466,28 @@ class AnyChainGraphRuntime:
                     int(before.get("turn_index") or 0) + 1,
                 )
                 if self._attempt_effect_evidence(attempt)[0]:
+                    release_unowned_input_secret_bindings(
+                        input_secret_bindings,
+                        before,
+                    )
                     self._finish_failed_turn_attempt(attempt, exc)
                     raise
-                recovered = self._recover_invariant_failure(
-                    before,
-                    candidate,
-                    exc,
-                    attempt,
-                )
+                try:
+                    recovered = self._recover_invariant_failure(
+                        before,
+                        candidate,
+                        exc,
+                        attempt,
+                        registry_transaction=registry_transaction,
+                        input_secret_bindings=input_secret_bindings,
+                    )
+                except BaseException as recovery_exc:
+                    self._terminalize_failed_attempt_once(
+                        attempt,
+                        recovery_exc,
+                    )
+                    raise
+                self._remember_owned_secret_references(recovered)
                 self._write_turn_observation(
                     "turn_recovered",
                     before,
@@ -311,17 +496,30 @@ class AnyChainGraphRuntime:
                 )
                 return recovered
             except BaseException as exc:
+                release_unowned_input_secret_bindings(
+                    input_secret_bindings,
+                    before,
+                )
                 self._finish_failed_turn_attempt(attempt, exc)
                 raise
             persisted = dict(result)
             try:
+                release_unowned_input_secret_bindings(
+                    input_secret_bindings,
+                    persisted,
+                )
+                registry_transaction.prepare()
+                registry_transaction.publish_prepared()
                 self._last_terminal_outcome = self._commit_turn_attempt(
                     attempt,
                     persisted,
                 )
+                registry_transaction.mark_product_head_committed()
+                registry_transaction.finalize()
             except BaseException as exc:
                 self._terminalize_failed_attempt_once(attempt, exc)
                 raise
+            self._remember_owned_secret_references(persisted)
             self._write_turn_observation(
                 "turn_committed",
                 before,
@@ -336,6 +534,9 @@ class AnyChainGraphRuntime:
         candidate_state: AgentGraphState,
         exc: StateInvariantError,
         attempt: TurnAttempt,
+        *,
+        registry_transaction: SecretRegistryTransaction,
+        input_secret_bindings: tuple[Mapping[str, str], ...],
     ) -> AgentGraphState:
         """Commit typed recovery on the original physical attempt."""
 
@@ -346,7 +547,17 @@ class AnyChainGraphRuntime:
             facts=[{"code": "HARNESS_INVARIANT_FAILED", "source": "harness", "detail": str(exc)}],
             confirmed_config=candidate_state.get("confirmed_config") or {},
         )
-        recovered: AgentGraphState = deepcopy(base_state)
+        if has_incomplete_semantic_finalization(base_state):
+            discard_state_secret_references(base_state)
+            recovered = quarantine_inflight_semantic_finalization(
+                base_state,
+                thread_id=self.thread_id,
+                language=str(base_state.get("language") or "en"),
+                session_purpose=self.session_purpose,
+                error_type="InvariantFailureDuringSemanticFinalization",
+            )
+        else:
+            recovered = deepcopy(base_state)
         recovered["turn_index"] = max(
             int(candidate_state.get("turn_index") or 0),
             int(base_state.get("turn_index") or 0) + 1,
@@ -357,12 +568,29 @@ class AnyChainGraphRuntime:
         recovered["pending_domain_result"] = {}
         recovered["side_effect_intent"] = {}
         recovered["side_effect_receipt"] = {}
+        draft = dict(recovered.get("semantic_plan_draft") or {})
+        if draft.get("status") in {
+            "awaiting_clarification",
+            "ready_for_review",
+        }:
+            discard_draft_secret_references(draft)
+            recovered["semantic_plan_draft"] = mark_semantic_plan_draft_stale(
+                draft,
+                reasons=("harness_invariant_recovery",),
+            )
+            recovered.setdefault("audit_events", []).append({
+                "event": "semantic_draft_invalidated",
+                "draft_id": str(draft.get("draft_id") or ""),
+                "revision": int(draft.get("revision") or 0),
+                "reasons": ["harness_invariant_recovery"],
+            })
         recovered["failure_recovery"] = {"status": "pending", "record": record}
         recovered["active_group"] = "failure_recovery"
         recovered["control"] = {}
         recovered["pending_question"] = (
             question_for_recovery(recovered, "failure_recovery") or {}
         )
+        reconcile_state_secret_bindings(recovered)
         reset_turn_response(recovered)
         recovered = finalize_turn_response(recovered)
         validate_state(recovered)
@@ -374,15 +602,36 @@ class AnyChainGraphRuntime:
         snapshot = self.graph.get_state(config)
         persisted = dict(getattr(snapshot, "values", None) or {})
         validate_state(persisted)
+        release_unowned_input_secret_bindings(
+            input_secret_bindings,
+            persisted,
+        )
+        registry_transaction.prepare()
+        registry_transaction.publish_prepared()
         self._last_terminal_outcome = self._commit_turn_attempt(
             attempt,
             persisted,
             snapshot=snapshot,
         )
+        registry_transaction.mark_product_head_committed()
+        registry_transaction.finalize()
         return persisted
 
     def snapshot(self) -> AgentGraphState:
-        return self._load_state(language="en")
+        return self._load_state_transactionally(language="en")
+
+    def _load_state_transactionally(self, language: str) -> AgentGraphState:
+        """Load and migrate one Product Head in its own registry transaction."""
+
+        with secret_registry_transaction() as transaction:
+            state = self._load_state(
+                language=language,
+                registry_transaction=transaction,
+            )
+            if not transaction.committed:
+                transaction.prepare()
+                transaction.commit()
+            return state
 
     def prepare_resume_offer(self, language: str) -> AgentGraphState:
         return self._invoke_runtime_action(
@@ -428,7 +677,25 @@ class AnyChainGraphRuntime:
     ) -> AgentGraphState:
         """Run one trusted terminal command through the product graph."""
 
-        state = self._load_state(language=language)
+        state = self._load_state_transactionally(language=language)
+        with secret_registry_transaction() as transaction:
+            return self._invoke_runtime_action_transaction(
+                action,
+                language=language,
+                observation=observation,
+                state=state,
+                registry_transaction=transaction,
+            )
+
+    def _invoke_runtime_action_transaction(
+        self,
+        action: Mapping[str, Any],
+        *,
+        language: str,
+        observation: str,
+        state: AgentGraphState,
+        registry_transaction: SecretRegistryTransaction,
+    ) -> AgentGraphState:
         before = deepcopy(state)
         state["last_user_input"] = ""
         state["language"] = language
@@ -438,7 +705,12 @@ class AnyChainGraphRuntime:
             self.session_purpose,
         )
         attempt = self._begin_turn_attempt(state)
+        self._bind_registry_to_attempt(registry_transaction, attempt)
         config = {"configurable": {"thread_id": attempt.physical_thread_id}}
+        product_head_context = _attempt_product_head_context(
+            self.transaction_authority_id,
+            attempt,
+        )
         try:
             result = self.graph.invoke(
                 state,
@@ -449,17 +721,23 @@ class AnyChainGraphRuntime:
                     "web_research": {},
                     "runtime_action": deepcopy(dict(action)),
                     "repository_revision": {},
+                    "product_head": product_head_context,
                 },
             )
             validate_state(result)
             persisted = dict(result)
+            registry_transaction.prepare()
+            registry_transaction.publish_prepared()
             self._last_terminal_outcome = self._commit_turn_attempt(
                 attempt,
                 persisted,
             )
+            registry_transaction.mark_product_head_committed()
+            registry_transaction.finalize()
         except BaseException as exc:
-            self._finish_failed_turn_attempt(attempt, exc)
+            self._terminalize_failed_attempt_once(attempt, exc)
             raise
+        self._remember_owned_secret_references(persisted)
         if observation:
             self._write_turn_observation(
                 observation,
@@ -469,14 +747,18 @@ class AnyChainGraphRuntime:
             )
         return persisted
 
-    def _persist_state(self, patch: dict[str, Any]) -> AgentGraphState:
+    def _persist_state(
+        self,
+        patch: dict[str, Any],
+        *,
+        registry_transaction: SecretRegistryTransaction | None = None,
+    ) -> AgentGraphState:
         """Internal checkpoint write used by typed runtime operations."""
 
         patch = ensure_session_metadata(dict(patch), self.thread_id, self.session_purpose)
         patch = project_checkpoint_state(patch)
         self._ensure_product_head(
             language=str(patch.get("language") or "en"),
-            preferred_state=patch,
         )
         revision = repository_revision(Path(__file__).resolve().parents[2])
         attempt = self.turn_transactions.begin_attempt(
@@ -484,6 +766,8 @@ class AnyChainGraphRuntime:
             origin_revision_commit=revision["commit"],
             origin_revision_worktree_hash=revision["worktree_hash"],
         )
+        if registry_transaction is not None:
+            self._bind_registry_to_attempt(registry_transaction, attempt)
         try:
             config = self.graph.update_state(
                 {"configurable": {"thread_id": attempt.physical_thread_id}},
@@ -493,20 +777,32 @@ class AnyChainGraphRuntime:
             snapshot = self.graph.get_state(config)
             values = dict(getattr(snapshot, "values", None) or {})
             validate_state(values)
+            if registry_transaction is not None:
+                registry_transaction.prepare()
+                registry_transaction.publish_prepared()
             self._last_terminal_outcome = self._commit_turn_attempt(
                 attempt,
                 values,
                 snapshot=snapshot,
             )
+            if registry_transaction is not None:
+                registry_transaction.mark_product_head_committed()
+                registry_transaction.finalize()
+            self._remember_owned_secret_references(values)
             return values
         except BaseException as exc:
-            self._finish_failed_turn_attempt(attempt, exc)
+            self._terminalize_failed_attempt_once(attempt, exc)
             raise
 
-    def _load_state(self, language: str) -> AgentGraphState:
+    def _load_state(
+        self,
+        language: str,
+        *,
+        registry_transaction: SecretRegistryTransaction | None = None,
+    ) -> AgentGraphState:
         values: dict[str, Any] = {}
+        head = self._ensure_product_head(language=language)
         try:
-            head = self._ensure_product_head(language=language)
             config = {
                 "configurable": {
                     "thread_id": head.checkpoint_thread_id,
@@ -528,9 +824,6 @@ class AnyChainGraphRuntime:
                     session_purpose=self.session_purpose,
                 )
                 validate_state(migrated)
-                if migrated != project_checkpoint_state(values):
-                    return self._persist_state(migrated)
-                return migrated
         except Exception as exc:
             quarantined = new_state(self.thread_id, language=language, session_purpose=self.session_purpose)
             for key in RESET_PRESERVED_KEYS:
@@ -544,14 +837,21 @@ class AnyChainGraphRuntime:
             quarantined["audit_events"] = list(values.get("audit_events") or []) + [
                 {"event": "checkpoint_quarantined", "error_type": type(exc).__name__}
             ]
-            if values and self.turn_transactions.get_product_head(
-                self.transaction_authority_id
-            ):
-                try:
-                    return self._persist_state(quarantined)
-                except Exception:
-                    pass
-            return quarantined
+            return self._persist_state(
+                quarantined,
+                registry_transaction=registry_transaction,
+            )
+        if values:
+            if migrated != project_checkpoint_state(values):
+                # A Product Head write failure is not checkpoint corruption.
+                # Keep it outside recovery so the registry transaction rolls
+                # back every process-local mutation made during migration.
+                return self._persist_state(
+                    migrated,
+                    registry_transaction=registry_transaction,
+                )
+            self._remember_owned_secret_references(migrated)
+            return migrated
         return new_state(self.thread_id, language=language, session_purpose=self.session_purpose)
 
     def _ensure_product_head(
@@ -649,6 +949,23 @@ class AnyChainGraphRuntime:
             raise
         return attempt
 
+    def _bind_registry_to_attempt(
+        self,
+        transaction: SecretRegistryTransaction,
+        attempt: TurnAttempt,
+    ) -> None:
+        transaction.bind_external_commit_probe(
+            lambda: (
+                (
+                    outcome := self.turn_transactions.get_terminal_outcome(
+                        attempt.transaction_id
+                    )
+                )
+                is not None
+                and outcome.outcome == "committed"
+            )
+        )
+
     def _commit_turn_attempt(
         self,
         attempt: TurnAttempt,
@@ -657,7 +974,24 @@ class AnyChainGraphRuntime:
         snapshot: Any | None = None,
     ) -> TerminalOutcome:
         config = {"configurable": {"thread_id": attempt.physical_thread_id}}
-        snapshot = snapshot or self.graph.get_state(config)
+        expected_state = project_checkpoint_state(state)
+        validate_state(expected_state)
+        expected_fingerprint = _state_fingerprint(expected_state)
+        if snapshot is None:
+            committed_config = self.graph.update_state(
+                config,
+                expected_state,
+                as_node="validate",
+            )
+            snapshot = self.graph.get_state(committed_config)
+        persisted = dict(getattr(snapshot, "values", None) or {})
+        if (
+            not persisted
+            or _state_fingerprint(persisted) != expected_fingerprint
+        ):
+            raise RuntimeError(
+                "turn attempt checkpoint does not match its committed state"
+            )
         if tuple(getattr(snapshot, "next", ()) or ()):
             raise RuntimeError("completed turn attempt did not reach graph END")
         checkpoint_id = str(
@@ -672,7 +1006,7 @@ class AnyChainGraphRuntime:
             transaction_id=attempt.transaction_id,
             physical_thread_id=attempt.physical_thread_id,
             attempt_checkpoint_id=checkpoint_id,
-            attempt_fingerprint=_state_fingerprint(state),
+            attempt_fingerprint=expected_fingerprint,
             render_hash=_canonical_hash(state.get("visible_response") or []),
         )
 
@@ -1665,6 +1999,8 @@ class InvocationContext(TypedDict, total=False):
     web_research: dict[str, Any]
     runtime_action: dict[str, Any]
     repository_revision: dict[str, str]
+    product_head: dict[str, Any]
+    input_secret_bindings: dict[str, Any]
 
 
 _INVOCATION_CONTEXT_KEYS = (
@@ -1713,6 +2049,20 @@ def _prepare_graph_step(
     revision = dict(invocation_context.get("repository_revision") or {})
     if revision:
         result.setdefault("turn_context", {})["repository_revision"] = revision
+    product_head = dict(invocation_context.get("product_head") or {})
+    if product_head:
+        result.setdefault("turn_context", {})["product_head"] = product_head
+    input_secret_bindings = [
+        dict(item)
+        for item in (
+            invocation_context.get("input_secret_bindings") or {}
+        ).get("items") or ()
+        if isinstance(item, Mapping)
+    ]
+    if input_secret_bindings:
+        result.setdefault("turn_context", {})[
+            "input_secret_bindings"
+        ] = input_secret_bindings
     runtime_action = (
         dict(invocation_context.get("runtime_action") or {})
         if not str((result.get("turn_context") or {}).get("text") or "").strip()
@@ -1727,6 +2077,21 @@ def _prepare_graph_step(
     for key in _INVOCATION_CONTEXT_KEYS:
         result[key] = {}  # type: ignore[literal-required]
     return result
+
+
+def _attempt_product_head_context(
+    product_authority_id: str,
+    attempt: TurnAttempt,
+) -> dict[str, Any]:
+    """Project the immutable Product Head from which one turn branches."""
+
+    return {
+        "product_authority_id": product_authority_id,
+        "revision": int(attempt.base_revision),
+        "checkpoint_thread_id": attempt.base_checkpoint_thread_id,
+        "checkpoint_id": attempt.base_checkpoint_id,
+        "state_fingerprint": attempt.base_fingerprint,
+    }
 
 
 def _owner_step(

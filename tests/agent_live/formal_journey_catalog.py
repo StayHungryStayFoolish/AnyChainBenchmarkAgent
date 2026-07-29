@@ -15,6 +15,10 @@ from agent.harness.control_receipts import (
 )
 from agent.harness.plan_coverage import segment_user_turn
 from agent.workflows.group_registry import GROUP_ORDER
+from agent.workflows.group_registry import (
+    NEW_CHAIN_ENDPOINT_STATUSES,
+    RPC_EXTENSION_ENDPOINT_STATUSES,
+)
 from tests.agent_live.dynamic_dual_ai_chaos import (
     JourneyPostconditionResult,
     JourneyPostconditionVerifierDefinition,
@@ -1265,6 +1269,85 @@ def factor_observed(
     )
 
 
+def subject_group_path_coherent(
+    context: JourneyVerifierContext,
+) -> JourneyPostconditionResult:
+    factors = {}
+    for raw in getattr(context.schedule, "allowed_risk_factors", ()) or ():
+        name, separator, value = str(raw).partition(":")
+        if separator and name and value:
+            factors[name] = value
+    subject_group = str(
+        getattr(context.schedule, "subject_group", "") or ""
+    )
+    expected_mode = {
+        "fake": ("rpc_benchmark", "fake-node"),
+        "real": ("rpc_benchmark", "real-node"),
+        "sync": ("sync_observe", "sync-observe"),
+    }.get(factors.get("workflow_mode"))
+
+    matching_turns: list[int] = []
+    if expected_mode and subject_group:
+        for event, receipt in _domain_commits(context):
+            transitions = [
+                transition
+                for transition in receipt.get("group_state_transitions") or ()
+                if isinstance(transition, Mapping)
+                and str(transition.get("group") or "") == subject_group
+            ]
+            if not transitions:
+                continue
+            if not (
+                _event_has_state_value(
+                    event,
+                    "workflow_mode",
+                    expected_mode[0],
+                )
+                and _event_has_state_value(
+                    event,
+                    "target_mode",
+                    expected_mode[1],
+                )
+            ):
+                continue
+            if subject_group == "endpoint_process" and factors.get(
+                "workflow_mode"
+            ) == "fake":
+                chain_case = factors.get("chain_case")
+                if chain_case == "case1":
+                    if not _event_has_state_value(
+                        event,
+                        "custom_rpc.status",
+                        *RPC_EXTENSION_ENDPOINT_STATUSES,
+                    ):
+                        continue
+                elif chain_case == "case2":
+                    if not _event_has_state_value(
+                        event,
+                        "chain_identity.status",
+                        *NEW_CHAIN_ENDPOINT_STATUSES,
+                    ):
+                        continue
+                else:
+                    continue
+            matching_turns.append(int(event.turn_index))
+
+    return _result(
+        "subject_group_path_coherent",
+        bool(matching_turns),
+        context,
+        subject_group=subject_group,
+        workflow_mode_factor=factors.get("workflow_mode", ""),
+        chain_case_factor=factors.get("chain_case", ""),
+        matching_turn_indexes=matching_turns,
+        missing_product_receipts=(
+            []
+            if matching_turns
+            else ["domain_commit:subject_group+workflow_path"]
+        ),
+    )
+
+
 _BASE_VERIFIER_DEFINITIONS = (
     JourneyPostconditionVerifierDefinition(
         "committed_state", "formal-committed-state", 2,
@@ -1300,6 +1383,13 @@ _BASE_VERIFIER_DEFINITIONS = (
         "state_regressed", "formal-state-regression", 2,
         "Detects broken PTY/runtime lineage or an exact rollback to a prior checkpoint.",
         state_regressed,
+    ),
+    JourneyPostconditionVerifierDefinition(
+        "subject_group_path_coherent",
+        "formal-subject-group-path-coherent",
+        2,
+        "The subject-group transition and its compatible workflow path coexist in one committed runtime event.",
+        subject_group_path_coherent,
     ),
 )
 

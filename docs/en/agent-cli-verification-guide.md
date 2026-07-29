@@ -135,10 +135,14 @@ git diff --check
 ```
 
 Run these commands inside the Linux `bench` service. Checkpoint schema version
-18 is the current contract. Migration coverage must prove the version-16
-pending-owner/Chain-RPC context boundary, the version-17
-`semantic_planning` boundary, and the version-18 response-authority boundary,
-including safe removal of historical in-flight planning and response scratch.
+23 is the current contract. Migration coverage must prove the version-16
+pending-owner/Chain-RPC context boundary, version-17 semantic planning,
+version-18 response authority, version-19 drafts, version-20 Product Head
+binding, version-21 atom evidence and secret references, version-22 durable
+bindings, and version-23 signed sensitivity, memory-hard verifiers, registry
+transactions, and reference-only durable plans. Version-21 raw
+credentials/references and version-22 legacy bindings/references must be
+quarantined.
 
 Passing domain behavior through a test adapter that directly constructs
 `review_plan` state does not prove the graph split. Split-stage evidence must

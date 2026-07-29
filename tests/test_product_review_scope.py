@@ -16,7 +16,7 @@ class ProductReviewScopeTest(unittest.TestCase):
         self.assertEqual(scope["documentation"]["pair_denominator"], 13)
         self.assertEqual(scope["documentation"]["exemption_denominator"], 0)
         self.assertEqual(scope["documentation"]["fact_denominator"], 12)
-        self.assertEqual(scope["migration"]["check_denominator"], 19)
+        self.assertEqual(scope["migration"]["check_denominator"], 24)
         self.assertEqual(scope["external_capabilities"]["denominator"], 1)
         self.assertEqual(scope["severity"]["denominator"], 5)
         self.assertEqual(scope["shell_gates"]["denominator"], 51)

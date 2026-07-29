@@ -11,7 +11,11 @@ import random
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
-from agent.workflows.group_registry import GROUP_ORDER
+from agent.workflows.group_registry import (
+    GROUP_ORDER,
+    GROUP_SPEC_BY_NAME,
+    group_applicable,
+)
 from tests.agent_live.covering_arrays import (
     FACTOR_MODEL_SCHEMA_VERSION,
     Factor,
@@ -32,7 +36,19 @@ STATE_CONTROL_FACTOR_NAMES = (
     "group_state",
     "interruption_depth",
     "evidence_shape",
+    "chain_case",
 )
+_WORKFLOW_STATE_BY_FACTOR = {
+    "fake": ("rpc_benchmark", "fake-node"),
+    "real": ("rpc_benchmark", "real-node"),
+    "sync": ("sync_observe", "sync-observe"),
+}
+_CHAIN_EXTENSION_STATE_BY_FACTOR = {
+    "known": ({}, {}),
+    "case1": ({}, {"status": "needs_endpoint"}),
+    "case2": ({"status": "existing_family_needs_endpoint"}, {}),
+    "case3": ({"status": "unsupported_adapter_family"}, {}),
+}
 
 
 @dataclass(frozen=True)
@@ -44,6 +60,38 @@ class ProductCoveringArrayResult:
     rows: tuple[dict[str, str], ...]
     row_ids: tuple[str, ...]
     report: dict[str, Any]
+
+
+def product_state_for_factor_row(
+    factors: Mapping[str, str],
+) -> dict[str, Any]:
+    """Project one test-factor row into the product's applicability state."""
+
+    workflow_factor = str(factors.get("workflow_mode") or "")
+    chain_factor = str(factors.get("chain_case") or "")
+    if workflow_factor not in _WORKFLOW_STATE_BY_FACTOR:
+        raise ValueError(f"unknown workflow_mode factor: {workflow_factor}")
+    if chain_factor not in _CHAIN_EXTENSION_STATE_BY_FACTOR:
+        raise ValueError(f"unknown chain_case factor: {chain_factor}")
+    workflow_mode, target_mode = _WORKFLOW_STATE_BY_FACTOR[workflow_factor]
+    chain_identity, custom_rpc = _CHAIN_EXTENSION_STATE_BY_FACTOR[chain_factor]
+    return {
+        "workflow_mode": workflow_mode,
+        "target_mode": target_mode,
+        "chain_identity": dict(chain_identity),
+        "custom_rpc": dict(custom_rpc),
+    }
+
+
+def factor_row_group_applicable(factors: Mapping[str, str]) -> bool:
+    """Return whether the row's subject group can exist on its product path."""
+
+    subject_group = str(factors.get("subject_group") or "")
+    spec = GROUP_SPEC_BY_NAME.get(subject_group)
+    return bool(
+        spec is not None
+        and group_applicable(product_state_for_factor_row(factors), spec)
+    )
 
 
 def build_product_factor_model() -> FactorModel:
@@ -81,28 +129,41 @@ def build_product_factor_model() -> FactorModel:
     def forbid(constraint_id: str, **values: str) -> None:
         forbidden.append(ForbiddenCombination.from_mapping(constraint_id, values))
 
+    for workflow_mode in _WORKFLOW_STATE_BY_FACTOR:
+        for subject_group in GROUP_ORDER:
+            applicable_cases = {
+                chain_case
+                for chain_case in _CHAIN_EXTENSION_STATE_BY_FACTOR
+                if factor_row_group_applicable({
+                    "workflow_mode": workflow_mode,
+                    "chain_case": chain_case,
+                    "subject_group": subject_group,
+                })
+            }
+            if not applicable_cases:
+                forbid(
+                    f"registry-inapplicable-{workflow_mode}-{subject_group}",
+                    workflow_mode=workflow_mode,
+                    subject_group=subject_group,
+                )
+                continue
+            for chain_case in sorted(
+                set(_CHAIN_EXTENSION_STATE_BY_FACTOR) - applicable_cases
+            ):
+                forbid(
+                    "registry-conditionally-inapplicable-"
+                    f"{workflow_mode}-{chain_case}-{subject_group}",
+                    workflow_mode=workflow_mode,
+                    chain_case=chain_case,
+                    subject_group=subject_group,
+                )
+
     # Sync observation has no RPC workload. RPC workflows require a workload,
     # except Case 3, which exits to secondary-development handoff.
     for workload in (
         "default_single", "default_mixed", "custom_single", "custom_mixed"
     ):
         forbid(f"sync-no-{workload}", workflow_mode="sync", workload=workload)
-    for subject_group in (
-        "workload_rpc",
-        "target_samples_fixtures",
-        "qps_profile",
-    ):
-        forbid(
-            f"sync-no-{subject_group}-group",
-            workflow_mode="sync",
-            subject_group=subject_group,
-        )
-    for workflow_mode in ("fake", "real"):
-        forbid(
-            f"{workflow_mode}-no-sync-observe-group",
-            workflow_mode=workflow_mode,
-            subject_group="sync_observe",
-        )
     for workflow_mode in ("fake", "real"):
         for chain_case in ("known", "case1", "case2"):
             forbid(

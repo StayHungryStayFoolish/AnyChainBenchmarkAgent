@@ -48,7 +48,7 @@ complete terminal turn
 -> persist/invoke/receipt when the action has an external side effect
 -> repeat selection through graph transitions while admitted work remains
 -> canonical fallback and one response with at most one blocking question
--> validate and checkpoint schema version 18
+-> validate and checkpoint schema version 23
 ```
 
 The deterministic fast path does not include arbitrary manually entered typed
@@ -108,11 +108,13 @@ workflow remains 20 groups with exactly eight domain owners.
 Important implementation files:
 
 - `agent/harness/graph.py`: LangGraph/checkpoint runtime
-- `agent/harness/coordinator.py`: graph-node transitions and sole typed commit
-  boundary
-- `agent/harness/hierarchical_planner.py`: sole semantic-planning entry; Stage
+- `agent/harness/coordinator.py`: graph-node transitions, sole semantic-routing
+  authority, and sole typed commit boundary
+- `agent/harness/hierarchical_planner.py`: sole general semantic planner; Stage
   A partitions the complete turn and Stage B compiles owner-scoped actions
   before whole-plan admission
+- `agent/harness/bounded_semantic_lane.py`: finite-catalog semantic mapper with
+  no general routing, state-mutation, or commit authority
 - `agent/harness/action_registry.py`: typed action contracts and prerequisites
 - `agent/harness/admission.py`: admission, conflict, prerequisite, and semantic
   coverage validation
@@ -151,11 +153,21 @@ initializes typed response fragments before persistence as version 15; version
 16 materializes the explicit pending-question owner and typed Chain/RPC case
 context; and version 17 introduces checkpointed semantic-planning state.
 Version 18 retires persisted turn-local response text/manifests in favor of the
-central response authority. Migration to version 18 clears historical
-in-flight semantic-planning and response scratch rather than resuming a
-partially compiled owner schedule or stale prose from an older contract. Older
-state is quarantined and only allowlisted environment facts may be offered for
-reconfirmation.
+central response authority. Version 19 adds the non-executable semantic-draft
+boundary. Migration to version 19 clears historical in-flight semantic
+planning, drafts, draft-bound questions, and response scratch rather than
+resuming a partially compiled owner schedule or stale prose from an older
+contract. Version 20 additionally binds the draft and its finalization receipt
+to the Product Head checkpoint lineage and the complete group/action/question
+contract authority. Version 19 drafts are cleared during migration; current
+drafts that outlive an authority change become stale before admission.
+Version 21 adds atom evidence, secret references, and atomic finalization;
+version 22 adds durable secret bindings. Version 23 signs input sensitivity,
+uses salted memory-hard secret verifiers, transacts registry mutations with
+Product Head, and keeps durable plans reference-only. Version 21 raw
+credentials/references and version 22 legacy bindings/references are
+quarantined. Older state is quarantined and only allowlisted environment facts
+may be offered for reconfirmation.
 
 ## Migrated Historical Findings
 
@@ -261,6 +273,29 @@ conversations or jobs. Ledger, matrix, PTY, simulator, and execution scripts
 remain subordinate evidence providers; their direct exit codes never declare product
 readiness. G3-G6 are not closed, so the product status remains not ready.
 
+PTY workers persist candidate JSON only. Before workers start, the immutable
+batch manifest freezes an Ed25519 public trust root. The private key is created
+in controller memory and is never written to the shared filesystem or
+environment; a subprocess controller receives it only through an inherited
+pipe descriptor that is closed before workers start.
+After independently validating a candidate against the frozen shard, schedule,
+target, revision, and runtime boundaries, the controller signs a separate
+authority receipt. The admitted artifact snapshot, receipt, and commit marker
+are published as one immutable `.admitted` directory:
+missing, stale, partially published, or differently signed pairs fail closed.
+Validation also recomputes projected source hashes and rejects legacy runtime
+events and owning secret capabilities in mapping keys or values. The batch
+result binds the committed bundle digest and public trust root. Evidence
+conversion additionally requires that trust-root ID as an explicit
+orchestrator input; the manifest cannot appoint itself as trusted.
+An admitted completed-batch source captures the required runtime files once and
+converts only from that read-only snapshot. Product evidence records the
+original source paths and snapshot hashes, but later admission never re-reads
+those mutable runtime files. G3/G4 expose only the `evidence-batch` conversion
+command; a standalone runtime-root conversion cannot qualify evidence.
+
+An artifact's internal self-hashes are never source authority.
+
 Fixed denominators:
 
 - G3: 60 retained-regression obligations;
@@ -339,9 +374,15 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
 python3 tools/check_agent_boundaries.py --root .
 PYTHONDONTWRITEBYTECODE=1 python3 -m compileall -q agent tests
 git diff --check
+python3 tests/agent_live/run_product_acceptance.py --through-phase 8 \
+  --g3-authority-trust-root-id "$G3_AUTHORITY_TRUST_ROOT_ID" \
+  --g4-round-1-authority-trust-root-id "$G4_ROUND_1_AUTHORITY_TRUST_ROOT_ID" \
+  --g4-round-2-authority-trust-root-id "$G4_ROUND_2_AUTHORITY_TRUST_ROOT_ID"
 ```
 
 Also run dynamic DeepSeek-backed conversations and required real executions.
+The three trust-root IDs must come from the controller that froze each batch;
+never derive them from the evidence manifest being admitted.
 Do not claim completion from unit tests or scripted transcripts alone.
 
 ## Repair Rules

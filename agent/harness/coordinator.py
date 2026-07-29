@@ -4,13 +4,29 @@ from __future__ import annotations
 
 import json
 import hashlib
+import re
 from copy import deepcopy
 from dataclasses import asdict, is_dataclass, replace
 from typing import Any, Mapping
 
 from agent.runners.job_manager import verify_job_receipt
+from agent.utils.redaction import redact
 
 from .state import AgentGraphState, PendingQuestion, RESET_PRESERVED_KEYS, new_state
+from .secret_refs import (
+    discard_draft_secret_references,
+    discard_secret_reference,
+    discard_state_secret_references,
+    materialize_state_secret_references,
+    missing_state_secret_bindings,
+    reconcile_state_secret_bindings,
+    redact_secret_references,
+    register_state_secret_bindings,
+    resolve_secret_reference,
+    restore_secret_reference,
+    secret_value_hash,
+    store_secret_reference,
+)
 from .input_identity import user_input_hash
 from . import hierarchical_planner
 from .bounded_semantic_lane import (
@@ -52,6 +68,7 @@ from .contracts import (
     PendingDomainResult,
     SideEffectIntent,
     SideEffectReceipt,
+    SemanticDraftCommand,
     TurnReceipt,
     WorkflowGoalCommand,
     StateDelta,
@@ -101,6 +118,24 @@ from .questions import (
     pending_option_value_exists as _pending_option_value_exists,
     validate_pending_question_contract,
     value_satisfies_pending_contract as _value_satisfies_pending_contract,
+    choice_question,
+    manual_question,
+    question_text,
+    semantic_draft_question_template,
+    secret_reentry_question_template,
+    with_pending_question_behavior,
+    with_pending_question_created_turn,
+)
+from .semantic_drafts import (
+    build_semantic_draft_finalization_receipt,
+    cancel_semantic_plan_draft,
+    mark_semantic_plan_draft_stale,
+    missing_semantic_draft_secret_bindings,
+    resolve_semantic_draft_atom,
+    reopen_previous_semantic_draft_atom,
+    semantic_draft_question_binding,
+    semantic_draft_staleness_reasons,
+    validate_semantic_plan_draft,
 )
 from .response import (
     finalize_turn_response as _finalize_turn_response,
@@ -142,6 +177,8 @@ _ADMISSION_METADATA_KEYS = (
     "_transaction_action_ids",
     "_plan_transaction_hash",
     "_merged_origin_texts",
+    "_semantic_draft_finalization_receipt",
+    "_semantic_secret_bindings",
 )
 
 
@@ -231,6 +268,268 @@ def apply_coordinator_action(state: AgentGraphState, action: ActionProposal) -> 
             completion="unchanged",
             stop_after_response=True,
         )
+    if action.action_type == "reenter_secret_reference":
+        try:
+            binding = {
+                "scope_id": str(action.arguments.get("scope_id") or ""),
+                "owner_kind": str(action.arguments.get("owner_kind") or ""),
+                "owner_id": str(action.arguments.get("owner_id") or ""),
+                "owner_revision": int(
+                    action.arguments.get("owner_revision") or 0
+                ),
+                "reference": str(action.arguments.get("reference") or ""),
+                "atom_id": str(action.arguments.get("atom_id") or ""),
+                "value_hash": str(action.arguments.get("value_hash") or ""),
+            }
+            pending_binding = dict(
+                (state.get("pending_question") or {}).get(
+                    "secret_reentry_binding"
+                )
+                or {}
+            )
+            if binding != pending_binding:
+                raise ValueError("secret re-entry binding is not active")
+            if binding["owner_kind"] == "semantic_draft":
+                draft = validate_semantic_plan_draft(
+                    state.get("semantic_plan_draft") or {}
+                )
+                expected_bindings = [
+                    {
+                        "scope_id": str(item.get("draft_id") or ""),
+                        "owner_kind": "semantic_draft",
+                        "owner_id": str(draft.get("draft_id") or ""),
+                        "owner_revision": int(draft.get("revision") or 0),
+                        "reference": str(item.get("reference") or ""),
+                        "atom_id": str(item.get("atom_id") or ""),
+                        "value_hash": str(item.get("value_hash") or ""),
+                    }
+                    for item in missing_semantic_draft_secret_bindings(draft)
+                ]
+            elif binding["owner_kind"] == "durable_state":
+                expected_bindings = [
+                    {
+                        **dict(item),
+                        "owner_kind": "durable_state",
+                        "owner_id": str(item.get("reference") or ""),
+                        "owner_revision": 0,
+                    }
+                    for item in missing_state_secret_bindings(state)
+                ]
+            else:
+                expected_bindings = []
+            if binding not in expected_bindings:
+                raise ValueError("secret re-entry binding is not active")
+            restore_secret_reference(
+                str(action.arguments.get("secret_value") or ""),
+                reference=binding["reference"],
+                draft_id=binding["scope_id"],
+                atom_id=binding["atom_id"],
+                expected_hash=binding["value_hash"],
+            )
+        except (TypeError, ValueError):
+            return HandlerResult(
+                blocker=_failure(
+                    "harness.failure.coordinator.semantic_draft_unavailable",
+                    arguments={"operation": action.action_type},
+                )
+            )
+        return HandlerResult(
+            consumed_action_ids=(action.action_id,),
+            clear_pending=True,
+            completion="completed",
+        )
+    if action.action_type == "resolve_semantic_draft_atom":
+        try:
+            draft = validate_semantic_plan_draft(
+                state.get("semantic_plan_draft") or {}
+            )
+            raw_resolution = str(action.arguments.get("resolution") or "").strip()
+            safe_resolution = str(redact(raw_resolution)).strip()
+            if not safe_resolution:
+                raise ValueError("semantic draft resolution cannot be empty")
+            draft_id = str(action.arguments.get("draft_id") or "")
+            revision = int(action.arguments.get("revision") or 0)
+            atom_id = str(action.arguments.get("atom_id") or "")
+            if (
+                draft_id != str(draft.get("draft_id") or "")
+                or revision != int(draft.get("revision") or 0)
+                or atom_id != str(draft.get("active_atom_id") or "")
+            ):
+                raise ValueError("semantic draft resolution binding mismatch")
+            stale_reasons = semantic_draft_staleness_reasons(draft, state)
+            if stale_reasons:
+                return HandlerResult(
+                    consumed_action_ids=(action.action_id,),
+                    semantic_draft_command=SemanticDraftCommand(
+                        operation="invalidate",
+                        draft_id=draft_id,
+                        revision=revision,
+                        reason="|".join(stale_reasons),
+                    ),
+                    clear_pending=True,
+                    response_fragments=(_fragment(
+                        "harness.failure.coordinator.semantic_draft_unavailable",
+                        kind="error",
+                        arguments={"operation": action.action_type},
+                    ),),
+                    completion="blocked",
+                    stop_after_response=True,
+                )
+            resolution_ref = ""
+            resolution_hash = secret_value_hash(raw_resolution)
+            if safe_resolution != raw_resolution:
+                resolution_ref, resolution_hash = store_secret_reference(
+                    raw_resolution,
+                    draft_id=draft_id,
+                    atom_id=atom_id,
+                )
+            command = SemanticDraftCommand(
+                operation="resolve",
+                draft_id=draft_id,
+                revision=revision,
+                atom_id=atom_id,
+                resolution=safe_resolution,
+                resolution_hash=resolution_hash,
+                resolution_ref=resolution_ref,
+            )
+            resolved = resolve_semantic_draft_atom(
+                draft,
+                draft_id=command.draft_id,
+                revision=command.revision,
+                atom_id=command.atom_id,
+                resolution=command.resolution,
+                resolution_hash=command.resolution_hash,
+                resolution_ref=command.resolution_ref,
+            )
+        except (TypeError, ValueError):
+            return HandlerResult(
+                blocker=_failure(
+                    "harness.failure.coordinator.semantic_draft_unavailable",
+                    arguments={"operation": action.action_type},
+                )
+            )
+        next_question = (
+            _semantic_draft_question(resolved)
+            if resolved.get("status") == "awaiting_clarification"
+            else None
+        )
+        return HandlerResult(
+            consumed_action_ids=(action.action_id,),
+            semantic_draft_command=command,
+            clear_pending=True,
+            pending_question=next_question,
+            next_group=str((next_question or {}).get("group") or ""),
+            completion=(
+                "blocked" if next_question is not None else "completed"
+            ),
+            stop_after_response=next_question is not None,
+        )
+    if action.action_type == "previous_semantic_draft_atom":
+        try:
+            draft = validate_semantic_plan_draft(
+                state.get("semantic_plan_draft") or {}
+            )
+            command = SemanticDraftCommand(
+                operation="previous",
+                draft_id=str(action.arguments.get("draft_id") or ""),
+                revision=int(action.arguments.get("revision") or 0),
+                atom_id=str(action.arguments.get("atom_id") or ""),
+            )
+            if (
+                command.draft_id != str(draft.get("draft_id") or "")
+                or command.revision != int(draft.get("revision") or 0)
+            ):
+                raise ValueError("semantic draft previous binding mismatch")
+            stale_reasons = semantic_draft_staleness_reasons(draft, state)
+            if stale_reasons:
+                return HandlerResult(
+                    consumed_action_ids=(action.action_id,),
+                    semantic_draft_command=SemanticDraftCommand(
+                        operation="invalidate",
+                        draft_id=command.draft_id,
+                        revision=command.revision,
+                        reason="|".join(stale_reasons),
+                    ),
+                    clear_pending=True,
+                    response_fragments=(_fragment(
+                        "harness.failure.coordinator.semantic_draft_unavailable",
+                        kind="error",
+                        arguments={"operation": action.action_type},
+                    ),),
+                    completion="blocked",
+                    stop_after_response=True,
+                )
+            previous = reopen_previous_semantic_draft_atom(
+                draft,
+                draft_id=command.draft_id,
+                revision=command.revision,
+                atom_id=command.atom_id,
+            )
+        except (TypeError, ValueError):
+            return HandlerResult(
+                blocker=_failure(
+                    "harness.failure.coordinator.semantic_draft_unavailable",
+                    arguments={"operation": action.action_type},
+                )
+            )
+        next_question = _semantic_draft_question(previous)
+        return HandlerResult(
+            consumed_action_ids=(action.action_id,),
+            semantic_draft_command=command,
+            clear_pending=True,
+            pending_question=next_question,
+            next_group=str(next_question.get("group") or ""),
+            completion="blocked",
+            stop_after_response=True,
+        )
+    if action.action_type == "cancel_semantic_draft":
+        try:
+            draft = validate_semantic_plan_draft(
+                state.get("semantic_plan_draft") or {}
+            )
+            command = SemanticDraftCommand(
+                operation="cancel",
+                draft_id=str(action.arguments.get("draft_id") or ""),
+                revision=int(action.arguments.get("revision") or 0),
+                reason=str(action.arguments.get("reason") or "cancelled"),
+            )
+            if (
+                command.draft_id != str(draft.get("draft_id") or "")
+                or command.revision != int(draft.get("revision") or 0)
+            ):
+                raise ValueError("semantic draft cancellation binding mismatch")
+            stale_reasons = semantic_draft_staleness_reasons(draft, state)
+            if stale_reasons:
+                return HandlerResult(
+                    consumed_action_ids=(action.action_id,),
+                    semantic_draft_command=SemanticDraftCommand(
+                        operation="invalidate",
+                        draft_id=command.draft_id,
+                        revision=command.revision,
+                        reason="|".join(stale_reasons),
+                    ),
+                    clear_pending=True,
+                    response_fragments=(_fragment(
+                        "harness.failure.coordinator.semantic_draft_unavailable",
+                        kind="error",
+                        arguments={"operation": action.action_type},
+                    ),),
+                    completion="blocked",
+                    stop_after_response=True,
+                )
+        except (TypeError, ValueError):
+            return HandlerResult(
+                blocker=_failure(
+                    "harness.failure.coordinator.semantic_draft_unavailable",
+                    arguments={"operation": action.action_type},
+                )
+            )
+        return HandlerResult(
+            consumed_action_ids=(action.action_id,),
+            semantic_draft_command=command,
+            clear_pending=True,
+            completion="completed",
+        )
     if action.action_type == "request_config_field_input":
         field = str(action.arguments.get("config_field") or "").strip()
         group = group_for_field(field)
@@ -298,6 +597,14 @@ def apply_coordinator_action(state: AgentGraphState, action: ActionProposal) -> 
             stop_after_response=True,
         )
     if action.action_type == "go_back":
+        draft = dict(state.get("semantic_plan_draft") or {})
+        if draft.get("status") == "awaiting_clarification":
+            return HandlerResult(
+                blocker=_failure(
+                    "harness.failure.coordinator.semantic_draft_unavailable",
+                    arguments={"operation": action.action_type},
+                )
+            )
         return HandlerResult(
             consumed_action_ids=(action.action_id,),
             navigation_command=NavigationCommand(operation="go_back"),
@@ -400,6 +707,141 @@ def apply_coordinator_action(state: AgentGraphState, action: ActionProposal) -> 
     )
 
 COORDINATOR_RUNTIME = DomainRuntime(apply_action=apply_coordinator_action)
+
+
+def _semantic_draft_question(draft: Mapping[str, Any]) -> dict[str, Any]:
+    """Build the only question allowed to resolve the active draft atom."""
+
+    validated = validate_semantic_plan_draft(draft)
+    atom_id = str(validated.get("active_atom_id") or "")
+    atom = next(
+        (
+            dict(item)
+            for item in validated.get("unresolved_atoms") or ()
+            if isinstance(item, Mapping)
+            and str(item.get("atom_id") or "") == atom_id
+        ),
+        {},
+    )
+    if not atom:
+        raise StateInvariantError("semantic draft has no active atom record")
+    group = str(atom.get("group") or "opening")
+    binding = semantic_draft_question_binding(validated)
+    template = semantic_draft_question_template()
+    atom_ids = [
+        str(item.get("atom_id") or "")
+        for item in validated.get("unresolved_atoms") or ()
+        if isinstance(item, Mapping)
+    ]
+    active_index = atom_ids.index(atom_id)
+    options: list[dict[str, Any]] = []
+    if active_index > 0:
+        previous_atom_id = atom_ids[active_index - 1]
+        previous_spec = next(
+            item
+            for item in template["options"]
+            if item["id"] == "previous"
+        )
+        options.append({
+            "id": previous_spec["id"],
+            "value": previous_spec["value"],
+            "label": question_text(
+                previous_spec["label_message_id"]
+            ),
+            "action": {
+                "type": previous_spec["action_type"],
+                "draft_id": binding["draft_id"],
+                "revision": binding["revision"],
+                "atom_id": previous_atom_id,
+            },
+            "expected_patch": {},
+            "return_policy": previous_spec["return_policy"],
+        })
+    cancel_spec = next(
+        item
+        for item in template["options"]
+        if item["id"] == "cancel"
+    )
+    options.append({
+        "id": cancel_spec["id"],
+        "value": cancel_spec["value"],
+        "label": question_text(
+            cancel_spec["label_message_id"]
+        ),
+        "action": {
+            "type": cancel_spec["action_type"],
+            "draft_id": binding["draft_id"],
+            "revision": binding["revision"],
+            "reason": "user_cancelled",
+        },
+        "expected_patch": {},
+        "return_policy": cancel_spec["return_policy"],
+    })
+    return choice_question(
+        group,
+        f"semantic_draft:{binding['draft_id']}:{binding['revision']}:{atom_id}",
+        question_text(
+            template["prompt_message_id"],
+            source=str(atom.get("source_text") or atom.get("source_path") or ""),
+        ),
+        owner="coordinator",
+        field=template["field"],
+        kind=template["kind"],
+        options=options,
+        manual_input_allowed=True,
+        accepted_action_types=(template["manual_action_type"],),
+        manual_action={
+            "type": template["manual_action_type"],
+            "draft_id": binding["draft_id"],
+            "revision": binding["revision"],
+            "atom_id": binding["atom_id"],
+            "value_argument": template["manual_value_argument"],
+        },
+        queue_barrier=template["queue_barrier"],
+        barrier_policy=template["barrier_policy"],
+        validation=template["validation"],
+        semantic_draft_binding=binding,
+    )
+
+
+def _secret_reentry_question(
+    group: str,
+    binding: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build one signed re-entry contract for lost process-local material."""
+
+    exact_binding = {
+        "scope_id": str(binding.get("scope_id") or ""),
+        "owner_kind": str(binding.get("owner_kind") or ""),
+        "owner_id": str(binding.get("owner_id") or ""),
+        "owner_revision": int(binding.get("owner_revision") or 0),
+        "reference": str(binding.get("reference") or ""),
+        "atom_id": str(binding.get("atom_id") or ""),
+        "value_hash": str(binding.get("value_hash") or ""),
+    }
+    template = secret_reentry_question_template()
+    return manual_question(
+        str(group or "opening"),
+        (
+            "secret_reentry:"
+            f"{exact_binding['owner_kind']}:{exact_binding['owner_id']}:"
+            f"{exact_binding['atom_id']}"
+        ),
+        question_text(template["prompt_message_id"]),
+        owner="coordinator",
+        field=template["field"],
+        kind=template["kind"],
+        accepted_action_types=(template["manual_action_type"],),
+        manual_action={
+            "type": template["manual_action_type"],
+            **exact_binding,
+            "value_argument": template["manual_value_argument"],
+        },
+        queue_barrier=template["queue_barrier"],
+        barrier_policy=template["barrier_policy"],
+        validation=template["validation"],
+        secret_reentry_binding=exact_binding,
+    )
 
 
 def _set_turn_phase(state: AgentGraphState, phase: str, reason: str = "") -> AgentGraphState:
@@ -567,6 +1009,19 @@ def _receipt_hash(value: Any) -> str:
             default=str,
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _invalidate_semantic_draft(
+    state: AgentGraphState,
+    draft: Mapping[str, Any],
+    *,
+    reasons: tuple[str, ...],
+) -> None:
+    state["semantic_plan_draft"] = mark_semantic_plan_draft_stale(
+        draft,
+        reasons=reasons,
+    )
+    discard_draft_secret_references(draft)
 
 
 def _append_control_receipt(
@@ -835,11 +1290,30 @@ def _record_semantic_plan_receipt(
     receipt = dict(state.get("turn_receipt") or {})
     if not receipt:
         return
-    normalized_units = [
+    new_units = [
         deepcopy(dict(unit))
         for unit in semantic_units
         if str(unit.get("unit_id") or "")
     ]
+    normalized_units = new_units
+    if receipt.get("admitted_action_ids"):
+        normalized_units = [
+            deepcopy(dict(unit))
+            for unit in receipt.get("semantic_units") or []
+            if isinstance(unit, Mapping) and str(unit.get("unit_id") or "")
+        ]
+        index_by_id = {
+            str(unit["unit_id"]): index
+            for index, unit in enumerate(normalized_units)
+        }
+        for unit in new_units:
+            unit_id = str(unit["unit_id"])
+            prior = index_by_id.get(unit_id)
+            if prior is None:
+                index_by_id[unit_id] = len(normalized_units)
+                normalized_units.append(unit)
+            else:
+                normalized_units[prior] = unit
     unresolved = [
         str(unit.get("unit_id") or "")
         for unit in normalized_units
@@ -870,6 +1344,11 @@ def _record_semantic_plan_receipt(
             "verdict": verdict,
         })
     pending_verdicts = [
+        deepcopy(dict(row))
+        for row in receipt.get("pending_candidate_verdicts") or []
+        if isinstance(row, Mapping)
+    ]
+    pending_verdicts.extend([
         {
             "action_index": contract.get("action_index"),
             "admission_action_id": str(
@@ -886,7 +1365,7 @@ def _record_semantic_plan_receipt(
         }
         for contract in pending_choice_contracts
         if isinstance(contract, Mapping)
-    ]
+    ])
     receipt["semantic_units"] = normalized_units
     receipt["unresolved_units"] = unresolved
     receipt["pending_candidate_verdicts"] = pending_verdicts
@@ -908,8 +1387,17 @@ def prepare_turn_step(state: AgentGraphState) -> AgentGraphState:
             "inflight_transition_resumed",
         )
     state = _apply_handler_result(state, reconcile_execution_state(state), owner="execution")
-    pending_owner = str((state.get("pending_question") or {}).get("group") or "").strip()
-    if pending_owner:
+    try:
+        reconcile_state_secret_bindings(state)
+    except ValueError as exc:
+        raise StateInvariantError(str(exc)) from exc
+    pending = dict(state.get("pending_question") or {})
+    pending_owner = str(pending.get("group") or "").strip()
+    if (
+        pending_owner
+        and not pending.get("semantic_draft_binding")
+        and not pending.get("secret_reentry_binding")
+    ):
         state["active_group"] = pending_owner
     state["turn_index"] = int(state.get("turn_index") or 0) + 1
     text = str(state.get("last_user_input") or "").strip()
@@ -953,6 +1441,31 @@ def prepare_turn_step(state: AgentGraphState) -> AgentGraphState:
     )
     state["semantic_planning"] = {}
     state["proposed_actions"] = []
+    missing_durable_secrets = missing_state_secret_bindings(state)
+    if missing_durable_secrets and not (
+        state.get("pending_question") or {}
+    ).get("secret_reentry_binding"):
+        binding = missing_durable_secrets[0]
+        _install_pending_question(
+            state,
+            _secret_reentry_question(
+                str(state.get("active_group") or "opening"),
+                {
+                    **binding,
+                    "owner_kind": "durable_state",
+                    "owner_id": binding["reference"],
+                    "owner_revision": 0,
+                },
+            ),
+            activate_group=False,
+        )
+        if state.get("action_queue"):
+            _set_pending_queue_resume(state, enabled=True)
+        return _set_turn_phase(
+            state,
+            "compose",
+            "durable_secret_reentry_required",
+        )
     return _set_turn_phase(state, "adjudicate")
 
 
@@ -1176,12 +1689,31 @@ def _admit_deterministic_action(
 def partition_turn_step(state: AgentGraphState) -> AgentGraphState:
     """Persist Stage A's semantic partition and owner schedule."""
 
-    text = str((state.get("turn_context") or {}).get("text") or "")
-    document = compile_bounded_semantic_value(state, text)
-    planning_lane = "bounded_semantic_value"
+    draft = dict(state.get("semantic_plan_draft") or {})
+    finalizing_draft = draft.get("status") == "ready_for_review"
+    active_draft = draft.get("status") in {
+        "awaiting_clarification",
+        "ready_for_review",
+    }
+    text = (
+        str(draft.get("original_input") or "")
+        if finalizing_draft
+        else str((state.get("turn_context") or {}).get("text") or "")
+    )
+    document = (
+        None
+        if active_draft
+        else compile_bounded_semantic_value(state, text)
+    )
+    planning_lane = (
+        "semantic_draft_finalization"
+        if finalizing_draft
+        else "bounded_semantic_value"
+    )
     if document is None:
         document = hierarchical_planner.begin_semantic_partition(state, text)
-        planning_lane = "hierarchical"
+        if not finalizing_draft:
+            planning_lane = "hierarchical"
     state["semantic_planning"] = document
     _append_control_receipt(
         state,
@@ -1290,11 +1822,11 @@ def _consume_planner_queue(
             "result_reason_hash": hashlib.sha256(
                 str(queue.get("reason") or "").encode("utf-8")
             ).hexdigest(),
-            "planned_action_types": [
+            "planned_action_types": list(dict.fromkeys(
                 str(item.get("type") or "")
                 for item in queue.get("actions") or ()
                 if isinstance(item, Mapping) and str(item.get("type") or "")
-            ],
+            )),
             "semantic_units": [
                 {
                     "unit_id": str(item.get("unit_id") or ""),
@@ -1310,7 +1842,57 @@ def _consume_planner_queue(
             },
         },
     )
+    semantic_draft = queue.get("semantic_draft")
+    if isinstance(semantic_draft, Mapping):
+        draft = validate_semantic_plan_draft(semantic_draft)
+        question = _semantic_draft_question(draft)
+        state["semantic_plan_draft"] = draft
+        state.setdefault("turn_context", {})["semantic_units"] = [
+            dict(row)
+            for row in queue.get("semantic_units") or []
+            if isinstance(row, Mapping)
+        ]
+        _record_semantic_plan_receipt(
+            state,
+            state["turn_context"]["semantic_units"],
+            [],
+        )
+        if str((state.get("turn_receipt") or {}).get("turn_id") or ""):
+            state["turn_receipt"] = reconcile_admission_coverage(
+                state.get("turn_receipt") or {},
+                [],
+            )
+        _install_pending_question(
+            state,
+            question,
+            activate_group=False,
+        )
+        return _set_turn_phase(
+            state,
+            "compose",
+            "semantic_draft_awaiting_clarification",
+        )
+    existing_draft = dict(state.get("semantic_plan_draft") or {})
+    if (
+        existing_draft.get("status") == "ready_for_review"
+        and any(
+            isinstance(item, Mapping)
+            and str(item.get("type") or "") == "clarify_unresolved"
+            for item in queue.get("actions") or ()
+        )
+    ):
+        _invalidate_semantic_draft(
+            state,
+            existing_draft,
+            reasons=("finalization_still_unresolved",),
+        )
     if str(queue.get("reason") or "") == "resolver failed":
+        if existing_draft.get("status") == "ready_for_review":
+            _invalidate_semantic_draft(
+                state,
+                existing_draft,
+                reasons=("finalization_provider_failed",),
+            )
         record = model_provider_failure_record("resolver_failed")
         state["failure_recovery"] = {"status": "pending", "record": record}
         _replace_response_fragments(
@@ -1363,6 +1945,34 @@ def admit_turn_step(state: AgentGraphState) -> AgentGraphState:
         list(state.get("proposed_actions") or []),
     )
     if admission.status == "rejected":
+        draft = dict(state.get("semantic_plan_draft") or {})
+        rejection_codes = {item.code for item in admission.rejections}
+        if (
+            draft.get("status") == "awaiting_clarification"
+            and "pending_answer_invalidated" in rejection_codes
+            and (state.get("pending_question") or {}).get(
+                "semantic_draft_binding"
+            )
+        ):
+            _invalidate_semantic_draft(
+                state,
+                draft,
+                reasons=("incompatible_sibling_mutation",),
+            )
+            state["pending_question"] = {}
+            state["semantic_planning"] = {}
+            state["proposed_actions"] = []
+            return _set_turn_phase(
+                state,
+                "plan",
+                "semantic_draft_invalidated_by_complete_turn",
+            )
+        if draft.get("status") == "ready_for_review":
+            _invalidate_semantic_draft(
+                state,
+                draft,
+                reasons=("final_admission_rejected",),
+            )
         state["action_errors"] = [
             {
                 "code": rejection.code,
@@ -1449,7 +2059,14 @@ def admit_turn_step(state: AgentGraphState) -> AgentGraphState:
     origin_group = str(state.get("active_group") or "")
     turn_local_actions = [item for item in actions if action_is_turn_local(item)]
     durable_actions = [item for item in actions if not action_is_turn_local(item)]
+    draft = dict(state.get("semantic_plan_draft") or {})
     if not _has_meaningful_queue(actions):
+        if draft.get("status") == "ready_for_review":
+            _invalidate_semantic_draft(
+                state,
+                draft,
+                reasons=("finalization_produced_no_actions",),
+            )
         pending = state.get("pending_question") or {}
         if pending:
             _replace_response_fragments(
@@ -1464,8 +2081,6 @@ def admit_turn_step(state: AgentGraphState) -> AgentGraphState:
             )
             return _set_turn_phase(state, "compose", "semantic_input_not_admitted")
         return _set_turn_phase(state, "fallback", "no_admitted_actions")
-    for action in actions:
-        _record_admitted_action(state, action, source="semantic_plan")
     pending = state.get("pending_question") or {}
     existing_queue = [
         _admission_action_from_envelope(item)
@@ -1487,6 +2102,71 @@ def admit_turn_step(state: AgentGraphState) -> AgentGraphState:
         # answer supersedes every pre-existing queue entry regardless of
         # whether a legacy checkpoint happens to contain plan-like metadata.
         existing_queue = []
+    finalizing_ready_draft = bool(
+        draft.get("status") == "ready_for_review"
+        and all(
+            str(item.get("type") or "")
+            != "reenter_secret_reference"
+            for item in actions
+        )
+    )
+    if finalizing_ready_draft:
+        if any(
+            (ACTION_BY_TYPE.get(str(item.get("type") or "")) is not None)
+            and ACTION_BY_TYPE[str(item.get("type") or "")].effect == "execution"
+            for item in actions
+        ):
+            _invalidate_semantic_draft(
+                state,
+                draft,
+                reasons=("external_execution_requires_fresh_authorization",),
+            )
+            state["proposed_actions"] = []
+            state["action_errors"] = [{
+                "code": "semantic_draft_external_execution_rejected",
+                "message": (
+                    "external execution requires a fresh authorization turn"
+                ),
+                "action_indexes": [
+                    index
+                    for index, item in enumerate(actions)
+                    if (
+                        ACTION_BY_TYPE.get(str(item.get("type") or "")) is not None
+                        and ACTION_BY_TYPE[
+                            str(item.get("type") or "")
+                        ].effect == "execution"
+                    )
+                ],
+            }]
+            return _set_turn_phase(
+                state,
+                "fallback",
+                "semantic_draft_external_execution_rejected",
+            )
+        for action in actions:
+            secret_bindings = _semantic_secret_bindings(draft, action)
+            if secret_bindings:
+                action["_semantic_secret_bindings"] = secret_bindings
+        finalization_receipt = build_semantic_draft_finalization_receipt(
+            draft,
+            actions,
+        )
+        for action in actions:
+            action["_semantic_draft_finalization_receipt"] = deepcopy(
+                finalization_receipt
+            )
+        _validate_admission_transaction(
+            state,
+            actions,
+            current_submission=True,
+        )
+    else:
+        for action in actions:
+            secret_bindings = _turn_secret_bindings(state, action)
+            if secret_bindings:
+                action["_semantic_secret_bindings"] = secret_bindings
+    for action in actions:
+        _record_admitted_action(state, action, source="semantic_plan")
     ordered_actions = _order_action_queue(state, [
         *turn_local_actions,
         *_merge_durable_action_queue(existing_queue, durable_actions),
@@ -1498,6 +2178,26 @@ def admit_turn_step(state: AgentGraphState) -> AgentGraphState:
         default_origin_group=origin_group,
         default_plan_scope=scope,
     )
+    register_state_secret_bindings(
+        state,
+        [
+            binding
+            for action in actions
+            for binding in action.get("_semantic_secret_bindings") or ()
+            if isinstance(binding, Mapping)
+        ],
+    )
+    secret_candidate = {
+        **state,
+        "action_queue": ordered_queue,
+    }
+    try:
+        reconcile_state_secret_bindings(secret_candidate)
+    except ValueError as exc:
+        raise StateInvariantError(str(exc)) from exc
+    state["secret_bindings"] = list(
+        secret_candidate.get("secret_bindings") or []
+    )
     queue_deferred_by_pending_contract = bool(
         pending
         and ordered_queue
@@ -1507,14 +2207,45 @@ def admit_turn_step(state: AgentGraphState) -> AgentGraphState:
         )
     )
     if queue_deferred_by_pending_contract:
-        pending["resume_action_queue"] = True
-        state["pending_question"] = pending
-    if pending.get("queue_barrier") is True and queue_deferred_by_pending_contract:
-        state["action_queue"] = ordered_queue
-        return _set_turn_phase(state, "compose", "pending_contract_barrier")
+        _set_pending_queue_resume(state, enabled=True)
+    _discard_unreferenced_action_secrets(
+        state.get("action_queue") or [],
+        ordered_queue,
+        state,
+    )
     state["action_queue"] = ordered_queue
     state["completed_actions"] = []
     state["action_errors"] = []
+    if finalizing_ready_draft:
+        state.setdefault("audit_events", []).append({
+            "event": "semantic_draft_finalized",
+            **deepcopy(finalization_receipt),
+        })
+        state.setdefault("turn_context", {})[
+            "semantic_draft_finalization_receipt"
+        ] = deepcopy(finalization_receipt)
+        retained_secret_refs = {
+            str(binding.get("reference") or "")
+            for action in actions
+            for binding in action.get("_semantic_secret_bindings") or ()
+            if isinstance(binding, Mapping)
+            and str(binding.get("reference") or "")
+        }
+        for binding in draft.get("source_secret_bindings") or ():
+            if not isinstance(binding, Mapping):
+                continue
+            reference = str(binding.get("reference") or "")
+            if reference and reference not in retained_secret_refs:
+                discard_secret_reference(reference)
+        for atom in draft.get("unresolved_atoms") or ():
+            if not isinstance(atom, Mapping):
+                continue
+            reference = str(atom.get("resolution_ref") or "")
+            if reference and reference not in retained_secret_refs:
+                discard_secret_reference(reference)
+        state["semantic_plan_draft"] = {}
+    if pending.get("queue_barrier") is True and queue_deferred_by_pending_contract:
+        return _set_turn_phase(state, "compose", "pending_contract_barrier")
     if state.get("action_queue"):
         return _set_turn_phase(state, "execute", "actions_admitted")
     if state.get("pending_question"):
@@ -1562,6 +2293,12 @@ def select_action_step(state: AgentGraphState) -> AgentGraphState:
         queued_envelope = dict(queue[0])
     envelope = action_envelope_from_dict(queued_envelope)
     action = _queue_action(queued_envelope)
+    finalization_receipt = dict(
+        envelope.admission_metadata.get(
+            "semantic_draft_finalization_receipt"
+        )
+        or {}
+    )
     try:
         _validate_admission_transaction(
             state,
@@ -1581,22 +2318,24 @@ def select_action_step(state: AgentGraphState) -> AgentGraphState:
             "durable_admission_metadata_rejected",
         )
     target_group = resolve_action_target_group(action)
-    prerequisite = next(
-        (
-            capability
-            for capability in sorted(_action_requirements(state, action))
-            if not _state_has_capability(state, capability)
-            and capability in ALLOWED_GROUPS
-        ),
-        "",
-    )
+    prerequisite = ""
+    if not finalization_receipt:
+        prerequisite = next(
+            (
+                capability
+                for capability in sorted(_action_requirements(state, action))
+                if not _state_has_capability(state, capability)
+                and capability in ALLOWED_GROUPS
+            ),
+            "",
+        )
     if prerequisite:
         control = dict(state.get("control") or {})
         control["deferred_group"] = target_group
         state["control"] = control
         state = _activate_group_question(state, prerequisite)
         if state.get("pending_question"):
-            state["pending_question"]["resume_action_queue"] = True
+            _set_pending_queue_resume(state, enabled=True)
         return _set_turn_phase(
             state,
             "compose",
@@ -1813,8 +2552,10 @@ def _serialize_admitted_actions(
                 or default_origin_group
             ),
             origin_text=str(
-                action.get("_origin_text")
-                or default_origin_text
+                redact_secret_references(
+                    action.get("_origin_text")
+                    or default_origin_text
+                )
             ),
             plan_scope=str(
                 action.get("_plan_scope")
@@ -1825,14 +2566,302 @@ def _serialize_admitted_actions(
     return serialized
 
 
+def _secret_reference_paths(
+    value: Any,
+    path: tuple[str | int, ...] = (),
+) -> list[tuple[tuple[str | int, ...], str]]:
+    if isinstance(value, str):
+        return [
+            (path, match.group(0))
+            for match in re.finditer(
+                r"semantic-secret:[A-Za-z0-9_-]+",
+                value,
+            )
+        ]
+    if isinstance(value, Mapping):
+        return [
+            row
+            for key, item in value.items()
+            for row in _secret_reference_paths(item, (*path, str(key)))
+        ]
+    if isinstance(value, list):
+        return [
+            row
+            for index, item in enumerate(value)
+            for row in _secret_reference_paths(item, (*path, index))
+        ]
+    return []
+
+
+def _semantic_secret_bindings(
+    draft: Mapping[str, Any],
+    action: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    bindings_by_reference = {
+        str(atom.get("resolution_ref") or ""): dict(atom)
+        for atom in draft.get("unresolved_atoms") or ()
+        if isinstance(atom, Mapping)
+        and str(atom.get("resolution_ref") or "")
+    }
+    bindings_by_reference.update({
+        str(binding.get("reference") or ""): {
+            "atom_id": str(binding.get("atom_id") or ""),
+            "resolution_hash": str(binding.get("value_hash") or ""),
+        }
+        for binding in draft.get("source_secret_bindings") or ()
+        if isinstance(binding, Mapping)
+        and str(binding.get("reference") or "")
+    })
+    bindings: list[dict[str, Any]] = []
+    business_action = {
+        key: value
+        for key, value in action.items()
+        if not str(key).startswith("_")
+        and key not in {"action_id", "confidence", "reason"}
+    }
+    for path, reference in _secret_reference_paths(business_action):
+        atom = bindings_by_reference.get(reference)
+        if atom is None:
+            raise StateInvariantError(
+                "semantic action contains an unbound secret reference"
+            )
+        bindings.append({
+            "path": list(path),
+            "reference": reference,
+            "draft_id": str(draft.get("draft_id") or ""),
+            "atom_id": str(atom.get("atom_id") or ""),
+            "value_hash": str(atom.get("resolution_hash") or ""),
+        })
+    return bindings
+
+
+def _turn_secret_bindings(
+    state: Mapping[str, Any],
+    action: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Bind ingress references used by one admitted action to exact paths."""
+
+    available = {
+        str(binding.get("reference") or ""): dict(binding)
+        for binding in (
+            state.get("turn_context") or {}
+        ).get("input_secret_bindings") or ()
+        if isinstance(binding, Mapping)
+        and str(binding.get("reference") or "")
+    }
+    bindings: list[dict[str, Any]] = []
+    business_action = {
+        key: value
+        for key, value in action.items()
+        if not str(key).startswith("_")
+        and key not in {"action_id", "confidence", "reason"}
+    }
+    for path, reference in _secret_reference_paths(business_action):
+        source = available.get(reference)
+        if source is None:
+            raise StateInvariantError(
+                "admitted action contains an unbound ingress secret reference"
+            )
+        bindings.append({
+            "path": list(path),
+            "reference": reference,
+            "draft_id": str(source.get("draft_id") or ""),
+            "atom_id": str(source.get("atom_id") or ""),
+            "value_hash": str(source.get("value_hash") or ""),
+        })
+    return bindings
+
+
+def _value_at_path(value: Any, path: list[str | int]) -> Any:
+    current = value
+    for key in path:
+        if isinstance(key, int) and isinstance(current, list):
+            current = current[key]
+        elif isinstance(key, str) and isinstance(current, Mapping):
+            current = current[key]
+        else:
+            raise StateInvariantError("semantic secret binding path is invalid")
+    return current
+
+
+def _replace_value_at_path(
+    value: Any,
+    path: list[str | int],
+    replacement: str,
+) -> None:
+    if not path:
+        raise StateInvariantError("semantic secret binding path cannot be empty")
+    parent = value
+    for key in path[:-1]:
+        if isinstance(key, int) and isinstance(parent, list):
+            parent = parent[key]
+        elif isinstance(key, str) and isinstance(parent, dict):
+            parent = parent[key]
+        else:
+            raise StateInvariantError("semantic secret binding path is invalid")
+    key = path[-1]
+    if isinstance(key, int) and isinstance(parent, list):
+        parent[key] = replacement
+    elif isinstance(key, str) and isinstance(parent, dict):
+        parent[key] = replacement
+    else:
+        raise StateInvariantError("semantic secret binding path is invalid")
+
+
+def _materialize_semantic_secret_bindings(
+    action: dict[str, Any],
+    envelope: ActionEnvelope,
+) -> dict[str, Any]:
+    """Resolve admitted secret refs only for the selected domain invocation."""
+
+    bindings = envelope.admission_metadata.get("semantic_secret_bindings") or ()
+    for raw in bindings:
+        if not isinstance(raw, Mapping):
+            raise StateInvariantError("semantic secret binding is invalid")
+        path = [
+            int(item) if isinstance(item, int) and not isinstance(item, bool)
+            else str(item)
+            for item in raw.get("path") or ()
+        ]
+        reference = str(raw.get("reference") or "")
+        current = _value_at_path(action, path)
+        if not isinstance(current, str) or reference not in current:
+            raise StateInvariantError("semantic secret reference binding changed")
+        value = resolve_secret_reference(
+            reference,
+            draft_id=str(raw.get("draft_id") or ""),
+            atom_id=str(raw.get("atom_id") or ""),
+            expected_hash=str(raw.get("value_hash") or ""),
+        )
+        if value is None:
+            raise StateInvariantError("semantic secret reference is unavailable")
+        if path != ["source_evidence"]:
+            _replace_value_at_path(
+                action,
+                path,
+                current.replace(reference, value),
+            )
+    return action
+
+
+def _project_secret_values_to_references(
+    value: Any,
+    envelope: ActionEnvelope,
+) -> Any:
+    """Remove materialized secret values before a domain result is durable."""
+
+    replacements: dict[str, str] = {}
+    for raw in (
+        envelope.admission_metadata.get("semantic_secret_bindings") or ()
+    ):
+        if not isinstance(raw, Mapping):
+            raise StateInvariantError("semantic secret binding is invalid")
+        reference = str(raw.get("reference") or "")
+        secret = resolve_secret_reference(
+            reference,
+            draft_id=str(raw.get("draft_id") or ""),
+            atom_id=str(raw.get("atom_id") or ""),
+            expected_hash=str(raw.get("value_hash") or ""),
+        )
+        if secret is None:
+            raise StateInvariantError("semantic secret reference is unavailable")
+        replacements[secret] = reference
+
+    def project(item: Any) -> Any:
+        if isinstance(item, str):
+            result = item
+            for secret, reference in replacements.items():
+                result = result.replace(secret, reference)
+            return result
+        if isinstance(item, Mapping):
+            return {key: project(child) for key, child in item.items()}
+        if isinstance(item, list):
+            return [project(child) for child in item]
+        if isinstance(item, tuple):
+            return tuple(project(child) for child in item)
+        return item
+
+    return project(value)
+
+
+def _project_handler_result_secrets(
+    result: HandlerResult,
+    envelope: ActionEnvelope,
+) -> HandlerResult:
+    payload = handler_result_to_dict(result)
+    return handler_result_from_dict(
+        _project_secret_values_to_references(payload, envelope)
+    )
+
+
+def _secret_references_in_envelopes(
+    envelopes: Any,
+) -> set[str]:
+    references: set[str] = set()
+    for payload in envelopes or ():
+        if not isinstance(payload, Mapping) or not _is_serialized_action_envelope(
+            payload
+        ):
+            continue
+        envelope = action_envelope_from_dict(payload)
+        for binding in (
+            envelope.admission_metadata.get("semantic_secret_bindings") or ()
+        ):
+            if isinstance(binding, Mapping):
+                reference = str(binding.get("reference") or "")
+                if reference:
+                    references.add(reference)
+    return references
+
+
+def _discard_unreferenced_action_secrets(
+    removed: Any,
+    retained: Any,
+    state: Mapping[str, Any] | None = None,
+) -> None:
+    retained_refs = _secret_references_in_envelopes(retained)
+    retained_refs.update(
+        str(item.get("reference") or "")
+        for item in (state or {}).get("secret_bindings") or ()
+        if isinstance(item, Mapping)
+    )
+    for reference in _secret_references_in_envelopes(removed) - retained_refs:
+        discard_secret_reference(reference)
+
+
 def _domain_action_from_envelope(
     state: AgentGraphState,
     payload: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Build the owner input from trusted envelope provenance."""
 
-    action = _action_from_envelope(payload)
     envelope = action_envelope_from_dict(payload)
+    action = _materialize_semantic_secret_bindings(
+        _action_from_envelope(payload),
+        envelope,
+    )
+    state_secret_identity_fields = (
+        frozenset({
+            "source_evidence",
+            "scope_id",
+            "owner_kind",
+            "owner_id",
+            "owner_revision",
+            "reference",
+            "atom_id",
+            "value_hash",
+        })
+        if envelope.action_type == "reenter_secret_reference"
+        else frozenset({"source_evidence"})
+    )
+    try:
+        action = materialize_state_secret_references(
+            action,
+            state,
+            skip_keys=state_secret_identity_fields,
+        )
+    except ValueError as exc:
+        raise StateInvariantError(str(exc)) from exc
     origin_text = envelope.origin_text
     if envelope.action_type == "propose_config_values":
         action["source_text"] = origin_text
@@ -1990,6 +3019,7 @@ def invoke_idempotent_side_effect_step(state: AgentGraphState) -> AgentGraphStat
         deepcopy(candidate),
         _action_proposal(action, envelope.confidence),
     )
+    result = _project_handler_result_secrets(result, envelope)
     serialized_result = handler_result_to_dict(result)
     job_id = ""
     for write in result.delta.writes:
@@ -2071,6 +3101,7 @@ def prepare_selected_owner_result_step(
             action,
             envelope,
         )
+        result = _project_handler_result_secrets(result, envelope)
         candidate = _set_turn_phase(candidate, "commit", "pending_result_prepared")
         candidate["pending_domain_result"] = pending_domain_result_to_dict(
             PendingDomainResult(
@@ -2093,6 +3124,7 @@ def prepare_selected_owner_result_step(
         handler_state,
         _action_proposal(action, envelope.confidence),
     )
+    result = _project_handler_result_secrets(result, envelope)
     spec = ACTION_BY_TYPE.get(envelope.action_type)
     if spec is not None and spec.lifetime == "turn_local":
         allowed_roots = set(spec.turn_local_result_roots)
@@ -2240,6 +3272,42 @@ def _prepare_pending_answer_result(
             followup_actions=(followup,),
             completion="completed",
         )
+    declared_manual = (
+        dict(pending.get("manual_action") or {})
+        if isinstance(pending.get("manual_action"), Mapping)
+        else {}
+    )
+    if (
+        declared_manual
+        and str(declared_manual.get("type") or "") != "answer_pending"
+        and (
+            isinstance(pending.get("semantic_draft_binding"), Mapping)
+            or isinstance(pending.get("secret_reentry_binding"), Mapping)
+        )
+    ):
+        value_argument = str(declared_manual.pop("value_argument", "") or "")
+        followup = {
+            key: item
+            for key, item in declared_manual.items()
+            if key != "type"
+        }
+        followup["type"] = str(declared_manual.get("type") or "")
+        followup[value_argument] = value
+        spec = ACTION_BY_TYPE.get(followup["type"])
+        if (
+            spec is not None
+            and "source_evidence" in spec.allowed_arguments
+            and not str(followup.get("source_evidence") or "").strip()
+        ):
+            followup["source_evidence"] = str(raw_answer or value or "").strip()
+        followup["confidence"] = "high"
+        followup["selection_contract_verified"] = True
+        return HandlerResult(
+            consumed_action_ids=(envelope.action_id,),
+            clear_pending=not bool(spec is not None and spec.preserve_pending),
+            followup_actions=(followup,),
+            completion="completed",
+        )
     question_id = str(pending.get("id") or "")
     group = str(pending.get("group") or "")
     pending_owner = str(
@@ -2296,8 +3364,10 @@ def commit_selected_action_step(state: AgentGraphState) -> AgentGraphState:
     before_pending = dict(candidate.get("pending_question") or {})
     before_pending_id = str(before_pending.get("id") or "")
     spec = ACTION_BY_TYPE.get(envelope.action_type)
-    candidate["action_queue"] = queue[1:]
-    if envelope.action_type == "answer_pending":
+    candidate["action_queue"] = (
+        queue if prepared.result.blocker else queue[1:]
+    )
+    if envelope.action_type == "answer_pending" and not prepared.result.blocker:
         _discard_superseded_queue_actions(candidate, before_pending)
     candidate["pending_domain_result"] = {}
     candidate["selected_action"] = {}
@@ -2316,13 +3386,68 @@ def commit_selected_action_step(state: AgentGraphState) -> AgentGraphState:
         }
     ):
         candidate["pending_question"] = {}
+    finalization_receipt = dict(
+        envelope.admission_metadata.get(
+            "semantic_draft_finalization_receipt"
+        )
+        or {}
+    )
+    if finalization_receipt and prepared.result.blocker:
+        raise StateInvariantError(
+            "semantic draft finalization transaction blocked before publish: "
+            f"{prepared.result.blocker.code}"
+        )
+    if finalization_receipt and not prepared.result.blocker:
+        candidate.setdefault("audit_events", []).append({
+            "event": "semantic_draft_finalization_action_applied",
+            "draft_id": str(finalization_receipt.get("draft_id") or ""),
+            "receipt_hash": str(finalization_receipt.get("receipt_hash") or ""),
+            "admission_transaction_hash": str(
+                finalization_receipt.get("admission_transaction_hash") or ""
+            ),
+            "action_id": envelope.action_id,
+        })
     committed = _apply_handler_result(
         candidate,
         prepared.result,
         owner=envelope.owner,
     )
+    register_state_secret_bindings(
+        committed,
+        envelope.admission_metadata.get("semantic_secret_bindings") or (),
+    )
+    try:
+        reconcile_state_secret_bindings(committed)
+    except ValueError as exc:
+        raise StateInvariantError(str(exc)) from exc
+    remaining_finalized_actions = []
+    if finalization_receipt:
+        remaining_finalized_actions = [
+            item
+            for item in committed.get("action_queue") or ()
+            if isinstance(item, Mapping)
+            and str(
+                (
+                    (item.get("admission_metadata") or {}).get(
+                        "semantic_draft_finalization_receipt"
+                    )
+                    or {}
+                ).get("receipt_hash")
+                or ""
+            )
+            == str(finalization_receipt.get("receipt_hash") or "")
+        ]
+    if finalization_receipt and remaining_finalized_actions:
+        # A finalized pure plan is one Product Head transaction. Questions
+        # produced by intermediate domain handlers are deferred until every
+        # action succeeds, so a later blocker can roll back the whole attempt.
+        committed["pending_question"] = {}
+        control = dict(committed.get("control") or {})
+        control.pop("deferred_group", None)
+        committed["control"] = control
     if (
-        prepared.result.completion == "in_progress"
+        not remaining_finalized_actions
+        and prepared.result.completion == "in_progress"
         and prepared.result.next_group
         and not committed.get("pending_question")
     ):
@@ -2354,7 +3479,7 @@ def commit_selected_action_step(state: AgentGraphState) -> AgentGraphState:
             )
             _install_pending_question(committed, next_question)
     if committed.get("pending_question") and committed.get("action_queue"):
-        committed["pending_question"]["resume_action_queue"] = True
+        _set_pending_queue_resume(committed, enabled=True)
     defer_after_answer = False
     if envelope.action_type == "answer_pending":
         committed = _resume_field_reconfiguration_after_prerequisite(
@@ -2367,18 +3492,19 @@ def commit_selected_action_step(state: AgentGraphState) -> AgentGraphState:
             == before_pending_id
             and prepared.result.completion == "blocked"
         ):
-            committed["pending_question"]["created_turn_index"] = int(
-                committed.get("turn_index") or 0
+            committed["pending_question"] = with_pending_question_created_turn(
+                committed["pending_question"],
+                created_turn_index=int(committed.get("turn_index") or 0),
             )
         if (
             prepared.result.completion == "blocked"
             and committed.get("pending_question")
             and committed.get("action_queue")
         ):
-            committed["pending_question"]["resume_action_queue"] = True
+            _set_pending_queue_resume(committed, enabled=True)
             defer_after_answer = True
         elif committed.get("pending_question") and committed.get("action_queue"):
-            committed["pending_question"]["resume_action_queue"] = True
+            _set_pending_queue_resume(committed, enabled=True)
             if (
                 not _queue_has_eligible_action(committed)
             ):
@@ -2402,7 +3528,7 @@ def commit_selected_action_step(state: AgentGraphState) -> AgentGraphState:
     if not rejected:
         if spec is None or spec.lifetime != "turn_local":
             completed = list(committed.get("completed_actions") or [])
-            completed.append(action)
+            completed.append(redact_secret_references(action))
             committed["completed_actions"] = completed[-20:]
         if envelope.action_id:
             applied = list(committed.get("applied_action_ids") or [])
@@ -2426,6 +3552,24 @@ def commit_selected_action_step(state: AgentGraphState) -> AgentGraphState:
                 ) + result_count
                 committed["turn_context"] = turn_context
     committed["current_action"] = {}
+    try:
+        reconcile_state_secret_bindings(committed)
+    except ValueError as exc:
+        raise StateInvariantError(str(exc)) from exc
+    if not rejected:
+        _discard_unreferenced_action_secrets(
+            queue,
+            committed.get("action_queue") or [],
+            committed,
+        )
+    draft_finalization = _prepare_ready_semantic_draft_finalization(committed)
+    if draft_finalization:
+        validate_state(committed)
+        return _set_turn_phase(
+            committed,
+            str(draft_finalization["phase"]),
+            str(draft_finalization["reason"]),
+        )
     if (
         spec is not None
         and spec.lifetime == "turn_local"
@@ -2458,6 +3602,100 @@ def commit_selected_action_step(state: AgentGraphState) -> AgentGraphState:
         return _set_turn_phase(committed, "compose", "action_committed_pending")
     validate_state(committed)
     return _set_turn_phase(committed, "fallback", "action_committed_queue_complete")
+
+
+def _prepare_ready_semantic_draft_finalization(
+    state: AgentGraphState,
+) -> dict[str, str] | None:
+    """Prepare a ready draft for full recompilation without applying candidates."""
+
+    ready_draft = dict(state.get("semantic_plan_draft") or {})
+    if ready_draft.get("status") != "ready_for_review":
+        return None
+    stale_reasons = semantic_draft_staleness_reasons(ready_draft, state)
+    if stale_reasons:
+        _invalidate_semantic_draft(
+            state,
+            ready_draft,
+            reasons=stale_reasons,
+        )
+        state["pending_question"] = {}
+        return {
+            "phase": "fallback",
+            "reason": "semantic_draft_precondition_changed",
+        }
+    missing_secret_bindings = missing_semantic_draft_secret_bindings(
+        ready_draft
+    )
+    if missing_secret_bindings:
+        missing = missing_secret_bindings[0]
+        question = _secret_reentry_question(
+            str(ready_draft.get("source_active_group") or "opening"),
+            {
+                "scope_id": str(missing.get("draft_id") or ""),
+                "owner_kind": "semantic_draft",
+                "owner_id": str(ready_draft.get("draft_id") or ""),
+                "owner_revision": int(ready_draft.get("revision") or 0),
+                "reference": str(missing.get("reference") or ""),
+                "atom_id": str(missing.get("atom_id") or ""),
+                "value_hash": str(missing.get("value_hash") or ""),
+            },
+        )
+        _install_pending_question(state, question)
+        turn_context = dict(state.get("turn_context") or {})
+        turn_context.pop("semantic_draft_finalization", None)
+        state["turn_context"] = turn_context
+        return {
+            "phase": "compose",
+            "reason": "semantic_draft_secret_reentry_required",
+        }
+    state["pending_question"] = dict(
+        ready_draft.get("source_pending_question") or {}
+    )
+    state["active_group"] = str(
+        ready_draft.get("source_active_group") or "opening"
+    )
+    turn_context = dict(state.get("turn_context") or {})
+    turn_context.update({
+        "text": str(ready_draft.get("original_input") or ""),
+        "semantic_draft_finalization": {
+            "draft_id": str(ready_draft.get("draft_id") or ""),
+            "revision": int(ready_draft.get("revision") or 0),
+        },
+    })
+    clarification_receipt = dict(state.get("turn_receipt") or {})
+    if clarification_receipt:
+        turn_context["semantic_draft_clarification_receipt"] = (
+            clarification_receipt
+        )
+    replay_receipt = turn_receipt_to_dict(TurnReceipt(
+        turn_id=(
+            f"semantic-draft:{ready_draft.get('draft_id')}:"
+            f"{int(ready_draft.get('revision') or 0)}"
+        ),
+        input_hash=str(ready_draft.get("original_input_hash") or ""),
+        language=str(state.get("language") or "en"),
+        input_shape="semantic_draft_finalization",
+        clauses=tuple(
+            dict(item)
+            for item in ready_draft.get("source_clauses") or ()
+            if isinstance(item, Mapping)
+        ),
+        pending_before=dict(
+            ready_draft.get("source_pending_question") or {}
+        ),
+    ))
+    turn_context["semantic_draft_replay_receipt_id"] = str(
+        replay_receipt.get("turn_id") or ""
+    )
+    state["turn_context"] = turn_context
+    state["turn_receipt"] = replay_receipt
+    state["semantic_planning"] = {}
+    state["proposed_actions"] = []
+    return {
+        "phase": "plan",
+        "reason": "semantic_draft_ready_for_finalization",
+    }
 
 
 def _prepared_state_hash(state: Mapping[str, Any]) -> str:
@@ -2551,6 +3789,9 @@ def compose_turn_step(state: AgentGraphState) -> AgentGraphState:
             ],
         },
     )
+    turn_context = dict(state.get("turn_context") or {})
+    turn_context.pop("input_secret_bindings", None)
+    state["turn_context"] = turn_context
     return _set_turn_phase(state, "end", "response_composed")
 
 
@@ -2960,6 +4201,70 @@ def _apply_handler_result(
                 f"unsupported workflow goal command: {command.operation}"
             )
         candidate["workflow_goals"] = goals
+    if result.semantic_draft_command is not None:
+        command = result.semantic_draft_command
+        current_draft = validate_semantic_plan_draft(
+            candidate.get("semantic_plan_draft") or {}
+        )
+        if command.operation == "resolve":
+            candidate["semantic_plan_draft"] = resolve_semantic_draft_atom(
+                current_draft,
+                draft_id=command.draft_id,
+                revision=command.revision,
+                atom_id=command.atom_id,
+                resolution=command.resolution,
+                resolution_hash=command.resolution_hash,
+                resolution_ref=command.resolution_ref,
+            )
+        elif command.operation == "cancel":
+            if (
+                str(current_draft.get("draft_id") or "") != command.draft_id
+                or int(current_draft.get("revision") or 0) != command.revision
+            ):
+                raise StateInvariantError("semantic draft cancellation binding mismatch")
+            candidate["semantic_plan_draft"] = cancel_semantic_plan_draft(
+                current_draft,
+                reason=command.reason,
+            )
+            discard_draft_secret_references(current_draft)
+        elif command.operation == "previous":
+            reopened = reopen_previous_semantic_draft_atom(
+                current_draft,
+                draft_id=command.draft_id,
+                revision=command.revision,
+                atom_id=command.atom_id,
+            )
+            retained_refs = {
+                str(atom.get("resolution_ref") or "")
+                for atom in reopened.get("unresolved_atoms") or ()
+                if isinstance(atom, Mapping)
+            }
+            for atom in current_draft.get("unresolved_atoms") or ():
+                if not isinstance(atom, Mapping):
+                    continue
+                reference = str(atom.get("resolution_ref") or "")
+                if reference and reference not in retained_refs:
+                    discard_secret_reference(reference)
+            candidate["semantic_plan_draft"] = reopened
+        elif command.operation == "invalidate":
+            if (
+                str(current_draft.get("draft_id") or "") != command.draft_id
+                or int(current_draft.get("revision") or 0) != command.revision
+            ):
+                raise StateInvariantError("semantic draft invalidation binding mismatch")
+            candidate["semantic_plan_draft"] = mark_semantic_plan_draft_stale(
+                current_draft,
+                reasons=tuple(
+                    item
+                    for item in command.reason.split("|")
+                    if item
+                ),
+            )
+            discard_draft_secret_references(current_draft)
+        else:
+            raise StateInvariantError(
+                f"unsupported semantic draft command: {command.operation}"
+            )
     candidate = apply_state_delta(candidate, result.delta, owner=owner)
 
     recovery_pending: dict[str, Any] | None = None
@@ -3002,7 +4307,10 @@ def _apply_handler_result(
             )
             _install_pending_question(candidate, pending)
     pending_owner = str((candidate.get("pending_question") or {}).get("group") or "").strip()
-    if pending_owner:
+    pending_is_semantic_draft = bool(
+        (candidate.get("pending_question") or {}).get("semantic_draft_binding")
+    )
+    if pending_owner and not pending_is_semantic_draft:
         candidate["active_group"] = pending_owner
         mark_group_reconfiguring(candidate, pending_owner)
     elif result.completion == "completed":
@@ -3050,7 +4358,7 @@ def _apply_handler_result(
             default_plan_scope=scope,
         )
     if candidate.get("pending_question") and not candidate.get("action_queue"):
-        candidate["pending_question"].pop("resume_action_queue", None)
+        _set_pending_queue_resume(candidate, enabled=False)
 
     candidate = _activate_ready_deferred_group(candidate)
     _append_domain_control_receipts(
@@ -3222,12 +4530,14 @@ def _commit_navigation_command(
         return candidate, followups
     if resume_group:
         _discard_cancelled_origin_from_history(candidate)
+    domain_resume = bool(resume_group)
     previous_group = resume_group or _pop_previous_group(candidate)
     if previous_group:
         candidate = _activate_group_question(
             candidate,
             previous_group,
             record_history=False,
+            reconfigure=not domain_resume,
         )
     else:
         candidate["pending_question"] = {}
@@ -3286,9 +4596,20 @@ def _apply_group_invalidation_state(
 
     invalidated = set(groups)
     if "preflight_smoke_execution" in invalidated:
+        execution_decision = str(
+            (state.get("preflight") or {}).get("decision") or ""
+        ).strip()
         state["plan"] = {}
         state["plan_file"] = ""
-        state["preflight"] = {}
+        state["preflight"] = (
+            {
+                "approved": False,
+                "decision": "declined",
+                "status": "declined",
+            }
+            if execution_decision == "declined"
+            else {}
+        )
         state["smoke"] = {}
         state["final_benchmark"] = {}
     if "job_monitoring" in invalidated:
@@ -3327,7 +4648,20 @@ def _apply_checkpoint_command(state: AgentGraphState, command: CheckpointCommand
     candidate["last_user_input"] = str(state.get("last_user_input") or "")
     candidate["turn_context"] = deepcopy(dict(state.get("turn_context") or {}))
     candidate["turn_receipt"] = deepcopy(dict(state.get("turn_receipt") or {}))
-    candidate["audit_events"] = list(state.get("audit_events") or []) + [{"event": "workflow_reset"}]
+    reset_events = [{"event": "workflow_reset"}]
+    draft = dict(state.get("semantic_plan_draft") or {})
+    discard_state_secret_references(state)
+    if draft:
+        discard_draft_secret_references(draft)
+        reset_events.append({
+            "event": "semantic_draft_reset",
+            "draft_id": str(draft.get("draft_id") or ""),
+            "draft_revision": int(draft.get("revision") or 0),
+        })
+    candidate["audit_events"] = [
+        *list(state.get("audit_events") or []),
+        *reset_events,
+    ]
     if command.command == "retain_safe":
         candidate["confirmed_config"] = deepcopy(dict(command.confirmed_config))
     return candidate
@@ -3399,7 +4733,7 @@ def _ask_next_blocking_question(state: AgentGraphState) -> AgentGraphState:
         if active_question:
             _install_pending_question(state, active_question)
             if state.get("action_queue"):
-                state["pending_question"]["resume_action_queue"] = True
+                _set_pending_queue_resume(state, enabled=True)
             return state
     # A completed handler relinquishes its active group. Shared fallback then
     # computes the earliest relevant incomplete group from validated state.
@@ -3409,7 +4743,7 @@ def _ask_next_blocking_question(state: AgentGraphState) -> AgentGraphState:
     if question:
         _install_pending_question(state, question)
         if state.get("action_queue"):
-            state["pending_question"]["resume_action_queue"] = True
+            _set_pending_queue_resume(state, enabled=True)
     else:
         next_action = compute_next_action(state)
         state["pending_question"] = {}
@@ -3495,11 +4829,19 @@ def _record_group_transition(state: AgentGraphState, next_group: str, *, record_
     mark_group_reconfiguring(state, next_group)
 
 
-def _install_pending_question(state: AgentGraphState, question: PendingQuestion) -> None:
+def _install_pending_question(
+    state: AgentGraphState,
+    question: PendingQuestion,
+    *,
+    activate_group: bool = True,
+) -> None:
     """Install one blocking contract and enter its owner's repair lifecycle."""
 
     pending = validate_pending_question_contract(dict(question))
-    pending.setdefault("created_turn_index", int(state.get("turn_index") or 0))
+    pending = with_pending_question_created_turn(
+        pending,
+        created_turn_index=int(state.get("turn_index") or 0),
+    )
     turn_context = dict(state.get("turn_context") or {})
     installed = [
         dict(item)
@@ -3513,9 +4855,38 @@ def _install_pending_question(state: AgentGraphState, question: PendingQuestion)
     state["turn_context"] = turn_context
     state["pending_question"] = pending
     group = str(pending.get("group") or "").strip()
-    if group:
+    if (
+        group
+        and activate_group
+        and not pending.get("semantic_draft_binding")
+        and not pending.get("secret_reentry_binding")
+    ):
         state["active_group"] = group
         mark_group_reconfiguring(state, group)
+
+
+def _set_pending_queue_resume(
+    state: AgentGraphState,
+    *,
+    enabled: bool,
+) -> None:
+    """Transition queue-resume behavior through the signed question contract."""
+
+    pending = dict(state.get("pending_question") or {})
+    if not pending:
+        return
+    if (
+        pending.get("semantic_draft_binding")
+        or pending.get("secret_reentry_binding")
+    ):
+        state["pending_question"] = with_pending_question_behavior(
+            pending,
+            resume_action_queue=enabled,
+        )
+    elif enabled:
+        state["pending_question"]["resume_action_queue"] = True
+    else:
+        state["pending_question"].pop("resume_action_queue", None)
 
 
 def _pop_previous_group(state: AgentGraphState) -> str:

@@ -118,6 +118,19 @@ node is a different trust boundary: it deterministically validates action
 schema, provenance, conflicts, prerequisites, pending-question contracts, and
 queue eligibility before actions become durable.
 
+When exact DemandAtoms remain unresolved, `review_plan` may create a durable
+but non-executable `SemanticPlanDraft`. Its locally validated candidates are
+evidence, not admitted actions: they cannot enter benchmark configuration,
+group readiness, or `action_queue`. The coordinator asks one revision-bound
+atom question at a time. After the final resolution it restores the original
+pending contract and active group, recompiles the complete original source
+with the resolution evidence, and reruns coverage, whole-plan review, and
+deterministic admission. Every newly admitted envelope carries the same
+finalization receipt. Session, schema, registry, pending-contract, or workflow
+precondition drift invalidates the draft; reset/cancel never commits its
+candidates. External execution requires a later fresh authorization turn and
+cannot be finalized from a draft.
+
 The persisted semantic-partition receipt names its `planning_lane` as either
 `bounded_semantic_value` or `hierarchical`. The producer, runtime-event
 validator, retained-regression verifier, and audit export share this strict
@@ -254,17 +267,19 @@ Control-plane responsibilities are deliberately separate:
 
 - `admission.py` validates proposals, conflicts, prerequisites, and semantic
   coverage before an action becomes durable;
-- `hierarchical_planner.py` is the sole product semantic-planning entry.
-  Stage A partitions the complete turn and assigns bounded owner/group routes;
-  Stage B compiles actions with owner-scoped schemas before whole-plan
-  admission;
+- `coordinator.py` is the sole product semantic-routing authority. It chooses
+  exact deterministic handling, finite-catalog bounded semantic mapping, or
+  the general hierarchical planner without creating another commit path;
+- `hierarchical_planner.py` is the sole general semantic planner. Stage A
+  partitions the complete turn and assigns bounded owner/group routes; Stage B
+  compiles actions with owner-scoped schemas before whole-plan admission;
 - `semantic_admission.py` prepares and validates immutable semantic documents
   after owner-scoped compilation. It has no planner entry and does not select a
   provider; the checkpointed `review_plan` transition supplies the configured
   provider for bounded whole-plan semantic review;
 - `bounded_semantic_lane.py` owns finite-catalog, source-anchored semantic
   mapping and its immutable evidence receipt; it has no general intent-routing
-  or state-mutation authority;
+  or state-mutation authority and cannot bypass whole-plan admission;
 - `turn_transactions.py` owns the logical Product Head, isolated physical
   attempts, reconciliation, and terminal outbox;
 - `terminal_protocol.py` owns the versioned non-secret terminal projection
@@ -367,7 +382,7 @@ edit it manually. If a user changes an earlier answer, the Harness must update
 or invalidate the affected group state and regenerate downstream runtime
 artifacts through deterministic tools.
 
-Checkpoint state uses schema version 18. Current-version turns never invoke a
+Checkpoint state uses schema version 23. Current-version turns never invoke a
 legacy action compiler. Version 12 checkpoints cross the explicit migration
 boundary; version 13 checkpoints additionally migrate deferred-queue retention
 into the typed pending-question contract; version 14 initializes typed response
@@ -375,10 +390,34 @@ fragments before persistence as version 15; version 16 materializes the
 explicit pending-question owner and typed Chain/RPC case context; and version
 17 introduces the checkpointed `semantic_planning` contract; version 18
 retires persisted turn-local response text and manifests in favor of the
-current response authority. Migration to version 18 discards incompatible
-in-flight planning and response scratch rather than resuming an owner cursor
-or response contract compiled under an older schema, while retaining
-compatible durable workflow state.
+current response authority; and version 19 introduces coordinator-owned
+`SemanticPlanDraft` state. Migration to version 19 discards incompatible
+in-flight planning, drafts, draft-bound questions, and response scratch rather
+than resuming a contract compiled under an older schema, while retaining
+compatible durable workflow state. Version 20 binds draft creation and
+finalization to the real Product Head checkpoint lineage plus the current
+group, action, and question authorities. Version 19 drafts are invalidated
+during migration because they cannot prove those bindings. A version 20 draft
+that outlives any contract-authority change is marked stale before current
+registry validation and cannot enter admission. Version 21 adds atom-level
+semantic evidence, opaque secret references, signed question scheduling
+fields, and atomic finalization receipts; incomplete version 20 finalization
+transactions are quarantined as a whole. Version 22 adds a durable-state
+secret-binding registry. Version 23 signs sensitivity into the group/question
+contract, uses salted memory-hard secret verifiers, and transacts registry
+mutations with the Product Head commit. Checkpoints and durable execution plans
+retain only opaque references and verifiers. Exact sensitive scalar answers
+are projected before the LLM and first checkpoint. In compound turns,
+deterministic typed candidates such as endpoint URLs and structured
+credentials are projected separately, preserving sibling demands for semantic
+planning; declared numbered/Y-N options are not treated as secret material.
+Raw material exists only at the job-local invocation boundary; job directories
+use mode `0700` and
+secret-capable files use mode `0600`. Runtime cleanup uses a cached ownership
+index and remains observable and retryable. Missing current-version material
+installs an exact signed question-contract-v6 re-entry contract. Version 21
+state containing raw credentials or references, and version 22 state containing
+old bindings or references, is quarantined rather than resumed.
 Older checkpoints are quarantined: only an allowlisted set of environment
 facts is exposed for reconfirmation, and old pending actions or guessed plan
 files are never resumed as executable work.

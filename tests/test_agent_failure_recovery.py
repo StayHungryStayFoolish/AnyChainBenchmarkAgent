@@ -438,6 +438,7 @@ class FailureRecoveryTest(unittest.TestCase):
     def test_invariant_failure_is_quarantined_as_recovery_state(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
         from agent.harness.invariants import StateInvariantError
+        from agent.harness.secret_refs import secret_registry_transaction
         from agent.harness.state import new_state
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -450,12 +451,15 @@ class FailureRecoveryTest(unittest.TestCase):
                 attempt = runtime._begin_turn_attempt(state)
                 candidate = dict(state)
                 candidate["active_group"] = "not-a-real-group"
-                recovered = runtime._recover_invariant_failure(
-                    state,
-                    candidate,
-                    StateInvariantError("unknown active group"),
-                    attempt,
-                )
+                with secret_registry_transaction() as transaction:
+                    recovered = runtime._recover_invariant_failure(
+                        state,
+                        candidate,
+                        StateInvariantError("unknown active group"),
+                        attempt,
+                        registry_transaction=transaction,
+                        input_secret_bindings=(),
+                    )
                 outcomes = runtime.turn_transactions.list_terminal_outcomes(
                     runtime.transaction_authority_id
                 )

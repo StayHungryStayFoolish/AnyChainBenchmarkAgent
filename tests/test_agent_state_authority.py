@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from agent.harness.questions import QUESTION_CONTRACT_VERSION
+
 
 class TerminalPersistenceAuthorityTest(unittest.TestCase):
     def test_terminal_store_persists_only_shell_ui_and_consent(self) -> None:
@@ -146,12 +148,80 @@ class InvocationContextAuthorityTest(unittest.TestCase):
         ))
         self.assertTrue(any(
             event.get("event") == "checkpoint_pending_actions_quarantined"
-            and "contract_version 3" in str(event.get("contract_error") or "")
+            and f"contract_version {QUESTION_CONTRACT_VERSION}"
+            in str(event.get("contract_error") or "")
             for event in events
         ))
         self.assertEqual(
             migrated["checkpoint_recovery"]["status"],
             "quarantined",
+        )
+
+    def test_v21_checkpoint_with_unbound_secret_reference_is_quarantined(
+        self,
+    ) -> None:
+        from agent.harness.state import STATE_SCHEMA_VERSION, migrate_state, new_state
+
+        old = new_state("v21-unbound-secret", language="en")
+        old["schema_version"] = 21
+        old.pop("secret_bindings", None)
+        old["confirmed_config"]["LOCAL_RPC_URL"] = (
+            "semantic-secret:legacy-unbound-reference"
+        )
+        old["job"] = {"job_id": "job_preserved", "status": "completed"}
+
+        migrated = migrate_state(
+            old,
+            thread_id="v21-unbound-secret",
+            language="en",
+            session_purpose="user",
+        )
+
+        self.assertEqual(migrated["schema_version"], STATE_SCHEMA_VERSION)
+        self.assertEqual(migrated["confirmed_config"], {})
+        self.assertEqual(migrated["secret_bindings"], [])
+        self.assertEqual(migrated["job"]["job_id"], "job_preserved")
+        self.assertEqual(
+            migrated["checkpoint_recovery"]["error_type"],
+            "UnsafeSecretCheckpoint",
+        )
+        self.assertTrue(any(
+            event.get("event")
+            == "checkpoint_unbound_secret_references_quarantined"
+            for event in migrated["audit_events"]
+        ))
+
+    def test_v21_checkpoint_with_raw_url_credential_is_quarantined(
+        self,
+    ) -> None:
+        from agent.harness.state import STATE_SCHEMA_VERSION, migrate_state, new_state
+
+        old = new_state("v21-raw-secret", language="en")
+        old["schema_version"] = 21
+        old.pop("secret_bindings", None)
+        old["confirmed_config"]["LOCAL_RPC_URL"] = (
+            "https://user:private-password@rpc.example.invalid"
+        )
+        old["job"] = {"job_id": "job_preserved", "status": "completed"}
+
+        migrated = migrate_state(
+            old,
+            thread_id="v21-raw-secret",
+            language="en",
+            session_purpose="user",
+        )
+
+        self.assertEqual(migrated["schema_version"], STATE_SCHEMA_VERSION)
+        self.assertEqual(migrated["confirmed_config"], {})
+        self.assertEqual(migrated["secret_bindings"], [])
+        self.assertEqual(migrated["job"]["job_id"], "job_preserved")
+        self.assertEqual(
+            migrated["checkpoint_recovery"]["error_type"],
+            "UnsafeSecretCheckpoint",
+        )
+        self.assertNotIn(
+            "private-password",
+            json.dumps(migrated, ensure_ascii=False),
         )
 
     def test_current_pending_question_id_cannot_retain_queue_without_typed_contract(self) -> None:

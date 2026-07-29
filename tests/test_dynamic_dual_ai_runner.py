@@ -30,9 +30,14 @@ from tests.agent_live.chaos_scheduler import ScheduledCoverageTarget, build_chao
 from tests.agent_live.coverage_evidence import (
     RuntimeTurnEvent,
     VerifiedPostcondition,
+    admit_pty_artifact_pair,
+    build_pty_authority_receipt,
     content_hash,
+    create_pty_authority_signer,
+    load_pty_authority_receipt,
     load_valid_evidence_reference,
     validate_pty_diagnostic_artifact,
+    validate_pty_cli_candidate_artifact,
     validate_pty_cli_evidence_artifact,
     verify_runtime_postcondition,
 )
@@ -54,7 +59,7 @@ from tests.agent_live.dynamic_dual_ai_chaos import (
     TerminalTurnFailure,
     _complete_agent_response,
     _validate_decision,
-    _verify_declared_postconditions,
+    verify_declared_postconditions,
     encode_bracketed_paste,
     transport_for_config,
     validate_startup_session_event,
@@ -153,7 +158,7 @@ class DeclaredTargetSetVerificationTest(unittest.TestCase):
             "tests.agent_live.dynamic_dual_ai_chaos.verify_runtime_postcondition",
             side_effect=[passed, failed],
         ) as verifier:
-            result = _verify_declared_postconditions(
+            result = verify_declared_postconditions(
                 SimpleNamespace(),
                 SimpleNamespace(),
                 SimpleNamespace(),
@@ -167,7 +172,7 @@ class DeclaredTargetSetVerificationTest(unittest.TestCase):
 
     def test_unknown_declared_sibling_target_fails_closed(self) -> None:
         with self.assertRaisesRegex(ValueError, "unknown coverage ids: edge-missing"):
-            _verify_declared_postconditions(
+            verify_declared_postconditions(
                 SimpleNamespace(),
                 SimpleNamespace(),
                 SimpleNamespace(),
@@ -609,6 +614,7 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
         )
         self._runtime_identity.start()
         self.addCleanup(self._runtime_identity.stop)
+        self.signer = create_pty_authority_signer()
 
     def test_config_rejects_extra_environment_identity_override(self) -> None:
         for key in ("LLM_PROVIDER", "LLM_MODEL", "AGENT_CONFIG_LOCAL"):
@@ -1014,7 +1020,7 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             }
             self.assertEqual(set(artifacts), {"dynamic_dual_ai", "real_cli"})
             for artifact in artifacts.values():
-                valid, reason = validate_pty_cli_evidence_artifact(
+                valid, reason = validate_pty_cli_candidate_artifact(
                     artifact,
                     edge=EDGE,
                     revision=REVISION,
@@ -2122,8 +2128,13 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 (root / ".agent/dynamic-chaos/contract-session/diagnostics").glob("*.json")
             )
             self.assertEqual(len(diagnostics), 1)
+            admit_pty_artifact_pair(diagnostics[0], signer=self.signer)
             diagnostic = json.loads(diagnostics[0].read_text(encoding="utf-8"))
-            valid, reason = validate_pty_diagnostic_artifact(diagnostic)
+            valid, reason = validate_pty_diagnostic_artifact(
+                diagnostic,
+                authority=load_pty_authority_receipt(diagnostics[0]),
+                trusted_public_key_b64=self.signer.public_key_b64,
+            )
             self.assertTrue(valid, reason)
             self.assertEqual(diagnostic["diagnostic_kind"], "failed_attempt")
             self.assertEqual(diagnostic["verification_status"], "postcondition_failed")
@@ -2307,7 +2318,7 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             self.assertEqual(len(result.turns), 2)
             self.assertEqual(len(result.evidence_paths), 2)
             artifact = json.loads(result.evidence_paths[0].read_text(encoding="utf-8"))
-            valid, reason = validate_pty_cli_evidence_artifact(
+            valid, reason = validate_pty_cli_candidate_artifact(
                 artifact,
                 edge=edge,
                 revision=REVISION,

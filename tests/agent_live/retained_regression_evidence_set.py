@@ -18,7 +18,10 @@ import uuid
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from tests.agent_live.coverage_evidence import content_hash
+from tests.agent_live.coverage_evidence import (
+    content_hash,
+    verify_controller_payload_signature,
+)
 from tests.agent_live.batch_orchestrator import (
     BATCH_MANIFEST_SCHEMA_VERSION,
     BATCH_RESULT_SCHEMA_VERSION,
@@ -62,6 +65,7 @@ def publish_retained_regression_evidence_set(
     open_batch_manifest_path: str | Path,
     open_batch_result_path: str | Path,
     evidence_paths: Sequence[str | Path],
+    expected_authority_trust_root_id: str,
 ) -> Path:
     """Validate and atomically publish one complete immutable G3 collection."""
 
@@ -78,6 +82,7 @@ def publish_retained_regression_evidence_set(
         open_batch_manifest_path=open_batch_manifest_path,
         open_batch_result_path=open_batch_result_path,
         evidence_paths=evidence_paths,
+        expected_authority_trust_root_id=expected_authority_trust_root_id,
     )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -103,6 +108,7 @@ def load_retained_regression_evidence_set(
     provider: Mapping[str, Any],
     obligations: Sequence[Mapping[str, Any]],
     revision: Mapping[str, str],
+    expected_authority_trust_root_id: str,
 ) -> dict[str, Any]:
     """Load only the collection declared by one immutable G3 manifest."""
 
@@ -137,6 +143,7 @@ def load_retained_regression_evidence_set(
             str(dict(row)["path"])
             for row in _required_rows(manifest, "evidence")
         ],
+        expected_authority_trust_root_id=expected_authority_trust_root_id,
     )
     if rebuilt != manifest:
         raise ValueError("G3 evidence-set manifest differs from validated sources")
@@ -152,6 +159,7 @@ def _build_validated_manifest(
     open_batch_manifest_path: str | Path,
     open_batch_result_path: str | Path,
     evidence_paths: Sequence[str | Path],
+    expected_authority_trust_root_id: str,
 ) -> dict[str, Any]:
     active_revision = _validated_revision(revision)
     validate_retained_regression_runner_provider(
@@ -194,6 +202,7 @@ def _build_validated_manifest(
             for row in provider.get("targets") or ()
             if isinstance(row, Mapping)
         },
+        expected_authority_trust_root_id=expected_authority_trust_root_id,
     )
 
     resolved_evidence = tuple(
@@ -233,6 +242,7 @@ def _build_validated_manifest(
         "obligation_count": TOTAL_EVIDENCE_COUNT,
         "exact_count": RETAINED_REGRESSION_EXACT_COUNT,
         "open_count": RETAINED_REGRESSION_OPEN_COUNT,
+        "authority_trust_root_id": expected_authority_trust_root_id,
         "exact_execution_index": _source_reference(
             exact_path,
             identity_field="index_hash",
@@ -343,6 +353,7 @@ def _validate_open_batch(
     revision: Mapping[str, str],
     obligations: Mapping[str, Mapping[str, Any]],
     provider_targets: Mapping[str, Mapping[str, Any]],
+    expected_authority_trust_root_id: str,
 ) -> dict[str, str]:
     manifest_unsigned = {
         key: value
@@ -352,6 +363,12 @@ def _validate_open_batch(
     batch_id = content_hash(manifest_unsigned)
     manifest_id = content_hash({**manifest_unsigned, "batch_id": batch_id})
     shards = _required_rows(manifest, "shards")
+    if (
+        not expected_authority_trust_root_id
+        or manifest.get("pty_authority_trust_root_id")
+        != expected_authority_trust_root_id
+    ):
+        raise ValueError("G3 open batch trust root is not externally trusted")
     open_ids = {
         obligation_id
         for obligation_id, row in obligations.items()
@@ -363,6 +380,7 @@ def _validate_open_batch(
         or manifest.get("manifest_id") != manifest_id
         or manifest.get("revision") != revision
         or manifest.get("manifest_path") != str(manifest_path)
+        or manifest.get("controller_owned_execution") is not True
         or manifest.get("shard_count") != RETAINED_REGRESSION_OPEN_COUNT
         or len(shards) != RETAINED_REGRESSION_OPEN_COUNT
         or manifest.get("worker_runtime") not in {"docker", "linux"}
@@ -427,8 +445,16 @@ def _validate_open_batch(
     if manifest.get("expected_obligation_set_hash") != observed_set_hash:
         raise ValueError("G3 open batch obligation-set hash drifted")
 
-    result_unsigned = {
-        key: value for key, value in result.items() if key != "index_id"
+    result_signed_payload = {
+        key: value
+        for key, value in result.items()
+        if key not in {"index_id", "controller_signature_b64"}
+    }
+    result_signed_index = {
+        **result_signed_payload,
+        "controller_signature_b64": str(
+            result.get("controller_signature_b64") or ""
+        ),
     }
     result_rows = _required_rows(result, "shards")
     result_shard_ids = {
@@ -436,10 +462,24 @@ def _validate_open_batch(
     }
     if (
         result.get("schema_version") != BATCH_RESULT_SCHEMA_VERSION
-        or result.get("index_id") != content_hash(result_unsigned)
+        or result.get("index_id") != content_hash(result_signed_index)
         or result.get("batch_id") != batch_id
         or result.get("manifest_id") != manifest_id
+        or result.get("execution_authority_mode") != "controller_owned_v1"
         or result.get("revision") != revision
+        or result.get("pty_authority_trust_root_id")
+        != manifest.get("pty_authority_trust_root_id")
+        or result.get("pty_authority_public_key_b64")
+        != manifest.get("pty_authority_public_key_b64")
+        or not verify_controller_payload_signature(
+            result_signed_payload,
+            signature_b64=str(
+                result.get("controller_signature_b64") or ""
+            ),
+            trusted_public_key_b64=str(
+                manifest.get("pty_authority_public_key_b64") or ""
+            ),
+        )
         or result.get("execution_status") != "discovery_complete"
         or result.get("scheduled") != RETAINED_REGRESSION_OPEN_COUNT
         or result.get("started") != RETAINED_REGRESSION_OPEN_COUNT
@@ -672,6 +712,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--open-batch-manifest", required=True, type=Path)
     parser.add_argument("--open-batch-result", required=True, type=Path)
     parser.add_argument("--open-evidence-index", required=True, type=Path)
+    parser.add_argument("--authority-trust-root-id", required=True)
     parser.add_argument("--output-dir", required=True, type=Path)
     return parser
 
@@ -704,6 +745,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         revision=revision,
         artifact_type=G3_ARTIFACT_TYPE,
         round_id="",
+        expected_authority_trust_root_id=args.authority_trust_root_id,
     )
     publish_retained_regression_evidence_set(
         output_dir=args.output_dir,
@@ -714,6 +756,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         open_batch_manifest_path=args.open_batch_manifest,
         open_batch_result_path=args.open_batch_result,
         evidence_paths=(*exact_paths, *open_paths),
+        expected_authority_trust_root_id=args.authority_trust_root_id,
     )
     return 0
 

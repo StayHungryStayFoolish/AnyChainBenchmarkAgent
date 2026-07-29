@@ -7,6 +7,7 @@ from typing import Any, Mapping
 
 from .action_registry import (
     ACTION_BY_TYPE,
+    build_admission_transaction_hash,
     lifecycle_rejected_action_indexes,
     validate_action_contract,
     validate_action_transaction_contract,
@@ -17,10 +18,16 @@ from .action_registry import (
 from .contracts import AdmissionRejection, AdmissionResult
 from .invariants import StateInvariantError
 from .questions import (
+    action_settles_pending_contract,
     pending_option_value_exists as _pending_option_value_exists,
     value_satisfies_pending_contract as _value_satisfies_pending_contract,
 )
+from .secret_refs import resolve_secret_reference
 from .state import AgentGraphState
+from .semantic_drafts import (
+    semantic_final_plan_hash,
+    validate_semantic_draft_finalization_receipt,
+)
 from agent.workflows.group_registry import invalidation_targets
 
 
@@ -31,7 +38,27 @@ def reconcile_admission_coverage(
     """Reconcile semantic coverage after rejected proposals are removed."""
 
     reconciled = deepcopy(dict(receipt))
-    action_ids_by_unit: dict[str, list[str]] = {}
+    existing_admitted = {
+        str(action_id)
+        for action_id in reconciled.get("admitted_action_ids") or []
+        if str(action_id)
+    }
+    action_ids_by_unit: dict[str, list[str]] = {
+        str(unit_id): [
+            str(action_id)
+            for action_id in action_ids
+            if str(action_id) in existing_admitted
+        ]
+        for unit_id, action_ids in dict(
+            reconciled.get("unit_action_bindings") or {}
+        ).items()
+        if str(unit_id)
+    }
+    action_ids_by_unit = {
+        unit_id: action_ids
+        for unit_id, action_ids in action_ids_by_unit.items()
+        if action_ids
+    }
     for action in actions:
         action_type = str(action.get("type") or "")
         if action_type == "unknown" or action_type not in ACTION_BY_TYPE:
@@ -42,7 +69,9 @@ def reconcile_admission_coverage(
         for unit_id in action.get("_source_unit_ids") or []:
             normalized_unit_id = str(unit_id or "")
             if normalized_unit_id:
-                action_ids_by_unit.setdefault(normalized_unit_id, []).append(action_id)
+                bound = action_ids_by_unit.setdefault(normalized_unit_id, [])
+                if action_id not in bound:
+                    bound.append(action_id)
 
     unresolved: list[str] = []
     semantic_units: list[dict[str, Any]] = []
@@ -132,8 +161,16 @@ def _canonical_pending_choice_matches(
 def _bypasses_canonical_pending_choice(
     state: AgentGraphState,
     action: Mapping[str, Any],
+    actions: tuple[Mapping[str, Any], ...],
 ) -> bool:
-    """Reject a declared option owner that bypassed canonical admission."""
+    """Reject an unreviewed or falsely claimed declared-option selection.
+
+    A registered read-only action may also be the effect of one menu option.
+    Its shape alone does not make an independent consultation a selection.
+    Whole-plan admission signs independent semantic purpose separately from
+    canonical pending-option ownership, so this boundary must preserve that
+    distinction instead of reclassifying the action.
+    """
 
     if str(action.get("type") or "") == "answer_pending":
         return False
@@ -148,8 +185,61 @@ def _bypasses_canonical_pending_choice(
         if spec is None or not spec.pending_option_admission:
             continue
         if all(key == "type" or action.get(key) == value for key, value in declared.items()):
-            return True
+            return not (
+                spec.effect == "read_only"
+                and action.get("semantic_purpose_verified") is True
+                and action.get("pending_option_semantic_verified") is not True
+                and _has_current_admission_identity(state, action, actions)
+            )
     return False
+
+
+def _has_current_admission_identity(
+    state: AgentGraphState,
+    action: Mapping[str, Any],
+    actions: tuple[Mapping[str, Any], ...],
+) -> bool:
+    """Verify one action belongs to the current Harness admission transaction."""
+
+    action_ids = tuple(
+        str(item.get("_admission_action_id") or "")
+        for item in actions
+    )
+    declared_orders = {
+        tuple(str(value) for value in item.get("_transaction_action_ids") or ())
+        for item in actions
+    }
+    transaction_hashes = {
+        str(item.get("_plan_transaction_hash") or "")
+        for item in actions
+    }
+    if (
+        not action_ids
+        or any(not action_id for action_id in action_ids)
+        or len(action_ids) != len(set(action_ids))
+        or declared_orders != {action_ids}
+        or len(transaction_hashes) != 1
+        or not next(iter(transaction_hashes), "")
+        or str(action.get("_admission_action_id") or "") not in action_ids
+    ):
+        return False
+
+    thread_id = str(state.get("thread_id") or "default")
+    session_id = str((state.get("session") or {}).get("id") or thread_id)
+    semantic_units = [
+        dict(item)
+        for item in (state.get("turn_context") or {}).get("semantic_units") or ()
+        if isinstance(item, Mapping)
+    ]
+    expected_hash = build_admission_transaction_hash(
+        thread_id=thread_id,
+        session_id=session_id,
+        submitted_turn_index=int(state.get("turn_index") or 0),
+        actions=[dict(item) for item in actions],
+        semantic_units=semantic_units,
+        admission_action_ids=list(action_ids),
+    )
+    return transaction_hashes == {expected_hash}
 
 
 def validate_action_plan(
@@ -188,7 +278,7 @@ def validate_action_plan(
     bypasses = tuple(
         index
         for index, item in enumerate(proposed)
-        if _bypasses_canonical_pending_choice(state, item)
+        if _bypasses_canonical_pending_choice(state, item, proposed)
     )
     if bypasses:
         return AdmissionResult(
@@ -296,14 +386,61 @@ def _pending_answer_is_invalidated(
 ) -> bool:
     """Return whether a sibling mutation invalidates a pending answer."""
 
-    pending_group = str((state.get("pending_question") or {}).get("group") or "").strip()
+    pending = dict(state.get("pending_question") or {})
+    pending_group = str(pending.get("group") or "").strip()
     if not pending_group:
         return False
+    pending_answer = next(
+        (
+            action
+            for action in actions
+            if action_settles_pending_contract(action, pending)
+        ),
+        None,
+    )
+    if (
+        pending_answer is not None
+        and "rejection_evidence_value" in pending
+        and pending_answer.get("selected_value")
+        == pending.get("rejection_evidence_value")
+    ):
+        return False
     for action in actions:
-        if str(action.get("type") or "") == "answer_pending":
+        if action_settles_pending_contract(action, pending):
             continue
         spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
-        if spec is None or not spec.mutation_dimension:
+        if spec is None:
+            continue
+        draft_binding = dict(pending.get("semantic_draft_binding") or {})
+        if draft_binding:
+            # A clarification and any other state/navigation/execution demand
+            # form a new complete turn. Repartition that turn instead of
+            # committing the resolution ahead of its siblings.
+            if spec.effect != "read_only":
+                return True
+            if not spec.mutation_dimension:
+                continue
+            draft = dict(state.get("semantic_plan_draft") or {})
+            relevant_groups = {
+                str(item.get("group") or "")
+                for item in (
+                    *tuple(draft.get("candidates") or ()),
+                    *tuple(draft.get("unresolved_atoms") or ()),
+                )
+                if isinstance(item, Mapping) and str(item.get("group") or "")
+            }
+            source_group = str(draft.get("source_active_group") or "")
+            if source_group:
+                relevant_groups.add(source_group)
+            target_group = str(spec.target_group or spec.mutation_dimension).strip()
+            invalidated = {
+                *spec.invalidates_groups,
+                *invalidation_targets(target_group),
+            }
+            if target_group in relevant_groups or relevant_groups & invalidated:
+                return True
+            continue
+        if not spec.mutation_dimension:
             continue
         source_group = str(spec.target_group or spec.mutation_dimension).strip()
         if pending_group in set(invalidation_targets(source_group)):
@@ -323,13 +460,23 @@ def _action_answers_pending_contract(state: AgentGraphState, action: dict[str, A
             answer = str(action.get("answer") or "").strip()
             evidence = str(action.get("source_evidence") or "").strip()
             user_text = str(state.get("last_user_input") or "")
+            contract_answer = _materialized_ingress_pending_value(
+                state,
+                answer,
+            )
             return bool(
                 pending.get("manual_input_allowed") is True
                 and answer
                 and evidence
                 and evidence in user_text
-                and answer in evidence
-                and _value_satisfies_pending_contract(answer, pending)
+                and (
+                    answer in evidence
+                    or contract_answer != answer
+                )
+                and _value_satisfies_pending_contract(
+                    contract_answer,
+                    pending,
+                )
                 and action.get("semantic_purpose_verified") is True
             )
         if not (
@@ -343,6 +490,10 @@ def _action_answers_pending_contract(state: AgentGraphState, action: dict[str, A
         selected = None
     raw_answer = selected if selected is not None else action.get("answer")
     answer = str(raw_answer or "").strip()
+    contract_answer = _materialized_ingress_pending_value(
+        state,
+        raw_answer,
+    )
     evidence = str(action.get("source_evidence") or "").strip()
     user_text = str(state.get("last_user_input") or "")
     declared_option = _pending_option_value_exists(selected, pending)
@@ -359,15 +510,49 @@ def _action_answers_pending_contract(state: AgentGraphState, action: dict[str, A
         str(pending.get("field") or "").strip().casefold(),
         str(pending.get("group") or "").strip().casefold(),
     }
-    if answer.casefold() in reserved_identifiers:
+    if str(contract_answer or "").strip().casefold() in reserved_identifiers:
         return False
     return bool(
         raw_answer not in (None, "")
         and (
             declared_option
-            or _value_satisfies_pending_contract(raw_answer, pending)
+            or _value_satisfies_pending_contract(contract_answer, pending)
         )
     )
+
+
+def _materialized_ingress_pending_value(
+    state: AgentGraphState,
+    value: Any,
+) -> Any:
+    """Resolve only a turn-bound secret reference for contract validation."""
+
+    reference = str(value or "").strip()
+    from .contracts import is_secret_reference
+
+    if not is_secret_reference(reference):
+        return value
+    binding = next(
+        (
+            dict(item)
+            for item in (
+                (state.get("turn_context") or {}).get("input_secret_bindings")
+                or ()
+            )
+            if isinstance(item, Mapping)
+            and str(item.get("reference") or "") == reference
+        ),
+        {},
+    )
+    if not binding:
+        return value
+    resolved = resolve_secret_reference(
+        reference,
+        draft_id=str(binding.get("draft_id") or ""),
+        atom_id=str(binding.get("atom_id") or ""),
+        expected_hash=str(binding.get("value_hash") or ""),
+    )
+    return value if resolved is None else resolved
 
 
 def _has_meaningful_queue(actions: list[dict[str, Any]]) -> bool:
@@ -404,8 +589,23 @@ def _validate_admission_transaction(
         actual_order = tuple(str(action.get("_admission_action_id") or "") for action in receipt_actions)
         if actual_order != tuple(value for value in declared_order if value in set(actual_order)):
             raise StateInvariantError("admission transaction action order mismatch")
+    finalization_receipts: list[dict[str, Any]] = []
     for action in actions:
         action_type = str(action.get("type") or "")
+        finalization_receipt = action.get(
+            "_semantic_draft_finalization_receipt"
+        )
+        if isinstance(finalization_receipt, Mapping):
+            try:
+                finalization_receipts.append(
+                    validate_semantic_draft_finalization_receipt(
+                        finalization_receipt,
+                        action=action,
+                        session_id=session_id,
+                    )
+                )
+            except ValueError as exc:
+                raise StateInvariantError(str(exc)) from exc
         if "_replacement_intake_receipt" in action:
             validate_replacement_intake_admission_receipt(
                 action,
@@ -431,3 +631,32 @@ def _validate_admission_transaction(
                 session_id=session_id,
                 submitted_turn_index=turn_index if current_submission else None,
             )
+    if finalization_receipts:
+        receipt_hashes = {
+            str(item.get("receipt_hash") or "")
+            for item in finalization_receipts
+        }
+        if len(receipt_hashes) != 1:
+            raise StateInvariantError(
+                "semantic draft finalization receipts are inconsistent"
+            )
+        if current_submission:
+            final_action_ids = tuple(
+                str(item)
+                for item in finalization_receipts[0].get("final_action_ids") or ()
+            )
+            actual_action_ids = tuple(
+                str(item.get("action_id") or "")
+                for item in actions
+                if item.get("_semantic_draft_finalization_receipt")
+            )
+            if actual_action_ids != final_action_ids:
+                raise StateInvariantError(
+                    "semantic draft finalization action set mismatch"
+                )
+            if semantic_final_plan_hash(actions) != str(
+                finalization_receipts[0].get("final_plan_hash") or ""
+            ):
+                raise StateInvariantError(
+                    "semantic draft finalization plan hash mismatch"
+                )

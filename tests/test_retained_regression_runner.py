@@ -45,7 +45,7 @@ from tests.agent_live.retained_regression_runner import (
     build_retained_regression_definition_manifest,
     build_product_obligation_evidence_artifact,
     build_retained_regression_runner_provider,
-    convert_completed_retained_journey_to_product_evidence,
+    _convert_retained_journey_runtime_to_product_evidence as convert_completed_retained_journey_to_product_evidence,
     execute_exact_retained_regressions,
     freeze_retained_regression_open_batch,
     RETAINED_REGRESSION_JOURNEY_VERIFIER_REGISTRY,

@@ -15,6 +15,10 @@ from ...planners.strategy_planner import (
 )
 
 from ..state import AgentGraphState
+from ..secret_refs import (
+    materialize_state_secret_references,
+    project_state_secret_values,
+)
 from ..sync_observe_contract import SyncObserveRequest
 from ..contracts import HandlerResult, RecoveryCommand, ResponseFragment, StateDelta
 from ..failures import failure_record_from_job, failure_record_from_preflight
@@ -49,15 +53,20 @@ def execute_approved_preflight_and_smoke(state: AgentGraphState) -> HandlerResul
                 completion="blocked",
             )
         recovery_command = _resolved_recovery_command(output, validation_receipt="preflight_passed")
+        runtime_plan = materialize_state_secret_references(
+            output.get("plan") or {},
+            output,
+        )
         job_result = execution_service.execute(
             ExecutionRequest(
                 operation=ExecutionOperation.SYNC_OBSERVE,
                 plan_file=str(data.get("plan_file", "")),
-                plan=output.get("plan") or None,
+                plan=runtime_plan or None,
                 approved=True,
                 idempotency_key=_execution_idempotency_key(output),
             )
         ).to_dict()
+        job_result = project_state_secret_values(job_result, output)
         output["job"] = _job_from_execution_result(job_result)
         if _execution_result_failed(job_result, output["job"]):
             return _execution_result(
@@ -97,15 +106,20 @@ def execute_approved_preflight_and_smoke(state: AgentGraphState) -> HandlerResul
     recovery_command = _resolved_recovery_command(output, validation_receipt="preflight_passed")
 
     if output.get("target_mode") == "fake-node":
+        runtime_plan = materialize_state_secret_references(
+            output.get("plan") or {},
+            output,
+        )
         smoke = execution_service.execute(
             ExecutionRequest(
                 operation=ExecutionOperation.FAKE_NODE_SMOKE,
                 plan_file=str(data.get("plan_file", "")),
-                plan=output.get("plan") or None,
+                plan=runtime_plan or None,
                 approved=True,
                 idempotency_key=_execution_idempotency_key(output),
             )
         ).to_dict()
+        smoke = project_state_secret_values(smoke, output)
         output["smoke"] = smoke
         output["job"] = _job_from_execution_result(smoke)
         if _execution_result_failed(smoke, output["job"]):
@@ -127,15 +141,20 @@ def execute_approved_preflight_and_smoke(state: AgentGraphState) -> HandlerResul
             recovery_command=recovery_command,
         )
 
+    runtime_plan = materialize_state_secret_references(
+        output.get("plan") or {},
+        output,
+    )
     smoke = execution_service.execute(
         ExecutionRequest(
             operation=ExecutionOperation.REAL_NODE_SMOKE,
             plan_file=str(data.get("plan_file", "")),
-            plan=output.get("plan") or None,
+            plan=runtime_plan or None,
             approved=True,
             idempotency_key=_execution_idempotency_key(output),
         )
     ).to_dict()
+    smoke = project_state_secret_values(smoke, output)
     smoke_job = _job_from_execution_result(smoke)
     output["smoke"] = {
         "purpose": "real_node_isolated_smoke",
@@ -169,15 +188,20 @@ def execute_approved_final_benchmark(state: AgentGraphState) -> HandlerResult:
     final = output.setdefault("final_benchmark", {})
     if final.get("job_id"):
         return HandlerResult()
+    runtime_plan = materialize_state_secret_references(
+        output.get("plan") or {},
+        output,
+    )
     result = execution_service.execute(
         ExecutionRequest(
             operation=ExecutionOperation.FINAL_BENCHMARK,
             plan_file=str(output.get("plan_file") or ""),
-            plan=output.get("plan") or None,
+            plan=runtime_plan or None,
             approved=True,
             idempotency_key=_execution_idempotency_key(output),
         )
     ).to_dict()
+    result = project_state_secret_values(result, output)
     job = (result.get("data") or {}).get("job", {})
     if not job:
         warnings = "; ".join(str(item) for item in result.get("warnings") or [] if str(item).strip())
@@ -247,7 +271,10 @@ def _execution_result(
 
 
 def _prepare_kwargs(state: AgentGraphState) -> dict[str, Any]:
-    confirmed = state.get("confirmed_config") or {}
+    confirmed = materialize_state_secret_references(
+        state.get("confirmed_config") or {},
+        state,
+    )
     qps = state.get("qps_profile") or {}
     qps_overrides = qps.get("overrides") or {}
     obs = state.get("observability") or {}
@@ -321,7 +348,7 @@ def _prepare_kwargs(state: AgentGraphState) -> dict[str, Any]:
         kwargs["rpc_methods"] = [str(method) for method in methods if str(method).strip()]
     if isinstance(weights, dict) and weights:
         kwargs["mixed_weights"] = {str(method): int(weight) for method, weight in weights.items()}
-    return kwargs
+    return materialize_state_secret_references(kwargs, state)
 
 
 def _prepare_benchmark_with_runtime_contract(state: AgentGraphState) -> dict[str, Any]:
@@ -362,15 +389,19 @@ def _prepare_benchmark_with_runtime_contract(state: AgentGraphState) -> dict[str
             prepare_kwargs=prepare_kwargs,
         )
     )
-    prepared = prepared_result.to_dict()
+    prepared = project_state_secret_values(prepared_result.to_dict(), state)
     runtime_override = prepare_kwargs.get("chain_config_override")
     if isinstance(runtime_override, dict) and runtime_override:
+        durable_override = project_state_secret_values(
+            runtime_override,
+            state,
+        )
         prepared_data = prepared.setdefault("data", {})
         plan = prepared_data.setdefault("plan", {})
         if not isinstance(plan, dict):
             raise RuntimeError("prepare service returned a non-object plan")
         planned_override = plan.get("chain_config_override")
-        if planned_override != runtime_override:
+        if planned_override != durable_override:
             raise RuntimeError(
                 "prepare service omitted or changed the validated "
                 "chain_config_override"
