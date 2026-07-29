@@ -38,6 +38,8 @@ _COORDINATOR_RECEIPT_TYPES = frozenset({
     "execution_approval",
 })
 _SHA256_LENGTH = 64
+_EMPTY_DOCUMENT_HASH = hashlib.sha256(b"{}").hexdigest()
+_EMPTY_ERRORS_HASH = hashlib.sha256(b"[]").hexdigest()
 
 
 def _content_hash(value: Mapping[str, Any]) -> str:
@@ -329,16 +331,33 @@ def _validate_owner_compilation(
     }
     if not _exact_fields(receipt, fields):
         return False, "owner-compilation receipt shape is invalid"
+    status = receipt.get("status")
+    cursor_before = receipt.get("cursor_before")
+    cursor_after = receipt.get("cursor_after")
+    document_hash = receipt.get("document_hash")
+    errors_hash = receipt.get("errors_hash")
     if (
         not str(receipt.get("owner") or "")
-        or not _valid_nonnegative_integer(receipt.get("cursor_before"))
-        or not _valid_nonnegative_integer(receipt.get("cursor_after"))
-        or int(receipt["cursor_after"]) != int(receipt["cursor_before"]) + 1
-        or receipt.get("status") not in {"compile_owner", "review_plan", "failed"}
-        or not _valid_hash(receipt.get("document_hash"))
-        or not _valid_hash(receipt.get("errors_hash"))
+        or not _valid_nonnegative_integer(cursor_before)
+        or not _valid_nonnegative_integer(cursor_after)
+        or status not in {"compile_owner", "review_plan", "failed"}
+        or not _valid_hash(document_hash)
+        or not _valid_hash(errors_hash)
     ):
         return False, "owner-compilation receipt semantics are invalid"
+    if status == "failed":
+        if (
+            int(cursor_after) != int(cursor_before)
+            or document_hash != _EMPTY_DOCUMENT_HASH
+            or errors_hash == _EMPTY_ERRORS_HASH
+        ):
+            return False, "failed owner-compilation receipt semantics are invalid"
+    elif (
+        int(cursor_after) != int(cursor_before) + 1
+        or document_hash == _EMPTY_DOCUMENT_HASH
+        or errors_hash != _EMPTY_ERRORS_HASH
+    ):
+        return False, "successful owner-compilation receipt semantics are invalid"
     return True, ""
 
 

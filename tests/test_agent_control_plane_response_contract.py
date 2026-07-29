@@ -64,7 +64,7 @@ class ControlPlaneResponseContractTest(unittest.TestCase):
                 "cursor_after": 1,
                 "status": "review_plan",
                 "document_hash": "2" * 64,
-                "errors_hash": "3" * 64,
+                "errors_hash": hashlib.sha256(b"[]").hexdigest(),
             },
             {
                 "receipt_type": "whole_plan_review",
@@ -116,6 +116,49 @@ class ControlPlaneResponseContractTest(unittest.TestCase):
         )
         self.assertFalse(valid)
         self.assertIn("semantics", reason)
+
+    def test_failed_owner_compilation_preserves_cursor_and_carries_errors(self) -> None:
+        failed = {
+            "receipt_type": "owner_compilation",
+            "turn_index": 3,
+            "owner": "coordinator",
+            "cursor_before": 0,
+            "cursor_after": 0,
+            "status": "failed",
+            "document_hash": hashlib.sha256(b"{}").hexdigest(),
+            "errors_hash": hashlib.sha256(
+                json.dumps(
+                    ["owner output rejected"],
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+        }
+        self.assertEqual(
+            validate_coordinator_control_receipt(
+                _signed_receipt(failed),
+                turn_index=3,
+            ),
+            (True, ""),
+        )
+
+        advanced = {**failed, "cursor_after": 1}
+        valid, reason = validate_coordinator_control_receipt(
+            _signed_receipt(advanced),
+            turn_index=3,
+        )
+        self.assertFalse(valid)
+        self.assertIn("failed owner-compilation", reason)
+
+        no_errors = {
+            **failed,
+            "errors_hash": hashlib.sha256(b"[]").hexdigest(),
+        }
+        valid, reason = validate_coordinator_control_receipt(
+            _signed_receipt(no_errors),
+            turn_index=3,
+        )
+        self.assertFalse(valid)
+        self.assertIn("failed owner-compilation", reason)
 
     def test_every_registered_control_message_renders_in_both_languages(self) -> None:
         value_by_type = {
