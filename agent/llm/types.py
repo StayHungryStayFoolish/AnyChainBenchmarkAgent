@@ -37,6 +37,7 @@ _PROVIDER_FAILURE_CATEGORIES = frozenset({
 _PROVIDER_RETRY_REASONS = frozenset({
     "credential_transport_timeout",
     "normal_finish_empty_text",
+    "output_truncated",
     "rate_limit",
     "response",
     "service",

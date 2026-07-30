@@ -455,6 +455,166 @@ class TurnBudgetContractTest(unittest.TestCase):
             },),
         )
 
+    def test_openai_compatible_provider_retries_one_truncated_completion(
+        self,
+    ) -> None:
+        from agent.llm.config import LLMConfig
+        from agent.llm.providers import DeepSeekProvider
+        from agent.llm.types import LLMMessage, LLMRequest, llm_turn_scope
+
+        calls = 0
+
+        class Completions:
+            def create(self, **_call):
+                nonlocal calls
+                calls += 1
+                truncated = calls == 1
+                return types.SimpleNamespace(
+                    choices=[
+                        types.SimpleNamespace(
+                            finish_reason="length" if truncated else "stop",
+                            message=types.SimpleNamespace(
+                                content="partial" if truncated else '{"ok":true}',
+                                tool_calls=None,
+                                refusal=None,
+                            ),
+                        )
+                    ],
+                    model_dump=lambda: {"attempt": calls},
+                )
+
+        class OpenAI:
+            def __init__(self, **_kwargs):
+                self.chat = types.SimpleNamespace(completions=Completions())
+
+        module = types.ModuleType("openai")
+        module.OpenAI = OpenAI
+        httpx_module = types.ModuleType("httpx")
+        httpx_module.Timeout = lambda **values: types.SimpleNamespace(**values)
+        config = LLMConfig(
+            provider="deepseek",
+            model="deepseek-v4-pro",
+            deepseek_api_key="secret",
+            deepseek_api_key_present=True,
+            max_retries=1,
+        )
+        with patch.dict(
+            sys.modules,
+            {"openai": module, "httpx": httpx_module},
+        ):
+            with llm_turn_scope(2) as turn:
+                response = DeepSeekProvider(config).complete(
+                    LLMRequest(
+                        messages=[LLMMessage(role="user", content="hello")],
+                        replay_safety="side_effect_free",
+                    )
+                )
+                attempt_evidence = turn.provider_attempt_evidence()
+
+        self.assertEqual(response.text, '{"ok":true}')
+        self.assertEqual(response.attempt_count, 2)
+        self.assertEqual(response.retry_reasons, ("output_truncated",))
+        self.assertEqual(response.last_finish_reason, "stop")
+        self.assertEqual(calls, 2)
+        self.assertEqual(
+            attempt_evidence,
+            ({
+                "provider": "deepseek",
+                "model": "deepseek-v4-pro",
+                "outcome": "success",
+                "attempt_count": 2,
+                "retry_reasons": ["output_truncated"],
+                "retry_exhausted": False,
+                "last_finish_reason": "stop",
+            },),
+        )
+
+    def test_openai_compatible_provider_exhausts_truncation_retry_budget(
+        self,
+    ) -> None:
+        from agent.llm.config import LLMConfig
+        from agent.llm.providers import DeepSeekProvider
+        from agent.llm.types import (
+            LLMMessage,
+            LLMProviderError,
+            LLMRequest,
+            llm_turn_scope,
+        )
+
+        calls = 0
+
+        class OpenAI:
+            def __init__(self, **_kwargs):
+                def create(**_call):
+                    nonlocal calls
+                    calls += 1
+                    return types.SimpleNamespace(
+                        choices=[
+                            types.SimpleNamespace(
+                                finish_reason="length",
+                                message=types.SimpleNamespace(
+                                    content="partial",
+                                    tool_calls=None,
+                                    refusal=None,
+                                ),
+                            )
+                        ]
+                    )
+
+                self.chat = types.SimpleNamespace(
+                    completions=types.SimpleNamespace(create=create)
+                )
+
+        module = types.ModuleType("openai")
+        module.OpenAI = OpenAI
+        httpx_module = types.ModuleType("httpx")
+        httpx_module.Timeout = lambda **values: types.SimpleNamespace(**values)
+        config = LLMConfig(
+            provider="deepseek",
+            model="deepseek-v4-pro",
+            deepseek_api_key="secret",
+            deepseek_api_key_present=True,
+            max_retries=1,
+        )
+        with patch.dict(
+            sys.modules,
+            {"openai": module, "httpx": httpx_module},
+        ):
+            with llm_turn_scope(2) as turn:
+                with self.assertRaises(LLMProviderError) as raised:
+                    DeepSeekProvider(config).complete(
+                        LLMRequest(
+                            messages=[
+                                LLMMessage(role="user", content="hello")
+                            ],
+                            replay_safety="side_effect_free",
+                        )
+                    )
+                attempt_evidence = turn.provider_attempt_evidence()
+
+        self.assertEqual(calls, 2)
+        self.assertTrue(raised.exception.retriable)
+        self.assertTrue(raised.exception.retry_exhausted)
+        self.assertEqual(raised.exception.attempt_count, 2)
+        self.assertEqual(
+            raised.exception.retry_reasons,
+            ("output_truncated",),
+        )
+        self.assertEqual(raised.exception.last_finish_reason, "length")
+        self.assertEqual(
+            attempt_evidence,
+            ({
+                "provider": "deepseek",
+                "model": "deepseek-v4-pro",
+                "outcome": "provider_failure",
+                "attempt_count": 2,
+                "retry_reasons": ["output_truncated"],
+                "retry_exhausted": True,
+                "last_finish_reason": "length",
+                "category": "response",
+            },),
+        )
+
     def test_openai_compatible_provider_exhausts_malformed_success_budget(
         self,
     ) -> None:
@@ -526,7 +686,7 @@ class TurnBudgetContractTest(unittest.TestCase):
         )
         self.assertEqual(raised.exception.last_finish_reason, "stop")
 
-    def test_empty_text_abnormal_finishes_are_not_retried(self) -> None:
+    def test_empty_text_unsafe_abnormal_finishes_are_not_retried(self) -> None:
         from agent.llm.config import LLMConfig
         from agent.llm.providers import DeepSeekProvider
         from agent.llm.types import (
@@ -537,7 +697,6 @@ class TurnBudgetContractTest(unittest.TestCase):
         )
 
         cases = (
-            ("length", None, None),
             ("content_filter", None, None),
             ("stop", [{"id": "tool-1"}], None),
             ("stop", None, "refused"),
@@ -608,6 +767,113 @@ class TurnBudgetContractTest(unittest.TestCase):
                     raised.exception.last_finish_reason,
                     finish_reason,
                 )
+
+    def test_replay_safe_truncated_text_is_retriable_for_text_providers(
+        self,
+    ) -> None:
+        from agent.llm.config import LLMConfig
+        from agent.llm.providers import (
+            _parse_anthropic_completion,
+            _parse_gemini_completion,
+            _parse_openai_completion,
+        )
+        from agent.llm.types import LLMProviderError, LLMRequest
+
+        config = LLMConfig(
+            provider="deepseek",
+            model="deepseek-v4-pro",
+            deepseek_api_key="secret",
+            deepseek_api_key_present=True,
+        )
+        request = LLMRequest(
+            messages=[],
+            replay_safety="side_effect_free",
+        )
+        cases = (
+            (
+                _parse_openai_completion,
+                types.SimpleNamespace(choices=[
+                    types.SimpleNamespace(
+                        finish_reason="length",
+                        message=types.SimpleNamespace(
+                            content="partial",
+                            tool_calls=None,
+                            refusal=None,
+                        ),
+                    )
+                ]),
+                "length",
+            ),
+            (
+                _parse_gemini_completion,
+                {
+                    "candidates": [{
+                        "finishReason": "MAX_TOKENS",
+                        "content": {"parts": [{"text": "partial"}]},
+                    }]
+                },
+                "max_tokens",
+            ),
+            (
+                _parse_anthropic_completion,
+                {
+                    "stop_reason": "max_tokens",
+                    "content": [{"type": "text", "text": "partial"}],
+                },
+                "max_tokens",
+            ),
+        )
+        for parser, response, finish_reason in cases:
+            with self.subTest(parser=parser.__name__):
+                with self.assertRaises(LLMProviderError) as raised:
+                    parser(config, request, response)
+                self.assertTrue(raised.exception.retriable)
+                self.assertEqual(
+                    raised.exception.retry_reason,
+                    "output_truncated",
+                )
+                self.assertEqual(
+                    raised.exception.last_finish_reason,
+                    finish_reason,
+                )
+
+    def test_truncated_text_is_not_retriable_for_unsafe_or_tool_requests(
+        self,
+    ) -> None:
+        from agent.llm.config import LLMConfig
+        from agent.llm.providers import _parse_openai_completion
+        from agent.llm.types import LLMProviderError, LLMRequest
+
+        config = LLMConfig(
+            provider="deepseek",
+            model="deepseek-v4-pro",
+            deepseek_api_key="secret",
+            deepseek_api_key_present=True,
+        )
+        response = types.SimpleNamespace(choices=[
+            types.SimpleNamespace(
+                finish_reason="length",
+                message=types.SimpleNamespace(
+                    content="partial",
+                    tool_calls=None,
+                    refusal=None,
+                ),
+            )
+        ])
+        requests = (
+            LLMRequest(messages=[]),
+            LLMRequest(
+                messages=[],
+                replay_safety="side_effect_free",
+                tools=[{"type": "function"}],
+            ),
+        )
+        for request in requests:
+            with self.subTest(request=request):
+                with self.assertRaises(LLMProviderError) as raised:
+                    _parse_openai_completion(config, request, response)
+                self.assertFalse(raised.exception.retriable)
+                self.assertEqual(raised.exception.retry_reason, "")
 
     def test_nonempty_abnormal_or_structured_outputs_fail_closed(self) -> None:
         from agent.llm.config import LLMConfig

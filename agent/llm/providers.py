@@ -747,11 +747,33 @@ def _require_text_completion_disposition(
             finish_reason=finish_reason,
         )
     if finish_reason not in normal_finish_reasons:
+        retriable = _truncated_text_retryable(
+            request,
+            finish_reason=finish_reason,
+            has_alternative_output=has_alternative_output,
+        )
         raise _response_error(
             config,
             f"completion ended with {finish_reason}",
+            retriable=retriable,
+            retry_reason="output_truncated" if retriable else "",
             finish_reason=finish_reason,
         )
+
+
+def _truncated_text_retryable(
+    request: LLMRequest,
+    *,
+    finish_reason: str,
+    has_alternative_output: bool,
+) -> bool:
+    return (
+        request.response_mode == "text_required"
+        and request.replay_safety == "side_effect_free"
+        and not request.tools
+        and not has_alternative_output
+        and finish_reason.casefold() in {"length", "max_tokens"}
+    )
 
 
 def _empty_text_retryable(
