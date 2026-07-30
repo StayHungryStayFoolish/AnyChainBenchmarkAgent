@@ -176,6 +176,7 @@ from agent.workflows.group_registry import (
 ALLOWED_GROUPS = frozenset(USER_NAVIGABLE_GROUPS)
 _ADMISSION_METADATA_KEYS = (
     "_semantic_admission_receipt",
+    "_semantic_consensus_receipt",
     "_replacement_intake_receipt",
     "_proposal_field_receipts",
     "_proposal_transaction_hashes",

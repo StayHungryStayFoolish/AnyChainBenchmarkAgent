@@ -111,6 +111,12 @@ whole-plan semantic admission。其后的 `admit` 是不同的信任边界：在
 进入 durable queue 前，确定性校验 action schema、provenance、冲突、前置条件、
 pending-question contract 和 queue eligibility。
 
+包含已注册 semantic value 且具有非只读 effect 的 plan 必须执行双审查。两次
+独立 admission 都必须接受同一个不可变 plan；任意一次语义拒绝或格式错误都会让
+完整 transaction fail closed。Harness 签发的 consensus receipt 会把 plan、
+transaction、action 顺序、两次 review hash 与 request size 绑定到每个 durable
+envelope；只读 plan 仍只执行一次 review。
+
 当原子化后的 turn 仍有精确 DemandAtom 无法解析时，`review_plan` 可以创建一个
 持久但不可执行的 `SemanticPlanDraft`。其中已通过本地校验的 candidate 只是证据，
 不是 admitted action，不能进入 benchmark 配置、group readiness 或

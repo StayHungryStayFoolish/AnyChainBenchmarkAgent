@@ -12,6 +12,7 @@ from .action_registry import (
     validate_action_contract,
     validate_action_transaction_contract,
     validate_field_intake_admission_receipt,
+    validate_semantic_consensus_receipt,
     validate_replacement_intake_admission_receipt,
     validate_proposal_field_receipts,
 )
@@ -611,8 +612,23 @@ def _validate_admission_transaction(
         if actual_order != tuple(value for value in declared_order if value in set(actual_order)):
             raise StateInvariantError("admission transaction action order mismatch")
     finalization_receipts: list[dict[str, Any]] = []
+    consensus_receipts: list[dict[str, Any]] = []
     for action in actions:
         action_type = str(action.get("type") or "")
+        consensus_receipt = action.get("_semantic_consensus_receipt")
+        if isinstance(consensus_receipt, Mapping):
+            try:
+                validate_semantic_consensus_receipt(
+                    action,
+                    thread_id=thread_id,
+                    session_id=session_id,
+                    submitted_turn_index=turn_index
+                    if current_submission
+                    else None,
+                )
+                consensus_receipts.append(dict(consensus_receipt))
+            except ValueError as exc:
+                raise StateInvariantError(str(exc)) from exc
         finalization_receipt = action.get(
             "_semantic_draft_finalization_receipt"
         )
@@ -651,6 +667,35 @@ def _validate_admission_transaction(
                 thread_id=thread_id,
                 session_id=session_id,
                 submitted_turn_index=turn_index if current_submission else None,
+            )
+    if consensus_receipts:
+        receipt_ids = {
+            str(item.get("receipt_id") or "")
+            for item in consensus_receipts
+        }
+        if len(receipt_ids) != 1:
+            raise StateInvariantError(
+                "semantic consensus receipts are inconsistent"
+            )
+        receipt_action_ids = tuple(
+            str(value)
+            for value in consensus_receipts[0].get(
+                "admission_action_ids"
+            )
+            or ()
+        )
+        actual_action_ids = tuple(
+            str(item.get("_admission_action_id") or "")
+            for item in actions
+            if item.get("_semantic_consensus_receipt")
+        )
+        if actual_action_ids != tuple(
+            value
+            for value in receipt_action_ids
+            if value in set(actual_action_ids)
+        ):
+            raise StateInvariantError(
+                "semantic consensus action set mismatch"
             )
     if finalization_receipts:
         receipt_hashes = {

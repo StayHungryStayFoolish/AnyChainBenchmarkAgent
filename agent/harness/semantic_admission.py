@@ -19,6 +19,7 @@ from .action_registry import (
     build_field_intake_admission_receipt,
     build_proposal_field_receipt,
     build_replacement_intake_admission_receipt,
+    build_semantic_consensus_receipt,
     canonical_consultation_topic,
     normalize_current_action_envelope,
     resolve_action_target_group,
@@ -961,6 +962,14 @@ def _admitted_action_queue(
     admitted = _attach_semantic_admission_receipts(
         json.dumps(payload, ensure_ascii=False, sort_keys=True),
         state,
+        semantic_consensus={
+            "plan_hash": plan.plan_hash,
+            "review_hashes": list(admission.review_hashes),
+            "request_count": admission.request_count,
+            "request_sizes": list(admission.request_sizes),
+        }
+        if admission.consensus_required
+        else None,
     )
     admitted_payload = _parse_json_object(admitted)
     admitted_actions = (
@@ -1772,6 +1781,8 @@ def _proposal_field_source(
 def _attach_semantic_admission_receipts(
     text: str,
     state: AgentGraphState | None = None,
+    *,
+    semantic_consensus: Mapping[str, Any] | None = None,
 ) -> str:
     """Mark actions whose purpose passed the final semantic admission review.
 
@@ -1834,11 +1845,28 @@ def _attach_semantic_admission_receipts(
         semantic_units=semantic_units,
         admission_action_ids=admission_action_ids,
     )
+    consensus_receipt = (
+        build_semantic_consensus_receipt(
+            thread_id=thread_id,
+            session_id=session_id,
+            submitted_turn_index=submitted_turn_index,
+            transaction_hash=transaction_hash,
+            plan_hash=str(semantic_consensus.get("plan_hash") or ""),
+            admission_action_ids=admission_action_ids,
+            review_hashes=semantic_consensus.get("review_hashes") or (),
+            request_count=int(semantic_consensus.get("request_count") or 0),
+            request_sizes=semantic_consensus.get("request_sizes") or (),
+        )
+        if semantic_consensus is not None
+        else None
+    )
     for index, action in enumerate(actions):
         if isinstance(action, dict):
             action["_admission_action_id"] = admission_action_ids[index]
             action["_transaction_action_ids"] = list(admission_action_ids)
             action["_plan_transaction_hash"] = transaction_hash
+            if consensus_receipt is not None:
+                action["_semantic_consensus_receipt"] = consensus_receipt
         if isinstance(action, dict) and _requires_semantic_fulfillment_review(action):
             action["semantic_purpose_verified"] = True
             spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))

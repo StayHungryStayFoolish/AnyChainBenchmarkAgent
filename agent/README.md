@@ -108,6 +108,12 @@ LLM output is never executed directly. The semantic path checkpoints
 `admit` for deterministic schema, provenance, conflict, prerequisite, and
 pending-contract validation. Repository tools own configuration
 materialization, execution, monitoring, and evidence-backed analysis.
+If a plan contains a registered semantic value that changes product state,
+`review_plan` requires two independent admissions of the same immutable plan.
+Either semantic rejection or either malformed review rejects the complete
+transaction. The resulting consensus receipt binds both review hashes and
+request evidence to every admitted envelope; read-only plans retain one
+review.
 
 If an atomized turn contains both valid candidate actions and exact unresolved
 atoms, the coordinator persists one non-executable `SemanticPlanDraft`.

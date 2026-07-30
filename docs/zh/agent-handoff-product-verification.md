@@ -102,7 +102,9 @@ control action。它不拥有 `GroupSpec`，不是第 9 个 domain owner。
 - `hierarchical_planner.py`：唯一通用语义规划器；
 - `bounded_semantic_lane.py`：有限目录语义 mapper，不拥有通用路由、状态修改或
   commit 权限；
-- `semantic_admission.py`：不可变 semantic document 的准备与校验；
+- `semantic_admission.py`：不可变 semantic document 的准备与校验；由模型
+  grounding 的状态变更必须通过两次独立 whole-plan admission，并携带 durable
+  consensus receipt；
 - `admission.py`：action、冲突、前置条件和 coverage 校验；
 - `queue.py`：依赖安全排序和 pending barrier；
 - `routing.py`：navigation、return policy 和 canonical fallback；

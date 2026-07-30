@@ -118,6 +118,13 @@ node is a different trust boundary: it deterministically validates action
 schema, provenance, conflicts, prerequisites, pending-question contracts, and
 queue eligibility before actions become durable.
 
+A plan containing a registered semantic value with a non-read-only effect
+uses a two-review rule. Two independent admission requests must both admit the
+same immutable plan; either semantic rejection or malformed review fails the
+complete transaction closed. A Harness-minted consensus receipt binds the
+plan, transaction, ordered action identities, both review hashes, and request
+sizes to every durable envelope. Read-only plans continue to use one review.
+
 When exact DemandAtoms remain unresolved, `review_plan` may create a durable
 but non-executable `SemanticPlanDraft`. Its locally validated candidates are
 evidence, not admitted actions: they cannot enter benchmark configuration,

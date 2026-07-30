@@ -133,7 +133,9 @@ Important implementation files:
 - `agent/harness/transitions.py`: invalidation and reconfiguration state
 - `agent/harness/invariants.py`: state and expected-patch enforcement
 - `agent/harness/semantic_admission.py`: immutable semantic-document
-  preparation and admission helpers with no planner entry
+  preparation and admission helpers with no planner entry; model-grounded
+  state mutations require two independent whole-plan admissions and one
+  durable consensus receipt
 - `agent/harness/advisory.py`: non-controlling model-backed chain/RPC/evidence
   analysis
 - `agent/harness/domains/`: the eight product domain owners

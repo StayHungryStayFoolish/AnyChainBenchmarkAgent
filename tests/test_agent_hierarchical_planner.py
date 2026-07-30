@@ -3769,9 +3769,23 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             [action["type"] for action in result["actions"]],
             ["choose_target_mode", "choose_chain", "set_qps_mode"],
         )
-        self.assertEqual(whole_plan_attempts, [False, True])
-        self.assertEqual(result["planner_metrics"]["model_calls"], 6)
-        self.assertEqual(result["planner_metrics"]["admission_calls"], 3)
+        from agent.harness.action_registry import (
+            validate_semantic_consensus_receipt,
+        )
+
+        for action in result["actions"]:
+            validate_semantic_consensus_receipt(
+                action,
+                thread_id="hierarchical-e2e",
+                session_id="hierarchical-e2e",
+                submitted_turn_index=0,
+            )
+        self.assertEqual(
+            whole_plan_attempts,
+            [False, True, False, True],
+        )
+        self.assertEqual(result["planner_metrics"]["model_calls"], 8)
+        self.assertEqual(result["planner_metrics"]["admission_calls"], 5)
 
     def test_semantic_draft_recompiles_clarification_through_real_admission(
         self,

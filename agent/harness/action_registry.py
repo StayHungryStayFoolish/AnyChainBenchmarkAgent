@@ -1321,6 +1321,7 @@ TRUSTED_ACTION_METADATA_FIELDS = frozenset({
     "target_mode_semantic_verified",
     "group_navigation_semantic_verified",
     "_semantic_admission_receipt",
+    "_semantic_consensus_receipt",
     "_proposal_field_receipts",
     "_proposal_transaction_hashes",
     "_admission_action_id",
@@ -1762,6 +1763,114 @@ def build_admission_transaction_hash(
         "actions": canonical_actions,
         "semantic_units": canonical_units,
     })
+
+
+def build_semantic_consensus_receipt(
+    *,
+    thread_id: str,
+    session_id: str,
+    submitted_turn_index: int,
+    transaction_hash: str,
+    plan_hash: str,
+    admission_action_ids: Sequence[str],
+    review_hashes: Sequence[str],
+    request_count: int,
+    request_sizes: Sequence[int],
+) -> dict[str, Any]:
+    """Mint one durable two-review receipt for grounded state mutations."""
+
+    payload = {
+        "version": SEMANTIC_ADMISSION_RECEIPT_VERSION,
+        "receipt_type": "semantic_consensus",
+        "thread_id": str(thread_id or "").strip(),
+        "session_id": str(session_id or "").strip(),
+        "submitted_turn_index": int(submitted_turn_index),
+        "transaction_hash": str(transaction_hash or "").strip(),
+        "plan_hash": str(plan_hash or "").strip(),
+        "admission_action_ids": [
+            str(value).strip()
+            for value in admission_action_ids
+            if str(value).strip()
+        ],
+        "review_hashes": [
+            str(value).strip()
+            for value in review_hashes
+            if str(value).strip()
+        ],
+        "review_ids": ["primary", "consensus"],
+        "request_count": int(request_count),
+        "request_sizes": [int(value) for value in request_sizes],
+        "action_contract_hash": action_registry_contract_hash(),
+        "admission_contract_hash": admission_contract_hash(),
+    }
+    if (
+        not all(
+            str(payload[key] or "").strip()
+            for key in (
+                "thread_id",
+                "session_id",
+                "transaction_hash",
+                "plan_hash",
+            )
+        )
+        or len(payload["review_hashes"]) != 2
+        or not payload["admission_action_ids"]
+        or payload["request_count"] != len(payload["request_sizes"])
+        or payload["request_count"] < 2
+        or any(size <= 0 for size in payload["request_sizes"])
+    ):
+        raise ValueError("semantic consensus receipt is incomplete")
+    return {**payload, "receipt_id": _content_hash(payload)}
+
+
+def validate_semantic_consensus_receipt(
+    action: Mapping[str, Any],
+    *,
+    thread_id: str | None = None,
+    session_id: str | None = None,
+    submitted_turn_index: int | None = None,
+) -> None:
+    """Validate one grounded-mutation consensus receipt against its action."""
+
+    receipt = action.get("_semantic_consensus_receipt")
+    if not isinstance(receipt, Mapping):
+        raise ValueError("semantic consensus receipt is missing")
+    expected = build_semantic_consensus_receipt(
+        thread_id=str(receipt.get("thread_id") or ""),
+        session_id=str(receipt.get("session_id") or ""),
+        submitted_turn_index=int(receipt.get("submitted_turn_index") or 0),
+        transaction_hash=str(receipt.get("transaction_hash") or ""),
+        plan_hash=str(receipt.get("plan_hash") or ""),
+        admission_action_ids=receipt.get("admission_action_ids") or (),
+        review_hashes=receipt.get("review_hashes") or (),
+        request_count=int(receipt.get("request_count") or 0),
+        request_sizes=receipt.get("request_sizes") or (),
+    )
+    if dict(receipt) != expected:
+        raise ValueError("semantic consensus receipt does not match its contract")
+    if str(action.get("_plan_transaction_hash") or "") != str(
+        receipt.get("transaction_hash") or ""
+    ):
+        raise ValueError("semantic consensus receipt transaction mismatch")
+    if str(action.get("_admission_action_id") or "") not in {
+        str(value)
+        for value in receipt.get("admission_action_ids") or ()
+    }:
+        raise ValueError("semantic consensus receipt action identity mismatch")
+    if thread_id is not None and str(receipt.get("thread_id") or "") != str(
+        thread_id
+    ):
+        raise ValueError("semantic consensus receipt thread mismatch")
+    if session_id is not None and str(receipt.get("session_id") or "") != str(
+        session_id
+    ):
+        raise ValueError("semantic consensus receipt session mismatch")
+    if (
+        submitted_turn_index is not None
+        and int(receipt.get("submitted_turn_index") or 0)
+        != int(submitted_turn_index)
+    ):
+        raise ValueError("semantic consensus receipt belongs to another turn")
 
 
 def build_replacement_intake_admission_receipt(

@@ -1,9 +1,11 @@
 """Bounded semantic compilation and immutable whole-plan admission.
 
-The configured model gets one compilation call and one independent admission
-call.  Admission can reject a complete candidate, but it cannot edit the
-candidate.  The caller may run one repair compilation followed by one final
-admission; this module never retries per action or per semantic unit.
+The configured model gets one compilation call and an independent admission
+boundary.  Plans that mutate state through a model-grounded semantic value
+require two independent admissions.  Admission can reject a complete
+candidate, but it cannot edit the candidate.  The caller may run one repair
+compilation followed by final admission; this module never retries per action
+or per semantic unit.
 """
 
 from __future__ import annotations
@@ -248,6 +250,8 @@ class WholePlanAdmission:
     response: Mapping[str, Any] | None = None
     request_count: int = 1
     request_sizes: tuple[int, ...] = ()
+    consensus_required: bool = False
+    review_hashes: tuple[str, ...] = ()
 
     def repair_context(self) -> dict[str, Any]:
         return {
@@ -456,62 +460,117 @@ def request_whole_plan_admission(
     contract_repair: bool = False,
     reasoning_mode: ReasoningMode = STRICT_JSON_REASONING_MODE,
 ) -> WholePlanAdmission:
-    """Run one immutable review with one bounded structural-contract repair."""
+    """Run immutable review and require consensus for grounded mutations."""
 
     base_prompt = whole_plan_admission_prompt(semantic_policy)
     base_payload = plan.request_payload()
-    previous_output = ""
-    previous_errors: tuple[str, ...] = ()
     request_sizes: list[int] = []
-    admission = WholePlanAdmission(False, ("whole-plan admission was not run",))
-    for attempt in range(2 if contract_repair else 1):
-        ensure_turn_active()
-        prompt = base_prompt
-        payload = dict(base_payload)
-        if attempt:
-            payload["admission_contract_repair"] = {
-                "prior_invalid_output": previous_output,
-                "validation_errors": list(previous_errors),
-                "instruction": (
-                    "Return a complete replacement admission document for the "
-                    "same immutable plan. Preserve semantic verdicts and correct "
-                    "every structural receipt or schema error."
-                ),
-            }
-            prompt = (
-                f"{base_prompt} This is a contract-repair attempt. The prior "
-                f"admission document was structurally rejected for: "
-                f"{'; '.join(previous_errors)}. Return every required row and "
-                "opaque id exactly; do not change an explicit semantic rejection "
-                "merely to pass validation."
+    review_hashes: list[str] = []
+    consensus_required = _requires_grounded_mutation_consensus(plan)
+
+    def run_review(*, consensus_index: int) -> WholePlanAdmission:
+        previous_output = ""
+        previous_errors: tuple[str, ...] = ()
+        admission = WholePlanAdmission(
+            False,
+            ("whole-plan admission was not run",),
+        )
+        for attempt in range(2 if contract_repair else 1):
+            ensure_turn_active()
+            prompt = base_prompt
+            payload = dict(base_payload)
+            if consensus_index:
+                prompt = (
+                    f"{base_prompt} This is an independent consensus review of "
+                    "the same immutable plan. Re-evaluate every value-grounded "
+                    "state mutation from its owned source units. Do not trust or "
+                    "infer any prior reviewer verdict."
+                )
+            if attempt:
+                payload["admission_contract_repair"] = {
+                    "prior_invalid_output": previous_output,
+                    "validation_errors": list(previous_errors),
+                    "instruction": (
+                        "Return a complete replacement admission document for the "
+                        "same immutable plan. Preserve semantic verdicts and correct "
+                        "every structural receipt or schema error."
+                    ),
+                }
+                prompt = (
+                    f"{prompt} This is a contract-repair attempt. The prior "
+                    f"admission document was structurally rejected for: "
+                    f"{'; '.join(previous_errors)}. Return every required row and "
+                    "opaque id exactly; do not change an explicit semantic rejection "
+                    "merely to pass validation."
+                )
+            payload_text = _canonical_json(payload)
+            request_sizes.append(
+                len(prompt.encode("utf-8")) + len(payload_text.encode("utf-8"))
             )
-        payload_text = _canonical_json(payload)
-        request_sizes.append(
-            len(prompt.encode("utf-8")) + len(payload_text.encode("utf-8"))
+            response = provider.complete(LLMRequest(
+                messages=[
+                    LLMMessage(role="system", content=prompt),
+                    LLMMessage(role="user", content=payload_text),
+                ],
+                temperature=0.0,
+                max_tokens=max_tokens,
+                reasoning_mode=reasoning_mode,
+                replay_safety="side_effect_free",
+            ))
+            previous_output = str(response.text or "")
+            admission = validate_whole_plan_admission(
+                previous_output,
+                plan,
+                allowed_action_types=allowed_action_types,
+            )
+            if admission.valid or _is_explicit_semantic_rejection(admission):
+                break
+            previous_errors = admission.errors
+        review_hashes.append(_content_hash(admission.response or previous_output))
+        return admission
+
+    primary = run_review(consensus_index=0)
+    if not primary.valid or not consensus_required:
+        return replace(
+            primary,
+            request_count=len(request_sizes),
+            request_sizes=tuple(request_sizes),
+            consensus_required=consensus_required,
+            review_hashes=tuple(review_hashes),
         )
-        response = provider.complete(LLMRequest(
-            messages=[
-                LLMMessage(role="system", content=prompt),
-                LLMMessage(role="user", content=payload_text),
-            ],
-            temperature=0.0,
-            max_tokens=max_tokens,
-            reasoning_mode=reasoning_mode,
-            replay_safety="side_effect_free",
-        ))
-        previous_output = str(response.text or "")
-        admission = validate_whole_plan_admission(
-            previous_output,
-            plan,
-            allowed_action_types=allowed_action_types,
+
+    consensus = run_review(consensus_index=1)
+    if not consensus.valid:
+        return replace(
+            consensus,
+            errors=tuple(dict.fromkeys([
+                "grounded mutation consensus review rejected the immutable plan",
+                *consensus.errors,
+            ])),
+            request_count=len(request_sizes),
+            request_sizes=tuple(request_sizes),
+            consensus_required=True,
+            review_hashes=tuple(review_hashes),
         )
-        if admission.valid or _is_explicit_semantic_rejection(admission):
-            break
-        previous_errors = admission.errors
     return replace(
-        admission,
+        primary,
         request_count=len(request_sizes),
         request_sizes=tuple(request_sizes),
+        consensus_required=True,
+        review_hashes=tuple(review_hashes),
+    )
+
+
+def _requires_grounded_mutation_consensus(
+    plan: ImmutableSemanticPlan,
+) -> bool:
+    """Return whether one immutable plan needs two semantic admissions."""
+
+    return any(
+        isinstance(record, Mapping)
+        and str(record.get("registry_effect") or "") != "read_only"
+        and bool(record.get("required_value_grounding_arguments"))
+        for record in plan.request_payload().get("actions") or ()
     )
 
 
@@ -525,6 +584,8 @@ def _is_explicit_semantic_rejection(
         return False
     action_rows = response.get("action_verdicts")
     unit_rows = response.get("unit_verdicts")
+    if not isinstance(action_rows, list) or not isinstance(unit_rows, list):
+        return False
     rejected_actions = [
         row
         for row in action_rows

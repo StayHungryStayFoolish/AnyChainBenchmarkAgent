@@ -317,6 +317,59 @@ def _immutable_admission_fixture() -> tuple[Any, dict[str, Any]]:
     return plan, _whole_plan_admission_payload(request)
 
 
+def _grounded_mutation_admission_fixture() -> tuple[Any, dict[str, Any]]:
+    from agent.harness.semantic_compiler import freeze_semantic_plan
+
+    source = "Use fake-node."
+    action = {
+        "type": "choose_target_mode",
+        "target_mode": "fake-node",
+        "target_mode_explicit": True,
+        "source_evidence": "fake-node",
+    }
+    unit = {
+        "unit_id": "unit-1",
+        "clause_id": "clause-1",
+        "source_text": source,
+        "disposition": "action",
+        "action_indexes": [0],
+    }
+    plan = freeze_semantic_plan(
+        {"actions": [action], "semantic_units": [unit]},
+        action_records=[{
+            "action_id": "action-1",
+            "action_index": 0,
+            "action": action,
+            "registry_effect": "configuration_mutation",
+            "required_value_grounding_arguments": ["target_mode"],
+            "closed_enum_grounding_values": {
+                "target_mode": [
+                    "fake-node",
+                    "real-node",
+                    "sync-observe",
+                ],
+            },
+            "operation_arguments": {"target_mode": "fake-node"},
+            "unit_ids": ["unit-1"],
+            "allowed_support_relations": [],
+        }],
+        unit_records=[{
+            "unit_id": "unit-1",
+            "unit_index": 0,
+            "unit": unit,
+            "source_text": source,
+            "evidence_sources": [source],
+            "disposition": "action",
+            "owner_action_ids": ["action-1"],
+        }],
+        review_context={"pending_question": {}},
+    )
+    request = SimpleNamespace(
+        messages=[None, SimpleNamespace(content=plan.request_json)]
+    )
+    return plan, _whole_plan_admission_payload(request)
+
+
 def _immutable_required_relation_fixture() -> tuple[Any, dict[str, Any]]:
     from agent.harness.semantic_compiler import freeze_semantic_plan
 
@@ -360,6 +413,108 @@ def _immutable_required_relation_fixture() -> tuple[Any, dict[str, Any]]:
 
 
 class BoundedSemanticAdmissionTest(unittest.TestCase):
+    def test_grounded_mutation_requires_two_independent_admissions(self) -> None:
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import request_whole_plan_admission
+
+        plan, valid = _grounded_mutation_admission_fixture()
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(
+            text=json.dumps(valid, sort_keys=True),
+        )
+
+        admission = request_whole_plan_admission(
+            provider,
+            plan,
+            semantic_policy="preserve the immutable plan",
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+
+        self.assertTrue(admission.valid, admission.errors)
+        self.assertTrue(admission.consensus_required)
+        self.assertEqual(provider.complete.call_count, 2)
+        self.assertEqual(admission.request_count, 2)
+        self.assertEqual(len(admission.review_hashes), 2)
+
+    def test_grounded_mutation_consensus_rejection_is_atomic(self) -> None:
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import request_whole_plan_admission
+
+        plan, valid = _grounded_mutation_admission_fixture()
+        rejected = deepcopy(valid)
+        rejected["action_verdicts"][0]["verdict"] = "reject"
+        rejected["action_verdicts"][0]["reason"] = (
+            "the source rejects the immutable value"
+        )
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
+            SimpleNamespace(text=json.dumps(rejected, sort_keys=True)),
+        ]
+
+        admission = request_whole_plan_admission(
+            provider,
+            plan,
+            semantic_policy="preserve the immutable plan",
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+
+        self.assertFalse(admission.valid)
+        self.assertTrue(admission.consensus_required)
+        self.assertIn(
+            "grounded mutation consensus review rejected",
+            "; ".join(admission.errors),
+        )
+        self.assertEqual(provider.complete.call_count, 2)
+
+    def test_primary_grounded_mutation_rejection_short_circuits(self) -> None:
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import request_whole_plan_admission
+
+        plan, rejected = _grounded_mutation_admission_fixture()
+        rejected["action_verdicts"][0]["verdict"] = "reject"
+        rejected["action_verdicts"][0]["reason"] = (
+            "the immutable value is not affirmatively selected"
+        )
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(
+            text=json.dumps(rejected, sort_keys=True),
+        )
+
+        admission = request_whole_plan_admission(
+            provider,
+            plan,
+            semantic_policy="preserve the immutable plan",
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+
+        self.assertFalse(admission.valid)
+        self.assertTrue(admission.consensus_required)
+        self.assertEqual(provider.complete.call_count, 1)
+        self.assertEqual(len(admission.review_hashes), 1)
+
+    def test_malformed_grounded_mutation_consensus_fails_closed(self) -> None:
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import request_whole_plan_admission
+
+        plan, valid = _grounded_mutation_admission_fixture()
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
+            SimpleNamespace(text="{}"),
+        ]
+
+        admission = request_whole_plan_admission(
+            provider,
+            plan,
+            semantic_policy="preserve the immutable plan",
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+
+        self.assertFalse(admission.valid)
+        self.assertTrue(admission.consensus_required)
+        self.assertEqual(provider.complete.call_count, 2)
+
     def test_strict_json_compilation_disables_provider_reasoning(self) -> None:
         from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
         from agent.harness.semantic_compiler import (
@@ -395,6 +550,8 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
         )
 
         self.assertTrue(admission.valid, admission.errors)
+        self.assertFalse(admission.consensus_required)
+        self.assertEqual(admission_provider.complete.call_count, 1)
         admission_request = admission_provider.complete.call_args.args[0]
         self.assertEqual(admission_request.reasoning_mode, "disabled")
 
