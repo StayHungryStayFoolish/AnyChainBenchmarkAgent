@@ -62,6 +62,27 @@ def _turns(context: Any) -> tuple[Any, ...]:
     return tuple(getattr(context, "completed_turns", ()) or ())
 
 
+def _visible_terminal_response_hashes(context: Any) -> dict[int, str]:
+    """Project complete PTY responses to their terminal payload hashes."""
+
+    hashes: dict[int, str] = {}
+    prefix = "Agent> "
+    boundary = "\nAgent> "
+    for turn in _turns(context):
+        response = str(getattr(turn, "agent_response", "") or "")
+        if boundary in response:
+            terminal = response.split(boundary, 1)[1]
+        elif response.startswith(prefix):
+            terminal = response[len(prefix):]
+        else:
+            continue
+        if terminal:
+            hashes[int(getattr(turn, "turn_index", -1))] = render_hash(
+                terminal
+            )
+    return hashes
+
+
 def _verifier_input(context: Any) -> tuple[dict[str, Any] | None, str]:
     try:
         return validate_verifier_input_contract(
@@ -589,6 +610,7 @@ def _visible_orientation_authority(
         int(getattr(event, "turn_index", -1)): event
         for event in _events(context)
     }
+    visible_terminal_hashes = _visible_terminal_response_hashes(context)
     for item in orientations:
         orientations_by_turn[int(item["turn_index"])].append(item)
     for item in commits:
@@ -607,12 +629,11 @@ def _visible_orientation_authority(
         }
         manifest = dict(getattr(event, "render_manifest", {}) or {})
         visible_hashes = list(manifest.get("fragment_hashes") or ())
-        observation = str(getattr(event, "observation", "") or "").strip()
         if (
             manifest.get("fragment_count") != 1
             or len(visible_hashes) != 1
-            or not observation
-            or visible_hashes[0] != render_hash(observation)
+            or visible_terminal_hashes.get(turn_index)
+            != visible_hashes[0]
         ):
             continue
         for orientation in orientations_by_turn.get(turn_index, ()):
@@ -681,7 +702,6 @@ def _visible_orientation_authority(
                             == expected.semantic_hash
                             and status_fragments[0].get("render_hash")
                             == expected.render_hash
-                            and observation == expected.text
                         )
                 if (
                     commit_receipt.get("owner") != "orientation"
@@ -3326,6 +3346,7 @@ def _execution_stage_explained(context: Any) -> PredicateResult:
         int(getattr(event, "turn_index", -1)): event
         for event in _events(context)
     }
+    visible_terminal_hashes = _visible_terminal_response_hashes(context)
     matches: list[dict[str, Any]] = []
     for orientation in orientations:
         receipt = orientation["receipt"]
@@ -3385,6 +3406,7 @@ def _execution_stage_explained(context: Any) -> PredicateResult:
             )
             if (
                 pending_transition is None
+                or pending_transition.get("transition") != "preserved"
                 or pending_transition.get("before_group")
                 != "preflight_smoke_execution"
                 or pending_transition.get("after_group")
@@ -3393,10 +3415,7 @@ def _execution_stage_explained(context: Any) -> PredicateResult:
                 or not pending_transition.get("after_id")
                 or receipt.get("pending_contract_hash")
                 != pending_transition.get("before_hash")
-                or action_id
-                not in set(
-                    pending_transition.get("consumer_action_ids") or ()
-                )
+                or pending_transition.get("consumer_action_ids")
             ):
                 continue
             render_manifest = (
@@ -3451,6 +3470,8 @@ def _execution_stage_explained(context: Any) -> PredicateResult:
                         == composition_receipt.get(
                             "terminal_response_hash"
                         )
+                        and visible_terminal_hashes.get(turn_index)
+                        == visible_hashes[0]
                         and recomputed is not None
                         and recomputed["terminal_response_hash"]
                         == composition_receipt.get(

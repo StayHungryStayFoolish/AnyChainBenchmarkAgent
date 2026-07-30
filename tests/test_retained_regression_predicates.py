@@ -459,6 +459,22 @@ def _context(*events: RuntimeTurnEvent, **values) -> SimpleNamespace:
     )
 
 
+def _visible_turn(
+    terminal_response: str,
+    *,
+    user_message: str = "",
+    turn_index: int = 1,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        turn_index=turn_index,
+        user_message=user_message,
+        agent_response=(
+            "Agent> [thinking] Processing the current request.\n"
+            f"Agent> {terminal_response}"
+        ),
+    )
+
+
 def _verifier_input(
     variant: str,
     messages: tuple[str, ...],
@@ -2641,6 +2657,10 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
             "status_uses_job_evidence"
         ](_context(
             orientation_status,
+            turns=(_visible_turn(
+                rendered_status.text,
+                user_message="What is the current status?",
+            ),),
             verifier_input_contract=_verifier_input(
                 "exact",
                 ("What is the current status?",),
@@ -2648,6 +2668,22 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
             ),
         ))
         self.assertTrue(satisfied, details)
+
+        mismatched_status, mismatch_details = POSTCONDITION_EVALUATORS[
+            "status_uses_job_evidence"
+        ](_context(
+            orientation_status,
+            turns=(_visible_turn(
+                "A different visible status.",
+                user_message="What is the current status?",
+            ),),
+            verifier_input_contract=_verifier_input(
+                "exact",
+                ("What is the current status?",),
+                semantic_roles=("job_status_consultation",),
+            ),
+        ))
+        self.assertFalse(mismatched_status, mismatch_details)
 
         invisible_orientation = replace(
             orientation_status,
@@ -2661,6 +2697,10 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
             "status_uses_job_evidence"
         ](_context(
             invisible_orientation,
+            turns=(_visible_turn(
+                rendered_status.text,
+                user_message="What is the current status?",
+            ),),
             verifier_input_contract=_verifier_input(
                 "exact",
                 ("What is the current status?",),
@@ -2884,7 +2924,7 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
             "after_id": "preflight_smoke_confirm",
             "after_group": "preflight_smoke_execution",
             "after_hash": pending_contract_hash,
-            "consumer_action_ids": ["action-1"],
+            "consumer_action_ids": [],
         }
         complete_event = replace(
             _event(
@@ -2913,12 +2953,42 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
         )
         satisfied, details = POSTCONDITION_EVALUATORS[
             "execution_stage_explained"
-        ](_context(complete_event))
+        ](_context(
+            complete_event,
+            turns=(_visible_turn(
+                f"{rendered_explanation.text}\n{pending_text}",
+            ),),
+        ))
         self.assertTrue(satisfied, details)
         self.assertEqual(
             details["matches"][0]["message_id"],
             "harness.orientation.consultation.preflight_smoke",
         )
+
+        consumed_pending = replace(
+            complete_event,
+            pending_transition={
+                **preflight_transition,
+                "consumer_action_ids": ["action-1"],
+            },
+        )
+        consumed, consumed_details = POSTCONDITION_EVALUATORS[
+            "execution_stage_explained"
+        ](_context(
+            consumed_pending,
+            turns=(_visible_turn(
+                f"{rendered_explanation.text}\n{pending_text}",
+            ),),
+        ))
+        self.assertFalse(consumed, consumed_details)
+
+        transcript_mismatch, mismatch_details = POSTCONDITION_EVALUATORS[
+            "execution_stage_explained"
+        ](_context(
+            complete_event,
+            turns=(_visible_turn("A different visible response."),),
+        ))
+        self.assertFalse(transcript_mismatch, mismatch_details)
 
         generic_fragment = {
             "message_id": "harness.orientation.consultation.requirements",
