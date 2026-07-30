@@ -42,6 +42,7 @@ from .plan_coverage import (
 )
 from .questions import (
     coerce_pending_answer,
+    declared_option_label_variants,
     exact_answer,
     pending_option_value_exists,
     pending_value_identity,
@@ -704,6 +705,7 @@ def _freeze_bounded_semantic_plan(
     ]
     review_workflow_state = workflow_snapshot(state)
     review_group_schema = group_schema()
+    review_pending = _pending_review_contract(pending)
     if compact_pending_review:
         pending_group = str(pending.get("group") or "")
         review_workflow_state = {
@@ -711,7 +713,7 @@ def _freeze_bounded_semantic_plan(
             "language": str(state.get("language") or ""),
             "target_mode": str(state.get("target_mode") or ""),
             "workflow_mode": str(state.get("workflow_mode") or ""),
-            "pending_question": pending,
+            "pending_question": review_pending,
         }
         review_group_schema = [
             row for row in group_schema()
@@ -726,7 +728,7 @@ def _freeze_bounded_semantic_plan(
                 "user_text": "\n".join(clause.text for clause in clauses),
                 "clauses": [clause.as_dict() for clause in clauses],
             },
-            "pending_question": state.get("pending_question") or {},
+            "pending_question": review_pending,
             "turn_pending_value_candidates": turn_pending_value_candidates,
             "workflow_state": review_workflow_state,
             "action_schema": action_schema(action_types=allowed_action_types),
@@ -1392,9 +1394,17 @@ def _semantic_action_purpose(
         declared = dict(option.get("action") or {})
         declared_spec = ACTION_BY_TYPE.get(str(declared.get("type") or ""))
         effect = declared_spec.purpose if declared_spec is not None else "apply the displayed option's declared effect"
+        labels = declared_option_label_variants(option)
+        expected_patch = (
+            dict(option.get("expected_patch") or {})
+            if isinstance(option.get("expected_patch"), Mapping)
+            else {}
+        )
         return (
-            f"Select the displayed pending option labelled {str(option.get('label') or '')!r} "
-            f"with value {option.get('value')!r}; its declared effect is: {effect}"
+            f"Select only the displayed pending option with id "
+            f"{str(option.get('id') or '')!r}, registered labels {list(labels)!r}, "
+            f"and value {option.get('value')!r}; its expected state effect is "
+            f"{expected_patch!r}, and its declared dispatch effect is: {effect}"
         )
     if action_type == "answer_pending" and state:
         return "Supply a source-grounded answer that actually satisfies the active typed pending contract."
@@ -1493,6 +1503,25 @@ def _semantic_action_purpose(
             ),
         }.get(command, fallback)
     return fallback
+
+
+def _pending_review_contract(
+    pending: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Add catalog meanings to a review-only copy of a pending contract."""
+
+    review = dict(pending)
+    review["options"] = [
+        {
+            **dict(option),
+            "semantic_labels": list(
+                declared_option_label_variants(option)
+            ),
+        }
+        for option in pending.get("options") or []
+        if isinstance(option, Mapping)
+    ]
+    return review
 
 
 def _matching_pending_option(

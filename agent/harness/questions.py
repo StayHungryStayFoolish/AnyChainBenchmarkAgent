@@ -905,6 +905,29 @@ def choice_question(
     })
 
 
+def declared_option_label_variants(
+    option: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Render one option's registered meanings without mutating its contract."""
+
+    labels: list[str] = []
+    label_ref = option.get("label_ref")
+    if isinstance(label_ref, dict):
+        reference = text_ref_from_dict(label_ref)
+        labels.extend(
+            render_text_ref(
+                reference,
+                language,
+                kind="option_label",
+            ).strip()
+            for language in ("en", "zh")
+        )
+    legacy_label = str(option.get("label") or "").strip()
+    if legacy_label:
+        labels.append(legacy_label)
+    return tuple(dict.fromkeys(label for label in labels if label))
+
+
 def _declared_option_candidates(
     question: Mapping[str, Any],
 ) -> tuple[tuple[str, Any], ...]:
@@ -916,17 +939,7 @@ def _declared_option_candidates(
             str(option.get("id") or "").strip(),
             str(option.get("value") or "").strip(),
         }
-        label_ref = option.get("label_ref")
-        if isinstance(label_ref, dict):
-            reference = text_ref_from_dict(label_ref)
-            literals.update(
-                render_text_ref(
-                    reference,
-                    language,
-                    kind="option_label",
-                ).strip()
-                for language in ("en", "zh")
-            )
+        literals.update(declared_option_label_variants(option))
         for literal in literals:
             if literal:
                 candidates.append((literal, option.get("value")))

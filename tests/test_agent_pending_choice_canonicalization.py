@@ -241,6 +241,115 @@ def _performance_manual_state(*, advanced: bool = False) -> dict[str, Any]:
 
 class CanonicalPendingChoiceTests(unittest.TestCase):
 
+    def test_unknown_chain_options_expose_registered_label_variants(self) -> None:
+        from agent.harness.domains.chain_identity import (
+            _identity_confirmation_question,
+        )
+        from agent.harness.questions import declared_option_label_variants
+
+        state = _state(
+            active_group="chain_identity",
+            chain_identity={
+                "raw": "sola",
+                "canonical": "sola",
+                "proposed_known_chain": "solana",
+                "status": "needs_known_chain_confirmation",
+                "case": "known_candidate",
+                "llm_resolution": {
+                    "possible_known_chain": "solana",
+                    "adapter_family": "unknown",
+                },
+            },
+        )
+        question = _identity_confirmation_question(state) or {}
+        options = {
+            str(option.get("value") or ""): option
+            for option in question.get("options") or []
+        }
+
+        self.assertEqual(
+            set(declared_option_label_variants(options["reenter_chain"])),
+            {"Re-enter the chain name", "重新输入链名"},
+        )
+        self.assertEqual(
+            set(declared_option_label_variants(options["choose_protocol"])),
+            {
+                "This is another real chain; confirm its protocol",
+                "这是另一条真实链，继续确认协议",
+            },
+        )
+
+    def test_semantic_review_receives_selected_and_sibling_option_meanings(
+        self,
+    ) -> None:
+        from agent.harness.domains.chain_identity import (
+            _identity_confirmation_question,
+        )
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.semantic_admission import _freeze_bounded_semantic_plan
+
+        state = _state(
+            active_group="chain_identity",
+            chain_identity={
+                "raw": "sola",
+                "canonical": "sola",
+                "proposed_known_chain": "solana",
+                "status": "needs_known_chain_confirmation",
+                "case": "known_candidate",
+                "llm_resolution": {
+                    "possible_known_chain": "solana",
+                    "adapter_family": "unknown",
+                },
+            },
+        )
+        state["pending_question"] = _identity_confirmation_question(state) or {}
+        text = "这是另一条真实链"
+        clauses = tuple(segment_user_turn(text))
+        candidate = json.dumps({
+            "actions": [{
+                "type": "answer_pending",
+                "selected_value": "reenter_chain",
+                "source_evidence": text,
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": clauses[0].clause_id,
+                "source_text": text,
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "candidate pending answer",
+            }],
+        }, ensure_ascii=False)
+
+        request = _freeze_bounded_semantic_plan(
+            candidate,
+            state,
+            clauses,
+        ).request_payload()
+        action = request["actions"][0]
+        review_options = {
+            str(option.get("value") or ""): option
+            for option in request["review_context"]["pending_question"]["options"]
+        }
+
+        self.assertIn("Re-enter the chain name", action["declared_purpose"])
+        self.assertIn("重新输入链名", action["declared_purpose"])
+        self.assertNotIn(
+            "这是另一条真实链，继续确认协议",
+            action["declared_purpose"],
+        )
+        self.assertEqual(
+            set(review_options["choose_protocol"]["semantic_labels"]),
+            {
+                "This is another real chain; confirm its protocol",
+                "这是另一条真实链，继续确认协议",
+            },
+        )
+        self.assertEqual(
+            review_options["choose_protocol"]["expected_patch"],
+            {"chain_identity.status": "needs_protocol_confirmation"},
+        )
+
 
     def test_declared_option_id_is_canonicalized_to_its_value(self) -> None:
         from agent.harness.questions import choice_question, question_text
