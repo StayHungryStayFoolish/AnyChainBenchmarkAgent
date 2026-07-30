@@ -155,7 +155,8 @@ def _apply_analysis_action(state: AgentGraphState, action: ActionProposal) -> Ha
                 state,
                 str(action.arguments.get("evidence") or ""),
                 pending,
-            )
+            ),
+            consumed_action_id=action.action_id,
         )
     if action.action_type == "append_evidence_collection":
         if not state.get("evidence_collection"):
@@ -165,7 +166,8 @@ def _apply_analysis_action(state: AgentGraphState, action: ActionProposal) -> Ha
                 state,
                 str(action.arguments.get("evidence") or ""),
                 state.get("evidence_collection") or {},
-            )
+            ),
+            consumed_action_id=action.action_id,
         )
     if action.action_type == "finish_evidence_collection":
         if not state.get("evidence_collection"):
@@ -174,13 +176,25 @@ def _apply_analysis_action(state: AgentGraphState, action: ActionProposal) -> Ha
             state,
             state.get("evidence_collection") or {},
         )
-        return _collection_result(outcome)
+        return _collection_result(
+            outcome,
+            consumed_action_id=action.action_id,
+        )
     if action.action_type == "pause_evidence_collection":
-        return pause_evidence_collection(state)
+        return _bind_collection_action(
+            pause_evidence_collection(state),
+            action.action_id,
+        )
     if action.action_type == "resume_evidence_collection":
-        return resume_evidence_collection(state)
+        return _bind_collection_action(
+            resume_evidence_collection(state),
+            action.action_id,
+        )
     if action.action_type == "cancel_evidence_collection":
-        return cancel_evidence_collection(state)
+        return _bind_collection_action(
+            cancel_evidence_collection(state),
+            action.action_id,
+        )
 
     if action.action_type == "analyze_report":
         report_context = dict(state.get("report_context") or {})
@@ -217,12 +231,6 @@ def _apply_analysis_action(state: AgentGraphState, action: ActionProposal) -> Ha
                     or ""
                 ),
                 consumed_action_id=action.action_id,
-            )
-            return HandlerResult(
-                consumed_action_ids=(action.action_id,),
-                response_fragments=(response_fragment,),
-                completion="in_progress",
-                stop_after_response=True,
             )
         evidence_buffer = [dict(item) for item in list(state.get("evidence_buffer") or [])]
         if not collecting:
@@ -268,12 +276,29 @@ def _apply_analysis_action(state: AgentGraphState, action: ActionProposal) -> Ha
     ))
 
 
-def _collection_result(outcome: EvidenceCollectionOutcome) -> HandlerResult:
+def _bind_collection_action(
+    result: HandlerResult,
+    consumed_action_id: str,
+) -> HandlerResult:
+    """Bind an admitted collection transition to its sole causal action."""
+
+    if result.blocker is not None:
+        return result
+    if result.consumed_action_ids not in {(), (consumed_action_id,)}:
+        raise ValueError("evidence collection result has a conflicting causal action")
+    return replace(result, consumed_action_ids=(consumed_action_id,))
+
+
+def _collection_result(
+    outcome: EvidenceCollectionOutcome,
+    *,
+    consumed_action_id: str,
+) -> HandlerResult:
     """Convert collection transport output into the normal graph lifecycle."""
 
     if outcome.disposition != "pending_answer":
-        return outcome.result
-    return HandlerResult(
+        return _bind_collection_action(outcome.result, consumed_action_id)
+    return _bind_collection_action(HandlerResult(
         delta=outcome.result.delta,
         control_receipts=outcome.result.control_receipts,
         clear_pending=False,
@@ -286,7 +311,7 @@ def _collection_result(outcome: EvidenceCollectionOutcome) -> HandlerResult:
             "selection_contract_verified": True,
         },),
         completion="completed",
-    )
+    ), consumed_action_id)
 
 
 def should_start_evidence_collection(text: str) -> bool:
@@ -538,7 +563,7 @@ def prompt_evidence_collection_waiting(
         block_id=block_id,
     )
     return HandlerResult(
-        delta=StateDelta.set_values({"evidence_collection": normalized}),
+        delta=StateDelta(),
         control_receipts=_control_receipts_since(state, previous_ids),
         response_fragments=(response_fragment,),
         completion="in_progress",

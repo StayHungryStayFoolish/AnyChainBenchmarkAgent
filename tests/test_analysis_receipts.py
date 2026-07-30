@@ -12,6 +12,7 @@ from agent.harness.domains.analysis import (
     apply_analysis_action,
     continue_evidence_collection,
     finish_evidence_collection,
+    prompt_evidence_collection_waiting,
     report_artifact_entry_result,
     start_evidence_collection,
 )
@@ -282,6 +283,159 @@ class AnalysisOwnerReceiptTest(unittest.TestCase):
             rendered.render_hash,
         )
         self.assertTrue(validate_analysis_receipt(receipt)[0])
+
+    def test_every_collection_transition_binds_its_admitted_action(self) -> None:
+        question = {"id": "freeform_evidence", "kind": "log_evidence"}
+        cases = (
+            (
+                "start_evidence_collection",
+                {"evidence": "ERROR connection refused"},
+                {"pending_question": {
+                    "id": "new_chain_schema_evidence",
+                    "kind": "evidence",
+                }},
+            ),
+            (
+                "append_evidence_collection",
+                {"evidence": "retry exhausted"},
+                {"evidence_collection": {
+                    "question": question,
+                    "lines": ["ERROR connection refused"],
+                    "language": "en",
+                    "status": "active",
+                }},
+            ),
+            (
+                "finish_evidence_collection",
+                {},
+                {"evidence_collection": {
+                    "question": question,
+                    "lines": ["ERROR connection refused"],
+                    "language": "en",
+                    "status": "active",
+                }},
+            ),
+            (
+                "pause_evidence_collection",
+                {},
+                {"evidence_collection": {
+                    "question": question,
+                    "lines": ["ERROR connection refused"],
+                    "language": "en",
+                    "status": "active",
+                }},
+            ),
+            (
+                "resume_evidence_collection",
+                {},
+                {"evidence_collection": {
+                    "question": question,
+                    "lines": ["ERROR connection refused"],
+                    "language": "en",
+                    "status": "paused",
+                }},
+            ),
+            (
+                "cancel_evidence_collection",
+                {},
+                {"evidence_collection": {
+                    "question": question,
+                    "lines": ["ERROR connection refused"],
+                    "language": "en",
+                    "status": "active",
+                }},
+            ),
+        )
+        for action_type, arguments, state_values in cases:
+            with self.subTest(action_type=action_type):
+                state = self._state(f"collection-{action_type}")
+                state.update(deepcopy(state_values))
+                action_id = f"action-{action_type}"
+                action = ActionProposal(
+                    action_id=action_id,
+                    action_type=action_type,
+                    arguments=arguments,
+                    confidence="high",
+                )
+                result = apply_analysis_action(state, action)
+                self.assertIsNone(result.blocker)
+                self.assertEqual(result.consumed_action_ids, (action_id,))
+
+    def test_inline_collection_completion_keeps_append_action_identity(self) -> None:
+        state = self._state("collection-inline-finish")
+        state["evidence_collection"] = {
+            "question": {"id": "freeform_evidence", "kind": "log_evidence"},
+            "lines": ["ERROR connection refused"],
+            "language": "en",
+            "status": "active",
+        }
+        action = ActionProposal(
+            action_id="append-and-finish",
+            action_type="append_evidence_collection",
+            arguments={"evidence": "retry exhausted\nEND"},
+            confidence="high",
+        )
+
+        result = apply_analysis_action(state, action)
+
+        self.assertEqual(result.consumed_action_ids, ("append-and-finish",))
+        self.assertEqual(result.completion, "completed")
+        self.assertTrue(any(
+            write.path == ("evidence_buffer",)
+            for write in result.delta.writes
+        ))
+
+    def test_rpc_collection_handoff_keeps_finish_action_identity(self) -> None:
+        state = self._state("collection-pending-answer")
+        state["evidence_collection"] = {
+            "question": {"id": "new_chain_schema_evidence", "kind": "evidence"},
+            "lines": ['{"jsonrpc":"2.0","method":"eth_blockNumber","params":[]}'],
+            "language": "en",
+            "status": "active",
+        }
+        action = ActionProposal(
+            action_id="finish-rpc-evidence",
+            action_type="finish_evidence_collection",
+            arguments={},
+            confidence="high",
+        )
+
+        result = apply_analysis_action(state, action)
+
+        self.assertEqual(result.consumed_action_ids, ("finish-rpc-evidence",))
+        self.assertEqual(result.pending_question["id"], "new_chain_schema_evidence")
+        self.assertEqual(result.followup_actions[0]["type"], "answer_pending")
+
+    def test_collection_blocker_does_not_claim_action_consumption(self) -> None:
+        state = self._state("collection-invalid-pause")
+        action = ActionProposal(
+            action_id="invalid-pause",
+            action_type="pause_evidence_collection",
+            arguments={},
+            confidence="high",
+        )
+
+        result = apply_analysis_action(state, action)
+
+        self.assertIsNotNone(result.blocker)
+        self.assertEqual(result.consumed_action_ids, ())
+
+    def test_empty_collection_waiting_is_read_only(self) -> None:
+        state = self._state("collection-empty-wait")
+        collecting = {
+            "question": {"id": "freeform_evidence", "kind": "log_evidence"},
+            "lines": ["ERROR connection refused"],
+            "language": "en",
+            "status": "active",
+            "block_id": "existing-block",
+        }
+        state["evidence_collection"] = deepcopy(collecting)
+
+        result = prompt_evidence_collection_waiting(state, collecting)
+
+        self.assertEqual(result.delta.writes, ())
+        self.assertEqual(result.delta.deletes, ())
+        self.assertEqual(state["evidence_collection"], collecting)
 
     def test_report_receipt_binds_requested_job_resolved_job_and_response_identity(self) -> None:
         state = self._state("report-analysis")
