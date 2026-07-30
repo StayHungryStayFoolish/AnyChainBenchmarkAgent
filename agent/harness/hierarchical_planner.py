@@ -1270,6 +1270,10 @@ def _validate_partition_document(
     raw_units = payload.get("semantic_units")
     if not isinstance(raw_units, list):
         return [], ("Stage A semantic_units is not a list",)
+    raw_units = _normalize_contract_bound_pending_routes(
+        raw_units,
+        state or {},
+    )
     raw_units = _retain_unclaimed_prose_clauses(raw_units, clauses)
     partition = validate_semantic_partition(raw_units, clauses)
     errors = list(partition.errors)
@@ -1449,6 +1453,47 @@ def _validate_partition_document(
                 + ", ".join(missing)
             )
     return output, tuple(dict.fromkeys(errors))
+
+
+def _normalize_contract_bound_pending_routes(
+    raw_units: Sequence[Any],
+    state: Mapping[str, Any],
+) -> list[Any]:
+    """Derive a pending-answer group only from the active signed contract."""
+
+    pending = dict(state.get("pending_question") or {})
+    pending_group = str(pending.get("group") or "")
+    pending_owners = _UNIVERSAL_OPERATION_OWNERS.get("pending_answer") or ()
+    if (
+        not pending_group
+        or pending_group not in GROUP_SPEC_BY_NAME
+        or len(pending_owners) != 1
+    ):
+        return list(raw_units)
+    pending_owner = pending_owners[0]
+    output: list[Any] = []
+    for raw in raw_units:
+        if not isinstance(raw, Mapping):
+            output.append(raw)
+            continue
+        unit = dict(raw)
+        routes = unit.get("owner_routes")
+        if (
+            str(unit.get("operation") or "") != "pending_answer"
+            or not isinstance(routes, list)
+            or len(routes) != 1
+            or not isinstance(routes[0], Mapping)
+            or set(routes[0]) != _ROUTE_KEYS
+            or str(routes[0].get("owner") or "") != pending_owner
+        ):
+            output.append(unit)
+            continue
+        unit["owner_routes"] = [{
+            "owner": pending_owner,
+            "group": pending_group,
+        }]
+        output.append(unit)
+    return output
 
 
 def _retain_unclaimed_prose_clauses(

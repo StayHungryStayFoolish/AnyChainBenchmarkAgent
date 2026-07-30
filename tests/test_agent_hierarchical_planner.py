@@ -2954,6 +2954,122 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             errors,
         )
 
+    def test_stage_a_derives_pending_answer_group_from_active_contract(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import (
+            _validate_partition_document,
+        )
+        from agent.harness.plan_coverage import TurnClause
+        from agent.harness.questions import manual_question, question_text
+        from agent.harness.state import new_state
+
+        state = new_state("pending-route-contract", language="en")
+        state["pending_question"] = manual_question(
+            "chain_identity",
+            "chain",
+            question_text("question.chain_rpc.chain.prompt"),
+            owner="chain_rpc",
+            field="chain",
+        )
+        unit = {
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": "arbitrary wrapper",
+            "operation": "pending_answer",
+            "owner_routes": [{
+                "owner": "coordinator",
+                "group": "coordinator",
+            }],
+            "reason": "model supplied an owner name as the group",
+        }
+
+        partition, errors = _validate_partition_document(
+            json.dumps({"semantic_units": [unit], "reason": "answer"}),
+            (TurnClause("clause-1", "arbitrary wrapper", "prose"),),
+            state=state,
+        )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(
+            partition[0]["owner_routes"],
+            [{"owner": "coordinator", "group": "chain_identity"}],
+        )
+
+    def test_stage_a_does_not_invent_ambiguous_pending_routes(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _validate_partition_document,
+        )
+        from agent.harness.plan_coverage import TurnClause
+        from agent.harness.questions import manual_question, question_text
+        from agent.harness.state import new_state
+
+        state = new_state("pending-route-negatives", language="en")
+        state["pending_question"] = manual_question(
+            "chain_identity",
+            "chain",
+            question_text("question.chain_rpc.chain.prompt"),
+            owner="chain_rpc",
+            field="chain",
+        )
+        base = {
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": "arbitrary wrapper",
+            "operation": "pending_answer",
+            "owner_routes": [{
+                "owner": "coordinator",
+                "group": "coordinator",
+            }],
+            "reason": "invalid route",
+        }
+        cases = {
+            "missing_pending": ({}, base),
+            "wrong_owner": (
+                state,
+                {
+                    **base,
+                    "owner_routes": [{
+                        "owner": "orientation",
+                        "group": "coordinator",
+                    }],
+                },
+            ),
+            "multiple_routes": (
+                state,
+                {
+                    **base,
+                    "owner_routes": [
+                        {"owner": "coordinator", "group": "coordinator"},
+                        {"owner": "coordinator", "group": "chain_identity"},
+                    ],
+                },
+            ),
+            "non_pending_operation": (
+                state,
+                {**base, "operation": "domain_request"},
+            ),
+        }
+        for name, (case_state, case_unit) in cases.items():
+            with self.subTest(name=name):
+                partition, errors = _validate_partition_document(
+                    json.dumps({
+                        "semantic_units": [case_unit],
+                        "reason": "invalid",
+                    }),
+                    (TurnClause(
+                        "clause-1",
+                        "arbitrary wrapper",
+                        "prose",
+                    ),),
+                    state=case_state,
+                )
+                self.assertTrue(errors)
+                self.assertNotEqual(
+                    partition[0].get("owner_routes"),
+                    [{"owner": "coordinator", "group": "chain_identity"}],
+                )
+
     def test_unique_manual_candidate_keeps_wrapper_as_source_context(self) -> None:
         from agent.harness.hierarchical_planner import (
             _canonicalize_unique_manual_pending_partition,
