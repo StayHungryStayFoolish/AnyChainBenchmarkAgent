@@ -134,6 +134,81 @@ def _validated_method_contract(
     }
 
 
+def _new_chain_response_confirmation_seed() -> dict[str, Any]:
+    """Build a response-confirmation state from durable probe evidence."""
+
+    chain = "coverage-evm"
+    endpoint = "http://geth-dev:8545"
+    evidence_file = str(
+        Path(__file__).resolve().parent
+        / "fixtures"
+        / "rpc_probe"
+        / "coverage-evm-eth-block-number.json"
+    )
+    validated = _validated_method_contract(
+        method="eth_blockNumber",
+        endpoint=endpoint,
+        chain=chain,
+        evidence_file=evidence_file,
+    )
+    schema = deepcopy(validated["schema"])
+    observed_response = {
+        "shape_hash": "a" * 64,
+        "sample": '{"jsonrpc":"2.0","result":"0x1"}',
+        "evidence_file": evidence_file,
+    }
+    draft = {
+        **schema,
+        "contract_version": 1,
+        "revision": 1,
+        "phase": "response_confirmation",
+        "confirmed_parameters": [],
+        "request_confirmed": True,
+        "response_confirmed": False,
+        "observed_response": observed_response,
+        "probe": {
+            "ready": True,
+            "request_contract_hash": request_contract_hash(schema),
+            "catalog_revision": 1,
+            "admissible_catalog_revision": 1,
+            "probe_receipt": deepcopy(validated["probe_receipt"]),
+            "evidence_file": evidence_file,
+        },
+    }
+    return {
+        "target_mode": "real-node",
+        "workflow_mode": "rpc_benchmark",
+        "chain_identity": {
+            "canonical": chain,
+            "adapter_family": "jsonrpc",
+            "status": "existing_family_response_needs_confirmation",
+            "candidate_method": "eth_blockNumber",
+            "observed_response": deepcopy(observed_response),
+        },
+        "endpoint_evidence": {
+            **_validated_new_chain_endpoint_evidence(
+                endpoint=endpoint,
+                chain=chain,
+            ),
+            "new_chain_method_probe": {
+                "ready": True,
+                "status": "ok",
+                "evidence_file": evidence_file,
+            },
+        },
+        "custom_rpc": {
+            "catalog": {
+                "contract_version": 1,
+                "revision": 1,
+                "chain": chain,
+                "methods": [],
+                "finished": False,
+                "draft": draft,
+            },
+        },
+    }
+
+
 def canonical_question_contract(question: Mapping[str, Any]) -> dict[str, Any]:
     """Remove runtime identity while preserving the complete question contract."""
 
@@ -968,37 +1043,7 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
         (
             "new_chain_response",
             "endpoint_process",
-            {
-                "target_mode": "real-node",
-                "workflow_mode": "rpc_benchmark",
-                "chain_identity": {
-                    "canonical": "new-chain",
-                    "status": "existing_family_response_needs_confirmation",
-                    "candidate_method": "eth_blockNumber",
-                    "observed_response": {"shape_hash": "shape-1", "sample": '{"result":"0x1"}'},
-                },
-                "custom_rpc": {
-                    "catalog": {
-                        "contract_version": 1,
-                        "revision": 1,
-                        "methods": [],
-                        "finished": False,
-                        "draft": {
-                            "contract_version": 1,
-                            "revision": 1,
-                            "phase": "response_confirmation",
-                            "method": "eth_blockNumber",
-                            "params": [],
-                            "params_json": [],
-                            "confirmed_parameters": [],
-                            "request_confirmed": True,
-                            "response_confirmed": False,
-                            "probe": {"ready": True},
-                            "observed_response": {"shape_hash": "shape-1", "sample": '{"result":"0x1"}'},
-                        },
-                    },
-                },
-            },
+            _new_chain_response_confirmation_seed(),
         ),
         (
             "new_chain_continue",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import unittest
 
 from agent.harness.invariants import validate_state
@@ -10,6 +11,7 @@ from tests.agent_live.harness_contract_scenarios import (
     manual_input_case,
     question_scenarios,
 )
+from tests.agent_live.graph_turn import answer_pending
 from tests.agent_live.runtime_checkpoint import reviewed_scenario_state
 
 
@@ -55,6 +57,59 @@ class HarnessContractScenarioTest(unittest.TestCase):
             self.assertEqual(state.get("rpc_mode"), rpc_mode)
             self.assertEqual((state.get("chain_identity") or {}).get("status"), "confirmed")
             self.assertEqual((state.get("pending_question") or {}).get("id"), "workload_confirm")
+
+    def test_new_chain_response_seed_finalizes_validated_method_once(self) -> None:
+        state = reviewed_scenario_state("new_chain_response")
+        state["thread_id"] = "unit-new-chain-response-valid"
+
+        self.assertEqual(
+            (state.get("pending_question") or {}).get("id"),
+            "new_chain_response_confirm",
+        )
+        result = answer_pending(state, "Y", selected_value=True)
+
+        self.assertEqual(
+            (result.get("pending_question") or {}).get("id"),
+            "new_chain_method_continue",
+        )
+        catalog = (result.get("custom_rpc") or {}).get("catalog") or {}
+        methods = catalog.get("methods") or []
+        self.assertEqual(
+            [item.get("method") for item in methods],
+            ["eth_blockNumber"],
+        )
+        self.assertTrue(
+            ((catalog.get("last_transition") or {}).get("accepted")),
+        )
+        self.assertEqual(
+            (catalog.get("last_transition") or {}).get("command"),
+            "add_method",
+        )
+        validate_state(result)  # type: ignore[arg-type]
+
+    def test_new_chain_response_seed_fails_closed_with_stale_probe_binding(self) -> None:
+        state = reviewed_scenario_state("new_chain_response")
+        stale = deepcopy(state)
+        stale["thread_id"] = "unit-new-chain-response-stale"
+        draft = ((stale.get("custom_rpc") or {}).get("catalog") or {}).get("draft") or {}
+        draft["probe"]["probe_receipt"]["evidence_file_hash"] = "0" * 64
+
+        result = answer_pending(stale, "Y", selected_value=True)
+
+        self.assertEqual(
+            (result.get("pending_question") or {}).get("id"),
+            "new_chain_response_confirm",
+        )
+        catalog = (result.get("custom_rpc") or {}).get("catalog") or {}
+        self.assertEqual(catalog.get("methods") or [], [])
+        self.assertTrue(
+            ((catalog.get("last_transition") or {}).get("accepted")),
+        )
+        self.assertEqual(
+            (catalog.get("last_transition") or {}).get("command"),
+            "confirm_response",
+        )
+        validate_state(result)  # type: ignore[arg-type]
 
     def test_semantic_coordinator_actions_have_independent_reviewed_seeds(self) -> None:
         scenarios = action_transition_scenarios("en")
