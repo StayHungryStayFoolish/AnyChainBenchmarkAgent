@@ -317,7 +317,7 @@ An artifact's internal self-hashes are never source authority.
 Fixed denominators:
 
 - G3: 60 retained-regression obligations;
-- G4: 625 response-driven dynamic Chaos obligations per complete round, with
+- G4: 732 response-driven dynamic Chaos obligations per complete round, with
   two consecutive rounds using distinct round/session/request/execution/evidence
   identities and no new S1/S2 root class;
 - G5: 4 real-execution lanes;

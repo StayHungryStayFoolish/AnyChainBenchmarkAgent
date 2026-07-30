@@ -251,7 +251,7 @@ runtime-root 转换不能形成合格证据。
 固定分母：
 
 - G3：60 个 retained-regression obligation；
-- G4：625 个 response-driven dynamic Chaos obligation，每轮完整覆盖，连续
+- G4：732 个 response-driven dynamic Chaos obligation，每轮完整覆盖，连续
   两轮使用不同 round/session/request/execution/evidence identity，并且没有
   新 S1/S2 root class；
 - G5：4 个真实执行 lane；

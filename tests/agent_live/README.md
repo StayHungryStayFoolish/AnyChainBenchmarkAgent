@@ -58,8 +58,8 @@ are raw evidence, not product acceptance.
 
 Phase 8 uses finite, frozen denominators. G3 contains 60 retained-regression
 obligations: exact, isomorphic, negative, and neighboring variants for each of
-15 sanitized real-user cases. The current G4 catalog contains 625
-response-driven obligations: 176 constrained pairwise rows plus 449 high-risk
+15 sanitized real-user cases. The current G4 catalog contains 732
+response-driven obligations: 177 constrained pairwise rows plus 555 high-risk
 state-control triples. This number is descriptive, not a second source of
 truth: every run must validate the denominator and per-model counts from
 `product_chaos_obligation_report()` in the revision-bound catalog before
