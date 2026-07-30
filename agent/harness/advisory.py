@@ -15,6 +15,7 @@ from ..llm.types import (
 )
 from ..onboarding.families import SUPPORTED_FAMILIES
 from .context import workflow_snapshot
+from .semantic_compiler import request_semantic_compilation
 from .state import AgentGraphState, DEFAULT_GROUP_ORDER
 
 
@@ -40,25 +41,13 @@ def resolve_unknown_chain_identity(
 
     try:
         provider = provider_from_config()
-        response = provider.complete(
-            LLMRequest(
-                messages=[
-                    LLMMessage(role="system", content=_chain_identity_prompt()),
-                    LLMMessage(
-                        role="user",
-                        content=json.dumps(
-                            _chain_identity_payload(state, chain_text),
-                            ensure_ascii=False,
-                            sort_keys=True,
-                        ),
-                    ),
-                ],
-                temperature=0.0,
-                max_tokens=900,
-                replay_safety="side_effect_free",
-            )
+        raw = request_semantic_compilation(
+            provider,
+            system_prompt=_chain_identity_prompt(),
+            request_payload=_chain_identity_payload(state, chain_text),
+            max_tokens=900,
         )
-        payload = _parse_json_object(response.text)
+        payload = _parse_json_object(raw)
     except (LLMTurnTimeoutError, LLMProviderError):
         raise
     except Exception as exc:
@@ -180,25 +169,13 @@ def _extract_chain_mention_with_provider(
     state: AgentGraphState,
     text: str,
 ) -> dict[str, Any]:
-    response = provider.complete(
-        LLMRequest(
-            messages=[
-                LLMMessage(role="system", content=_chain_mention_prompt()),
-                LLMMessage(
-                    role="user",
-                    content=json.dumps(
-                        _chain_mention_payload(state, text),
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ),
-                ),
-            ],
-            temperature=0.0,
-            max_tokens=300,
-            replay_safety="side_effect_free",
-        )
+    raw = request_semantic_compilation(
+        provider,
+        system_prompt=_chain_mention_prompt(),
+        request_payload=_chain_mention_payload(state, text),
+        max_tokens=300,
     )
-    return _parse_json_object(response.text)
+    return _parse_json_object(raw)
 
 
 def extract_rpc_schema_from_evidence(
@@ -211,29 +188,17 @@ def extract_rpc_schema_from_evidence(
 
     try:
         provider = provider_from_config()
-        response = provider.complete(
-            LLMRequest(
-                messages=[
-                    LLMMessage(role="system", content=_rpc_schema_prompt()),
-                    LLMMessage(
-                        role="user",
-                        content=json.dumps(
-                            _rpc_schema_payload(
-                                state,
-                                evidence,
-                                method_hint=method_hint,
-                            ),
-                            ensure_ascii=False,
-                            sort_keys=True,
-                        ),
-                    ),
-                ],
-                temperature=0.0,
-                max_tokens=1200,
-                replay_safety="side_effect_free",
-            )
+        raw = request_semantic_compilation(
+            provider,
+            system_prompt=_rpc_schema_prompt(),
+            request_payload=_rpc_schema_payload(
+                state,
+                evidence,
+                method_hint=method_hint,
+            ),
+            max_tokens=1200,
         )
-        payload = _parse_json_object(response.text)
+        payload = _parse_json_object(raw)
     except (LLMTurnTimeoutError, LLMProviderError):
         raise
     except Exception as exc:
