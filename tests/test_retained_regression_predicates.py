@@ -259,24 +259,28 @@ def _rpc_schema_receipt(
     matching_ids: bool = True,
     producer_action_id: str = "append-request",
     catalog_revision: int = 2,
+    source_revisions: tuple[int, ...] = (1, 2),
+    source_evidence_hashes: tuple[str, ...] = (
+        RPC_SOURCE_EVIDENCE_HASH,
+    ),
+    source_action_value_hashes: tuple[str, ...] = (
+        RPC_SOURCE_ACTION_VALUE_HASH,
+    ),
+    include_response: bool = True,
+    include_validation_endpoint: bool = False,
+    method: str = "eth_chainId",
 ) -> dict:
     fields = [
         {
             "field_path": "method",
             "source_kind": "protocol_request_parser",
-            "source_revisions": [1, 2],
-            "value_hash": evidence_hash("eth_chainId"),
-        },
-        {
-            "field_path": "response_summary",
-            "source_kind": "protocol_response_parser",
-            "source_revisions": [1, 2],
-            "value_hash": evidence_hash("JSON-RPC result (string)"),
+            "source_revisions": list(source_revisions),
+            "value_hash": evidence_hash(method),
         },
         {
             "field_path": "exchange_correlation.status",
             "source_kind": "protocol_exchange_correlator",
-            "source_revisions": [1, 2],
+            "source_revisions": list(source_revisions),
             "value_hash": evidence_hash(
                 "correlated" if correlated else "response_id_mismatch"
             ),
@@ -284,34 +288,64 @@ def _rpc_schema_receipt(
         {
             "field_path": "exchange_correlation.request_id_hashes",
             "source_kind": "protocol_exchange_correlator",
-            "source_revisions": [1, 2],
+            "source_revisions": list(source_revisions),
             "value_hash": evidence_hash(["request-id"]),
         },
         {
             "field_path": "exchange_correlation.response_id_hashes",
             "source_kind": "protocol_exchange_correlator",
-            "source_revisions": [1, 2],
+            "source_revisions": list(source_revisions),
             "value_hash": evidence_hash(
-                ["request-id"] if matching_ids else ["response-id"]
+                (
+                    ["request-id"]
+                    if matching_ids
+                    else ["response-id"]
+                )
+                if include_response
+                else []
             ),
         },
     ]
+    if include_response:
+        fields.insert(1, {
+            "field_path": "response_summary",
+            "source_kind": "protocol_response_parser",
+            "source_revisions": list(source_revisions),
+            "value_hash": evidence_hash("JSON-RPC result (string)"),
+        })
+    if include_validation_endpoint:
+        fields.append({
+            "field_path": "validation_endpoint",
+            "source_kind": "rpc_endpoint_role",
+            "source_revisions": list(source_revisions),
+            "value_hash": evidence_hash("validation-endpoint"),
+        })
+    source_bindings = sorted([
+        {
+            "evidence_hash": evidence_hash_value,
+            "action_value_hash": action_value_hash,
+        }
+        for evidence_hash_value, action_value_hash in zip(
+            source_evidence_hashes,
+            source_action_value_hashes,
+            strict=True,
+        )
+    ], key=lambda item: item["evidence_hash"])
     body = {
         "receipt_type": "rpc_schema_provenance",
         "receipt_version": 2,
         "turn_index": turn_index,
         "owner": "rpc_catalog",
-        "method": "eth_chainId",
-        "method_hash": evidence_hash("eth_chainId"),
+        "method": method,
+        "method_hash": evidence_hash(method),
         "catalog_revision": catalog_revision,
         "fields": fields,
         "fields_hash": evidence_hash(fields),
-        "source_evidence_hashes": [RPC_SOURCE_EVIDENCE_HASH],
-        "source_action_value_hashes": [RPC_SOURCE_ACTION_VALUE_HASH],
-        "source_bindings": [{
-            "evidence_hash": RPC_SOURCE_EVIDENCE_HASH,
-            "action_value_hash": RPC_SOURCE_ACTION_VALUE_HASH,
-        }],
+        "source_evidence_hashes": sorted(source_evidence_hashes),
+        "source_action_value_hashes": sorted(
+            source_action_value_hashes
+        ),
+        "source_bindings": source_bindings,
         "producer_action_id": producer_action_id,
     }
     return {**body, "receipt_id": evidence_hash(body)}
@@ -324,7 +358,25 @@ def _rpc_catalog_transition_receipt(
     accepted: bool = True,
     producer_action_id: str = "rpc-action",
     command: str = "append_evidence",
+    source_evidence_hashes: tuple[str, ...] = (
+        RPC_SOURCE_EVIDENCE_HASH,
+    ),
+    source_action_value_hashes: tuple[str, ...] = (
+        RPC_SOURCE_ACTION_VALUE_HASH,
+    ),
+    method: str = "eth_chainId",
 ) -> dict:
+    source_bindings = sorted([
+        {
+            "evidence_hash": evidence_hash_value,
+            "action_value_hash": action_value_hash,
+        }
+        for evidence_hash_value, action_value_hash in zip(
+            source_evidence_hashes,
+            source_action_value_hashes,
+            strict=True,
+        )
+    ], key=lambda item: item["evidence_hash"])
     body = {
         "receipt_type": "rpc_catalog_transition",
         "receipt_version": 2,
@@ -338,14 +390,13 @@ def _rpc_catalog_transition_receipt(
         "method_names": [],
         "method_hashes": [],
         "method_count": 0,
-        "draft_method": "eth_chainId",
-        "draft_method_hash": evidence_hash("eth_chainId"),
-        "source_evidence_hashes": [RPC_SOURCE_EVIDENCE_HASH],
-        "source_action_value_hashes": [RPC_SOURCE_ACTION_VALUE_HASH],
-        "source_bindings": [{
-            "evidence_hash": RPC_SOURCE_EVIDENCE_HASH,
-            "action_value_hash": RPC_SOURCE_ACTION_VALUE_HASH,
-        }],
+        "draft_method": method,
+        "draft_method_hash": evidence_hash(method),
+        "source_evidence_hashes": sorted(source_evidence_hashes),
+        "source_action_value_hashes": sorted(
+            source_action_value_hashes
+        ),
+        "source_bindings": source_bindings,
         "finished": False,
         "producer_action_id": producer_action_id,
     }
@@ -3730,6 +3781,215 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
             "rpc_schema_evidence_extracted"
         ](_context(wrong_revision))
         self.assertFalse(satisfied)
+
+    def test_rpc_schema_evidence_accepts_a_bound_progressive_exchange(
+        self,
+    ) -> None:
+        response_action_hash = evidence_hash("response-action-value")
+        response_evidence_hash = evidence_hash("response-evidence")
+        first = _event(
+            _rpc_schema_receipt(
+                turn_index=1,
+                catalog_revision=2,
+                source_revisions=(1,),
+                include_response=False,
+            ),
+            _rpc_catalog_transition_receipt(
+                turn_index=1,
+                revision=1,
+                producer_action_id="append-request",
+            ),
+            _rpc_catalog_transition_receipt(
+                turn_index=1,
+                revision=2,
+                producer_action_id="append-request",
+                command="correct_draft",
+            ),
+            _domain_commit(
+                action_id="append-request",
+                owner="chain_rpc",
+            ),
+            turn_index=1,
+            admitted_actions=({
+                "type": "rpc_catalog_command",
+                "action_id": "append-request",
+                "owner": "chain_rpc",
+                "effect": "state_mutation",
+                "group": "endpoint_process",
+                "argument_value_hashes": {
+                    "catalog_command": _value_hash("append_evidence"),
+                    "source_evidence": RPC_SOURCE_ACTION_VALUE_HASH,
+                },
+            },),
+            pending_transition={
+                "transition": "replaced",
+                "before_id": "custom_rpc_schema_evidence",
+                "before_group": "endpoint_process",
+                "before_hash": "1" * 64,
+                "after_id": "custom_rpc_schema_confirm",
+                "after_group": "endpoint_process",
+                "after_hash": "2" * 64,
+                "consumer_action_ids": ["append-request"],
+            },
+        )
+        cumulative_evidence = (
+            RPC_SOURCE_EVIDENCE_HASH,
+            response_evidence_hash,
+        )
+        cumulative_actions = (
+            RPC_SOURCE_ACTION_VALUE_HASH,
+            response_action_hash,
+        )
+        second = _event(
+            _rpc_schema_receipt(
+                turn_index=2,
+                producer_action_id="append-response",
+                catalog_revision=4,
+                source_revisions=(1, 3),
+                source_evidence_hashes=cumulative_evidence,
+                source_action_value_hashes=cumulative_actions,
+                include_validation_endpoint=True,
+            ),
+            _rpc_catalog_transition_receipt(
+                turn_index=2,
+                revision=3,
+                producer_action_id="append-response",
+                source_evidence_hashes=cumulative_evidence,
+                source_action_value_hashes=cumulative_actions,
+            ),
+            _rpc_catalog_transition_receipt(
+                turn_index=2,
+                revision=4,
+                producer_action_id="append-response",
+                command="correct_draft",
+                source_evidence_hashes=cumulative_evidence,
+                source_action_value_hashes=cumulative_actions,
+            ),
+            _domain_commit(
+                turn_index=2,
+                action_id="append-response",
+                owner="chain_rpc",
+            ),
+            turn_index=2,
+            admitted_actions=({
+                "type": "rpc_catalog_command",
+                "action_id": "append-response",
+                "owner": "chain_rpc",
+                "effect": "state_mutation",
+                "group": "endpoint_process",
+                "argument_value_hashes": {
+                    "catalog_command": _value_hash("append_evidence"),
+                    "source_evidence": response_action_hash,
+                },
+            },),
+            pending_transition={
+                "transition": "replaced",
+                "before_id": "custom_rpc_schema_confirm",
+                "before_group": "endpoint_process",
+                "before_hash": "2" * 64,
+                "after_id": "custom_rpc_schema_confirm",
+                "after_group": "endpoint_process",
+                "after_hash": "3" * 64,
+                "consumer_action_ids": ["append-response"],
+            },
+        )
+
+        satisfied, details = POSTCONDITION_EVALUATORS[
+            "rpc_schema_evidence_extracted"
+        ](_context(first, second))
+        self.assertTrue(satisfied, details)
+        self.assertEqual(details["progressed_turn_indexes"], [2])
+
+        endpoint_scoped, details = POSTCONDITION_EVALUATORS[
+            "example_endpoint_scope_preserved"
+        ](_context(first, second))
+        self.assertTrue(endpoint_scoped, details)
+
+        runtime_overwrite = _event(
+            _domain_commit(
+                turn_index=3,
+                action_id="runtime-overwrite",
+                owner="chain_rpc",
+                paths=("LOCAL_RPC_URL",),
+            ),
+            turn_index=3,
+        )
+        replaced, details = POSTCONDITION_EVALUATORS[
+            "example_endpoint_replaced_runtime_endpoint"
+        ](_context(first, second, runtime_overwrite))
+        self.assertTrue(replaced, details)
+
+        without_first = POSTCONDITION_EVALUATORS[
+            "rpc_schema_evidence_extracted"
+        ](_context(second))[0]
+        self.assertFalse(without_first)
+
+        missing_consumer = replace(
+            second,
+            control_receipts=tuple(
+                receipt
+                for receipt in second.control_receipts
+                if receipt.get("receipt_type") != "domain_commit"
+            ),
+        )
+        self.assertFalse(POSTCONDITION_EVALUATORS[
+            "rpc_schema_evidence_extracted"
+        ](_context(first, missing_consumer))[0])
+
+        response_without_parser = replace(
+            second,
+            control_receipts=(
+                _rpc_schema_receipt(
+                    turn_index=2,
+                    producer_action_id="append-response",
+                    catalog_revision=4,
+                    source_revisions=(1, 3),
+                    source_evidence_hashes=cumulative_evidence,
+                    source_action_value_hashes=cumulative_actions,
+                    include_response=False,
+                ),
+                *second.control_receipts[1:],
+            ),
+        )
+        self.assertFalse(POSTCONDITION_EVALUATORS[
+            "rpc_schema_evidence_extracted"
+        ](_context(first, response_without_parser))[0])
+
+        changed_method = replace(
+            second,
+            control_receipts=(
+                _rpc_schema_receipt(
+                    turn_index=2,
+                    producer_action_id="append-response",
+                    catalog_revision=4,
+                    source_revisions=(1, 3),
+                    source_evidence_hashes=cumulative_evidence,
+                    source_action_value_hashes=cumulative_actions,
+                    method="eth_blockNumber",
+                ),
+                _rpc_catalog_transition_receipt(
+                    turn_index=2,
+                    revision=3,
+                    producer_action_id="append-response",
+                    source_evidence_hashes=cumulative_evidence,
+                    source_action_value_hashes=cumulative_actions,
+                    method="eth_blockNumber",
+                ),
+                _rpc_catalog_transition_receipt(
+                    turn_index=2,
+                    revision=4,
+                    producer_action_id="append-response",
+                    command="correct_draft",
+                    source_evidence_hashes=cumulative_evidence,
+                    source_action_value_hashes=cumulative_actions,
+                    method="eth_blockNumber",
+                ),
+                second.control_receipts[3],
+            ),
+        )
+        self.assertFalse(POSTCONDITION_EVALUATORS[
+            "rpc_schema_evidence_extracted"
+        ](_context(first, changed_method))[0])
 
     def test_schema_intake_loop_requires_repeated_evidence_question(self) -> None:
         loop = _event(

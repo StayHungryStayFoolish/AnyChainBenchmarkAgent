@@ -2650,6 +2650,269 @@ def _removed_default_method_committed(context: Any) -> PredicateResult:
     )
 
 
+def _rpc_schema_progressions(
+    context: Any,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[Mapping[str, Any]],
+]:
+    schemas, invalid_schemas = _valid_receipts(
+        context, "rpc_schema_provenance"
+    )
+    catalogs, invalid_catalogs = _valid_receipts(
+        context, "rpc_catalog_transition"
+    )
+    catalogs_by_turn: dict[int, list[Mapping[str, Any]]] = defaultdict(list)
+    for item in catalogs:
+        catalogs_by_turn[int(item["turn_index"])].append(item)
+    events_by_turn = {
+        int(getattr(event, "turn_index", -1)): event
+        for event in _events(context)
+    }
+    consumers, invalid_commits = _domain_consumers_by_turn(
+        context,
+        owner="chain_rpc",
+    )
+    lineage_by_method: dict[str, dict[str, Any]] = {}
+    progression: list[dict[str, Any]] = []
+    complete: list[dict[str, Any]] = []
+    endpoint_scoped: list[dict[str, Any]] = []
+
+    for item in sorted(
+        schemas,
+        key=lambda record: (
+            int(record["turn_index"]),
+            int(record["receipt"].get("catalog_revision") or -1),
+        ),
+    ):
+        receipt = item["receipt"]
+        turn_index = int(item["turn_index"])
+        method_hash = str(receipt.get("method_hash") or "")
+        event = events_by_turn.get(turn_index)
+        transition = (
+            _valid_pending_transition(event)
+            if event is not None
+            else None
+        )
+        before_id = str((transition or {}).get("before_id") or "")
+        after_id = str((transition or {}).get("after_id") or "")
+        starts_lineage = before_id.endswith("_schema_evidence")
+        continues_lineage = before_id.endswith("_schema_confirm")
+        prior = lineage_by_method.get(method_hash)
+        if (
+            not _is_hash(method_hash)
+            or transition is None
+            or not after_id.endswith("_schema_confirm")
+            or not (starts_lineage or (continues_lineage and prior))
+        ):
+            continue
+
+        consumer_ids = set(transition.get("consumer_action_ids") or ())
+        admitted = [
+            action
+            for action in (
+                getattr(event, "admitted_action_provenance", ()) or ()
+            )
+            if isinstance(action, Mapping)
+            and str(action.get("action_id") or "") in consumer_ids
+            and str(action.get("action_id") or "")
+            in consumers.get(turn_index, set())
+            and str(action.get("type") or "") == "rpc_catalog_command"
+            and dict(action.get("argument_value_hashes") or {}).get(
+                "catalog_command"
+            )
+            == content_hash("append_evidence")
+            and str(action.get("action_id") or "")
+            == str(receipt.get("producer_action_id") or "")
+        ]
+        if not admitted:
+            continue
+        producer_ids = {
+            str(action.get("action_id") or "") for action in admitted
+        }
+        current_action_hashes = {
+            str(value_hash)
+            for action in admitted
+            for argument, value_hash in dict(
+                action.get("argument_value_hashes") or {}
+            ).items()
+            if argument
+            in {
+                "source_evidence",
+                "rpc_schema_evidence",
+                "selected_value",
+                "answer",
+            }
+            and _is_hash(str(value_hash or ""))
+        }
+        accepted_appends = [
+            catalog
+            for catalog in catalogs_by_turn.get(turn_index, [])
+            if catalog["receipt"].get("accepted") is True
+            and catalog["receipt"].get("command") == "append_evidence"
+            and str(catalog["receipt"].get("producer_action_id") or "")
+            in producer_ids
+            and (
+                not catalog["receipt"].get("draft_method_hash")
+                or catalog["receipt"].get("draft_method_hash") == method_hash
+            )
+            and catalog["receipt"].get("source_evidence_hashes")
+            == receipt.get("source_evidence_hashes")
+            and catalog["receipt"].get("source_action_value_hashes")
+            == receipt.get("source_action_value_hashes")
+        ]
+        accepted_schema_transitions = [
+            catalog
+            for catalog in catalogs_by_turn.get(turn_index, [])
+            if catalog["receipt"].get("accepted") is True
+            and catalog["receipt"].get("command") == "correct_draft"
+            and str(catalog["receipt"].get("producer_action_id") or "")
+            in producer_ids
+            and int(catalog["receipt"].get("catalog_revision") or -1)
+            == int(receipt.get("catalog_revision") or -2)
+            and (
+                not catalog["receipt"].get("draft_method_hash")
+                or catalog["receipt"].get("draft_method_hash") == method_hash
+            )
+        ]
+        if not accepted_appends or not accepted_schema_transitions:
+            continue
+
+        append_revisions = {
+            int(catalog["receipt"].get("catalog_revision") or -1)
+            for catalog in accepted_appends
+        }
+        source_action_hashes = set(
+            receipt.get("source_action_value_hashes") or ()
+        )
+        source_evidence_hashes = set(
+            receipt.get("source_evidence_hashes") or ()
+        )
+        prior_action_hashes = set(
+            (prior or {}).get("source_action_hashes") or ()
+        )
+        prior_evidence_hashes = set(
+            (prior or {}).get("source_evidence_hashes") or ()
+        )
+        prior_append_revisions = set(
+            (prior or {}).get("append_revisions") or ()
+        )
+        lineage_append_revisions = prior_append_revisions | append_revisions
+        if (
+            not current_action_hashes
+            or not current_action_hashes <= source_action_hashes
+            or not prior_action_hashes <= source_action_hashes
+            or not prior_evidence_hashes <= source_evidence_hashes
+            or (
+                prior
+                and int(receipt.get("catalog_revision") or -1)
+                <= int(prior.get("catalog_revision") or -1)
+            )
+            or (
+                prior_append_revisions
+                and min(append_revisions) <= max(prior_append_revisions)
+            )
+        ):
+            continue
+
+        fields = {
+            str(field.get("field_path") or ""): field
+            for field in receipt.get("fields") or ()
+            if isinstance(field, Mapping)
+        }
+        source_kinds = {
+            str(field.get("source_kind") or "")
+            for field in fields.values()
+        }
+        status = fields.get("exchange_correlation.status") or {}
+        request_ids = fields.get(
+            "exchange_correlation.request_id_hashes"
+        ) or {}
+        response_ids = fields.get(
+            "exchange_correlation.response_id_hashes"
+        ) or {}
+        provenance_fields = [
+            field
+            for field in (
+                status,
+                request_ids,
+                response_ids,
+                *[
+                    field
+                    for field in fields.values()
+                    if field.get("source_kind")
+                    in {
+                        "protocol_request_parser",
+                        "protocol_response_parser",
+                    }
+                ],
+            )
+            if isinstance(field, Mapping)
+        ]
+        lineage_revisions = {
+            tuple(field.get("source_revisions") or ())
+            for field in provenance_fields
+        }
+        common_revisions = next(iter(lineage_revisions), ())
+        if (
+            len(lineage_revisions) != 1
+            or not common_revisions
+            or not lineage_append_revisions <= set(common_revisions)
+        ):
+            continue
+
+        record = {
+            **item,
+            "append_revisions": tuple(sorted(lineage_append_revisions)),
+            "source_action_hashes": tuple(sorted(source_action_hashes)),
+            "source_evidence_hashes": tuple(sorted(source_evidence_hashes)),
+        }
+        lineage_by_method[method_hash] = {
+            "catalog_revision": int(
+                receipt.get("catalog_revision") or -1
+            ),
+            "append_revisions": lineage_append_revisions,
+            "source_action_hashes": source_action_hashes,
+            "source_evidence_hashes": source_evidence_hashes,
+        }
+        progression.append(record)
+
+        validation_endpoint = fields.get("validation_endpoint") or {}
+        if (
+            validation_endpoint.get("source_kind") == "rpc_endpoint_role"
+            and tuple(validation_endpoint.get("source_revisions") or ())
+            == tuple(common_revisions)
+            and _is_hash(
+                str(validation_endpoint.get("value_hash") or "")
+            )
+        ):
+            endpoint_scoped.append(record)
+
+        if (
+            "protocol_request_parser" in source_kinds
+            and "protocol_response_parser" in source_kinds
+            and status.get("source_kind") == "protocol_exchange_correlator"
+            and status.get("value_hash") == evidence_hash("correlated")
+            and request_ids.get("source_kind")
+            == "protocol_exchange_correlator"
+            and response_ids.get("source_kind")
+            == "protocol_exchange_correlator"
+            and request_ids.get("value_hash")
+            == response_ids.get("value_hash")
+            and _is_hash(str(request_ids.get("value_hash") or ""))
+        ):
+            complete.append(record)
+
+    return (
+        progression,
+        complete,
+        endpoint_scoped,
+        [*invalid_schemas, *invalid_catalogs, *invalid_commits],
+    )
+
+
 def _example_endpoint_scope_preserved(context: Any) -> PredicateResult:
     endpoints, invalid_endpoints = _valid_receipts(
         context,
@@ -2684,7 +2947,18 @@ def _example_endpoint_scope_preserved(context: Any) -> PredicateResult:
             and producer in consumers.get(turn_index, set())
         ):
             matched.append(item)
-    invalid = [*invalid_endpoints, *invalid_commits]
+    (
+        _schema_progression,
+        _complete_schemas,
+        schema_endpoint_scope,
+        invalid_schema_lineage,
+    ) = _rpc_schema_progressions(context)
+    invalid = [
+        *invalid_endpoints,
+        *invalid_commits,
+        *invalid_schema_lineage,
+    ]
+    matched.extend(schema_endpoint_scope)
     return bool(matched) and not invalid, _receipt_details(
         "rpc_endpoint_scope",
         matched,
@@ -2695,10 +2969,19 @@ def _example_endpoint_scope_preserved(context: Any) -> PredicateResult:
 def _example_endpoint_replaced_runtime_endpoint(context: Any) -> PredicateResult:
     endpoints, invalid_endpoints = _valid_receipts(context, "rpc_endpoint_role")
     deltas, invalid_commits = _material_delta_records(context)
+    (
+        _schema_progression,
+        _complete_schemas,
+        schema_endpoint_scope,
+        invalid_schema_lineage,
+    ) = _rpc_schema_progressions(context)
     validation_turns = sorted({
         int(item["turn_index"])
         for item in endpoints
         if item["receipt"].get("role") == "validation"
+    } | {
+        int(item["turn_index"])
+        for item in schema_endpoint_scope
     })
     if not validation_turns:
         return False, _receipt_details(
@@ -2815,6 +3098,7 @@ def _example_endpoint_replaced_runtime_endpoint(context: Any) -> PredicateResult
         *invalid_endpoints,
         *invalid_commits,
         *invalid_consumer_commits,
+        *invalid_schema_lineage,
     ]
     return bool(replaced) and not invalid, _receipt_details(
         "rpc_endpoint_scope",
@@ -2825,185 +3109,12 @@ def _example_endpoint_replaced_runtime_endpoint(context: Any) -> PredicateResult
 
 
 def _rpc_schema_evidence_extracted(context: Any) -> PredicateResult:
-    valid, invalid = _valid_receipts(context, "rpc_schema_provenance")
-    valid_catalog, invalid_catalog = _valid_receipts(
-        context, "rpc_catalog_transition"
-    )
-    catalog_by_turn: dict[int, list[dict[str, Any]]] = defaultdict(list)
-    for item in valid_catalog:
-        catalog_by_turn[int(item["turn_index"])].append(item)
-    events_by_turn = {
-        int(getattr(event, "turn_index", -1)): event
-        for event in _events(context)
-    }
-    chain_consumers, invalid_commits = _domain_consumers_by_turn(
-        context,
-        owner="chain_rpc",
-    )
-    correlated: list[dict[str, Any]] = []
-    for item in valid:
-        receipt = item["receipt"]
-        turn_index = int(item["turn_index"])
-        event = events_by_turn.get(turn_index)
-        transition = (
-            _valid_pending_transition(event)
-            if event is not None
-            else None
-        )
-        if (
-            transition is None
-            or not str(transition.get("before_id") or "").endswith(
-                "_schema_evidence"
-            )
-            or not str(transition.get("after_id") or "").endswith(
-                "_schema_confirm"
-            )
-        ):
-            continue
-        consumer_ids = set(transition.get("consumer_action_ids") or ())
-        admitted = [
-            action
-            for action in (
-                getattr(event, "admitted_action_provenance", ()) or ()
-            )
-            if isinstance(action, Mapping)
-            and str(action.get("action_id") or "") in consumer_ids
-            and str(action.get("action_id") or "")
-            in chain_consumers.get(turn_index, set())
-            and str(action.get("type") or "") == "rpc_catalog_command"
-            and dict(action.get("argument_value_hashes") or {}).get(
-                "catalog_command"
-            )
-            == content_hash("append_evidence")
-        ]
-        admitted_source_hashes = {
-            str(value_hash)
-            for action in admitted
-            for argument, value_hash in dict(
-                action.get("argument_value_hashes") or {}
-            ).items()
-            if argument
-            in {
-                "source_evidence",
-                "rpc_schema_evidence",
-                "selected_value",
-                "answer",
-            }
-            and _is_hash(str(value_hash or ""))
-        }
-        accepted_catalog = [
-            catalog
-            for catalog in catalog_by_turn.get(turn_index, [])
-            if catalog["receipt"].get("accepted") is True
-            and catalog["receipt"].get("command") == "append_evidence"
-            and str(
-                catalog["receipt"].get("producer_action_id") or ""
-            )
-            in {
-                str(action.get("action_id") or "")
-                for action in admitted
-            }
-            and (
-                not catalog["receipt"].get("draft_method_hash")
-                or catalog["receipt"].get("draft_method_hash")
-                == receipt.get("method_hash")
-            )
-        ]
-        accepted_schema_transitions = [
-            catalog
-            for catalog in catalog_by_turn.get(turn_index, [])
-            if catalog["receipt"].get("accepted") is True
-            and catalog["receipt"].get("command") == "correct_draft"
-            and catalog["receipt"].get("producer_action_id")
-            == receipt.get("producer_action_id")
-            and int(
-                catalog["receipt"].get("catalog_revision") or -1
-            )
-            == int(receipt.get("catalog_revision") or -2)
-        ]
-        fields = {
-            str(field.get("field_path") or ""): field
-            for field in receipt.get("fields") or ()
-            if isinstance(field, Mapping)
-        }
-        source_kinds = {
-            str(field.get("source_kind") or "")
-            for field in fields.values()
-        }
-        status = fields.get("exchange_correlation.status") or {}
-        request_ids = fields.get(
-            "exchange_correlation.request_id_hashes"
-        ) or {}
-        response_ids = fields.get(
-            "exchange_correlation.response_id_hashes"
-        ) or {}
-        lineage_revisions = {
-            tuple(field.get("source_revisions") or ())
-            for field in (
-                status,
-                request_ids,
-                response_ids,
-                *[
-                    field
-                    for field in fields.values()
-                    if field.get("source_kind")
-                    in {
-                        "protocol_request_parser",
-                        "protocol_response_parser",
-                    }
-                ],
-            )
-            if isinstance(field, Mapping)
-        }
-        if (
-            _is_hash(str(receipt.get("method_hash") or ""))
-            and "protocol_request_parser" in source_kinds
-            and "protocol_response_parser" in source_kinds
-            and status.get("source_kind") == "protocol_exchange_correlator"
-            and status.get("value_hash") == evidence_hash("correlated")
-            and request_ids.get("source_kind")
-            == "protocol_exchange_correlator"
-            and response_ids.get("source_kind")
-            == "protocol_exchange_correlator"
-            and request_ids.get("value_hash")
-            == response_ids.get("value_hash")
-            and _is_hash(str(request_ids.get("value_hash") or ""))
-            and len(lineage_revisions) == 1
-            and bool(next(iter(lineage_revisions), ()))
-            and bool(admitted)
-            and bool(accepted_catalog)
-            and bool(accepted_schema_transitions)
-            and bool(receipt.get("source_evidence_hashes"))
-            and set(receipt.get("source_action_value_hashes") or ())
-            <= admitted_source_hashes
-            and all(
-                catalog["receipt"].get("producer_action_id")
-                == receipt.get("producer_action_id")
-                for catalog in accepted_catalog
-            )
-            and all(
-                catalog["receipt"].get("source_evidence_hashes")
-                == receipt.get("source_evidence_hashes")
-                for catalog in accepted_catalog
-            )
-            and all(
-                catalog["receipt"].get("source_action_value_hashes")
-                == receipt.get("source_action_value_hashes")
-                for catalog in accepted_catalog
-            )
-            and all(
-                int(catalog["receipt"].get("catalog_revision") or -1)
-                < int(receipt.get("catalog_revision") or -2)
-                for catalog in accepted_catalog
-            )
-            and all(
-                int(catalog["receipt"].get("catalog_revision") or -1)
-                in set(next(iter(lineage_revisions), ()))
-                for catalog in accepted_catalog
-            )
-        ):
-            correlated.append(item)
-    invalid_receipts = [*invalid, *invalid_catalog, *invalid_commits]
+    (
+        _progression,
+        correlated,
+        _endpoint_scoped,
+        invalid_receipts,
+    ) = _rpc_schema_progressions(context)
     return bool(correlated) and not invalid_receipts, _receipt_details(
         "rpc_schema_provenance",
         correlated,
