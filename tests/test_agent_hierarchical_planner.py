@@ -4713,6 +4713,71 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertFalse(_is_explicit_semantic_rejection(malformed))
         self.assertTrue(_is_explicit_semantic_rejection(valid_rejection))
 
+    def test_whole_plan_canonicalizes_only_ownerless_context_omission(
+        self,
+    ) -> None:
+        from agent.harness.semantic_compiler import (
+            _canonicalize_admission_receipts,
+        )
+
+        def canonicalize(record: dict, row: dict) -> dict:
+            payload = {
+                "action_verdicts": [],
+                "unit_verdicts": [dict(row)],
+            }
+            return _canonicalize_admission_receipts(
+                payload,
+                action_records={},
+                unit_records={"unit-1": record},
+            )["unit_verdicts"][0]
+
+        context_record = {
+            "unit_id": "unit-1",
+            "disposition": "context",
+            "owner_action_ids": [],
+            "source_text": "permission framing",
+        }
+        omitted = {
+            "unit_id": "unit-1",
+            "verdict": "omitted",
+            "omitted_action_type": "",
+            "evidence_quote": "permission framing",
+            "reason": "non-executable framing",
+        }
+        self.assertEqual(
+            canonicalize(context_record, omitted)["verdict"],
+            "context",
+        )
+
+        owned_context = {
+            **context_record,
+            "owner_action_ids": ["action-1"],
+        }
+        self.assertEqual(
+            canonicalize(owned_context, omitted)["verdict"],
+            "omitted",
+        )
+        self.assertEqual(
+            canonicalize(
+                context_record,
+                {
+                    **omitted,
+                    "omitted_action_type": "answer_opening_question",
+                },
+            )["verdict"],
+            "omitted",
+        )
+        self.assertEqual(
+            canonicalize(
+                {
+                    **context_record,
+                    "disposition": "unresolved",
+                },
+                omitted,
+            )["verdict"],
+            "omitted",
+        )
+
     def test_stage_a_context_unit_defers_omission_authority_to_clause(self) -> None:
         from agent.harness.hierarchical_planner import (
             _review_stage_a_partition,

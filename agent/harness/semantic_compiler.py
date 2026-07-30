@@ -1061,6 +1061,23 @@ def _canonicalize_admission_receipts(
     action_rows = payload.get("action_verdicts")
     if not isinstance(action_rows, list):
         return payload
+    unit_rows = payload.get("unit_verdicts")
+    if isinstance(unit_rows, list):
+        for raw_row in unit_rows:
+            if not isinstance(raw_row, dict):
+                continue
+            unit_id = str(raw_row.get("unit_id") or "")
+            record = unit_records.get(unit_id)
+            if (
+                isinstance(record, Mapping)
+                and record.get("disposition") == "context"
+                and not tuple(record.get("owner_action_ids") or ())
+                and raw_row.get("verdict") == "omitted"
+                and not str(
+                    raw_row.get("omitted_action_type") or ""
+                ).strip()
+            ):
+                raw_row["verdict"] = "context"
     for raw_row in action_rows:
         if not isinstance(raw_row, dict) or str(raw_row.get("verdict") or "") != "admit":
             continue
