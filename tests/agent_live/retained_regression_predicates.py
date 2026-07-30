@@ -1850,10 +1850,16 @@ def _bound_unknown_chain_resolutions(
     identities, invalid = _valid_receipts(
         context, "chain_identity_resolution"
     )
+    pending_resolutions, invalid_pending = _valid_receipts(
+        context, "pending_resolution"
+    )
     chain_consumers, invalid_commits = _domain_consumers_by_turn(
         context,
         owner="chain_rpc",
     )
+    pending_by_turn: dict[int, list[Mapping[str, Any]]] = defaultdict(list)
+    for item in pending_resolutions:
+        pending_by_turn[int(item["turn_index"])].append(item["receipt"])
     events_by_turn = {
         int(getattr(event, "turn_index", -1)): event
         for event in _events(context)
@@ -1876,7 +1882,7 @@ def _bound_unknown_chain_resolutions(
         candidate_hash = str(
             item["receipt"].get("candidate_hash") or ""
         )
-        actions = [
+        admitted_actions = [
             action
             for action in (
                 getattr(event, "admitted_action_provenance", ()) or ()
@@ -1884,16 +1890,39 @@ def _bound_unknown_chain_resolutions(
             if isinstance(action, Mapping)
             and str(action.get("action_id") or "") in consumer_ids
             and str(action.get("action_id") or "") in committed_ids
-            and str(action.get("type") or "")
+        ]
+        direct_actions = [
+            action
+            for action in admitted_actions
+            if str(action.get("type") or "")
             in {"choose_chain", "change_chain"}
             and dict(action.get("argument_value_hashes") or {}).get(
                 "chain_text"
             )
             == candidate_hash
         ]
-        if actions:
+        pending_actions = [
+            action
+            for action in admitted_actions
+            if str(action.get("type") or "") == "answer_pending"
+            and dict(action.get("argument_value_hashes") or {}).get("answer")
+            == candidate_hash
+            and any(
+                receipt.get("pending_id") == "chain"
+                and receipt.get("pending_group") == "chain_identity"
+                and receipt.get("verdict") == "accepted"
+                and receipt.get("selected_value_hash") == candidate_hash
+                and receipt.get("resolved_action_id")
+                == action.get("action_id")
+                for receipt in pending_by_turn.get(
+                    int(item["turn_index"]),
+                    (),
+                )
+            )
+        ]
+        if direct_actions or pending_actions:
             bound.append(item)
-    return bound, [*invalid, *invalid_commits]
+    return bound, [*invalid, *invalid_pending, *invalid_commits]
 
 
 def _unknown_chain_identity_resolution_started(context: Any) -> PredicateResult:

@@ -740,6 +740,110 @@ def _workload_receipt(**updates) -> dict:
 
 
 class RetainedRegressionPredicatesTest(unittest.TestCase):
+    def test_unknown_chain_resolution_accepts_split_pending_domain_lineage(
+        self,
+    ) -> None:
+        candidate_hash = "1" * 64
+        action_id = "manual-chain-action"
+        identity = _hashed({
+            "receipt_type": "chain_identity_resolution",
+            "schema_version": 2,
+            "owner": "chain_rpc",
+            "turn_index": 1,
+            "candidate_hash": candidate_hash,
+            "resolver_source": "llm",
+            "reference_kind": "named_identity",
+            "chain_exists": "true",
+            "canonical_name_hash": "2" * 64,
+            "possible_known_chain_hash": "3" * 64,
+            "adapter_family": "jsonrpc",
+            "confidence": "high",
+            "google_search_invoked": False,
+            "google_search_available": False,
+            "search_evidence_hash": "4" * 64,
+            "confirmation_required": True,
+        })
+
+        def context(
+            *,
+            pending_updates: dict | None = None,
+            action_updates: dict | None = None,
+            commit_owner: str = "chain_rpc",
+            tamper_pending: bool = False,
+        ) -> SimpleNamespace:
+            pending = _pending_receipt(**{
+                "pending_id": "chain",
+                "pending_group": "chain_identity",
+                "selected_option_id": "",
+                "selected_value_hash": candidate_hash,
+                "resolved_action_id": action_id,
+                "resolution_path": "typed_manual_value",
+                "normalizer": "declared_value_type",
+                **(pending_updates or {}),
+            })
+            if tamper_pending:
+                pending = {**pending, "selected_value_hash": "9" * 64}
+            action = {
+                "type": "answer_pending",
+                "action_id": action_id,
+                "owner": "coordinator",
+                "effect": "configuration_mutation",
+                "group": "",
+                "argument_value_hashes": {"answer": candidate_hash},
+                **(action_updates or {}),
+            }
+            return _context(_event(
+                identity,
+                pending,
+                _domain_commit(
+                    action_id=action_id,
+                    owner=commit_owner,
+                    paths=("chain_identity.raw",),
+                ),
+                admitted_actions=(action,),
+                pending_transition={
+                    "transition": "replaced",
+                    "before_id": "chain",
+                    "before_group": "chain_identity",
+                    "before_hash": "1" * 64,
+                    "after_id": "unknown_chain_identity_confirm",
+                    "after_group": "chain_identity",
+                    "after_hash": "6" * 64,
+                    "consumer_action_ids": [action_id],
+                },
+            ))
+
+        valid = context()
+        for postcondition in (
+            "unknown_chain_identity_resolution_started",
+            "chain_confirmation_required",
+        ):
+            satisfied, details = POSTCONDITION_EVALUATORS[postcondition](valid)
+            self.assertTrue(satisfied, details)
+            self.assertEqual(details["receipt_ids"], [identity["receipt_id"]])
+
+        invalid_contexts = (
+            context(pending_updates={"resolved_action_id": "other-action"}),
+            context(pending_updates={"selected_value_hash": "8" * 64}),
+            context(pending_updates={"verdict": "rejected"}),
+            context(
+                action_updates={
+                    "argument_value_hashes": {"answer": "7" * 64},
+                }
+            ),
+            context(commit_owner="environment"),
+            context(tamper_pending=True),
+        )
+        for invalid in invalid_contexts:
+            for postcondition in (
+                "unknown_chain_identity_resolution_started",
+                "chain_confirmation_required",
+            ):
+                satisfied, _details = POSTCONDITION_EVALUATORS[
+                    postcondition
+                ](invalid)
+                self.assertFalse(satisfied)
+
     def test_disk_size_resolution_accepts_detected_or_manual_capacity(self) -> None:
         predicate = POSTCONDITION_EVALUATORS["disk_size_resolved"]
         for resolution_path, option_id in (
