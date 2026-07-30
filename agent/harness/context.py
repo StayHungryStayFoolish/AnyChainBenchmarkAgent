@@ -13,6 +13,7 @@ from .action_registry import (
     ActionSpec,
     project_action_specs,
 )
+from .questions import semantic_pending_question
 from .state import AgentGraphState
 
 from agent.workflows.group_registry import GROUPS, USER_NAVIGABLE_GROUPS
@@ -146,7 +147,9 @@ def workflow_snapshot(state: AgentGraphState) -> dict[str, Any]:
     return {
         "language": state.get("language") or "en",
         "active_group": state.get("active_group") or "opening",
-        "pending_question": state.get("pending_question") or {},
+        "pending_question": semantic_pending_question(
+            state.get("pending_question") or {}
+        ),
         "target_mode": state.get("target_mode") or "",
         "workflow_mode": state.get("workflow_mode") or "",
         "chain_identity": {

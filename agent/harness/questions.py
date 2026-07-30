@@ -928,6 +928,23 @@ def declared_option_label_variants(
     return tuple(dict.fromkeys(label for label in labels if label))
 
 
+def semantic_pending_question(
+    pending: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project catalog meanings for LLM review without changing product state."""
+
+    semantic = dict(pending)
+    semantic["options"] = [
+        {
+            **dict(option),
+            "semantic_labels": list(declared_option_label_variants(option)),
+        }
+        for option in pending.get("options") or []
+        if isinstance(option, Mapping)
+    ]
+    return semantic
+
+
 def _declared_option_candidates(
     question: Mapping[str, Any],
 ) -> tuple[tuple[str, Any], ...]:

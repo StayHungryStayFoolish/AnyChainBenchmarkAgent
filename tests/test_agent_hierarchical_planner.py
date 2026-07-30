@@ -1493,10 +1493,19 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         )
         prompt = _stage_b_prompt("coordinator")
 
+        semantic_options = payload["owner_state"]["pending_question"]["options"]
         self.assertEqual(
-            payload["owner_state"]["pending_question"]["options"],
-            state["pending_question"]["options"],
+            [option["value"] for option in semantic_options],
+            ["alpha", "unknown"],
         )
+        self.assertEqual(
+            [option["semantic_labels"] for option in semantic_options],
+            [["First"], ["None / unsure"]],
+        )
+        self.assertTrue(all(
+            "semantic_labels" not in option
+            for option in state["pending_question"]["options"]
+        ))
         self.assertIn(
             "answer_pending",
             {row["type"] for row in payload["owner_action_schema"]},

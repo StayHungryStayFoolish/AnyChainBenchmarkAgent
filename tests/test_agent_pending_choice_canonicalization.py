@@ -350,6 +350,64 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
             {"chain_identity.status": "needs_protocol_confirmation"},
         )
 
+    def test_all_semantic_planning_boundaries_share_option_meanings(self) -> None:
+        from agent.harness.context import owner_workflow_snapshot
+        from agent.harness.domains.chain_identity import (
+            _identity_confirmation_question,
+        )
+        from agent.harness.hierarchical_planner import _stage_a_payload
+        from agent.harness.plan_coverage import segment_user_turn
+
+        state = _state(
+            active_group="chain_identity",
+            chain_identity={
+                "raw": "sola",
+                "canonical": "sola",
+                "proposed_known_chain": "solana",
+                "status": "needs_known_chain_confirmation",
+                "case": "known_candidate",
+                "llm_resolution": {
+                    "possible_known_chain": "solana",
+                    "adapter_family": "unknown",
+                },
+            },
+        )
+        state["pending_question"] = _identity_confirmation_question(state) or {}
+        original_pending = deepcopy(state["pending_question"])
+        text = "这是另一条真实链"
+        clauses = tuple(segment_user_turn(text))
+
+        stage_a_pending = _stage_a_payload(
+            state,
+            text,
+            clauses,
+        )["pending_question"]
+        owner_pending = owner_workflow_snapshot(
+            state,
+            "coordinator",
+            groups=frozenset({"chain_identity"}),
+        )["pending_question"]
+
+        self.assertEqual(
+            stage_a_pending["options"],
+            owner_pending["options"],
+        )
+        self.assertEqual(
+            {
+                str(option.get("value") or ""): option["semantic_labels"]
+                for option in stage_a_pending["options"]
+            }["choose_protocol"],
+            [
+                "This is another real chain; confirm its protocol",
+                "这是另一条真实链，继续确认协议",
+            ],
+        )
+        self.assertEqual(state["pending_question"], original_pending)
+        self.assertTrue(all(
+            "semantic_labels" not in option
+            for option in state["pending_question"]["options"]
+        ))
+
 
     def test_declared_option_id_is_canonicalized_to_its_value(self) -> None:
         from agent.harness.questions import choice_question, question_text

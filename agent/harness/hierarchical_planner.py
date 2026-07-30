@@ -53,6 +53,7 @@ from .questions import (
     exact_option_prefix_answer,
     pending_option_value_exists,
     pending_value_identity,
+    semantic_pending_question,
     typed_pending_value_candidates,
 )
 from .semantic_compiler import (
@@ -987,7 +988,7 @@ def _stage_a_payload(
         "clauses": [clause.as_dict() for clause in clauses],
         "language": state.get("language") or "en",
         "active_group": state.get("active_group") or "opening",
-        "pending_question": pending,
+        "pending_question": semantic_pending_question(pending),
         "pending_barrier_contract": pending_barrier_semantics(pending),
         "registered_semantic_value_domains": list(
             registered_semantic_value_domains()
