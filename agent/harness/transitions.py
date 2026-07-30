@@ -50,6 +50,7 @@ def invalidate_for_chain_change(state: AgentGraphState, *, new_chain: str = "") 
         "SYNC_OBSERVE_RPC_URL",
         "MAINNET_RPC_URL",
         "MAINNET_RPC_URL_REVIEWED",
+        "MAINNET_RPC_URL_DISABLED",
         "BLOCKCHAIN_PROCESS_NAMES",
         "CHAIN_REST_URL",
         "CHAIN_INDEXER_URL",
@@ -84,6 +85,7 @@ def invalidate_for_target_mode(state: AgentGraphState, previous_mode: str = "") 
         for key in ("sync_rpc_url_ready", "sync_rpc_url_probe"):
             evidence.pop(key, None)
         confirmed.pop("MAINNET_RPC_URL_REVIEWED", None)
+        confirmed.pop("MAINNET_RPC_URL_DISABLED", None)
     else:
         evidence = state.setdefault("endpoint_evidence", {})
         for key in ("sync_rpc_url_ready", "sync_rpc_url_probe"):
@@ -93,7 +95,7 @@ def invalidate_for_target_mode(state: AgentGraphState, previous_mode: str = "") 
             # fake-node session contains no validated real endpoint to promote.
             for key in ("local_rpc_url_ready", "local_rpc_url_probe"):
                 evidence.pop(key, None)
-            for field in ("LOCAL_RPC_URL", "MAINNET_RPC_URL", "MAINNET_RPC_URL_REVIEWED", "BLOCKCHAIN_PROCESS_NAMES"):
+            for field in ("LOCAL_RPC_URL", "MAINNET_RPC_URL", "MAINNET_RPC_URL_REVIEWED", "MAINNET_RPC_URL_DISABLED", "BLOCKCHAIN_PROCESS_NAMES"):
                 confirmed.pop(field, None)
     record_group_invalidations(state, "target_mode")
 

@@ -7,7 +7,6 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from agent.harness.questions import QUESTION_CONTRACT_VERSION
 
 
 class TerminalPersistenceAuthorityTest(unittest.TestCase):
@@ -71,22 +70,41 @@ class TerminalPersistenceAuthorityTest(unittest.TestCase):
 
 
 class InvocationContextAuthorityTest(unittest.TestCase):
-    def test_current_checkpoint_never_invokes_v12_action_adapter(self) -> None:
+    def test_legacy_checkpoint_never_recovers_executable_control_state(
+        self,
+    ) -> None:
         from agent.harness.state import migrate_state, new_state
 
-        current = new_state("current-no-compat", language="en")
-        with patch(
-            "agent.harness.checkpoint_migrations.compile_v12_custom_rpc_action"
-        ) as legacy_adapter:
-            migrated = migrate_state(
-                current,
-                thread_id="current-no-compat",
-                language="en",
-                session_purpose="user",
-            )
+        old = new_state("legacy-inflight", language="en")
+        old["schema_version"] = 12
+        old["confirmed_config"] = {"CLOUD_REGION": "us-1"}
+        old["action_queue"] = [{
+            "type": "start_custom_rpc",
+            "rpc_method": "eth_chainId",
+        }]
+        old["current_action"] = {"type": "approve_preflight_smoke"}
+        old["pending_question"] = {"id": "legacy-question"}
+        old["side_effect_intent"] = {"status": "prepared"}
 
-        legacy_adapter.assert_not_called()
-        self.assertEqual(migrated["schema_version"], current["schema_version"])
+        migrated = migrate_state(
+            old,
+            thread_id="legacy-inflight",
+            language="en",
+            session_purpose="user",
+        )
+
+        self.assertEqual(migrated["confirmed_config"]["CLOUD_REGION"], "us-1")
+        for field in (
+            "action_queue",
+            "current_action",
+            "pending_question",
+            "side_effect_intent",
+        ):
+            self.assertFalse(migrated[field])
+        self.assertTrue(any(
+            event.get("event") == "checkpoint_legacy_inflight_quarantined"
+            for event in migrated.get("audit_events") or ()
+        ))
 
     def test_v12_checkpoint_is_persisted_at_current_schema_once(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
@@ -147,9 +165,8 @@ class InvocationContextAuthorityTest(unittest.TestCase):
             for event in events
         ))
         self.assertTrue(any(
-            event.get("event") == "checkpoint_pending_actions_quarantined"
-            and f"contract_version {QUESTION_CONTRACT_VERSION}"
-            in str(event.get("contract_error") or "")
+            event.get("event") == "checkpoint_legacy_inflight_quarantined"
+            and event.get("quarantined", {}).get("action_queue") == 1
             for event in events
         ))
         self.assertEqual(
@@ -618,9 +635,19 @@ class ImmutableExecutionPlanTest(unittest.TestCase):
                     },
                 )
 
-            with patch(
-                "agent.harness.domains.execution_runtime.execution_service.execute",
-                side_effect=prepare,
+            with (
+                patch(
+                    "agent.harness.domains.execution_runtime.validated_method_contract_is_current",
+                    return_value=True,
+                ),
+                patch(
+                    "agent.harness.domains.rpc_catalog.validated_method_contract_is_current",
+                    return_value=True,
+                ),
+                patch(
+                    "agent.harness.domains.execution_runtime.execution_service.execute",
+                    side_effect=prepare,
+                ),
             ):
                 result = _prepare_benchmark_with_runtime_contract(state)
 

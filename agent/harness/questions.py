@@ -32,6 +32,7 @@ from .contracts import (
 )
 from .input_values import (
     extract_rpc_method_token_candidates,
+    extract_rpc_wire_evidence_spans,
     extract_url_candidates,
     has_rpc_wire_evidence,
     looks_like_wire_method_identity,
@@ -717,6 +718,7 @@ def choice_question(
     domain_context: dict[str, Any] | None = None,
     evidence_path: str = "",
     rejection_evidence_value: Any = None,
+    structured_input_owner: bool = False,
     structured_config_key: str = "",
     candidate_bindings: tuple[dict[str, Any], ...] = (),
     semantic_draft_binding: dict[str, Any] | None = None,
@@ -849,6 +851,7 @@ def choice_question(
         "field": field,
         "manual_input_allowed": manual_input_allowed,
         "sensitive_input": sensitive_input,
+        **({"structured_input_owner": True} if structured_input_owner else {}),
         **({"structured_config_key": structured_key} if structured_key else {}),
         **({"candidate_bindings": declared_bindings} if declared_bindings else {}),
         "options": rendered,
@@ -927,7 +930,8 @@ def _declared_option_candidates(
         for literal in literals:
             if literal:
                 candidates.append((literal, option.get("value")))
-    if str(question.get("kind") or "") == "yes_no" and options:
+    question_kind = str(question.get("kind") or "")
+    if question_kind == "yes_no" and options:
         candidates.extend(
             (literal, options[0].get("value"))
             for literal in ("y", "yes")
@@ -937,6 +941,11 @@ def _declared_option_candidates(
                 (literal, options[1].get("value"))
                 for literal in ("n", "no")
             )
+    if question_kind == "device" and len(options) == 1:
+        candidates.extend(
+            (literal, options[0].get("value"))
+            for literal in ("y", "yes")
+        )
     unique: list[tuple[str, Any]] = []
     observed: set[tuple[str, str]] = set()
     for literal, value in candidates:
@@ -1060,6 +1069,35 @@ def action_for_value(question: dict[str, Any], value: Any) -> dict[str, Any]:
         if option.get("value") == value:
             return dict(option.get("action") or {})
     return {}
+
+
+def manual_action_for_value(
+    question: dict[str, Any],
+    value: Any,
+) -> dict[str, Any]:
+    """Compile one valid typed value through its declared manual owner."""
+
+    if not value_satisfies_pending_contract(value, question):
+        return {}
+    declared = question.get("manual_action")
+    if not isinstance(declared, Mapping):
+        return {}
+    action_type = str(declared.get("type") or "").strip()
+    value_argument = str(declared.get("value_argument") or "").strip()
+    spec = ACTION_BY_TYPE.get(action_type)
+    if (
+        spec is None
+        or not value_argument
+        or value_argument not in spec.allowed_arguments
+    ):
+        return {}
+    action = {
+        str(key): item
+        for key, item in declared.items()
+        if str(key) not in {"value_argument", "use_complete_turn"}
+    }
+    action[value_argument] = value
+    return action
 
 
 def normalize_scalar(value: str) -> str:
@@ -1364,6 +1402,12 @@ def answer_fits_pending(text: str, question: dict[str, Any]) -> bool:
     raw = _strip_scalar(text)
     if not raw:
         return False
+    if (
+        question.get("structured_input_owner") is True
+        and question.get("manual_input_allowed") is True
+        and _is_structured_evidence_literal(text, allow_params_only=True)
+    ):
+        return True
     if semantic_value_domain_conflicts(
         text,
         owning_group=str(question.get("group") or ""),
@@ -1424,7 +1468,7 @@ def answer_fits_pending(text: str, question: dict[str, Any]) -> bool:
 
 
 def _is_structured_evidence_literal(value: Any, *, allow_params_only: bool = False) -> bool:
-    """Admit only wire syntax that is deterministic without intent routing."""
+    """Admit only a complete wire document or command without sibling prose."""
 
     text = str(value or "").strip()
     if not text:
@@ -1434,7 +1478,11 @@ def _is_structured_evidence_literal(value: Any, *, allow_params_only: bool = Fal
         lines = candidate.splitlines()
         if len(lines) >= 3:
             candidate = "\n".join(lines[1:-1]).strip()
-    if has_rpc_wire_evidence(candidate, allow_params_only=allow_params_only):
+    spans = extract_rpc_wire_evidence_spans(
+        candidate,
+        allow_params_only=allow_params_only,
+    )
+    if any(start == 0 and end == len(candidate) for start, end in spans):
         return True
     first_line = candidate.splitlines()[0].strip().casefold()
     return first_line == "curl" or first_line.startswith("curl ")

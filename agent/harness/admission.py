@@ -275,6 +275,26 @@ def validate_action_plan(
                 ),
             ),
         )
+    internal = tuple(
+        index
+        for index, item in enumerate(proposed)
+        if (
+            (spec := ACTION_BY_TYPE.get(str(item.get("type") or "")))
+            is not None
+            and spec.typed_option_only
+        )
+    )
+    if internal:
+        return AdmissionResult(
+            status="rejected",
+            rejections=(
+                AdmissionRejection(
+                    "typed_option_action_forbidden",
+                    "typed-option actions may only be materialized from the active runtime contract",
+                    internal,
+                ),
+            ),
+        )
     bypasses = tuple(
         index
         for index, item in enumerate(proposed)
@@ -398,9 +418,10 @@ def _pending_answer_is_invalidated(
         ),
         None,
     )
+    if pending_answer is None:
+        return False
     if (
-        pending_answer is not None
-        and "rejection_evidence_value" in pending
+        "rejection_evidence_value" in pending
         and pending_answer.get("selected_value")
         == pending.get("rejection_evidence_value")
     ):

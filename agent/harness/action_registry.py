@@ -262,6 +262,16 @@ def _validate_chain_selection(action: Mapping[str, Any]) -> None:
 
 def _validate_rpc_catalog_command(action: Mapping[str, Any]) -> None:
     command = str(action.get("catalog_command") or "")
+    if command not in {
+        "enter",
+        "set_endpoint",
+        "set_method",
+        "append_evidence",
+        "keep_current_method",
+        "replace_current_method",
+        "finish",
+    }:
+        raise ValueError(f"unknown rpc_catalog_command: {command or '<missing>'}")
     required_by_command = {
         "set_endpoint": "rpc_endpoint",
         "set_method": "rpc_method",
@@ -332,13 +342,19 @@ def _evidence_append_transition(
 ) -> tuple[tuple[str, ...], Any] | None:
     """Project the same completion transition owned by the analysis domain."""
 
-    from .domains.analysis import evidence_collection_complete
+    from .domains.analysis import (
+        bounded_evidence_input,
+        evidence_collection_complete,
+    )
 
     collection = state.get("evidence_collection")
     active = collection if isinstance(collection, Mapping) else {}
     lines = [str(item) for item in active.get("lines") or []]
-    lines.append(str(action.get("evidence") or ""))
-    if evidence_collection_complete(lines):
+    incoming, terminated = bounded_evidence_input(
+        str(action.get("evidence") or "")
+    )
+    lines.extend(incoming)
+    if terminated or evidence_collection_complete(lines):
         return ("evidence_collection", "status"), None
     return None
 
@@ -390,12 +406,14 @@ class ActionSpec:
     crosses_pending_barrier: bool = False
     requires_specific_change: bool = False
     incomplete_mutation_intake: bool = False
+    incomplete_read_intake: bool = False
     required_arguments: tuple[str, ...] = ()
     constraints: tuple[str, ...] = ()
     suppressed_by: tuple[str, ...] = ()
     semantic_recovery_source_argument: str = ""
     semantic_support_relations: tuple[str, ...] = ()
     semantic_value_grounding_arguments: tuple[str, ...] = ()
+    open_identity_grounding_arguments: tuple[str, ...] = ()
     semantic_value_representative: bool = False
     exact_source_value_arguments: tuple[str, ...] = ()
     pending_option_semantic: str = ""
@@ -414,6 +432,7 @@ class ActionSpec:
     structured_intake: tuple[StructuredIntakeSpec, ...] = ()
     invalidates_groups: tuple[str, ...] = ()
     internal_only: bool = False
+    typed_option_only: bool = False
     validator: ActionValidator | None = None
 
     @property
@@ -438,11 +457,12 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
     ActionSpec(
         "set_response_language",
         "orientation",
-        "Persist an explicit user preference for Chinese or English responses without changing benchmark configuration.",
+        "Override the response language for the current turn without changing benchmark configuration.",
         ("language", "source_evidence"),
         execution_phase=2,
         lifetime="turn_local",
         effect="workflow_state_mutation",
+        turn_local_result_roots=("language",),
         semantic_operations=("administrative",),
         required_arguments=("language", "source_evidence"),
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
@@ -521,6 +541,8 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         crosses_pending_barrier=True,
         required_arguments=("source_evidence",),
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
+        semantic_value_grounding_arguments=("chain_text", "chain_candidates"),
+        open_identity_grounding_arguments=("chain_text", "chain_candidates"),
         semantic_value_representative=True,
         entry_intake=True,
         entry_intake_purpose="Enter initial chain identity selection from any active workflow group.",
@@ -540,6 +562,8 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         crosses_pending_barrier=True,
         required_arguments=("source_evidence",),
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
+        semantic_value_grounding_arguments=("chain_text", "chain_candidates"),
+        open_identity_grounding_arguments=("chain_text", "chain_candidates"),
         entry_intake=True,
         entry_intake_purpose="Enter chain replacement from any active workflow group.",
         entry_intake_value_arguments=("chain_text", "chain_candidates"),
@@ -558,6 +582,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         crosses_pending_barrier=True,
         effect="workflow_navigation",
         incomplete_mutation_intake=True,
+        required_arguments=("source_evidence",),
         semantic_support_relations=(
             *FRAMED_OPERATION_SUPPORT_RELATIONS,
             "non_mutation_scope",
@@ -575,6 +600,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         crosses_pending_barrier=True,
         effect="workflow_navigation",
         incomplete_mutation_intake=True,
+        required_arguments=("source_evidence",),
         semantic_support_relations=(
             *FRAMED_OPERATION_SUPPORT_RELATIONS,
             "non_mutation_scope",
@@ -711,7 +737,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
     ActionSpec(
         "rpc_catalog_command",
         "chain_rpc",
-        "Apply exactly one catalog transition: enter, set_endpoint, set_method, or append_evidence.",
+        "Apply exactly one catalog transition, including explicit method-conflict resolution. Use finish only when the user says the already validated methods are sufficient.",
         ("catalog_command", "rpc_method", "rpc_endpoint", "rpc_schema_evidence", "source_evidence"),
         40,
         "endpoint_process",
@@ -720,7 +746,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         requires_capabilities=("chain_identity",),
         required_arguments=("catalog_command", "source_evidence"),
         constraints=(
-            "set_endpoint requires only rpc_endpoint; set_method requires only rpc_method; append_evidence requires only rpc_schema_evidence; enter accepts no payload",
+            "set_endpoint requires only rpc_endpoint; set_method requires only rpc_method; append_evidence requires only rpc_schema_evidence; enter, keep_current_method, replace_current_method, and finish accept no payload",
         ),
         entry_intake=True,
         entry_intake_purpose="Enter custom RPC method catalog setup and collect its endpoint, method, and schema evidence.",
@@ -811,10 +837,10 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         semantic_value_grounding_arguments=("sync_observe_stop_condition",),
         validator=_validate_sync_observe_options,
     ),
-    ActionSpec("approve_preflight_smoke", "execution", "Approve one idempotent preflight/smoke submission.", compiler_groups=("preflight_smoke_execution",), effect="execution"),
-    ActionSpec("reject_preflight_smoke", "execution", "Pause before preflight/smoke without submitting a job.", compiler_groups=("preflight_smoke_execution",)),
-    ActionSpec("approve_final_benchmark", "execution", "Approve final real-node benchmark submission after isolated smoke success.", compiler_groups=("job_monitoring",), effect="execution"),
-    ActionSpec("reject_final_benchmark", "execution", "Pause after successful real-node smoke without submitting the final benchmark.", compiler_groups=("job_monitoring",)),
+    ActionSpec("approve_preflight_smoke", "execution", "Approve one idempotent preflight/smoke submission.", compiler_groups=("preflight_smoke_execution",), effect="execution", internal_only=True, typed_option_only=True),
+    ActionSpec("reject_preflight_smoke", "execution", "Pause before preflight/smoke without submitting a job.", compiler_groups=("preflight_smoke_execution",), internal_only=True, typed_option_only=True),
+    ActionSpec("approve_final_benchmark", "execution", "Approve final real-node benchmark submission after isolated smoke success.", compiler_groups=("job_monitoring",), effect="execution", internal_only=True, typed_option_only=True),
+    ActionSpec("reject_final_benchmark", "execution", "Pause after successful real-node smoke without submitting the final benchmark.", compiler_groups=("job_monitoring",), internal_only=True, typed_option_only=True),
     ActionSpec(
         "set_accounts_presence",
         "environment",
@@ -850,6 +876,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         "Start framed multi-line evidence collection for the active evidence question.",
         ("evidence", "source_evidence"),
         execution_phase=3,
+        preserve_pending=True,
         crosses_pending_barrier=True,
         required_arguments=("evidence", "source_evidence"),
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
@@ -861,6 +888,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         "Append the current user-supplied evidence fragment to an active evidence collection; never use this for questions, navigation, corrections, or unrelated conversation.",
         ("evidence", "source_evidence"),
         execution_phase=4,
+        preserve_pending=True,
         crosses_pending_barrier=True,
         required_arguments=("evidence", "source_evidence"),
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
@@ -876,6 +904,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         "Finish the active evidence collection only when the user explicitly says the evidence block is complete.",
         ("source_evidence",),
         execution_phase=4,
+        preserve_pending=True,
         crosses_pending_barrier=True,
         required_arguments=("source_evidence",),
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
@@ -891,6 +920,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         "Pause and preserve the active evidence collection only when the user explicitly requests a temporary detour.",
         ("source_evidence",),
         execution_phase=3,
+        preserve_pending=True,
         crosses_pending_barrier=True,
         required_arguments=("source_evidence",),
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
@@ -906,6 +936,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         "Resume a paused evidence collection only when the user explicitly asks to continue that collection.",
         ("source_evidence",),
         execution_phase=3,
+        preserve_pending=True,
         crosses_pending_barrier=True,
         required_arguments=("source_evidence",),
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
@@ -921,6 +952,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         "Discard the active evidence collection only when the user explicitly cancels it.",
         ("source_evidence",),
         execution_phase=4,
+        preserve_pending=True,
         crosses_pending_barrier=True,
         required_arguments=("source_evidence",),
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
@@ -933,13 +965,14 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
     ActionSpec(
         "analyze_evidence",
         "analysis",
-        "Analyze pasted or previously collected logs/errors/evidence without becoming a deferred workflow command.",
+        "Analyze pasted or previously collected logs/errors/evidence. When the user requests analysis but has not supplied evidence yet, open one typed freeform evidence collection and analyze its complete bounded payload when it closes.",
         ("evidence", "question"),
         execution_phase=5,
         lifetime="turn_local",
         effect="read_only",
-        turn_local_result_roots=("evidence_buffer",),
+        turn_local_result_roots=("evidence_buffer", "evidence_collection"),
         crosses_pending_barrier=True,
+        incomplete_read_intake=True,
         semantic_recovery_source_argument="evidence",
         semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
         semantic_operations=("evidence_analysis",),
@@ -1333,6 +1366,7 @@ def action_registry_contract_hash() -> str:
             "crosses_pending_barrier": spec.crosses_pending_barrier,
             "requires_specific_change": spec.requires_specific_change,
             "incomplete_mutation_intake": spec.incomplete_mutation_intake,
+            "incomplete_read_intake": spec.incomplete_read_intake,
             "entry_intake": spec.entry_intake,
             "entry_intake_purpose": spec.entry_intake_purpose,
             "entry_intake_fixed_arguments": [
@@ -1360,6 +1394,9 @@ def action_registry_contract_hash() -> str:
             "semantic_recovery_source_argument": spec.semantic_recovery_source_argument,
             "semantic_support_relations": list(spec.semantic_support_relations),
             "semantic_value_grounding_arguments": list(spec.semantic_value_grounding_arguments),
+            "open_identity_grounding_arguments": list(
+                spec.open_identity_grounding_arguments
+            ),
             "semantic_value_representative": spec.semantic_value_representative,
             "exact_source_value_arguments": list(spec.exact_source_value_arguments),
             "pending_option_semantic": spec.pending_option_semantic,
@@ -1371,6 +1408,7 @@ def action_registry_contract_hash() -> str:
             "state_transition_path": list(spec.state_transition_path),
             "state_transition_value": spec.state_transition_value,
             "internal_only": spec.internal_only,
+            "typed_option_only": spec.typed_option_only,
             "state_transition_resolver": (
                 f"{spec.state_transition_resolver.__module__}.{spec.state_transition_resolver.__qualname__}"
                 if spec.state_transition_resolver is not None
@@ -2076,7 +2114,18 @@ ACTION_ARGUMENT_SCHEMAS: dict[str, Mapping[str, Any]] = {
     "adapter_family": {"type": "string", "minLength": 1},
     "answer": {},
     "canonical_chain_name": {"type": "string", "minLength": 1},
-    "catalog_command": {"type": "string", "enum": ["enter", "set_endpoint", "set_method", "append_evidence"]},
+    "catalog_command": {
+        "type": "string",
+        "enum": [
+            "enter",
+            "set_endpoint",
+            "set_method",
+            "append_evidence",
+            "keep_current_method",
+            "replace_current_method",
+            "finish",
+        ],
+    },
     "chain_candidates": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1},
     "chain_exists": {"type": "boolean"},
     "chain_text": {"type": "string", "minLength": 1},
@@ -2224,6 +2273,54 @@ def normalize_current_action_envelope(raw: Mapping[str, Any]) -> dict[str, Any]:
     if "intent" in action:
         raise ValueError("intent.v1 is retired for current-turn actions")
     return action
+
+
+def lower_empty_entry_action_to_registered_intake(
+    raw: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Lower one value-less entry action to its unique typed intake.
+
+    Stage B may identify the correct workflow dimension before it has a
+    concrete business value. The registry already declares both the concrete
+    entry action and the typed intake that collects the missing value. This
+    function connects those two contracts without guessing a value or changing
+    an action that supplied one.
+    """
+
+    action = normalize_current_action_envelope(raw)
+    spec = ACTION_BY_TYPE.get(str(action.get("type") or "").strip())
+    if (
+        spec is None
+        or not spec.entry_intake
+        or not spec.target_group
+        or not spec.entry_intake_value_arguments
+        or any(
+            action.get(argument) not in (None, "", [], {})
+            for argument in spec.entry_intake_value_arguments
+        )
+    ):
+        return action
+    intake_specs = [
+        candidate
+        for candidate in ACTION_SPECS
+        if candidate.owner == spec.owner
+        and candidate.target_group == spec.target_group
+        and candidate.incomplete_mutation_intake
+        and set(candidate.required_arguments).issubset({"source_evidence"})
+    ]
+    if len(intake_specs) != 1:
+        return action
+    intake = intake_specs[0]
+    replacement: dict[str, Any] = {"type": intake.action_type}
+    for key in ACTION_METADATA_FIELDS:
+        if key != "type" and key in action:
+            replacement[key] = action[key]
+    if (
+        "source_evidence" in intake.allowed_arguments
+        and action.get("source_evidence") not in (None, "")
+    ):
+        replacement["source_evidence"] = action["source_evidence"]
+    return replacement
 
 
 def validate_action_contract(
@@ -2632,6 +2729,17 @@ def validate_action_registry() -> None:
                 "incomplete mutation intake actions need a target group and source evidence: "
                 f"{spec.action_type}"
             )
+        if spec.incomplete_read_intake and (
+            spec.effect != "read_only"
+            or spec.lifetime != "turn_local"
+            or bool(spec.required_arguments)
+            or bool(spec.required_state_path)
+        ):
+            raise RuntimeError(
+                "incomplete read intake actions must be turn-local, read-only, "
+                "and require no arguments or prior lifecycle state: "
+                f"{spec.action_type}"
+            )
         if spec.entry_intake:
             fixed_arguments = dict(spec.entry_intake_fixed_arguments)
             value_arguments = set(spec.entry_intake_value_arguments)
@@ -2761,6 +2869,13 @@ def validate_action_registry() -> None:
         if set(spec.exact_source_value_arguments) - set(spec.allowed_arguments):
             raise RuntimeError(
                 f"exact source arguments must be allowed: {spec.action_type}"
+            )
+        if set(spec.open_identity_grounding_arguments) - set(
+            spec.semantic_value_grounding_arguments
+        ):
+            raise RuntimeError(
+                "open identity arguments must be semantic grounding arguments: "
+                f"{spec.action_type}"
             )
     intake_groups = [
         spec.target_group

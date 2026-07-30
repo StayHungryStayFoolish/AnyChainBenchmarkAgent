@@ -158,6 +158,12 @@ MESSAGES = {
         "arguments": {"chain": "string", "single": "string", "mixed": "string"},
         "kinds": {"message"},
     },
+    "harness.orientation.consultation.rpc_mode": {
+        "en": "`single` sends one selected RPC method throughout the workload. `mixed` sends several enabled RPC methods according to explicit weights; enabled weights must total 100. After choosing a mode, you can keep the chain-template defaults or validate custom methods and configure the effective workload.",
+        "zh": "`single` 在整个 workload 中只发送一个已选 RPC method。`mixed` 按明确权重发送多个已启用 RPC methods，启用权重必须合计 100。选择模式后，可以保留 chain template 默认值，也可以验证自定义 methods 并配置当前 workload。",
+        "arguments": {},
+        "kinds": {"message"},
+    },
     "harness.orientation.consultation.current_context_pending": {
         "en": "Current workflow context: active group `{active_group}`; pending question `{pending_question}` (field `{pending_field}`); execution status `{execution_status}`; saved evidence lines: {evidence_lines}.\nNext, answer the pending question shown below or state which configuration group to change.",
         "zh": "当前 workflow 状态：active group `{active_group}`；待确认问题 `{pending_question}`（字段 `{pending_field}`）；执行状态 `{execution_status}`；已保存证据行数：{evidence_lines}。\n下一步请回答下方待确认问题，或直接说明要修改哪个配置组。",

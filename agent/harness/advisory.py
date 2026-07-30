@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import Any, Mapping
 
 from ..llm.providers import provider_from_config
 from ..llm.types import (
@@ -19,6 +19,17 @@ from .state import AgentGraphState, DEFAULT_GROUP_ORDER
 
 
 ADAPTER_FAMILIES = list(SUPPORTED_FAMILIES)
+_CHAIN_IDENTITY_MODEL_BOUNDARY_KEY = "_model_provenance_boundary"
+_CHAIN_IDENTITY_MODEL_BOUNDARY_VALUE = "chain_identity_v1"
+_MODEL_PROVENANCE_FIELDS = frozenset(
+    {
+        "google_search_available",
+        "google_search_invoked",
+        "search_evidence_hash",
+        "search_result",
+        _CHAIN_IDENTITY_MODEL_BOUNDARY_KEY,
+    }
+)
 
 
 def resolve_unknown_chain_identity(
@@ -52,6 +63,7 @@ def resolve_unknown_chain_identity(
         raise
     except Exception as exc:
         payload = {
+            "reference_kind": "uncertain",
             "chain_exists": None,
             "reason": (
                 "chain identity resolver failed: "
@@ -59,8 +71,80 @@ def resolve_unknown_chain_identity(
             ),
             "confidence": "low",
         }
+    payload = {
+        key: value
+        for key, value in payload.items()
+        if key not in _MODEL_PROVENANCE_FIELDS
+    }
+    payload = normalize_chain_identity_resolution(payload)
+    payload[_CHAIN_IDENTITY_MODEL_BOUNDARY_KEY] = (
+        _CHAIN_IDENTITY_MODEL_BOUNDARY_VALUE
+    )
     payload.setdefault("chain_text", chain_text)
     return payload
+
+
+def normalize_chain_identity_resolution(
+    value: dict[str, Any] | Any,
+) -> dict[str, Any]:
+    """Normalize one advisory identity result before state or receipt use."""
+
+    payload = dict(value) if isinstance(value, Mapping) else {}
+    inferred_reference_kind = (
+        "named_identity"
+        if (
+            isinstance(payload.get("chain_exists"), bool)
+            or str(payload.get("canonical_chain_name") or "").strip()
+            or str(payload.get("possible_known_chain") or "").strip()
+        )
+        else "uncertain"
+    )
+    reference_kind = str(
+        payload.get("reference_kind") or inferred_reference_kind
+    ).strip().lower()
+    payload["reference_kind"] = (
+        reference_kind
+        if reference_kind
+        in {"named_identity", "generic_reference", "uncertain"}
+        else "uncertain"
+    )
+    if payload["reference_kind"] in {"generic_reference", "uncertain"}:
+        payload.update(
+            {
+                "chain_exists": None,
+                "canonical_chain_name": "",
+                "adapter_family": "unknown",
+                "possible_known_chain": "",
+            }
+        )
+        payload.pop("search_result", None)
+    return payload
+
+
+def trusted_chain_identity_search_result(
+    resolution: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return search evidence only after the model-output trust boundary.
+
+    The identity model cannot establish tool provenance by returning fields
+    that resemble a google_search result.  `resolve_unknown_chain_identity`
+    removes those fields before applying the private boundary marker.  A
+    later external-tool result may then be attached to that sanitized value.
+    """
+
+    if (
+        resolution.get(_CHAIN_IDENTITY_MODEL_BOUNDARY_KEY)
+        != _CHAIN_IDENTITY_MODEL_BOUNDARY_VALUE
+        or resolution.get("reference_kind")
+        in {"generic_reference", "uncertain"}
+    ):
+        return {}
+    search_result = resolution.get("search_result")
+    return (
+        dict(search_result)
+        if isinstance(search_result, Mapping)
+        else {}
+    )
 
 
 def extract_chain_mention(
@@ -263,15 +347,24 @@ def _chain_identity_prompt() -> str:
     return (
         "You resolve blockchain chain names for AnyChain Benchmark Agent. "
         "Return one JSON object only. Do not explain. The input chain is not "
-        "one of the configured AnyChain templates. Decide whether it appears "
-        "to be a real blockchain/network name, whether it is a typo or partial "
-        "alias for a known chain, and what adapter family it likely uses. Do "
-        "not claim certainty if unsure. Allowed adapter_family values: "
+        "one of the configured AnyChain templates. First classify whether the "
+        "input supplies a named chain/network identity. Use reference_kind="
+        "'named_identity' for an actual proper name, ticker, alias, or plausible "
+        "misspelling that names one candidate; use 'generic_reference' for a "
+        "pronoun, deictic reference, category, placeholder, or request for some "
+        "other/another chain without naming it; use 'uncertain' only when that "
+        "distinction cannot be made. For a named identity, decide whether it "
+        "appears to be a real blockchain/network name, whether it is a typo or "
+        "partial alias for a known chain, and what adapter family it likely "
+        "uses. Do not claim certainty if unsure. Allowed adapter_family values: "
         f"{', '.join(ADAPTER_FAMILIES + ['unsupported', 'unknown'])}. "
-        "Schema: {chain_exists:boolean|null, canonical_chain_name:string, "
+        "For generic_reference, chain_exists must be null and all proposed "
+        "identity fields must be empty/unknown. Schema: "
+        "{reference_kind:'named_identity'|'generic_reference'|'uncertain', "
+        "chain_exists:boolean|null, canonical_chain_name:string, "
         "adapter_family:string, protocol_or_api:string, "
         "possible_known_chain:string, evidence_summary:string, "
-        "confidence:'low'|'medium'|'high'}."
+        "reason:string, confidence:'low'|'medium'|'high'}."
     )
 
 

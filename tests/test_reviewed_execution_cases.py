@@ -253,7 +253,9 @@ class ReviewedExecutionCaseTest(unittest.TestCase):
             "session_id": session_id,
             "session_purpose": "real-cli-coverage",
             "pending_question_id": str(scenario.question["id"]),
-            "pending_contract_hash": content_hash(scenario.question),
+            "pending_contract_hash": content_hash(
+                canonical_question_contract(scenario.question)
+            ),
         }
         receipt["receipt_hash"] = content_hash(receipt)
 

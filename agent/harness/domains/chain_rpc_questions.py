@@ -20,7 +20,7 @@ from ..state import AgentGraphState
 
 from agent.onboarding.families import SUPPORTED_FAMILIES
 from agent.validators.rpc_workload import default_workload
-from .chain_rpc_support import _weight_example
+from .chain_rpc_support import _weight_example, active_rpc_onboarding_case
 from .rpc_catalog import catalog_method_names, draft_view, next_parameter_to_confirm
 
 choice_question = partial(_choice_question, owner="chain_rpc")
@@ -39,9 +39,160 @@ def _method_identity_completion() -> TextRef:
     return question_text("question.chain_rpc.method_identity.completion")
 
 
+def _method_intake_question(
+    state: AgentGraphState,
+    *,
+    case: str,
+) -> dict[str, Any]:
+    new_chain = case == "new_chain"
+    question_id = "new_chain_method" if new_chain else "custom_rpc_method"
+    prompt_id = (
+        "question.chain_rpc.new_chain_method.prompt"
+        if new_chain
+        else "question.chain_rpc.custom_method.prompt"
+    )
+    options = []
+    if catalog_method_names(state):
+        options.append(
+            _action_option(
+                "finish",
+                (
+                    question_text("question.chain_rpc.option.finish_new_chain_methods")
+                    if new_chain
+                    else question_text("question.chain_rpc.option.finish_custom_methods")
+                ),
+                "finish",
+                "rpc_catalog_command",
+                {
+                    (
+                        "chain_identity.status"
+                        if new_chain
+                        else "custom_rpc.status"
+                    ): (
+                        "existing_family_needs_workload_scope"
+                        if new_chain
+                        else "needs_scope"
+                    )
+                },
+                catalog_command="finish",
+            )
+        )
+    if not options:
+        return manual_question(
+            "endpoint_process",
+            question_id,
+            question_text(prompt_id),
+            field=question_id,
+            accepted_action_types=("rpc_catalog_command",),
+            manual_action={
+                "type": "rpc_catalog_command",
+                "catalog_command": "set_method",
+                "value_argument": "rpc_method",
+            },
+            queue_barrier=True,
+            barrier_policy="explicit_detour_only",
+            validation={"input_mode": "rpc_method_or_schema_evidence"},
+            completion_effect=_method_identity_completion(),
+            domain_context={"rpc_case": case},
+        )
+    return choice_question(
+        "endpoint_process",
+        question_id,
+        question_text(prompt_id),
+        field=question_id,
+        kind="manual_value",
+        options=options,
+        manual_input_allowed=True,
+        accepted_action_types=("rpc_catalog_command",),
+        manual_action={
+            "type": "rpc_catalog_command",
+            "catalog_command": "set_method",
+            "value_argument": "rpc_method",
+        },
+        queue_barrier=True,
+        barrier_policy="explicit_detour_only",
+        validation={"input_mode": "rpc_method_or_schema_evidence"},
+        completion_effect=_method_identity_completion(),
+        domain_context={"rpc_case": case},
+    )
+
+
+def _method_conflict_question(
+    state: AgentGraphState,
+    *,
+    case: str,
+) -> dict[str, Any]:
+    owner = (
+        state.get("chain_identity") or {}
+        if case == "new_chain"
+        else state.get("custom_rpc") or {}
+    )
+    conflict = owner.get("method_conflict") or {}
+    current = normalize_scalar(conflict.get("current_method"))
+    incoming = normalize_scalar(conflict.get("incoming_method"))
+    question_id = (
+        "new_chain_method_conflict"
+        if case == "new_chain"
+        else "custom_rpc_method_conflict"
+    )
+    return choice_question(
+        "endpoint_process",
+        question_id,
+        question_text(
+            "question.chain_rpc.method_conflict.prompt",
+            current_method=current,
+            incoming_method=incoming,
+        ),
+        field=question_id,
+        options=[
+            _action_option(
+                "keep_current",
+                question_text(
+                    "question.chain_rpc.option.keep_current_method",
+                    method=current,
+                ),
+                "keep_current",
+                "rpc_catalog_command",
+                {
+                    (
+                        "chain_identity.status"
+                        if case == "new_chain"
+                        else "custom_rpc.status"
+                    ): (
+                        "existing_family_needs_schema_evidence"
+                        if case == "new_chain"
+                        else "needs_schema_evidence"
+                    )
+                },
+                catalog_command="keep_current_method",
+            ),
+            _action_option(
+                "replace",
+                question_text(
+                    "question.chain_rpc.option.replace_current_method",
+                    method=incoming,
+                ),
+                "replace",
+                "rpc_catalog_command",
+                {"custom_rpc.catalog.draft.method": incoming},
+                catalog_command="replace_current_method",
+            ),
+        ],
+        accepted_action_types=("rpc_catalog_command",),
+        queue_barrier=True,
+        barrier_policy="exclusive_owner",
+        domain_context={"rpc_case": case},
+    )
+
+
 def _endpoint_validation_question(state: AgentGraphState) -> dict[str, Any] | None:
     custom = state.get("custom_rpc") or {}
     identity = state.get("chain_identity") or {}
+    active_case = active_rpc_onboarding_case(state)
+    if active_case == "new_chain":
+        custom = {}
+    elif active_case == "custom_rpc":
+        identity = {}
     if custom.get("status") == "needs_adapter_family_confirmation":
         return _adapter_family_question(state, custom=True)
     if custom.get("status") in {"needs_endpoint", "probe_failed"} and not custom.get("endpoint_ready"):
@@ -70,23 +221,9 @@ def _endpoint_validation_question(state: AgentGraphState) -> dict[str, Any] | No
             },
         )
     if custom.get("status") == "needs_method" and not draft_view(state).get("method"):
-        return manual_question(
-            "endpoint_process",
-            "custom_rpc_method",
-            question_text("question.chain_rpc.custom_method.prompt"),
-            field="custom_rpc_method",
-            accepted_action_types=("rpc_catalog_command",),
-            manual_action={
-                "type": "rpc_catalog_command",
-                "catalog_command": "set_method",
-                "value_argument": "rpc_method",
-            },
-            queue_barrier=True,
-            barrier_policy="explicit_detour_only",
-            validation={"input_mode": "rpc_method_or_schema_evidence"},
-            completion_effect=_method_identity_completion(),
-            domain_context={"rpc_case": "custom_rpc"},
-        )
+        return _method_intake_question(state, case="custom_rpc")
+    if custom.get("status") == "method_conflict":
+        return _method_conflict_question(state, case="custom_rpc")
     if custom.get("status") == "needs_schema_evidence":
         method = normalize_scalar(
             draft_view(state).get("method") or custom.get("candidate_method")
@@ -154,23 +291,9 @@ def _endpoint_validation_question(state: AgentGraphState) -> dict[str, Any] | No
             },
         )
     if identity.get("status") == "existing_family_needs_method":
-        return manual_question(
-            "endpoint_process",
-            "new_chain_method",
-            question_text("question.chain_rpc.new_chain_method.prompt"),
-            field="new_chain_method",
-            accepted_action_types=("rpc_catalog_command",),
-            manual_action={
-                "type": "rpc_catalog_command",
-                "catalog_command": "set_method",
-                "value_argument": "rpc_method",
-            },
-            queue_barrier=True,
-            barrier_policy="explicit_detour_only",
-            validation={"input_mode": "rpc_method_or_schema_evidence"},
-            completion_effect=_method_identity_completion(),
-            domain_context={"rpc_case": "new_chain"},
-        )
+        return _method_intake_question(state, case="new_chain")
+    if identity.get("status") == "existing_family_method_conflict":
+        return _method_conflict_question(state, case="new_chain")
     if identity.get("status") == "existing_family_needs_schema_evidence":
         method = normalize_scalar(draft_view(state).get("method"))
         return manual_question(
@@ -253,7 +376,15 @@ def _mainnet_review_question(state: AgentGraphState, *, sync_observe: bool) -> d
         "MAINNET_RPC_URL_REVIEWED",
         [
             _answer_option("yes", question_text("question.chain_rpc.option.yes"), True, {"confirmed_config.MAINNET_RPC_URL_REVIEWED": True}),
-            _answer_option("no", question_text("question.chain_rpc.option.no"), False, {"confirmed_config.MAINNET_RPC_URL_REVIEWED": True}),
+            _answer_option(
+                "no",
+                question_text("question.chain_rpc.option.no"),
+                False,
+                {
+                    "confirmed_config.MAINNET_RPC_URL_REVIEWED": True,
+                    "confirmed_config.MAINNET_RPC_URL_DISABLED": True,
+                },
+            ),
         ],
         kind="confirm_or_value",
         manual_input_allowed=True,
@@ -279,6 +410,46 @@ def _chain_question(state: AgentGraphState) -> dict[str, Any]:
         },
         queue_barrier=True,
         evidence_path="chain_identity.canonical",
+    )
+
+
+def _chain_selection_question(
+    state: AgentGraphState,
+    *,
+    candidates: list[str] | tuple[str, ...] = (),
+) -> dict[str, Any]:
+    current_chain = normalize_scalar(
+        (state.get("chain_identity") or {}).get("canonical")
+    )
+    normalized_candidates = [
+        normalize_scalar(item)
+        for item in candidates
+        if normalize_scalar(item)
+    ]
+    if current_chain:
+        prompt = question_text(
+            "question.chain_rpc.chain_change.current.prompt",
+            current_chain=current_chain,
+        )
+    elif normalized_candidates:
+        prompt = question_text(
+            "question.chain_rpc.chain_change.candidates.prompt",
+            candidates=", ".join(normalized_candidates),
+        )
+    else:
+        prompt = question_text("question.chain_rpc.chain_change.prompt")
+    return manual_question(
+        "chain_identity",
+        "chain_change_input",
+        prompt,
+        field="chain_change_input",
+        accepted_action_types=("choose_chain", "change_chain"),
+        manual_action={
+            "type": "change_chain" if current_chain else "choose_chain",
+            "value_argument": "chain_text",
+        },
+        queue_barrier=True,
+        evidence_path="chain_identity.change_candidate.canonical",
     )
 
 
@@ -421,7 +592,16 @@ def _schema_confirmation_question(state: AgentGraphState, case: str) -> dict[str
             _answer_option("no", question_text("question.chain_rpc.option.no"), False, {f"{'chain_identity' if case == 'new_chain' else 'custom_rpc'}.status": "existing_family_needs_schema_evidence" if case == "new_chain" else "needs_schema_evidence"}),
         ],
         kind="yes_no",
+        manual_input_allowed=True,
+        accepted_action_types=("rpc_catalog_command",),
+        manual_action={
+            "type": "rpc_catalog_command",
+            "catalog_command": "append_evidence",
+            "value_argument": "rpc_schema_evidence",
+        },
         queue_barrier=True,
+        validation={"value_type": "evidence_contribution", "max_length": 65536},
+        structured_input_owner=True,
         rpc_case=case,
     )
 
@@ -457,7 +637,16 @@ def _schema_confirmation_text(draft: dict[str, Any]) -> TextRef:
         field_rows = [
             "{name}: type={field_type}, meaning={meaning}".format(
                 name=item.get("name") or "<unnamed>",
-                field_type=item.get("type") or "unknown",
+                field_type=(
+                    "/".join(
+                        str(value)
+                        for value in item.get("json_types") or ()
+                        if str(value)
+                    )
+                    or item.get("json_type")
+                    or item.get("type")
+                    or "unknown"
+                ),
                 meaning=item.get("meaning") or "unknown",
             )
             for item in response_fields
@@ -472,6 +661,13 @@ def _schema_confirmation_text(draft: dict[str, Any]) -> TextRef:
         params_summary=params_summary,
         response_summary=normalize_scalar(draft.get("response_summary")) or "<unknown>",
         response_fields="; ".join(field_rows) or "<unknown>",
+        response_schema_status=(
+            "truncated; additional response fields may exist"
+            if draft.get("response_schema_truncated")
+            else "complete for supplied response evidence"
+            if draft.get("response_schema_complete")
+            else "not established"
+        ),
         confidence=normalize_scalar(draft.get("confidence")) or "unknown",
         conflicts="; ".join(str(item) for item in conflicts)
         if isinstance(conflicts, list) and conflicts
@@ -524,7 +720,16 @@ def _parameter_confirmation_question(state: AgentGraphState, case: str, index: i
             _answer_option("no", question_text("question.chain_rpc.option.no"), False, {f"{owner_key}.status": "existing_family_needs_schema_evidence" if case == "new_chain" else "needs_schema_evidence"}),
         ],
         kind="yes_no",
+        manual_input_allowed=True,
+        accepted_action_types=("rpc_catalog_command",),
+        manual_action={
+            "type": "rpc_catalog_command",
+            "catalog_command": "append_evidence",
+            "value_argument": "rpc_schema_evidence",
+        },
         queue_barrier=True,
+        validation={"value_type": "evidence_contribution", "max_length": 65536},
+        structured_input_owner=True,
         rpc_case=case,
     )
 
@@ -554,7 +759,16 @@ def _probe_confirmation_question(state: AgentGraphState, case: str, *, retry: bo
             _answer_option("no", question_text("question.chain_rpc.option.no"), False, {"custom_rpc.catalog.draft.request_confirmed": False}),
         ],
         kind="yes_no",
+        manual_input_allowed=True,
+        accepted_action_types=("rpc_catalog_command",),
+        manual_action={
+            "type": "rpc_catalog_command",
+            "catalog_command": "append_evidence",
+            "value_argument": "rpc_schema_evidence",
+        },
         queue_barrier=True,
+        validation={"value_type": "evidence_contribution", "max_length": 65536},
+        structured_input_owner=True,
         rpc_case=case,
     )
 
@@ -592,7 +806,16 @@ def _response_confirmation_question(state: AgentGraphState, case: str) -> dict[s
             _answer_option("no", question_text("question.chain_rpc.option.no"), False, {f"{owner_key}.status": "existing_family_needs_schema_evidence" if case == "new_chain" else "needs_schema_evidence"}),
         ],
         kind="yes_no",
+        manual_input_allowed=True,
+        accepted_action_types=("rpc_catalog_command",),
+        manual_action={
+            "type": "rpc_catalog_command",
+            "catalog_command": "append_evidence",
+            "value_argument": "rpc_schema_evidence",
+        },
         queue_barrier=True,
+        validation={"value_type": "evidence_contribution", "max_length": 65536},
+        structured_input_owner=True,
         rpc_case=case,
     )
 
@@ -643,8 +866,18 @@ def _scope_question(state: AgentGraphState, case: str) -> dict[str, Any]:
             question_text("question.chain_rpc.scope.new_chain.prompt"),
             "new_chain_workload_scope",
             [
-                _answer_option("single_replace", question_text("question.chain_rpc.option.single_validated_method"), "single_replace", {"chain_identity.workload_scope": "single_replace"}),
-                _answer_option("mixed_replace", question_text("question.chain_rpc.option.mixed_validated_methods"), "mixed_replace", {"chain_identity.status": "existing_family_needs_weights"}),
+                _answer_option(
+                    "single_replace",
+                    question_text("question.chain_rpc.option.single_validated_method"),
+                    "single",
+                    {"chain_identity.workload_scope": "single_replace"},
+                ),
+                _answer_option(
+                    "mixed_replace",
+                    question_text("question.chain_rpc.option.mixed_validated_methods"),
+                    "mixed",
+                    {"chain_identity.status": "existing_family_needs_weights"},
+                ),
             ],
             accepted_action_types=("rpc_workload_command",),
             queue_barrier=True,
@@ -656,9 +889,24 @@ def _scope_question(state: AgentGraphState, case: str) -> dict[str, Any]:
         question_text("question.chain_rpc.scope.custom_rpc.prompt"),
         "custom_rpc_scope",
         [
-            _answer_option("single_replace", question_text("question.chain_rpc.option.single_custom_method"), "single_replace", {"custom_rpc.scope": "single_replace"}),
-            _answer_option("mixed_replace", question_text("question.chain_rpc.option.mixed_custom_only"), "mixed_replace", {"custom_rpc.status": "needs_weights"}),
-            _answer_option("mixed_add", question_text("question.chain_rpc.option.mixed_defaults_plus_custom"), "mixed_add", {"custom_rpc.status": "needs_weights"}),
+            _answer_option(
+                "single_replace",
+                question_text("question.chain_rpc.option.single_custom_method"),
+                "single",
+                {"custom_rpc.scope": "single_replace"},
+            ),
+            _answer_option(
+                "mixed_replace",
+                question_text("question.chain_rpc.option.mixed_custom_only"),
+                "mixed_replace",
+                {"custom_rpc.status": "needs_weights"},
+            ),
+            _answer_option(
+                "mixed_add",
+                question_text("question.chain_rpc.option.mixed_defaults_plus_custom"),
+                "mixed_add",
+                {"custom_rpc.status": "needs_weights"},
+            ),
         ],
         accepted_action_types=("rpc_workload_command",),
         queue_barrier=True,
@@ -731,8 +979,10 @@ def _choice(
     kind: str = "numbered_choice",
     manual_input_allowed: bool = False,
     accepted_action_types: tuple[str, ...] = (),
+    manual_action: dict[str, Any] | None = None,
     queue_barrier: bool = False,
     validation: dict[str, Any] | None = None,
+    structured_input_owner: bool = False,
     rpc_case: str = "",
 ) -> dict[str, Any]:
     return choice_question(
@@ -744,9 +994,11 @@ def _choice(
         kind=kind,
         manual_input_allowed=manual_input_allowed,
         accepted_action_types=accepted_action_types,
+        manual_action=manual_action,
         queue_barrier=queue_barrier,
         barrier_policy="exclusive_owner" if queue_barrier else "",
         validation=validation,
+        structured_input_owner=structured_input_owner,
         domain_context={"rpc_case": rpc_case} if rpc_case else {},
     )
 

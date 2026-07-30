@@ -9,7 +9,10 @@ from ..input_values import (
     normalize_scalar,
     normalize_target_mode,
 )
-from ..advisory import resolve_unknown_chain_identity
+from ..advisory import (
+    normalize_chain_identity_resolution,
+    resolve_unknown_chain_identity,
+)
 from ..questions import question_text
 from ..state import AgentGraphState
 from ..transitions import (
@@ -20,7 +23,13 @@ from ..transitions import (
 from agent.knowledge.chain_identity import canonicalize_chain_scalar, repo_chain_names
 from agent.llm.search_grounding import run_google_search_grounding
 from agent.onboarding.families import SUPPORTED_FAMILIES
-from .chain_rpc_questions import _adapter_family_question, _answer_option, _choice
+from .chain_rpc_questions import (
+    _adapter_family_question,
+    _answer_option,
+    _chain_question,
+    _chain_selection_question,
+    _choice,
+)
 from .chain_rpc_questions import _endpoint_validation_question
 from .chain_identity_receipts import emit_chain_identity_resolution_receipt
 from .response_fragments import ResponseCollector, emit
@@ -42,27 +51,61 @@ def _resolution_from_arguments(arguments: Mapping[str, Any]) -> dict[str, Any] |
     if not (
         any(normalize_scalar(arguments.get(key)) for key in ("canonical_chain_name", "adapter_family", "possible_known_chain"))
         or isinstance(arguments.get("chain_exists"), bool)
+        or normalize_scalar(arguments.get("reference_kind"))
     ):
         return None
     return {
         key: deepcopy(value)
         for key, value in arguments.items()
-        if key in {"chain_exists", "canonical_chain_name", "adapter_family", "possible_known_chain", "confidence", "reason", "evidence_summary"}
+        if key in {
+            "reference_kind",
+            "chain_exists",
+            "canonical_chain_name",
+            "adapter_family",
+            "possible_known_chain",
+            "confidence",
+            "reason",
+            "evidence_summary",
+        }
     }
 
 
 def research_chain_identity(state: AgentGraphState, raw: str, resolution: dict[str, Any] | None = None) -> dict[str, Any]:
     """Research an unconfigured chain without mutating workflow state."""
 
-    resolved = deepcopy(resolution) if resolution is not None else dict(resolve_unknown_chain_identity(state, raw) or {})
-    if (state.get("web_research") or {}).get("google_search_available"):
+    proposal = deepcopy(resolution) if resolution is not None else {}
+    if normalize_scalar(proposal.get("reference_kind")) not in {
+        "named_identity",
+        "generic_reference",
+        "uncertain",
+    }:
+        classified = dict(resolve_unknown_chain_identity(state, raw) or {})
+        resolved = {**proposal, **classified}
+    else:
+        resolved = proposal
+    if (
+        resolved.get("reference_kind") == "named_identity"
+        and (state.get("web_research") or {}).get("google_search_available")
+    ):
         result = run_google_search_grounding(
             f"{raw} blockchain network: does it exist, what protocol/RPC API does it use, official documentation"
         )
         resolved["search_result"] = result.as_dict()
         if result.available and result.text_summary:
             resolved["evidence_summary"] = result.text_summary
-    return resolved
+    return normalize_chain_identity_resolution(resolved)
+
+
+def _identity_resolver_source(
+    resolution: Mapping[str, Any] | None,
+) -> str:
+    if (
+        isinstance(resolution, Mapping)
+        and normalize_scalar(resolution.get("reference_kind"))
+        in {"named_identity", "generic_reference", "uncertain"}
+    ):
+        return "planner_proposal"
+    return "llm"
 
 
 def _verified_search_summary(resolution: Mapping[str, Any]) -> str:
@@ -207,9 +250,16 @@ def _apply_chain_candidate(
         state,
         candidate=raw,
         resolution=resolved,
-        resolver_source="planner_proposal" if resolution is not None else "llm",
+        resolver_source=_identity_resolver_source(resolution),
         confirmation_required=True,
     )
+    if resolved.get("reference_kind") in {"generic_reference", "uncertain"}:
+        identity = state.get("chain_identity") or {}
+        if identity.get("status") != "confirmed":
+            state["chain_identity"] = {}
+        state["active_group"] = "chain_identity"
+        state["pending_question"] = _chain_question(state)
+        return
     adapter_family = normalize_scalar(resolved.get("adapter_family") or "unknown")
     canonical_name = normalize_scalar(resolved.get("canonical_chain_name") or raw)
     possible_known = _known_chain_proposal(resolved, known)
@@ -286,11 +336,16 @@ def _request_chain_change(
             state,
             candidate=raw,
             resolution=resolved,
-            resolver_source=(
-                "planner_proposal" if resolution is not None else "llm"
-            ),
+            resolver_source=_identity_resolver_source(resolution),
             confirmation_required=True,
         )
+        if resolved.get("reference_kind") in {
+            "generic_reference",
+            "uncertain",
+        }:
+            state["active_group"] = "chain_identity"
+            state["pending_question"] = _chain_selection_question(state)
+            return
     candidate_label = canonical or raw
     prompt = (
         question_text(

@@ -16,6 +16,15 @@ from agent.harness.action_registry import MODE_COMPARISON_TOPIC
 from agent.harness.control_receipts import (
     validate_persisted_domain_control_receipt,
 )
+from agent.harness.contracts import ResponseFragment
+from agent.harness.domains.rpc_receipts import evidence_hash
+from agent.harness.questions import render_question
+from agent.harness.response_catalog import (
+    MESSAGE_CATALOG,
+    render_fragment,
+    render_hash,
+    semantic_hash,
+)
 from agent.harness.state import DURABLE_ENVIRONMENT_STATE_ROOTS
 from agent.workflows.group_registry import GROUP_OWNER
 from tests.agent_live.coverage_evidence import content_hash
@@ -198,6 +207,53 @@ def _domain_commits(context: Any) -> tuple[
     list[Mapping[str, Any]], list[Mapping[str, Any]]
 ]:
     return _valid_receipts(context, "domain_commit")
+
+
+def _domain_consumers_by_turn(
+    context: Any,
+    *,
+    owner: str,
+    events: Sequence[Any] | None = None,
+) -> tuple[dict[int, set[str]], list[Mapping[str, Any]]]:
+    if events is None:
+        valid, invalid = _domain_commits(context)
+    else:
+        valid = []
+        invalid = []
+        for event in events:
+            for receipt in tuple(
+                getattr(event, "control_receipts", ()) or ()
+            ):
+                if (
+                    not isinstance(receipt, Mapping)
+                    or receipt.get("receipt_type") != "domain_commit"
+                ):
+                    continue
+                accepted, reason = validate_persisted_domain_control_receipt(
+                    receipt,
+                    turn_index=int(getattr(event, "turn_index", -1)),
+                )
+                record = {
+                    "receipt": receipt,
+                    "receipt_id": str(receipt.get("receipt_id") or ""),
+                    "turn_index": int(getattr(event, "turn_index", -1)),
+                    "reason": reason,
+                }
+                (valid if accepted else invalid).append(record)
+    consumers: dict[int, set[str]] = defaultdict(set)
+    for item in valid:
+        receipt = item["receipt"]
+        if (
+            receipt.get("owner") != owner
+            or receipt.get("completion") == "rejected"
+        ):
+            continue
+        consumers[int(item["turn_index"])].update(
+            str(action_id)
+            for action_id in receipt.get("consumed_action_ids") or ()
+            if str(action_id)
+        )
+    return consumers, invalid
 
 
 def _material_delta_records(
@@ -509,15 +565,343 @@ def _consultation_answered_read_only(context: Any) -> PredicateResult:
     )
 
 
-def _retained_state_described(context: Any) -> PredicateResult:
-    return _receipt_predicate(
+def _visible_orientation_authority(
+    context: Any,
+    *,
+    topics: frozenset[str],
+    required_message_ids: frozenset[str] = frozenset(),
+) -> tuple[dict[int, set[str]], list[dict[str, str]]]:
+    """Bind an orientation action through commit, composition, and rendering."""
+
+    orientations, invalid_orientations = _valid_receipts(
         context,
-        family="orientation_read_only",
-        receipt_types=("orientation_response",),
-        predicate=lambda receipt: (
-            receipt.get("read_only") is True
-            and receipt.get("topic") in {"current_config", "current_context"}
-        ),
+        "orientation_response",
+    )
+    commits, invalid_commits = _domain_commits(context)
+    compositions, invalid_compositions = _valid_receipts(
+        context,
+        "response_composition",
+    )
+    orientations_by_turn: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    commits_by_turn: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    compositions_by_turn: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    events_by_turn = {
+        int(getattr(event, "turn_index", -1)): event
+        for event in _events(context)
+    }
+    for item in orientations:
+        orientations_by_turn[int(item["turn_index"])].append(item)
+    for item in commits:
+        commits_by_turn[int(item["turn_index"])].append(item)
+    for item in compositions:
+        compositions_by_turn[int(item["turn_index"])].append(item)
+    matches: dict[int, set[str]] = defaultdict(set)
+    for turn_index, event in events_by_turn.items():
+        admitted = {
+            str(action.get("action_id") or ""): action
+            for action in (
+                getattr(event, "admitted_action_provenance", ()) or ()
+            )
+            if isinstance(action, Mapping)
+            and str(action.get("action_id") or "")
+        }
+        manifest = dict(getattr(event, "render_manifest", {}) or {})
+        visible_hashes = list(manifest.get("fragment_hashes") or ())
+        observation = str(getattr(event, "observation", "") or "").strip()
+        if (
+            manifest.get("fragment_count") != 1
+            or len(visible_hashes) != 1
+            or not observation
+            or visible_hashes[0] != render_hash(observation)
+        ):
+            continue
+        for orientation in orientations_by_turn.get(turn_index, ()):
+            receipt = orientation["receipt"]
+            action_id = str(receipt.get("action_id") or "")
+            action = admitted.get(action_id) or {}
+            if (
+                receipt.get("read_only") is not True
+                or receipt.get("topic") not in topics
+                or action.get("type") != receipt.get("action_type")
+            ):
+                continue
+            for commit in commits_by_turn.get(turn_index, ()):
+                commit_receipt = commit["receipt"]
+                fragments = [
+                    dict(fragment)
+                    for fragment in (
+                        commit_receipt.get("response_fragments") or ()
+                    )
+                    if isinstance(fragment, Mapping)
+                ]
+                message_ids = {
+                    str(fragment.get("message_id") or "")
+                    for fragment in fragments
+                }
+                job_fragment_matches = True
+                if (
+                    "harness.orientation.consultation.job_verified"
+                    in message_ids
+                ):
+                    projection = dict(
+                        receipt.get("state_projection") or {}
+                    )
+                    status_fragments = [
+                        fragment
+                        for fragment in fragments
+                        if fragment.get("message_id")
+                        == "harness.orientation.consultation.job_verified"
+                    ]
+                    language = str(manifest.get("language") or "")
+                    if language not in {"en", "zh"}:
+                        job_fragment_matches = False
+                    else:
+                        expected = render_fragment(
+                            ResponseFragment(
+                                kind="message",
+                                message_id=(
+                                    "harness.orientation.consultation."
+                                    "job_verified"
+                                ),
+                                arguments={
+                                    "job_id": str(
+                                        projection.get("job_id") or ""
+                                    ),
+                                    "status": str(
+                                        projection.get("job_status") or ""
+                                    ),
+                                },
+                                source=__name__,
+                            ),
+                            language,
+                        )
+                        job_fragment_matches = (
+                            len(status_fragments) == 1
+                            and status_fragments[0].get("semantic_hash")
+                            == expected.semantic_hash
+                            and status_fragments[0].get("render_hash")
+                            == expected.render_hash
+                            and observation == expected.text
+                        )
+                if (
+                    commit_receipt.get("owner") != "orientation"
+                    or action_id
+                    not in set(
+                        commit_receipt.get("consumed_action_ids") or ()
+                    )
+                    or not fragments
+                    or any(
+                        str(fragment.get("message_id") or "")
+                        not in MESSAGE_CATALOG
+                        for fragment in fragments
+                    )
+                    or not job_fragment_matches
+                    or not required_message_ids.issubset(message_ids)
+                    or receipt.get("response_hash")
+                    != semantic_hash([
+                        str(fragment.get("semantic_hash") or "")
+                        for fragment in fragments
+                    ])
+                ):
+                    continue
+                for composition in compositions_by_turn.get(turn_index, ()):
+                    composed_receipt = composition["receipt"]
+                    composed = [
+                        dict(fragment)
+                        for fragment in (
+                            composed_receipt.get("fragments") or ()
+                        )
+                        if isinstance(fragment, Mapping)
+                    ]
+                    if (
+                        action_id
+                        in set(
+                            composed_receipt.get("source_action_ids")
+                            or ()
+                        )
+                        and all(
+                            fragment in composed
+                            for fragment in fragments
+                        )
+                        and composed_receipt.get(
+                            "pending_contract_hash"
+                        )
+                        == manifest.get("pending_contract_hash")
+                        and visible_hashes[0]
+                        == composed_receipt.get(
+                            "terminal_response_hash"
+                        )
+                    ):
+                        matches[turn_index].add(action_id)
+                        break
+    return matches, [
+        *invalid_orientations,
+        *invalid_commits,
+        *invalid_compositions,
+    ]
+
+
+def _retained_state_described(context: Any) -> PredicateResult:
+    contract, contract_error = _verifier_input(context)
+    required_turns = {
+        int(step.get("turn_index") or -1)
+        for step in (
+            (contract or {}).get("source_contract", {}).get(
+                "source_steps"
+            )
+            or ()
+        )
+        if isinstance(step, Mapping)
+        and step.get("semantic_role") == "retained_state_consultation"
+    } if contract is not None else set()
+    orientations, invalid_orientations = _valid_receipts(
+        context,
+        "orientation_response",
+    )
+    commits, invalid_commits = _domain_commits(context)
+    compositions, invalid_compositions = _valid_receipts(
+        context,
+        "response_composition",
+    )
+    orientation_by_turn = defaultdict(list)
+    commit_by_turn = defaultdict(list)
+    composition_by_turn = defaultdict(list)
+    for item in orientations:
+        orientation_by_turn[int(item["turn_index"])].append(item)
+    for item in commits:
+        commit_by_turn[int(item["turn_index"])].append(item)
+    for item in compositions:
+        composition_by_turn[int(item["turn_index"])].append(item)
+    matched: list[int] = []
+    for source_turn_index, event in enumerate(_events(context), start=1):
+        runtime_turn_index = int(getattr(event, "turn_index", -1))
+        admitted = {
+            str(action.get("action_id") or ""): action
+            for action in (
+                getattr(event, "admitted_action_provenance", ()) or ()
+            )
+            if isinstance(action, Mapping)
+            and str(action.get("action_id") or "")
+        }
+        manifest = dict(getattr(event, "render_manifest", {}) or {})
+        visible_hashes = list(manifest.get("fragment_hashes") or ())
+        if (
+            manifest.get("fragment_count") != 1
+            or len(visible_hashes) != 1
+        ):
+            continue
+        for orientation in orientation_by_turn.get(
+            runtime_turn_index,
+            (),
+        ):
+            receipt = orientation["receipt"]
+            action_id = str(receipt.get("action_id") or "")
+            action = admitted.get(action_id) or {}
+            if (
+                receipt.get("read_only") is not True
+                or receipt.get("topic")
+                not in {"current_config", "current_context"}
+                or action.get("type")
+                != receipt.get("action_type")
+            ):
+                continue
+            for commit in commit_by_turn.get(runtime_turn_index, ()):
+                commit_receipt = commit["receipt"]
+                fragments = [
+                    dict(fragment)
+                    for fragment in (
+                        commit_receipt.get("response_fragments") or ()
+                    )
+                    if isinstance(fragment, Mapping)
+                ]
+                if (
+                    commit_receipt.get("owner") != "orientation"
+                    or action_id
+                    not in set(
+                        commit_receipt.get("consumed_action_ids") or ()
+                    )
+                    or not fragments
+                    or receipt.get("response_hash")
+                    != semantic_hash([
+                        str(fragment.get("semantic_hash") or "")
+                        for fragment in fragments
+                    ])
+                ):
+                    continue
+                for composition in composition_by_turn.get(
+                    runtime_turn_index,
+                    (),
+                ):
+                    composition_receipt = composition["receipt"]
+                    composed = [
+                        dict(fragment)
+                        for fragment in (
+                            composition_receipt.get("fragments") or ()
+                        )
+                        if isinstance(fragment, Mapping)
+                    ]
+                    if (
+                        action_id
+                        in set(
+                            composition_receipt.get(
+                                "source_action_ids"
+                            )
+                            or ()
+                        )
+                        and all(
+                            fragment in composed
+                            for fragment in fragments
+                        )
+                        and visible_hashes[0]
+                        == composition_receipt.get(
+                            "terminal_response_hash"
+                        )
+                    ):
+                        matched.append(source_turn_index)
+                        break
+    invalid = [
+        *invalid_orientations,
+        *invalid_commits,
+        *invalid_compositions,
+    ]
+    return (
+        bool(matched)
+        and not invalid
+        and (
+            not required_turns
+            or required_turns.issubset(set(matched))
+        )
+        and not contract_error
+    ), {
+        "evidence_family": "orientation_visible_read_only",
+        "matched_source_turn_indexes": sorted(set(matched)),
+        "required_source_turn_indexes": sorted(required_turns),
+        "invalid_receipts": invalid,
+        "verifier_contract_error": contract_error,
+    }
+
+
+def _admitted_action_matches_pending_option(
+    action: Mapping[str, Any],
+    option: Mapping[str, Any],
+) -> bool:
+    declared_action = option.get("action")
+    action_type = str(action.get("type") or "")
+    if isinstance(declared_action, Mapping):
+        if action_type != str(declared_action.get("type") or ""):
+            return False
+        value_hashes = dict(action.get("argument_value_hashes") or {})
+        return all(
+            value_hashes.get(str(key)) == content_hash(value)
+            for key, value in declared_action.items()
+            if str(key) != "type"
+        )
+    return bool(
+        action_type == "answer_pending"
+        and (
+            option.get("semantic_action")
+            or option.get("expected_patch")
+        )
     )
 
 
@@ -549,10 +933,41 @@ def _resume_action_contract_exposed(context: Any) -> PredicateResult:
     )
     matched = []
     matched_hashes: list[str] = []
+    displayed_contract_turns: dict[str, int] = {}
+    resolution_matches: list[int] = []
+    resolution_semantic_hashes: list[str] = []
+    invalid_resolutions: list[dict[str, str]] = []
+    mismatched_resolutions: list[dict[str, Any]] = []
+    expected_options: dict[str, Mapping[str, Any]] = {}
+    duplicate_expected_option_ids: set[str] = set()
+    for option in tuple(expected_contract.get("options") or ()):
+        if not isinstance(option, Mapping):
+            continue
+        option_id = str(option.get("id") or option.get("option_id") or "")
+        if (
+            not option_id
+            or not (
+                option.get("action")
+                or option.get("expected_patch")
+                or option.get("semantic_action")
+            )
+        ):
+            continue
+        if option_id in expected_options:
+            duplicate_expected_option_ids.add(option_id)
+        expected_options[option_id] = option
     initial_event = getattr(context, "initial_event", None)
     events = (
+        *tuple(getattr(context, "setup_events", ()) or ()),
         *((initial_event,) if initial_event is not None else ()),
         *_events(context),
+    )
+    orientation_consumers, invalid_domain_commits = (
+        _domain_consumers_by_turn(
+            context,
+            owner="orientation",
+            events=events,
+        )
     )
     seen_event_ids: set[str] = set()
     for event in events:
@@ -562,11 +977,15 @@ def _resume_action_contract_exposed(context: Any) -> PredicateResult:
         if event_id:
             seen_event_ids.add(event_id)
         contract = dict(getattr(event, "pending_contract", {}) or {})
-        contract_hash = (
+        render_manifest = dict(
+            getattr(event, "render_manifest", {}) or {}
+        )
+        semantic_contract_hash = (
             content_hash(canonical_question_contract(contract))
             if contract
             else ""
         )
+        runtime_contract_hash = content_hash(contract) if contract else ""
         options = tuple(contract.get("options") or ())
         option_ids = [
             str(option.get("id") or option.get("option_id") or "")
@@ -576,10 +995,16 @@ def _resume_action_contract_exposed(context: Any) -> PredicateResult:
         if (
             contract.get("id") == "resume_harness_session"
             and expected_hash
-            and contract_hash == expected_hash
+            and semantic_contract_hash == expected_hash
             and len(option_ids) >= 2
             and all(option_ids)
             and len(option_ids) == len(set(option_ids))
+            and render_manifest.get("pending_contract_hash")
+            == runtime_contract_hash
+            and dict(render_manifest.get("result") or {}).get(
+                "question_id"
+            )
+            == "resume_harness_session"
             and all(
                 isinstance(option, Mapping)
                 and (
@@ -590,14 +1015,120 @@ def _resume_action_contract_exposed(context: Any) -> PredicateResult:
                 for option in options
             )
         ):
-            matched.append(int(getattr(event, "turn_index", -1)))
-            matched_hashes.append(contract_hash)
-    return bool(matched), {
+            turn_index = int(getattr(event, "turn_index", -1))
+            matched.append(turn_index)
+            matched_hashes.append(semantic_contract_hash)
+            displayed_contract_turns[runtime_contract_hash] = turn_index
+        for receipt in tuple(
+            getattr(event, "control_receipts", ()) or ()
+        ):
+            if (
+                not isinstance(receipt, Mapping)
+                or receipt.get("receipt_type") != "pending_resolution"
+                or receipt.get("pending_id") != "resume_harness_session"
+            ):
+                continue
+            accepted, reason = validate_persisted_domain_control_receipt(
+                receipt,
+                turn_index=int(getattr(event, "turn_index", -1)),
+            )
+            if not accepted:
+                invalid_resolutions.append({
+                    "receipt_id": str(receipt.get("receipt_id") or ""),
+                    "reason": reason,
+                })
+                continue
+            selected_option_id = str(
+                receipt.get("selected_option_id") or ""
+            )
+            selected_option = expected_options.get(selected_option_id)
+            transition = _valid_pending_transition(event)
+            admitted_actions = {
+                str(action.get("action_id") or ""): action
+                for action in (
+                    getattr(event, "admitted_action_provenance", ()) or ()
+                )
+                if isinstance(action, Mapping)
+            }
+            resolved_action_id = str(
+                receipt.get("resolved_action_id") or ""
+            )
+            resolved_action = admitted_actions.get(resolved_action_id)
+            turn_index = int(getattr(event, "turn_index", -1))
+            resolved_contract_hash = str(
+                receipt.get("pending_contract_hash") or ""
+            )
+            if (
+                receipt.get("verdict") == "accepted"
+                and receipt.get("normalizer") == "exact_contract"
+                and receipt.get("resolution_path") == "exact_contract"
+                and resolved_contract_hash in displayed_contract_turns
+                and displayed_contract_turns[resolved_contract_hash]
+                < turn_index
+                and selected_option is not None
+                and selected_option_id not in duplicate_expected_option_ids
+                and receipt.get("selected_value_hash")
+                == content_hash(selected_option.get("value"))
+                and resolved_action is not None
+                and _admitted_action_matches_pending_option(
+                    resolved_action,
+                    selected_option,
+                )
+                and resolved_action_id
+                in orientation_consumers.get(turn_index, set())
+                and transition is not None
+                and transition.get("before_id")
+                == "resume_harness_session"
+                and transition.get("before_hash")
+                == resolved_contract_hash
+                and resolved_action_id
+                in set(transition.get("consumer_action_ids") or ())
+            ):
+                resolution_matches.append(turn_index)
+                resolution_semantic_hashes.append(
+                    content_hash(selected_option)
+                )
+            elif receipt.get("verdict") == "accepted":
+                mismatched_resolutions.append({
+                    "turn_index": int(
+                        getattr(event, "turn_index", -1)
+                    ),
+                    "pending_contract_hash": str(
+                        receipt.get("pending_contract_hash") or ""
+                    ),
+                    "selected_option_id": selected_option_id,
+                    "resolution_path": str(
+                        receipt.get("resolution_path") or ""
+                    ),
+                    "normalizer": str(receipt.get("normalizer") or ""),
+                })
+    resolved_after_display = [
+        turn_index
+        for turn_index in resolution_matches
+        if any(display_turn < turn_index for display_turn in matched)
+    ]
+    return (
+        bool(matched)
+        and (
+            not resolution_matches
+            or len(resolved_after_display) == len(resolution_matches)
+        )
+        and not invalid_resolutions
+        and not mismatched_resolutions
+        and not invalid_domain_commits
+    ), {
         "evidence_family": "resume_contract",
         "scenario_id": scenario_id,
         "expected_pending_contract_hash": expected_hash,
         "matched_pending_contract_hashes": matched_hashes,
         "matched_turn_indexes": matched,
+        "matched_resolution_turn_indexes": resolved_after_display,
+        "matched_resolution_option_semantic_hashes": (
+            resolution_semantic_hashes
+        ),
+        "invalid_resolution_receipts": invalid_resolutions,
+        "mismatched_resolution_receipts": mismatched_resolutions,
+        "invalid_domain_commit_receipts": invalid_domain_commits,
     }
 
 
@@ -1290,21 +1821,83 @@ def _mode_request_consumed_as_chain_identity(
     }
 
 
-def _unknown_chain_identity_resolution_started(context: Any) -> PredicateResult:
-    return _receipt_predicate(
+def _bound_unknown_chain_resolutions(
+    context: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    identities, invalid = _valid_receipts(
+        context, "chain_identity_resolution"
+    )
+    chain_consumers, invalid_commits = _domain_consumers_by_turn(
         context,
-        family="unknown_chain_identity",
-        receipt_types=("chain_identity_resolution",),
-        predicate=lambda receipt: bool(receipt.get("resolver_source")),
+        owner="chain_rpc",
+    )
+    events_by_turn = {
+        int(getattr(event, "turn_index", -1)): event
+        for event in _events(context)
+    }
+    bound: list[dict[str, Any]] = []
+    for item in identities:
+        event = events_by_turn.get(int(item["turn_index"]))
+        transition = (
+            _valid_pending_transition(event)
+            if event is not None
+            else None
+        )
+        if (
+            transition is None
+            or transition.get("after_group") != "chain_identity"
+        ):
+            continue
+        consumer_ids = set(transition.get("consumer_action_ids") or ())
+        committed_ids = chain_consumers.get(int(item["turn_index"]), set())
+        candidate_hash = str(
+            item["receipt"].get("candidate_hash") or ""
+        )
+        actions = [
+            action
+            for action in (
+                getattr(event, "admitted_action_provenance", ()) or ()
+            )
+            if isinstance(action, Mapping)
+            and str(action.get("action_id") or "") in consumer_ids
+            and str(action.get("action_id") or "") in committed_ids
+            and str(action.get("type") or "")
+            in {"choose_chain", "change_chain"}
+            and dict(action.get("argument_value_hashes") or {}).get(
+                "chain_text"
+            )
+            == candidate_hash
+        ]
+        if actions:
+            bound.append(item)
+    return bound, [*invalid, *invalid_commits]
+
+
+def _unknown_chain_identity_resolution_started(context: Any) -> PredicateResult:
+    bound, invalid = _bound_unknown_chain_resolutions(context)
+    matches = [
+        item
+        for item in bound
+        if bool(item["receipt"].get("resolver_source"))
+    ]
+    return bool(matches) and not invalid, _receipt_details(
+        "unknown_chain_identity",
+        matches,
+        invalid,
     )
 
 
 def _chain_confirmation_required(context: Any) -> PredicateResult:
-    return _receipt_predicate(
-        context,
-        family="unknown_chain_identity",
-        receipt_types=("chain_identity_resolution",),
-        predicate=lambda receipt: receipt.get("confirmation_required") is True,
+    bound, invalid = _bound_unknown_chain_resolutions(context)
+    matches = [
+        item
+        for item in bound
+        if item["receipt"].get("confirmation_required") is True
+    ]
+    return bool(matches) and not invalid, _receipt_details(
+        "unknown_chain_identity",
+        matches,
+        invalid,
     )
 
 
@@ -1855,31 +2448,118 @@ def _new_chain_request_routed(context: Any) -> PredicateResult:
     identity, invalid_identity = _valid_receipts(
         context, "chain_identity_resolution"
     )
-    routed_actions = []
+    identities_by_turn: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for item in identity:
+        identities_by_turn[int(item["turn_index"])].append(item)
+    route_action_types_requiring_identity = {
+        "set_chain_candidate",
+        "change_chain",
+        "choose_chain",
+        "select_chain",
+    }
+    chain_consumers, invalid_commits = _domain_consumers_by_turn(
+        context,
+        owner="chain_rpc",
+    )
+    routed_actions: list[dict[str, Any]] = []
+    typed_intakes: list[dict[str, Any]] = []
+    matches: list[dict[str, Any]] = []
     for event in _events(context):
-        for target in tuple(
-            getattr(event, "admitted_action_targets", ()) or ()
-        ):
-            if (
-                isinstance(target, Mapping)
-                and target.get("type") == "change_group"
-                and target.get("group") == "chain_identity"
-            ):
-                routed_actions.append(target)
-        if set(getattr(event, "admitted_action_types", ()) or ()) & {
-            "set_chain_candidate",
-            "change_chain",
-            "select_chain",
-        }:
-            routed_actions.append({
-                "type": "chain_identity_action",
-                "turn_index": int(getattr(event, "turn_index", -1)),
+        turn_index = int(getattr(event, "turn_index", -1))
+        transition = _valid_pending_transition(event)
+        typed_intake = (
+            transition is not None
+            and transition.get("transition") in {"created", "replaced"}
+            and transition.get("after_group") == "chain_identity"
+            and transition.get("after_id") in {"chain", "chain_change_input"}
+        )
+        if typed_intake:
+            typed_intakes.append({
+                "turn_index": turn_index,
+                "question_id": str(transition.get("after_id") or ""),
+                "consumer_action_ids": list(
+                    transition.get("consumer_action_ids") or ()
+                ),
             })
-    return bool(identity or routed_actions) and not invalid_identity, _receipt_details(
+        provenance = [
+            action
+            for action in tuple(
+                getattr(event, "admitted_action_provenance", ()) or ()
+            )
+            if isinstance(action, Mapping)
+            and str(action.get("action_id") or "")
+        ]
+        for action in provenance:
+            action_type = str(action.get("type") or "")
+            is_chain_route = (
+                action_type in {
+                    "set_chain_candidate",
+                    "change_chain",
+                    "choose_chain",
+                    "request_chain_selection",
+                    "select_chain",
+                }
+                or (
+                    action_type == "change_group"
+                    and action.get("group") == "chain_identity"
+                )
+            )
+            if not is_chain_route:
+                continue
+            action_id = str(action["action_id"])
+            record = {
+                "turn_index": turn_index,
+                "action_id": action_id,
+                "action_type": action_type,
+            }
+            routed_actions.append(record)
+            same_turn_identity = identities_by_turn.get(turn_index, [])
+            identity_required = (
+                action_type in route_action_types_requiring_identity
+            )
+            action_candidate_hash = str(
+                dict(action.get("argument_value_hashes") or {}).get(
+                    "chain_text"
+                )
+                or ""
+            )
+            bound_identity = [
+                item
+                for item in same_turn_identity
+                if str(item["receipt"].get("candidate_hash") or "")
+                == action_candidate_hash
+            ]
+            if (
+                typed_intake
+                and action_id
+                in set(transition.get("consumer_action_ids") or ())
+                and action_id
+                in chain_consumers.get(turn_index, set())
+                and (
+                    not identity_required
+                    or (
+                        _is_hash(action_candidate_hash)
+                        and bool(bound_identity)
+                    )
+                )
+            ):
+                matches.append({
+                    **record,
+                    "question_id": str(transition.get("after_id") or ""),
+                    "identity_receipt_ids": [
+                        str(item.get("receipt_id") or "")
+                        for item in bound_identity
+                    ],
+                })
+    invalid = [*invalid_identity, *invalid_commits]
+    return bool(matches) and not invalid, _receipt_details(
         "chain_request_routing",
         identity,
-        invalid_identity,
+        invalid,
         routed_action_count=len(routed_actions),
+        typed_intake_count=len(typed_intakes),
+        typed_intakes=typed_intakes,
+        matches=matches,
     )
 
 
@@ -1971,31 +2651,171 @@ def _removed_default_method_committed(context: Any) -> PredicateResult:
 
 
 def _example_endpoint_scope_preserved(context: Any) -> PredicateResult:
-    return _receipt_predicate(
+    endpoints, invalid_endpoints = _valid_receipts(
         context,
-        family="rpc_endpoint_scope",
-        receipt_types=("rpc_endpoint_role",),
-        predicate=lambda receipt: receipt.get("role") == "validation",
+        "rpc_endpoint_role",
+    )
+    consumers, invalid_commits = _domain_consumers_by_turn(
+        context,
+        owner="chain_rpc",
+    )
+    events = {
+        int(getattr(event, "turn_index", -1)): event
+        for event in _events(context)
+    }
+    matched = []
+    for item in endpoints:
+        receipt = item["receipt"]
+        turn_index = int(item["turn_index"])
+        producer = str(receipt.get("producer_action_id") or "")
+        event = events.get(turn_index)
+        admitted_ids = {
+            str(action.get("action_id") or "")
+            for action in (
+                getattr(event, "admitted_action_provenance", ()) or ()
+            )
+            if isinstance(action, Mapping)
+        } if event is not None else set()
+        if (
+            receipt.get("role") == "validation"
+            and receipt.get("ready") is True
+            and producer
+            and producer in admitted_ids
+            and producer in consumers.get(turn_index, set())
+        ):
+            matched.append(item)
+    invalid = [*invalid_endpoints, *invalid_commits]
+    return bool(matched) and not invalid, _receipt_details(
+        "rpc_endpoint_scope",
+        matched,
+        invalid,
     )
 
 
 def _example_endpoint_replaced_runtime_endpoint(context: Any) -> PredicateResult:
     endpoints, invalid_endpoints = _valid_receipts(context, "rpc_endpoint_role")
     deltas, invalid_commits = _material_delta_records(context)
-    validation_turns = {
+    validation_turns = sorted({
         int(item["turn_index"])
         for item in endpoints
         if item["receipt"].get("role") == "validation"
+    })
+    if not validation_turns:
+        return False, _receipt_details(
+            "rpc_endpoint_scope",
+            [],
+            [*invalid_endpoints, *invalid_commits],
+            runtime_endpoint_write_count=0,
+        )
+    consumers, invalid_consumer_commits = _domain_consumers_by_turn(
+        context,
+        owner="chain_rpc",
+    )
+    events = {
+        int(getattr(event, "turn_index", -1)): event
+        for event in _events(context)
     }
+    endpoint_receipts_by_id = {
+        str(item["receipt"].get("receipt_id") or ""): item
+        for item in endpoints
+        if str(item["receipt"].get("receipt_id") or "")
+    }
+    authorized_runtime_writes: set[tuple[int, str, str, str]] = set()
+    for item in endpoints:
+        receipt = item["receipt"]
+        if receipt.get("role") not in {
+            "final_benchmark",
+            "sync_observe",
+        }:
+            continue
+        turn_index = int(item["turn_index"])
+        producer = str(receipt.get("producer_action_id") or "")
+        event = events.get(turn_index)
+        admitted_ids = {
+            str(action.get("action_id") or "")
+            for action in (
+                getattr(event, "admitted_action_provenance", ()) or ()
+            )
+            if isinstance(action, Mapping)
+        } if event is not None else set()
+        admitted_value_hashes = {
+            str(action.get("action_id") or ""): set(
+                str(value_hash)
+                for value_hash in dict(
+                    action.get("argument_value_hashes") or {}
+                ).values()
+            )
+            for action in (
+                getattr(event, "admitted_action_provenance", ()) or ()
+            )
+            if isinstance(action, Mapping)
+        } if event is not None else {}
+        direct_source = (
+            receipt.get("source_kind") == "direct_action"
+            and receipt.get("source_value_hash")
+            in admitted_value_hashes.get(producer, set())
+        )
+        source_item = endpoint_receipts_by_id.get(
+            str(receipt.get("source_receipt_id") or "")
+        )
+        source_receipt = (
+            source_item["receipt"]
+            if isinstance(source_item, Mapping)
+            else {}
+        )
+        promoted_source = (
+            receipt.get("source_kind") == "validated_endpoint"
+            and source_item is not None
+            and int(source_item["turn_index"]) < turn_index
+            and source_receipt.get("role") == "validation"
+            and source_receipt.get("ready") is True
+            and source_receipt.get("endpoint_hash")
+            == receipt.get("endpoint_hash")
+            and source_receipt.get("source_value_hash")
+            == receipt.get("source_value_hash")
+        )
+        if (
+            receipt.get("ready") is True
+            and producer
+            and producer in admitted_ids
+            and producer in consumers.get(turn_index, set())
+            and (direct_source or promoted_source)
+        ):
+            authorized_runtime_writes.add((
+                turn_index,
+                producer,
+                str(receipt.get("config_field") or ""),
+                str(receipt.get("source_value_hash") or ""),
+            ))
     replaced = [
         item
         for item in deltas
-        if int(item["turn_index"]) in validation_turns
+        if int(item["turn_index"]) >= min(validation_turns)
         and item["operation"] == "write"
         and _path_leaf(item["path"])
-        in {"LOCAL_RPC_URL", "MAINNET_RPC_URL", "SYNC_ENDPOINT"}
+        in {
+            "LOCAL_RPC_URL",
+            "MAINNET_RPC_URL",
+            "SYNC_OBSERVE_RPC_URL",
+        }
+        and not any(
+            (
+                int(item["turn_index"]),
+                str(producer),
+                _path_leaf(item["path"]),
+                str(item.get("value_hash") or ""),
+            )
+            in authorized_runtime_writes
+            for producer in (
+                item["receipt"].get("consumed_action_ids") or ()
+            )
+        )
     ]
-    invalid = [*invalid_endpoints, *invalid_commits]
+    invalid = [
+        *invalid_endpoints,
+        *invalid_commits,
+        *invalid_consumer_commits,
+    ]
     return bool(replaced) and not invalid, _receipt_details(
         "rpc_endpoint_scope",
         replaced,
@@ -2005,35 +2825,298 @@ def _example_endpoint_replaced_runtime_endpoint(context: Any) -> PredicateResult
 
 
 def _rpc_schema_evidence_extracted(context: Any) -> PredicateResult:
-    return _receipt_predicate(
+    valid, invalid = _valid_receipts(context, "rpc_schema_provenance")
+    valid_catalog, invalid_catalog = _valid_receipts(
+        context, "rpc_catalog_transition"
+    )
+    catalog_by_turn: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for item in valid_catalog:
+        catalog_by_turn[int(item["turn_index"])].append(item)
+    events_by_turn = {
+        int(getattr(event, "turn_index", -1)): event
+        for event in _events(context)
+    }
+    chain_consumers, invalid_commits = _domain_consumers_by_turn(
         context,
-        family="rpc_schema_provenance",
-        receipt_types=("rpc_schema_provenance",),
-        predicate=lambda receipt: bool(receipt.get("fields")),
+        owner="chain_rpc",
+    )
+    correlated: list[dict[str, Any]] = []
+    for item in valid:
+        receipt = item["receipt"]
+        turn_index = int(item["turn_index"])
+        event = events_by_turn.get(turn_index)
+        transition = (
+            _valid_pending_transition(event)
+            if event is not None
+            else None
+        )
+        if (
+            transition is None
+            or not str(transition.get("before_id") or "").endswith(
+                "_schema_evidence"
+            )
+            or not str(transition.get("after_id") or "").endswith(
+                "_schema_confirm"
+            )
+        ):
+            continue
+        consumer_ids = set(transition.get("consumer_action_ids") or ())
+        admitted = [
+            action
+            for action in (
+                getattr(event, "admitted_action_provenance", ()) or ()
+            )
+            if isinstance(action, Mapping)
+            and str(action.get("action_id") or "") in consumer_ids
+            and str(action.get("action_id") or "")
+            in chain_consumers.get(turn_index, set())
+            and str(action.get("type") or "") == "rpc_catalog_command"
+            and dict(action.get("argument_value_hashes") or {}).get(
+                "catalog_command"
+            )
+            == content_hash("append_evidence")
+        ]
+        admitted_source_hashes = {
+            str(value_hash)
+            for action in admitted
+            for argument, value_hash in dict(
+                action.get("argument_value_hashes") or {}
+            ).items()
+            if argument
+            in {
+                "source_evidence",
+                "rpc_schema_evidence",
+                "selected_value",
+                "answer",
+            }
+            and _is_hash(str(value_hash or ""))
+        }
+        accepted_catalog = [
+            catalog
+            for catalog in catalog_by_turn.get(turn_index, [])
+            if catalog["receipt"].get("accepted") is True
+            and catalog["receipt"].get("command") == "append_evidence"
+            and str(
+                catalog["receipt"].get("producer_action_id") or ""
+            )
+            in {
+                str(action.get("action_id") or "")
+                for action in admitted
+            }
+            and (
+                not catalog["receipt"].get("draft_method_hash")
+                or catalog["receipt"].get("draft_method_hash")
+                == receipt.get("method_hash")
+            )
+        ]
+        accepted_schema_transitions = [
+            catalog
+            for catalog in catalog_by_turn.get(turn_index, [])
+            if catalog["receipt"].get("accepted") is True
+            and catalog["receipt"].get("command") == "correct_draft"
+            and catalog["receipt"].get("producer_action_id")
+            == receipt.get("producer_action_id")
+            and int(
+                catalog["receipt"].get("catalog_revision") or -1
+            )
+            == int(receipt.get("catalog_revision") or -2)
+        ]
+        fields = {
+            str(field.get("field_path") or ""): field
+            for field in receipt.get("fields") or ()
+            if isinstance(field, Mapping)
+        }
+        source_kinds = {
+            str(field.get("source_kind") or "")
+            for field in fields.values()
+        }
+        status = fields.get("exchange_correlation.status") or {}
+        request_ids = fields.get(
+            "exchange_correlation.request_id_hashes"
+        ) or {}
+        response_ids = fields.get(
+            "exchange_correlation.response_id_hashes"
+        ) or {}
+        lineage_revisions = {
+            tuple(field.get("source_revisions") or ())
+            for field in (
+                status,
+                request_ids,
+                response_ids,
+                *[
+                    field
+                    for field in fields.values()
+                    if field.get("source_kind")
+                    in {
+                        "protocol_request_parser",
+                        "protocol_response_parser",
+                    }
+                ],
+            )
+            if isinstance(field, Mapping)
+        }
+        if (
+            _is_hash(str(receipt.get("method_hash") or ""))
+            and "protocol_request_parser" in source_kinds
+            and "protocol_response_parser" in source_kinds
+            and status.get("source_kind") == "protocol_exchange_correlator"
+            and status.get("value_hash") == evidence_hash("correlated")
+            and request_ids.get("source_kind")
+            == "protocol_exchange_correlator"
+            and response_ids.get("source_kind")
+            == "protocol_exchange_correlator"
+            and request_ids.get("value_hash")
+            == response_ids.get("value_hash")
+            and _is_hash(str(request_ids.get("value_hash") or ""))
+            and len(lineage_revisions) == 1
+            and bool(next(iter(lineage_revisions), ()))
+            and bool(admitted)
+            and bool(accepted_catalog)
+            and bool(accepted_schema_transitions)
+            and bool(receipt.get("source_evidence_hashes"))
+            and set(receipt.get("source_action_value_hashes") or ())
+            <= admitted_source_hashes
+            and all(
+                catalog["receipt"].get("producer_action_id")
+                == receipt.get("producer_action_id")
+                for catalog in accepted_catalog
+            )
+            and all(
+                catalog["receipt"].get("source_evidence_hashes")
+                == receipt.get("source_evidence_hashes")
+                for catalog in accepted_catalog
+            )
+            and all(
+                catalog["receipt"].get("source_action_value_hashes")
+                == receipt.get("source_action_value_hashes")
+                for catalog in accepted_catalog
+            )
+            and all(
+                int(catalog["receipt"].get("catalog_revision") or -1)
+                < int(receipt.get("catalog_revision") or -2)
+                for catalog in accepted_catalog
+            )
+            and all(
+                int(catalog["receipt"].get("catalog_revision") or -1)
+                in set(next(iter(lineage_revisions), ()))
+                for catalog in accepted_catalog
+            )
+        ):
+            correlated.append(item)
+    invalid_receipts = [*invalid, *invalid_catalog, *invalid_commits]
+    return bool(correlated) and not invalid_receipts, _receipt_details(
+        "rpc_schema_provenance",
+        correlated,
+        invalid_receipts,
+        correlated_receipt_count=len(correlated),
+        progressed_turn_indexes=sorted(
+            {int(item["turn_index"]) for item in correlated}
+        ),
     )
 
 
 def _schema_intake_looped(context: Any) -> PredicateResult:
-    valid, invalid = _valid_receipts(context, "rpc_schema_provenance")
-    identities = Counter(
-        (
-            str(item["receipt"].get("method_hash") or ""),
-            str(item["receipt"].get("fields_hash") or ""),
-            int(item["receipt"].get("catalog_revision") or 0),
+    valid_catalog, invalid_catalog = _valid_receipts(
+        context, "rpc_catalog_transition"
+    )
+    catalog_by_turn: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for item in valid_catalog:
+        catalog_by_turn[int(item["turn_index"])].append(item)
+    accepted_turns: set[int] = set()
+    chain_consumers, invalid_commits = _domain_consumers_by_turn(
+        context,
+        owner="chain_rpc",
+    )
+    mutation_actions_by_turn: dict[int, dict[str, str]] = defaultdict(dict)
+    for event in _events(context):
+        turn_index = int(getattr(event, "turn_index", -1))
+        transition = _valid_pending_transition(event)
+        consumer_ids = set(
+            (transition or {}).get("consumer_action_ids") or ()
         )
-        for item in valid
-    )
-    loops = {
-        repr(identity): count
-        for identity, count in identities.items()
-        if count > 1
+        for action in (
+            getattr(event, "admitted_action_provenance", ()) or ()
+        ):
+            if (
+                not isinstance(action, Mapping)
+                or str(action.get("action_id") or "") not in consumer_ids
+                or str(action.get("action_id") or "")
+                not in chain_consumers.get(turn_index, set())
+                or str(action.get("type") or "")
+                != "rpc_catalog_command"
+            ):
+                continue
+            command_hash = str(
+                dict(action.get("argument_value_hashes") or {}).get(
+                    "catalog_command"
+                )
+                or ""
+            )
+            action_id = str(action.get("action_id") or "")
+            mutation_actions_by_turn[turn_index][action_id] = command_hash
+            if (
+                command_hash == content_hash("append_evidence")
+                and any(
+                    item["receipt"].get("accepted") is True
+                    and item["receipt"].get("command")
+                    == "append_evidence"
+                    and item["receipt"].get("producer_action_id")
+                    == action_id
+                    for item in catalog_by_turn.get(turn_index, ())
+                )
+            ):
+                accepted_turns.add(turn_index)
+    loops: list[dict[str, Any]] = []
+    for event in _events(context):
+        transition = _valid_pending_transition(event)
+        if transition is None:
+            continue
+        before_id = str(transition.get("before_id") or "")
+        after_id = str(transition.get("after_id") or "")
+        evidence_stalled = (
+            before_id.endswith("_schema_evidence")
+            and content_hash("append_evidence")
+            in set(
+                mutation_actions_by_turn.get(
+                    int(getattr(event, "turn_index", -1)),
+                    {},
+                ).values()
+            )
+            and int(getattr(event, "turn_index", -1))
+            not in accepted_turns
+        )
+        confirmation_stalled = (
+            before_id.endswith("_schema_confirm")
+            and bool(
+                set(mutation_actions_by_turn.get(
+                    int(getattr(event, "turn_index", -1)),
+                    {},
+                ).values())
+                & {
+                    content_hash("confirm_request"),
+                    content_hash("confirm_response"),
+                }
+            )
+        )
+        if (
+            after_id == before_id
+            and bool(transition.get("consumer_action_ids"))
+            and (evidence_stalled or confirmation_stalled)
+        ):
+            loops.append({
+                "turn_index": int(getattr(event, "turn_index", -1)),
+                "pending_question_id": before_id,
+                "consumer_action_ids": list(
+                    transition.get("consumer_action_ids") or ()
+                ),
+            })
+    return bool(loops), {
+        "evidence_family": "rpc_schema_lifecycle",
+        "repeated_schema_intake_transitions": loops,
+        "accepted_incremental_evidence_turns": sorted(accepted_turns),
+        "invalid_catalog_receipts": invalid_catalog,
+        "invalid_domain_commit_receipts": invalid_commits,
     }
-    return bool(loops) and not invalid, _receipt_details(
-        "rpc_schema_provenance",
-        valid,
-        invalid,
-        repeated_schema_states=loops,
-    )
 
 
 def _multiline_evidence_block_collected_once(context: Any) -> PredicateResult:
@@ -2104,51 +3187,457 @@ def _evidence_analysis_returned(context: Any) -> PredicateResult:
         receipt_types=("analysis_invocation", "analysis_report"),
         predicate=lambda receipt: (
             receipt.get("invoked") is True
-            and receipt.get("visible_result_hash")
-            and receipt.get("visible_result_hash")
-            != hashlib.sha256(b'""').hexdigest()
+            and receipt.get("response_rendered") is True
+            and _is_hash(str(receipt.get("response_render_hash") or ""))
+            and _is_hash(str(receipt.get("response_semantic_hash") or ""))
+            and bool(receipt.get("response_message_ids"))
         ),
     )
 
 
 def _execution_stage_explained(context: Any) -> PredicateResult:
-    return _receipt_predicate(
-        context,
-        family="orientation_read_only",
-        receipt_types=("orientation_response",),
-        predicate=lambda receipt: (
-            receipt.get("topic") == "execution_preflight_smoke"
-            and receipt.get("read_only") is True
-        ),
+    orientations, invalid_orientations = _valid_receipts(
+        context, "orientation_response"
+    )
+    commits, invalid_commits = _domain_commits(context)
+    compositions, invalid_compositions = _valid_receipts(
+        context, "response_composition"
+    )
+    execution_explanation_message = (
+        "harness.orientation.consultation.preflight_smoke"
+    )
+    compositions_by_turn: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for composition in compositions:
+        compositions_by_turn[int(composition["turn_index"])].append(
+            composition
+        )
+    events_by_turn = {
+        int(getattr(event, "turn_index", -1)): event
+        for event in _events(context)
+    }
+    matches: list[dict[str, Any]] = []
+    for orientation in orientations:
+        receipt = orientation["receipt"]
+        if (
+            receipt.get("read_only") is not True
+            or receipt.get("action_type") != "answer_opening_question"
+            or receipt.get("topic")
+            not in {
+                "requirements",
+                "workflow",
+                "execution_preflight_smoke",
+            }
+        ):
+            continue
+        turn_index = int(orientation["turn_index"])
+        action_id = str(receipt.get("action_id") or "")
+        event = events_by_turn.get(turn_index)
+        admitted_orientation_actions = [
+            action
+            for action in (
+                getattr(event, "admitted_action_provenance", ()) or ()
+            )
+            if isinstance(action, Mapping)
+            and str(action.get("action_id") or "") == action_id
+            and str(action.get("type") or "")
+            == str(receipt.get("action_type") or "")
+        ] if event is not None else []
+        if not admitted_orientation_actions:
+            continue
+        for commit in commits:
+            commit_receipt = commit["receipt"]
+            if (
+                int(commit["turn_index"]) != turn_index
+                or commit_receipt.get("owner") != "orientation"
+                or action_id
+                not in set(commit_receipt.get("consumed_action_ids") or ())
+            ):
+                continue
+            explanation_fragments = [
+                dict(fragment)
+                for fragment in commit_receipt.get("response_fragments") or ()
+                if isinstance(fragment, Mapping)
+                and fragment.get("message_id")
+                == execution_explanation_message
+            ]
+            if not explanation_fragments:
+                continue
+            domain_fragments = [
+                dict(fragment)
+                for fragment in commit_receipt.get("response_fragments") or ()
+                if isinstance(fragment, Mapping)
+            ]
+            pending_transition = (
+                _valid_pending_transition(event)
+                if event is not None
+                else None
+            )
+            if (
+                pending_transition is None
+                or pending_transition.get("before_group")
+                != "preflight_smoke_execution"
+                or pending_transition.get("after_group")
+                != "preflight_smoke_execution"
+                or not pending_transition.get("before_id")
+                or not pending_transition.get("after_id")
+                or receipt.get("pending_contract_hash")
+                != pending_transition.get("before_hash")
+                or action_id
+                not in set(
+                    pending_transition.get("consumer_action_ids") or ()
+                )
+            ):
+                continue
+            render_manifest = (
+                dict(getattr(event, "render_manifest", {}) or {})
+                if event is not None
+                else {}
+            )
+            visible_hashes = list(
+                render_manifest.get("fragment_hashes") or ()
+            )
+            fragment_count = render_manifest.get("fragment_count")
+            domain_response_hash = semantic_hash([
+                str(fragment.get("semantic_hash") or "")
+                for fragment in domain_fragments
+            ])
+            if receipt.get("response_hash") != domain_response_hash:
+                continue
+            for composition in compositions_by_turn.get(turn_index, []):
+                composition_receipt = composition["receipt"]
+                if action_id not in set(
+                    composition_receipt.get("source_action_ids") or ()
+                ):
+                    continue
+                composed_fragments = [
+                    dict(fragment)
+                    for fragment in composition_receipt.get("fragments") or ()
+                    if isinstance(fragment, Mapping)
+                ]
+                recomputed = _recompute_preflight_composition(
+                    composed_fragments,
+                    pending_contract=dict(
+                        getattr(event, "pending_contract", {}) or {}
+                    ),
+                    language=str(
+                        composition_receipt.get("language") or ""
+                    ),
+                )
+                for fragment in explanation_fragments:
+                    render_hash = str(fragment.get("render_hash") or "")
+                    if (
+                        all(
+                            domain_fragment in composed_fragments
+                            for domain_fragment in domain_fragments
+                        )
+                        and fragment in composed_fragments
+                        and composition_receipt.get(
+                            "pending_contract_hash"
+                        )
+                        == render_manifest.get("pending_contract_hash")
+                        and len(visible_hashes) == 1
+                        and visible_hashes[0]
+                        == composition_receipt.get(
+                            "terminal_response_hash"
+                        )
+                        and recomputed is not None
+                        and recomputed["terminal_response_hash"]
+                        == composition_receipt.get(
+                            "terminal_response_hash"
+                        )
+                        and recomputed["terminal_semantic_hash"]
+                        == composition_receipt.get(
+                            "terminal_semantic_hash"
+                        )
+                        and isinstance(fragment_count, int)
+                        and fragment_count == 1
+                    ):
+                        matches.append({
+                            "turn_index": turn_index,
+                            "orientation_receipt_id": str(
+                                orientation.get("receipt_id") or ""
+                            ),
+                            "domain_commit_receipt_id": str(
+                                commit.get("receipt_id") or ""
+                            ),
+                            "composition_receipt_id": str(
+                                composition.get("receipt_id") or ""
+                            ),
+                            "message_id": execution_explanation_message,
+                            "render_hash": render_hash,
+                            "visible_render_authority": "render_manifest_hash",
+                        })
+    invalid = [
+        *invalid_orientations,
+        *invalid_commits,
+        *invalid_compositions,
+    ]
+    return bool(matches) and not invalid, _receipt_details(
+        "orientation_execution_explanation",
+        orientations,
+        invalid,
+        matches=matches,
     )
 
 
+def _recompute_preflight_composition(
+    fragments: Sequence[Mapping[str, Any]],
+    *,
+    pending_contract: Mapping[str, Any],
+    language: str,
+) -> dict[str, str] | None:
+    allowed_messages = {
+        "harness.orientation.consultation.preflight_smoke",
+        "harness.orientation.consultation.requirements",
+        "harness.orientation.consultation.requirements_with_recommendation",
+    }
+    texts: list[str] = []
+    semantic_hashes: list[str] = []
+    for item in fragments:
+        role = str(item.get("role") or "")
+        message_id = str(item.get("message_id") or "")
+        if role == "pending_question":
+            if (
+                not pending_contract
+                or message_id
+                != str(pending_contract.get("id") or "")
+            ):
+                return None
+            text = render_question(pending_contract, language).strip()
+            item_semantic_hash = semantic_hash({
+                "kind": "pending_question",
+                "question": dict(pending_contract),
+            })
+            item_render_hash = render_hash(text)
+        elif message_id in allowed_messages and role == "message":
+            rendered = render_fragment(
+                ResponseFragment(
+                    kind="message",
+                    message_id=message_id,
+                    source=__name__,
+                ),
+                language,
+            )
+            text = rendered.text
+            item_semantic_hash = rendered.semantic_hash
+            item_render_hash = rendered.render_hash
+        else:
+            return None
+        if (
+            item.get("semantic_hash") != item_semantic_hash
+            or item.get("render_hash") != item_render_hash
+        ):
+            return None
+        texts.append(text)
+        semantic_hashes.append(item_semantic_hash)
+    if not any(
+        item.get("message_id")
+        == "harness.orientation.consultation.preflight_smoke"
+        for item in fragments
+    ):
+        return None
+    terminal = "\n".join(texts).strip()
+    return {
+        "terminal_response_hash": render_hash(terminal),
+        "terminal_semantic_hash": semantic_hash(semantic_hashes),
+    }
+
+
 def _approved_execution_submitted_once(context: Any) -> PredicateResult:
+    from agent.runners.job_manager import verify_job_receipt
+
+    contract, contract_error = _verifier_input(context)
+    required_turns = {
+        int(step.get("turn_index") or -1)
+        for step in (
+            (contract or {}).get("source_contract", {}).get(
+                "source_steps"
+            )
+            or ()
+        )
+        if isinstance(step, Mapping)
+        and step.get("semantic_role") == "approve_execution"
+    } if contract is not None else set()
+    approvals, invalid_approvals = _valid_receipts(
+        context,
+        "execution_approval",
+    )
+    pending_resolutions, invalid_pending = _valid_receipts(
+        context,
+        "pending_resolution",
+    )
+    commits, invalid_commits = _domain_commits(context)
+    approvals_by_turn = defaultdict(list)
+    pending_by_turn = defaultdict(list)
+    commits_by_turn = defaultdict(list)
+    for item in approvals:
+        approvals_by_turn[int(item["turn_index"])].append(item)
+    for item in pending_resolutions:
+        pending_by_turn[int(item["turn_index"])].append(item)
+    for item in commits:
+        commits_by_turn[int(item["turn_index"])].append(item)
     submissions: dict[str, set[tuple[str, str]]] = defaultdict(set)
-    for event in _events(context):
+    verified_turns: list[int] = []
+    for source_turn_index, event in enumerate(_events(context), start=1):
+        runtime_turn_index = int(getattr(event, "turn_index", -1))
         summary = dict(
             getattr(event, "execution_receipt_summary", {}) or {}
+        )
+        manager_receipt = dict(
+            summary.get("manager_submission_receipt") or {}
         )
         key = str(
             summary.get("receipt_idempotency_key")
             or summary.get("intent_idempotency_key")
             or ""
         )
-        manager_receipt = str(
+        manager_receipt_id = str(
             summary.get("manager_submission_receipt_id") or ""
         )
         job_id = str(summary.get("job_id") or "")
+        all_admitted = [
+            action
+            for action in (
+                getattr(event, "admitted_action_provenance", ()) or ()
+            )
+            if isinstance(action, Mapping)
+            and str(action.get("action_id") or "")
+        ]
+        admitted = [
+            action
+            for action in all_admitted
+            if str(action.get("type") or "")
+            in {
+                "approve_preflight_smoke",
+                "approve_final_benchmark",
+            }
+        ]
+        consumed = {
+            str(action_id)
+            for commit in commits_by_turn.get(runtime_turn_index, ())
+            if commit["receipt"].get("owner") == "execution"
+            for action_id in (
+                commit["receipt"].get("consumed_action_ids") or ()
+            )
+        }
+        bound_approvals = [
+            approval["receipt"]
+            for approval in approvals_by_turn.get(
+                runtime_turn_index,
+                (),
+            )
+            if approval["receipt"].get("approval_action_id")
+            in {
+                str(action.get("action_id") or "")
+                for action in admitted
+                if str(action.get("action_id") or "") in consumed
+            }
+        ]
+        intent_projection = dict(
+            summary.get("side_effect_intent_projection") or {}
+        )
+        effect_projection = dict(
+            summary.get("side_effect_receipt_projection") or {}
+        )
+        pending_receipts = {
+            str(item["receipt"].get("receipt_id") or ""): item["receipt"]
+            for item in pending_by_turn.get(runtime_turn_index, ())
+        }
         if (
             key
-            and _is_hash(manager_receipt)
+            and verify_job_receipt(manager_receipt)
+            and manager_receipt.get("receipt_type")
+            == "job_submission"
+            and manager_receipt_id
+            == manager_receipt.get("receipt_id")
             and job_id
+            and manager_receipt.get("job_id") == job_id
             and summary.get("manager_submission_disposition")
             in {"created", "reused"}
+            and manager_receipt.get("disposition")
+            == summary.get("manager_submission_disposition")
             and int(summary.get("manager_matching_job_count") or 0) == 1
+            and manager_receipt.get("matching_job_count") == 1
+            and manager_receipt.get("execution_key_hash")
+            == summary.get("manager_execution_key_hash")
+            == content_hash(key)
+            and any(
+                approval.get("job_id") == job_id
+                and approval.get("job_submission_receipt_id")
+                == manager_receipt_id
+                and approval.get("job_submission_receipt_hash")
+                == content_hash(manager_receipt)
+                and approval.get("approval_action_type")
+                in {
+                    str(action.get("type") or "")
+                    for action in admitted
+                }
+                and approval.get("idempotency_key_hash")
+                == content_hash(key)
+                and intent_projection.get("execution_request_id")
+                == approval.get("execution_request_id")
+                and key
+                == f"harness:{approval.get('execution_request_id')}"
+                and approval.get("side_effect_intent_id")
+                == intent_projection.get("intent_id")
+                == summary.get("intent_id")
+                and approval.get("side_effect_intent_hash")
+                == content_hash(intent_projection)
+                and approval.get("side_effect_receipt_id")
+                == effect_projection.get("receipt_id")
+                == summary.get("receipt_id")
+                and approval.get("side_effect_receipt_hash")
+                == content_hash(effect_projection)
+                and intent_projection.get("action_id")
+                == effect_projection.get("action_id")
+                == approval.get("approval_action_id")
+                and effect_projection.get("intent_id")
+                == intent_projection.get("intent_id")
+                and effect_projection.get("job_id") == job_id
+                and (
+                    lambda pending_receipt: (
+                        bool(pending_receipt)
+                        and pending_receipt.get("resolved_action_id")
+                        == approval.get("answer_action_id")
+                        and pending_receipt.get("selected_value_hash")
+                        == content_hash(True)
+                        and any(
+                            str(action.get("action_id") or "")
+                            == approval.get("answer_action_id")
+                            and str(action.get("type") or "")
+                            == "answer_pending"
+                            for action in all_admitted
+                        )
+                    )
+                )(
+                    pending_receipts.get(
+                        str(
+                            approval.get(
+                                "pending_resolution_receipt_id"
+                            )
+                            or ""
+                        ),
+                        {},
+                    )
+                )
+                for approval in bound_approvals
+            )
         ):
-            submissions[key].add((manager_receipt, job_id))
-    satisfied = len(submissions) == 1 and all(
+            submissions[key].add((manager_receipt_id, job_id))
+            verified_turns.append(source_turn_index)
+    satisfied = (
+        len(submissions) == 1
+        and all(
         len(identities) == 1 for identities in submissions.values()
+        )
+        and not invalid_approvals
+        and not invalid_pending
+        and not invalid_commits
+        and not contract_error
+        and (
+            not required_turns
+            or required_turns.issubset(set(verified_turns))
+        )
     )
     return satisfied, {
         "evidence_family": "job_submission",
@@ -2156,10 +3645,18 @@ def _approved_execution_submitted_once(context: Any) -> PredicateResult:
             key: sorted(identities)
             for key, identities in submissions.items()
         },
+        "verified_source_turn_indexes": sorted(set(verified_turns)),
+        "required_source_turn_indexes": sorted(required_turns),
+        "invalid_execution_approval_receipts": invalid_approvals,
+        "invalid_pending_resolution_receipts": invalid_pending,
+        "invalid_domain_commit_receipts": invalid_commits,
+        "verifier_contract_error": contract_error,
     }
 
 
 def _duplicate_job_submission(context: Any) -> PredicateResult:
+    from agent.runners.job_manager import verify_job_receipt
+
     submissions: dict[str, set[tuple[str, str]]] = defaultdict(set)
     for event in _events(context):
         summary = dict(
@@ -2170,11 +3667,16 @@ def _duplicate_job_submission(context: Any) -> PredicateResult:
             or summary.get("intent_idempotency_key")
             or ""
         )
+        receipt = dict(summary.get("manager_submission_receipt") or {})
         identity = (
-            str(summary.get("manager_submission_receipt_id") or ""),
-            str(summary.get("job_id") or ""),
+            str(receipt.get("receipt_id") or ""),
+            str(receipt.get("job_id") or ""),
         )
-        if key and any(identity):
+        if (
+            key
+            and verify_job_receipt(receipt)
+            and receipt.get("receipt_type") == "job_submission"
+        ):
             submissions[key].add(identity)
     duplicates = {
         key: len(identities)
@@ -2188,35 +3690,255 @@ def _duplicate_job_submission(context: Any) -> PredicateResult:
 
 
 def _status_uses_job_evidence(context: Any) -> PredicateResult:
-    matched = []
-    for event in _events(context):
+    from agent.runners.job_manager import verify_job_receipt
+
+    contract, contract_error = _verifier_input(context)
+    if contract is None:
+        return False, {
+            "evidence_family": "job_read",
+            "status_intent_turn_indexes": [],
+            "verified_status_turn_indexes": [],
+            "unverified_status_turn_indexes": [],
+            "required_status_turn_indexes": [],
+            "verifier_contract_error": contract_error,
+        }
+    required_status_turns = {
+        int(step.get("turn_index") or -1)
+        for step in (
+            (contract or {}).get("source_contract", {}).get(
+                "source_steps"
+            )
+            or ()
+        )
+        if isinstance(step, Mapping)
+        and step.get("semantic_role")
+        in {
+            "execution_evidence_consultation",
+            "job_status_consultation",
+        }
+    }
+    status_intents: list[int] = []
+    matched: list[int] = []
+    unverified: list[int] = []
+    orientation_receipts, invalid_orientations = _valid_receipts(
+        context,
+        "orientation_response",
+    )
+    visible_orientation, invalid_visible = _visible_orientation_authority(
+        context,
+        topics=frozenset({
+            "current_context",
+            "current_job",
+            "job_status",
+            "execution_status",
+        }),
+        required_message_ids=frozenset({
+            "harness.orientation.consultation.job_verified",
+        }),
+    )
+    commits, invalid_commits = _domain_commits(context)
+    orientation_by_turn: dict[int, dict[str, Mapping[str, Any]]] = (
+        defaultdict(dict)
+    )
+    for item in orientation_receipts:
+        receipt = item["receipt"]
+        if (
+            receipt.get("read_only") is True
+            and receipt.get("action_type") == "answer_opening_question"
+            and receipt.get("topic")
+            in {
+                "current_context",
+                "current_job",
+                "job_status",
+                "execution_status",
+            }
+        ):
+            orientation_by_turn[int(item["turn_index"])][
+                str(receipt.get("action_id") or "")
+            ] = receipt
+    verified_orientation_consumers: dict[int, set[str]] = defaultdict(set)
+    for item in commits:
+        receipt = item["receipt"]
+        if (
+            receipt.get("owner") == "orientation"
+            and any(
+                isinstance(fragment, Mapping)
+                and fragment.get("message_id")
+                == "harness.orientation.consultation.job_verified"
+                for fragment in receipt.get("response_fragments") or ()
+            )
+        ):
+            verified_orientation_consumers[int(item["turn_index"])].update(
+                str(action_id)
+                for action_id in receipt.get("consumed_action_ids") or ()
+                if str(action_id)
+            )
+    for source_turn_index, event in enumerate(_events(context), start=1):
+        runtime_turn_index = int(getattr(event, "turn_index", -1))
+        admitted_actions = [
+            action
+            for action in (
+                getattr(event, "admitted_action_provenance", ()) or ()
+            )
+            if isinstance(action, Mapping)
+            and str(action.get("action_id") or "")
+        ]
+        explicit_status_actions = [
+            action
+            for action in admitted_actions
+            if str(action.get("type") or "")
+            in {"status", "read_status", "analyze_job"}
+        ]
+        consumed_explicit_action_ids = {
+            str(action_id)
+            for commit in commits
+            if int(commit["turn_index"]) == runtime_turn_index
+            for action_id in (
+                commit["receipt"].get("consumed_action_ids") or ()
+            )
+            if commit["receipt"].get("owner")
+            in {
+                str(action.get("owner") or "")
+                for action in explicit_status_actions
+            }
+        }
+        orientation_status_actions = [
+            action
+            for action in admitted_actions
+            if (
+                str(action.get("type") or "")
+                == "answer_opening_question"
+                and str(action.get("action_id") or "")
+                in orientation_by_turn.get(runtime_turn_index, {})
+                and str(action.get("action_id") or "")
+                in verified_orientation_consumers.get(
+                    runtime_turn_index,
+                    set(),
+                )
+                and str(action.get("action_id") or "")
+                in visible_orientation.get(runtime_turn_index, set())
+            )
+        ]
+        orientation_job_reads = []
+        for action in orientation_status_actions:
+            orientation_receipt = orientation_by_turn.get(
+                runtime_turn_index,
+                {},
+            ).get(str(action.get("action_id") or ""), {})
+            orientation_job_reads.extend(
+                dict(receipt)
+                for receipt in (
+                    orientation_receipt.get("source_receipts") or ()
+                )
+                if isinstance(receipt, Mapping)
+                and receipt.get("receipt_type") == "job_read"
+                and verify_job_receipt(dict(receipt))
+            )
         summary = dict(
             getattr(event, "execution_receipt_summary", {}) or {}
         )
-        if (
-            summary.get("job_id")
-            and _is_hash(summary.get("manager_read_receipt_id"))
-            and summary.get("manager_observed_status")
-            == summary.get("job_status")
-        ):
-            matched.append(int(getattr(event, "turn_index", -1)))
-    return bool(matched), {
+        if not explicit_status_actions and not orientation_status_actions:
+            continue
+        status_intents.append(source_turn_index)
+        admitted_types = {
+            str(action.get("type") or "")
+            for action in explicit_status_actions
+        }
+        orientation_verified = bool(
+            orientation_status_actions
+            and orientation_job_reads
+            and all(
+                receipt.get("job_id")
+                and receipt.get("observed_status")
+                == receipt.get("persisted_status")
+                for receipt in orientation_job_reads
+            )
+        )
+        execution_verified = bool(
+            summary.get("intent_action_type") in admitted_types
+            and any(
+                str(action.get("action_id") or "")
+                in consumed_explicit_action_ids
+                for action in explicit_status_actions
+            )
+            and (
+                lambda receipt: (
+                    verify_job_receipt(receipt)
+                    and receipt.get("receipt_type") == "job_read"
+                    and receipt.get("receipt_id")
+                    == summary.get("manager_read_receipt_id")
+                    and receipt.get("job_id") == summary.get("job_id")
+                    and receipt.get("observed_status")
+                    == receipt.get("persisted_status")
+                    and receipt.get("observed_status")
+                    == summary.get("manager_observed_status")
+                    == summary.get("job_status")
+                )
+            )(dict(summary.get("manager_read_receipt") or {}))
+        )
+        verified = orientation_verified or execution_verified
+        if verified:
+            matched.append(source_turn_index)
+        else:
+            unverified.append(source_turn_index)
+    return (
+        bool(status_intents)
+        and len(matched) == len(status_intents)
+        and not unverified
+        and not invalid_orientations
+        and not invalid_commits
+        and not invalid_visible
+        and (
+            not required_status_turns
+            or required_status_turns.issubset(set(matched))
+        )
+    ), {
         "evidence_family": "job_read",
+        "status_intent_turn_indexes": status_intents,
         "verified_status_turn_indexes": matched,
+        "unverified_status_turn_indexes": unverified,
+        "required_status_turn_indexes": sorted(required_status_turns),
+        "verifier_contract_error": contract_error,
+        "invalid_orientation_receipts": invalid_orientations,
+        "invalid_domain_commit_receipts": invalid_commits,
+        "invalid_visible_orientation_receipts": invalid_visible,
     }
 
 
 def _invented_job_status(context: Any) -> PredicateResult:
+    from agent.runners.job_manager import verify_job_receipt
+
     invented = []
     for event in _events(context):
+        admitted_types = {
+            str(action.get("type") or "")
+            for action in (
+                getattr(event, "admitted_action_provenance", ()) or ()
+            )
+            if isinstance(action, Mapping)
+            and str(action.get("action_id") or "")
+        }
         summary = dict(
             getattr(event, "execution_receipt_summary", {}) or {}
         )
+        receipt = dict(summary.get("manager_read_receipt") or {})
         if (
             summary.get("intent_action_type")
             in {"status", "read_status", "analyze_job"}
+            and summary.get("intent_action_type") in admitted_types
             and summary.get("job_status")
-            and not _is_hash(summary.get("manager_read_receipt_id"))
+            and not (
+                verify_job_receipt(receipt)
+                and receipt.get("receipt_type") == "job_read"
+                and receipt.get("receipt_id")
+                == summary.get("manager_read_receipt_id")
+                and receipt.get("job_id") == summary.get("job_id")
+                and receipt.get("observed_status")
+                == receipt.get("persisted_status")
+                and receipt.get("observed_status")
+                == summary.get("manager_observed_status")
+                == summary.get("job_status")
+            )
         ):
             invented.append(int(getattr(event, "turn_index", -1)))
     return bool(invented), {
@@ -2362,26 +4084,63 @@ def _semantic_units_partitioned_in_order(context: Any) -> PredicateResult:
             for unit in units
             if isinstance(unit, Mapping)
         ]
-        order = [str(value) for value in summary.get("semantic_order") or ()]
-        spans = [
-            (unit.get("start"), unit.get("end"))
+        action_order = [
+            str(value) for value in summary.get("semantic_order") or ()
+        ]
+        action_bindings = {
+            str(action_id): [
+                str(unit_id)
+                for unit_id in bound_units or ()
+                if str(unit_id)
+            ]
+            for action_id, bound_units in dict(
+                summary.get("action_unit_bindings") or {}
+            ).items()
+        }
+        bound_unit_order: list[str] = []
+        for action_id in action_order:
+            for unit_id in action_bindings.get(action_id, ()):
+                if unit_id not in bound_unit_order:
+                    bound_unit_order.append(unit_id)
+        expected_action_units = [
+            str(unit.get("unit_id") or "")
             for unit in units
             if isinstance(unit, Mapping)
+            and str(unit.get("disposition") or "") == "action"
         ]
-        if (
-            unit_ids
-            and unit_ids == order
-            and len(unit_ids) == len(set(unit_ids))
-            and all(
-                isinstance(start, int)
-                and isinstance(end, int)
-                and 0 <= start < end
-                for start, end in spans
+        spans_by_clause: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        valid_spans = True
+        for unit in units:
+            if not isinstance(unit, Mapping):
+                valid_spans = False
+                continue
+            start = unit.get("start")
+            end = unit.get("end")
+            if (
+                not isinstance(start, int)
+                or isinstance(start, bool)
+                or not isinstance(end, int)
+                or isinstance(end, bool)
+                or not 0 <= start < end
+            ):
+                valid_spans = False
+                continue
+            spans_by_clause[str(unit.get("clause_id") or "")].append(
+                (start, end)
             )
-            and all(
+        clause_spans_ordered = all(
+            all(
                 spans[index][1] <= spans[index + 1][0]
                 for index in range(len(spans) - 1)
             )
+            for spans in spans_by_clause.values()
+        )
+        if (
+            unit_ids
+            and len(unit_ids) == len(set(unit_ids))
+            and valid_spans
+            and clause_spans_ordered
+            and bound_unit_order == expected_action_units
         ):
             matched.append(item)
     return bool(matched) and not invalid, _receipt_details(
@@ -2393,6 +4152,7 @@ def _semantic_units_partitioned_in_order(context: Any) -> PredicateResult:
 
 
 def _admitted_mutations_only(context: Any) -> PredicateResult:
+    events = _events(context)
     commits, invalid = _domain_commits(context)
     violations = []
     mutation_count = 0
@@ -2419,10 +4179,11 @@ def _admitted_mutations_only(context: Any) -> PredicateResult:
         consumed = set(receipt.get("consumed_action_ids") or ())
         if not consumed or not consumed <= admitted:
             violations.append(str(item.get("receipt_id") or ""))
-    return mutation_count > 0 and not violations and not invalid, _receipt_details(
+    return bool(events) and not violations and not invalid, _receipt_details(
         "admission_lineage",
         commits,
         invalid,
+        event_count=len(events),
         mutation_count=mutation_count,
         violating_receipt_ids=violations,
     )
@@ -2434,13 +4195,76 @@ def _unresolved_units_preserved(context: Any) -> PredicateResult:
         summary = dict(
             getattr(event, "turn_receipt_summary", {}) or {}
         )
-        units = {
-            str(item.get("unit_id") or "")
+        units = [
+            dict(item)
             for item in summary.get("semantic_units") or ()
             if isinstance(item, Mapping)
+            and str(item.get("unit_id") or "")
+        ]
+        unit_ids = {str(item["unit_id"]) for item in units}
+        unresolved = {
+            str(unit_id)
+            for unit_id in summary.get("unresolved_unit_ids") or ()
+            if str(unit_id)
         }
-        unresolved = set(summary.get("unresolved_unit_ids") or ())
-        if unresolved and unresolved <= units:
+        admitted = {
+            str(item.get("action_id") or ""): dict(item)
+            for item in getattr(event, "admitted_action_provenance", ()) or ()
+            if isinstance(item, Mapping)
+            and str(item.get("action_id") or "")
+        }
+        executed = {
+            str(action_id)
+            for action_id in summary.get("execution_order") or ()
+            if str(action_id)
+        }
+        deferred = [
+            item
+            for action_id, item in admitted.items()
+            if action_id not in executed
+        ]
+        queued_types = Counter(
+            str(action_type)
+            for action_type in getattr(event, "action_queue_types", ()) or ()
+            if str(action_type)
+        )
+        deferred_types = Counter(
+            str(item.get("type") or "")
+            for item in deferred
+            if str(item.get("type") or "")
+        )
+        queued_actions_preserved = all(
+            queued_types[action_type] >= count
+            for action_type, count in deferred_types.items()
+        )
+        bindings = {
+            str(action_id): {
+                str(unit_id)
+                for unit_id in bound_units or ()
+                if str(unit_id)
+            }
+            for action_id, bound_units in dict(
+                summary.get("action_unit_bindings") or {}
+            ).items()
+        }
+        represented_units = set(unresolved)
+        for action_id in executed:
+            represented_units.update(bindings.get(action_id, set()))
+        if queued_actions_preserved:
+            for item in deferred:
+                represented_units.update(
+                    bindings.get(str(item.get("action_id") or ""), set())
+                )
+        required_units = {
+            str(item["unit_id"])
+            for item in units
+            if str(item.get("disposition") or "") in {"action", "unresolved"}
+        }
+        if (
+            unresolved <= unit_ids
+            and required_units <= represented_units
+            and (unresolved or deferred)
+        ):
             preserved.append(int(getattr(event, "turn_index", -1)))
     return bool(preserved), {
         "evidence_family": "semantic_units",

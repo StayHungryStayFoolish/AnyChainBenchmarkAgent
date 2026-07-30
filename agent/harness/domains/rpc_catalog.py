@@ -4,7 +4,17 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+import hashlib
+import json
+from pathlib import Path
 from typing import Any, Literal, Mapping, TypedDict
+
+from agent.validators.endpoint_probe import (
+    build_rpc_probe_contract,
+    rpc_probe_contract_hash,
+)
+from agent.validators.rpc_workload import default_workload
+from agent.knowledge.framework_capabilities import load_framework_capabilities
 
 from ..input_values import (
     looks_like_rest_method_identity,
@@ -12,10 +22,14 @@ from ..input_values import (
     normalize_scalar,
 )
 from ..state import AgentGraphState
+from ..secret_refs import materialize_state_secret_references
 from .rpc_receipts import (
+    admitted_action_value_hash,
     emit_catalog_transition_receipt,
+    emit_method_probe_receipt,
     emit_schema_provenance_receipt,
     evidence_hash,
+    validate_rpc_receipt,
 )
 
 
@@ -25,9 +39,12 @@ RPC_METHOD_CONTRACT_VERSION = 1
 CatalogCommand = Literal[
     "correct_draft",
     "append_evidence",
+    "keep_current_method",
+    "replace_current_method",
     "confirm_parameter",
     "confirm_request",
     "confirm_response",
+    "bind_validation_endpoint",
     "probe_method",
     "add_method",
     "finish_catalog",
@@ -40,6 +57,7 @@ class EvidenceFragment(TypedDict, total=False):
     kind: str
     content: str
     method: str
+    source_action_value_hash: str
 
 
 class MethodDraft(TypedDict, total=False):
@@ -57,6 +75,7 @@ class MethodDraft(TypedDict, total=False):
     response_json_type: str
     response_fields: list[dict[str, Any]]
     response_sample: Any
+    exchange_correlation: dict[str, Any]
     evidence: list[EvidenceFragment]
     field_provenance: list[dict[str, Any]]
     validation_endpoint: str
@@ -75,6 +94,8 @@ class ValidatedMethodContract(TypedDict, total=False):
     observed_response: dict[str, Any]
     validation_endpoint: str
     evidence_file: str
+    probe_receipt: dict[str, Any]
+    probe_catalog_revision: int
     evidence: list[EvidenceFragment]
     chain: str
 
@@ -167,17 +188,43 @@ def migrate_legacy_catalog(state: AgentGraphState) -> bool:
             for index, fragment in enumerate(fragments)
             if str(fragment).strip()
         ]
-    if draft and custom.get("status") in {"response_needs_confirmation", "method_validated_next", "validated"}:
-        draft["request_confirmed"] = True
-    observed = custom.get("observed_response") or identity.get("observed_response")
-    if draft and isinstance(observed, Mapping):
-        draft["observed_response"] = deepcopy(dict(observed))
-        draft["probe"] = {"ready": True, "status": "legacy_observed_response"}
+    if draft:
+        draft.setdefault(
+            "validation_endpoint",
+            normalize_scalar(custom.get("endpoint")),
+        )
+        draft["phase"] = "evidence"
+        draft["request_confirmed"] = False
+        draft["response_confirmed"] = False
+        draft.pop("probe", None)
+        draft.pop("observed_response", None)
     methods = custom.get("validated_methods") if isinstance(custom.get("validated_methods"), list) else []
     source = "custom_rpc.validated_methods"
     if not methods and isinstance(identity.get("validated_methods"), list):
         methods = identity.get("validated_methods") or []
         source = "chain_identity.validated_methods"
+    if not draft and methods:
+        candidate = methods[0] if isinstance(methods[0], Mapping) else {}
+        method = normalize_scalar(candidate.get("method"))
+        if method:
+            draft = {
+                "contract_version": RPC_METHOD_CONTRACT_VERSION,
+                "phase": "evidence",
+                "method": method,
+                "params_json": deepcopy(candidate.get("params")),
+                "params": deepcopy(candidate.get("params"))
+                if isinstance(candidate.get("params"), list)
+                else [],
+                "request_confirmed": False,
+                "response_confirmed": False,
+                "evidence": [{
+                    "revision": 1,
+                    "source": "legacy_checkpoint",
+                    "kind": "unverified_method_candidate",
+                    "content": method,
+                    "method": method,
+                }],
+            }
     if not draft and not methods:
         return False
     custom["catalog"] = {
@@ -185,14 +232,16 @@ def migrate_legacy_catalog(state: AgentGraphState) -> bool:
         "revision": max(1, int(custom.get("catalog_revision") or 0)),
         "chain": normalize_scalar(identity.get("canonical")),
         "draft": draft,
-        "methods": deepcopy(methods),
-        "finished": bool(methods and custom.get("status") in {"needs_scope", "validated"}),
+        "methods": [],
+        "finished": False,
         "last_transition": {
-            "command": "legacy_checkpoint_migration",
-            "accepted": True,
+            "command": "legacy_checkpoint_quarantine",
+            "accepted": False,
             "source": source,
         },
     }
+    if not normalize_scalar(identity.get("status")).startswith("existing_family_"):
+        custom["status"] = "needs_schema_evidence"
     for key in (
         "catalog_version",
         "catalog_revision",
@@ -211,6 +260,7 @@ def migrate_legacy_catalog(state: AgentGraphState) -> bool:
     state.setdefault("audit_events", []).append({
         "event": "legacy_rpc_catalog_migrated",
         "source": source,
+        "outcome": "quarantined_for_revalidation",
     })
     return True
 
@@ -240,6 +290,72 @@ def draft_view(state: Mapping[str, Any]) -> MethodDraft:
     return deepcopy(draft) if isinstance(draft, dict) else {}
 
 
+def request_contract_hash(draft: Mapping[str, Any]) -> str:
+    """Bind probe evidence to the exact user-confirmed RPC contract."""
+
+    return evidence_hash({
+        "method": normalize_scalar(draft.get("method")),
+        "params_json": deepcopy(draft.get("params_json")),
+        "params": deepcopy(draft.get("params") or []),
+        "parameter_style": normalize_scalar(draft.get("parameter_style")),
+        "response_summary": normalize_scalar(draft.get("response_summary")),
+        "response_json_type": normalize_scalar(
+            draft.get("response_json_type")
+        ),
+        "response_fields": deepcopy(draft.get("response_fields") or []),
+        "response_sample": deepcopy(draft.get("response_sample")),
+        "response_example": deepcopy(draft.get("response_example")),
+        "exchange_correlation": deepcopy(
+            draft.get("exchange_correlation") or {}
+        ),
+        "validation_endpoint": normalize_scalar(
+            draft.get("validation_endpoint")
+        ),
+    })
+
+
+def bind_validation_endpoint(
+    state: AgentGraphState,
+    endpoint: str,
+) -> CatalogTransition:
+    """Bind the exact probe scope without changing the reviewed RPC schema."""
+
+    catalog = ensure_catalog(state)
+    draft = _draft(catalog)
+    normalized = normalize_scalar(endpoint)
+    if not normalized:
+        return _transition(
+            state,
+            catalog,
+            "bind_validation_endpoint",
+            False,
+            str(draft.get("phase") or "draft"),
+            "validation endpoint is required",
+        )
+    if normalize_scalar(draft.get("validation_endpoint")) == normalized:
+        return _transition(
+            state,
+            catalog,
+            "bind_validation_endpoint",
+            True,
+            str(draft.get("phase") or "draft"),
+        )
+    draft["validation_endpoint"] = normalized
+    draft.pop("probe", None)
+    draft.pop("observed_response", None)
+    revision = _next_revision(catalog)
+    draft["revision"] = revision
+    _sync_projection(state)
+    return _record_transition(
+        state,
+        catalog,
+        "bind_validation_endpoint",
+        revision,
+        True,
+        str(draft.get("phase") or "draft"),
+    )
+
+
 def validated_contracts(state: AgentGraphState) -> list[ValidatedMethodContract]:
     catalog = ensure_catalog(state)
     methods = catalog.setdefault("methods", [])
@@ -249,6 +365,92 @@ def validated_contracts(state: AgentGraphState) -> list[ValidatedMethodContract]
 def validated_contracts_view(state: Mapping[str, Any]) -> list[ValidatedMethodContract]:
     methods = catalog_view(state).get("methods")
     return deepcopy(methods) if isinstance(methods, list) else []
+
+
+def effective_job_local_workload_methods(
+    state: Mapping[str, Any],
+) -> list[str]:
+    workload = state.get("workload")
+    if not isinstance(workload, Mapping) or not (
+        workload.get("confirmed") and workload.get("job_local_override")
+    ):
+        return []
+    return list(
+        dict.fromkeys(
+            normalize_scalar(method)
+            for method in workload.get("methods") or ()
+            if normalize_scalar(method)
+        )
+    )
+
+
+def effective_custom_workload_methods(state: Mapping[str, Any]) -> list[str]:
+    """Return selected methods that are absent from the canonical template."""
+
+    selected = effective_job_local_workload_methods(state)
+    if not selected:
+        return []
+    identity = state.get("chain_identity")
+    chain = normalize_scalar(
+        identity.get("canonical") or identity.get("raw")
+    ) if isinstance(identity, Mapping) else ""
+    defaults = default_workload(chain) if chain else {"exists": False}
+    canonical = (
+        {
+            normalize_scalar(method)
+            for method in defaults.get("methods") or ()
+            if normalize_scalar(method)
+        }
+        if defaults.get("exists")
+        else set()
+    )
+    return [method for method in selected if method not in canonical]
+
+
+def selected_validated_contracts(
+    state: AgentGraphState,
+) -> list[ValidatedMethodContract]:
+    """Return live catalog contracts selected by the effective workload."""
+
+    selected = effective_custom_workload_methods(state)
+    if not selected:
+        return []
+    selected_set = set(selected)
+    unique: dict[str, ValidatedMethodContract] = {}
+    for item in validated_contracts(state):
+        method = normalize_scalar(item.get("method"))
+        if method in selected_set:
+            unique[method] = item
+    return [unique[method] for method in selected if method in unique]
+
+
+def selected_validated_contracts_view(
+    state: Mapping[str, Any],
+) -> list[ValidatedMethodContract]:
+    """Return a detached view of contracts selected by the effective workload."""
+
+    selected = effective_custom_workload_methods(state)
+    if not selected:
+        return []
+    selected_set = set(selected)
+    unique = {
+        normalize_scalar(item.get("method")): item
+        for item in validated_contracts_view(state)
+        if normalize_scalar(item.get("method")) in selected_set
+    }
+    return [unique[method] for method in selected if method in unique]
+
+
+def selected_contracts_cover_effective_workload(
+    state: Mapping[str, Any],
+) -> bool:
+    """Return whether every selected custom method has one catalog contract."""
+
+    selected = effective_custom_workload_methods(state)
+    if not selected:
+        return True
+    contracts = selected_validated_contracts_view(state)
+    return [normalize_scalar(item.get("method")) for item in contracts] == selected
 
 
 def refresh_catalog_projection(state: AgentGraphState) -> None:
@@ -289,6 +491,34 @@ def append_evidence(
         "kind": normalize_scalar(kind) or "evidence",
         "content": clean,
     }
+    source_action_value_hash = admitted_action_value_hash(
+        state,
+        argument_names=(
+            "source_evidence",
+            "rpc_schema_evidence",
+            "rpc_method",
+            "selected_value",
+            "answer",
+        ),
+        expected_value=clean,
+    )
+    action_id = normalize_scalar(
+        (state.get("current_action") or {}).get("action_id")
+    )
+    admitted_actions = (state.get("turn_context") or {}).get(
+        "admitted_actions"
+    )
+    if action_id and isinstance(admitted_actions, list) and not source_action_value_hash:
+        return _transition(
+            state,
+            catalog,
+            "append_evidence",
+            False,
+            str(draft.get("phase") or "draft"),
+            "evidence is not bound to the admitted current-turn input",
+        )
+    if source_action_value_hash:
+        fragment["source_action_value_hash"] = source_action_value_hash
     if incoming or current:
         fragment["method"] = incoming or current
     fragments = draft.setdefault("evidence", [])
@@ -314,6 +544,16 @@ def correct_draft(state: AgentGraphState, draft_patch: Mapping[str, Any]) -> Cat
     next_draft["confirmed_parameters"] = []
     next_draft["request_confirmed"] = False
     next_draft["response_confirmed"] = False
+    next_draft.pop("probe", None)
+    next_draft.pop("observed_response", None)
+    next_draft["field_provenance"] = [
+        item
+        for item in next_draft.get("field_provenance") or ()
+        if isinstance(item, Mapping)
+        and not str(item.get("field_path") or "").startswith(
+            "observed_response."
+        )
+    ]
     if normalize_scalar(previous.get("method")) == normalize_scalar(next_draft.get("method")):
         next_draft["evidence"] = deepcopy(previous.get("evidence") or [])
     else:
@@ -337,13 +577,8 @@ def correct_draft(state: AgentGraphState, draft_patch: Mapping[str, Any]) -> Cat
     )
     emit_schema_provenance_receipt(
         state,
-        method=next_draft.get("method"),
         catalog_revision=revision,
-        field_provenance=[
-            item
-            for item in next_draft.get("field_provenance") or ()
-            if isinstance(item, Mapping)
-        ],
+        draft=next_draft,
     )
     return transition
 
@@ -447,15 +682,65 @@ def confirm_response(state: AgentGraphState, accepted: bool, *, observed: bool =
         return _commit_transition(state, catalog, "confirm_response", False, "evidence", "declined")
     if not observed and not has_expected_response(draft):
         return _transition(state, catalog, "confirm_response", False, str(draft.get("phase") or "draft"), "missing response contract")
+    if observed and not _observed_response_matches_probe(draft):
+        return _transition(
+            state,
+            catalog,
+            "confirm_response",
+            False,
+            str(draft.get("phase") or "draft"),
+            "observed response is not bound to the successful probe",
+        )
     draft["response_confirmed"] = True
     draft["phase"] = "validated" if observed and (draft.get("probe") or {}).get("ready") else "probe_confirmation"
-    return _commit_transition(state, catalog, "confirm_response", True, str(draft["phase"]))
+    transition = _commit_transition(
+        state,
+        catalog,
+        "confirm_response",
+        True,
+        str(draft["phase"]),
+    )
+    probe = draft.get("probe")
+    if isinstance(probe, dict) and probe.get("ready"):
+        probe["admissible_catalog_revision"] = transition.revision
+        _sync_projection(state)
+    return transition
 
 
 def record_probe(state: AgentGraphState, result: Mapping[str, Any], observed_response: Mapping[str, Any]) -> CatalogTransition:
     catalog = ensure_catalog(state)
     draft = _draft(catalog)
-    draft["probe"] = deepcopy(dict(result))
+    evidence_file = normalize_scalar(
+        result.get("evidence_file")
+        or observed_response.get("evidence_file")
+    )
+    endpoint = normalize_scalar(draft.get("validation_endpoint"))
+    endpoint_hash = _materialized_endpoint_hash(state, endpoint)
+    evidence_file_hash = probe_evidence_content_hash(evidence_file)
+    evidence_probe_contract_hash = probe_evidence_contract_hash(
+        evidence_file
+    )
+    expected_probe_contract_hash = _expected_probe_contract_hash(
+        state,
+        chain=normalize_scalar(catalog.get("chain")),
+        endpoint=endpoint,
+        method=normalize_scalar(draft.get("method")),
+        schema=draft,
+    )
+    ready = bool(
+        result.get("ready")
+        and endpoint_hash
+        and evidence_file_hash
+        and expected_probe_contract_hash
+        and normalize_scalar(result.get("probe_contract_hash"))
+        == expected_probe_contract_hash
+        and evidence_probe_contract_hash == expected_probe_contract_hash
+    )
+    draft["probe"] = {
+        **deepcopy(dict(result)),
+        "ready": ready,
+        "request_contract_hash": request_contract_hash(draft),
+    }
     if observed_response:
         draft["observed_response"] = deepcopy(dict(observed_response))
         provenance = [
@@ -475,7 +760,6 @@ def record_probe(state: AgentGraphState, result: Mapping[str, Any], observed_res
             for field, value in sorted(observed_response.items())
         )
         draft["field_provenance"] = provenance
-    ready = bool(result.get("ready"))
     draft["phase"] = "probe_succeeded" if ready else "probe_confirmation"
     transition = _commit_transition(
         state,
@@ -485,39 +769,105 @@ def record_probe(state: AgentGraphState, result: Mapping[str, Any], observed_res
         str(draft["phase"]),
         str(result.get("error") or ""),
     )
+    draft["probe"]["catalog_revision"] = transition.revision
+    draft["probe"]["admissible_catalog_revision"] = transition.revision
+    probe_receipt = emit_method_probe_receipt(
+        state,
+        method=normalize_scalar(draft.get("method")),
+        endpoint_hash=endpoint_hash,
+        request_contract_hash=normalize_scalar(
+            draft["probe"].get("request_contract_hash")
+        ),
+        catalog_revision=transition.revision,
+        evidence_file_hash=evidence_file_hash,
+        probe_contract_hash=expected_probe_contract_hash,
+        ready=ready
+        and bool(endpoint_hash)
+        and bool(evidence_file_hash)
+        and bool(expected_probe_contract_hash),
+        probe_status=normalize_scalar(result.get("status")),
+    )
+    if probe_receipt:
+        draft["probe"]["probe_receipt"] = probe_receipt
+        draft["probe"]["evidence_file"] = evidence_file
+    _sync_projection(state)
     emit_schema_provenance_receipt(
         state,
-        method=draft.get("method"),
         catalog_revision=transition.revision,
-        field_provenance=[
-            item
-            for item in draft.get("field_provenance") or ()
-            if isinstance(item, Mapping)
-        ],
+        draft=draft,
     )
     return transition
 
 
-def add_validated_method(state: AgentGraphState, contract: Mapping[str, Any]) -> CatalogTransition:
+def add_validated_method(state: AgentGraphState) -> CatalogTransition:
     catalog = ensure_catalog(state)
     draft = _draft(catalog)
-    method = normalize_scalar(contract.get("method") or draft.get("method"))
-    if not method or not draft.get("request_confirmed") or not (draft.get("probe") or {}).get("ready"):
+    method = normalize_scalar(draft.get("method"))
+    probe = draft.get("probe") or {}
+    probe_receipt = (
+        probe.get("probe_receipt")
+        if isinstance(probe.get("probe_receipt"), Mapping)
+        else {}
+    )
+    validation_endpoint = normalize_scalar(draft.get("validation_endpoint"))
+    evidence_file = normalize_scalar(probe.get("evidence_file"))
+    receipt_valid = method_probe_receipt_matches_contract(
+        state,
+        receipt=probe_receipt,
+        chain=normalize_scalar(catalog.get("chain")),
+        method=method,
+        schema=draft,
+        endpoint=validation_endpoint,
+        evidence_file=evidence_file,
+        catalog_revision=probe.get("catalog_revision"),
+    )
+    if (
+        not method
+        or not draft.get("request_confirmed")
+        or not probe.get("ready")
+        or probe.get("request_contract_hash") != request_contract_hash(draft)
+        or not isinstance(probe.get("catalog_revision"), int)
+        or isinstance(probe.get("catalog_revision"), bool)
+        or probe.get("admissible_catalog_revision")
+        != int(catalog.get("revision") or 0)
+        or not receipt_valid
+    ):
         return _transition(state, catalog, "add_method", False, str(draft.get("phase") or "draft"), "request confirmation and successful probe are required")
     if not draft.get("response_confirmed"):
         return _transition(state, catalog, "add_method", False, str(draft.get("phase") or "draft"), "response confirmation is required")
+    if draft.get("observed_response") and not _observed_response_matches_probe(
+        draft
+    ):
+        return _transition(
+            state,
+            catalog,
+            "add_method",
+            False,
+            str(draft.get("phase") or "draft"),
+            "observed response proof is stale or incomplete",
+        )
     revision = _next_revision(catalog)
-    record: ValidatedMethodContract = deepcopy(dict(contract))  # type: ignore[assignment]
-    record.update({
+    record: ValidatedMethodContract = {
         "contract_version": RPC_METHOD_CONTRACT_VERSION,
         "revision": revision,
         "method": method,
+        "params": deepcopy(draft.get("params_json")),
         "parameter_style": str(draft.get("parameter_style") or "unknown"),
+        "schema": deepcopy(dict(draft)),
         "request_confirmed": True,
         "response_confirmed": True,
+        "observed_response": deepcopy(
+            dict(draft.get("observed_response") or {})
+        ),
+        "validation_endpoint": validation_endpoint,
+        "evidence_file": evidence_file,
+        "probe_receipt": deepcopy(dict(probe_receipt)),
+        "probe_catalog_revision": int(
+            probe_receipt.get("catalog_revision") or 0
+        ),
         "evidence": deepcopy(draft.get("evidence") or []),
         "chain": normalize_scalar(catalog.get("chain")),
-    })
+    }
     methods = [
         item for item in catalog.get("methods") or []
         if isinstance(item, dict) and normalize_scalar(item.get("method")) != method
@@ -528,6 +878,385 @@ def add_validated_method(state: AgentGraphState, contract: Mapping[str, Any]) ->
     draft["revision"] = revision
     _sync_projection(state)
     return _record_transition(state, catalog, "add_method", revision, True, "validated")
+
+
+def validated_method_contract_is_current(
+    state: Mapping[str, Any],
+    contract: Mapping[str, Any],
+    *,
+    endpoint: str = "",
+) -> bool:
+    """Validate one persisted method contract at every consumption boundary."""
+
+    schema = (
+        contract.get("schema")
+        if isinstance(contract.get("schema"), Mapping)
+        else {}
+    )
+    receipt = (
+        contract.get("probe_receipt")
+        if isinstance(contract.get("probe_receipt"), Mapping)
+        else {}
+    )
+    method = normalize_scalar(contract.get("method"))
+    contract_endpoint = normalize_scalar(
+        contract.get("validation_endpoint")
+    )
+    expected_endpoint = normalize_scalar(endpoint) or contract_endpoint
+    chain = normalize_scalar(contract.get("chain"))
+    identity = (
+        state.get("chain_identity")
+        if isinstance(state.get("chain_identity"), Mapping)
+        else {}
+    )
+    current_chain = normalize_scalar(
+        identity.get("canonical")
+        or identity.get("raw")
+        or catalog_view(state).get("chain")
+    )
+    revision = contract.get("revision")
+    probe_revision = contract.get("probe_catalog_revision")
+    base_valid = bool(
+        contract.get("contract_version") == RPC_METHOD_CONTRACT_VERSION
+        and method
+        and normalize_scalar(schema.get("method")) == method
+        and contract.get("params") == schema.get("params_json")
+        and contract.get("request_confirmed") is True
+        and contract.get("response_confirmed") is True
+        and contract_endpoint
+        and expected_endpoint == contract_endpoint
+        and chain
+        and (not current_chain or current_chain == chain)
+        and isinstance(revision, int)
+        and not isinstance(revision, bool)
+        and isinstance(probe_revision, int)
+        and not isinstance(probe_revision, bool)
+        and revision > probe_revision >= 0
+        and method_probe_receipt_matches_contract(
+            state,
+            receipt=receipt,
+            chain=chain,
+            method=method,
+            schema=schema,
+            endpoint=contract_endpoint,
+            evidence_file=normalize_scalar(contract.get("evidence_file")),
+            catalog_revision=probe_revision,
+        )
+    )
+    if not base_valid:
+        return False
+    confirmed = (
+        state.get("confirmed_config")
+        if isinstance(state.get("confirmed_config"), Mapping)
+        else {}
+    )
+    final_endpoint = normalize_scalar(confirmed.get("LOCAL_RPC_URL"))
+    if (
+        normalize_scalar(state.get("target_mode")) == "real-node"
+        and final_endpoint
+    ):
+        return _final_endpoint_replay_is_current(
+            state,
+            contract,
+            endpoint=final_endpoint,
+        )
+    return True
+
+
+def method_probe_receipt_matches_contract(
+    state: Mapping[str, Any],
+    *,
+    receipt: Mapping[str, Any],
+    chain: str,
+    method: str,
+    schema: Mapping[str, Any],
+    endpoint: str,
+    evidence_file: str,
+    catalog_revision: Any,
+) -> bool:
+    """Verify receipt, schema, endpoint, and durable probe evidence together."""
+
+    expected_probe_hash = _expected_probe_contract_hash(
+        state,
+        chain=chain,
+        endpoint=endpoint,
+        method=method,
+        schema=schema,
+    )
+    return bool(
+        receipt
+        and validate_rpc_receipt(receipt)[0]
+        and receipt.get("method_hash") == evidence_hash(method)
+        and receipt.get("endpoint_hash")
+        == _materialized_endpoint_hash(state, endpoint)
+        and receipt.get("request_contract_hash")
+        == request_contract_hash(schema)
+        and receipt.get("catalog_revision") == catalog_revision
+        and receipt.get("evidence_file_hash")
+        == probe_evidence_content_hash(evidence_file)
+        and expected_probe_hash
+        and receipt.get("probe_contract_hash") == expected_probe_hash
+        and probe_evidence_contract_hash(evidence_file)
+        == expected_probe_hash
+        and receipt.get("ready") is True
+    )
+
+
+def _observed_response_matches_probe(
+    draft: Mapping[str, Any],
+) -> bool:
+    observed = (
+        draft.get("observed_response")
+        if isinstance(draft.get("observed_response"), Mapping)
+        else {}
+    )
+    probe = (
+        draft.get("probe")
+        if isinstance(draft.get("probe"), Mapping)
+        else {}
+    )
+    return bool(
+        observed
+        and probe.get("ready") is True
+        and normalize_scalar(observed.get("evidence_file"))
+        == normalize_scalar(probe.get("evidence_file"))
+        and (
+            normalize_scalar(observed.get("shape_hash"))
+            or normalize_scalar(observed.get("sample"))
+            or isinstance(observed.get("http_status"), int)
+        )
+    )
+
+
+def _final_endpoint_replay_is_current(
+    state: Mapping[str, Any],
+    contract: Mapping[str, Any],
+    *,
+    endpoint: str,
+) -> bool:
+    method = normalize_scalar(contract.get("method"))
+    schema = (
+        contract.get("schema")
+        if isinstance(contract.get("schema"), Mapping)
+        else {}
+    )
+    contract_endpoint = normalize_scalar(contract.get("final_endpoint"))
+    evidence_file = normalize_scalar(
+        contract.get("final_endpoint_evidence_file")
+    )
+    evidence = (
+        state.get("endpoint_evidence")
+        if isinstance(state.get("endpoint_evidence"), Mapping)
+        else {}
+    )
+    receipt = (
+        evidence.get("local_rpc_url_validation_receipt")
+        if isinstance(
+            evidence.get("local_rpc_url_validation_receipt"),
+            Mapping,
+        )
+        else {}
+    )
+    chain = normalize_scalar(contract.get("chain"))
+    family = _current_adapter_family(state, chain)
+    expected_probe_hash = _expected_probe_contract_hash(
+        state,
+        chain=chain,
+        endpoint=contract_endpoint,
+        method=method,
+        schema=schema,
+    )
+    binding = next(
+        (
+            item
+            for item in receipt.get("method_evidence_bindings") or ()
+            if isinstance(item, Mapping)
+            and normalize_scalar(item.get("method")) == method
+        ),
+        {},
+    )
+    return bool(
+        method
+        and contract_endpoint
+        and endpoint == contract_endpoint
+        and evidence_file
+        and expected_probe_hash
+        and probe_evidence_contract_hash(evidence_file)
+        == expected_probe_hash
+        and binding.get("evidence_file_hash")
+        == probe_evidence_content_hash(evidence_file)
+        and binding.get("probe_contract_hash") == expected_probe_hash
+        and validate_rpc_receipt(receipt)[0]
+        and receipt.get("receipt_id")
+        == evidence.get("local_rpc_url_validation_receipt_id")
+        and receipt.get("role") == "final_benchmark"
+        and receipt.get("case") == "runtime"
+        and receipt.get("config_field") == "LOCAL_RPC_URL"
+        and receipt.get("ready") is True
+        and receipt.get("chain") == chain
+        and receipt.get("adapter_family") == family
+        and receipt.get("endpoint_hash")
+        == _materialized_endpoint_hash(state, endpoint)
+        and receipt.get("method_hashes")
+        and evidence_hash(method) in receipt.get("method_hashes")
+    )
+
+
+def probe_evidence_contract_hash(path: str) -> str:
+    """Validate a durable probe contract and its real method observations."""
+
+    target = _probe_evidence_path(path)
+    if target is None:
+        return ""
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return ""
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("ready") is not True
+        or normalize_scalar(payload.get("status")) != "ok"
+    ):
+        return ""
+    contract_hash = rpc_probe_contract_hash(payload.get("probe_contract"))
+    if (
+        not contract_hash
+        or normalize_scalar(payload.get("probe_contract_hash"))
+        != contract_hash
+    ):
+        return ""
+    contract = payload.get("probe_contract")
+    methods = (
+        contract.get("methods")
+        if isinstance(contract, Mapping)
+        and isinstance(contract.get("methods"), list)
+        else []
+    )
+    checks = payload.get("checks")
+    if not isinstance(checks, list):
+        return ""
+    for method in methods:
+        matching = [
+            item
+            for item in checks
+            if isinstance(item, Mapping)
+            and normalize_scalar(item.get("name"))
+            == f"method_probe:{method}"
+        ]
+        if len(matching) != 1:
+            return ""
+        check = matching[0]
+        http_status = check.get("http_status")
+        if (
+            check.get("passed") is not True
+            or not isinstance(http_status, int)
+            or isinstance(http_status, bool)
+            or not 100 <= http_status <= 599
+            or not _is_sha256(normalize_scalar(
+                check.get("response_shape_hash")
+            ))
+            or not normalize_scalar(check.get("response_sample"))
+        ):
+            return ""
+    return contract_hash
+
+
+def probe_evidence_content_hash(path: str) -> str:
+    """Bind a probe receipt to durable evidence bytes, not a path claim."""
+
+    if not path:
+        return ""
+    try:
+        target = _probe_evidence_path(path)
+        if target is None:
+            return ""
+        digest = hashlib.sha256()
+        with target.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return ""
+
+
+def _expected_probe_contract_hash(
+    state: Mapping[str, Any],
+    *,
+    chain: str,
+    endpoint: str,
+    method: str,
+    schema: Mapping[str, Any],
+) -> str:
+    try:
+        materialized_endpoint = normalize_scalar(
+            materialize_state_secret_references(endpoint, state)
+        )
+    except (KeyError, RuntimeError, ValueError):
+        return ""
+    transport = _current_adapter_family(state, chain)
+    if not chain or not materialized_endpoint or not method or not transport:
+        return ""
+    return rpc_probe_contract_hash(build_rpc_probe_contract(
+        chain=chain,
+        endpoint=materialized_endpoint,
+        transport=transport,
+        methods=[method],
+        method_params={method: deepcopy(schema.get("params_json"))},
+    ))
+
+
+def _probe_evidence_path(path: str) -> Path | None:
+    if not path:
+        return None
+    target = Path(path)
+    if not target.is_absolute():
+        target = Path(__file__).resolve().parents[3] / target
+    return target if target.is_file() else None
+
+
+def _is_sha256(value: str) -> bool:
+    return bool(
+        len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _materialized_endpoint_hash(
+    state: Mapping[str, Any],
+    endpoint: str,
+) -> str:
+    if not endpoint:
+        return ""
+    try:
+        materialized = normalize_scalar(
+            materialize_state_secret_references(endpoint, state)
+        )
+    except (KeyError, RuntimeError, ValueError):
+        return ""
+    return evidence_hash(materialized) if materialized else ""
+
+
+def _current_adapter_family(
+    state: Mapping[str, Any],
+    chain: str,
+) -> str:
+    identity = (
+        state.get("chain_identity")
+        if isinstance(state.get("chain_identity"), Mapping)
+        else {}
+    )
+    family = normalize_scalar(identity.get("adapter_family")).casefold()
+    if family:
+        return family
+    canonical = normalize_scalar(chain).casefold()
+    for row in load_framework_capabilities().get("chains", []):
+        if normalize_scalar(row.get("chain")).casefold() == canonical:
+            return normalize_scalar(
+                row.get("family") or row.get("adapter_family")
+            ).casefold()
+    return ""
+
+
 
 
 def reset_draft(state: AgentGraphState) -> CatalogTransition:

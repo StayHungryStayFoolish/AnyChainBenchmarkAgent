@@ -390,16 +390,30 @@ class CoverageEvidenceTest(unittest.TestCase):
     def test_runtime_event_rejects_rehashed_semantically_invalid_domain_receipt(
         self,
     ) -> None:
-        from agent.harness.domains.rpc_receipts import emit_endpoint_role_receipt
+        from agent.harness.domains.rpc_receipts import (
+            emit_endpoint_role_receipt,
+            exact_value_hash,
+        )
 
         state = new_state("runtime-domain-receipt")
         state["turn_index"] = 1
-        state["turn_context"] = {"text": "endpoint"}
+        endpoint = "https://example.invalid/private-token"
+        state["current_action"] = {"action_id": "endpoint-action"}
+        state["turn_context"] = {
+            "text": "endpoint",
+            "admitted_actions": [{
+                "action_id": "endpoint-action",
+                "argument_value_hashes": {
+                    "selected_value": exact_value_hash(endpoint),
+                },
+            }],
+        }
         emit_endpoint_role_receipt(
             state,
             role="validation",
             case="custom_rpc",
-            endpoint="https://example.invalid/private-token",
+            config_field="",
+            endpoint=endpoint,
             ready=True,
             probe_status="ok",
             chain="bsc",

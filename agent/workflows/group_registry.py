@@ -197,7 +197,7 @@ GROUPS: tuple[GroupSpec, ...] = (
     GroupSpec(
         name="endpoint_process",
         owner="chain_rpc",
-        fields=("LOCAL_RPC_URL", "MAINNET_RPC_URL", "MAINNET_RPC_URL_REVIEWED", "BLOCKCHAIN_PROCESS_NAMES", "SYNC_OBSERVE_RPC_URL", "endpoint_evidence"),
+        fields=("LOCAL_RPC_URL", "MAINNET_RPC_URL", "MAINNET_RPC_URL_REVIEWED", "MAINNET_RPC_URL_DISABLED", "BLOCKCHAIN_PROCESS_NAMES", "SYNC_OBSERVE_RPC_URL", "endpoint_evidence"),
         questions=(
             "LOCAL_RPC_URL",
             "SYNC_OBSERVE_RPC_URL",

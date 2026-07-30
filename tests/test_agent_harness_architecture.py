@@ -1644,7 +1644,9 @@ class HarnessArchitectureTest(unittest.TestCase):
         )
         self.assertEqual(result.completion, "completed")
 
-    def test_legacy_custom_rpc_migration_quarantines_untrusted_source(self) -> None:
+    def test_legacy_custom_rpc_migration_quarantines_all_executable_source(
+        self,
+    ) -> None:
         from agent.harness.state import migrate_state
 
         base = {
@@ -1666,9 +1668,9 @@ class HarnessArchitectureTest(unittest.TestCase):
         migration_event = next(
             event
             for event in rejected["audit_events"]
-            if event.get("event") == "checkpoint_action_queue_enveloped"
+            if event.get("event") == "checkpoint_legacy_inflight_quarantined"
         )
-        self.assertEqual(migration_event["rejected_untrusted"], 1)
+        self.assertEqual(migration_event["quarantined"]["action_queue"], 1)
 
         trusted = deepcopy(base)
         trusted["action_queue"][0]["source_evidence"] = (
@@ -1680,13 +1682,11 @@ class HarnessArchitectureTest(unittest.TestCase):
             language="en",
             session_purpose="user",
         )
-        self.assertEqual(
-            [
-                (row.get("arguments") or {}).get("catalog_command")
-                for row in migrated["action_queue"]
-            ],
-            ["set_endpoint", "set_method"],
-        )
+        self.assertEqual(migrated["action_queue"], [])
+        self.assertTrue(any(
+            event.get("event") == "checkpoint_legacy_inflight_quarantined"
+            for event in migrated["audit_events"]
+        ))
 
     def test_checkpoint_migration_quarantines_retired_pending_action_contracts(self) -> None:
         from agent.harness.state import migrate_state
@@ -1761,9 +1761,8 @@ class HarnessArchitectureTest(unittest.TestCase):
             "quarantined",
         )
         self.assertTrue(any(
-            event.get("event") == "checkpoint_pending_actions_quarantined"
-            and f"contract_version {QUESTION_CONTRACT_VERSION}"
-            in str(event.get("contract_error") or "")
+            event.get("event") == "checkpoint_legacy_inflight_quarantined"
+            and event.get("quarantined", {}).get("pending_question") is True
             for event in migrated["audit_events"]
         ))
 
@@ -1818,8 +1817,13 @@ class HarnessArchitectureTest(unittest.TestCase):
         ]
         self.assertEqual(
             {event["location"] for event in events},
-            {"top_level", "resume_context"},
+            {"resume_context"},
         )
+        self.assertTrue(any(
+            event.get("event") == "checkpoint_legacy_inflight_quarantined"
+            and event.get("quarantined", {}).get("pending_question") is True
+            for event in migrated["audit_events"]
+        ))
         self.assertTrue(all(
             f"contract_version {QUESTION_CONTRACT_VERSION}"
             in str(event.get("contract_error") or "")
@@ -2397,6 +2401,22 @@ class HarnessArchitectureTest(unittest.TestCase):
                 "config_field": "LOCAL_RPC_URL",
             },
         )
+        from agent.harness.domains.rpc_receipts import exact_value_hash
+
+        endpoint_state["current_action"] = {
+            "action_id": "endpoint-change",
+        }
+        endpoint_state["turn_context"] = {
+            "control_receipts": [],
+            "admitted_actions": [{
+                "action_id": "endpoint-change",
+                "argument_value_hashes": {
+                    "selected_value": exact_value_hash(
+                        "http://new.invalid"
+                    ),
+                },
+            }],
+        }
         probe = {"ready": True, "status": "ready", "evidence_file": "/tmp/probe.json"}
         with patch("agent.harness.domains.rpc_endpoint.validate_rpc_endpoint", return_value=probe):
             endpoint_result = apply_chain_rpc_answer(
@@ -2687,48 +2707,6 @@ class HarnessArchitectureTest(unittest.TestCase):
         self.assertEqual(result.status, "rejected")
         self.assertFalse(result.actions)
         self.assertTrue(result.rejections)
-
-    def test_model_action_envelope_normalizes_nested_arguments_at_boundary(self) -> None:
-        from agent.harness.checkpoint_migrations import normalize_v12_action_envelope
-
-        normalized = normalize_v12_action_envelope({
-            "type": "answer_opening_question",
-            "confidence": "high",
-            "arguments": {"topic": "current_config", "subject": "workload"},
-        })
-
-        self.assertEqual(normalized["topic"], "current_config")
-        self.assertEqual(normalized["subject"], "workload")
-        self.assertNotIn("arguments", normalized)
-
-    def test_nested_arguments_cannot_override_action_identity(self) -> None:
-        from agent.harness.checkpoint_migrations import normalize_v12_action_envelope
-
-        normalized = normalize_v12_action_envelope({
-            "type": "set_qps_mode",
-            "arguments": {"type": "reset_session", "qps_mode": "quick"},
-        })
-
-        self.assertEqual(normalized["type"], "set_qps_mode")
-        self.assertEqual(normalized["qps_mode"], "quick")
-
-    def test_nested_arguments_cannot_conflict_with_flat_arguments(self) -> None:
-        from agent.harness.checkpoint_migrations import normalize_v12_action_envelope
-
-        with self.assertRaisesRegex(ValueError, "conflicting flat and v12 arguments"):
-            normalize_v12_action_envelope({
-                "type": "answer_pending",
-                "answer": "Y",
-                "arguments": {"answer": "N"},
-            })
-
-        normalized = normalize_v12_action_envelope({
-            "type": "answer_pending",
-            "answer": "Y",
-            "arguments": {"answer": "Y"},
-        })
-        self.assertEqual(normalized["answer"], "Y")
-        self.assertNotIn("arguments", normalized)
 
     def test_workload_consultation_is_specific_and_non_mutating(self) -> None:
         from agent.harness.domains.orientation import consultation_fragment
@@ -3898,6 +3876,7 @@ class HarnessQuestionContractTest(unittest.TestCase):
                             "choose_chain",
                             {
                                 "chain_text": "sola",
+                                "reference_kind": "named_identity",
                                 "chain_exists": False,
                                 "possible_known_chain": "solana",
                                 "confidence": "high",
@@ -4635,7 +4614,11 @@ class HarnessStateInvariantTest(unittest.TestCase):
         self.assertEqual(migrated["qps_profile"], {})
         self.assertEqual(migrated["active_group"], "opening")
         self.assertEqual(migrated["pending_question"], {})
-        self.assertEqual(action_types(migrated), ["answer_opening_question"])
+        self.assertEqual(action_types(migrated), [])
+        self.assertTrue(any(
+            event.get("event") == "checkpoint_legacy_inflight_quarantined"
+            for event in migrated["audit_events"]
+        ))
 
     def test_sync_observe_invariant_rejects_runtime_qps_contamination(self) -> None:
         from agent.harness.invariants import StateInvariantError, validate_state

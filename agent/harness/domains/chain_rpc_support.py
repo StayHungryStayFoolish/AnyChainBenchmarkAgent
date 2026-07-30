@@ -44,6 +44,18 @@ def is_existing_family_lifecycle(identity: Any) -> bool:
     return normalize_scalar(identity.get("status")).startswith("existing_family_")
 
 
+def active_rpc_onboarding_case(state: Mapping[str, Any]) -> str:
+    """Return the sole workflow owner for the shared RPC catalog."""
+
+    identity = state.get("chain_identity")
+    if is_existing_family_lifecycle(identity):
+        return "new_chain"
+    custom = state.get("custom_rpc")
+    if isinstance(custom, Mapping) and normalize_scalar(custom.get("status")):
+        return "custom_rpc"
+    return ""
+
+
 def _jsonrpc_draft(method: str, params: Any) -> dict[str, Any]:
     return {
         "status": "draft",
@@ -180,6 +192,7 @@ def _merge_rpc_schema_draft(
         "number",
         "array",
         "object",
+        "mixed",
     }
     draft["response_json_type"] = (
         response_json_type
@@ -190,6 +203,18 @@ def _merge_rpc_schema_draft(
     )
     if not isinstance(draft.get("response_fields"), list):
         draft["response_fields"] = list(previous.get("response_fields") or [])
+    if not isinstance(draft.get("response_json_types"), list):
+        draft["response_json_types"] = list(
+            previous.get("response_json_types") or []
+        )
+    for field in (
+        "response_message_count",
+        "response_variants",
+        "response_schema_truncated",
+        "response_schema_complete",
+    ):
+        if field not in draft and field in previous:
+            draft[field] = previous[field]
     return draft
 
 
@@ -258,7 +283,7 @@ def _schema_confirmation_prompt(language: str, draft: dict[str, Any]) -> str:
     response = normalize_scalar(draft.get("response_summary")) or "<unknown>"
     response_fields = draft.get("response_fields") if isinstance(draft.get("response_fields"), list) else []
     response_fields_text = "; ".join(
-        f"{item.get('name') or '<unnamed>'}: type={item.get('type') or 'unknown'}, meaning={item.get('meaning') or 'unknown'}"
+        f"{item.get('name') or '<unnamed>'}: type={item.get('json_type') or item.get('type') or 'unknown'}, meaning={item.get('meaning') or 'unknown'}"
         for item in response_fields
         if isinstance(item, dict)
     ) or "<unknown>"

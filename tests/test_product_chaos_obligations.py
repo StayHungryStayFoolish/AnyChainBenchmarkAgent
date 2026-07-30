@@ -192,6 +192,7 @@ def _domain_commit(
         "receipt_type": "domain_commit",
         "turn_index": turn_index,
         "owner": owner,
+        "cause_kind": "admitted_action",
         "completion": "completed",
         "group_registry_contract_hash": "1" * 64,
         "pending_before_hash": "2" * 64,
@@ -218,9 +219,17 @@ def _domain_commit(
 
 
 def _rpc_schema_receipt(turn_index, fields):
+    source_evidence_hash = evidence_hash({
+        "revision": turn_index,
+        "source": "user",
+        "kind": "schema_evidence",
+        "method": "eth_test",
+        "content": f"evidence-{turn_index}",
+    })
+    source_action_value_hash = evidence_hash(f"evidence-{turn_index}")
     body = {
         "receipt_type": "rpc_schema_provenance",
-        "receipt_version": 1,
+        "receipt_version": 2,
         "turn_index": turn_index,
         "owner": "rpc_catalog",
         "method": "eth_test",
@@ -228,6 +237,13 @@ def _rpc_schema_receipt(turn_index, fields):
         "catalog_revision": turn_index,
         "fields": fields,
         "fields_hash": evidence_hash(fields),
+        "source_evidence_hashes": [source_evidence_hash],
+        "source_action_value_hashes": [source_action_value_hash],
+        "source_bindings": [{
+            "evidence_hash": source_evidence_hash,
+            "action_value_hash": source_action_value_hash,
+        }],
+        "producer_action_id": "rpc-action",
     }
     return _receipt(body, rpc=True)
 
@@ -235,7 +251,7 @@ def _rpc_schema_receipt(turn_index, fields):
 def _rpc_workload_receipt(turn_index, mode, *, custom):
     body = {
         "receipt_type": "rpc_workload_commit",
-        "receipt_version": 1,
+        "receipt_version": 2,
         "turn_index": turn_index,
         "owner": "rpc_workload",
         "case": "custom_rpc" if custom else "known",
@@ -265,6 +281,8 @@ def _response_receipt(turn_index, language):
         "active_group": "opening",
         "source_action_ids": [],
         "pending_contract_hash": "1" * 64,
+        "terminal_response_hash": "2" * 64,
+        "terminal_semantic_hash": "3" * 64,
         "fragments": [],
     })
 

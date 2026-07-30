@@ -55,6 +55,27 @@ MESSAGES = {
         "arguments": {},
         "kinds": {"completion_effect"},
     },
+    "question.chain_rpc.method_conflict.prompt": {
+        "en": "The new evidence names method `{incoming_method}`, while the current draft is for `{current_method}`. Choose which method owns this draft. Existing evidence is preserved until you explicitly replace it.",
+        "zh": "新证据中的 method 是 `{incoming_method}`，当前 draft 属于 `{current_method}`。请选择哪个 method 继续拥有该 draft；在你明确替换前，既有证据会保持不变。",
+        "arguments": {
+            "incoming_method": "string",
+            "current_method": "string",
+        },
+        "kinds": {"question_prompt"},
+    },
+    "question.chain_rpc.option.keep_current_method": {
+        "en": "Keep `{method}` and continue collecting its evidence",
+        "zh": "保留 `{method}`，继续收集它的证据",
+        "arguments": {"method": "string"},
+        "kinds": {"option_label"},
+    },
+    "question.chain_rpc.option.replace_current_method": {
+        "en": "Replace the draft with `{method}` and provide its evidence again",
+        "zh": "将 draft 替换为 `{method}`，并重新提供它的证据",
+        "arguments": {"method": "string"},
+        "kinds": {"option_label"},
+    },
     "question.chain_rpc.mainnet_review.case2.prompt": {
         "en": "Chain `{chain}` has no configured chain-template mainnet endpoint. Enter a custom comparison endpoint, or continue without mainnet height comparison.",
         "zh": "链 `{chain}` 没有已配置的 chain-template mainnet endpoint。请输入自定义对比 endpoint，或选择不使用 mainnet 高度对比继续。",
@@ -122,8 +143,8 @@ MESSAGES = {
         "kinds": {"question_prompt"},
     },
     "question.chain_rpc.schema_confirmation.prompt": {
-        "en": "Confirm the extracted RPC request contract and reviewed parameter semantics.\nEvidence: {evidence_kind}; transport: {transport}\nMethod: `{method}`\nParameters: {params_summary}\nResponse summary: {response_summary}\nResponse fields: {response_fields}\nConfidence: {confidence}\nConflicts: {conflicts}\nEvidence summary: {evidence_summary}\nThis confirms only the request contract and does not run an endpoint probe.",
-        "zh": "请确认提取出的 RPC request contract 和已审阅的参数语义。\n证据：{evidence_kind}；transport：{transport}\nMethod：`{method}`\n参数：{params_summary}\nResponse 摘要：{response_summary}\nResponse 字段：{response_fields}\n置信度：{confidence}\n冲突：{conflicts}\n证据摘要：{evidence_summary}\n这里只确认 request contract，不会执行 endpoint probe。",
+        "en": "Confirm the extracted RPC request contract and reviewed parameter semantics.\nEvidence: {evidence_kind}; transport: {transport}\nMethod: `{method}`\nParameters: {params_summary}\nResponse summary: {response_summary}\nResponse fields: {response_fields}\nResponse schema coverage: {response_schema_status}\nConfidence: {confidence}\nConflicts: {conflicts}\nEvidence summary: {evidence_summary}\nThis confirms only the request contract and does not run an endpoint probe.",
+        "zh": "请确认提取出的 RPC request contract 和已审阅的参数语义。\n证据：{evidence_kind}；transport：{transport}\nMethod：`{method}`\n参数：{params_summary}\nResponse 摘要：{response_summary}\nResponse 字段：{response_fields}\nResponse schema 覆盖状态：{response_schema_status}\n置信度：{confidence}\n冲突：{conflicts}\n证据摘要：{evidence_summary}\n这里只确认 request contract，不会执行 endpoint probe。",
         "arguments": {
             "evidence_kind": "string",
             "transport": "string",
@@ -131,6 +152,7 @@ MESSAGES = {
             "params_summary": "string",
             "response_summary": "string",
             "response_fields": "string",
+            "response_schema_status": "string",
             "confidence": "string",
             "conflicts": "string",
             "evidence_summary": "string",

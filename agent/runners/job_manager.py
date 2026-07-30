@@ -244,6 +244,8 @@ def get_job(job_id: str, jobs_dir: str | Path = DEFAULT_JOBS_DIR) -> dict[str, A
         raise FileNotFoundError(f"job not found: {job_id}")
     source_bytes = job_file.read_bytes()
     persisted = json.loads(source_bytes)
+    if not isinstance(persisted, dict):
+        raise ValueError(f"job record must be a JSON object: {job_file}")
     persisted_status = str(persisted.get("status") or "unknown")
     job = _legacy_result_view(dict(persisted))
     plan = _read_job_plan(job)
@@ -368,8 +370,12 @@ def _job(job_id: str, plan_id: str, status: str, plan_file: Path, run_dir: Path)
 
 
 def _read_json(path: str | Path) -> dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
+    source = Path(path)
+    with open(source, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"JSON document must be an object: {source}")
+    return payload
 
 
 def _write_json(path: str | Path, payload: dict[str, Any]) -> None:
@@ -396,7 +402,7 @@ def _jobs_by_execution_key(jobs_dir: Path, execution_key: str) -> list[dict[str,
     for job_file in sorted(jobs_dir.glob("job_*/job.json"), reverse=True):
         try:
             job = _read_json(job_file)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError, json.JSONDecodeError):
             continue
         if str(job.get("execution_key") or "") == execution_key:
             matches.append(job)

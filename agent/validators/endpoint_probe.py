@@ -23,6 +23,7 @@ CHAIN_ADAPTER_CLI = REPO_ROOT / "tools" / "chain_adapters" / "cli.py"
 CHAINS_DIR = REPO_ROOT / "config" / "chains"
 EVIDENCE_DIR = REPO_ROOT / ".agent" / "evidence" / "endpoint-probes"
 DEFAULT_ADDRESS = "0x0000000000000000000000000000000000000000"
+RPC_PROBE_CONTRACT_VERSION = 2
 
 # The generic (single-POST-JSON-RPC-call) probe applies to adapter families
 # whose RPC transport is a plain `{"jsonrpc": "2.0", "method": ..., "params":
@@ -92,6 +93,8 @@ def validate_rpc_endpoint(
         "status": "pending",
         "http_status": None,
         "response_shape_hash": "",
+        "probe_contract": {},
+        "probe_contract_hash": "",
         "error": "",
         "evidence_file": "",
         "session": _runtime_session_metadata(),
@@ -122,6 +125,16 @@ def validate_rpc_endpoint(
         return _finalize_result(result)
 
     selected_methods = methods or _default_methods(chain)
+    result["probe_contract"] = build_rpc_probe_contract(
+        chain=chain,
+        endpoint=endpoint,
+        transport=result["transport"],
+        methods=selected_methods[:5],
+        method_params=method_params,
+    )
+    result["probe_contract_hash"] = rpc_probe_contract_hash(
+        result["probe_contract"]
+    )
     if _should_use_generic_jsonrpc_probe(chain, result["transport"], selected_methods, method_params):
         return _validate_generic_jsonrpc_endpoint(
             result,
@@ -205,7 +218,6 @@ def _validate_generic_jsonrpc_endpoint(
     timeout: float,
 ) -> dict[str, Any]:
     selected_methods = list(dict.fromkeys([method.strip() for method in methods if method.strip()]))[:5]
-    result["transport"] = "jsonrpc"
     result["selected_methods"] = selected_methods
     result["selected_method"] = selected_methods[0] if selected_methods else ""
     if not selected_methods:
@@ -713,6 +725,88 @@ def _check(name: str, passed: bool, detail: str = "", **extra: Any) -> dict[str,
     return payload
 
 
+def build_rpc_probe_contract(
+    *,
+    chain: str,
+    endpoint: str,
+    transport: str,
+    methods: list[str],
+    method_params: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the secret-free contract represented by one probe evidence file."""
+
+    selected = list(
+        dict.fromkeys(
+            method.strip()
+            for method in methods
+            if isinstance(method, str) and method.strip()
+        )
+    )[:5]
+    params = {
+        method: method_params.get(method, [])
+        for method in selected
+    }
+    return {
+        "contract_version": RPC_PROBE_CONTRACT_VERSION,
+        "chain": (chain or "").strip().lower(),
+        "endpoint_hash": _canonical_digest((endpoint or "").strip()),
+        "transport": (transport or "").strip().lower(),
+        "methods": selected,
+        "method_params_hash": _canonical_digest(params),
+    }
+
+
+def rpc_probe_contract_hash(contract: Any) -> str:
+    """Return the canonical identity of a structurally valid probe contract."""
+
+    if (
+        not isinstance(contract, dict)
+        or set(contract) != {
+            "contract_version",
+            "chain",
+            "endpoint_hash",
+            "transport",
+            "methods",
+            "method_params_hash",
+        }
+        or contract.get("contract_version") != RPC_PROBE_CONTRACT_VERSION
+        or not isinstance(contract.get("chain"), str)
+        or not _is_sha256(contract.get("endpoint_hash"))
+        or not isinstance(contract.get("transport"), str)
+        or not contract.get("transport")
+        or not isinstance(contract.get("methods"), list)
+        or not contract.get("methods")
+        or any(
+            not isinstance(method, str) or not method.strip()
+            for method in contract.get("methods") or ()
+        )
+        or len(contract.get("methods") or ())
+        != len(set(contract.get("methods") or ()))
+        or not _is_sha256(contract.get("method_params_hash"))
+    ):
+        return ""
+    return _canonical_digest(contract)
+
+
+def _canonical_digest(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _is_sha256(value: Any) -> bool:
+    return bool(
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
 def _finalize_result(result: dict[str, Any]) -> dict[str, Any]:
     checks = result.get("checks") or []
     method_checks = [item for item in checks if str(item.get("name", "")).startswith("method_probe:")]
@@ -840,7 +934,7 @@ def _response_shape_hash(sample: str) -> str:
         parsed = {"_text": type(sample).__name__}
     shape = _shape(parsed)
     encoded = json.dumps(shape, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _shape(value: Any) -> Any:

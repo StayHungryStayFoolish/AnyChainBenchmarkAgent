@@ -10,8 +10,20 @@ import unittest
 from unittest.mock import patch
 
 from agent.harness.action_registry import MODE_COMPARISON_TOPIC
+from agent.harness.control_receipts import (
+    execution_intent_projection,
+    execution_side_effect_receipt_id,
+    execution_side_effect_projection,
+)
+from agent.harness.contracts import ResponseFragment
 from agent.harness.domains.rpc_receipts import evidence_hash
 from agent.harness.domains.analysis_receipts import analysis_hash
+from agent.harness.questions import choice_question, question_text, render_question
+from agent.harness.response_catalog import (
+    render_fragment,
+    render_hash,
+    semantic_hash,
+)
 from tests.agent_live.coverage_evidence import RuntimeTurnEvent, content_hash
 from tests.agent_live.retained_regression_attestations import (
     build_source_contract,
@@ -28,6 +40,21 @@ from tests.agent_live.retained_regression_predicates import (
 
 
 HASH = "a" * 64
+RPC_SOURCE_EVIDENCE_HASH = evidence_hash({
+    "revision": 1,
+    "source": "user",
+    "kind": "protocol_request",
+    "method": "eth_chainId",
+    "content": '{"method":"eth_chainId","params":[],"id":1}',
+})
+RPC_SOURCE_ACTION_VALUE_HASH = hashlib.sha256(
+    json.dumps(
+        '{"method":"eth_chainId","params":[],"id":1}',
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+).hexdigest()
 
 
 def _hashed(body: dict) -> dict:
@@ -45,6 +72,286 @@ def _value_hash(value) -> str:
     ).hexdigest()
 
 
+def _orientation_projection(**updates) -> dict:
+    projection = {
+        "target_mode": "",
+        "workflow_mode": "",
+        "chain": "",
+        "rpc_mode": "",
+        "qps_mode": "",
+        "observability_mode": "",
+        "confirmed_fields": [],
+        "pending_id": "",
+        "job_id": "",
+        "job_status": "",
+    }
+    projection.update(updates)
+    return projection
+
+
+def _job_read_receipt(
+    *,
+    job_id: str = "job-1",
+    status: str = "completed",
+) -> dict:
+    body = {
+        "receipt_type": "job_read",
+        "receipt_version": 1,
+        "owner": "job_manager",
+        "job_id": job_id,
+        "source_sha256": "9" * 64,
+        "persisted_status": status,
+        "observed_status": status,
+        "status_source": "persisted_job",
+        "workflow_type": "rpc_benchmark",
+        "artifact_keys": [],
+        "vegeta_artifact_present": False,
+        "submission_receipt_id": "",
+    }
+    return _hashed(body)
+
+
+def _job_submission_receipt(
+    *,
+    job_id: str = "job-1",
+    execution_key: str = "harness:request-1",
+) -> dict:
+    body = {
+        "receipt_type": "job_submission",
+        "receipt_version": 1,
+        "owner": "job_manager",
+        "job_id": job_id,
+        "operation": "approve_preflight_smoke",
+        "scenario_id": "fake_node_smoke",
+        "workflow_type": "rpc_benchmark",
+        "execution_key_hash": content_hash(execution_key),
+        "approved_plan_hash": "1" * 64,
+        "execution_plan_hash": "2" * 64,
+        "command_hash": "3" * 64,
+        "disposition": "created",
+        "matching_job_count": 1,
+        "load_generator": "vegeta",
+        "vegeta_allowed": True,
+    }
+    return _hashed(body)
+
+
+def _execution_approval_receipt(
+    *,
+    job_receipt: dict,
+    pending_receipt: dict,
+    action_id: str = "approve-1",
+    turn_index: int = 1,
+    execution_key: str = "harness:request-1",
+) -> dict:
+    intent = {
+        "intent_id": "5" * 64,
+        "turn_id": "predicate-test:1",
+        "action_id": action_id,
+        "operation": "approve_preflight_smoke",
+        "execution_request_id": "request-1",
+        "idempotency_key": execution_key,
+        "request_fingerprint": "a" * 64,
+        "expected_receipt_kind": "execution_handler_result",
+        "status": "succeeded",
+        "attempt_count": 1,
+    }
+    side_effect = {
+        "receipt_id": "",
+        "intent_id": intent["intent_id"],
+        "action_id": action_id,
+        "status": "succeeded",
+        "idempotency_key": execution_key,
+        "job_id": job_receipt["job_id"],
+        "failure_code": "",
+        "retryable": False,
+        "result": {},
+    }
+    side_effect["receipt_id"] = execution_side_effect_receipt_id(side_effect)
+    return _hashed({
+        "receipt_type": "execution_approval",
+        "turn_index": turn_index,
+        "approval_question_id": "preflight_smoke_confirm",
+        "pending_resolution_receipt_id": pending_receipt["receipt_id"],
+        "answer_action_id": "answer-1",
+        "approval_action_id": action_id,
+        "approval_action_type": "approve_preflight_smoke",
+        "execution_request_id": "request-1",
+        "side_effect_intent_id": intent["intent_id"],
+        "side_effect_intent_hash": content_hash(
+            execution_intent_projection(intent)
+        ),
+        "side_effect_receipt_id": side_effect["receipt_id"],
+        "side_effect_receipt_hash": content_hash(
+            execution_side_effect_projection(side_effect)
+        ),
+        "idempotency_key_hash": content_hash(execution_key),
+        "request_fingerprint": "a" * 64,
+        "job_submission_receipt_id": job_receipt["receipt_id"],
+        "job_submission_receipt_hash": content_hash(job_receipt),
+        "approved_plan_hash": "b" * 64,
+        "repository_revision": {
+            "commit": "c" * 40,
+            "worktree_hash": "d" * 64,
+        },
+        "plan_hash": "e" * 64,
+        "workflow_type": "rpc_benchmark",
+        "target_mode": "fake-node",
+        "job_id": job_receipt["job_id"],
+    })
+
+
+def _execution_summary(
+    job_receipt: dict,
+    *,
+    action_id: str = "approve-1",
+    execution_key: str = "harness:request-1",
+) -> dict:
+    intent = {
+        "intent_id": "5" * 64,
+        "turn_id": "predicate-test:1",
+        "action_id": action_id,
+        "operation": "approve_preflight_smoke",
+        "execution_request_id": "request-1",
+        "idempotency_key": execution_key,
+        "request_fingerprint": "a" * 64,
+        "expected_receipt_kind": "execution_handler_result",
+        "status": "succeeded",
+        "attempt_count": 1,
+    }
+    side_effect = {
+        "receipt_id": "",
+        "intent_id": intent["intent_id"],
+        "action_id": action_id,
+        "status": "succeeded",
+        "idempotency_key": execution_key,
+        "job_id": job_receipt["job_id"],
+        "failure_code": "",
+        "retryable": False,
+        "result": {},
+    }
+    side_effect["receipt_id"] = execution_side_effect_receipt_id(side_effect)
+    return {
+        "side_effect_intent_projection": execution_intent_projection(
+            intent
+        ),
+        "side_effect_receipt_projection": (
+            execution_side_effect_projection(side_effect)
+        ),
+        "intent_id": intent["intent_id"],
+        "intent_idempotency_key": execution_key,
+        "receipt_id": side_effect["receipt_id"],
+        "manager_submission_receipt_id": job_receipt["receipt_id"],
+        "manager_submission_receipt": job_receipt,
+        "manager_submission_disposition": "created",
+        "manager_matching_job_count": 1,
+        "manager_execution_key_hash": job_receipt[
+            "execution_key_hash"
+        ],
+        "job_id": job_receipt["job_id"],
+    }
+
+
+def _rpc_schema_receipt(
+    *,
+    turn_index: int,
+    correlated: bool = True,
+    matching_ids: bool = True,
+    producer_action_id: str = "append-request",
+    catalog_revision: int = 2,
+) -> dict:
+    fields = [
+        {
+            "field_path": "method",
+            "source_kind": "protocol_request_parser",
+            "source_revisions": [1, 2],
+            "value_hash": evidence_hash("eth_chainId"),
+        },
+        {
+            "field_path": "response_summary",
+            "source_kind": "protocol_response_parser",
+            "source_revisions": [1, 2],
+            "value_hash": evidence_hash("JSON-RPC result (string)"),
+        },
+        {
+            "field_path": "exchange_correlation.status",
+            "source_kind": "protocol_exchange_correlator",
+            "source_revisions": [1, 2],
+            "value_hash": evidence_hash(
+                "correlated" if correlated else "response_id_mismatch"
+            ),
+        },
+        {
+            "field_path": "exchange_correlation.request_id_hashes",
+            "source_kind": "protocol_exchange_correlator",
+            "source_revisions": [1, 2],
+            "value_hash": evidence_hash(["request-id"]),
+        },
+        {
+            "field_path": "exchange_correlation.response_id_hashes",
+            "source_kind": "protocol_exchange_correlator",
+            "source_revisions": [1, 2],
+            "value_hash": evidence_hash(
+                ["request-id"] if matching_ids else ["response-id"]
+            ),
+        },
+    ]
+    body = {
+        "receipt_type": "rpc_schema_provenance",
+        "receipt_version": 2,
+        "turn_index": turn_index,
+        "owner": "rpc_catalog",
+        "method": "eth_chainId",
+        "method_hash": evidence_hash("eth_chainId"),
+        "catalog_revision": catalog_revision,
+        "fields": fields,
+        "fields_hash": evidence_hash(fields),
+        "source_evidence_hashes": [RPC_SOURCE_EVIDENCE_HASH],
+        "source_action_value_hashes": [RPC_SOURCE_ACTION_VALUE_HASH],
+        "source_bindings": [{
+            "evidence_hash": RPC_SOURCE_EVIDENCE_HASH,
+            "action_value_hash": RPC_SOURCE_ACTION_VALUE_HASH,
+        }],
+        "producer_action_id": producer_action_id,
+    }
+    return {**body, "receipt_id": evidence_hash(body)}
+
+
+def _rpc_catalog_transition_receipt(
+    *,
+    turn_index: int,
+    revision: int = 1,
+    accepted: bool = True,
+    producer_action_id: str = "rpc-action",
+    command: str = "append_evidence",
+) -> dict:
+    body = {
+        "receipt_type": "rpc_catalog_transition",
+        "receipt_version": 2,
+        "turn_index": turn_index,
+        "owner": "rpc_catalog",
+        "command": command,
+        "catalog_revision": revision,
+        "accepted": accepted,
+        "phase": "draft",
+        "chain": "bsc",
+        "method_names": [],
+        "method_hashes": [],
+        "method_count": 0,
+        "draft_method": "eth_chainId",
+        "draft_method_hash": evidence_hash("eth_chainId"),
+        "source_evidence_hashes": [RPC_SOURCE_EVIDENCE_HASH],
+        "source_action_value_hashes": [RPC_SOURCE_ACTION_VALUE_HASH],
+        "source_bindings": [{
+            "evidence_hash": RPC_SOURCE_EVIDENCE_HASH,
+            "action_value_hash": RPC_SOURCE_ACTION_VALUE_HASH,
+        }],
+        "finished": False,
+        "producer_action_id": producer_action_id,
+    }
+    return {**body, "receipt_id": evidence_hash(body)}
+
+
 def _event(
     *receipts: dict,
     turn_index: int = 1,
@@ -53,6 +360,8 @@ def _event(
     admitted_actions: tuple[dict, ...] = (),
     material_diffs: dict | None = None,
     execution: dict | None = None,
+    render_manifest: dict | None = None,
+    observation: str = "",
 ) -> RuntimeTurnEvent:
     transition = pending_transition or {
         "transition": "absent",
@@ -75,10 +384,12 @@ def _event(
         active_group="test_group",
         pending_question_id=str(transition.get("after_id") or ""),
         action_queue_types=(),
+        observation=observation,
         revision={"commit": "test", "worktree_hash": "5" * 64},
         admitted_action_provenance=admitted_actions,
         turn_receipt_summary=turn_receipt or {},
         pending_transition=transition,
+        render_manifest=render_manifest or {},
         control_receipts=tuple(receipts),
         material_state_diff_hashes=material_diffs or {},
         execution_receipt_summary=execution or {},
@@ -92,6 +403,7 @@ def _context(*events: RuntimeTurnEvent, **values) -> SimpleNamespace:
         completed_decisions=tuple(values.get("decisions") or ()),
         verifier_input_contract=values.get("verifier_input_contract") or {},
         initial_event=values.get("initial_event"),
+        setup_events=tuple(values.get("setup_events") or ()),
         schedule=values.get("schedule") or SimpleNamespace(start_scenario=""),
     )
 
@@ -236,11 +548,14 @@ def _domain_commit(
     turn_index: int = 1,
     action_id: str = "action-1",
     paths: tuple[str, ...] = (),
+    owner: str = "environment",
+    response_fragments: tuple[dict, ...] = (),
 ) -> dict:
     return _hashed({
         "receipt_type": "domain_commit",
         "turn_index": turn_index,
-        "owner": "environment",
+        "owner": owner,
+        "cause_kind": "admitted_action",
         "completion": "in_progress",
         "group_registry_contract_hash": "4" * 64,
         "pending_before_hash": "1" * 64,
@@ -248,7 +563,7 @@ def _domain_commit(
         "consumed_action_ids": [action_id],
         "invalidated_groups": [],
         "invalidated_fields": [],
-        "response_fragments": [],
+        "response_fragments": list(response_fragments),
         "reconfigured_groups": [],
         "group_state_transitions": [],
         "material_delta": [
@@ -338,7 +653,7 @@ def _workload_receipt(**updates) -> dict:
     methods = ["eth_accounts"]
     body = {
         "receipt_type": "rpc_workload_commit",
-        "receipt_version": 1,
+        "receipt_version": 2,
         "turn_index": 1,
         "owner": "rpc_workload",
         "case": "custom_rpc",
@@ -1489,9 +1804,13 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
                 },
             },
         )
+        consultation_projection = _orientation_projection(
+            pending_id="chain",
+            target_mode="real-node",
+        )
         consultation_body = {
             "receipt_type": "orientation_response",
-            "schema_version": 1,
+            "schema_version": 3,
             "owner": "orientation",
             "turn_index": 2,
             "topic": MODE_COMPARISON_TOPIC,
@@ -1499,8 +1818,12 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
             "action_id": "action-2",
             "pending_contract_hash": "2" * 64,
             "response_hash": "3" * 64,
-            "projection_fields": ["pending_id", "target_mode"],
-            "state_projection_hash": "4" * 64,
+            "state_projection": consultation_projection,
+            "projection_fields": sorted(consultation_projection),
+            "state_projection_hash": content_hash(
+                consultation_projection
+            ),
+            "source_receipts": [],
             "read_only": True,
         }
         consultation_action = {
@@ -1961,10 +2284,24 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
         })
         summary = {
             "semantic_units": [
-                {"unit_id": "unit-1", "start": 0, "end": 4},
-                {"unit_id": "unit-2", "start": 5, "end": 9},
+                {
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "disposition": "action",
+                    "start": 0,
+                    "end": 4,
+                },
+                {
+                    "unit_id": "unit-2",
+                    "clause_id": "clause-1",
+                    "disposition": "unresolved",
+                    "start": 5,
+                    "end": 9,
+                },
             ],
-            "semantic_order": ["unit-1", "unit-2"],
+            "semantic_order": ["action-1"],
+            "execution_order": ["action-1"],
+            "action_unit_bindings": {"action-1": ["unit-1"]},
             "unit_action_bindings": {"unit-1": ["action-1"]},
             "unresolved_unit_ids": ["unit-2"],
         }
@@ -2000,25 +2337,83 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
     def test_execution_predicates_distinguish_single_submission_and_duplicate(
         self,
     ) -> None:
-        first = _event(
-            execution={
-                "intent_idempotency_key": "execution-key",
-                "manager_submission_receipt_id": "1" * 64,
-                "manager_submission_disposition": "created",
-                "manager_matching_job_count": 1,
-                "job_id": "job-1",
-            }
+        submission = _job_submission_receipt()
+        pending = _pending_receipt(
+            pending_id="preflight_smoke_confirm",
+            pending_group="preflight_smoke_execution",
+            resolved_action_id="answer-1",
+            selected_option_id="yes",
+            selected_value_hash=content_hash(True),
         )
-        satisfied, _ = POSTCONDITION_EVALUATORS[
+        approval = _execution_approval_receipt(
+            job_receipt=submission,
+            pending_receipt=pending,
+        )
+        first = _event(
+            pending,
+            approval,
+            _domain_commit(
+                action_id="approve-1",
+                owner="execution",
+            ),
+            admitted_actions=(
+                {
+                    "type": "answer_pending",
+                    "action_id": "answer-1",
+                    "owner": "coordinator",
+                    "effect": "control",
+                    "group": "preflight_smoke_execution",
+                    "argument_value_hashes": {},
+                },
+                {
+                    "type": "approve_preflight_smoke",
+                    "action_id": "approve-1",
+                    "owner": "execution",
+                    "effect": "execution",
+                    "group": "preflight_smoke_execution",
+                    "argument_value_hashes": {},
+                },
+            ),
+            execution=_execution_summary(submission),
+        )
+        satisfied, details = POSTCONDITION_EVALUATORS[
             "approved_execution_submitted_once"
-        ](_context(first))
-        self.assertTrue(satisfied)
+        ](_context(
+            first,
+            verifier_input_contract=_verifier_input(
+                "exact",
+                ("Y",),
+                semantic_roles=("approve_execution",),
+            ),
+        ))
+        self.assertTrue(satisfied, details)
+        summary_only = replace(
+            first,
+            control_receipts=(),
+            admitted_action_provenance=(),
+        )
+        satisfied, _details = POSTCONDITION_EVALUATORS[
+            "approved_execution_submitted_once"
+        ](_context(
+            summary_only,
+            verifier_input_contract=_verifier_input(
+                "exact",
+                ("Y",),
+                semantic_roles=("approve_execution",),
+            ),
+        ))
+        self.assertFalse(satisfied)
+
+        duplicate_receipt = _job_submission_receipt(job_id="job-2")
         duplicated = replace(
             first,
             turn_index=2,
             execution_receipt_summary={
                 **first.execution_receipt_summary,
-                "manager_submission_receipt_id": "2" * 64,
+                "manager_submission_receipt_id": (
+                    duplicate_receipt["receipt_id"]
+                ),
+                "manager_submission_receipt": duplicate_receipt,
                 "job_id": "job-2",
             },
         )
@@ -2028,15 +2423,599 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
         self.assertTrue(duplicate)
         self.assertEqual(
             details["duplicate_submission_counts"],
-            {"execution-key": 2},
+            {"harness:request-1": 2},
         )
+
+    def test_every_status_intent_requires_same_turn_manager_read_evidence(
+        self,
+    ) -> None:
+        running_read = _job_read_receipt(status="running")
+        verified_status = _event(
+            _domain_commit(
+                action_id="status-1",
+                owner="execution",
+            ),
+            turn_index=1,
+            admitted_actions=({
+                "type": "status",
+                "action_id": "status-1",
+                "owner": "execution",
+                "effect": "read_only",
+                "group": "execution",
+                "argument_value_hashes": {},
+            },),
+            execution={
+                "intent_action_type": "status",
+                "job_id": "job-1",
+                "job_status": "running",
+                "manager_observed_status": "running",
+                "manager_read_receipt_id": running_read["receipt_id"],
+                "manager_read_receipt": running_read,
+            },
+        )
+        completed_read = _job_read_receipt(status="completed")
+        verified_analysis = _event(
+            _domain_commit(
+                turn_index=2,
+                action_id="analyze-1",
+                owner="analysis",
+            ),
+            turn_index=2,
+            admitted_actions=({
+                "type": "analyze_job",
+                "action_id": "analyze-1",
+                "owner": "analysis",
+                "effect": "read_only",
+                "group": "analysis",
+                "argument_value_hashes": {},
+            },),
+            execution={
+                "intent_action_type": "analyze_job",
+                "job_id": "job-1",
+                "job_status": "completed",
+                "manager_observed_status": "completed",
+                "manager_read_receipt_id": completed_read["receipt_id"],
+                "manager_read_receipt": completed_read,
+            },
+        )
+        satisfied, details = POSTCONDITION_EVALUATORS[
+            "status_uses_job_evidence"
+        ](_context(
+            verified_status,
+            verified_analysis,
+            verifier_input_contract=_verifier_input(
+                "exact",
+                ("status", "analyze"),
+                semantic_roles=(
+                    "job_status_consultation",
+                    "execution_evidence_consultation",
+                ),
+            ),
+        ))
+        self.assertTrue(satisfied, details)
+        self.assertEqual(
+            details["verified_status_turn_indexes"],
+            [1, 2],
+        )
+
+        status_projection = _orientation_projection(
+            job_id="job-1",
+            job_status="completed",
+        )
+        rendered_status = render_fragment(
+            ResponseFragment(
+                kind="message",
+                message_id=(
+                    "harness.orientation.consultation.job_verified"
+                ),
+                arguments={
+                    "job_id": "job-1",
+                    "status": "completed",
+                },
+                source=__name__,
+            ),
+            "en",
+        )
+        status_fragment = {
+            "message_id": "harness.orientation.consultation.job_verified",
+            "render_hash": rendered_status.render_hash,
+            "semantic_hash": rendered_status.semantic_hash,
+            "role": "message",
+        }
+        orientation_status = _event(
+            _hashed({
+                "receipt_type": "orientation_response",
+                "schema_version": 3,
+                "owner": "orientation",
+                "turn_index": 1,
+                "topic": "execution_status",
+                "action_type": "answer_opening_question",
+                "action_id": "orientation-status",
+                "pending_contract_hash": "1" * 64,
+                "response_hash": semantic_hash([
+                    rendered_status.semantic_hash
+                ]),
+                "state_projection": status_projection,
+                "projection_fields": sorted(status_projection),
+                "state_projection_hash": content_hash(
+                    status_projection
+                ),
+                "source_receipts": [_job_read_receipt()],
+                "read_only": True,
+            }),
+            _domain_commit(
+                action_id="orientation-status",
+                owner="orientation",
+                response_fragments=(status_fragment,),
+            ),
+            _hashed({
+                "receipt_type": "response_composition",
+                "turn_index": 1,
+                "language": "en",
+                "active_group": "execution",
+                "source_action_ids": ["orientation-status"],
+                "pending_contract_hash": "1" * 64,
+                "terminal_response_hash": rendered_status.render_hash,
+                "terminal_semantic_hash": semantic_hash([
+                    rendered_status.semantic_hash
+                ]),
+                "fragments": [status_fragment],
+            }),
+            admitted_actions=({
+                "type": "answer_opening_question",
+                "action_id": "orientation-status",
+                "owner": "orientation",
+                "effect": "read_only",
+                "group": "",
+                "argument_value_hashes": {
+                    "topic": _value_hash("execution_status"),
+                },
+            },),
+            execution={
+                "intent_action_type": "approve_preflight_smoke",
+                "job_id": "job-1",
+                "job_status": "completed",
+                "manager_observed_status": "completed",
+                "manager_read_receipt_id": "6" * 64,
+            },
+            render_manifest={
+                "language": "en",
+                "fragment_count": 1,
+                "fragment_hashes": [rendered_status.render_hash],
+                "pending_contract_hash": "1" * 64,
+            },
+            observation=rendered_status.text,
+        )
+        satisfied, details = POSTCONDITION_EVALUATORS[
+            "status_uses_job_evidence"
+        ](_context(
+            orientation_status,
+            verifier_input_contract=_verifier_input(
+                "exact",
+                ("What is the current status?",),
+                semantic_roles=("job_status_consultation",),
+            ),
+        ))
+        self.assertTrue(satisfied, details)
+
+        invisible_orientation = replace(
+            orientation_status,
+            control_receipts=tuple(
+                receipt
+                for receipt in orientation_status.control_receipts
+                if receipt.get("receipt_type") != "response_composition"
+            ),
+        )
+        satisfied, _details = POSTCONDITION_EVALUATORS[
+            "status_uses_job_evidence"
+        ](_context(
+            invisible_orientation,
+            verifier_input_contract=_verifier_input(
+                "exact",
+                ("What is the current status?",),
+                semantic_roles=("job_status_consultation",),
+            ),
+        ))
+        self.assertFalse(satisfied)
+
+        hash_only = replace(
+            verified_status,
+            execution_receipt_summary={
+                **verified_status.execution_receipt_summary,
+                "manager_read_receipt": {},
+                "manager_read_receipt_id": "f" * 64,
+            },
+        )
+        invented, invented_details = POSTCONDITION_EVALUATORS[
+            "invented_job_status"
+        ](_context(hash_only))
+        self.assertTrue(invented, invented_details)
+
+        unverified_read = _event(
+            turn_index=3,
+            admitted_actions=({
+                "type": "read_status",
+                "action_id": "status-2",
+                "owner": "execution",
+                "effect": "read_only",
+                "group": "execution",
+                "argument_value_hashes": {},
+            },),
+            execution={
+                "intent_action_type": "read_status",
+                "job_id": "job-1",
+                "job_status": "completed",
+                "manager_observed_status": "completed",
+                "manager_read_receipt_id": "",
+            },
+        )
+        satisfied, details = POSTCONDITION_EVALUATORS[
+            "status_uses_job_evidence"
+        ](_context(
+            verified_status,
+            verified_analysis,
+            unverified_read,
+            verifier_input_contract=_verifier_input(
+                "exact",
+                ("status", "analyze", "status again"),
+                semantic_roles=(
+                    "job_status_consultation",
+                    "execution_evidence_consultation",
+                    "job_status_consultation",
+                ),
+            ),
+        ))
+        self.assertFalse(satisfied, details)
+        self.assertEqual(
+            details["status_intent_turn_indexes"],
+            [1, 2, 3],
+        )
+        self.assertEqual(
+            details["unverified_status_turn_indexes"],
+            [3],
+        )
+
+        missing_contract, details = POSTCONDITION_EVALUATORS[
+            "status_uses_job_evidence"
+        ](_context(verified_status))
+        self.assertFalse(missing_contract, details)
+        self.assertTrue(details["verifier_contract_error"])
+
+        dropped = _event(
+            turn_index=4,
+            admitted_actions=({
+                "type": "status",
+                "action_id": "status-dropped",
+                "owner": "execution",
+                "effect": "read_only",
+                "group": "execution",
+                "argument_value_hashes": {},
+            },),
+        )
+        satisfied, details = POSTCONDITION_EVALUATORS[
+            "status_uses_job_evidence"
+        ](_context(
+            dropped,
+            verifier_input_contract=_verifier_input(
+                "exact",
+                ("status",),
+                semantic_roles=("job_status_consultation",),
+            ),
+        ))
+        self.assertFalse(satisfied, details)
+        self.assertEqual(details["unverified_status_turn_indexes"], [1])
+
+    def test_execution_stage_explanation_requires_same_turn_signed_message(
+        self,
+    ) -> None:
+        pending_contract = choice_question(
+            "preflight_smoke_execution",
+            "preflight_smoke_confirm",
+            question_text("question.execution.preflight_smoke.prompt"),
+            owner="execution",
+            field="preflight_smoke_confirmed",
+            kind="yes_no",
+            options=[
+                {
+                    "label": question_text("question.control.option.yes"),
+                    "value": True,
+                    "action": {"type": "approve_preflight_smoke"},
+                    "expected_patch": {"preflight.approved": True},
+                },
+                {
+                    "label": question_text("question.control.option.no"),
+                    "value": False,
+                    "action": {"type": "reject_preflight_smoke"},
+                    "expected_patch": {"preflight.approved": False},
+                },
+            ],
+            queue_barrier=True,
+            rejection_evidence_value=False,
+        )
+        rendered_explanation = render_fragment(
+            ResponseFragment(
+                kind="message",
+                message_id=(
+                    "harness.orientation.consultation.preflight_smoke"
+                ),
+                source=__name__,
+            ),
+            "en",
+        )
+        pending_text = render_question(pending_contract, "en").strip()
+        pending_semantic_hash = semantic_hash({
+            "kind": "pending_question",
+            "question": pending_contract,
+        })
+        pending_render_hash = render_hash(pending_text)
+        explanation_fragment = {
+            "message_id": (
+                "harness.orientation.consultation.preflight_smoke"
+            ),
+            "render_hash": rendered_explanation.render_hash,
+            "role": "message",
+            "semantic_hash": rendered_explanation.semantic_hash,
+        }
+        pending_fragment = {
+            "message_id": "preflight_smoke_confirm",
+            "render_hash": pending_render_hash,
+            "role": "pending_question",
+            "semantic_hash": pending_semantic_hash,
+        }
+        pending_contract_hash = content_hash(pending_contract)
+        terminal_response_hash = render_hash(
+            f"{rendered_explanation.text}\n{pending_text}"
+        )
+        terminal_semantic_hash = semantic_hash([
+            rendered_explanation.semantic_hash,
+            pending_semantic_hash,
+        ])
+        execution_projection = _orientation_projection(
+            pending_id="preflight_smoke_confirm",
+        )
+        orientation = _hashed({
+            "receipt_type": "orientation_response",
+            "schema_version": 3,
+            "owner": "orientation",
+            "turn_index": 1,
+            "topic": "workflow",
+            "action_type": "answer_opening_question",
+            "action_id": "action-1",
+            "pending_contract_hash": pending_contract_hash,
+            "response_hash": semantic_hash([
+                rendered_explanation.semantic_hash,
+            ]),
+            "state_projection": execution_projection,
+            "projection_fields": sorted(execution_projection),
+            "state_projection_hash": content_hash(
+                execution_projection
+            ),
+            "source_receipts": [],
+            "read_only": True,
+        })
+        commit = _hashed({
+            "receipt_type": "domain_commit",
+            "turn_index": 1,
+            "owner": "orientation",
+            "cause_kind": "admitted_action",
+            "completion": "unchanged",
+            "group_registry_contract_hash": "4" * 64,
+            "pending_before_hash": pending_contract_hash,
+            "pending_after_hash": pending_contract_hash,
+            "consumed_action_ids": ["action-1"],
+            "invalidated_groups": [],
+            "invalidated_fields": [],
+            "response_fragments": [explanation_fragment],
+            "reconfigured_groups": [],
+            "group_state_transitions": [],
+            "material_delta": [],
+            "navigation_operation": "",
+            "navigation_origin_group": "",
+            "navigation_target_group": "",
+            "pending_after_id": "preflight_smoke_confirm",
+        })
+        composition = _hashed({
+            "receipt_type": "response_composition",
+            "turn_index": 1,
+            "language": "en",
+            "active_group": "preflight_smoke_execution",
+            "source_action_ids": ["action-1"],
+            "pending_contract_hash": pending_contract_hash,
+            "terminal_response_hash": terminal_response_hash,
+            "terminal_semantic_hash": terminal_semantic_hash,
+            "fragments": [explanation_fragment, pending_fragment],
+        })
+        preflight_transition = {
+            "transition": "preserved",
+            "before_id": "preflight_smoke_confirm",
+            "before_group": "preflight_smoke_execution",
+            "before_hash": pending_contract_hash,
+            "after_id": "preflight_smoke_confirm",
+            "after_group": "preflight_smoke_execution",
+            "after_hash": pending_contract_hash,
+            "consumer_action_ids": ["action-1"],
+        }
+        complete_event = replace(
+            _event(
+                orientation,
+                commit,
+                composition,
+                pending_transition=preflight_transition,
+                admitted_actions=({
+                    "type": "answer_opening_question",
+                    "action_id": "action-1",
+                    "owner": "orientation",
+                    "effect": "read_only",
+                    "group": "preflight_smoke_execution",
+                    "argument_value_hashes": {},
+                },),
+            ),
+            pending_contract=pending_contract,
+            render_manifest={
+                "language": "en",
+                "fragment_count": 1,
+                "fragment_hashes": [terminal_response_hash],
+                "pending_contract_hash": pending_contract_hash,
+                "result": "blocked",
+            },
+            observation=f"{rendered_explanation.text}\n{pending_text}",
+        )
+        satisfied, details = POSTCONDITION_EVALUATORS[
+            "execution_stage_explained"
+        ](_context(complete_event))
+        self.assertTrue(satisfied, details)
+        self.assertEqual(
+            details["matches"][0]["message_id"],
+            "harness.orientation.consultation.preflight_smoke",
+        )
+
+        generic_fragment = {
+            "message_id": "harness.orientation.consultation.requirements",
+            "render_hash": "7" * 64,
+            "role": "message",
+            "semantic_hash": "8" * 64,
+        }
+        generic_commit = _hashed({
+            **{
+                key: value
+                for key, value in commit.items()
+                if key != "receipt_id"
+            },
+            "response_fragments": [generic_fragment],
+        })
+        generic_composition = _hashed({
+            **{
+                key: value
+                for key, value in composition.items()
+                if key != "receipt_id"
+            },
+            "fragments": [generic_fragment],
+        })
+        generic_event = replace(
+            _event(
+                orientation,
+                generic_commit,
+                generic_composition,
+                pending_transition=preflight_transition,
+            ),
+            render_manifest={
+                "language": "en",
+                "fragment_count": 1,
+                "fragment_hashes": ["7" * 64],
+                "pending_contract_hash": "1" * 64,
+                "result": "blocked",
+            },
+        )
+        generic, generic_details = POSTCONDITION_EVALUATORS[
+            "execution_stage_explained"
+        ](_context(generic_event))
+        self.assertFalse(generic, generic_details)
+
+        cross_turn_commit = _hashed({
+            **{
+                key: value
+                for key, value in commit.items()
+                if key not in {"receipt_id", "turn_index"}
+            },
+            "turn_index": 2,
+        })
+        cross_turn_composition = _hashed({
+            **{
+                key: value
+                for key, value in composition.items()
+                if key not in {"receipt_id", "turn_index"}
+            },
+            "turn_index": 2,
+        })
+        cross_turn, cross_turn_details = POSTCONDITION_EVALUATORS[
+            "execution_stage_explained"
+        ](
+            _context(
+                _event(orientation, turn_index=1),
+                replace(
+                    _event(
+                        cross_turn_commit,
+                        cross_turn_composition,
+                        turn_index=2,
+                        pending_transition=preflight_transition,
+                    ),
+                    render_manifest={
+                        "language": "en",
+                        "fragment_count": 1,
+                        "fragment_hashes": ["5" * 64],
+                        "pending_contract_hash": "1" * 64,
+                        "result": "blocked",
+                    },
+                ),
+            )
+        )
+        self.assertFalse(cross_turn, cross_turn_details)
+
+        missing_composition, missing_details = POSTCONDITION_EVALUATORS[
+            "execution_stage_explained"
+        ](
+            _context(
+                replace(
+                    _event(
+                        orientation,
+                        commit,
+                        pending_transition=preflight_transition,
+                    ),
+                    render_manifest=complete_event.render_manifest,
+                )
+            )
+        )
+        self.assertFalse(missing_composition, missing_details)
+
+        mismatched_composition = _hashed({
+            **{
+                key: value
+                for key, value in composition.items()
+                if key != "receipt_id"
+            },
+            "fragments": [{
+                **explanation_fragment,
+                "render_hash": "9" * 64,
+            }],
+        })
+        mismatched, mismatched_details = POSTCONDITION_EVALUATORS[
+            "execution_stage_explained"
+        ](
+            _context(
+                replace(
+                    _event(
+                        orientation,
+                        commit,
+                        mismatched_composition,
+                        pending_transition=preflight_transition,
+                    ),
+                    render_manifest=complete_event.render_manifest,
+                )
+            )
+        )
+        self.assertFalse(mismatched, mismatched_details)
+
+        wrong_stage, wrong_stage_details = POSTCONDITION_EVALUATORS[
+            "execution_stage_explained"
+        ](
+            _context(
+                replace(
+                    _event(orientation, commit, composition),
+                    render_manifest=complete_event.render_manifest,
+                )
+            )
+        )
+        self.assertFalse(wrong_stage, wrong_stage_details)
 
     def test_read_only_consultation_positive_and_material_mutation_negative_side(
         self,
     ) -> None:
+        capabilities_projection = _orientation_projection(
+            pending_id="CLOUD_REGION",
+        )
         body = {
             "receipt_type": "orientation_response",
-            "schema_version": 1,
+            "schema_version": 3,
             "owner": "orientation",
             "turn_index": 1,
             "topic": "capabilities",
@@ -2044,8 +3023,12 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
             "action_id": "action-1",
             "pending_contract_hash": "1" * 64,
             "response_hash": "2" * 64,
-            "projection_fields": ["chain", "pending_id"],
-            "state_projection_hash": "3" * 64,
+            "state_projection": capabilities_projection,
+            "projection_fields": sorted(capabilities_projection),
+            "state_projection_hash": content_hash(
+                capabilities_projection
+            ),
+            "source_receipts": [],
             "read_only": True,
         }
         receipt = _hashed(body)
@@ -2102,20 +3085,98 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
         }
         self.assertEqual(unexpectedly_satisfied, {})
 
+    def test_admission_lineage_accepts_an_evidenced_read_only_turn(self) -> None:
+        satisfied, details = POSTCONDITION_EVALUATORS[
+            "admitted_mutations_only"
+        ](_context(_event()))
+
+        self.assertTrue(satisfied, details)
+        self.assertEqual(details["event_count"], 1)
+        self.assertEqual(details["mutation_count"], 0)
+
+    def test_runtime_transition_consumers_require_a_valid_domain_commit(
+        self,
+    ) -> None:
+        from agent.harness.graph import _pending_consumer_action_ids
+
+        committed = _domain_commit(
+            action_id="executed",
+            owner="chain_rpc",
+        )
+        preserved = _hashed({
+            **{
+                key: value
+                for key, value in _domain_commit(
+                    action_id="read-only",
+                    owner="orientation",
+                ).items()
+                if key != "receipt_id"
+            },
+            "pending_after_hash": "1" * 64,
+        })
+        multi_action = _hashed({
+            **{
+                key: value
+                for key, value in committed.items()
+                if key != "receipt_id"
+            },
+            "consumed_action_ids": ["executed", "unrelated"],
+        })
+        state = {
+            "turn_index": 1,
+            "turn_context": {
+                "control_receipts": [
+                    committed,
+                    preserved,
+                    {
+                        **committed,
+                        "consumed_action_ids": ["forged"],
+                    },
+                    multi_action,
+                ],
+            },
+        }
+
+        self.assertEqual(
+            _pending_consumer_action_ids(
+                state,
+                [
+                    {"action_id": "executed"},
+                    {"action_id": "read-only"},
+                    {"action_id": "admitted-only"},
+                    {"action_id": "forged"},
+                    {"action_id": "unrelated"},
+                ],
+            ),
+            ["executed"],
+        )
+
     def test_resume_contract_and_evidence_classification_use_structured_evidence(
         self,
     ) -> None:
         resume_contract = {
             "id": "resume_harness_session",
             "options": [
-                {"id": "1", "expected_patch": {"resume_context": {}}},
-                {"id": "2", "expected_patch": {"resume_context": {}}},
+                {
+                    "id": "1",
+                    "value": "continue",
+                    "expected_patch": {"resume_context": {}},
+                },
+                {
+                    "id": "2",
+                    "value": "modify",
+                    "expected_patch": {"resume_context": {}},
+                },
             ],
         }
         resume_event = replace(
             _event(),
             pending_question_id="resume_harness_session",
             pending_contract=resume_contract,
+            render_manifest={
+                "pending_contract_hash": content_hash(resume_contract),
+                "result": {"question_id": "resume_harness_session"},
+            },
         )
         context = _context(
             resume_event,
@@ -2159,9 +3220,280 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
         self.assertFalse(exposed)
         self.assertEqual(details["matched_pending_contract_hashes"], [])
 
+        resolution_event = _event(
+            _pending_receipt(
+                turn_index=2,
+                pending_id="resume_harness_session",
+                pending_contract_hash=content_hash(resume_contract),
+                selected_option_id="1",
+                selected_value_hash=content_hash("continue"),
+                resolved_action_id="resume-action",
+            ),
+            _domain_commit(
+                turn_index=2,
+                action_id="resume-action",
+                owner="orientation",
+            ),
+            turn_index=2,
+            admitted_actions=({
+                "type": "answer_pending",
+                "action_id": "resume-action",
+                "owner": "orientation",
+                "effect": "workflow_navigation",
+                "group": "opening",
+                "argument_value_hashes": {},
+            },),
+            pending_transition={
+                "transition": "consumed",
+                "before_id": "resume_harness_session",
+                "before_group": "opening",
+                "before_hash": content_hash(resume_contract),
+                "after_id": "",
+                "after_group": "",
+                "after_hash": content_hash({}),
+                "consumer_action_ids": ["resume-action"],
+            },
+        )
+        with patch(
+            "tests.agent_live.runtime_checkpoint.reviewed_scenario",
+            return_value=SimpleNamespace(question=resume_contract),
+        ):
+            exposed, details = POSTCONDITION_EVALUATORS[
+                "resume_action_contract_exposed"
+            ](
+                _context(
+                    resume_event,
+                    resolution_event,
+                    schedule=SimpleNamespace(
+                        start_scenario="resume-scenario",
+                    ),
+                )
+            )
+        self.assertTrue(exposed, details)
+        self.assertEqual(
+            details["matched_resolution_turn_indexes"],
+            [2],
+        )
+        self.assertEqual(
+            details["matched_resolution_option_semantic_hashes"],
+            [content_hash(resume_contract["options"][0])],
+        )
+
+        wrong_hash_resolution = _event(
+            _pending_receipt(
+                turn_index=2,
+                pending_id="resume_harness_session",
+                pending_contract_hash="f" * 64,
+                selected_option_id="1",
+                selected_value_hash=content_hash("continue"),
+                resolved_action_id="resume-action",
+            ),
+            turn_index=2,
+            admitted_actions=resolution_event.admitted_action_provenance,
+            pending_transition={
+                **resolution_event.pending_transition,
+                "before_hash": "f" * 64,
+            },
+        )
+        with patch(
+            "tests.agent_live.runtime_checkpoint.reviewed_scenario",
+            return_value=SimpleNamespace(question=resume_contract),
+        ):
+            exposed, details = POSTCONDITION_EVALUATORS[
+                "resume_action_contract_exposed"
+            ](
+                _context(
+                    resume_event,
+                    wrong_hash_resolution,
+                    schedule=SimpleNamespace(
+                        start_scenario="resume-scenario",
+                    ),
+                )
+            )
+        self.assertFalse(exposed, details)
+        self.assertEqual(details["matched_resolution_turn_indexes"], [])
+        self.assertEqual(
+            details["matched_turn_indexes"],
+            [1],
+        )
+        self.assertEqual(
+            len(details["mismatched_resolution_receipts"]),
+            1,
+        )
+
+        chain_intake_event = _event(
+            _domain_commit(
+                action_id="chain-intake",
+                owner="chain_rpc",
+            ),
+            admitted_actions=({
+                "type": "request_chain_selection",
+                "action_id": "chain-intake",
+                "owner": "chain_rpc",
+                "effect": "workflow_navigation",
+                "group": "chain_identity",
+                "argument_value_hashes": {},
+            },),
+            pending_transition={
+                "transition": "created",
+                "before_id": "",
+                "before_group": "",
+                "before_hash": "1" * 64,
+                "after_id": "chain_change_input",
+                "after_group": "chain_identity",
+                "after_hash": "2" * 64,
+                "consumer_action_ids": ["chain-intake"],
+            },
+        )
+        chain_intake_event = replace(
+            chain_intake_event,
+            admitted_action_types=("request_chain_selection",),
+        )
+        routed, details = POSTCONDITION_EVALUATORS[
+            "new_chain_request_routed"
+        ](_context(chain_intake_event))
+        self.assertTrue(routed, details)
+        self.assertEqual(details["routed_action_count"], 1)
+        self.assertEqual(details["typed_intake_count"], 1)
+
+        route_without_intake = _event(
+            admitted_actions=({
+                "type": "change_chain",
+                "action_id": "chain-change",
+                "owner": "chain_rpc",
+                "effect": "state_mutation",
+                "group": "chain_identity",
+                "argument_value_hashes": {},
+            },),
+        )
+        route_without_intake = replace(
+            route_without_intake,
+            admitted_action_types=("change_chain",),
+        )
+        route_only, route_only_details = POSTCONDITION_EVALUATORS[
+            "new_chain_request_routed"
+        ](_context(route_without_intake))
+        self.assertFalse(route_only, route_only_details)
+        self.assertEqual(route_only_details["routed_action_count"], 1)
+        self.assertEqual(route_only_details["typed_intake_count"], 0)
+
+        wrong_consumer_event = replace(
+            chain_intake_event,
+            pending_transition={
+                **chain_intake_event.pending_transition,
+                "consumer_action_ids": ["unrelated-action"],
+            },
+        )
+        routed, details = POSTCONDITION_EVALUATORS[
+            "new_chain_request_routed"
+        ](_context(wrong_consumer_event))
+        self.assertFalse(routed, details)
+
+        cross_turn_route = replace(
+            route_without_intake,
+            turn_index=1,
+        )
+        cross_turn_intake = _event(
+            turn_index=2,
+            pending_transition={
+                **chain_intake_event.pending_transition,
+                "consumer_action_ids": ["chain-change"],
+            },
+        )
+        routed, details = POSTCONDITION_EVALUATORS[
+            "new_chain_request_routed"
+        ](_context(cross_turn_route, cross_turn_intake))
+        self.assertFalse(routed, details)
+
+        unrelated_route_event = _event(
+            admitted_actions=({
+                "type": "change_group",
+                "action_id": "qps-route",
+                "owner": "coordinator",
+                "effect": "workflow_navigation",
+                "group": "qps_profile",
+                "argument_value_hashes": {},
+            },),
+            pending_transition={
+                **chain_intake_event.pending_transition,
+                "consumer_action_ids": ["qps-route"],
+            },
+        )
+        routed, details = POSTCONDITION_EVALUATORS[
+            "new_chain_request_routed"
+        ](_context(unrelated_route_event))
+        self.assertFalse(routed, details)
+
+        identity = _hashed({
+            "receipt_type": "chain_identity_resolution",
+            "schema_version": 2,
+            "owner": "chain_rpc",
+            "turn_index": 1,
+            "candidate_hash": "1" * 64,
+            "resolver_source": "llm",
+            "reference_kind": "named_identity",
+            "chain_exists": "unknown",
+            "canonical_name_hash": "2" * 64,
+            "possible_known_chain_hash": "3" * 64,
+            "adapter_family": "unknown",
+            "confidence": "low",
+            "google_search_invoked": False,
+            "google_search_available": False,
+            "search_evidence_hash": "4" * 64,
+            "confirmation_required": True,
+        })
+        named_route_event = _event(
+            identity,
+            _domain_commit(
+                action_id="named-chain-route",
+                owner="chain_rpc",
+            ),
+            admitted_actions=({
+                "type": "choose_chain",
+                "action_id": "named-chain-route",
+                "owner": "chain_rpc",
+                "effect": "state_mutation",
+                "group": "chain_identity",
+                "argument_value_hashes": {
+                    "chain_text": identity["candidate_hash"],
+                },
+            },),
+            pending_transition={
+                **chain_intake_event.pending_transition,
+                "consumer_action_ids": ["named-chain-route"],
+            },
+        )
+        routed, details = POSTCONDITION_EVALUATORS[
+            "new_chain_request_routed"
+        ](_context(named_route_event))
+        self.assertTrue(routed, details)
+        self.assertEqual(
+            details["matches"][0]["identity_receipt_ids"],
+            [identity["receipt_id"]],
+        )
+
+        cross_turn_identity = replace(
+            named_route_event,
+            control_receipts=(),
+        )
+        identity_turn_two = _hashed({
+            **{
+                key: value
+                for key, value in identity.items()
+                if key not in {"receipt_id", "turn_index"}
+            },
+            "turn_index": 2,
+        })
+        identity_only = _event(identity_turn_two, turn_index=2)
+        routed, details = POSTCONDITION_EVALUATORS[
+            "new_chain_request_routed"
+        ](_context(cross_turn_identity, identity_only))
+        self.assertFalse(routed, details)
+
+        orientation_projection = _orientation_projection()
         orientation_body = {
             "receipt_type": "orientation_response",
-            "schema_version": 1,
+            "schema_version": 3,
             "owner": "orientation",
             "turn_index": 1,
             "topic": "capabilities",
@@ -2169,8 +3501,12 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
             "action_id": "action-1",
             "pending_contract_hash": "1" * 64,
             "response_hash": "2" * 64,
-            "projection_fields": ["chain"],
-            "state_projection_hash": "3" * 64,
+            "state_projection": orientation_projection,
+            "projection_fields": sorted(orientation_projection),
+            "state_projection_hash": content_hash(
+                orientation_projection
+            ),
+            "source_receipts": [],
             "read_only": True,
         }
         evidence_body = {
@@ -2208,6 +3544,320 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
             )
         )
         self.assertTrue(counted, details)
+
+    def test_evidence_analysis_requires_a_signed_visible_response(self) -> None:
+        body = {
+            "receipt_type": "analysis_invocation",
+            "receipt_version": 2,
+            "turn_index": 2,
+            "owner": "analysis",
+            "source_kind": "active_block",
+            "block_id": "1" * 64,
+            "evidence_hash": "2" * 64,
+            "question_hash": "3" * 64,
+            "analysis_engine": "configured_llm",
+            "invoked": True,
+            "response_message_ids": ["analysis.model_document"],
+            "response_render_hash": "4" * 64,
+            "response_rendered": True,
+            "response_semantic_hash": "5" * 64,
+        }
+        receipt = {**body, "receipt_id": analysis_hash(body)}
+
+        satisfied, details = POSTCONDITION_EVALUATORS[
+            "evidence_analysis_returned"
+        ](_context(_event(receipt, turn_index=2)))
+
+        self.assertTrue(satisfied, details)
+
+        invisible_body = {
+            **body,
+            "response_message_ids": [],
+            "response_render_hash": "",
+            "response_rendered": False,
+            "response_semantic_hash": "",
+        }
+        invisible_receipt = {
+            **invisible_body,
+            "receipt_id": analysis_hash(invisible_body),
+        }
+        satisfied, _details = POSTCONDITION_EVALUATORS[
+            "evidence_analysis_returned"
+        ](_context(_event(invisible_receipt, turn_index=2)))
+
+        self.assertFalse(satisfied)
+
+    def test_rpc_schema_evidence_requires_correlated_exchange_and_progression(
+        self,
+    ) -> None:
+        progression = _event(
+            _rpc_schema_receipt(turn_index=1),
+            _rpc_catalog_transition_receipt(
+                turn_index=1,
+                producer_action_id="append-request",
+            ),
+            _rpc_catalog_transition_receipt(
+                turn_index=1,
+                revision=2,
+                producer_action_id="append-request",
+                command="correct_draft",
+            ),
+            _domain_commit(
+                action_id="append-request",
+                owner="chain_rpc",
+            ),
+            turn_index=1,
+            admitted_actions=({
+                "type": "rpc_catalog_command",
+                "action_id": "append-request",
+                "owner": "chain_rpc",
+                "effect": "state_mutation",
+                "group": "endpoint_process",
+                "argument_value_hashes": {
+                    "catalog_command": _value_hash("append_evidence"),
+                    "source_evidence": RPC_SOURCE_ACTION_VALUE_HASH,
+                },
+            },),
+            pending_transition={
+                "transition": "replaced",
+                "before_id": "custom_rpc_schema_evidence",
+                "before_group": "endpoint_process",
+                "before_hash": "1" * 64,
+                "after_id": "custom_rpc_schema_confirm",
+                "after_group": "endpoint_process",
+                "after_hash": "2" * 64,
+                "consumer_action_ids": ["append-request"],
+            },
+        )
+        satisfied, details = POSTCONDITION_EVALUATORS[
+            "rpc_schema_evidence_extracted"
+        ](_context(progression))
+
+        self.assertTrue(satisfied, details)
+        self.assertEqual(details["correlated_receipt_count"], 1)
+        self.assertEqual(details["progressed_turn_indexes"], [1])
+
+        mismatched = _event(
+            _rpc_schema_receipt(
+                turn_index=1,
+                matching_ids=False,
+            ),
+            _rpc_catalog_transition_receipt(turn_index=1),
+            turn_index=1,
+            admitted_actions=progression.admitted_action_provenance,
+            pending_transition=progression.pending_transition,
+        )
+        satisfied, _details = POSTCONDITION_EVALUATORS[
+            "rpc_schema_evidence_extracted"
+        ](_context(mismatched))
+        self.assertFalse(satisfied)
+
+        correlated = _event(
+            _rpc_schema_receipt(turn_index=2),
+            _rpc_catalog_transition_receipt(turn_index=2),
+            turn_index=2,
+        )
+        satisfied, _details = POSTCONDITION_EVALUATORS[
+            "rpc_schema_evidence_extracted"
+        ](_context(correlated))
+        self.assertFalse(satisfied)
+
+        wrong_command = _event(
+            _rpc_schema_receipt(turn_index=1),
+            _rpc_catalog_transition_receipt(
+                turn_index=1,
+                producer_action_id="append-request",
+            ),
+            _domain_commit(
+                action_id="append-request",
+                owner="chain_rpc",
+            ),
+            turn_index=1,
+            admitted_actions=({
+                **progression.admitted_action_provenance[0],
+                "argument_value_hashes": {
+                    "catalog_command": _value_hash("confirm_request"),
+                },
+            },),
+            pending_transition=progression.pending_transition,
+        )
+        satisfied, _details = POSTCONDITION_EVALUATORS[
+            "rpc_schema_evidence_extracted"
+        ](_context(wrong_command))
+        self.assertFalse(satisfied)
+
+        wrong_producer = replace(
+            progression,
+            control_receipts=(
+                _rpc_schema_receipt(
+                    turn_index=1,
+                    producer_action_id="other-action",
+                ),
+                _rpc_catalog_transition_receipt(
+                    turn_index=1,
+                    producer_action_id="append-request",
+                ),
+                _domain_commit(
+                    action_id="append-request",
+                    owner="chain_rpc",
+                ),
+            ),
+        )
+        satisfied, _details = POSTCONDITION_EVALUATORS[
+            "rpc_schema_evidence_extracted"
+        ](_context(wrong_producer))
+        self.assertFalse(satisfied)
+
+        wrong_revision = replace(
+            progression,
+            control_receipts=(
+                _rpc_schema_receipt(
+                    turn_index=1,
+                    catalog_revision=3,
+                ),
+                _rpc_catalog_transition_receipt(
+                    turn_index=1,
+                    revision=2,
+                    producer_action_id="append-request",
+                ),
+                _domain_commit(
+                    action_id="append-request",
+                    owner="chain_rpc",
+                ),
+            ),
+        )
+        satisfied, _details = POSTCONDITION_EVALUATORS[
+            "rpc_schema_evidence_extracted"
+        ](_context(wrong_revision))
+        self.assertFalse(satisfied)
+
+    def test_schema_intake_loop_requires_repeated_evidence_question(self) -> None:
+        loop = _event(
+            _domain_commit(
+                action_id="append-evidence",
+                owner="chain_rpc",
+            ),
+            turn_index=1,
+            admitted_actions=({
+                "type": "rpc_catalog_command",
+                "action_id": "append-evidence",
+                "owner": "chain_rpc",
+                "effect": "state_mutation",
+                "group": "endpoint_process",
+                "argument_value_hashes": {
+                    "catalog_command": _value_hash("append_evidence"),
+                },
+            },),
+            pending_transition={
+                "transition": "preserved",
+                "before_id": "custom_rpc_schema_evidence",
+                "before_group": "endpoint_process",
+                "before_hash": "1" * 64,
+                "after_id": "custom_rpc_schema_evidence",
+                "after_group": "endpoint_process",
+                "after_hash": "1" * 64,
+                "consumer_action_ids": ["append-evidence"],
+            },
+        )
+        advanced = _event(
+            turn_index=2,
+            pending_transition={
+                "transition": "replaced",
+                "before_id": "custom_rpc_schema_evidence",
+                "before_group": "endpoint_process",
+                "before_hash": "1" * 64,
+                "after_id": "custom_rpc_schema_confirm",
+                "after_group": "endpoint_process",
+                "after_hash": "2" * 64,
+                "consumer_action_ids": ["append-evidence"],
+            },
+        )
+
+        looped, details = POSTCONDITION_EVALUATORS[
+            "schema_intake_looped"
+        ](_context(loop))
+        self.assertTrue(looped, details)
+
+        incremental = _event(
+            _rpc_catalog_transition_receipt(
+                turn_index=1,
+                producer_action_id="append-evidence",
+            ),
+            _domain_commit(
+                action_id="append-evidence",
+                owner="chain_rpc",
+            ),
+            turn_index=1,
+            admitted_actions=({
+                "type": "rpc_catalog_command",
+                "action_id": "append-evidence",
+                "owner": "chain_rpc",
+                "effect": "state_mutation",
+                "group": "endpoint_process",
+                "argument_value_hashes": {
+                    "catalog_command": _value_hash("append_evidence"),
+                },
+            },),
+            pending_transition=loop.pending_transition,
+        )
+        looped, details = POSTCONDITION_EVALUATORS[
+            "schema_intake_looped"
+        ](_context(incremental))
+        self.assertFalse(looped, details)
+
+        looped, details = POSTCONDITION_EVALUATORS[
+            "schema_intake_looped"
+        ](_context(advanced))
+        self.assertFalse(looped, details)
+
+        confirmation_loop = _event(
+            _domain_commit(
+                turn_index=3,
+                action_id="confirm-schema",
+                owner="chain_rpc",
+            ),
+            turn_index=3,
+            admitted_actions=({
+                "type": "rpc_catalog_command",
+                "action_id": "confirm-schema",
+                "owner": "chain_rpc",
+                "effect": "state_mutation",
+                "group": "endpoint_process",
+                "argument_value_hashes": {
+                    "catalog_command": _value_hash("confirm_request"),
+                },
+            },),
+            pending_transition={
+                "transition": "preserved",
+                "before_id": "custom_rpc_schema_confirm",
+                "before_group": "endpoint_process",
+                "before_hash": "3" * 64,
+                "after_id": "custom_rpc_schema_confirm",
+                "after_group": "endpoint_process",
+                "after_hash": "3" * 64,
+                "consumer_action_ids": ["confirm-schema"],
+            },
+        )
+        looped, details = POSTCONDITION_EVALUATORS[
+            "schema_intake_looped"
+        ](_context(confirmation_loop))
+        self.assertTrue(looped, details)
+
+        consultation_detour = replace(
+            confirmation_loop,
+            admitted_action_provenance=({
+                "type": "answer_opening_question",
+                "action_id": "confirm-schema",
+                "owner": "orientation",
+                "effect": "read_only",
+                "group": "orientation",
+                "argument_value_hashes": {},
+            },),
+        )
+        looped, details = POSTCONDITION_EVALUATORS[
+            "schema_intake_looped"
+        ](_context(consultation_detour))
+        self.assertFalse(looped, details)
 
 
 if __name__ == "__main__":

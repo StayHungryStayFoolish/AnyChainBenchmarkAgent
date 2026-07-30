@@ -20,7 +20,12 @@ from typing import Any, Mapping, Sequence
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from agent.harness.control_receipts import validate_coordinator_control_receipt
+from agent.harness.control_receipts import (
+    execution_intent_projection,
+    execution_side_effect_receipt_id,
+    execution_side_effect_projection,
+    validate_coordinator_control_receipt,
+)
 from agent.harness.invariants import validate_state
 from agent.harness.runtime_identity import repository_revision
 from agent.harness.state import migrate_state, project_checkpoint_state
@@ -483,10 +488,14 @@ def _approval_chain(
         intent.get("status") != "succeeded"
         or intent.get("intent_id")
         != approval_receipt.get("side_effect_intent_id")
-        or _content_hash(intent)
+        or _content_hash(execution_intent_projection(intent))
         != approval_receipt.get("side_effect_intent_hash")
         or intent.get("action_id") != approval_id
         or intent.get("operation") != approval_action_type
+        or intent.get("execution_request_id")
+        != approval_receipt.get("execution_request_id")
+        or intent.get("idempotency_key")
+        != f"harness:{approval_receipt.get('execution_request_id')}"
         or intent.get("request_fingerprint")
         != approval_receipt.get("request_fingerprint")
         or _content_hash(intent.get("request") or {})
@@ -496,13 +505,15 @@ def _approval_chain(
         or side_effect_receipt.get("status") != "succeeded"
         or side_effect_receipt.get("receipt_id")
         != approval_receipt.get("side_effect_receipt_id")
-        or _content_hash(side_effect_receipt)
+        or _content_hash(execution_side_effect_projection(side_effect_receipt))
         != approval_receipt.get("side_effect_receipt_hash")
         or side_effect_receipt.get("intent_id") != intent.get("intent_id")
         or side_effect_receipt.get("action_id") != approval_id
         or side_effect_receipt.get("idempotency_key")
         != intent.get("idempotency_key")
         or side_effect_receipt.get("job_id") != job_id
+        or side_effect_receipt.get("receipt_id")
+        != execution_side_effect_receipt_id(side_effect_receipt)
         or not verify_job_receipt(submission)
         or submission.get("job_id") != job_id
         or submission.get("receipt_id")

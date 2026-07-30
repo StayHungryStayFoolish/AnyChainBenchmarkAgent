@@ -7,12 +7,14 @@ import json
 from copy import deepcopy
 from typing import Any, Mapping
 
+from ..advisory import trusted_chain_identity_search_result
 from ..state import AgentGraphState
 
 
-CHAIN_IDENTITY_RECEIPT_SCHEMA_VERSION = 1
+CHAIN_IDENTITY_RECEIPT_SCHEMA_VERSION = 2
 _CHAIN_EXISTS_VALUES = {"true", "false", "unknown"}
 _RESOLVER_SOURCES = {"llm", "planner_proposal"}
+_REFERENCE_KINDS = {"named_identity", "generic_reference", "uncertain"}
 
 
 def _hash(value: Any) -> str:
@@ -61,11 +63,27 @@ def emit_chain_identity_resolution_receipt(
         if chain_exists is False
         else "unknown"
     )
-    search = (
-        dict(resolution.get("search_result") or {})
-        if isinstance(resolution.get("search_result"), Mapping)
-        else {}
+    search = trusted_chain_identity_search_result(resolution)
+    inferred_reference_kind = (
+        "named_identity"
+        if (
+            isinstance(resolution.get("chain_exists"), bool)
+            or str(resolution.get("canonical_chain_name") or "").strip()
+            or str(resolution.get("possible_known_chain") or "").strip()
+        )
+        else "uncertain"
     )
+    reference_kind = str(
+        resolution.get("reference_kind") or inferred_reference_kind
+    ).strip().lower()
+    if reference_kind not in _REFERENCE_KINDS:
+        reference_kind = "uncertain"
+    unresolved_reference = reference_kind in {
+        "generic_reference",
+        "uncertain",
+    }
+    if unresolved_reference:
+        exists_value = "unknown"
     body = {
         "receipt_type": "chain_identity_resolution",
         "schema_version": CHAIN_IDENTITY_RECEIPT_SCHEMA_VERSION,
@@ -73,14 +91,23 @@ def emit_chain_identity_resolution_receipt(
         "turn_index": int(state.get("turn_index") or 0),
         "candidate_hash": _hash(str(candidate or "")),
         "resolver_source": str(resolver_source or ""),
+        "reference_kind": reference_kind,
         "chain_exists": exists_value,
         "canonical_name_hash": _hash(
-            str(resolution.get("canonical_chain_name") or "")
+            ""
+            if unresolved_reference
+            else str(resolution.get("canonical_chain_name") or "")
         ),
         "possible_known_chain_hash": _hash(
-            str(resolution.get("possible_known_chain") or "")
+            ""
+            if unresolved_reference
+            else str(resolution.get("possible_known_chain") or "")
         ),
-        "adapter_family": str(resolution.get("adapter_family") or "unknown"),
+        "adapter_family": (
+            "unknown"
+            if unresolved_reference
+            else str(resolution.get("adapter_family") or "unknown")
+        ),
         "confidence": str(resolution.get("confidence") or "low"),
         "google_search_invoked": bool(search),
         "google_search_available": search.get("available") is True,
@@ -106,6 +133,7 @@ def validate_chain_identity_receipt(
         "turn_index",
         "candidate_hash",
         "resolver_source",
+        "reference_kind",
         "chain_exists",
         "canonical_name_hash",
         "possible_known_chain_hash",
@@ -127,6 +155,7 @@ def validate_chain_identity_receipt(
         or not isinstance(receipt.get("turn_index"), int)
         or isinstance(receipt.get("turn_index"), bool)
         or receipt.get("resolver_source") not in _RESOLVER_SOURCES
+        or receipt.get("reference_kind") not in _REFERENCE_KINDS
         or receipt.get("chain_exists") not in _CHAIN_EXISTS_VALUES
         or not str(receipt.get("adapter_family") or "")
         or not str(receipt.get("confidence") or "")
@@ -137,6 +166,17 @@ def validate_chain_identity_receipt(
         or (
             receipt.get("google_search_available") is True
             and receipt.get("google_search_invoked") is not True
+        )
+        or (
+            receipt.get("reference_kind")
+            in {"generic_reference", "uncertain"}
+            and (
+                receipt.get("chain_exists") != "unknown"
+                or receipt.get("adapter_family") != "unknown"
+                or receipt.get("google_search_invoked") is True
+                or receipt.get("canonical_name_hash") != _hash("")
+                or receipt.get("possible_known_chain_hash") != _hash("")
+            )
         )
     ):
         return False, "chain-identity receipt semantics are invalid"

@@ -40,6 +40,23 @@ class AnalysisOwnerReceiptTest(unittest.TestCase):
             if item.get("receipt_type") == receipt_type
         ]
 
+    def _invocation_receipt(self, state):
+        action = ActionProposal(
+            action_id="analysis-evidence",
+            action_type="analyze_evidence",
+            arguments={
+                "evidence": "ERROR connection refused",
+                "question": "What failed?",
+            },
+            confidence="high",
+        )
+        with patch(
+            "agent.harness.domains.analysis.analyze_evidence_with_model",
+            return_value="The endpoint refused the connection.",
+        ):
+            apply_analysis_action(state, action)
+        return deepcopy(self._receipts(state, "analysis_invocation")[-1])
+
     @staticmethod
     def _verified_job(job_id: str, status: str = "completed") -> dict:
         from agent.runners.job_manager import _job_read_receipt
@@ -250,9 +267,11 @@ class AnalysisOwnerReceiptTest(unittest.TestCase):
             result = apply_analysis_action(state, action)
 
         analyze.assert_not_called()
-        receipt = self._receipts(state, "analysis_invocation")[-1]
-        self.assertEqual(receipt["source_kind"], "missing")
-        self.assertFalse(receipt["invoked"])
+        self.assertEqual(self._receipts(state, "analysis_invocation"), [])
+        receipt = self._receipts(state, "analysis_evidence_block")[-1]
+        self.assertEqual(receipt["operation"], "start")
+        self.assertEqual(receipt["input_disposition"], "request_only")
+        self.assertEqual(receipt["line_count"], 0)
         rendered = render_fragment(result.response_fragments[0], "en")
         self.assertEqual(
             receipt["response_semantic_hash"],
@@ -371,14 +390,7 @@ class AnalysisOwnerReceiptTest(unittest.TestCase):
 
     def test_version_one_receipt_fails_closed(self) -> None:
         state = self._state("old-analysis-receipt")
-        action = ActionProposal(
-            action_id="analysis-help",
-            action_type="analyze_evidence",
-            arguments={},
-            confidence="high",
-        )
-        apply_analysis_action(state, action)
-        receipt = deepcopy(self._receipts(state, "analysis_invocation")[-1])
+        receipt = self._invocation_receipt(state)
         receipt["receipt_version"] = ANALYSIS_RECEIPT_VERSION - 1
         receipt["receipt_id"] = analysis_hash({
             key: value for key, value in receipt.items() if key != "receipt_id"
@@ -391,14 +403,7 @@ class AnalysisOwnerReceiptTest(unittest.TestCase):
 
     def test_rehashed_render_identity_mismatch_fails_closed(self) -> None:
         state = self._state("render-identity-mismatch")
-        action = ActionProposal(
-            action_id="analysis-help",
-            action_type="analyze_evidence",
-            arguments={},
-            confidence="high",
-        )
-        apply_analysis_action(state, action)
-        receipt = deepcopy(self._receipts(state, "analysis_invocation")[-1])
+        receipt = self._invocation_receipt(state)
         receipt["response_rendered"] = False
         receipt["receipt_id"] = analysis_hash({
             key: value for key, value in receipt.items() if key != "receipt_id"
@@ -434,15 +439,8 @@ class AnalysisOwnerReceiptTest(unittest.TestCase):
 
     def test_tampered_receipt_fails_closed(self) -> None:
         state = self._state("tampered-analysis-receipt")
-        action = ActionProposal(
-            action_id="analysis-help",
-            action_type="analyze_evidence",
-            arguments={},
-            confidence="high",
-        )
-        apply_analysis_action(state, action)
-        receipt = deepcopy(self._receipts(state, "analysis_invocation")[-1])
-        receipt["invoked"] = True
+        receipt = self._invocation_receipt(state)
+        receipt["invoked"] = False
 
         valid, reason = validate_analysis_receipt(receipt)
 
@@ -451,15 +449,8 @@ class AnalysisOwnerReceiptTest(unittest.TestCase):
 
     def test_rehashed_semantically_inconsistent_receipt_fails_closed(self) -> None:
         state = self._state("inconsistent-analysis-receipt")
-        action = ActionProposal(
-            action_id="analysis-help",
-            action_type="analyze_evidence",
-            arguments={},
-            confidence="high",
-        )
-        apply_analysis_action(state, action)
-        receipt = deepcopy(self._receipts(state, "analysis_invocation")[-1])
-        receipt["invoked"] = True
+        receipt = self._invocation_receipt(state)
+        receipt["source_kind"] = "missing"
         receipt["receipt_id"] = analysis_hash({
             key: value for key, value in receipt.items() if key != "receipt_id"
         })

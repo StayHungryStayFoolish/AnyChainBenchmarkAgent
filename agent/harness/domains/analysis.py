@@ -94,6 +94,7 @@ __all__ = [
     "apply_analysis_action",
     "analyze_saved_evidence_result",
     "analyze_inline_evidence_result",
+    "bounded_evidence_input",
     "cancel_evidence_collection",
     "continue_evidence_collection",
     "evidence_collection_complete",
@@ -101,6 +102,7 @@ __all__ = [
     "finish_evidence_collection",
     "is_evidence_completion_command",
     "non_empty_evidence_lines",
+    "open_freeform_evidence_collection",
     "prompt_evidence_collection_waiting",
     "pause_evidence_collection",
     "report_artifact_entry_result",
@@ -207,16 +209,14 @@ def _apply_analysis_action(state: AgentGraphState, action: ActionProposal) -> Ha
         if collecting:
             evidence = "\n".join(str(item) for item in collecting.get("lines") or [] if str(item).strip())
         if not evidence:
-            response_fragment = _fragment("analysis.response.evidence_help")
-            emit_analysis_invocation_receipt(
+            return open_freeform_evidence_collection(
                 state,
-                source_kind="missing",
-                evidence="",
-                question=str(action.arguments.get("question") or state.get("last_user_input") or ""),
-                response_fragments=(response_fragment,),
-                language=str(state.get("language") or "en"),
-                terminal_rendered=True,
-                invoked=False,
+                question=str(
+                    action.arguments.get("question")
+                    or state.get("last_user_input")
+                    or ""
+                ),
+                consumed_action_id=action.action_id,
             )
             return HandlerResult(
                 consumed_action_ids=(action.action_id,),
@@ -355,6 +355,52 @@ def start_evidence_collection(
     )
 
 
+def open_freeform_evidence_collection(
+    state: AgentGraphState,
+    *,
+    question: str,
+    consumed_action_id: str,
+) -> HandlerResult:
+    """Open one empty log-evidence transaction without storing its request."""
+
+    question_contract = {
+        "id": "freeform_evidence",
+        "kind": "log_evidence",
+        "analysis_question": str(question or "").strip(),
+    }
+    lines: list[str] = []
+    block_id = evidence_block_id(question_contract, lines)
+    collecting = {
+        "question": question_contract,
+        "lines": lines,
+        "language": str(state.get("language") or "en"),
+        "status": "active",
+        "block_id": block_id,
+        "analysis_requested": True,
+    }
+    response_fragment = _fragment("analysis.response.evidence_help")
+    emit_evidence_block_receipt(
+        state,
+        operation="start",
+        question=question_contract,
+        lines=lines,
+        input_text=str(question or ""),
+        input_disposition="request_only",
+        status="active",
+        response_fragments=(response_fragment,),
+        language=str(state.get("language") or "en"),
+        terminal_rendered=True,
+        block_id=block_id,
+    )
+    return HandlerResult(
+        delta=StateDelta.set_values({"evidence_collection": collecting}),
+        consumed_action_ids=(consumed_action_id,),
+        response_fragments=(response_fragment,),
+        completion="in_progress",
+        stop_after_response=True,
+    )
+
+
 def continue_evidence_collection(
     state: AgentGraphState,
     text: str,
@@ -374,6 +420,7 @@ def continue_evidence_collection(
         "language": language,
         "status": "active",
         "block_id": block_id,
+        "analysis_requested": bool(active.get("analysis_requested")),
     }
 
     if is_evidence_completion_command(raw):
@@ -387,7 +434,11 @@ def continue_evidence_collection(
             status="active",
             block_id=block_id,
         )
-        return finish_evidence_collection(state, normalized)
+        return finish_evidence_collection(
+            state,
+            normalized,
+            analysis_requested=bool(normalized.get("analysis_requested")),
+        )
 
     if not raw.strip():
         response_fragment = _fragment(_evidence_waiting_message_id(question))
@@ -414,7 +465,8 @@ def continue_evidence_collection(
             disposition="collecting",
         )
 
-    lines.append(raw)
+    incoming_lines, terminated = bounded_evidence_input(raw)
+    lines.extend(incoming_lines)
     normalized["lines"] = lines
     collection_complete = evidence_collection_complete(lines)
     response_fragment = _fragment(
@@ -435,8 +487,12 @@ def continue_evidence_collection(
         terminal_rendered=not collection_complete,
         block_id=block_id,
     )
-    if collection_complete:
-        return finish_evidence_collection(state, normalized)
+    if terminated or collection_complete:
+        return finish_evidence_collection(
+            state,
+            normalized,
+            analysis_requested=bool(normalized.get("analysis_requested")),
+        )
     return EvidenceCollectionOutcome(
         result=HandlerResult(
             delta=StateDelta.set_values({"evidence_collection": normalized}),
@@ -458,7 +514,13 @@ def prompt_evidence_collection_waiting(
     question = active.get("question") if isinstance(active.get("question"), dict) else {}
     lines = [str(item) for item in list(active.get("lines") or []) if str(item).strip()]
     language = str(active.get("language") or state.get("language") or "en")
-    normalized = {"question": dict(question), "lines": lines, "language": language, "status": "active"}
+    normalized = {
+        "question": dict(question),
+        "lines": lines,
+        "language": language,
+        "status": "active",
+        "analysis_requested": bool(active.get("analysis_requested")),
+    }
     block_id = str(active.get("block_id") or "") or evidence_block_id(question, lines)
     normalized["block_id"] = block_id
     response_fragment = _fragment(_evidence_waiting_message_id(question))
@@ -533,18 +595,42 @@ def finish_evidence_collection(
         evidence_buffer = [dict(item) for item in list(state.get("evidence_buffer") or [])]
         evidence_buffer.append({"text": collected_text})
         values["evidence_buffer"] = evidence_buffer
-        response_fragments = tuple([
-            _fragment(
-                "analysis.response.logs_saved",
-                arguments={"count": len(lines)},
-                kind="evidence",
-            ),
-            *(
-                [_fragment("analysis.response.analysis_hint")]
-                if analysis_requested
-                else []
-            ),
-        ])
+        response_fragments: tuple[ResponseFragment, ...]
+        if analysis_requested or bool(active.get("analysis_requested")):
+            question_text = str(
+                question.get("analysis_question") or collected_text
+            )
+            response = analyze_evidence_with_model(
+                state,
+                collected_text,
+                question_text,
+            )
+            analysis_fragment = _analysis_document(
+                response,
+                source_kind="active_block",
+                language=language,
+                evidence_hash=analysis_hash(collected_text),
+            )
+            response_fragments = (analysis_fragment,)
+            emit_analysis_invocation_receipt(
+                state,
+                source_kind="active_block",
+                evidence=collected_text,
+                question=question_text,
+                response_fragments=response_fragments,
+                language=language,
+                terminal_rendered=True,
+                invoked=True,
+                block_id=block_id,
+            )
+        else:
+            response_fragments = (
+                _fragment(
+                    "analysis.response.logs_saved",
+                    arguments={"count": len(lines)},
+                    kind="evidence",
+                ),
+            )
         emit_evidence_block_receipt(
             state,
             operation="finish",
@@ -560,10 +646,12 @@ def finish_evidence_collection(
         return EvidenceCollectionOutcome(
             result=HandlerResult(
                 delta=StateDelta.set_values(values),
-                clear_pending=True,
                 response_fragments=response_fragments,
                 completion="completed",
                 stop_after_response=True,
+                suppress_pending_render=bool(
+                    analysis_requested or active.get("analysis_requested")
+                ),
             ),
             disposition="saved",
             collected_text=collected_text,
@@ -679,6 +767,20 @@ def non_empty_evidence_lines(text: str) -> list[str]:
 
     lines = [line.rstrip("\n") for line in str(text or "").splitlines() if line.strip()]
     return lines or [str(text or "").strip()]
+
+
+def bounded_evidence_input(text: str) -> tuple[list[str], bool]:
+    """Return non-empty payload lines before the first explicit terminator."""
+
+    payload: list[str] = []
+    terminated = False
+    for line in str(text or "").splitlines():
+        if is_evidence_completion_command(line):
+            terminated = True
+            break
+        if line.strip():
+            payload.append(line.rstrip("\n"))
+    return payload, terminated
 
 
 def evidence_collection_complete(lines: list[str]) -> bool:

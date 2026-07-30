@@ -98,7 +98,15 @@ _BLOCK_OPERATIONS = frozenset(
     {"start", "append", "ignore", "finish_requested", "finish", "pause", "resume", "cancel"}
 )
 _BLOCK_DISPOSITIONS = frozenset(
-    {"accepted", "blank_ignored", "completion", "pause", "resume", "cancel"}
+    {
+        "accepted",
+        "request_only",
+        "blank_ignored",
+        "completion",
+        "pause",
+        "resume",
+        "cancel",
+    }
 )
 _BLOCK_STATUSES = frozenset(
     {"active", "paused", "saved", "pending_answer", "empty", "cancelled"}
@@ -296,7 +304,6 @@ def validate_analysis_receipt(receipt: Mapping[str, Any]) -> tuple[bool, str]:
         if not _is_nonnegative_int(receipt.get("input_non_empty_line_count")):
             return False, "invalid input line count"
         expected = {
-            "start": ("accepted", "active"),
             "append": ("accepted", "active"),
             "ignore": ("blank_ignored", "active"),
             "finish_requested": ("completion", "active"),
@@ -308,6 +315,11 @@ def validate_analysis_receipt(receipt: Mapping[str, Any]) -> tuple[bool, str]:
             receipt.get("input_disposition"),
             receipt.get("status"),
         ) != expected:
+            return False, "inconsistent block lifecycle"
+        if receipt.get("operation") == "start" and (
+            receipt.get("input_disposition") not in {"accepted", "request_only"}
+            or receipt.get("status") != "active"
+        ):
             return False, "inconsistent block lifecycle"
         if receipt.get("operation") == "finish" and (
             receipt.get("input_disposition") != "completion"

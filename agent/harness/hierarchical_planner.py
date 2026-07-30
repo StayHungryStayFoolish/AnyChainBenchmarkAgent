@@ -31,6 +31,7 @@ from .action_registry import (
     registered_semantic_value_domains,
     semantic_grounding_arguments,
     semantic_value_domain_conflicts,
+    lower_empty_entry_action_to_registered_intake,
     validate_action_contract,
 )
 from .context import (
@@ -374,17 +375,45 @@ def compile_next_owner(
     output["stage_b_calls"] = int(output.get("stage_b_calls") or 0) + len(
         request_sizes
     )
-    if errors:
-        output["status"] = "failed"
-        output["errors"] = list(errors)
-        return output
     owner_documents = {
         str(key): dict(value)
         for key, value in dict(output.get("owner_documents") or {}).items()
         if isinstance(value, Mapping)
     }
+    owner_failures = [
+        dict(item)
+        for item in output.get("owner_failures") or ()
+        if isinstance(item, Mapping)
+    ]
+    if errors:
+        owner_document = {
+            "actions": [],
+            "bindings": [
+                {
+                    "unit_id": str(unit_id),
+                    "action_indexes": [],
+                    "disposition": "unresolved",
+                    "reason": (
+                        "The owning compiler could not produce a valid typed "
+                        "action after bounded repair."
+                    ),
+                }
+                for unit_id in request.get("unit_ids") or ()
+                if str(unit_id)
+            ],
+        }
+        owner_failures.append({
+            "owner": owner,
+            "unit_ids": [
+                str(unit_id)
+                for unit_id in request.get("unit_ids") or ()
+                if str(unit_id)
+            ],
+            "errors": list(errors),
+        })
     owner_documents[owner] = owner_document
     output["owner_documents"] = owner_documents
+    output["owner_failures"] = owner_failures
     output["owner_cursor"] = cursor + 1
     output["status"] = (
         "compile_owner" if cursor + 1 < len(requests) else "review_plan"
@@ -660,7 +689,15 @@ def review_semantic_plan(
     result = (
         _admitted_action_queue(plan, admission, state)
         if admission is not None and admission.valid and plan is not None
-        else _unresolved_action_queue(clauses, admission_errors)
+        else _unresolved_action_queue(
+            clauses,
+            admission_errors,
+            semantic_units=[
+                dict(item)
+                for item in candidate.get("semantic_units") or []
+                if isinstance(item, Mapping)
+            ],
+        )
     )
     return _with_metrics(
         result,
@@ -845,6 +882,10 @@ def _stage_a_prompt() -> str:
         "domain_request unit. Do not split its framing into a second pending_answer or "
         "unresolved demand unless that framing independently answers the active question or "
         "requests another operation. "
+        "Interrogative, permission-seeking, hedging, and politeness framing around one present "
+        "request belongs to that request. It is not a separate consultation or unresolved unit "
+        "unless the user independently asks for information beyond whether the requested "
+        "operation can proceed. "
         "A semantic option selection and adjacent prose that only explains the reason, uncertainty, "
         "basis, referential application, or declared completion effect for that same selection form "
         "one pending_answer operation even when punctuation or line breaks create several clauses. "
@@ -1795,6 +1836,9 @@ def _stage_a_admission_prompt() -> str:
         "unit already represents a compact registered-domain request, adjacent operation framing "
         "that adds no independent value, question, navigation, analysis, or mutation supports "
         "that unit; it is not a second pending answer or unresolved demand. "
+        "Interrogative, permission-seeking, hedging, or politeness wording that only frames "
+        "whether the same present request can proceed is redundant support for that request, "
+        "not an independent consultation or unresolved demand. "
         "An explicit keep, reuse, or reconfirm instruction for one concrete registered value "
         "is complete only when routed as the owning idempotent domain request; equality with "
         "current state does not make it context or redundant. A statement that a value or "
@@ -2252,7 +2296,13 @@ def _stage_b_prompt(owner: str) -> str:
         "value later does not supply that value and must not be compiled as a mutation. "
         "Do not add inferred "
         "identity, existence, protocol, canonical-name, or evidence-summary arguments to a "
-        "selection action; downstream domain validation owns those facts. Questions and "
+        "selection action; downstream domain validation owns those facts. "
+        "For arguments declared in open_identity_grounding_arguments, emit a concrete "
+        "identity only when the source supplies a named identity. Pronouns, deictic "
+        "references, generic categories, quantifiers, placeholders, and requests for "
+        "some other or another category member are missing values; emit the unique "
+        "registered incomplete_mutation_intake for that routed group instead. "
+        "Questions and "
         "explanations are read-only actions. A concrete request owned by another group has "
         "no valid action in this owner schema: mark that binding unresolved so Stage A can be "
         "corrected, rather than coercing it into a superficially similar action. Ambiguous or "
@@ -2263,7 +2313,10 @@ def _stage_b_prompt(owner: str) -> str:
         "action instead of guessing a concrete value or marking the unit unresolved. This "
         "includes closed enums where the source rejects one value but leaves multiple legal "
         "values: exclusion is not a concrete selection, so use the registered intake to ask "
-        "the user. Never synthesize an intake that is absent from owner_action_schema. "
+        "the user. When owner_action_schema declares incomplete_read_intake=true for the "
+        "unit's operation, emit that read-only action without invented payload; the owner "
+        "will collect the missing payload through its typed lifecycle. Never synthesize an "
+        "intake that is absent from owner_action_schema. "
         "When a semantic unit has operation=pending_answer, compare its complete exact source "
         "meaning with owner_state.pending_question and every declared option. If exactly one "
         "option is semantically selected, emit the coordinator-owned answer_pending action with "
@@ -2323,6 +2376,26 @@ def _action_schema_applies(
             operations=operations,
         )
     )
+
+
+def _action_spec_lifecycle_reachable(
+    spec: Any,
+    state: Mapping[str, Any],
+) -> bool:
+    """Expose only actions whose current lifecycle state can receive them."""
+
+    if spec.action_type == "start_evidence_collection":
+        pending = state.get("pending_question")
+        return bool(
+            isinstance(pending, Mapping)
+            and str(pending.get("kind") or "") == "evidence"
+        )
+    if not spec.required_state_path:
+        return True
+    current: Any = state
+    for key in spec.required_state_path:
+        current = current.get(key) if isinstance(current, Mapping) else None
+    return current in spec.required_state_values
 
 
 def _allowed_action_types_for_partition(
@@ -2415,6 +2488,10 @@ def _stage_b_payload(
             row,
             groups=groups,
             operations=selected_operations,
+        )
+        and _action_spec_lifecycle_reachable(
+            ACTION_BY_TYPE[str(row["type"])],
+            state,
         )
     ]
     owner_action_schema = list({
@@ -2551,6 +2628,26 @@ def _validate_owner_document(
     if not isinstance(bindings, list):
         errors.append(f"Stage B {owner} bindings is not a list")
         bindings = []
+    actions, bindings = _lower_registered_incomplete_read_intakes(
+        actions,
+        bindings,
+        owner=owner,
+        expected_groups=expected_groups or {},
+        expected_operations=expected_operations or {},
+    )
+    actions, bindings = _lower_registered_incomplete_mutation_intakes(
+        actions,
+        bindings,
+        owner=owner,
+        expected_groups=expected_groups or {},
+        expected_operations=expected_operations or {},
+        expected_sources=expected_sources or {},
+    )
+    actions = _bind_registered_intake_source_evidence(
+        actions,
+        bindings,
+        expected_sources=expected_sources or {},
+    )
     normalized_actions: list[dict[str, Any]] = []
     normalized_action_slots: list[dict[str, Any] | None] = [None] * len(actions)
     for index, action in enumerate(actions):
@@ -2558,7 +2655,9 @@ def _validate_owner_document(
             errors.append(f"Stage B {owner} action {index} is not an object")
             continue
         try:
-            normalized = validate_action_contract(action)
+            normalized = validate_action_contract(
+                lower_empty_entry_action_to_registered_intake(action)
+            )
         except ValueError as exc:
             errors.append(f"Stage B {owner} action {index} is invalid: {exc}")
             continue
@@ -2578,6 +2677,11 @@ def _validate_owner_document(
         spec = ACTION_BY_TYPE.get(str(normalized.get("type") or ""))
         if spec is None or spec.owner != owner:
             errors.append(f"Stage B {owner} emitted an unowned action at {index}")
+            continue
+        if spec.typed_option_only:
+            errors.append(
+                f"Stage B {owner} emitted a typed-option-only action at {index}"
+            )
             continue
         normalized_action_slots[index] = normalized
         normalized_actions.append(normalized)
@@ -2655,6 +2759,165 @@ def _validate_owner_document(
             dict(binding) for binding in bindings if isinstance(binding, Mapping)
         ],
     }, tuple(dict.fromkeys(errors))
+
+
+def _bind_registered_intake_source_evidence(
+    actions: Sequence[Any],
+    bindings: Sequence[Any],
+    *,
+    expected_sources: Mapping[str, Sequence[str]],
+) -> list[Any]:
+    """Bind one routed source unit to an incomplete mutation intake.
+
+    These registry-owned actions exist only to collect a value omitted by the
+    current source unit. Their authority to cross a pending barrier therefore
+    comes from the exact bound source, not from a model-authored paraphrase.
+    Ambiguous multi-unit ownership remains invalid and is never guessed.
+    """
+
+    normalized = [
+        dict(action) if isinstance(action, Mapping) else action
+        for action in actions
+    ]
+    sources_by_action: dict[int, set[str]] = {}
+    for binding in bindings:
+        if (
+            not isinstance(binding, Mapping)
+            or binding.get("disposition") != "action"
+            or not isinstance(binding.get("action_indexes"), list)
+        ):
+            continue
+        sources = {
+            str(source)
+            for source in expected_sources.get(
+                str(binding.get("unit_id") or ""),
+                (),
+            )
+            if str(source)
+        }
+        for index in binding.get("action_indexes") or ():
+            if isinstance(index, int) and not isinstance(index, bool):
+                sources_by_action.setdefault(index, set()).update(sources)
+    for index, action in enumerate(normalized):
+        if not isinstance(action, dict) or action.get("source_evidence"):
+            continue
+        spec = ACTION_BY_TYPE.get(str(action.get("type") or ""))
+        bound_sources = sources_by_action.get(index, set())
+        if (
+            spec is not None
+            and spec.incomplete_mutation_intake
+            and "source_evidence" in spec.required_arguments
+            and len(bound_sources) == 1
+        ):
+            action["source_evidence"] = next(iter(bound_sources))
+    return normalized
+
+
+def _lower_registered_incomplete_read_intakes(
+    actions: Sequence[Any],
+    bindings: Sequence[Any],
+    *,
+    owner: str,
+    expected_groups: Mapping[str, frozenset[str]],
+    expected_operations: Mapping[str, str],
+) -> tuple[list[Any], list[Any]]:
+    """Lower an unresolved routed read intake through its unique registry entry."""
+
+    lowered_actions = [
+        dict(action) if isinstance(action, Mapping) else action
+        for action in actions
+    ]
+    lowered_bindings: list[Any] = []
+    for raw in bindings:
+        if not isinstance(raw, Mapping):
+            lowered_bindings.append(raw)
+            continue
+        binding = dict(raw)
+        unit_id = str(binding.get("unit_id") or "")
+        operation = str(expected_operations.get(unit_id) or "")
+        groups = expected_groups.get(unit_id, frozenset())
+        candidates = [
+            spec
+            for spec in ACTION_SPECS
+            if (
+                spec.owner == owner
+                and spec.incomplete_read_intake
+                and _action_spec_applies(
+                    spec,
+                    groups=groups,
+                    operations=frozenset({operation}),
+                )
+            )
+        ]
+        if (
+            binding.get("disposition") == "unresolved"
+            and binding.get("action_indexes") == []
+            and len(candidates) == 1
+        ):
+            binding["disposition"] = "action"
+            binding["action_indexes"] = [len(lowered_actions)]
+            lowered_actions.append({"type": candidates[0].action_type})
+        lowered_bindings.append(binding)
+    return lowered_actions, lowered_bindings
+
+
+def _lower_registered_incomplete_mutation_intakes(
+    actions: Sequence[Any],
+    bindings: Sequence[Any],
+    *,
+    owner: str,
+    expected_groups: Mapping[str, frozenset[str]],
+    expected_operations: Mapping[str, str],
+    expected_sources: Mapping[str, Sequence[str]],
+) -> tuple[list[Any], list[Any]]:
+    """Lower a routed value-less mutation through its unique typed intake."""
+
+    lowered_actions = [
+        dict(action) if isinstance(action, Mapping) else action
+        for action in actions
+    ]
+    lowered_bindings: list[Any] = []
+    for raw in bindings:
+        if not isinstance(raw, Mapping):
+            lowered_bindings.append(raw)
+            continue
+        binding = dict(raw)
+        unit_id = str(binding.get("unit_id") or "")
+        operation = str(expected_operations.get(unit_id) or "")
+        groups = expected_groups.get(unit_id, frozenset())
+        sources = tuple(
+            str(source)
+            for source in expected_sources.get(unit_id, ())
+            if str(source)
+        )
+        candidates = [
+            spec
+            for spec in ACTION_SPECS
+            if (
+                spec.owner == owner
+                and spec.incomplete_mutation_intake
+                and set(spec.required_arguments).issubset({"source_evidence"})
+                and _action_spec_applies(
+                    spec,
+                    groups=groups,
+                    operations=frozenset({operation}),
+                )
+            )
+        ]
+        if (
+            binding.get("disposition") == "unresolved"
+            and binding.get("action_indexes") == []
+            and len(candidates) == 1
+            and sources
+        ):
+            action = {"type": candidates[0].action_type}
+            if "source_evidence" in candidates[0].allowed_arguments:
+                action["source_evidence"] = sources[0]
+            binding["disposition"] = "action"
+            binding["action_indexes"] = [len(lowered_actions)]
+            lowered_actions.append(action)
+        lowered_bindings.append(binding)
+    return lowered_actions, lowered_bindings
 
 
 def _merge_owner_documents(

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Mapping
 from unittest.mock import patch
 
@@ -19,10 +20,118 @@ from agent.harness.domains.execution import question_for_execution
 from agent.harness.domains.orientation import opening_question, resume_modify_group_question
 from agent.harness.domains.performance import question_for_performance
 from agent.harness.domains.recovery import question_for_recovery
+from agent.harness.domains.rpc_receipts import evidence_hash, exact_value_hash
+from agent.harness.domains.rpc_catalog import (
+    probe_evidence_contract_hash,
+    probe_evidence_content_hash,
+    request_contract_hash,
+)
 from agent.harness.domains.sync_observe import question_for_sync_observe
 from agent.harness.state import AgentGraphState, new_state
 from tests.agent_live.coverage_evidence import content_hash
 from tests.agent_live.graph_turn import invoke_product_graph_turn
+
+
+def _validation_endpoint_receipt(
+    *,
+    endpoint: str,
+    chain: str,
+    turn_index: int = 1,
+) -> dict[str, Any]:
+    body = {
+        "receipt_type": "rpc_endpoint_role",
+        "receipt_version": 2,
+        "turn_index": turn_index,
+        "owner": "rpc_endpoint",
+        "role": "validation",
+        "case": "new_chain",
+        "config_field": "",
+        "endpoint_hash": evidence_hash(endpoint),
+        "source_kind": "direct_action",
+        "source_receipt_id": "",
+        "source_value_hash": exact_value_hash(endpoint),
+        "previous_endpoint_hash": "",
+        "ready": True,
+        "probe_status_hash": evidence_hash("ok"),
+        "chain": chain,
+        "adapter_family": "jsonrpc",
+        "methods": [],
+        "method_hashes": [],
+        "method_evidence_bindings": [],
+        "producer_action_id": "coverage-endpoint-validation",
+    }
+    return {**body, "receipt_id": evidence_hash(body)}
+
+
+def _validated_new_chain_endpoint_evidence(
+    *,
+    endpoint: str,
+    chain: str,
+) -> dict[str, Any]:
+    receipt = _validation_endpoint_receipt(endpoint=endpoint, chain=chain)
+    return {
+        "candidate_endpoint": endpoint,
+        "candidate_endpoint_ready": True,
+        "candidate_endpoint_validation_receipt_id": receipt["receipt_id"],
+        "candidate_endpoint_validation_receipt": receipt,
+        "new_chain_endpoint_probe": {
+            "ready": True,
+            "status": "ok",
+            "endpoint": endpoint,
+            "chain": chain,
+            "transport": "jsonrpc",
+            "evidence_file": ".agent/evidence/coverage-endpoint.json",
+        },
+    }
+
+
+def _validated_method_contract(
+    *,
+    method: str,
+    endpoint: str,
+    chain: str,
+    evidence_file: str,
+) -> dict[str, Any]:
+    schema = {
+        "method": method,
+        "params": [],
+        "params_json": [],
+        "parameter_style": "positional",
+        "response_summary": "observed JSON-RPC response",
+        "validation_endpoint": endpoint,
+    }
+    body = {
+        "receipt_type": "rpc_method_probe",
+        "receipt_version": 2,
+        "turn_index": 1,
+        "owner": "rpc_catalog",
+        "method": method,
+        "method_hash": evidence_hash(method),
+        "endpoint_hash": evidence_hash(endpoint),
+        "request_contract_hash": request_contract_hash(schema),
+        "catalog_revision": 1,
+        "evidence_file_hash": probe_evidence_content_hash(evidence_file),
+        "probe_contract_hash": probe_evidence_contract_hash(evidence_file),
+        "ready": True,
+        "probe_status_hash": evidence_hash("ok"),
+        "producer_action_id": "coverage-method-probe",
+    }
+    receipt = {**body, "receipt_id": evidence_hash(body)}
+    return {
+        "contract_version": 1,
+        "revision": 2,
+        "method": method,
+        "params": [],
+        "parameter_style": "positional",
+        "schema": schema,
+        "request_confirmed": True,
+        "response_confirmed": True,
+        "validation_endpoint": endpoint,
+        "evidence_file": evidence_file,
+        "probe_receipt": receipt,
+        "probe_catalog_revision": 1,
+        "chain": chain,
+    }
 
 
 def canonical_question_contract(question: Mapping[str, Any]) -> dict[str, Any]:
@@ -30,6 +139,8 @@ def canonical_question_contract(question: Mapping[str, Any]) -> dict[str, Any]:
 
     stable = deepcopy(dict(question))
     stable.pop("execution_request_id", None)
+    stable.pop("created_turn_index", None)
+    stable.setdefault("same_turn_navigation_allowed", False)
     return stable
 
 
@@ -858,6 +969,8 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
             "new_chain_response",
             "endpoint_process",
             {
+                "target_mode": "real-node",
+                "workflow_mode": "rpc_benchmark",
                 "chain_identity": {
                     "canonical": "new-chain",
                     "status": "existing_family_response_needs_confirmation",
@@ -986,35 +1099,27 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
                     "status": "existing_family_runtime_choice",
                     "case": "case2",
                 },
-                "endpoint_evidence": {
-                    "candidate_endpoint": "http://geth-dev:8545",
-                    "candidate_endpoint_ready": True,
-                    "new_chain_endpoint_probe": {
-                        "ready": True,
-                        "status": "ok",
-                        "endpoint": "http://geth-dev:8545",
-                        "chain": "coverage-evm",
-                        "transport": "jsonrpc",
-                        "evidence_file": ".agent/evidence/coverage-endpoint.json",
-                    },
-                },
+                "endpoint_evidence": _validated_new_chain_endpoint_evidence(
+                    endpoint="http://geth-dev:8545",
+                    chain="coverage-evm",
+                ),
                 "custom_rpc": {
                     "catalog": {
                         "contract_version": 1,
                         "revision": 1,
                         "chain": "coverage-evm",
                         "methods": [
-                            {
-                                "contract_version": 1,
-                                "revision": 1,
-                                "method": "eth_blockNumber",
-                                "params": [],
-                                "request_confirmed": True,
-                                "response_confirmed": True,
-                                "validation_endpoint": "http://geth-dev:8545",
-                                "evidence_file": ".agent/evidence/coverage-method.json",
-                                "chain": "coverage-evm",
-                            },
+                            _validated_method_contract(
+                                method="eth_blockNumber",
+                                endpoint="http://geth-dev:8545",
+                                chain="coverage-evm",
+                                evidence_file=str(
+                                    Path(__file__).resolve().parent
+                                    / "fixtures"
+                                    / "rpc_probe"
+                                    / "coverage-evm-eth-block-number.json"
+                                ),
+                            ),
                         ],
                         "finished": True,
                     },
@@ -1305,7 +1410,7 @@ def _catalog_only_scenarios(language: str) -> dict[str, QuestionScenario]:
                 "draft": {
                     "contract_version": 1,
                     "phase": "evidence",
-                    "method": "eth_blockNumber",
+                    "method": "eth_chainId",
                 },
             },
         ),

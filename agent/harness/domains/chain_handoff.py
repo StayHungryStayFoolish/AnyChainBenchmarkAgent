@@ -5,13 +5,29 @@ from __future__ import annotations
 from copy import deepcopy
 
 from ..input_values import normalize_scalar
+from ..secret_refs import materialize_state_secret_references
 from ..state import AgentGraphState
 from ..transitions import mark_group_reconfigured, record_group_invalidations
 from .chain_rpc_questions import _case3_evidence_question
 from .response_fragments import ResponseCollector, emit
 from .chain_rpc_support import _next_group
-from .rpc_catalog import catalog_method_names, draft_view, validated_contracts_view
-from .rpc_receipts import emit_endpoint_role_receipt, emit_workload_commit_receipt
+from .rpc_catalog import (
+    catalog_method_names,
+    draft_view,
+    probe_evidence_content_hash,
+    probe_evidence_contract_hash,
+    refresh_catalog_projection,
+    validated_contracts,
+    validated_method_contract_is_current,
+    validated_contracts_view,
+)
+from .rpc_receipts import (
+    emit_endpoint_role_receipt,
+    emit_workload_commit_receipt,
+    evidence_hash,
+    exact_value_hash,
+    validate_rpc_receipt,
+)
 
 def _promote_case2_endpoint(
     state: AgentGraphState,
@@ -23,17 +39,68 @@ def _promote_case2_endpoint(
     confirmed = state.setdefault("confirmed_config", {})
     chain = normalize_scalar(identity.get("canonical") or identity.get("raw"))
     endpoint = normalize_scalar(evidence.get("candidate_endpoint"))
-    methods = catalog_method_names(state)
+    catalog_methods = catalog_method_names(state)
+    methods = [
+        normalize_scalar(item.get("method"))
+        for item in validated_contracts_view(state)
+        if _validated_method_matches_endpoint(
+            state,
+            item,
+            endpoint=endpoint,
+        )
+    ]
+    methods = list(dict.fromkeys(methods))
     method = methods[0] if len(methods) == 1 else ""
     endpoint_probe = (
         evidence.get("new_chain_endpoint_probe")
         if isinstance(evidence.get("new_chain_endpoint_probe"), dict)
         else {}
     )
+    try:
+        materialized_endpoint = normalize_scalar(
+            materialize_state_secret_references(endpoint, state)
+        )
+        materialized_probe_endpoint = normalize_scalar(
+            materialize_state_secret_references(
+                endpoint_probe.get("endpoint"),
+                state,
+            )
+        )
+    except (KeyError, RuntimeError, ValueError):
+        materialized_endpoint = ""
+        materialized_probe_endpoint = ""
+    validation_receipt = (
+        evidence.get("candidate_endpoint_validation_receipt")
+        if isinstance(
+            evidence.get("candidate_endpoint_validation_receipt"),
+            dict,
+        )
+        else {}
+    )
+    validation_receipt_valid = bool(
+        validation_receipt
+        and validate_rpc_receipt(validation_receipt)[0]
+        and validation_receipt.get("receipt_id")
+        == evidence.get("candidate_endpoint_validation_receipt_id")
+        and validation_receipt.get("role") == "validation"
+        and validation_receipt.get("case") == "new_chain"
+        and validation_receipt.get("ready") is True
+        and normalize_scalar(validation_receipt.get("chain")) == chain
+        and normalize_scalar(
+            validation_receipt.get("adapter_family")
+        )
+        == normalize_scalar(identity.get("adapter_family"))
+        and materialized_endpoint
+        and validation_receipt.get("endpoint_hash")
+        == evidence_hash(materialized_endpoint)
+        and validation_receipt.get("source_value_hash")
+        == exact_value_hash(endpoint)
+    )
     probe_matches = bool(
         endpoint
+        and validation_receipt_valid
         and endpoint_probe.get("ready") is True
-        and normalize_scalar(endpoint_probe.get("endpoint")) == endpoint
+        and materialized_probe_endpoint == materialized_endpoint
         and normalize_scalar(endpoint_probe.get("chain")) == chain
         and normalize_scalar(endpoint_probe.get("transport"))
         == normalize_scalar(identity.get("adapter_family"))
@@ -51,22 +118,75 @@ def _promote_case2_endpoint(
             source=__name__,
         )
         return False
+    if set(methods) != set(catalog_methods):
+        identity["status"] = "existing_family_needs_method"
+        emit(
+            responses,
+            "chain_rpc.response.case2_promotion_blocked",
+            source=__name__,
+        )
+        return False
     identity.update({"status": "confirmed", "case": "case2_runtime_override"})
     confirmed["BLOCKCHAIN_NODE"] = chain
     if endpoint:
         confirmed["LOCAL_RPC_URL"] = endpoint
         evidence["local_rpc_url_ready"] = True
-        emit_endpoint_role_receipt(
+        method_contracts = [
+            item
+            for item in validated_contracts(state)
+            if normalize_scalar(item.get("method")) in methods
+        ]
+        runtime_receipt = emit_endpoint_role_receipt(
             state,
             role="final_benchmark",
-            case="new_chain",
-            endpoint=endpoint,
+            case="runtime",
+            config_field="LOCAL_RPC_URL",
+            endpoint=materialized_endpoint,
+            source_kind="validated_endpoint",
+            source_receipt_id=str(
+                validation_receipt.get("receipt_id") or ""
+            ),
+            source_value_hash=str(
+                validation_receipt.get("source_value_hash") or ""
+            ),
             ready=True,
             probe_status=endpoint_probe.get("status"),
             chain=chain,
             adapter_family=identity.get("adapter_family"),
             methods=methods,
+            method_evidence_bindings=[
+                {
+                    "method": item.get("method"),
+                    "evidence_file_hash": probe_evidence_content_hash(
+                        normalize_scalar(item.get("evidence_file"))
+                    ),
+                    "probe_contract_hash": probe_evidence_contract_hash(
+                        normalize_scalar(item.get("evidence_file"))
+                    ),
+                }
+                for item in method_contracts
+            ],
         )
+        if not runtime_receipt:
+            identity["status"] = "existing_family_needs_method"
+            emit(
+                responses,
+                "chain_rpc.response.case2_promotion_blocked",
+                source=__name__,
+            )
+            return False
+        evidence["local_rpc_url_validation_receipt_id"] = (
+            runtime_receipt["receipt_id"]
+        )
+        evidence["local_rpc_url_validation_receipt"] = deepcopy(
+            runtime_receipt
+        )
+        for item in method_contracts:
+            item["final_endpoint"] = endpoint
+            item["final_endpoint_evidence_file"] = normalize_scalar(
+                item.get("evidence_file")
+            )
+        refresh_catalog_projection(state)
     state["target_mode"] = "real-node"
     state["workflow_mode"] = "rpc_benchmark"
     if method and not (state.get("workload") or {}).get("confirmed"):
@@ -81,6 +201,19 @@ def _promote_case2_endpoint(
     state['active_group'] = _next_group(state)
     emit(responses, "chain_rpc.response.case2_promoted", source=__name__)
     return True
+
+
+def _validated_method_matches_endpoint(
+    state: AgentGraphState,
+    contract: dict,
+    *,
+    endpoint: str,
+) -> bool:
+    return validated_method_contract_is_current(
+        state,
+        contract,
+        endpoint=endpoint,
+    )
 
 
 def _prepare_case2_handoff(

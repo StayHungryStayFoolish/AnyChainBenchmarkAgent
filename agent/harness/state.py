@@ -318,17 +318,7 @@ def migrate_state(
     for key, value in INVOCATION_CONTEXT_DEFAULTS.items():
         fresh[key] = value.copy() if isinstance(value, dict) else value  # type: ignore[literal-required]
     if raw_version == 12:
-        _migrate_v12_action_queue_contract(fresh)
         _migrate_v12_mode_exclusive_state(fresh)
-        fresh["selected_action"] = {}
-        fresh["pending_domain_result"] = {}
-        fresh["side_effect_intent"] = {}
-        fresh["side_effect_receipt"] = {}
-        fresh["turn_receipt"] = {}
-        control = dict(fresh.get("control") or {})
-        control.pop("selected_owner", None)
-        control.pop("phase", None)
-        fresh["control"] = control
     if raw_version <= 13:
         _migrate_v13_pending_queue_ownership(fresh)
     if raw_version <= 14:
@@ -347,6 +337,11 @@ def migrate_state(
         _migrate_v21_semantic_evidence_contract(fresh)
     if raw_version <= 22:
         fresh["secret_bindings"] = []
+    if raw_version < STATE_SCHEMA_VERSION:
+        _quarantine_legacy_inflight_control_state(
+            fresh,
+            raw_version=raw_version,
+        )
     _invalidate_draft_on_contract_authority_drift(fresh)
     # Version migrations first separate compatible durable work from state
     # owned by a retired mode. Only then may an invalid pending contract
@@ -361,6 +356,52 @@ def migrate_state(
         })
     fresh["schema_version"] = STATE_SCHEMA_VERSION
     return ensure_session_metadata(fresh, thread_id, session_purpose, touch=False)
+
+
+def _quarantine_legacy_inflight_control_state(
+    state: AgentGraphState,
+    *,
+    raw_version: int,
+) -> None:
+    """Retain durable configuration, never executable legacy control state."""
+
+    quarantined = {
+        "action_queue": len(state.get("action_queue") or ()),
+        "selected_action": bool(state.get("selected_action")),
+        "current_action": bool(state.get("current_action")),
+        "pending_domain_result": bool(state.get("pending_domain_result")),
+        "pending_question": bool(state.get("pending_question")),
+        "semantic_plan_draft": bool(state.get("semantic_plan_draft")),
+        "side_effect_intent": bool(state.get("side_effect_intent")),
+        "side_effect_receipt": bool(state.get("side_effect_receipt")),
+    }
+    state["action_queue"] = []
+    state["selected_action"] = {}
+    state["current_action"] = {}
+    state["pending_domain_result"] = {}
+    state["pending_question"] = {}
+    state["proposed_actions"] = []
+    state["semantic_planning"] = {}
+    state["semantic_plan_draft"] = {}
+    state["side_effect_intent"] = {}
+    state["side_effect_receipt"] = {}
+    state["turn_receipt"] = {}
+    state["secret_bindings"] = []
+    control = dict(state.get("control") or {})
+    control.pop("selected_owner", None)
+    control.pop("phase", None)
+    state["control"] = control
+    state["checkpoint_recovery"] = {
+        "status": "quarantined",
+        "error_type": "LegacyInflightControlState",
+        "from_schema_version": raw_version,
+        "durable_configuration_retained": True,
+    }
+    state.setdefault("audit_events", []).append({
+        "event": "checkpoint_legacy_inflight_quarantined",
+        "from_schema_version": raw_version,
+        "quarantined": quarantined,
+    })
 
 
 def _quarantine_unbound_secret_reference_state(
@@ -851,151 +892,6 @@ def _quarantine_pre_v12_state(
         "retained_fields": sorted(safe_values),
     }]
     return state
-
-
-def _migrate_v12_action_queue_contract(state: AgentGraphState) -> None:
-    """Compile every pre-v12 raw queue into admitted ActionEnvelopes once."""
-
-    from .action_registry import (
-        ACTION_BY_TYPE,
-        assign_action_ids,
-    )
-    from .checkpoint_migrations import compile_v12_custom_rpc_action
-    from .contracts import ActionEnvelope, action_envelope_to_dict
-    from .domains.registry import GROUP_OWNER
-
-    queue = list(state.get("action_queue") or [])
-    if not queue or all(
-        isinstance(item, dict)
-        and str(item.get("action_type") or "")
-        and str(item.get("owner") or "")
-        and isinstance(item.get("arguments"), Mapping)
-        for item in queue
-    ):
-        return
-    migrated: list[dict[str, Any]] = []
-    rejected = 0
-    for item in queue:
-        if not isinstance(item, dict):
-            rejected += 1
-            continue
-        if (
-            str(item.get("action_type") or "")
-            and str(item.get("owner") or "")
-            and isinstance(item.get("arguments"), Mapping)
-        ):
-            migrated.append(item)
-            continue
-        action_type = str(item.get("type") or "")
-        if action_type != "start_custom_rpc":
-            if action_type in ACTION_BY_TYPE:
-                migrated.append(item)
-                continue
-            rejected += 1
-            continue
-        source = str(item.get("source_evidence") or "").strip()
-        exact_values = [
-            str(item.get(key) or "").strip()
-            for key in ("rpc_endpoint", "rpc_method", "rpc_schema_evidence")
-            if item.get(key) not in (None, "")
-        ]
-        if not source or any(value not in source for value in exact_values):
-            rejected += 1
-            continue
-        migrated.extend(compile_v12_custom_rpc_action(item))
-    if any(not str(item.get("action_id") or "") for item in migrated):
-        migration_scope = (
-            f"checkpoint:{state.get('thread_id') or 'default'}:"
-            f"{int(state.get('turn_index') or 0)}"
-        )
-        migrated = assign_action_ids(
-            migration_scope,
-            "checkpoint action queue migration",
-            migrated,
-        )
-    migration_scope = (
-        f"checkpoint:{state.get('thread_id') or 'default'}:"
-        f"{int(state.get('turn_index') or 0)}"
-    )
-    enveloped: list[dict[str, Any]] = []
-    pending = state.get("pending_question") or {}
-    pending_group = str(pending.get("group") or "")
-    pending_owner = str(pending.get("owner") or GROUP_OWNER.get(pending_group, ""))
-    for index, action in enumerate(migrated):
-        if str(action.get("action_type") or ""):
-            enveloped.append(action)
-            continue
-        action_type = str(action.get("type") or "")
-        spec = ACTION_BY_TYPE[action_type]
-        owner = (
-            pending_owner or spec.owner
-            if action_type == "answer_pending"
-            else spec.owner
-        )
-        origin_text = str(
-            action.get("_origin_text")
-            or action.get("source_evidence")
-            or ""
-        )
-        arguments = {
-            str(key): deepcopy(value)
-            for key, value in action.items()
-            if key not in {"type", "action_id", "confidence", "reason"}
-            and not str(key).startswith("_")
-        }
-        effect_kind = (
-            "external"
-            if spec.effect == "execution"
-            else "read_only"
-            if spec.effect == "read_only"
-            else "pure"
-        )
-        enveloped.append(action_envelope_to_dict(ActionEnvelope(
-            action_id=str(action.get("action_id") or ""),
-            action_type=action_type,
-            owner=owner,
-            target_group=spec.target_group,
-            arguments=arguments,
-            confidence=str(action.get("confidence") or "medium"),  # type: ignore[arg-type]
-            reason=str(action.get("reason") or ""),
-            source_evidence_hash=hashlib.sha256(origin_text.encode("utf-8")).hexdigest(),
-            semantic_order=int(action.get("_plan_index") or index),
-            submitted_turn_index=int(
-                action.get("_submitted_turn_index")
-                or state.get("turn_index")
-                or 0
-            ),
-            origin_group=str(action.get("_queue_origin_group") or ""),
-            origin_text=origin_text,
-            plan_scope=str(action.get("_plan_scope") or migration_scope),
-            admission_metadata={
-                str(key).removeprefix("_"): deepcopy(value)
-                for key, value in action.items()
-                if str(key).startswith("_")
-                and str(key) not in {
-                    "_origin_text",
-                    "_queue_origin_group",
-                    "_submitted_turn_index",
-                    "_plan_scope",
-                    "_plan_index",
-                }
-            },
-            effect_kind=effect_kind,  # type: ignore[arg-type]
-            idempotency_key=(
-                f"{state.get('thread_id') or 'default'}:"
-                f"{int(state.get('turn_index') or 0)}:"
-                f"{str(action.get('action_id') or '')}"
-            ),
-        )))
-    state["action_queue"] = enveloped
-    if enveloped and state.get("pending_question"):
-        state["pending_question"]["resume_action_queue"] = True
-    state.setdefault("audit_events", []).append({
-        "event": "checkpoint_action_queue_enveloped",
-        "before": len(queue),
-        "after": len(enveloped),
-        "rejected_untrusted": rejected,
-    })
 
 
 def _migrate_v13_pending_queue_ownership(state: AgentGraphState) -> None:

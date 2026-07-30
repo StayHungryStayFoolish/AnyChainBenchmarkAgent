@@ -270,8 +270,10 @@ Older state is quarantined for explicit reconfirmation.
   `harness/response_messages/` are the sole localized product-prose authority.
 - `harness/contracts.py`: typed actions, domain results, side-effect
   intent/receipt, navigation commands, and turn receipts.
-- `harness/checkpoint_migrations.py`: the isolated version-12 checkpoint
-  adapter; current turns must not import it.
+- `harness/state.py`: the sole checkpoint-schema boundary. Durable compatible
+  configuration may survive migration, but every legacy in-flight question,
+  queue, semantic draft, or side-effect state is quarantined and never
+  recompiled into current actions.
 - `harness/semantic_admission.py`: immutable semantic-document preparation and
   admission after owner-scoped compilation; it exposes no planner entry.
 - `harness/bounded_semantic_lane.py`: finite-catalog, source-anchored semantic
@@ -434,6 +436,19 @@ The execution application boundary resolves every side-effecting request
 through `runners/execution_scenarios.py`. RPC smoke, RPC final benchmark, and
 bounded sync-observe are distinct scenarios with strict workflow, command,
 artifact, and evidence contracts; they are not interchangeable aliases.
+Custom RPC execution additionally requires a current owner-issued method-probe
+receipt and durable semantic probe contract. One validator recomputes the
+chain, materialized endpoint identity, selected method, exact parameters,
+adapter family, request/schema hash, successful HTTP observation, response
+shape, evidence bytes, and catalog lineage at catalog admission and Case 2
+promotion. Before real-node execution, the selected effective workload is
+compared with the canonical chain template. Only selected methods absent from
+that template require custom-method proof and replay against the final
+materialized `LOCAL_RPC_URL`; historical catalog methods outside the workload
+are not execution requirements. The endpoint is committed only after the owner
+receipt binds every required custom-method evidence one-to-one. Persisted
+endpoint values remain opaque secret references; raw endpoint material crosses
+only the probe or job-local tool boundary.
 Product gate G5 requires four fresh jobs from three distinct approved plans:
 fake-node smoke, Geth real-node smoke, Geth real-node final, and bounded
 sync-observe. Reused job identities and missing hashed runtime/report artifacts

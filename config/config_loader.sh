@@ -479,8 +479,16 @@ resolve_active_chain_template_file() {
     return 1
 }
 
-MAINNET_RPC_URL="${MAINNET_RPC_URL:-$(resolve_mainnet_rpc_url_from_template "$BLOCKCHAIN_NODE" || true)}"
-if [[ -z "$MAINNET_RPC_URL" ]]; then
+case "${MAINNET_RPC_URL_DISABLED:-false}" in
+    true|TRUE|True|1|yes|YES|Yes)
+        MAINNET_RPC_URL_DISABLED="true"
+        MAINNET_RPC_URL=""
+        ;;
+    *)
+        MAINNET_RPC_URL="${MAINNET_RPC_URL:-$(resolve_mainnet_rpc_url_from_template "$BLOCKCHAIN_NODE" || true)}"
+        ;;
+esac
+if [[ -z "$MAINNET_RPC_URL" && "${MAINNET_RPC_URL_DISABLED:-false}" != "true" ]]; then
     if job_local_chain_override_matches "$BLOCKCHAIN_NODE"; then
         echo "ℹ️ Job-local chain override has no default MAINNET_RPC_URL; comparison remains disabled unless explicitly configured" >&2
     else

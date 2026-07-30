@@ -59,7 +59,7 @@
     {
       "id": "RR-010",
       "precondition": "Case 2 custom RPC intake with validated endpoint and method",
-      "turns": ["Y", "不再添加 method", "single", "把默认 method 全部替换掉"],
+      "turns": ["Y", "不再添加 method", "single"],
       "expected": "Exit method collection, choose workload scope, configure weights when applicable, and materialize only the effective runtime method set."
     },
     {
@@ -86,7 +86,7 @@
     {
       "id": "RR-014",
       "precondition": "RPC benchmark is partially configured",
-      "turns": ["切换到 sync-observe", "观察 60 秒", "再切回 real-node"],
+      "turns": ["切换到 sync-observe", "Y", "观察 60 秒", "再切回 real-node", "Y"],
       "expected": "Retain compatible environment evidence, invalidate workload/QPS/fixture fields in sync-observe, then re-require RPC-only groups when returning."
     },
     {

@@ -125,8 +125,10 @@ Important implementation files:
   semantic fragments, while `response_catalog.py` and `response_messages/`
   are the sole localized product-prose authority
 - `agent/harness/contracts.py`: durable action/result/effect/turn contracts
-- `agent/harness/checkpoint_migrations.py`: isolated historical checkpoint
-  migration boundary only
+- `agent/harness/state.py`: sole checkpoint-schema boundary; compatible
+  durable configuration may be retained, while every legacy in-flight
+  control state is quarantined instead of being recompiled into current
+  actions
 - `agent/harness/questions.py`: typed question/option contracts
 - `agent/harness/transitions.py`: invalidation and reconfiguration state
 - `agent/harness/invariants.py`: state and expected-patch enforcement
@@ -221,6 +223,22 @@ endpoint and method, record fixture evidence when fake-node is requested, then
 choose single replacement, mixed replacement, or mixed addition. Enabled
 weights are positive and total exactly 100. Only a job-local override is
 materialized, and traffic evidence must prove the selected method executed.
+Each successful method probe writes a secret-free durable probe contract that
+binds the chain, a hash of the materialized endpoint, the selected method, and
+the exact parameter payload and adapter family. Durable evidence must contain
+one successful method observation with HTTP status, a full response-shape
+hash, and a response sample/hash. The RPC catalog and Case 2 promotion use the
+same validator to recompute that contract and verify its owner receipt,
+evidence bytes, request/schema hash, and catalog revision. Before real-node
+execution, only the custom methods selected by the effective workload are
+replayed against the final materialized `LOCAL_RPC_URL`. A method is custom
+only when it is absent from the canonical chain template; a job-local weight
+change does not turn template methods into custom methods. An empty effective
+workload is invalid. The endpoint is not committed or reported as ready unless
+its owner receipt binds every required custom-method proof one-to-one. A path
+to an arbitrary existing file, a stale or
+modified contract, a missing secret reference, or reused evidence/input
+binding fails closed.
 
 ### Case 2: unconfigured chain, existing adapter family
 

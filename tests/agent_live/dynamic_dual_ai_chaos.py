@@ -438,6 +438,7 @@ class JourneyVerifierContext:
     observed_edge_keys: tuple[str, ...]
     latest_turn: PtyCliTurnRecord | None
     completed_events: tuple[RuntimeTurnEvent, ...] = ()
+    setup_events: tuple[RuntimeTurnEvent, ...] = ()
     completed_decisions: tuple[JourneyDecisionProvenance, ...] = ()
     evaluating_postcondition_id: str = ""
     verifier_input_contract: Mapping[str, Any] = field(default_factory=dict)
@@ -1579,7 +1580,7 @@ class ContainerPtyBridgeTransport:
         if self._process is not None:
             raise RuntimeError("container PTY bridge transport has already started")
         process_env = dict(env)
-        process_env.setdefault("ANYCHAIN_CHAOS_EXECUTION_ID", self.execution_id)
+        process_env["ANYCHAIN_CHAOS_EXECUTION_ID"] = self.execution_id
         if self.cleanup_receipt_dir is None:
             self._temporary_receipt_dir = tempfile.TemporaryDirectory(
                 prefix="anychain-container-cleanup-"
@@ -1588,8 +1589,8 @@ class ContainerPtyBridgeTransport:
         else:
             receipt_dir = self.cleanup_receipt_dir
         receipt_dir.mkdir(parents=True, exist_ok=True)
-        process_env.setdefault(
-            "ANYCHAIN_CHAOS_INNER_CLEANUP_RECEIPT_DIR", str(receipt_dir)
+        process_env["ANYCHAIN_CHAOS_INNER_CLEANUP_RECEIPT_DIR"] = str(
+            receipt_dir
         )
         self._process = subprocess.Popen(
             self.command,

@@ -1765,6 +1765,35 @@ class TurnCheckpointContractTest(unittest.TestCase):
                 self.assertEqual(resumed["control"]["phase"], expected_phase)
                 self.assertEqual(resumed["turn_index"], before_turn)
 
+    def test_execution_intent_rejects_missing_pending_authorization(self) -> None:
+        from agent.harness.contracts import ActionEnvelope, action_envelope_to_dict
+        from agent.harness.coordinator import prepare_execution_intent_step
+        from agent.harness.invariants import StateInvariantError
+        from agent.harness.state import new_state
+
+        envelope = ActionEnvelope(
+            action_id="unauthorized-execution",
+            action_type="approve_preflight_smoke",
+            owner="execution",
+            target_group="preflight_smoke_execution",
+            effect_kind="external",
+            status="selected",
+        )
+        state = new_state("unauthorized-execution", language="en")
+        state["selected_action"] = action_envelope_to_dict(envelope)
+        state["current_action"] = {
+            "type": envelope.action_type,
+            "action_id": envelope.action_id,
+        }
+
+        with self.assertRaisesRegex(
+            StateInvariantError,
+            "canonical pending-resolution receipt",
+        ):
+            prepare_execution_intent_step(state, expected_owner="execution")
+
+        self.assertFalse(state.get("side_effect_intent"))
+
     def test_fresh_startup_persists_the_opening_contract_as_next_turn_baseline(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
         from tests.agent_live.graph_turn import (

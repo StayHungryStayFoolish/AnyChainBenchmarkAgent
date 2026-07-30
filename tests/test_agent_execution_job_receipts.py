@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import stat
 import tempfile
@@ -80,6 +81,26 @@ class JobManagerReceiptTest(unittest.TestCase):
         contradictory["receipt_id"] = "0" * 64
         self.assertFalse(verify_job_receipt(contradictory))
 
+    def test_non_object_job_record_fails_closed_and_is_skipped_by_scan(self) -> None:
+        from agent.runners.job_manager import (
+            _jobs_by_execution_key,
+            get_job,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jobs_dir = Path(tmpdir) / "jobs"
+            corrupt_dir = jobs_dir / "job_corrupt"
+            corrupt_dir.mkdir(parents=True)
+            (corrupt_dir / "job.json").write_text("null\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "JSON object"):
+                get_job("job_corrupt", jobs_dir=jobs_dir)
+
+            self.assertEqual(
+                _jobs_by_execution_key(jobs_dir, "execution:test"),
+                [],
+            )
+
     def test_execution_plan_hash_binds_secret_bearing_plan_exactly(self) -> None:
         from agent.runners.job_manager import _submission_receipt
 
@@ -122,7 +143,7 @@ class JobManagerReceiptTest(unittest.TestCase):
         self.assertNotIn("token-a", json.dumps(first, sort_keys=True))
 
     def test_job_local_secret_material_is_owner_only(self) -> None:
-        from agent.runners.job_manager import submit_job
+        from agent.runners.job_manager import get_job, submit_job
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -256,7 +277,7 @@ class JobManagerReceiptTest(unittest.TestCase):
 class ExecutionReceiptPropagationTest(unittest.TestCase):
     def test_runtime_summary_projects_only_valid_manager_receipts(self) -> None:
         from agent.harness.graph import _execution_receipt_summary
-        from agent.runners.job_manager import submit_job
+        from agent.runners.job_manager import get_job, submit_job
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -267,11 +288,19 @@ class ExecutionReceiptPropagationTest(unittest.TestCase):
                 mock=True,
                 approved=True,
             )
+            read_receipt = get_job(
+                submitted["job_id"],
+                jobs_dir=root / "jobs",
+            )["execution_receipts"]["last_read"]
 
         summary = _execution_receipt_summary({"job": submitted})
         self.assertEqual(
             summary["manager_submission_receipt_id"],
             submitted["execution_receipts"]["submission"]["receipt_id"],
+        )
+        self.assertEqual(
+            summary["manager_submission_receipt"],
+            submitted["execution_receipts"]["submission"],
         )
         self.assertEqual(summary["manager_submission_disposition"], "created")
 
@@ -279,12 +308,27 @@ class ExecutionReceiptPropagationTest(unittest.TestCase):
         tampered["execution_receipts"]["submission"]["matching_job_count"] = 99
         summary = _execution_receipt_summary({"job": tampered})
         self.assertEqual(summary["manager_submission_receipt_id"], "")
+        self.assertEqual(summary["manager_submission_receipt"], {})
         self.assertEqual(summary["manager_matching_job_count"], 0)
 
         other_job = json.loads(json.dumps(submitted))
         other_job["job_id"] = "job_other"
         summary = _execution_receipt_summary({"job": other_job})
         self.assertEqual(summary["manager_submission_receipt_id"], "")
+
+        wrong_type = json.loads(json.dumps(submitted))
+        wrong_type["execution_receipts"]["submission"] = read_receipt
+        summary = _execution_receipt_summary({"job": wrong_type})
+        self.assertEqual(summary["manager_submission_receipt_id"], "")
+        self.assertEqual(summary["manager_submission_receipt"], {})
+
+        stale_status = json.loads(json.dumps(submitted))
+        stale_status["status"] = "running"
+        stale_status["execution_receipts"]["last_read"] = read_receipt
+        summary = _execution_receipt_summary({"job": stale_status})
+        self.assertEqual(summary["manager_read_receipt_id"], "")
+        self.assertEqual(summary["manager_read_receipt"], {})
+        self.assertEqual(summary["manager_observed_status"], "")
 
     def test_application_service_returns_manager_submission_receipt(self) -> None:
         from agent.runners.application_service import (
@@ -384,6 +428,181 @@ class ExecutionReceiptPropagationTest(unittest.TestCase):
             message = render_fragment(fragment, "en").text
         self.assertIn("cannot be verified", message)
         self.assertIn("last-known status is `running`", message)
+
+    def test_job_consultation_binds_the_exact_manager_read_used_for_output(
+        self,
+    ) -> None:
+        from agent.harness.contracts import ActionProposal
+        from agent.harness.domains.orientation import apply_orientation_action
+        from agent.harness.domains.orientation_receipts import (
+            validate_orientation_receipt,
+        )
+        from agent.runners.job_manager import get_job, submit_job
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            plan_file = JobManagerReceiptTest._write_plan(root)
+            jobs_dir = root / "jobs"
+            submitted = submit_job(
+                plan_file,
+                jobs_dir=jobs_dir,
+                mock=True,
+                approved=True,
+            )
+            persisted = get_job(submitted["job_id"], jobs_dir=jobs_dir)
+
+        state = {
+            "turn_index": 3,
+            "job": {
+                "job_id": submitted["job_id"],
+                "status": "running",
+                "execution_receipts": {
+                    "submission": persisted["execution_receipts"][
+                        "submission"
+                    ],
+                },
+            },
+        }
+        action = ActionProposal(
+            action_id="status-consultation",
+            action_type="answer_opening_question",
+            arguments={
+                "topic": "execution_status",
+                "source_evidence": "What is the current status?",
+            },
+            confidence="high",
+        )
+        with patch(
+            "agent.harness.domains.orientation.get_job",
+            return_value=persisted,
+        ):
+            result = apply_orientation_action(state, action)
+
+        self.assertFalse(result.delta.writes)
+        source_receipts = result.control_receipts[0]["source_receipts"]
+        self.assertEqual(len(source_receipts), 1)
+        self.assertEqual(
+            source_receipts[0]["receipt_id"],
+            persisted["execution_receipts"]["last_read"]["receipt_id"],
+        )
+        self.assertEqual(
+            result.response_fragments[0].message_id,
+            "harness.orientation.consultation.job_verified",
+        )
+        receipt = dict(result.control_receipts[0])
+        self.assertTrue(validate_orientation_receipt(receipt)[0])
+
+        wrong_receipt_type = json.loads(json.dumps(receipt))
+        wrong_receipt_type["source_receipts"] = [
+            persisted["execution_receipts"]["submission"]
+        ]
+        unsigned = {
+            key: value
+            for key, value in wrong_receipt_type.items()
+            if key != "receipt_id"
+        }
+        wrong_receipt_type["receipt_id"] = hashlib.sha256(
+            json.dumps(
+                unsigned,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertFalse(validate_orientation_receipt(wrong_receipt_type)[0])
+
+        tampered_source = json.loads(json.dumps(receipt))
+        tampered_source["source_receipts"][0]["observed_status"] = "failed"
+        unsigned = {
+            key: value
+            for key, value in tampered_source.items()
+            if key != "receipt_id"
+        }
+        tampered_source["receipt_id"] = hashlib.sha256(
+            json.dumps(
+                unsigned,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertFalse(validate_orientation_receipt(tampered_source)[0])
+
+        mismatched_projection = json.loads(json.dumps(receipt))
+        mismatched_projection["state_projection"]["job_id"] = "job-other"
+        mismatched_projection["state_projection_hash"] = hashlib.sha256(
+            json.dumps(
+                mismatched_projection["state_projection"],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        unsigned = {
+            key: value
+            for key, value in mismatched_projection.items()
+            if key != "receipt_id"
+        }
+        mismatched_projection["receipt_id"] = hashlib.sha256(
+            json.dumps(
+                unsigned,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertFalse(validate_orientation_receipt(mismatched_projection)[0])
+
+        extra_projection_field = json.loads(json.dumps(receipt))
+        extra_projection_field["state_projection"]["untrusted"] = "value"
+        extra_projection_field["state_projection_hash"] = hashlib.sha256(
+            json.dumps(
+                extra_projection_field["state_projection"],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        unsigned = {
+            key: value
+            for key, value in extra_projection_field.items()
+            if key != "receipt_id"
+        }
+        extra_projection_field["receipt_id"] = hashlib.sha256(
+            json.dumps(
+                unsigned,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertFalse(
+            validate_orientation_receipt(extra_projection_field)[0]
+        )
+
+        wrong_topic = json.loads(json.dumps(receipt))
+        wrong_topic["topic"] = "capabilities"
+        unsigned = {
+            key: value
+            for key, value in wrong_topic.items()
+            if key != "receipt_id"
+        }
+        wrong_topic["receipt_id"] = hashlib.sha256(
+            json.dumps(
+                unsigned,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        self.assertFalse(validate_orientation_receipt(wrong_topic)[0])
 
 
 if __name__ == "__main__":

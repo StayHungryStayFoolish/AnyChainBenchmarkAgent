@@ -368,6 +368,134 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
             plan.request_payload()["actions"][0]["registry_incomplete_mutation_intake"],
             False,
         )
+        self.assertIs(
+            plan.request_payload()["actions"][0]["registry_incomplete_read_intake"],
+            False,
+        )
+
+    def test_rejected_transaction_preserves_partitioned_units_as_unresolved(
+        self,
+    ) -> None:
+        from agent.harness.plan_coverage import TurnClause
+        from agent.harness.semantic_admission import _unresolved_action_queue
+
+        units = [
+            {
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "start": 0,
+                "end": 12,
+                "source_text": "region is us-1",
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "region proposal",
+            },
+            {
+                "unit_id": "unit-2",
+                "clause_id": "clause-1",
+                "start": 14,
+                "end": 25,
+                "source_text": "explain mixed",
+                "disposition": "action",
+                "action_indexes": [1],
+                "reason": "consultation",
+            },
+        ]
+
+        queue = _unresolved_action_queue(
+            (TurnClause("clause-1", "region is us-1; explain mixed", "prose"),),
+            ("whole-plan admission rejected one or more immutable actions",),
+            semantic_units=units,
+        )
+
+        self.assertEqual(
+            queue["unresolved_clauses"],
+            ["region is us-1", "explain mixed"],
+        )
+        self.assertEqual(
+            [unit["unit_id"] for unit in queue["semantic_units"]],
+            ["unit-1", "unit-2"],
+        )
+        self.assertTrue(all(
+            unit["disposition"] == "unresolved"
+            and unit["action_indexes"] == []
+            for unit in queue["semantic_units"]
+        ))
+
+    def test_researched_identity_preserves_raw_manual_source(
+        self,
+    ) -> None:
+        from agent.harness.domains.chain_rpc_questions import _chain_question
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.semantic_admission import (
+            _canonicalize_pending_choice_actions,
+        )
+
+        state = _state(active_group="chain_identity")
+        state["pending_question"] = _chain_question(state)
+        clauses = tuple(segment_user_turn("sola"))
+        candidate = json.dumps({
+            "actions": [{
+                "type": "answer_pending",
+                "answer": "solana",
+                "source_evidence": "sola",
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": clauses[0].clause_id,
+                "source_text": "sola",
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "manual chain identity",
+            }],
+        })
+
+        canonical = json.loads(_canonicalize_pending_choice_actions(
+            candidate,
+            state,
+            eligible_unit_ids=frozenset({"unit-1"}),
+        ))
+
+        self.assertEqual(canonical["actions"][0]["answer"], "sola")
+        self.assertEqual(
+            canonical["actions"][0]["source_evidence"],
+            "sola",
+        )
+
+    def test_semantic_review_derives_incomplete_read_intake_from_registry(
+        self,
+    ) -> None:
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.semantic_admission import (
+            _freeze_bounded_semantic_plan,
+            _semantic_fulfillment_prompt,
+        )
+
+        state = _state(active_group="opening")
+        text = "I have a log for you to analyze."
+        clauses = tuple(segment_user_turn(text))
+        candidate = json.dumps({
+            "actions": [{
+                "type": "analyze_evidence",
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": clauses[0].clause_id,
+                "source_text": text,
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "the source requests analysis before supplying evidence",
+            }],
+        })
+
+        plan = _freeze_bounded_semantic_plan(candidate, state, clauses)
+        record = plan.request_payload()["actions"][0]
+        policy = _semantic_fulfillment_prompt()
+
+        self.assertIs(record["registry_incomplete_read_intake"], True)
+        self.assertIs(record["registry_incomplete_mutation_intake"], False)
+        self.assertIn("open one typed freeform evidence collection", record["declared_purpose"])
+        self.assertIn("registry_incomplete_read_intake=true", policy)
 
 
     def test_same_unit_explicit_mutation_invalidates_the_old_pending_answer(self) -> None:

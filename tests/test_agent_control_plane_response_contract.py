@@ -252,6 +252,8 @@ class ControlPlaneResponseContractTest(unittest.TestCase):
             "active_group": "opening",
             "source_action_ids": ["a1"],
             "pending_contract_hash": "3" * 64,
+            "terminal_response_hash": "4" * 64,
+            "terminal_semantic_hash": "5" * 64,
             "fragments": [_manifest()],
         })
 
@@ -275,6 +277,7 @@ class ControlPlaneResponseContractTest(unittest.TestCase):
             "receipt_type": "domain_commit",
             "turn_index": 5,
             "owner": "coordinator",
+            "cause_kind": "validation_rejection",
             "completion": "rejected",
             "group_registry_contract_hash": "4" * 64,
             "pending_before_hash": "5" * 64,
@@ -289,6 +292,51 @@ class ControlPlaneResponseContractTest(unittest.TestCase):
         self.assertEqual(
             validate_coordinator_control_receipt(receipt, turn_index=5),
             (True, ""),
+        )
+
+    def test_system_reconcile_cannot_claim_business_mutation(self) -> None:
+        base = {
+            "receipt_type": "domain_commit",
+            "turn_index": 6,
+            "owner": "execution",
+            "cause_kind": "system_reconcile",
+            "completion": "unchanged",
+            "group_registry_contract_hash": "4" * 64,
+            "pending_before_hash": "5" * 64,
+            "pending_after_hash": "5" * 64,
+            "pending_after_id": "",
+            "consumed_action_ids": [],
+            "invalidated_groups": [],
+            "invalidated_fields": [],
+            "reconfigured_groups": [],
+            "group_state_transitions": [],
+            "navigation_operation": "",
+            "navigation_origin_group": "",
+            "navigation_target_group": "",
+            "material_delta": [],
+            "response_fragments": [],
+        }
+        valid = _signed_receipt(base)
+        self.assertEqual(
+            validate_coordinator_control_receipt(valid, turn_index=6),
+            (True, ""),
+        )
+
+        mutated = dict(base)
+        mutated["material_delta"] = [{
+            "operation": "write",
+            "path": "confirmed_config.CLOUD_REGION",
+            "value_hash": "7" * 64,
+        }]
+        mutated = _signed_receipt(mutated)
+        accepted, reason = validate_coordinator_control_receipt(
+            mutated,
+            turn_index=6,
+        )
+        self.assertFalse(accepted)
+        self.assertEqual(
+            reason,
+            "system reconcile cannot mutate business workflow state",
         )
 
     def test_v17_migration_clears_retired_turn_local_response_state(self) -> None:

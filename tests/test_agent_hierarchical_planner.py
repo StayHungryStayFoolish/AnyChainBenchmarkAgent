@@ -10,6 +10,61 @@ from unittest.mock import patch
 
 
 class HierarchicalPlannerContractTest(unittest.TestCase):
+    def test_owner_compile_failure_is_preserved_as_typed_unresolved_work(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import compile_next_owner
+        from agent.harness.state import new_state
+
+        document = {
+            "status": "compile_owner",
+            "owner_cursor": 0,
+            "owner_requests": [{
+                "owner": "chain_rpc",
+                "unit_ids": ["unit-chain"],
+                "groups": ["chain_identity"],
+            }],
+            "routed_partition": [{
+                "unit_id": "unit-chain",
+                "clause_id": "clause-1",
+                "source_text": "switch to BNB",
+                "operation": "domain_request",
+                "owner_routes": [{
+                    "owner": "chain_rpc",
+                    "group": "chain_identity",
+                }],
+            }],
+        }
+
+        with patch(
+            "agent.harness.hierarchical_planner._compile_owner_document",
+            return_value=(
+                {},
+                ("Stage B chain_rpc did not return strict JSON",),
+                (101, 103),
+            ),
+        ):
+            result = compile_next_owner(new_state("owner-failure"), document)
+
+        self.assertEqual(result["status"], "review_plan")
+        self.assertEqual(result["owner_cursor"], 1)
+        self.assertEqual(
+            result["owner_documents"]["chain_rpc"]["bindings"],
+            [{
+                "unit_id": "unit-chain",
+                "action_indexes": [],
+                "disposition": "unresolved",
+                "reason": (
+                    "The owning compiler could not produce a valid typed "
+                    "action after bounded repair."
+                ),
+            }],
+        )
+        self.assertEqual(
+            result["owner_failures"][0]["unit_ids"],
+            ["unit-chain"],
+        )
+
     def test_stage_a_structured_demand_atoms_can_use_distinct_operations(
         self,
     ) -> None:
@@ -2734,6 +2789,10 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             patch(
                 "agent.harness.hierarchical_planner._compile_owner_document",
             ) as owner_compiler,
+            patch(
+                "agent.harness.hierarchical_planner.build_semantic_plan_draft",
+                return_value={"status": "awaiting_clarification"},
+            ),
         ):
             result = resolve_product_action_queue(
                 state,
@@ -4419,10 +4478,12 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                     expected_operations={"unit-1": "domain_request"},
                 )
 
-                self.assertTrue(
-                    any("outside unit route" in error for error in errors),
-                    errors,
+                expected = (
+                    "typed-option-only"
+                    if action["type"] == "approve_final_benchmark"
+                    else "outside unit route"
                 )
+                self.assertTrue(any(expected in error for error in errors), errors)
 
     def test_stage_a_admission_rejects_an_omitted_sibling_demand(self) -> None:
         from agent.harness.hierarchical_planner import _review_stage_a_partition
@@ -4604,6 +4665,53 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertTrue(any("omitted demand" in error for error in errors))
         self.assertEqual(len(sizes), 1)
         self.assertEqual(compiler.call_count, 1)
+
+    def test_whole_plan_admission_repairs_malformed_omission_rejection(
+        self,
+    ) -> None:
+        from agent.harness.semantic_compiler import (
+            WholePlanAdmission,
+            _is_explicit_semantic_rejection,
+        )
+
+        malformed = WholePlanAdmission(
+            valid=False,
+            errors=(
+                "whole-plan omitted demand is not registry expressible: unit-2",
+                "whole-plan admission found unresolved or omitted demand",
+            ),
+            response={
+                "action_verdicts": [{
+                    "action_id": "action-1",
+                    "verdict": "admit",
+                }],
+                "unit_verdicts": [{
+                    "unit_id": "unit-2",
+                    "verdict": "omitted",
+                    "omitted_action_type": "",
+                }],
+            },
+        )
+        valid_rejection = WholePlanAdmission(
+            valid=False,
+            errors=(
+                "whole-plan admission found unresolved or omitted demand",
+            ),
+            response={
+                "action_verdicts": [{
+                    "action_id": "action-1",
+                    "verdict": "admit",
+                }],
+                "unit_verdicts": [{
+                    "unit_id": "unit-2",
+                    "verdict": "omitted",
+                    "omitted_action_type": "answer_opening_question",
+                }],
+            },
+        )
+
+        self.assertFalse(_is_explicit_semantic_rejection(malformed))
+        self.assertTrue(_is_explicit_semantic_rejection(valid_rejection))
 
     def test_stage_a_context_unit_defers_omission_authority_to_clause(self) -> None:
         from agent.harness.hierarchical_planner import (
@@ -5124,10 +5232,9 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                 ("unit-1",),
             )
 
-        self.assertEqual(errors, ())
-        self.assertEqual(
-            document["actions"],
-            [{"type": "approve_preflight_smoke"}],
+        self.assertTrue(
+            any("typed-option-only" in error for error in errors),
+            errors,
         )
         self.assertEqual(len(sizes), 2)
         self.assertEqual(compiler.call_count, 2)
@@ -5353,6 +5460,295 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         )
         self.assertTrue(intake["incomplete_mutation_intake"])
         self.assertEqual(intake["target_group"], "target_mode")
+
+    def test_stage_b_lowers_missing_evidence_to_registered_read_intake(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _validate_owner_document
+
+        document = {
+            "actions": [],
+            "bindings": [{
+                "unit_id": "unit-1",
+                "action_indexes": [],
+                "disposition": "unresolved",
+                "reason": "evidence has not been pasted yet",
+            }],
+            "reason": "wait for evidence",
+        }
+
+        payload, errors = _validate_owner_document(
+            json.dumps(document, ensure_ascii=False),
+            "analysis",
+            ("unit-1",),
+            expected_groups={"unit-1": frozenset()},
+            expected_operations={"unit-1": "evidence_analysis"},
+            expected_sources={
+                "unit-1": ("这是日志，你可以帮我分析么？",),
+            },
+        )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(payload["actions"], [{"type": "analyze_evidence"}])
+        self.assertEqual(
+            payload["bindings"][0]["disposition"],
+            "action",
+        )
+        self.assertEqual(payload["bindings"][0]["action_indexes"], [0])
+
+    def test_stage_b_does_not_lower_unregistered_unresolved_read(self) -> None:
+        from agent.harness.hierarchical_planner import _validate_owner_document
+
+        document = {
+            "actions": [],
+            "bindings": [{
+                "unit_id": "unit-1",
+                "action_indexes": [],
+                "disposition": "unresolved",
+                "reason": "subject is ambiguous",
+            }],
+            "reason": "clarification is required",
+        }
+
+        payload, errors = _validate_owner_document(
+            json.dumps(document, ensure_ascii=False),
+            "orientation",
+            ("unit-1",),
+            expected_groups={"unit-1": frozenset()},
+            expected_operations={"unit-1": "consultation"},
+            expected_sources={"unit-1": ("解释一下",)},
+        )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(payload["actions"], [])
+        self.assertEqual(
+            payload["bindings"][0]["disposition"],
+            "unresolved",
+        )
+
+    def test_stage_b_lowers_value_less_entry_to_unique_registered_intake(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _validate_owner_document
+
+        document = {
+            "actions": [{
+                "type": "choose_chain",
+                "source_evidence": "重新测试别的链",
+            }],
+            "bindings": [{
+                "unit_id": "unit-1",
+                "action_indexes": [0],
+                "disposition": "action",
+                "reason": "chain replacement requested without a concrete value",
+            }],
+            "reason": "compile the registered chain intake",
+        }
+
+        payload, errors = _validate_owner_document(
+            json.dumps(document, ensure_ascii=False),
+            "chain_rpc",
+            ("unit-1",),
+            expected_groups={"unit-1": frozenset({"chain_identity"})},
+            expected_operations={"unit-1": "domain_request"},
+            expected_sources={"unit-1": ("重新测试别的链",)},
+        )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(payload["actions"], [{
+            "type": "request_chain_selection",
+            "source_evidence": "重新测试别的链",
+        }])
+
+    def test_stage_b_lowers_unresolved_value_less_mutation_to_registered_intake(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _validate_owner_document
+
+        source = "我需要重新测试别的链，可以么"
+        document = {
+            "actions": [],
+            "bindings": [{
+                "unit_id": "unit-1",
+                "action_indexes": [],
+                "disposition": "unresolved",
+                "reason": "replacement requested without a concrete value",
+            }],
+            "reason": "the typed intake must collect the missing value",
+        }
+
+        payload, errors = _validate_owner_document(
+            json.dumps(document, ensure_ascii=False),
+            "chain_rpc",
+            ("unit-1",),
+            expected_groups={"unit-1": frozenset({"chain_identity"})},
+            expected_operations={"unit-1": "domain_request"},
+            expected_sources={"unit-1": (source,)},
+        )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(payload["actions"], [{
+            "type": "request_chain_selection",
+            "source_evidence": source,
+        }])
+        self.assertEqual(payload["bindings"], [{
+            "unit_id": "unit-1",
+            "action_indexes": [0],
+            "disposition": "action",
+            "reason": "replacement requested without a concrete value",
+        }])
+
+    def test_stage_b_binds_exact_source_to_registered_mutation_intake(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _validate_owner_document
+
+        source = "I need to benchmark a different chain."
+        document = {
+            "actions": [{
+                "type": "request_chain_selection",
+            }],
+            "bindings": [{
+                "unit_id": "unit-1",
+                "action_indexes": [0],
+                "disposition": "action",
+                "reason": "collect the omitted replacement chain",
+            }],
+            "reason": "use the registry-owned incomplete mutation intake",
+        }
+
+        payload, errors = _validate_owner_document(
+            json.dumps(document),
+            "chain_rpc",
+            ("unit-1",),
+            expected_groups={"unit-1": frozenset({"chain_identity"})},
+            expected_operations={"unit-1": "domain_request"},
+            expected_sources={"unit-1": (source,)},
+        )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(payload["actions"], [{
+            "type": "request_chain_selection",
+            "source_evidence": source,
+        }])
+
+    def test_stage_b_does_not_guess_intake_evidence_from_multiple_units(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _validate_owner_document
+
+        document = {
+            "actions": [{
+                "type": "request_chain_selection",
+            }],
+            "bindings": [
+                {
+                    "unit_id": unit_id,
+                    "action_indexes": [0],
+                    "disposition": "action",
+                    "reason": "shared intake",
+                }
+                for unit_id in ("unit-1", "unit-2")
+            ],
+            "reason": "ambiguous ownership must fail closed",
+        }
+
+        payload, errors = _validate_owner_document(
+            json.dumps(document),
+            "chain_rpc",
+            ("unit-1", "unit-2"),
+            expected_groups={
+                "unit-1": frozenset({"chain_identity"}),
+                "unit-2": frozenset({"chain_identity"}),
+            },
+            expected_operations={
+                "unit-1": "domain_request",
+                "unit-2": "domain_request",
+            },
+            expected_sources={
+                "unit-1": ("change the chain",),
+                "unit-2": ("choose another network",),
+            },
+        )
+
+        self.assertEqual(payload["actions"], [])
+        self.assertTrue(
+            any("missing required arguments" in error for error in errors),
+            errors,
+        )
+
+    def test_stage_b_does_not_lower_unrouted_or_ambiguous_mutation_intake(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _validate_owner_document
+
+        document = {
+            "actions": [],
+            "bindings": [{
+                "unit_id": "unit-1",
+                "action_indexes": [],
+                "disposition": "unresolved",
+                "reason": "the requested domain is not known",
+            }],
+            "reason": "clarification required",
+        }
+
+        payload, errors = _validate_owner_document(
+            json.dumps(document),
+            "chain_rpc",
+            ("unit-1",),
+            expected_groups={"unit-1": frozenset()},
+            expected_operations={"unit-1": "domain_request"},
+            expected_sources={"unit-1": ("change it",)},
+        )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(payload["actions"], [])
+        self.assertEqual(payload["bindings"][0]["disposition"], "unresolved")
+
+    def test_stage_b_keeps_concrete_and_multi_candidate_chain_entries(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _validate_owner_document
+
+        for action in (
+            {
+                "type": "choose_chain",
+                "chain_text": "ethereum",
+                "source_evidence": "ethereum",
+            },
+            {
+                "type": "choose_chain",
+                "chain_candidates": ["ethereum", "bsc"],
+                "source_evidence": "ethereum or bsc",
+            },
+        ):
+            with self.subTest(action=action):
+                document = {
+                    "actions": [action],
+                    "bindings": [{
+                        "unit_id": "unit-1",
+                        "action_indexes": [0],
+                        "disposition": "action",
+                        "reason": "concrete chain input",
+                    }],
+                    "reason": "compile concrete chain input",
+                }
+                payload, errors = _validate_owner_document(
+                    json.dumps(document),
+                    "chain_rpc",
+                    ("unit-1",),
+                    expected_groups={
+                        "unit-1": frozenset({"chain_identity"}),
+                    },
+                    expected_operations={"unit-1": "domain_request"},
+                    expected_sources={
+                        "unit-1": (str(action["source_evidence"]),),
+                    },
+                )
+
+                self.assertEqual(errors, ())
+                self.assertEqual(payload["actions"], [action])
 
     def test_stage_b_repairs_closed_enum_guess_to_registered_intake(self) -> None:
         from agent.harness.hierarchical_planner import _compile_owner_document

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+from collections import Counter
 from typing import Any
 
 import yaml
@@ -142,20 +144,34 @@ def extract_url_candidates(value: Any) -> tuple[str, ...]:
 
 
 def extract_json_values(value: Any) -> list[Any]:
-    """Decode every valid JSON object or array embedded in a value."""
+    """Decode source-level JSON documents without re-emitting descendants."""
 
     decoder = json.JSONDecoder()
     output: list[Any] = []
     text = str(value or "")
-    for index, char in enumerate(text):
+    index = 0
+    while index < len(text):
+        char = text[index]
         if char not in "[{":
+            index += 1
+            continue
+        line_prefix = text[text.rfind("\n", 0, index) + 1 : index].rstrip()
+        if re.fullmatch(
+            r"\s*[A-Za-z_][A-Za-z0-9_.-]*\s*:",
+            line_prefix,
+        ):
+            index += 1
             continue
         try:
-            parsed, _ = decoder.raw_decode(text[index:])
+            parsed, consumed = decoder.raw_decode(text[index:])
         except json.JSONDecodeError:
+            index += 1
             continue
         if isinstance(parsed, (dict, list)):
             output.append(parsed)
+            index += consumed
+            continue
+        index += 1
     return output
 
 
@@ -173,28 +189,55 @@ def extract_rpc_wire_values(value: Any) -> list[Any]:
     if not text:
         return []
     output = list(extract_json_values(text))
-    yaml_candidates: list[str] = [text]
-    yaml_candidates.extend(
-        match.group(1).strip()
-        for match in re.finditer(r"```(?:ya?ml)?\s*\n(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
-        if match.group(1).strip()
-    )
+    yaml_candidates: list[str] = []
+    fenced_spans: list[tuple[int, int]] = []
+    for match in re.finditer(
+        r"```(?:ya?ml)?\s*\n(.*?)```",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        candidate = match.group(1).strip()
+        if candidate and not extract_json_values(candidate):
+            yaml_candidates.append(candidate)
+        fenced_spans.append(match.span())
     lines = text.splitlines()
+    line_offset = 0
     for index, line in enumerate(lines):
-        if line != line.lstrip() or ":" not in line:
+        line_start = line_offset
+        line_offset += len(line) + 1
+        if (
+            any(start <= line_start < end for start, end in fenced_spans)
+            or line != line.lstrip()
+            or ":" not in line
+        ):
             continue
         key = line.split(":", 1)[0].strip().strip("\"'").casefold()
         if key in _RPC_WIRE_KEYS:
-            yaml_candidates.append("\n".join(lines[index:]).strip())
+            candidate = "\n".join(lines[index:]).strip()
+            if candidate and not extract_json_values(candidate):
+                yaml_candidates.append(candidate)
             break
-    for candidate in yaml_candidates:
+    if text.lstrip().startswith("-") and not extract_json_values(text):
+        yaml_candidates.append(text)
+    for candidate in dict.fromkeys(yaml_candidates):
         if not candidate or candidate[0] in "[{":
             continue
         try:
             parsed = yaml.safe_load(candidate)
         except yaml.YAMLError:
             continue
-        if isinstance(parsed, (dict, list)) and parsed not in output:
+        if isinstance(parsed, list) and not any(
+            _parsed_rpc_wire_evidence(item, allow_params_only=False)
+            for item in parsed
+            if isinstance(item, dict)
+        ):
+            continue
+        if isinstance(parsed, dict) and not _parsed_rpc_wire_evidence(
+            parsed,
+            allow_params_only=True,
+        ):
+            continue
+        if isinstance(parsed, (dict, list)):
             output.append(parsed)
     return output
 
@@ -204,11 +247,59 @@ def _rpc_wire_payloads(value: Any) -> list[Any]:
     for document in extract_rpc_wire_values(value):
         payloads.append(document)
         if isinstance(document, dict):
-            for key in ("request", "response"):
-                nested = document.get(key)
-                if isinstance(nested, (dict, list)):
+            for key, nested in document.items():
+                if (
+                    str(key).casefold() in {"request", "response"}
+                    and isinstance(nested, (dict, list))
+                ):
                     payloads.append(nested)
     return payloads
+
+
+def _owned_rpc_wire_payloads(value: Any) -> list[Any]:
+    """Return wire payloads without re-emitting objects owned by a batch.
+
+    Source-level JSON parsing already preserves separate documents. YAML
+    wrappers may expose ``request``/``response`` children, so ownership is
+    resolved structurally rather than by content deduplication. This preserves
+    two genuinely repeated top-level messages, including duplicate ids.
+    """
+
+    payloads: list[Any] = []
+    for document in extract_rpc_wire_values(value):
+        if isinstance(document, dict):
+            nested = [
+                item
+                for key, item in document.items()
+                if (
+                    str(key).casefold() in {"request", "response"}
+                    and isinstance(item, (dict, list))
+                )
+            ]
+            document_keys = {str(key).casefold() for key in document}
+            if nested and not (
+                "method" in document_keys
+                or "result" in document_keys
+                or "error" in document_keys
+            ):
+                payloads.extend(nested)
+                continue
+        payloads.append(document)
+    return payloads
+
+
+def _rpc_wire_messages(value: Any) -> list[dict[str, Any]]:
+    """Flatten only source-owned RPC batches into message objects."""
+
+    messages: list[dict[str, Any]] = []
+    for payload in _owned_rpc_wire_payloads(value):
+        if isinstance(payload, list):
+            messages.extend(
+                item for item in payload if isinstance(item, dict)
+            )
+        elif isinstance(payload, dict):
+            messages.append(payload)
+    return messages
 
 
 def extract_rpc_method_identities(value: Any) -> list[str]:
@@ -220,9 +311,7 @@ def extract_rpc_method_identities(value: Any) -> list[str]:
     """
 
     methods: list[str] = []
-    for payload in _rpc_wire_payloads(value):
-        if not isinstance(payload, dict):
-            continue
+    for payload in _rpc_wire_messages(value):
         method = next(
             (
                 item
@@ -346,12 +435,24 @@ def _parsed_rpc_wire_evidence(
     payloads = [document]
     if isinstance(document, dict):
         payloads.extend(
-            document[key]
-            for key in ("request", "response")
-            if isinstance(document.get(key), (dict, list))
+            item
+            for key, item in document.items()
+            if (
+                str(key).casefold() in {"request", "response"}
+                and isinstance(item, (dict, list))
+            )
         )
     for payload in payloads:
         if isinstance(payload, list):
+            if any(
+                _parsed_rpc_wire_evidence(
+                    item,
+                    allow_params_only=False,
+                )
+                for item in payload
+                if isinstance(item, dict)
+            ):
+                return True
             if allow_params_only:
                 return True
             continue
@@ -371,11 +472,345 @@ def has_rpc_response_evidence(value: Any) -> bool:
     """Return whether one turn contains a response object, not only a request."""
 
     return any(
-        isinstance(payload, dict)
-        and any(str(key).casefold() in {"result", "error"} for key in payload)
+        any(str(key).casefold() in {"result", "error"} for key in payload)
         and not any(str(key).casefold() == "method" for key in payload)
-        for payload in _rpc_wire_payloads(value)
+        for payload in _rpc_wire_messages(value)
     )
+
+
+def extract_rpc_exchange_correlation(value: Any) -> dict[str, Any]:
+    """Return a privacy-safe correlation summary for JSON-RPC evidence."""
+
+    requests: list[dict[str, Any]] = []
+    responses: list[dict[str, Any]] = []
+    payload_directions: dict[int, set[str]] = {}
+    for payload_index, payload in enumerate(_owned_rpc_wire_payloads(value)):
+        candidates = payload if isinstance(payload, list) else [payload]
+        for batch_index, candidate in enumerate(candidates):
+            if not isinstance(candidate, dict):
+                continue
+            keys = {str(key).casefold(): key for key in candidate}
+            id_present = "id" in keys
+            id_hash = (
+                hashlib.sha256(
+                    json.dumps(
+                        candidate[keys["id"]],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                        default=str,
+                    ).encode("utf-8")
+                ).hexdigest()
+                if id_present
+                else ""
+            )
+            if "method" in keys:
+                if isinstance(payload, list):
+                    payload_directions.setdefault(payload_index, set()).add(
+                        "request"
+                    )
+                requests.append(
+                    {
+                        "method": normalize_scalar(candidate[keys["method"]]),
+                        "id_present": id_present,
+                        "id_hash": id_hash,
+                        "payload_index": payload_index,
+                        "batch_index": batch_index,
+                    }
+                )
+                continue
+            response_keys = [
+                key for key in ("result", "error") if key in keys
+            ]
+            if len(response_keys) == 1:
+                if isinstance(payload, list):
+                    payload_directions.setdefault(payload_index, set()).add(
+                        "response"
+                    )
+                responses.append(
+                    {
+                        "response_key": response_keys[0],
+                        "id_present": id_present,
+                        "id_hash": id_hash,
+                        "payload_index": payload_index,
+                        "batch_index": batch_index,
+                    }
+                )
+
+    methods = sorted(
+        {
+            str(item.get("method") or "")
+            for item in requests
+            if str(item.get("method") or "")
+        }
+    )
+    request_id_sequence = [
+        str(item.get("id_hash") or "")
+        for item in requests
+        if item.get("id_present")
+    ]
+    response_id_sequence = [
+        str(item.get("id_hash") or "")
+        for item in responses
+        if item.get("id_present")
+    ]
+    request_ids = Counter(request_id_sequence)
+    response_ids = Counter(response_id_sequence)
+    duplicate_request_ids = sorted(
+        digest for digest, count in request_ids.items() if count > 1
+    )
+    duplicate_response_ids = sorted(
+        digest for digest, count in response_ids.items() if count > 1
+    )
+    mixed_direction_payloads = sorted(
+        index
+        for index, directions in payload_directions.items()
+        if len(directions) > 1
+    )
+    if mixed_direction_payloads:
+        status = "mixed_batch_directions"
+    elif len(methods) > 1:
+        status = "multiple_request_methods"
+    elif responses and not requests:
+        status = "response_without_request"
+    elif duplicate_request_ids or duplicate_response_ids:
+        status = "duplicate_exchange_id"
+    elif responses and (
+        any(not item.get("id_present") for item in responses)
+        or not request_ids
+        or response_ids != request_ids
+    ):
+        status = "response_id_mismatch"
+    elif responses:
+        status = "correlated"
+    elif requests:
+        status = "request_only"
+    else:
+        status = "no_wire_exchange"
+    return {
+        "status": status,
+        "methods": methods,
+        "request_count": len(requests),
+        "response_count": len(responses),
+        "request_id_hashes": sorted(request_id_sequence),
+        "response_id_hashes": sorted(response_id_sequence),
+        "duplicate_request_id_hashes": duplicate_request_ids,
+        "duplicate_response_id_hashes": duplicate_response_ids,
+        "mixed_direction_payload_indexes": mixed_direction_payloads,
+        "request_correlations": [
+            {
+                "method": str(item.get("method") or ""),
+                "id_present": bool(item.get("id_present")),
+                "id_hash": str(item.get("id_hash") or ""),
+                "payload_index": int(item.get("payload_index") or 0),
+                "batch_index": int(item.get("batch_index") or 0),
+            }
+            for item in requests
+        ],
+        "response_correlations": [
+            {
+                "response_key": str(item.get("response_key") or ""),
+                "id_present": bool(item.get("id_present")),
+                "id_hash": str(item.get("id_hash") or ""),
+                "payload_index": int(item.get("payload_index") or 0),
+                "batch_index": int(item.get("batch_index") or 0),
+            }
+            for item in responses
+        ],
+    }
+
+
+def extract_rpc_response_contract(value: Any) -> dict[str, Any]:
+    """Extract source-exact JSON-RPC response structure without semantics.
+
+    The result describes only facts present on the wire.  Blockchain-specific
+    meaning remains advisory model/document work and is merged separately.
+    """
+
+    response_kinds: set[str] = set()
+    response_types: set[str] = set()
+    field_types: dict[str, set[str]] = {}
+    response_variants: list[dict[str, Any]] = []
+    truncated = False
+    response_count = 0
+    max_fields = 64
+    max_variants = 64
+    variant_field_count = 0
+    for payload_index, payload in enumerate(_owned_rpc_wire_payloads(value)):
+        candidates = payload if isinstance(payload, list) else [payload]
+        for batch_index, candidate in enumerate(candidates):
+            if not isinstance(candidate, dict):
+                continue
+            keys = {str(key).casefold(): key for key in candidate}
+            if "method" in keys:
+                continue
+            response_keys = [key for key in ("result", "error") if key in keys]
+            if len(response_keys) != 1:
+                continue
+            response_key = response_keys[0]
+            response_value = candidate[keys[response_key]]
+            response_count += 1
+            response_kinds.add(response_key)
+            response_types.add(_json_wire_type(response_value))
+            remaining_fields = max_fields - variant_field_count
+            fields, field_truncated = _response_wire_fields(
+                response_key,
+                response_value,
+                max_fields=remaining_fields,
+            )
+            if len(response_variants) < max_variants:
+                response_variants.append(
+                    {
+                        "response_key": response_key,
+                        "id_hash": _rpc_wire_id_hash(
+                            candidate[keys["id"]]
+                        )
+                        if "id" in keys
+                        else "",
+                        "payload_index": payload_index,
+                        "batch_index": batch_index,
+                        "json_type": _json_wire_type(response_value),
+                        "response_fields": fields,
+                        "response_schema_truncated": field_truncated,
+                        "response_schema_complete": not field_truncated,
+                    }
+                )
+                variant_field_count += len(fields)
+            else:
+                field_truncated = True
+            truncated = truncated or field_truncated
+            for field in fields:
+                name = str(field.get("name") or "")
+                json_types = field.get("json_types") or [field.get("json_type")]
+                if name in field_types or len(field_types) < max_fields:
+                    field_types.setdefault(name, set()).update(
+                        str(item)
+                        for item in json_types
+                        if str(item or "")
+                    )
+                else:
+                    truncated = True
+    if not response_count:
+        return {}
+    sorted_response_types = sorted(response_types)
+    response_json_type = (
+        sorted_response_types[0]
+        if len(sorted_response_types) == 1
+        else "mixed"
+    )
+    response_kind = (
+        next(iter(response_kinds))
+        if len(response_kinds) == 1
+        else "mixed"
+    )
+    return {
+        "response_summary": (
+            f"JSON-RPC {response_kind} ({response_json_type}); "
+            f"messages={response_count}"
+        ),
+        "response_json_type": response_json_type,
+        "response_json_types": sorted_response_types,
+        "response_fields": [
+            {
+                "name": name,
+                "json_type": (
+                    sorted(types)[0] if len(types) == 1 else "mixed"
+                ),
+                "json_types": sorted(types),
+                "meaning": "unknown",
+            }
+            for name, types in sorted(field_types.items())
+        ],
+        "response_message_count": response_count,
+        "response_variants": response_variants,
+        "response_schema_truncated": truncated,
+        "response_schema_complete": not truncated,
+    }
+
+
+def _response_wire_fields(
+    root: str,
+    value: Any,
+    *,
+    max_depth: int = 6,
+    max_fields: int = 64,
+) -> tuple[list[dict[str, Any]], bool]:
+    if max_fields <= 0:
+        return [], True
+    field_types: dict[str, set[str]] = {}
+    truncated = False
+
+    def record(path: str, item: Any, depth: int) -> None:
+        nonlocal truncated
+        if depth > max_depth:
+            truncated = True
+            return
+        if path not in field_types and len(field_types) >= max_fields:
+            truncated = True
+            return
+        json_type = _json_wire_type(item)
+        field_types.setdefault(path, set()).add(json_type)
+        if isinstance(item, dict):
+            for key in sorted(item, key=str):
+                record(f"{path}.{key}", item[key], depth + 1)
+                if len(field_types) >= max_fields:
+                    if any(
+                        child_key not in field_types
+                        for child_key in (
+                            f"{path}.{remaining}"
+                            for remaining in sorted(item, key=str)
+                        )
+                    ):
+                        truncated = True
+                    break
+        elif isinstance(item, list) and item:
+            for child in item:
+                record(f"{path}[]", child, depth + 1)
+                if len(field_types) >= max_fields:
+                    truncated = True
+                    break
+
+    record(root, value, 0)
+    return (
+        [
+            {
+                "name": path,
+                "json_type": sorted(types)[0] if len(types) == 1 else "mixed",
+                "json_types": sorted(types),
+                "meaning": "unknown",
+            }
+            for path, types in sorted(field_types.items())
+        ],
+        truncated,
+    )
+
+
+def _rpc_wire_id_hash(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _json_wire_type(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return "unknown"
 
 
 def extract_json_object_or_array(value: Any) -> str:

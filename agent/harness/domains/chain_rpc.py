@@ -99,7 +99,7 @@ def _workload_default_question_text(state: AgentGraphState):
 
 from .chain_handoff import (_prepare_case2_handoff, _prepare_case3_handoff, _promote_case2_endpoint, _record_case3_evidence)
 from .chain_identity import (_apply_chain_candidate, _apply_chain_change_decision, _apply_unknown_chain_decision, _chain_ambiguity_question, _confirm_custom_rpc_family, _enter_case_for_adapter_family, _identity_confirmation_question, _origin_text, _preserve_same_chain, _request_chain_change, _request_target_mode_change, _resolution_from_arguments, _target_mode_is_explicit)
-from .chain_rpc_questions import (_action_option, _adapter_family_question, _answer_option, _case3_evidence_question, _chain_question, _choice, _endpoint_probe_completion, _endpoint_validation_question, _mainnet_review_question, _target_change_scope_question, _target_mode_selection_question)
+from .chain_rpc_questions import (_action_option, _adapter_family_question, _answer_option, _case3_evidence_question, _chain_question, _chain_selection_question, _choice, _endpoint_probe_completion, _endpoint_validation_question, _mainnet_review_question, _target_change_scope_question, _target_mode_selection_question)
 from .chain_rpc_support import (_adapter_family, _answer_result, _chain_confirmed, _handoff_stops, _invalidate_execution, _next_group, _result, is_existing_family_lifecycle)
 from .rpc_endpoint import (
     _apply_endpoint_answer,
@@ -109,9 +109,11 @@ from .rpc_endpoint import (
     _confirm_parameter_contract,
     _confirm_probe_response,
     _confirm_request_contract,
+    _resolve_method_conflict,
 )
 from .rpc_workload import (_apply_continue, _apply_requested_workload, _apply_scope, _apply_weights, _set_single_workload)
-from .rpc_catalog import append_evidence, strict_method_identity
+from .rpc_catalog import strict_method_identity
+from .rpc_receipts import emit_endpoint_role_receipt
 from .response_fragments import ResponseCollector, emit, failure
 
 def question_for_chain_rpc(state: AgentGraphState, group: str) -> dict[str, Any] | None:
@@ -421,6 +423,11 @@ def apply_chain_rpc_action(state: AgentGraphState, action: ActionProposal) -> Ha
         return _result(state, next_state, action, response_fragments=tuple(responses))
     if action_type in {"choose_chain", "change_chain"}:
         raw = normalize_scalar(arguments.get("chain_text"))
+        candidate_values = [
+            normalize_scalar(item)
+            for item in arguments.get("chain_candidates") or ()
+            if normalize_scalar(item)
+        ]
         candidate_mode = normalize_target_mode(arguments.get("target_mode"))
         if candidate_mode and _target_mode_is_explicit(next_state, candidate_mode, arguments) and not next_state.get("target_mode"):
             next_state["target_mode"] = candidate_mode
@@ -430,6 +437,13 @@ def apply_chain_rpc_action(state: AgentGraphState, action: ActionProposal) -> Ha
             mention = extract_chain_mention(next_state, _origin_text(next_state, arguments))
             if bool(mention.get("found")) and normalize_scalar(mention.get("confidence")).casefold() in {"medium", "high"}:
                 raw = normalize_scalar(mention.get("chain_text"))
+        if not raw and len(candidate_values) == 1:
+            raw = candidate_values[0]
+        ambiguity = _chain_ambiguity_question(next_state, raw, arguments)
+        if ambiguity:
+            next_state['active_group'] = "chain_identity"
+            next_state['pending_question'] = ambiguity
+            return _result(state, next_state, action, completion="blocked", response_fragments=tuple(responses))
         if not raw:
             next_state['active_group'] = "chain_identity"
             next_state['pending_question'] = _chain_question(next_state)
@@ -443,11 +457,6 @@ def apply_chain_rpc_action(state: AgentGraphState, action: ActionProposal) -> Ha
         if current and canonical == current:
             _preserve_same_chain(next_state, current, responses=responses)
             return _result(state, next_state, action, completion="unchanged", response_fragments=tuple(responses))
-        ambiguity = _chain_ambiguity_question(next_state, raw, arguments)
-        if ambiguity:
-            next_state['active_group'] = "chain_identity"
-            next_state['pending_question'] = ambiguity
-            return _result(state, next_state, action, completion="blocked", response_fragments=tuple(responses))
         resolution = _resolution_from_arguments(arguments)
         if action_type == "change_chain" or current:
             _request_chain_change(next_state, raw, arguments, resolution=resolution, responses=responses)
@@ -524,37 +533,14 @@ def apply_chain_rpc_action(state: AgentGraphState, action: ActionProposal) -> Ha
         return _result(state, next_state, action, completion="blocked", response_fragments=tuple(responses))
     if action_type == "request_chain_selection":
         next_state['active_group'] = "chain_identity"
-        current_chain = normalize_scalar((next_state.get("chain_identity") or {}).get("canonical"))
         candidates = [
             normalize_scalar(item)
             for item in arguments.get("chain_candidates") or []
             if normalize_scalar(item)
         ]
-        if current_chain:
-            prompt = question_text(
-                "question.chain_rpc.chain_change.current.prompt",
-                current_chain=current_chain,
-            )
-        elif candidates:
-            prompt = question_text(
-                "question.chain_rpc.chain_change.candidates.prompt",
-                candidates=", ".join(candidates),
-            )
-        else:
-            prompt = question_text("question.chain_rpc.chain_change.prompt")
-        manual_action_type = "change_chain" if current_chain else "choose_chain"
-        next_state['pending_question'] = manual_question(
-            "chain_identity",
-            "chain_change_input",
-            prompt,
-            field="chain_change_input",
-            accepted_action_types=("choose_chain", "change_chain"),
-            manual_action={
-                "type": manual_action_type,
-                "value_argument": "chain_text",
-            },
-            queue_barrier=True,
-            evidence_path="chain_identity.change_candidate.canonical",
+        next_state["pending_question"] = _chain_selection_question(
+            next_state,
+            candidates=candidates,
         )
         return _result(state, next_state, action, completion="blocked", response_fragments=tuple(responses))
     if action_type == "request_target_mode_selection":
@@ -599,11 +585,20 @@ def apply_chain_rpc_action(state: AgentGraphState, action: ActionProposal) -> Ha
             command_arguments["rpc_method"] = arguments.get("rpc_method")
         elif command == "append_evidence":
             command_arguments["rpc_schema_evidence"] = arguments.get("rpc_schema_evidence")
-        elif command != "enter":
+        elif command not in {
+            "enter",
+            "finish",
+            "keep_current_method",
+            "replace_current_method",
+        }:
             return HandlerResult(blocker=failure("chain_rpc.failure.invalid_operation", arguments={"operation": f"rpc_catalog_command:{command}"}, source=__name__))
         arguments = command_arguments
     elif action_type == "rpc_workload_command":
-        if not chain_identity_confirmed(next_state):
+        identity = next_state.get("chain_identity") or {}
+        if not (
+            chain_identity_confirmed(next_state)
+            or is_existing_family_lifecycle(identity)
+        ):
             return HandlerResult(blocker=failure("chain_rpc.failure.invalid_operation", arguments={"operation": "custom_workload_without_confirmed_chain"}, source=__name__))
         arguments = {
             key: value
@@ -616,6 +611,46 @@ def apply_chain_rpc_action(state: AgentGraphState, action: ActionProposal) -> Ha
     )
     if not identity_name:
         return HandlerResult(blocker=failure("chain_rpc.failure.missing_required_value", arguments={"field": "chain_identity"}, source=__name__))
+    if action_type == "rpc_catalog_command" and command == "finish":
+        case = "new_chain" if is_existing_family_lifecycle(identity) else "custom_rpc"
+        _apply_continue(next_state, case, "finish", responses=responses)
+        _install_chain_rpc_next_question(next_state, "endpoint_process")
+        return _result(
+            state,
+            next_state,
+            action,
+            completion="in_progress",
+            response_fragments=tuple(responses),
+        )
+    if action_type == "rpc_catalog_command" and command in {
+        "keep_current_method",
+        "replace_current_method",
+    }:
+        case = (
+            "new_chain"
+            if is_existing_family_lifecycle(identity)
+            else "custom_rpc"
+        )
+        if not _resolve_method_conflict(
+            next_state,
+            case=case,
+            replace=command == "replace_current_method",
+        ):
+            return HandlerResult(
+                blocker=failure(
+                    "chain_rpc.failure.invalid_operation",
+                    arguments={"operation": command},
+                    source=__name__,
+                )
+            )
+        _install_chain_rpc_next_question(next_state, "endpoint_process")
+        return _result(
+            state,
+            next_state,
+            action,
+            completion="in_progress",
+            response_fragments=tuple(responses),
+        )
     method = normalize_scalar(arguments.get("rpc_method"))
     endpoint = extract_url_candidate(arguments.get("rpc_endpoint"))
     origin_text = _origin_text(next_state, arguments)
@@ -624,6 +659,37 @@ def apply_chain_rpc_action(state: AgentGraphState, action: ActionProposal) -> Ha
     if is_existing_family_lifecycle(identity):
         previous_pending = deepcopy(next_state.get("pending_question") or {})
         next_state['pending_question'] = {}
+        requested_scope = normalize_scalar(arguments.get("workload_scope"))
+        if requested_scope in {"single_replace", "mixed_replace"}:
+            _apply_scope(
+                next_state,
+                "new_chain",
+                requested_scope,
+                responses=responses,
+            )
+            requested_weights = arguments.get("rpc_weights")
+            if (
+                requested_scope == "mixed_replace"
+                and isinstance(requested_weights, Mapping)
+            ):
+                _apply_weights(
+                    next_state,
+                    "new_chain",
+                    requested_weights,
+                    responses=responses,
+                )
+            _install_chain_rpc_next_question(next_state, "endpoint_process")
+            return _result(
+                state,
+                next_state,
+                action,
+                completion=(
+                    "completed"
+                    if (next_state.get("workload") or {}).get("confirmed")
+                    else "in_progress"
+                ),
+                response_fragments=tuple(responses),
+            )
         if endpoint and identity.get("status") == "existing_family_needs_endpoint":
             _apply_endpoint_answer(
                 next_state,
@@ -647,20 +713,34 @@ def apply_chain_rpc_action(state: AgentGraphState, action: ActionProposal) -> Ha
     if method:
         strict_method = strict_method_identity(method, adapter_family=_adapter_family(next_state))
         if strict_method:
-            append_evidence(
-                next_state,
-                content=strict_method,
-                source="typed_action",
-                kind="method_identity",
-                method=strict_method,
-            )
             method = strict_method
+            _apply_method_answer(
+                next_state,
+                "custom_rpc",
+                strict_method,
+                responses=responses,
+            )
         else:
             method = ""
             emit(
                 responses,
                 "chain_rpc.response.method_grammar_rejected",
                 source=__name__,
+            )
+        if custom.get("status") == "method_conflict":
+            next_state.setdefault("workload", {})["choice"] = "custom_rpc"
+            next_state["active_group"] = "endpoint_process"
+            record_group_invalidations(
+                next_state,
+                "endpoint_process",
+                "workload_rpc",
+            )
+            return _result(
+                state,
+                next_state,
+                action,
+                completion="blocked",
+                response_fragments=tuple(responses),
             )
     requested_scope = normalize_scalar(arguments.get("workload_scope"))
     requested_weights = arguments.get("rpc_weights")
@@ -886,7 +966,14 @@ def apply_chain_rpc_answer(
     if question_id == "MAINNET_RPC_URL_REVIEWED":
         confirmed = next_state.setdefault("confirmed_config", {})
         if value is False:
-            next_state.setdefault("endpoint_evidence", {})["mainnet_review_declined"] = True
+            evidence = next_state.setdefault("endpoint_evidence", {})
+            evidence["mainnet_review_declined"] = True
+            for key in ("mainnet_rpc_url_probe", "mainnet_rpc_url_ready"):
+                evidence.pop(key, None)
+            confirmed.pop("MAINNET_RPC_URL", None)
+            confirmed["MAINNET_RPC_URL_DISABLED"] = True
+        elif value is True:
+            confirmed.pop("MAINNET_RPC_URL_DISABLED", None)
         elif value is not True:
             endpoint = extract_url_candidate(value)
             if not endpoint:
@@ -917,6 +1004,19 @@ def apply_chain_rpc_answer(
                 )
             evidence["mainnet_rpc_url_ready"] = True
             confirmed["MAINNET_RPC_URL"] = endpoint
+            confirmed.pop("MAINNET_RPC_URL_DISABLED", None)
+            emit_endpoint_role_receipt(
+                next_state,
+                role="mainnet_comparison",
+                case=str(identity.get("case") or "known"),
+                config_field="MAINNET_RPC_URL",
+                endpoint=endpoint,
+                ready=True,
+                probe_status=probe.get("status"),
+                chain=chain,
+                adapter_family=family,
+                methods=methods,
+            )
         confirmed["MAINNET_RPC_URL_REVIEWED"] = True
         return _answer_result(state, next_state)
     if question_id in {"custom_rpc_method", "new_chain_method"}:
@@ -979,7 +1079,12 @@ def apply_chain_rpc_answer(
     if question_id in {"custom_rpc_scope", "new_chain_workload_scope"}:
         if rpc_case not in {"custom_rpc", "new_chain"}:
             return HandlerResult(blocker=failure("chain_rpc.failure.invalid_question_contract", arguments={"question_id": question_id}, source=__name__))
-        _apply_scope(next_state, rpc_case, value, responses=responses)
+        normalized_scope = normalize_scalar(value)
+        scope = {
+            "single": "single_replace",
+            "mixed": "mixed_replace",
+        }.get(normalized_scope, normalized_scope)
+        _apply_scope(next_state, rpc_case, scope, responses=responses)
         _install_chain_rpc_next_question(next_state, "endpoint_process")
         return _answer_result(state, next_state, completion="in_progress", response_fragments=tuple(responses))
     if question_id in {"custom_rpc_single_method", "new_chain_single_method"}:

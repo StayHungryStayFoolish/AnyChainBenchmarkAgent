@@ -3,19 +3,24 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from typing import Any, Mapping
 
 from ..failures import build_failure_record
 from ..input_values import (
     extract_json_object_or_array,
     extract_json_values,
+    extract_rpc_exchange_correlation,
+    extract_rpc_response_contract,
     has_rpc_response_evidence,
     extract_rpc_params_or_request,
     extract_url_candidate,
+    extract_url_candidates,
     looks_like_url_value,
     normalize_scalar,
 )
 from ..advisory import extract_rpc_schema_from_evidence
+from ..secret_refs import materialize_state_secret_references
 from ..state import AgentGraphState
 from ..transitions import (
     invalidate_for_endpoint_change,
@@ -33,6 +38,7 @@ from .chain_rpc_questions import (
     _adapter_family_question,
     _continue_question,
     _catalog_confirmation_question,
+    _method_conflict_question,
     _response_confirmation_question,
 )
 from .chain_rpc_support import _adapter_family, _case_dict, _draft_has_params, _looks_like_rest_method, _merge_rpc_schema_draft, _schema_indicates_jsonrpc, _schema_indicates_rest
@@ -41,17 +47,24 @@ from .response_fragments import ResponseCollector, emit
 from .rpc_catalog import (
     add_validated_method,
     append_evidence,
+    bind_validation_endpoint,
     confirm_parameter,
     confirm_request,
     confirm_response,
     correct_draft,
     draft_view,
+    effective_custom_workload_methods,
+    effective_job_local_workload_methods,
     ensure_catalog,
     incomplete_parameters,
     next_parameter_to_confirm,
+    probe_evidence_content_hash,
+    probe_evidence_contract_hash,
     record_probe,
     refresh_catalog_projection,
     reset_draft,
+    selected_contracts_cover_effective_workload,
+    selected_validated_contracts,
     strict_method_identity,
     validated_contracts,
 )
@@ -75,6 +88,7 @@ def _apply_endpoint_answer(
     role = normalize_scalar(endpoint_contract.get("endpoint_role"))
     case = normalize_scalar(endpoint_contract.get("rpc_case"))
     config_field = normalize_scalar(endpoint_contract.get("config_field"))
+    contracts: list[dict[str, Any]] = []
     if (role, case, config_field) not in {
         ("final_benchmark", "runtime", "LOCAL_RPC_URL"),
         ("sync_observe", "runtime", "SYNC_OBSERVE_RPC_URL"),
@@ -89,9 +103,53 @@ def _apply_endpoint_answer(
         if case == "custom_rpc"
         else (state.get("endpoint_evidence") or {}).get("candidate_endpoint")
     )
+    skip_endpoint_probe = False
     if role == "final_benchmark":
         contracts = _selected_custom_contracts(state)
-        if contracts:
+        selected_workload_methods = effective_job_local_workload_methods(state)
+        selected_custom_methods = effective_custom_workload_methods(state)
+        workload = state.get("workload")
+        job_local_override = bool(
+            isinstance(workload, Mapping)
+            and workload.get("confirmed")
+            and workload.get("job_local_override")
+        )
+        if job_local_override and not selected_workload_methods:
+            message = "confirmed job-local workload has no selected methods"
+            result = {
+                "ready": False,
+                "status": "proof_incomplete",
+                "error": message,
+                "blockers": [message],
+                "endpoint": endpoint,
+                "selected_methods": [],
+                "method_results": {},
+                "evidence_file": "",
+            }
+            methods = []
+            params = None
+            skip_endpoint_probe = True
+        elif selected_custom_methods and not (
+            selected_contracts_cover_effective_workload(state)
+        ):
+            message = (
+                "selected custom workload is not fully covered by "
+                "validated method contracts"
+            )
+            result = {
+                "ready": False,
+                "status": "proof_incomplete",
+                "error": message,
+                "blockers": [message],
+                "endpoint": endpoint,
+                "selected_methods": selected_custom_methods,
+                "method_results": {},
+                "evidence_file": "",
+            }
+            methods = selected_custom_methods
+            params = None
+            skip_endpoint_probe = True
+        elif contracts:
             result = _validate_final_endpoint_contracts(
                 chain=chain,
                 endpoint=endpoint,
@@ -100,6 +158,7 @@ def _apply_endpoint_answer(
             )
             methods = None
             params = None
+            skip_endpoint_probe = True
         else:
             methods, params = health_probe_methods(chain, family)
     elif role == "sync_observe":
@@ -107,7 +166,7 @@ def _apply_endpoint_answer(
         params = None
     else:
         methods, params = health_probe_methods(chain, family)
-    if not (role == "final_benchmark" and contracts):
+    if not skip_endpoint_probe:
         result = validate_rpc_endpoint(
             chain=chain,
             endpoint=endpoint,
@@ -116,10 +175,32 @@ def _apply_endpoint_answer(
             method_params=params,
             timeout=3.0,
         )
-    emit_endpoint_role_receipt(
+    method_evidence_bindings: list[dict[str, str]] = []
+    if role == "final_benchmark" and contracts:
+        for contract in contracts:
+            method = normalize_scalar(contract.get("method"))
+            method_result = (
+                (result.get("method_results") or {}).get(method, {})
+                if isinstance(result.get("method_results"), Mapping)
+                else {}
+            )
+            evidence_file = normalize_scalar(
+                method_result.get("evidence_file")
+            )
+            method_evidence_bindings.append({
+                "method": method,
+                "evidence_file_hash": probe_evidence_content_hash(
+                    evidence_file
+                ),
+                "probe_contract_hash": probe_evidence_contract_hash(
+                    evidence_file
+                ),
+            })
+    endpoint_receipt = emit_endpoint_role_receipt(
         state,
         role=role,
         case=case,
+        config_field=config_field,
         endpoint=endpoint,
         previous_endpoint=previous_endpoint,
         ready=bool(result.get("ready")),
@@ -131,9 +212,38 @@ def _apply_endpoint_answer(
             if role == "final_benchmark" and contracts
             else methods or ()
         ),
+        method_evidence_bindings=method_evidence_bindings,
     )
+    if role == "final_benchmark" and result.get("ready") and not endpoint_receipt:
+        result["ready"] = False
+        result["status"] = "proof_incomplete"
+        result["error"] = (
+            "final endpoint proof could not be bound to the selected workload"
+        )
+        result.setdefault("blockers", []).append(result["error"])
     evidence = state.setdefault("endpoint_evidence", {})
+    if role == "validation" and endpoint_receipt:
+        if case == "custom_rpc":
+            custom = state.setdefault("custom_rpc", {})
+            custom["endpoint_validation_receipt_id"] = endpoint_receipt[
+                "receipt_id"
+            ]
+            custom["endpoint_validation_receipt"] = deepcopy(endpoint_receipt)
+        elif case == "new_chain":
+            evidence[
+                "candidate_endpoint_validation_receipt_id"
+            ] = endpoint_receipt["receipt_id"]
+            evidence[
+                "candidate_endpoint_validation_receipt"
+            ] = deepcopy(endpoint_receipt)
     if role == "final_benchmark":
+        if endpoint_receipt:
+            evidence["local_rpc_url_validation_receipt_id"] = (
+                endpoint_receipt["receipt_id"]
+            )
+            evidence["local_rpc_url_validation_receipt"] = deepcopy(
+                endpoint_receipt
+            )
         evidence["local_rpc_url_probe"] = result
         if contracts:
             evidence["final_custom_rpc_probe"] = result
@@ -263,33 +373,14 @@ def _apply_method_answer(
         return
     current_method = normalize_scalar(draft_view(state).get("method"))
     if current_method and current_method != next_method:
-        transition = append_evidence(
+        _open_method_conflict(
             state,
-            content=raw,
-            source="user",
-            kind="protocol_request" if parsed is not None else "method_identity",
-            method=next_method,
+            case=case,
+            current_method=current_method,
+            incoming_method=next_method,
+            responses=responses,
         )
-        if not transition.accepted:
-            case_dict["status"] = "existing_family_needs_schema_evidence" if case == "new_chain" else "needs_schema_evidence"
-            emit(
-                responses,
-                "chain_rpc.response.rpc_method_conflict",
-                arguments={
-                    "incoming_method": next_method,
-                    "current_method": current_method,
-                },
-                source=__name__,
-            )
-            return
-    elif not current_method:
-        append_evidence(
-            state,
-            content=raw,
-            source="user",
-            kind="protocol_request" if parsed is not None else "method_identity",
-            method=next_method,
-        )
+        return
     family_is_rest_shaped = _adapter_family(state) not in GENERIC_JSONRPC_PROBE_FAMILIES
     if not (parsed_method and parsed is not None) and (
         (looks_like_url_value(method_value) and not family_is_rest_shaped)
@@ -306,7 +397,83 @@ def _apply_method_answer(
             responses=responses,
         )
         return
+    if not current_method:
+        append_evidence(
+            state,
+            content=raw,
+            source="user",
+            kind="method_identity",
+            method=next_method,
+        )
     case_dict["status"] = "existing_family_needs_schema_evidence" if case == "new_chain" else "needs_schema_evidence"
+
+
+def _open_method_conflict(
+    state: AgentGraphState,
+    *,
+    case: str,
+    current_method: str,
+    incoming_method: str,
+    responses: ResponseCollector,
+) -> None:
+    owner = _case_dict(state, case)
+    owner["method_conflict"] = {
+        "current_method": current_method,
+        "incoming_method": incoming_method,
+    }
+    owner["status"] = (
+        "existing_family_method_conflict"
+        if case == "new_chain"
+        else "method_conflict"
+    )
+    state["active_group"] = "endpoint_process"
+    state["pending_question"] = _method_conflict_question(
+        state,
+        case=case,
+    )
+    emit(
+        responses,
+        "chain_rpc.response.rpc_method_conflict",
+        arguments={
+            "incoming_method": incoming_method,
+            "current_method": current_method,
+        },
+        source=__name__,
+    )
+
+
+def _resolve_method_conflict(
+    state: AgentGraphState,
+    *,
+    case: str,
+    replace: bool,
+) -> bool:
+    owner = _case_dict(state, case)
+    conflict = owner.get("method_conflict")
+    if not isinstance(conflict, Mapping):
+        return False
+    current = normalize_scalar(conflict.get("current_method"))
+    incoming = normalize_scalar(conflict.get("incoming_method"))
+    if not current or not incoming:
+        return False
+    if replace:
+        transition = correct_draft(
+            state,
+            {
+                "method": incoming,
+                "evidence": [],
+                "field_provenance": [],
+            },
+        )
+        if not transition.accepted:
+            return False
+    owner.pop("method_conflict", None)
+    owner["status"] = (
+        "existing_family_needs_schema_evidence"
+        if case == "new_chain"
+        else "needs_schema_evidence"
+    )
+    return True
 
 
 def _apply_schema_evidence(
@@ -340,6 +507,37 @@ def _apply_schema_evidence(
         emit(responses, "chain_rpc.response.rpc_evidence_rejected", source=__name__)
         return False
     current_method = normalize_scalar(draft_view(state).get("method"))
+    if current_method and incoming_method and current_method != incoming_method:
+        _open_method_conflict(
+            state,
+            case=case,
+            current_method=current_method,
+            incoming_method=incoming_method,
+            responses=responses,
+        )
+        return False
+    retained_fragments = [
+        str(item.get("content") or "")
+        for item in draft_view(state).get("evidence") or []
+        if isinstance(item, Mapping) and str(item.get("content") or "").strip()
+    ]
+    exchange = extract_rpc_exchange_correlation(
+        "\n\n".join([*retained_fragments, clean_evidence])
+    )
+    if exchange.get("status") in {
+        "multiple_request_methods",
+        "response_without_request",
+        "response_id_mismatch",
+        "duplicate_exchange_id",
+        "mixed_batch_directions",
+    }:
+        emit(
+            responses,
+            "chain_rpc.response.rpc_exchange_uncorrelated",
+            arguments={"reason": str(exchange.get("status") or "unknown")},
+            source=__name__,
+        )
+        return False
     transition = append_evidence(
         state,
         content=clean_evidence,
@@ -359,6 +557,11 @@ def _apply_schema_evidence(
             source=__name__,
         )
         return False
+    _record_validation_endpoint_scope(
+        state,
+        case=case,
+        evidence=clean_evidence,
+    )
     fragments = [
         str(item.get("content") or "")
         for item in draft_view(state).get("evidence") or []
@@ -372,6 +575,7 @@ def _apply_schema_evidence(
         extracted = dict(extract_rpc_schema_from_evidence(state, combined_evidence, method_hint=method) or {})
         if extracted.get("status") == "failed":
             extracted = {}
+        wire_response = extract_rpc_response_contract(combined_evidence)
         if _request_only_schema_evidence(fragments, method):
             # Model knowledge may explain a known method, but it cannot turn a
             # request-only paste into user-supplied response evidence. The
@@ -382,6 +586,11 @@ def _apply_schema_evidence(
             extracted["response_fields"] = []
             extracted.pop("response_sample", None)
             extracted.pop("response_example", None)
+        elif wire_response:
+            extracted = _merge_wire_response_schema(
+                extracted,
+                wire_response,
+            )
         previous_draft = draft_view(state)
         draft = _merge_rpc_schema_draft(
             method=method,
@@ -390,6 +599,7 @@ def _apply_schema_evidence(
             previous=previous_draft,
         )
         draft["validation_endpoint"] = _validation_endpoint(state, case)
+        draft["exchange_correlation"] = exchange
         draft["field_provenance"] = _schema_field_provenance(
             draft,
             previous=previous_draft,
@@ -400,6 +610,7 @@ def _apply_schema_evidence(
                 if isinstance(item, Mapping)
             ],
             wire_request_observed=True,
+            wire_response_schema=wire_response,
         )
         correct_draft(state, draft)
         case_dict["status"] = "existing_family_schema_needs_confirmation" if case == "new_chain" else "schema_needs_confirmation"
@@ -438,6 +649,7 @@ def _apply_schema_evidence(
     if previous:
         draft = {**previous, **draft}
     draft["validation_endpoint"] = _validation_endpoint(state, case)
+    draft["exchange_correlation"] = exchange
     draft["field_provenance"] = _schema_field_provenance(
         draft,
         previous=previous,
@@ -452,6 +664,7 @@ def _apply_schema_evidence(
             if isinstance(item, Mapping)
         ],
         wire_request_observed=False,
+        wire_response_schema=extract_rpc_response_contract(combined_evidence),
     )
     correct_draft(state, draft)
     if _schema_conflict(state, draft, case=case, responses=responses):
@@ -472,6 +685,37 @@ def _apply_schema_evidence(
     case_dict["status"] = "existing_family_schema_needs_confirmation" if case == "new_chain" else "schema_needs_confirmation"
     state['pending_question'] = _catalog_confirmation_question(state, case)
     return True
+
+
+def _record_validation_endpoint_scope(
+    state: AgentGraphState,
+    *,
+    case: str,
+    evidence: str,
+) -> None:
+    """Verify that embedded URLs cannot replace the validated endpoint source."""
+
+    if not extract_url_candidates(evidence):
+        return
+    endpoint = _validation_endpoint(state, case)
+    if not endpoint:
+        return
+    evidence_state = state.get("endpoint_evidence") or {}
+    owner = _case_dict(state, case)
+    receipt = (
+        evidence_state.get("candidate_endpoint_validation_receipt")
+        if case == "new_chain"
+        else owner.get("endpoint_validation_receipt")
+    )
+    if not isinstance(receipt, Mapping):
+        return
+    if (
+        receipt.get("role") != "validation"
+        or receipt.get("case") != case
+        or receipt.get("ready") is not True
+        or receipt.get("endpoint_hash") != evidence_hash(endpoint)
+    ):
+        raise ValueError("validation endpoint provenance mismatch")
 
 
 def _fragment_contributes_rpc_fact(
@@ -523,6 +767,7 @@ def _schema_field_provenance(
     extracted: Mapping[str, Any],
     evidence_fragments: list[Mapping[str, Any]],
     wire_request_observed: bool,
+    wire_response_schema: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     """Describe where schema fields came from without retaining their values."""
 
@@ -609,18 +854,79 @@ def _schema_field_provenance(
     for field in (
         "response_summary",
         "response_json_type",
-        "response_fields",
-        "response_sample",
-        "response_example",
+        "response_json_types",
+        "response_message_count",
+        "response_variants",
+        "response_schema_truncated",
+        "response_schema_complete",
     ):
-        if field not in draft:
+        if field not in draft or not _meaningful_response_schema_value(
+            field,
+            draft.get(field),
+        ):
             continue
         source = (
+            "protocol_response_parser"
+            if field != "response_summary" and wire_response_schema
+            else "protocol_response_parser"
+            if field == "response_summary"
+            and draft.get(field) == wire_response_schema.get(field)
+            else
             "model_extraction_from_user_evidence"
             if field in extracted
             else "retained"
         )
         record(field, draft.get(field), source)
+    response_fields = (
+        draft.get("response_fields")
+        if isinstance(draft.get("response_fields"), list)
+        else []
+    )
+    for index, response_field in enumerate(response_fields):
+        if not isinstance(response_field, Mapping):
+            continue
+        for field, value in sorted(response_field.items()):
+            source = (
+                "protocol_response_parser"
+                if wire_response_schema
+                and field in {"name", "json_type", "json_types", "type"}
+                else "model_extraction_from_user_evidence"
+                if field in {"meaning", "semantic_type", "encoding"}
+                else "retained"
+            )
+            record(f"response_fields[{index}].{field}", value, source)
+    for field in ("response_sample", "response_example"):
+        if field not in draft or not _meaningful_response_schema_value(
+            field,
+            draft.get(field),
+        ):
+            continue
+        record(
+            field,
+            draft.get(field),
+            "model_extraction_from_user_evidence"
+            if field in extracted
+            else "retained",
+        )
+    correlation = (
+        draft.get("exchange_correlation")
+        if isinstance(draft.get("exchange_correlation"), Mapping)
+        else {}
+    )
+    for field in (
+        "status",
+        "request_id_hashes",
+        "response_id_hashes",
+        "request_correlations",
+        "response_correlations",
+        "mixed_direction_payload_indexes",
+    ):
+        if field in correlation:
+            record(
+                f"exchange_correlation.{field}",
+                correlation.get(field),
+                "protocol_exchange_correlator",
+            )
     if normalize_scalar(draft.get("validation_endpoint")):
         record(
             "validation_endpoint",
@@ -628,6 +934,77 @@ def _schema_field_provenance(
             "rpc_endpoint_role",
         )
     return [output[path] for path in sorted(output)]
+
+
+def _merge_wire_response_schema(
+    extracted: Mapping[str, Any],
+    wire_response: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Keep response wire shape authoritative while retaining reviewed meaning."""
+
+    merged = dict(extracted)
+    wire_fields = (
+        wire_response.get("response_fields")
+        if isinstance(wire_response.get("response_fields"), list)
+        else []
+    )
+    extracted_fields = {
+        normalize_scalar(item.get("name")): item
+        for item in merged.get("response_fields") or ()
+        if isinstance(item, Mapping) and normalize_scalar(item.get("name"))
+    }
+    response_fields: list[dict[str, Any]] = []
+    for wire_field in wire_fields:
+        if not isinstance(wire_field, Mapping):
+            continue
+        name = normalize_scalar(wire_field.get("name"))
+        row = dict(extracted_fields.get(name) or {})
+        row.update(dict(wire_field))
+        if normalize_scalar(row.get("meaning")) in {"", "unknown"}:
+            row["meaning"] = "unknown"
+        response_fields.append(row)
+    merged["response_fields"] = response_fields
+    merged["response_json_type"] = wire_response.get("response_json_type")
+    merged["response_json_types"] = list(
+        wire_response.get("response_json_types") or []
+    )
+    merged["response_message_count"] = int(
+        wire_response.get("response_message_count") or 0
+    )
+    merged["response_variants"] = [
+        dict(item)
+        for item in wire_response.get("response_variants") or ()
+        if isinstance(item, Mapping)
+    ]
+    merged["response_schema_truncated"] = bool(
+        wire_response.get("response_schema_truncated")
+    )
+    merged["response_schema_complete"] = bool(
+        wire_response.get("response_schema_complete")
+    )
+    if not _meaningful_response_schema_value(
+        "response_summary",
+        merged.get("response_summary"),
+    ):
+        merged["response_summary"] = wire_response.get("response_summary")
+    return merged
+
+
+def _meaningful_response_schema_value(field: str, value: Any) -> bool:
+    """Exclude placeholders from response-schema provenance."""
+
+    if field == "response_fields":
+        return isinstance(value, list) and bool(value)
+    if field in {"response_sample", "response_example"}:
+        return value is not None and value != "" and value != {} and value != []
+    return normalize_scalar(value).casefold() not in {
+        "",
+        "unknown",
+        "<unknown>",
+        "unavailable",
+        "n/a",
+        "none",
+    }
 
 
 def _request_only_schema_evidence(fragments: list[str], method: str) -> bool:
@@ -669,11 +1046,44 @@ def _probe_schema(
             source=__name__,
         )
         return
-    params = draft.get("params_json")
     endpoint = normalize_scalar((state.get("endpoint_evidence") or {}).get("candidate_endpoint")) if case == "new_chain" else normalize_scalar(case_dict.get("endpoint"))
+    scope = bind_validation_endpoint(state, endpoint)
+    if not scope.accepted:
+        case_dict["status"] = (
+            "existing_family_needs_endpoint"
+            if case == "new_chain"
+            else "needs_endpoint"
+        )
+        emit(
+            responses,
+            "chain_rpc.response.request_confirmation_required",
+            source=__name__,
+        )
+        return
+    draft = draft_view(state)
+    method = normalize_scalar(draft.get("method"))
+    params = draft.get("params_json")
+    try:
+        probe_endpoint = normalize_scalar(
+            materialize_state_secret_references(endpoint, state)
+        )
+    except (KeyError, RuntimeError, ValueError):
+        probe_endpoint = ""
+    if not probe_endpoint:
+        case_dict["status"] = (
+            "existing_family_needs_endpoint"
+            if case == "new_chain"
+            else "needs_endpoint"
+        )
+        emit(
+            responses,
+            "chain_rpc.response.request_confirmation_required",
+            source=__name__,
+        )
+        return
     result = validate_rpc_endpoint(
         chain=normalize_scalar((state.get("chain_identity") or {}).get("canonical") or (state.get("chain_identity") or {}).get("raw")),
-        endpoint=endpoint,
+        endpoint=probe_endpoint,
         methods=[method],
         adapter_family=_adapter_family(state),
         method_params={method: params},
@@ -821,24 +1231,9 @@ def _finalize_probed_method(
     responses: ResponseCollector,
 ) -> None:
     case_dict = _case_dict(state, case)
-    draft = draft_view(state)
-    method = normalize_scalar(draft.get("method"))
-    params = draft.get("params_json")
     evidence_key = "new_chain_method_probe" if case == "new_chain" else "custom_rpc_method_probe"
     result = (state.get("endpoint_evidence") or {}).get(evidence_key) or {}
-    contract = {
-        "method": method,
-        "params": params,
-        "schema": dict(draft),
-        "observed_response": dict(draft.get("observed_response") or {}),
-        "validation_endpoint": (
-            normalize_scalar((state.get("endpoint_evidence") or {}).get("candidate_endpoint"))
-            if case == "new_chain"
-            else normalize_scalar(case_dict.get("endpoint"))
-        ),
-        "evidence_file": result.get("evidence_file") or "",
-    }
-    transition = add_validated_method(state, contract)
+    transition = add_validated_method(state)
     if not transition.accepted:
         case_dict["status"] = "existing_family_response_needs_confirmation" if case == "new_chain" else "response_needs_confirmation"
         return
@@ -927,19 +1322,7 @@ def _record_validation_failure(state: AgentGraphState, code: str, result: Mappin
 def _selected_custom_contracts(state: AgentGraphState) -> list[dict[str, Any]]:
     """Return the custom contracts selected for the effective workload."""
 
-    selected = {
-        normalize_scalar(method)
-        for method in (state.get("workload") or {}).get("methods") or []
-        if normalize_scalar(method)
-    }
-    records = [
-        item for item in validated_contracts(state)
-        if normalize_scalar(item.get("method")) and (not selected or normalize_scalar(item.get("method")) in selected)
-    ]
-    unique: dict[str, dict[str, Any]] = {}
-    for item in records:
-        unique[normalize_scalar(item.get("method"))] = item
-    return list(unique.values())
+    return selected_validated_contracts(state)
 
 
 def _validate_final_endpoint_contracts(
@@ -1063,13 +1446,25 @@ def _response_contract_conflicts(
     except (TypeError, json.JSONDecodeError):
         return []
     conflicts: list[str] = []
+    variants = [
+        dict(item)
+        for item in draft.get("response_variants") or ()
+        if isinstance(item, Mapping)
+    ]
+    if bool(draft.get("response_schema_truncated")) or any(
+        bool(item.get("response_schema_truncated"))
+        for item in variants
+    ):
+        conflicts.append(
+            "response schema is truncated and requires explicit confirmation"
+        )
     expected_sample = draft.get("response_sample", draft.get("response_example"))
     if isinstance(expected_sample, str):
         try:
             expected_sample = json.loads(expected_sample)
         except json.JSONDecodeError:
             expected_sample = None
-    if expected_sample is not None:
+    if expected_sample is not None and not variants:
         expected_shape = _json_shape(expected_sample)
         observed_shape = _json_shape(observed)
         if expected_shape != observed_shape:
@@ -1086,32 +1481,175 @@ def _response_contract_conflicts(
                     f"stable response mismatch: expected {expected_stable}, observed {stable_result}"
                 )
 
-    fields = [item for item in draft.get("response_fields") or [] if isinstance(item, dict) and normalize_scalar(item.get("name"))]
-    if fields:
-        names = {normalize_scalar(item.get("name")) for item in fields}
-        container = observed if "result" in names else observed.get("result") if isinstance(observed, dict) else observed
-        if not isinstance(container, dict):
-            conflicts.append("response fields were expected but the observed response container is not an object")
-        else:
-            for item in fields:
-                name = normalize_scalar(item.get("name"))
-                if name not in container:
-                    conflicts.append(f"observed response is missing expected field {name}")
-                    continue
-                expected_type = _normalized_json_type(item.get("type") or item.get("json_type"))
-                observed_type = _json_type(container[name])
-                if expected_type and expected_type != observed_type:
-                    conflicts.append(f"response field {name} expected {expected_type}, observed {observed_type}")
+    observed_messages = (
+        [item for item in observed if isinstance(item, dict)]
+        if isinstance(observed, list)
+        else [observed]
+        if isinstance(observed, dict)
+        else []
+    )
+    if variants and observed_messages:
+        for message in observed_messages:
+            response_keys = {
+                key for key in ("result", "error") if key in message
+            }
+            candidate_conflicts = [
+                _response_variant_conflicts(variant, message)
+                for variant in variants
+                if normalize_scalar(variant.get("response_key"))
+                in response_keys
+            ]
+            if not candidate_conflicts:
+                conflicts.append(
+                    "observed response does not match any declared response variant"
+                )
+            elif all(candidate_conflicts):
+                conflicts.extend(min(candidate_conflicts, key=len))
 
-    declared_type = _declared_response_json_type(draft.get("response_json_type"))
-    if declared_type:
+    fields = [
+        item
+        for item in draft.get("response_fields") or []
+        if isinstance(item, dict) and normalize_scalar(item.get("name"))
+    ]
+    if fields and not variants:
+        for item in fields:
+            name = normalize_scalar(item.get("name"))
+            values = _wire_path_values(observed, name)
+            if not values:
+                conflicts.append(f"observed response is missing expected field {name}")
+                continue
+            expected_types = {
+                normalized
+                for normalized in (
+                    _normalized_json_type(value)
+                    for value in (
+                        item.get("json_types")
+                        if isinstance(item.get("json_types"), list)
+                        else [item.get("type") or item.get("json_type")]
+                    )
+                )
+                if normalized and normalized != "mixed"
+            }
+            observed_types = {_json_type(value) for value in values}
+            if expected_types and not observed_types.issubset(expected_types):
+                conflicts.append(
+                    f"response field {name} expected "
+                    f"{', '.join(sorted(expected_types))}, "
+                    f"observed {', '.join(sorted(observed_types))}"
+                )
+
+    declared_types = {
+        normalized
+        for normalized in (
+            _declared_response_json_type(value)
+            for value in (
+                draft.get("response_json_types")
+                if isinstance(draft.get("response_json_types"), list)
+                else [draft.get("response_json_type")]
+            )
+        )
+        if normalized and normalized != "mixed"
+    }
+    if declared_types and not variants:
         result_value = observed.get("result") if isinstance(observed, dict) and "result" in observed else observed
         observed_type = _json_type(result_value)
-        if observed_type != declared_type:
+        if observed_type not in declared_types:
             conflicts.append(
-                f"response contract expected {declared_type}, observed {observed_type}"
+                f"response contract expected {', '.join(sorted(declared_types))}, "
+                f"observed {observed_type}"
             )
     return list(dict.fromkeys(conflicts))
+
+
+def _response_variant_conflicts(
+    variant: Mapping[str, Any],
+    observed: Mapping[str, Any],
+) -> list[str]:
+    response_key = normalize_scalar(variant.get("response_key"))
+    if response_key not in observed:
+        return [f"response variant requires {response_key}"]
+    conflicts: list[str] = []
+    if bool(variant.get("response_schema_truncated")):
+        conflicts.append(
+            "response variant schema is truncated and requires explicit confirmation"
+        )
+    fields = [
+        item
+        for item in variant.get("response_fields") or ()
+        if isinstance(item, Mapping) and normalize_scalar(item.get("name"))
+    ]
+    for item in fields:
+        name = normalize_scalar(item.get("name"))
+        values = _wire_path_values(observed, name)
+        if not values:
+            conflicts.append(f"observed response is missing expected field {name}")
+            continue
+        expected_types = {
+            normalized
+            for normalized in (
+                _normalized_json_type(value)
+                for value in (
+                    item.get("json_types")
+                    if isinstance(item.get("json_types"), list)
+                    else [item.get("type") or item.get("json_type")]
+                )
+            )
+            if normalized and normalized != "mixed"
+        }
+        observed_types = {_json_type(value) for value in values}
+        if expected_types and not observed_types.issubset(expected_types):
+            conflicts.append(
+                f"response field {name} expected "
+                f"{', '.join(sorted(expected_types))}, "
+                f"observed {', '.join(sorted(observed_types))}"
+            )
+    expected_type = _normalized_json_type(variant.get("json_type"))
+    observed_type = _json_type(observed.get(response_key))
+    if (
+        expected_type
+        and expected_type != "mixed"
+        and observed_type != expected_type
+    ):
+        conflicts.append(
+            f"response variant {response_key} expected {expected_type}, "
+            f"observed {observed_type}"
+        )
+    return conflicts
+
+
+def _wire_path_values(value: Any, path: str) -> list[Any]:
+    """Resolve dotted response paths and explicit array element markers."""
+
+    first = path.split(".", 1)[0].removesuffix("[]")
+    if (
+        isinstance(value, dict)
+        and first not in {"result", "error"}
+        and first not in value
+        and isinstance(value.get("result"), (dict, list))
+    ):
+        current = [value["result"]]
+    else:
+        current = [value]
+    for segment in (part for part in path.split(".") if part):
+        is_array = segment.endswith("[]")
+        key = segment[:-2] if is_array else segment
+        selected: list[Any] = []
+        for item in current:
+            if not isinstance(item, dict) or key not in item:
+                continue
+            selected.append(item[key])
+        if is_array:
+            current = [
+                child
+                for item in selected
+                if isinstance(item, list)
+                for child in item
+            ]
+        else:
+            current = selected
+        if not current:
+            return []
+    return current
 
 
 def _json_shape(value: Any) -> Any:

@@ -463,6 +463,7 @@ class HandlerResult:
     completion: CompletionStatus = "unchanged"
     blocker: FailureDescriptor | None = None
     stop_after_response: bool = False
+    suppress_pending_render: bool = False
 
     def __post_init__(self) -> None:
         if not all(
@@ -520,6 +521,7 @@ class SideEffectIntent:
     turn_id: str
     action_id: str
     operation: str
+    execution_request_id: str
     idempotency_key: str
     request: Mapping[str, Any]
     request_fingerprint: str
@@ -871,6 +873,7 @@ def handler_result_to_dict(result: HandlerResult) -> dict[str, Any]:
             failure_descriptor_to_dict(result.blocker) if result.blocker else None
         ),
         "stop_after_response": result.stop_after_response,
+        "suppress_pending_render": result.suppress_pending_render,
     }
 
 
@@ -992,6 +995,7 @@ def handler_result_from_dict(payload: Mapping[str, Any]) -> HandlerResult:
             else None
         ),
         stop_after_response=bool(payload.get("stop_after_response")),
+        suppress_pending_render=bool(payload.get("suppress_pending_render")),
     )
 
 

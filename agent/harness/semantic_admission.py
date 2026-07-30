@@ -41,6 +41,7 @@ from .plan_coverage import (
     validate_plan_coverage,
 )
 from .questions import (
+    coerce_pending_answer,
     exact_answer,
     pending_option_value_exists,
     pending_value_identity,
@@ -187,7 +188,16 @@ def _canonicalize_pending_choice_actions(
                 "confidence": str(action.get("confidence") or "medium"),
             }
             if not _manual_answer_has_literal_source(canonical, source):
-                continue
+                if (
+                    str(pending.get("value_domain") or "")
+                    != "researched_identity"
+                    or not value_satisfies_pending_contract(source, pending)
+                ):
+                    continue
+                manual_value = coerce_pending_answer(source, pending)
+                canonical["answer"] = manual_value
+                if not _manual_answer_has_literal_source(canonical, source):
+                    continue
             actions[index] = canonical
             continue
         if not option:
@@ -628,6 +638,7 @@ def _freeze_bounded_semantic_plan(
             "registry_target_group": target_group,
             "registry_target_group_owner": target_spec.owner if target_spec is not None else "",
             "registry_incomplete_mutation_intake": spec.incomplete_mutation_intake,
+            "registry_incomplete_read_intake": spec.incomplete_read_intake,
             "registry_pending_option_admission": spec.pending_option_admission,
             "declared_purpose": _semantic_action_purpose(action, spec.purpose, state),
             "operation_arguments": operation_arguments,
@@ -644,6 +655,11 @@ def _freeze_bounded_semantic_plan(
             "required_value_grounding_arguments": list(
                 semantic_grounding_arguments(action)
             ),
+            "open_identity_grounding_arguments": [
+                argument
+                for argument in spec.open_identity_grounding_arguments
+                if argument in action
+            ],
             "closed_enum_grounding_values": {
                 argument: list(
                     (ACTION_ARGUMENT_SCHEMAS.get(argument) or {}).get("enum")
@@ -993,8 +1009,23 @@ def _merge_plan_errors(
 def _unresolved_action_queue(
     clauses: tuple[TurnClause, ...],
     errors: tuple[str, ...],
+    *,
+    semantic_units: list[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    unresolved = tuple(clause.text for clause in clauses)
+    preserved_units = [
+        {
+            **dict(unit),
+            "disposition": "unresolved",
+            "action_indexes": [],
+        }
+        for unit in semantic_units or []
+        if str(unit.get("unit_id") or "")
+        and str(unit.get("source_text") or "")
+    ]
+    unresolved = tuple(
+        str(unit["source_text"])
+        for unit in preserved_units
+    ) or tuple(clause.text for clause in clauses)
     reasons = tuple(dict.fromkeys(str(error) for error in errors if str(error)))
     return {
         "actions": [{
@@ -1006,6 +1037,7 @@ def _unresolved_action_queue(
         "reason": "resolver returned an incomplete clause plan",
         "coverage_errors": list(reasons),
         "unresolved_clauses": list(unresolved),
+        "semantic_units": preserved_units,
     }
 
 
@@ -1451,6 +1483,13 @@ def _semantic_action_purpose(
             "append_evidence": (
                 "Ingest new source-attributable RPC method-schema, parameter, request, "
                 "response, or documentation facts into the active catalog draft."
+            ),
+            "keep_current_method": (
+                "Resolve the active method conflict by preserving the current draft."
+            ),
+            "replace_current_method": (
+                "Resolve the active method conflict by replacing the draft with the "
+                "already presented incoming method."
             ),
         }.get(command, fallback)
     return fallback
@@ -1965,6 +2004,7 @@ def _semantic_fulfillment_prompt(*, review_kind: str = "both") -> str:
         "A read-only consultation purpose is supported only when the source asks for an answer, explanation, comparison, status, preparation guidance, or similar information. It is not supported when the source explicitly requests only a selection, mutation, navigation, execution, or evidence-ingestion operation. A declarative reason attached to a pending-option selection does not become a consultation merely because it explains that selection; when it has no independent question or requested effect, it is support for the pending-answer purpose and a proposed consultation over that reason is unsupported. Distinct consultation subjects remain independent demands: a purpose that reports workflow configuration or pending context does not report whether a current or historical benchmark job exists, and a job-status purpose does not report retained workflow configuration. A compound unit asking for both is complete only when mapped purposes explicitly cover both subjects. "
         + GROUP_NAVIGATION_SEMANTIC_POLICY
         + "When an action record has registry_incomplete_mutation_intake=true, its authoritative declared_purpose intentionally opens a later typed intake. Admit it when the source explicitly requests the initial selection or replacement described by that purpose but supplies no concrete value; do not require the value that the later question exists to collect. When such an action is the declared owner of an active pending option, selecting that option is sufficient source support for the intake purpose. "
+        "When an action record has registry_incomplete_read_intake=true, its authoritative declared_purpose intentionally opens a later typed read-only collection because the source requests that registered analysis but has not supplied its payload yet. Admit that intake when the source explicitly requests the declared read operation; do not require the evidence, document, log, or other payload that the typed collection exists to collect. This rule does not authorize a different read subject, mutation, navigation, or execution request. "
         "A chain-candidate-intake purpose is supported when the source presents one or more tentative benchmark-chain candidates without committing to one. It intentionally preserves candidates for a later typed confirmation question and is not a chain mutation. "
         "A QPS-customization purpose requires an explicit request to alter, tune, override, or avoid defaults of one or more QPS profile values, even when concrete numbers arrive later. Merely visiting the QPS area without requesting a profile-value change is navigation. "
         "A wire-method-selection purpose requires an actual callable wire method, not merely a schema field named method or method_id. An endpoint-selection purpose requires an explicitly selected validation endpoint, not an example or documentation URL. A secondary-development evidence purpose likewise requires new protocol, endpoint, request, response, or official-document evidence. A pending-answer purpose must actually answer the supplied pending contract. Reset and execution "

@@ -88,12 +88,11 @@
     },
     {
       "case_id": "RR-010",
-      "source_turns_hash": "3bd66161de4808c4c6ec6efe830f112f0995c1faa5bbfc74528e99bbbab31ce6",
+      "source_turns_hash": "a308d3c16c9910f1b2bf561bbef0cef1d7eb7954ec09a07e526fc4ec78b351f4",
       "source_steps": [
         {"step_id": "source-1", "turn_index": 1, "semantic_role": "confirm_custom_method"},
         {"step_id": "source-2", "turn_index": 2, "semantic_role": "finish_method_collection"},
-        {"step_id": "source-3", "turn_index": 3, "semantic_role": "select_single_workload"},
-        {"step_id": "source-4", "turn_index": 4, "semantic_role": "replace_template_methods"}
+        {"step_id": "source-3", "turn_index": 3, "semantic_role": "replace_template_methods"}
       ]
     },
     {
@@ -124,11 +123,13 @@
     },
     {
       "case_id": "RR-014",
-      "source_turns_hash": "9e1c959201b5fa64c34f4dfb81fd5fce17d620a606f2863d3d9add17306e2112",
+      "source_turns_hash": "6e29a5fb319234d4ea2a56f4a2efd91c1c953a2618bc3543d93467a51f1b9a09",
       "source_steps": [
         {"step_id": "source-1", "turn_index": 1, "semantic_role": "switch_to_sync_observe"},
-        {"step_id": "source-2", "turn_index": 2, "semantic_role": "set_sync_observe_duration"},
-        {"step_id": "source-3", "turn_index": 3, "semantic_role": "switch_to_real_node"}
+        {"step_id": "source-2", "turn_index": 2, "semantic_role": "confirmation"},
+        {"step_id": "source-3", "turn_index": 3, "semantic_role": "set_sync_observe_duration"},
+        {"step_id": "source-4", "turn_index": 4, "semantic_role": "switch_to_real_node"},
+        {"step_id": "source-5", "turn_index": 5, "semantic_role": "confirmation"}
       ]
     },
     {

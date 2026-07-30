@@ -48,7 +48,17 @@ def finalize_turn_response(state: AgentGraphState) -> AgentGraphState:
         if pending
         else ""
     )
-    suppress_pending_render = bool(turn_context.pop("suppress_pending_render", False))
+    suppress_pending_render = bool(
+        turn_context.pop("suppress_pending_render", False)
+        or (
+            state.get("evidence_collection")
+            and str(
+                (state.get("evidence_collection") or {}).get("status")
+                or "active"
+            )
+            == "active"
+        )
+    )
     state["turn_context"] = turn_context
     if pending and not suppress_pending_render:
         pending_semantic_hash = semantic_hash(

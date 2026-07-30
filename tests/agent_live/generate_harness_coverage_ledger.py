@@ -1030,6 +1030,7 @@ def build_ledger(
                 "crosses_pending_barrier": spec.crosses_pending_barrier,
                 "requires_specific_change": spec.requires_specific_change,
                 "incomplete_mutation_intake": spec.incomplete_mutation_intake,
+                "incomplete_read_intake": spec.incomplete_read_intake,
                 "required_arguments": list(spec.required_arguments),
                 "constraints": list(spec.constraints),
                 "suppressed_by": list(spec.suppressed_by),

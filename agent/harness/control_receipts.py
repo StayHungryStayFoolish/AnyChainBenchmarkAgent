@@ -22,6 +22,7 @@ _HANDLER_OWNER_BY_RECEIPT = {
     "rpc_endpoint_role": "chain_rpc",
     "rpc_catalog_transition": "chain_rpc",
     "rpc_schema_provenance": "chain_rpc",
+    "rpc_method_probe": "chain_rpc",
     "rpc_workload_commit": "chain_rpc",
     "rpc_workload_materialization": "execution",
 }
@@ -40,6 +41,11 @@ _COORDINATOR_RECEIPT_TYPES = frozenset({
 _SHA256_LENGTH = 64
 _EMPTY_DOCUMENT_HASH = hashlib.sha256(b"{}").hexdigest()
 _EMPTY_ERRORS_HASH = hashlib.sha256(b"[]").hexdigest()
+EXECUTION_APPROVAL_CONTRACTS = {
+    "preflight_smoke_confirm": "approve_preflight_smoke",
+    "real_node_smoke_confirm": "approve_preflight_smoke",
+    "real_node_final_benchmark_confirm": "approve_final_benchmark",
+}
 
 
 def _content_hash(value: Mapping[str, Any]) -> str:
@@ -67,6 +73,59 @@ def _valid_hash(value: Any, *, allow_empty: bool = False) -> bool:
 
 def _exact_fields(receipt: Mapping[str, Any], expected: set[str]) -> bool:
     return set(receipt) == {*expected, "receipt_id"}
+
+
+def execution_intent_projection(intent: Mapping[str, Any]) -> dict[str, Any]:
+    """Project execution intent lineage without retaining request payloads."""
+
+    return {
+        "intent_id": str(intent.get("intent_id") or ""),
+        "turn_id": str(intent.get("turn_id") or ""),
+        "action_id": str(intent.get("action_id") or ""),
+        "operation": str(intent.get("operation") or ""),
+        "execution_request_id": str(
+            intent.get("execution_request_id") or ""
+        ),
+        "idempotency_key_hash": _content_hash(
+            str(intent.get("idempotency_key") or "")
+        ),
+        "request_fingerprint": str(
+            intent.get("request_fingerprint") or ""
+        ),
+        "expected_receipt_kind": str(
+            intent.get("expected_receipt_kind") or ""
+        ),
+        "status": str(intent.get("status") or ""),
+        "attempt_count": int(intent.get("attempt_count") or 0),
+    }
+
+
+def execution_side_effect_projection(
+    receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project side-effect receipt lineage without retaining handler results."""
+
+    return {
+        "receipt_id": str(receipt.get("receipt_id") or ""),
+        "intent_id": str(receipt.get("intent_id") or ""),
+        "action_id": str(receipt.get("action_id") or ""),
+        "status": str(receipt.get("status") or ""),
+        "idempotency_key_hash": _content_hash(
+            str(receipt.get("idempotency_key") or "")
+        ),
+        "job_id": str(receipt.get("job_id") or ""),
+        "failure_code": str(receipt.get("failure_code") or ""),
+        "retryable": bool(receipt.get("retryable")),
+        "result_hash": _content_hash(receipt.get("result") or {}),
+    }
+
+
+def execution_side_effect_receipt_id(receipt: Mapping[str, Any]) -> str:
+    """Return the content identity of an observed external side effect."""
+
+    projection = execution_side_effect_projection(receipt)
+    projection.pop("receipt_id", None)
+    return _content_hash(projection)
 
 
 def _valid_string_list(value: Any, *, unique: bool = False) -> bool:
@@ -193,14 +252,9 @@ def _validate_execution_approval(
     if not _exact_fields(receipt, fields):
         return False, "execution-approval receipt shape is invalid"
     revision = receipt.get("repository_revision")
-    approval_contracts = {
-        "preflight_smoke_confirm": "approve_preflight_smoke",
-        "real_node_smoke_confirm": "approve_preflight_smoke",
-        "real_node_final_benchmark_confirm": "approve_final_benchmark",
-    }
     question_id = str(receipt.get("approval_question_id") or "")
     if (
-        approval_contracts.get(question_id)
+        EXECUTION_APPROVAL_CONTRACTS.get(question_id)
         != receipt.get("approval_action_type")
         or not _valid_hash(receipt.get("pending_resolution_receipt_id"))
         or not str(receipt.get("answer_action_id") or "")
@@ -428,6 +482,8 @@ def _validate_response_composition(
         "source_action_ids",
         "pending_contract_hash",
         "fragments",
+        "terminal_response_hash",
+        "terminal_semantic_hash",
     }
     if not _exact_fields(receipt, fields):
         return False, "response-composition receipt shape is invalid"
@@ -436,6 +492,8 @@ def _validate_response_composition(
         not str(receipt.get("language") or "")
         or not _valid_string_list(receipt.get("source_action_ids"), unique=True)
         or not _valid_hash(receipt.get("pending_contract_hash"))
+        or not _valid_hash(receipt.get("terminal_response_hash"))
+        or not _valid_hash(receipt.get("terminal_semantic_hash"))
         or not _valid_response_fragment_manifest(
             fragments,
             allow_pending_question=True,
@@ -452,6 +510,7 @@ def _validate_domain_commit(
         "receipt_type",
         "turn_index",
         "owner",
+        "cause_kind",
         "completion",
         "group_registry_contract_hash",
         "pending_before_hash",
@@ -478,6 +537,8 @@ def _validate_domain_commit(
         return False, "domain-commit receipt shape is invalid"
     if (
         not str(receipt.get("owner") or "")
+        or receipt.get("cause_kind")
+        not in {"admitted_action", "system_reconcile", "validation_rejection"}
         or completion
         not in {"rejected", "unchanged", "in_progress", "completed", "blocked"}
         or not _valid_hash(receipt.get("group_registry_contract_hash"))
@@ -492,6 +553,8 @@ def _validate_domain_commit(
     ):
         if not _valid_string_list(receipt.get(field), unique=True):
             return False, f"domain-commit {field} is invalid"
+    if len(receipt.get("consumed_action_ids") or ()) > 1:
+        return False, "domain-commit has more than one causal action"
     if not _valid_response_fragment_manifest(
         receipt.get("response_fragments"),
         allow_pending_question=False,
@@ -499,13 +562,24 @@ def _validate_domain_commit(
         return False, "domain-commit response fragments are invalid"
     if completion == "rejected":
         if (
-            not _valid_hash(receipt.get("blocker_semantic_hash"))
+            receipt.get("cause_kind") != "validation_rejection"
+            or not _valid_hash(receipt.get("blocker_semantic_hash"))
             or receipt.get("consumed_action_ids")
             or receipt.get("invalidated_groups")
             or receipt.get("invalidated_fields")
         ):
             return False, "rejected domain-commit receipt is contradictory"
         return True, ""
+    consumed_action_ids = receipt.get("consumed_action_ids") or []
+    cause_kind = receipt.get("cause_kind")
+    if (
+        cause_kind == "admitted_action"
+        and len(consumed_action_ids) != 1
+        or cause_kind == "system_reconcile"
+        and consumed_action_ids
+        or cause_kind == "validation_rejection"
+    ):
+        return False, "domain-commit cause does not match its causal action"
     if not _valid_string_list(receipt.get("reconfigured_groups"), unique=True):
         return False, "domain-commit reconfigured groups are invalid"
     group_state_transitions = receipt.get("group_state_transitions")
@@ -568,6 +642,15 @@ def _validate_domain_commit(
         if identity in seen_paths:
             return False, "domain-commit material delta is duplicated"
         seen_paths.add(identity)
+    if cause_kind == "system_reconcile" and (
+        delta
+        or receipt.get("invalidated_groups")
+        or receipt.get("invalidated_fields")
+        or receipt.get("reconfigured_groups")
+        or group_state_transitions
+        or navigation_operation
+    ):
+        return False, "system reconcile cannot mutate business workflow state"
     return True, ""
 
 

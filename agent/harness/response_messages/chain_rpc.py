@@ -110,9 +110,15 @@ MESSAGES = {
         "kinds": _MESSAGE,
     },
     "chain_rpc.response.rpc_method_conflict": {
-        "en": "Evidence method `{incoming_method}` conflicts with deterministic method `{current_method}`. The fragment was rejected; the current draft and prior evidence are unchanged.",
-        "zh": "证据中的 method `{incoming_method}` 与当前 deterministic method `{current_method}` 冲突。已拒绝该 fragment，当前 draft 和既有证据保持不变。",
+        "en": "Evidence method `{incoming_method}` conflicts with deterministic method `{current_method}`. The fragment was not written. Choose whether to keep the current draft or explicitly replace it.",
+        "zh": "证据中的 method `{incoming_method}` 与当前 deterministic method `{current_method}` 冲突。该 fragment 未被写入；请选择保留当前 draft，或明确替换它。",
         "arguments": {"incoming_method": "string", "current_method": "string"},
+        "kinds": _MESSAGE,
+    },
+    "chain_rpc.response.rpc_exchange_uncorrelated": {
+        "en": "The request/response evidence could not be correlated: {reason}. Nothing from this fragment was written. Provide a request and response with matching JSON-RPC `id` values, or provide the request first.",
+        "zh": "request/response 证据无法关联：{reason}。本 fragment 未写入任何内容。请提供具有相同 JSON-RPC `id` 的 request 和 response，或先提供 request。",
+        "arguments": {"reason": "string"},
         "kinds": _MESSAGE,
     },
     "chain_rpc.response.parameter_semantics_missing": {

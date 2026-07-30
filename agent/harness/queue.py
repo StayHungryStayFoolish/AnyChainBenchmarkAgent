@@ -393,9 +393,15 @@ def action_can_run_while_pending(
         for item in pending.get("accepted_action_types") or []
         if str(item).strip()
     }
-    if action_type == "answer_pending" or action_type in accepted:
-        return True
     spec = ACTION_BY_TYPE.get(action_type)
+    if action_type == "answer_pending":
+        return True
+    if action_type in accepted and not (
+        spec is not None
+        and spec.typed_option_only
+        and action.get("selection_contract_verified") is not True
+    ):
+        return True
     source_evidence = str(action.get("source_evidence") or "").strip()
     origin_text = str(action.get("_origin_text") or "").strip()
     source_is_grounded = bool(
@@ -417,6 +423,13 @@ def action_can_run_while_pending(
     trusted_runtime_control = bool(
         spec is not None
         and spec.internal_only
+        and (
+            not spec.typed_option_only
+            or (
+                action.get("selection_contract_verified") is True
+                and action_type in accepted
+            )
+        )
     )
     administrative_detour = bool(
         declared_intake_detour

@@ -176,6 +176,22 @@ scope 为 `single_replace`、`mixed_replace` 或 `mixed_add`；active mixed
 weight 必须为正整数且精确合计 100。只生成 job-local runtime override，
 canonical chain template 保持不变。
 
+每次成功的 method probe 都必须写入一份不含 secret 的 durable probe
+contract，绑定 chain、物化后 endpoint 的 hash、所选 method、精确 params
+与 adapter family。durable evidence 必须包含该 method 的成功 HTTP
+observation、完整 response-shape hash 和 response sample/hash。RPC catalog
+与 Case 2 promotion 调用同一 validator，重新计算 contract，并验证 owner
+receipt、evidence 文件内容、request/schema hash 与 catalog revision。
+real-node 执行前，只对 effective workload 实际选中的 custom method 在最终
+物化后的 `LOCAL_RPC_URL` 上 replay；只有不属于 canonical chain template
+的 method 才是 custom method，job-local 权重调整不会把模板 method 变成
+custom method，空 effective workload 非法。历史 catalog 中未选中的 method
+不是本次执行依赖。只有 owner receipt 一对一绑定全部必需的 custom method
+proof 后，才能提交 endpoint 并向用户报告 ready。任意现有文件路径、陈旧或
+被修改的 contract、
+缺失的 secret reference、重复使用的 evidence/input binding 都必须 fail
+closed。
+
 ### Case 2：未配置链，但属于已有 adapter family
 
 先让当前 LLM 判断链是否存在及其协议；Gemini search 可用时，再用官方搜索

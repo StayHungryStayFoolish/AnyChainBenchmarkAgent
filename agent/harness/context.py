@@ -71,6 +71,7 @@ def _action_spec_schema(spec: ActionSpec) -> dict[str, Any]:
         "semantic_operations": list(spec.semantic_operations),
         "requires_specific_change": spec.requires_specific_change,
         "incomplete_mutation_intake": spec.incomplete_mutation_intake,
+        "incomplete_read_intake": spec.incomplete_read_intake,
         "entry_intake": spec.entry_intake,
         "entry_intake_purpose": spec.entry_intake_purpose,
         "entry_intake_fixed_arguments": dict(
@@ -93,6 +94,12 @@ def _action_spec_schema(spec: ActionSpec) -> dict[str, Any]:
         "required_state_values": list(spec.required_state_values),
         "state_transition_path": list(spec.state_transition_path),
         "state_transition_value": spec.state_transition_value,
+        "semantic_value_grounding_arguments": list(
+            spec.semantic_value_grounding_arguments
+        ),
+        "open_identity_grounding_arguments": list(
+            spec.open_identity_grounding_arguments
+        ),
         "exact_source_value_arguments": list(spec.exact_source_value_arguments),
     }
 

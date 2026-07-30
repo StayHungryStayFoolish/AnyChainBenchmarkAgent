@@ -87,6 +87,10 @@ from .contracts import (
     ResponseFragment,
 )
 from .control_receipts import (
+    EXECUTION_APPROVAL_CONTRACTS,
+    execution_intent_projection,
+    execution_side_effect_receipt_id,
+    execution_side_effect_projection,
     validate_coordinator_control_receipt,
     validate_domain_control_receipt,
 )
@@ -114,7 +118,9 @@ from .transitions import (
 )
 from .questions import (
     action_for_value,
+    exact_answer as contract_exact_answer,
     exact_option_answer as contract_exact_option_answer,
+    manual_action_for_value,
     pending_option_value_exists as _pending_option_value_exists,
     validate_pending_question_contract,
     value_satisfies_pending_contract as _value_satisfies_pending_contract,
@@ -893,13 +899,24 @@ def _record_admitted_action(
         admitted_action["owner"] = spec.owner
         admitted_action["effect"] = spec.effect
         admitted_action["group"] = resolve_action_target_group(action)
-    argument_payload = {
-        str(key): value
-        for key, value in action.items()
-        if key not in ACTION_METADATA_FIELDS
-        and key not in TRUSTED_ACTION_METADATA_FIELDS
-        and not str(key).startswith("_")
-    }
+    envelope_arguments = action.get("arguments")
+    if (
+        str(action.get("action_type") or "")
+        and isinstance(envelope_arguments, Mapping)
+    ):
+        argument_payload = {
+            str(key): value
+            for key, value in envelope_arguments.items()
+            if str(key)
+        }
+    else:
+        argument_payload = {
+            str(key): value
+            for key, value in action.items()
+            if key not in ACTION_METADATA_FIELDS
+            and key not in TRUSTED_ACTION_METADATA_FIELDS
+            and not str(key).startswith("_")
+        }
     admitted_action["argument_names"] = sorted(argument_payload)
     admitted_action["arguments_hash"] = hashlib.sha256(
         json.dumps(
@@ -1062,6 +1079,18 @@ def _record_pending_resolution(
     selected = action.get("selected_value")
     if selected is None:
         selected = action.get("answer")
+    if selected is None:
+        manual = pending.get("manual_action")
+        if (
+            isinstance(manual, Mapping)
+            and str(action.get("type") or "")
+            == str(manual.get("type") or "")
+        ):
+            value_argument = str(
+                manual.get("value_argument") or ""
+            ).strip()
+            if value_argument:
+                selected = action.get(value_argument)
     option = next(
         (
             item
@@ -1097,26 +1126,20 @@ def _record_pending_resolution(
     )
 
 
-def _record_execution_approval(
+def _execution_authorization_receipt(
     state: AgentGraphState,
     action: Mapping[str, Any],
-) -> None:
-    """Bind one committed execution approval to its answer, plan, and revision."""
+) -> dict[str, Any]:
+    """Verify the canonical user approval before any external side effect."""
 
     approval_action_type = str(
         action.get("type") or action.get("action_type") or ""
     )
-    approval_contracts = {
-        "approve_preflight_smoke": {
-            "preflight_smoke_confirm",
-            "real_node_smoke_confirm",
-        },
-        "approve_final_benchmark": {
-            "real_node_final_benchmark_confirm",
-        },
-    }
+    approval_contracts: dict[str, set[str]] = {}
+    for question_id, action_type in EXECUTION_APPROVAL_CONTRACTS.items():
+        approval_contracts.setdefault(action_type, set()).add(question_id)
     if approval_action_type not in approval_contracts:
-        return
+        raise StateInvariantError("action is not a registered execution approval")
     turn_index = int(state.get("turn_index") or 0)
     context = dict(state.get("turn_context") or {})
     pending_receipts = [
@@ -1138,20 +1161,6 @@ def _record_execution_approval(
     if len(valid_pending) != 1:
         raise StateInvariantError(
             "execution approval requires one canonical pending-resolution receipt"
-        )
-    revision = dict(context.get("repository_revision") or {})
-    plan = dict(state.get("plan") or {})
-    job_id = str((state.get("job") or {}).get("job_id") or "")
-    execution_request_id = str(
-        (state.get("preflight") or {}).get("execution_request_id") or ""
-    )
-    if not plan or not job_id:
-        raise StateInvariantError(
-            "execution approval completed without a plan or submitted job"
-        )
-    if not revision or not execution_request_id:
-        raise StateInvariantError(
-            "submitted execution approval is missing revision or request evidence"
         )
     pending_receipt = valid_pending[0]
     answer_actions = [
@@ -1178,6 +1187,36 @@ def _record_execution_approval(
         raise StateInvariantError(
             "execution approval requires one canonical affirmative answer"
         )
+    return pending_receipt
+
+
+def _record_execution_approval(
+    state: AgentGraphState,
+    action: Mapping[str, Any],
+) -> None:
+    """Bind one committed execution approval to its answer, plan, and revision."""
+
+    approval_action_type = str(
+        action.get("type") or action.get("action_type") or ""
+    )
+    if approval_action_type not in set(EXECUTION_APPROVAL_CONTRACTS.values()):
+        return
+    pending_receipt = _execution_authorization_receipt(state, action)
+    context = dict(state.get("turn_context") or {})
+    revision = dict(context.get("repository_revision") or {})
+    plan = dict(state.get("plan") or {})
+    job_id = str((state.get("job") or {}).get("job_id") or "")
+    execution_request_id = str(
+        (state.get("preflight") or {}).get("execution_request_id") or ""
+    )
+    if not plan or not job_id:
+        raise StateInvariantError(
+            "execution approval completed without a plan or submitted job"
+        )
+    if not revision or not execution_request_id:
+        raise StateInvariantError(
+            "submitted execution approval is missing revision or request evidence"
+        )
     intent = dict(state.get("side_effect_intent") or {})
     side_effect_receipt = dict(state.get("side_effect_receipt") or {})
     execution_receipts = dict(
@@ -1196,6 +1235,8 @@ def _record_execution_approval(
         or intent.get("status") != "succeeded"
         or intent.get("action_id") != expected_action_id
         or intent.get("operation") != approval_action_type
+        or intent.get("execution_request_id") != execution_request_id
+        or intent.get("idempotency_key") != f"harness:{execution_request_id}"
         or intent.get("request_fingerprint") != expected_request_fingerprint
         or not side_effect_receipt
         or side_effect_receipt.get("status") != "succeeded"
@@ -1204,6 +1245,8 @@ def _record_execution_approval(
         or side_effect_receipt.get("idempotency_key")
         != intent.get("idempotency_key")
         or side_effect_receipt.get("job_id") != job_id
+        or side_effect_receipt.get("receipt_id")
+        != execution_side_effect_receipt_id(side_effect_receipt)
         or not verify_job_receipt(submission_receipt)
         or submission_receipt.get("job_id") != job_id
         or submission_receipt.get("approved_plan_hash") != approved_plan_hash
@@ -1222,9 +1265,13 @@ def _record_execution_approval(
             "approval_action_type": approval_action_type,
             "execution_request_id": execution_request_id,
             "side_effect_intent_id": str(intent["intent_id"]),
-            "side_effect_intent_hash": _receipt_hash(intent),
+            "side_effect_intent_hash": _receipt_hash(
+                execution_intent_projection(intent)
+            ),
             "side_effect_receipt_id": str(side_effect_receipt["receipt_id"]),
-            "side_effect_receipt_hash": _receipt_hash(side_effect_receipt),
+            "side_effect_receipt_hash": _receipt_hash(
+                execution_side_effect_projection(side_effect_receipt)
+            ),
             "idempotency_key_hash": _receipt_hash(intent["idempotency_key"]),
             "request_fingerprint": str(intent["request_fingerprint"]),
             "job_submission_receipt_id": str(
@@ -1271,7 +1318,18 @@ def _append_domain_control_receipts(
             turn_index=turn_index,
         )
         if not valid:
-            raise StateInvariantError(f"invalid domain control receipt: {reason}")
+            receipt_identity = "/".join(
+                value
+                for value in (
+                    str(receipt.get("receipt_type") or ""),
+                    str(receipt.get("command") or ""),
+                )
+                if value
+            )
+            raise StateInvariantError(
+                "invalid domain control receipt"
+                f" ({receipt_identity or 'unknown'}): {reason}"
+            )
         receipt_id = str(receipt.get("receipt_id") or "")
         if receipt_id not in known_ids:
             receipts.append(receipt)
@@ -1521,6 +1579,17 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
                 },
                 source="evidence_transport",
             )
+        if "\n" in text or "\r" in text:
+            return _admit_deterministic_action(
+                state,
+                {
+                    "type": "append_evidence_collection",
+                    "evidence": text,
+                    "source_evidence": text,
+                    "confidence": "high",
+                },
+                source="evidence_transport",
+            )
         return _set_turn_phase(state, "plan", "typed_evidence_collection_turn")
 
     if turn_kind == "empty":
@@ -1624,6 +1693,27 @@ def adjudicate_turn_step(state: AgentGraphState) -> AgentGraphState:
         )
         return _set_turn_phase(state, "execute", "pending_answer_admitted")
 
+    manual_matched, manual_value = (
+        contract_exact_answer(text, pending)
+        if pending.get("structured_input_owner") is True
+        else (False, None)
+    )
+    if manual_matched:
+        manual_action = manual_action_for_value(pending, manual_value)
+        if manual_action:
+            spec = ACTION_BY_TYPE.get(str(manual_action.get("type") or ""))
+            if (
+                spec is not None
+                and "source_evidence" in spec.allowed_arguments
+                and not str(manual_action.get("source_evidence") or "").strip()
+            ):
+                manual_action["source_evidence"] = text
+            return _admit_deterministic_action(
+                state,
+                manual_action,
+                source="pending_question_manual_contract",
+            )
+
     return _set_turn_phase(state, "plan", "semantic_input")
 
 
@@ -1638,6 +1728,15 @@ def _admit_deterministic_action(
     text = str((state.get("turn_context") or {}).get("text") or "")
     scope = f"{state.get('thread_id') or 'default'}:{int(state.get('turn_index') or 0)}"
     admitted = assign_action_ids(scope, text, [dict(action)])[0]
+    pending = dict(state.get("pending_question") or {})
+    if source == "pending_question_manual_contract" and pending:
+        _record_pending_resolution(
+            state,
+            pending,
+            admitted,
+            input_text=text,
+            resolution_path="typed_manual_value",
+        )
     source_clauses = [
         dict(clause)
         for clause in (state.get("turn_receipt") or {}).get("clauses") or []
@@ -1724,7 +1823,11 @@ def partition_turn_step(state: AgentGraphState) -> AgentGraphState:
             "unit_count": int(document.get("unit_count") or 0),
             "owner_count": int(document.get("owner_count") or 0),
             "stage_a_calls": int(document.get("stage_a_calls") or 0),
-            "errors_hash": _receipt_hash(document.get("errors") or []),
+            "errors_hash": _receipt_hash(
+                document.get("errors")
+                or document.get("owner_failures")
+                or []
+            ),
         },
     )
     next_phase = (
@@ -2934,6 +3037,10 @@ def prepare_execution_intent_step(
     envelope = action_envelope_from_dict(candidate.get("selected_action") or {})
     if envelope.owner != "execution" or expected_owner != "execution":
         raise StateInvariantError("only the execution owner may prepare a side effect")
+    _execution_authorization_receipt(
+        candidate,
+        _action_from_envelope(candidate.get("selected_action") or {}),
+    )
     request_id = str(
         (candidate.get("preflight") or {}).get("execution_request_id")
         or envelope.action_id
@@ -2974,6 +3081,7 @@ def prepare_execution_intent_step(
             turn_id=turn_id,
             action_id=envelope.action_id,
             operation=envelope.action_type,
+            execution_request_id=request_id,
             idempotency_key=idempotency_key,
             request=request,
             request_fingerprint=request_fingerprint,
@@ -3015,6 +3123,7 @@ def invoke_idempotent_side_effect_step(state: AgentGraphState) -> AgentGraphStat
     if intent.get("action_id") != envelope.action_id:
         raise StateInvariantError("side-effect intent does not match the selected action")
     action = _domain_action_from_envelope(candidate, selected)
+    _execution_authorization_receipt(candidate, action)
     result = DOMAIN_RUNTIME["execution"].apply_action(
         deepcopy(candidate),
         _action_proposal(action, envelope.confidence),
@@ -3027,12 +3136,9 @@ def invoke_idempotent_side_effect_step(state: AgentGraphState) -> AgentGraphStat
             job_id = str(write.value or "")
             break
     status = "blocked" if result.blocker or result.completion == "blocked" else "succeeded"
-    receipt_id = hashlib.sha256(
-        f"{intent.get('intent_id')}:{intent.get('attempt_count')}".encode("utf-8")
-    ).hexdigest()
-    candidate["side_effect_receipt"] = side_effect_receipt_to_dict(
+    observed_receipt = side_effect_receipt_to_dict(
         SideEffectReceipt(
-            receipt_id=receipt_id,
+            receipt_id="",
             intent_id=str(intent.get("intent_id") or ""),
             action_id=envelope.action_id,
             status=status,  # type: ignore[arg-type]
@@ -3043,6 +3149,10 @@ def invoke_idempotent_side_effect_step(state: AgentGraphState) -> AgentGraphStat
             retryable=False,
         )
     )
+    observed_receipt["receipt_id"] = execution_side_effect_receipt_id(
+        observed_receipt
+    )
+    candidate["side_effect_receipt"] = observed_receipt
     validate_state(candidate)
     return _set_turn_phase(candidate, "commit_receipt", "execution_receipt_observed")
 
@@ -3412,6 +3522,10 @@ def commit_selected_action_step(state: AgentGraphState) -> AgentGraphState:
         prepared.result,
         owner=envelope.owner,
     )
+    if prepared.result.suppress_pending_render:
+        turn_context = dict(committed.get("turn_context") or {})
+        turn_context["suppress_pending_render"] = True
+        committed["turn_context"] = turn_context
     register_state_secret_bindings(
         committed,
         envelope.admission_metadata.get("semantic_secret_bindings") or (),
@@ -3779,6 +3893,18 @@ def compose_turn_step(state: AgentGraphState) -> AgentGraphState:
                 if str(item)
             ],
             "pending_contract_hash": _receipt_hash(pending),
+            "terminal_response_hash": str(
+                (state.get("turn_context") or {}).get(
+                    "terminal_response_hash"
+                )
+                or ""
+            ),
+            "terminal_semantic_hash": str(
+                (state.get("turn_context") or {}).get(
+                    "terminal_semantic_hash"
+                )
+                or ""
+            ),
             "fragments": [
                 dict(fragment)
                 for fragment in (state.get("turn_context") or {}).get(
@@ -4126,6 +4252,7 @@ def _apply_handler_result(
             "domain_commit",
             {
                 "owner": owner,
+                "cause_kind": "validation_rejection",
                 "completion": "rejected",
                 "group_registry_contract_hash": group_registry_contract_hash(),
                 "blocker_semantic_hash": semantic_hash(
@@ -4424,6 +4551,11 @@ def _apply_handler_result(
         "domain_commit",
         {
             "owner": owner,
+            "cause_kind": (
+                "admitted_action"
+                if result.consumed_action_ids
+                else "system_reconcile"
+            ),
             "completion": str(result.completion or ""),
             "group_registry_contract_hash": group_registry_contract_hash(),
             "consumed_action_ids": [
@@ -4574,7 +4706,7 @@ def _commit_navigation_command(
 def _activate_ready_deferred_group(state: AgentGraphState) -> AgentGraphState:
     """Resume an explicit group detour before registry fallback can take over."""
 
-    if state.get("pending_question"):
+    if state.get("pending_question") or state.get("action_queue"):
         return state
     control = dict(state.get("control") or {})
     deferred_group = str(control.get("deferred_group") or "").strip()

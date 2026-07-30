@@ -13,6 +13,7 @@ from typing import Any, Callable, Mapping, TypedDict
 from langgraph.runtime import Runtime
 
 from .checkpoints import create_sqlite_checkpointer, default_checkpoint_path
+from .control_receipts import validate_persisted_domain_control_receipt
 from ..llm.config import load_llm_config
 from ..llm.types import (
     LLMProviderError,
@@ -1564,7 +1565,10 @@ class AnyChainGraphRuntime:
             "pending_transition": _pending_transition_summary(
                 before,
                 after,
-                admitted_action_provenance,
+                _pending_consumer_action_ids(
+                    after,
+                    admitted_action_provenance,
+                ),
             ),
             "render_manifest": _render_manifest(after),
             "execution_receipt_summary": _execution_receipt_summary(after),
@@ -1715,7 +1719,7 @@ def _turn_receipt_summary(state: Mapping[str, Any]) -> dict[str, Any]:
 def _pending_transition_summary(
     before: Mapping[str, Any],
     after: Mapping[str, Any],
-    actions: list[dict[str, Any]],
+    consumer_action_ids: list[str],
 ) -> dict[str, Any]:
     pending_before = dict(before.get("pending_question") or {})
     pending_after = dict(after.get("pending_question") or {})
@@ -1739,12 +1743,45 @@ def _pending_transition_summary(
         "after_id": str(pending_after.get("id") or ""),
         "after_group": str(pending_after.get("group") or ""),
         "after_hash": after_hash,
-        "consumer_action_ids": [
-            str(item.get("action_id") or "")
-            for item in actions
-            if str(item.get("action_id") or "")
-        ],
+        "consumer_action_ids": list(consumer_action_ids),
     }
+
+
+def _pending_consumer_action_ids(
+    state: Mapping[str, Any],
+    admitted_actions: list[dict[str, Any]],
+) -> list[str]:
+    """Return admitted actions whose domain commit changed pending state."""
+
+    admitted_ids = {
+        str(item.get("action_id") or "")
+        for item in admitted_actions
+        if str(item.get("action_id") or "")
+    }
+    turn_index = int(state.get("turn_index") or 0)
+    consumed: list[str] = []
+    for receipt in _control_receipts(state):
+        if receipt.get("receipt_type") != "domain_commit":
+            continue
+        valid, _reason = validate_persisted_domain_control_receipt(
+            receipt,
+            turn_index=turn_index,
+        )
+        if (
+            not valid
+            or receipt.get("pending_before_hash")
+            == receipt.get("pending_after_hash")
+        ):
+            continue
+        for action_id in receipt.get("consumed_action_ids") or ():
+            normalized = str(action_id or "")
+            if (
+                normalized
+                and normalized in admitted_ids
+                and normalized not in consumed
+            ):
+                consumed.append(normalized)
+    return consumed
 
 
 def _render_manifest(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -1764,6 +1801,10 @@ def _render_manifest(state: Mapping[str, Any]) -> dict[str, Any]:
 
 def _execution_receipt_summary(state: Mapping[str, Any]) -> dict[str, Any]:
     from agent.runners.job_manager import verify_job_receipt
+    from agent.harness.control_receipts import (
+        execution_intent_projection,
+        execution_side_effect_projection,
+    )
 
     intent = dict(state.get("side_effect_intent") or {})
     receipt = dict(state.get("side_effect_receipt") or {})
@@ -1792,17 +1833,22 @@ def _execution_receipt_summary(state: Mapping[str, Any]) -> dict[str, Any]:
     job_id = str(job.get("job_id") or "")
     if (
         not verify_job_receipt(base_submission)
+        or base_submission.get("receipt_type") != "job_submission"
         or base_submission.get("job_id") != job_id
     ):
         base_submission = {}
     if (
         not verify_job_receipt(submission)
+        or submission.get("receipt_type") != "job_submission"
         or submission.get("job_id") != job_id
     ):
         submission = {}
     if (
         not verify_job_receipt(last_read)
+        or last_read.get("receipt_type") != "job_read"
         or last_read.get("job_id") != job_id
+        or last_read.get("observed_status")
+        != last_read.get("persisted_status")
         or last_read.get("observed_status") != job.get("status")
         or (
             last_read.get("submission_receipt_id")
@@ -1812,6 +1858,12 @@ def _execution_receipt_summary(state: Mapping[str, Any]) -> dict[str, Any]:
     ):
         last_read = {}
     return {
+        "side_effect_intent_projection": (
+            execution_intent_projection(intent) if intent else {}
+        ),
+        "side_effect_receipt_projection": (
+            execution_side_effect_projection(receipt) if receipt else {}
+        ),
         "intent_id": str(intent.get("intent_id") or ""),
         "intent_action_type": str(intent.get("operation") or ""),
         "intent_idempotency_key": str(intent.get("idempotency_key") or ""),
@@ -1823,6 +1875,7 @@ def _execution_receipt_summary(state: Mapping[str, Any]) -> dict[str, Any]:
         "manager_submission_receipt_id": str(
             submission.get("receipt_id") or ""
         ),
+        "manager_submission_receipt": deepcopy(submission),
         "manager_submission_disposition": str(
             submission.get("disposition") or ""
         ),
@@ -1836,6 +1889,7 @@ def _execution_receipt_summary(state: Mapping[str, Any]) -> dict[str, Any]:
             submission.get("execution_key_hash") or ""
         ),
         "manager_read_receipt_id": str(last_read.get("receipt_id") or ""),
+        "manager_read_receipt": deepcopy(last_read),
         "manager_observed_status": str(
             last_read.get("observed_status") or ""
         ),

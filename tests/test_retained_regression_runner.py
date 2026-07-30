@@ -374,6 +374,7 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
                 revision=REVISION,
                 execution_id=execution_id,
                 initial_event=context.initial_event,
+                setup_events=(),
                 events=context.completed_events,
                 turns=context.completed_turns,
             )
@@ -585,20 +586,48 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
             row for row in self.provider["targets"] if row["variant"] != "exact"
         )
         context = self._one_turn_context(target)
+        def submission_receipt(job_id: str) -> dict:
+            body = {
+                "receipt_type": "job_submission",
+                "receipt_version": 1,
+                "owner": "job_manager",
+                "job_id": job_id,
+                "operation": "approve_preflight_smoke",
+                "scenario_id": "fake_node_smoke",
+                "workflow_type": "rpc_benchmark",
+                "execution_key_hash": content_hash("same-key"),
+                "approved_plan_hash": "1" * 64,
+                "execution_plan_hash": "2" * 64,
+                "command_hash": "3" * 64,
+                "disposition": "created",
+                "matching_job_count": 1,
+                "load_generator": "vegeta",
+                "vegeta_allowed": True,
+            }
+            return {**body, "receipt_id": content_hash(body)}
+
+        second_submission = submission_receipt("job-b")
         duplicate_event = replace(
             context.current_event,
             execution_receipt_summary={
-                "receipt_idempotency_key": "same-key",
-                "receipt_id": "receipt-b",
+                "intent_idempotency_key": "same-key",
+                "manager_submission_receipt": second_submission,
+                "manager_submission_receipt_id": (
+                    second_submission["receipt_id"]
+                ),
                 "job_id": "job-b",
             },
         )
+        first_submission = submission_receipt("job-a")
         first_event = replace(
             context.current_event,
             after_fingerprint="c" * 64,
             execution_receipt_summary={
-                "receipt_idempotency_key": "same-key",
-                "receipt_id": "receipt-a",
+                "intent_idempotency_key": "same-key",
+                "manager_submission_receipt": first_submission,
+                "manager_submission_receipt_id": (
+                    first_submission["receipt_id"]
+                ),
                 "job_id": "job-a",
             },
         )
@@ -690,6 +719,7 @@ class RetainedRegressionRunnerProviderTest(unittest.TestCase):
             "receipt_type": "domain_commit",
             "turn_index": 1,
             "owner": "environment",
+            "cause_kind": "validation_rejection",
             "completion": "rejected",
             "group_registry_contract_hash": "4" * 64,
             "pending_before_hash": "5" * 64,

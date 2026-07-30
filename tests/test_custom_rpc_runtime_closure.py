@@ -27,6 +27,89 @@ def _custom_rpc_catalog(methods: list[dict], *, chain: str = "", **workflow: obj
 
 
 class CustomRpcRuntimeClosureTest(unittest.TestCase):
+    def _probe_result(
+        self,
+        *,
+        chain: str,
+        endpoint: str,
+        family: str,
+        method: str,
+        params: object,
+    ) -> dict:
+        from agent.validators.endpoint_probe import (
+            build_rpc_probe_contract,
+            rpc_probe_contract_hash,
+        )
+
+        contract = build_rpc_probe_contract(
+            chain=chain,
+            endpoint=endpoint,
+            transport=family,
+            methods=[method],
+            method_params={method: params},
+        )
+        contract_hash = rpc_probe_contract_hash(contract)
+        handle = tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            delete=False,
+        )
+        with handle:
+            json.dump(
+                {
+                    "ready": True,
+                    "status": "ok",
+                    "probe_contract": contract,
+                    "probe_contract_hash": contract_hash,
+                    "checks": [{
+                        "name": f"method_probe:{method}",
+                        "passed": True,
+                        "http_status": 200,
+                        "response_shape_hash": "a" * 64,
+                        "response_sample": (
+                            '{"jsonrpc":"2.0","result":"0x1"}'
+                        ),
+                    }],
+                },
+                handle,
+            )
+        path = Path(handle.name)
+        self.addCleanup(path.unlink, missing_ok=True)
+        return {
+            "ready": True,
+            "status": "ok",
+            "evidence_file": str(path),
+            "probe_contract": contract,
+            "probe_contract_hash": contract_hash,
+        }
+
+    def test_shell_loader_preserves_explicit_mainnet_comparison_disable(self) -> None:
+        env = os.environ.copy()
+        env.update(
+            {
+                "BLOCKCHAIN_NODE": "ethereum",
+                "MAINNET_RPC_URL": "",
+                "MAINNET_RPC_URL_DISABLED": "true",
+            }
+        )
+
+        result = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                "source config/config_loader.sh >/dev/null 2>&1; "
+                "printf '%s|%s' \"${MAINNET_RPC_URL:-}\" "
+                "\"${MAINNET_RPC_URL_DISABLED:-}\"",
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        self.assertEqual(result.stdout, "|true")
+
     def test_shell_loader_accepts_matching_job_local_chain_template(self) -> None:
         override_payload = {
             "_meta": {"adapter_family": "jsonrpc", "job_local_override": True},
@@ -156,8 +239,12 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
         self.assertNotIn("validated_methods", state["custom_rpc"])
         self.assertNotIn("validated_methods", state["chain_identity"])
 
-    def test_legacy_checkpoint_catalog_migrates_once_and_removes_mirrors(self) -> None:
-        from agent.harness.domains.rpc_catalog import ensure_catalog, validated_contracts_view
+    def test_legacy_checkpoint_catalog_quarantines_unverified_methods_once(self) -> None:
+        from agent.harness.domains.rpc_catalog import (
+            draft_view,
+            ensure_catalog,
+            validated_contracts_view,
+        )
         from agent.harness.state import new_state
 
         state = new_state("legacy-catalog-migration")
@@ -172,7 +259,12 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
         first_revision = first["revision"]
         second = ensure_catalog(state)
 
-        self.assertEqual(validated_contracts_view(state), [{"method": "eth_accounts", "params": []}])
+        self.assertEqual(validated_contracts_view(state), [])
+        self.assertEqual(draft_view(state)["method"], "next_method")
+        self.assertEqual(draft_view(state)["phase"], "evidence")
+        self.assertFalse(draft_view(state)["request_confirmed"])
+        self.assertFalse(draft_view(state)["response_confirmed"])
+        self.assertEqual(state["custom_rpc"]["status"], "needs_schema_evidence")
         self.assertEqual(second["revision"], first_revision)
         self.assertNotIn("validated_methods", state["custom_rpc"])
         self.assertNotIn("schema_draft", state["custom_rpc"])
@@ -249,6 +341,66 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
         self.assertTrue(state["custom_rpc"]["endpoint_ready"])
         for key in ("scope", "weights", "methods", "requested_workload", "job_local_override"):
             self.assertNotIn(key, state["custom_rpc"])
+
+    def test_final_endpoint_replays_only_explicitly_selected_custom_contracts(
+        self,
+    ) -> None:
+        from agent.harness.domains.rpc_endpoint import _selected_custom_contracts
+        from agent.harness.state import new_state
+
+        state = new_state("catalog-selection-authority")
+        state["custom_rpc"] = _custom_rpc_catalog(
+            [{"method": "debug_historicalOnly", "params": []}],
+            chain="bsc",
+        )
+
+        self.assertEqual(_selected_custom_contracts(state), [])
+
+        state["workload"] = {
+            "confirmed": True,
+            "choice": "template_defaults",
+            "methods": [],
+            "job_local_override": False,
+        }
+        self.assertEqual(_selected_custom_contracts(state), [])
+
+        state["workload"] = {
+            "confirmed": True,
+            "choice": "custom_rpc",
+            "methods": ["debug_historicalOnly"],
+            "job_local_override": True,
+        }
+        self.assertEqual(
+            [
+                item["method"]
+                for item in _selected_custom_contracts(state)
+            ],
+            ["debug_historicalOnly"],
+        )
+        state["custom_rpc"] = _custom_rpc_catalog(
+            [{"method": "demo_custom", "params": []}],
+            chain="bsc",
+        )
+        state["chain_identity"] = {"canonical": "bsc"}
+        state["workload"] = {
+            "confirmed": True,
+            "choice": "mixed_add",
+            "methods": [
+                "eth_getBalance",
+                "eth_getTransactionCount",
+                "eth_blockNumber",
+                "eth_gasPrice",
+                "demo_custom",
+            ],
+            "job_local_override": True,
+        }
+        self.assertEqual(
+            [
+                item["method"]
+                for item in _selected_custom_contracts(state)
+            ],
+            ["demo_custom"],
+        )
 
     def test_chain_change_retains_only_catalog_contracts_with_matching_provenance(self) -> None:
         from agent.harness.state import new_state
@@ -360,13 +512,18 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
         from tools.chain_adapters import get_adapter
         from tools.chain_adapters.cli import _get_param_format
 
-        template = materialize_custom_rpc_template(
-            chain="bsc",
-            adapter_family="",
-            rpc_mode="single",
-            workload={"methods": ["eth_accounts"]},
-            validated_methods=[{"method": "eth_accounts", "params": []}],
-        )
+        with patch(
+            "agent.harness.domains.rpc_catalog.validated_method_contract_is_current",
+            return_value=True,
+        ):
+            template = materialize_custom_rpc_template(
+                chain="bsc",
+                adapter_family="",
+                rpc_mode="single",
+                workload={"methods": ["eth_accounts"]},
+                validated_methods=[{"method": "eth_accounts", "params": []}],
+                contract_state={},
+            )
 
         self.assertEqual(template["_meta"]["adapter_family"], "jsonrpc")
         self.assertEqual(template["rpc_methods"]["single"], "eth_accounts")
@@ -403,13 +560,18 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
             "methods": ["demo_zero", "demo_multi", "demo_object"],
             "mixed_weights": {"demo_zero": 34, "demo_multi": 33, "demo_object": 33},
         }
-        template = materialize_custom_rpc_template(
-            chain="case2-runtime-only",
-            adapter_family="jsonrpc",
-            rpc_mode="mixed",
-            workload=workload,
-            validated_methods=contracts,
-        )
+        with patch(
+            "agent.harness.domains.rpc_catalog.validated_method_contract_is_current",
+            return_value=True,
+        ):
+            template = materialize_custom_rpc_template(
+                chain="case2-runtime-only",
+                adapter_family="jsonrpc",
+                rpc_mode="mixed",
+                workload=workload,
+                validated_methods=contracts,
+                contract_state={},
+            )
 
         self.assertEqual(template["_meta"]["adapter_family"], "jsonrpc")
         self.assertEqual(template["rpc_methods"]["mixed_weighted"], [
@@ -449,6 +611,7 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
                 "mixed_weights": {"demo_a": 50, "demo_b": 50},
             },
             validated_methods=[{"method": "demo_a", "params": []}],
+            contract_state={},
         )
 
         self.assertEqual(template, {})
@@ -760,6 +923,10 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
             "endpoint": "http://sample-one.invalid",
             "method": "demo_a",
         }
+        state["current_action"] = {
+            "action_id": "method-endpoint-probe",
+        }
+        state["turn_context"] = {"control_receipts": []}
         state = deepcopy(state)
         correct_draft(state, {
             "method": "demo_a",
@@ -770,10 +937,50 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
         })
         self.assertTrue(confirm_request(state, True).accepted)
         self.assertTrue(confirm_response(state, True).accepted)
+        from agent.validators.endpoint_probe import (
+            build_rpc_probe_contract,
+            rpc_probe_contract_hash,
+        )
+
+        probe_contract = build_rpc_probe_contract(
+            chain="bsc",
+            endpoint="http://sample-one.invalid",
+            transport="jsonrpc",
+            methods=["demo_a"],
+            method_params={"demo_a": []},
+        )
+        probe_contract_hash = rpc_probe_contract_hash(probe_contract)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            delete=False,
+        ) as evidence_handle:
+            json.dump(
+                {
+                    "ready": True,
+                    "status": "ok",
+                    "probe_contract": probe_contract,
+                    "probe_contract_hash": probe_contract_hash,
+                    "checks": [{
+                        "name": "method_probe:demo_a",
+                        "passed": True,
+                        "http_status": 200,
+                        "response_shape_hash": "a" * 64,
+                        "response_sample": (
+                            '{"jsonrpc":"2.0","result":"0x1"}'
+                        ),
+                    }],
+                },
+                evidence_handle,
+            )
+            evidence_file = evidence_handle.name
+        self.addCleanup(Path(evidence_file).unlink, missing_ok=True)
         probe = {
             "ready": True,
             "status": "ok",
-            "evidence_file": "demo-a.json",
+            "evidence_file": evidence_file,
+            "probe_contract": probe_contract,
+            "probe_contract_hash": probe_contract_hash,
             "checks": [{
                 "name": "method_probe:demo_a",
                 "response_sample": '{"jsonrpc":"2.0","result":"0x1"}',
@@ -790,23 +997,158 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
 
     def test_final_endpoint_replays_every_selected_custom_method_with_exact_params(self) -> None:
         from agent.harness.domains.rpc_endpoint import _apply_endpoint_answer
+        from agent.harness.domains.rpc_receipts import exact_value_hash
         from agent.harness.state import new_state
 
+        endpoint = "http://final.invalid"
         state = new_state("final-endpoint")
         state.update({
             "chain_identity": {"canonical": "bsc", "adapter_family": "jsonrpc"},
-            "workload": {"methods": ["demo_a", "demo_b"]},
+            "workload": {
+                "confirmed": True,
+                "choice": "custom_rpc",
+                "methods": ["demo_a", "demo_b"],
+                "job_local_override": True,
+            },
             "custom_rpc": _custom_rpc_catalog([
                 {"method": "demo_a", "params": []},
                 {"method": "demo_b", "params": {"owner": "0xabc"}},
             ], chain="bsc"),
         })
+        state["current_action"] = {"action_id": "final-endpoint-action"}
+        state["turn_context"] = {
+            "control_receipts": [],
+            "admitted_actions": [{
+                "action_id": "final-endpoint-action",
+                "argument_value_hashes": {
+                    "selected_value": exact_value_hash(endpoint),
+                },
+            }],
+        }
         state = deepcopy(state)
         def probe(**kwargs):
             method = kwargs["methods"][0]
-            return {"ready": True, "status": "ok", "evidence_file": f"{method}.json"}
+            return self._probe_result(
+                chain=kwargs["chain"],
+                endpoint=kwargs["endpoint"],
+                family=kwargs["adapter_family"],
+                method=method,
+                params=kwargs["method_params"][method],
+            )
 
         with patch("agent.harness.domains.rpc_endpoint.validate_rpc_endpoint", side_effect=probe) as validate:
+            _apply_endpoint_answer(
+                state,
+                {
+                    "endpoint_role": "final_benchmark",
+                    "rpc_case": "runtime",
+                    "config_field": "LOCAL_RPC_URL",
+                },
+                endpoint,
+                responses=[],
+            )
+
+        self.assertEqual(validate.call_count, 2)
+        self.assertEqual(
+            [(call.kwargs["methods"], call.kwargs["method_params"]) for call in validate.call_args_list],
+            [(["demo_a"], {"demo_a": []}), (["demo_b"], {"demo_b": {"owner": "0xabc"}})],
+        )
+        self.assertEqual(state["confirmed_config"]["LOCAL_RPC_URL"], endpoint)
+        self.assertTrue(all(item["final_endpoint"] == endpoint for item in state["custom_rpc"]["catalog"]["methods"]))
+        self.assertTrue(all(
+            Path(item["final_endpoint_evidence_file"]).is_file()
+            for item in state["custom_rpc"]["catalog"]["methods"]
+        ))
+
+    def test_final_endpoint_does_not_commit_when_owner_receipt_cannot_bind(
+        self,
+    ) -> None:
+        from agent.harness.domains.rpc_endpoint import _apply_endpoint_answer
+        from agent.harness.domains.rpc_receipts import exact_value_hash
+        from agent.harness.state import new_state
+
+        endpoint = "http://final.invalid"
+        state = new_state("final-endpoint-proof-failure")
+        state.update({
+            "chain_identity": {
+                "canonical": "bsc",
+                "adapter_family": "jsonrpc",
+            },
+            "workload": {
+                "confirmed": True,
+                "choice": "custom_rpc",
+                "methods": ["demo_a"],
+                "job_local_override": True,
+            },
+            "custom_rpc": _custom_rpc_catalog(
+                [{"method": "demo_a", "params": []}],
+                chain="bsc",
+            ),
+        })
+        state["current_action"] = {"action_id": "final-endpoint-action"}
+        state["turn_context"] = {
+            "control_receipts": [],
+            "admitted_actions": [{
+                "action_id": "final-endpoint-action",
+                "argument_value_hashes": {
+                    "selected_value": exact_value_hash(endpoint),
+                },
+            }],
+        }
+
+        with patch(
+            "agent.harness.domains.rpc_endpoint.validate_rpc_endpoint",
+            return_value={
+                "ready": True,
+                "status": "ok",
+                "evidence_file": "missing-evidence.json",
+            },
+        ):
+            _apply_endpoint_answer(
+                state,
+                {
+                    "endpoint_role": "final_benchmark",
+                    "rpc_case": "runtime",
+                    "config_field": "LOCAL_RPC_URL",
+                },
+                endpoint,
+                responses=[],
+            )
+
+        self.assertNotIn("LOCAL_RPC_URL", state.get("confirmed_config", {}))
+        self.assertFalse(state["endpoint_evidence"]["local_rpc_url_ready"])
+        self.assertEqual(
+            state["endpoint_evidence"]["local_rpc_url_probe"]["status"],
+            "proof_incomplete",
+        )
+
+    def test_final_endpoint_rejects_incomplete_custom_workload_coverage(
+        self,
+    ) -> None:
+        from agent.harness.domains.rpc_endpoint import _apply_endpoint_answer
+        from agent.harness.state import new_state
+
+        state = new_state("final-endpoint-missing-contract")
+        state.update({
+            "chain_identity": {
+                "canonical": "bsc",
+                "adapter_family": "jsonrpc",
+            },
+            "workload": {
+                "confirmed": True,
+                "choice": "custom_rpc",
+                "methods": ["debug_missing"],
+                "job_local_override": True,
+            },
+            "custom_rpc": _custom_rpc_catalog(
+                [{"method": "debug_historicalOnly", "params": []}],
+                chain="bsc",
+            ),
+        })
+
+        with patch(
+            "agent.harness.domains.rpc_endpoint.validate_rpc_endpoint",
+        ) as validate:
             _apply_endpoint_answer(
                 state,
                 {
@@ -818,17 +1160,53 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
                 responses=[],
             )
 
-        self.assertEqual(validate.call_count, 2)
+        validate.assert_not_called()
+        self.assertNotIn("LOCAL_RPC_URL", state.get("confirmed_config", {}))
+        self.assertFalse(state["endpoint_evidence"]["local_rpc_url_ready"])
         self.assertEqual(
-            [(call.kwargs["methods"], call.kwargs["method_params"]) for call in validate.call_args_list],
-            [(["demo_a"], {"demo_a": []}), (["demo_b"], {"demo_b": {"owner": "0xabc"}})],
+            state["endpoint_evidence"]["local_rpc_url_probe"][
+                "selected_methods"
+            ],
+            ["debug_missing"],
         )
-        self.assertEqual(state["confirmed_config"]["LOCAL_RPC_URL"], "http://final.invalid")
-        self.assertTrue(all(item["final_endpoint"] == "http://final.invalid" for item in state["custom_rpc"]["catalog"]["methods"]))
-        self.assertEqual(
-            [item["final_endpoint_evidence_file"] for item in state["custom_rpc"]["catalog"]["methods"]],
-            ["demo_a.json", "demo_b.json"],
-        )
+
+    def test_final_endpoint_rejects_empty_job_local_workload(
+        self,
+    ) -> None:
+        from agent.harness.domains.rpc_endpoint import _apply_endpoint_answer
+        from agent.harness.state import new_state
+
+        state = new_state("final-endpoint-empty-workload")
+        state.update({
+            "chain_identity": {
+                "canonical": "bsc",
+                "adapter_family": "jsonrpc",
+            },
+            "workload": {
+                "confirmed": True,
+                "choice": "custom_rpc",
+                "methods": [],
+                "job_local_override": True,
+            },
+        })
+
+        with patch(
+            "agent.harness.domains.rpc_endpoint.validate_rpc_endpoint",
+        ) as validate:
+            _apply_endpoint_answer(
+                state,
+                {
+                    "endpoint_role": "final_benchmark",
+                    "rpc_case": "runtime",
+                    "config_field": "LOCAL_RPC_URL",
+                },
+                "http://final.invalid",
+                responses=[],
+            )
+
+        validate.assert_not_called()
+        self.assertNotIn("LOCAL_RPC_URL", state.get("confirmed_config", {}))
+        self.assertFalse(state["endpoint_evidence"]["local_rpc_url_ready"])
 
     def test_final_endpoint_blocks_when_any_selected_custom_method_fails(self) -> None:
         from agent.harness.domains.rpc_endpoint import _apply_endpoint_answer
@@ -837,7 +1215,12 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
         state = new_state("final-endpoint-failure")
         state.update({
             "chain_identity": {"canonical": "bsc", "adapter_family": "jsonrpc"},
-            "workload": {"methods": ["demo_a", "demo_b"]},
+            "workload": {
+                "confirmed": True,
+                "choice": "custom_rpc",
+                "methods": ["demo_a", "demo_b"],
+                "job_local_override": True,
+            },
             "custom_rpc": _custom_rpc_catalog([
                 {"method": "demo_a", "params": []},
                 {"method": "demo_b", "params": ["0xabc"]},
@@ -1010,7 +1393,13 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
                 "adapter_family": "jsonrpc",
             },
             "custom_rpc": _custom_rpc_catalog(
-                [{"method": "demo_object", "params": {"height": "latest"}}],
+                [
+                    {
+                        "method": "demo_object",
+                        "params": {"height": "latest"},
+                    },
+                    {"method": "historical_only", "params": []},
+                ],
                 chain="case2-execution",
             ),
             "workload": {
@@ -1046,7 +1435,21 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
                     },
                 }
 
+            checked_methods: list[str] = []
+
+            def contract_is_current(_state, contract):
+                checked_methods.append(contract["method"])
+                return True
+
             with (
+                patch(
+                    "agent.harness.domains.execution_runtime.validated_method_contract_is_current",
+                    side_effect=contract_is_current,
+                ),
+                patch(
+                    "agent.harness.domains.rpc_catalog.validated_method_contract_is_current",
+                    return_value=True,
+                ),
                 patch(
                     "agent.runners.application_service.prepare_benchmark_run",
                     side_effect=prepare_with_runtime_override,
@@ -1065,11 +1468,94 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
                 {"height": {"literal": "latest"}},
             )
             self.assertEqual(run_preflight.call_args.args[0], plan)
+            self.assertEqual(checked_methods, ["demo_object"])
             self.assertEqual(
                 json.loads(plan_file.read_text(encoding="utf-8")),
                 {},
                 "runtime custom-RPC materialization must not overwrite the approved source plan",
             )
+
+    def test_template_only_weight_override_needs_no_custom_method_proof(
+        self,
+    ) -> None:
+        from agent.harness.domains.execution_runtime import (
+            _prepare_benchmark_with_runtime_contract,
+        )
+
+        methods = [
+            "eth_getBalance",
+            "eth_getTransactionCount",
+            "eth_blockNumber",
+            "eth_gasPrice",
+        ]
+        state = {
+            "chain_identity": {
+                "canonical": "bsc",
+                "adapter_family": "jsonrpc",
+            },
+            "custom_rpc": _custom_rpc_catalog([], chain="bsc"),
+            "workload": {
+                "confirmed": True,
+                "job_local_override": True,
+                "methods": methods,
+                "mixed_weights": {
+                    method: weight
+                    for method, weight in zip(
+                        methods,
+                        (10, 20, 30, 40),
+                        strict=True,
+                    )
+                },
+            },
+            "rpc_mode": "mixed",
+            "target_mode": "real-node",
+            "confirmed_config": {
+                "LOCAL_RPC_URL": "http://node.invalid",
+            },
+        }
+
+        def prepare_with_override(**kwargs):
+            return {
+                "status": "ok",
+                "warnings": [],
+                "data": {
+                    "plan": {
+                        "chain": "bsc",
+                        "chain_config_override": deepcopy(
+                            kwargs["chain_config_override"]
+                        ),
+                    },
+                    "plan_file": "",
+                    "preflight": {"passed": True},
+                },
+            }
+
+        with (
+            patch(
+                "agent.harness.domains.execution_runtime.validated_method_contract_is_current",
+            ) as validate_contract,
+            patch(
+                "agent.runners.application_service.prepare_benchmark_run",
+                side_effect=prepare_with_override,
+            ),
+        ):
+            result = _prepare_benchmark_with_runtime_contract(state)
+
+        validate_contract.assert_not_called()
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(
+            result["data"]["plan"]["chain_config_override"][
+                "rpc_methods"
+            ]["mixed_weighted"],
+            [
+                {"method": method, "weight": weight}
+                for method, weight in zip(
+                    methods,
+                    (10, 20, 30, 40),
+                    strict=True,
+                )
+            ],
+        )
 
     def test_execution_runtime_rejects_prepare_service_that_omits_case2_override(self) -> None:
         from agent.harness.domains.execution_runtime import (
@@ -1102,9 +1588,19 @@ class CustomRpcRuntimeClosureTest(unittest.TestCase):
             },
         }
 
-        with patch(
-            "agent.runners.application_service.prepare_benchmark_run",
-            return_value=prepared,
+        with (
+            patch(
+                "agent.harness.domains.execution_runtime.validated_method_contract_is_current",
+                return_value=True,
+            ),
+            patch(
+                "agent.harness.domains.rpc_catalog.validated_method_contract_is_current",
+                return_value=True,
+            ),
+            patch(
+                "agent.runners.application_service.prepare_benchmark_run",
+                return_value=prepared,
+            ),
         ):
             with self.assertRaisesRegex(
                 RuntimeError,

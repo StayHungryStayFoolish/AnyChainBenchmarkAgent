@@ -140,7 +140,7 @@ _CASE_CONTRACTS: Mapping[str, _CaseContract] = {
         ("stale_preflight_executed",),
     ),
     "RR-010": _CaseContract(
-        "new_chain_continue",
+        "new_chain_response",
         "S1",
         (
             "custom_method_collection_exited",

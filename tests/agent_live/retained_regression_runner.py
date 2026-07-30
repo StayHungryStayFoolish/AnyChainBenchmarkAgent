@@ -1108,6 +1108,7 @@ def execute_exact_retained_regression(
     )
     observed_turns: list[PtyCliTurnRecord] = []
     observed_events: list[RuntimeTurnEvent] = []
+    setup_events: list[RuntimeTurnEvent] = []
     transcript_lines: list[str] = []
     started_at = str(time.time_ns())
     initial_event: RuntimeTurnEvent | None = None
@@ -1161,6 +1162,7 @@ def execute_exact_retained_regression(
             desired="continue",
         )
         if resume_submission:
+            setup_events.append(initial_event)
             active_user_message = resume_submission
             transport.submit_bracketed_paste(resume_submission)
             resume_completion = wait_for_turn_completion(
@@ -1321,6 +1323,7 @@ def execute_exact_retained_regression(
         revision=active_revision,
         execution_id=execution_id,
         initial_event=initial_event,
+        setup_events=setup_events,
         events=observed_events,
         turns=observed_turns,
     )
@@ -1624,6 +1627,7 @@ def _write_exact_retained_artifacts(
     revision: Mapping[str, str],
     execution_id: str,
     initial_event: RuntimeTurnEvent,
+    setup_events: Sequence[RuntimeTurnEvent],
     events: Sequence[RuntimeTurnEvent],
     turns: Sequence[PtyCliTurnRecord],
 ) -> dict[str, Path]:
@@ -1649,6 +1653,7 @@ def _write_exact_retained_artifacts(
         },
         "runtime_events": {
             "initial_event": asdict(initial_event),
+            "setup_events": [asdict(event) for event in setup_events],
             "events": [asdict(event) for event in events],
         },
         "checkpoint_diff": {
@@ -2165,17 +2170,34 @@ def _reconstruct_verifier_context(
         })
     transcript_rows = payloads["transcript"].get("turns")
     runtime_rows = payloads["runtime_events"].get("events")
+    setup_rows = payloads["runtime_events"].get("setup_events") or []
     initial_raw = payloads["runtime_events"].get("initial_event")
     if (
         not isinstance(transcript_rows, list)
         or not transcript_rows
         or not isinstance(runtime_rows, list)
+        or not isinstance(setup_rows, list)
         or len(runtime_rows) != len(transcript_rows)
         or not isinstance(initial_raw, Mapping)
     ):
         raise ValueError("retained regression artifact turn lineage is incomplete")
     initial_event = _runtime_event_from_mapping(initial_raw)
     validate_runtime_turn_event(initial_event)
+    setup_events = tuple(
+        _runtime_event_from_mapping(item)
+        for item in setup_rows
+        if isinstance(item, Mapping)
+    )
+    if len(setup_events) != len(setup_rows):
+        raise ValueError("retained regression setup event is invalid")
+    for event in setup_events:
+        validate_runtime_turn_event(event)
+    if (
+        setup_events
+        and setup_events[-1].after_fingerprint
+        != initial_event.before_fingerprint
+    ):
+        raise ValueError("retained regression setup lineage is broken")
     events = tuple(
         _runtime_event_from_mapping(item)
         for item in runtime_rows
@@ -2346,8 +2368,12 @@ def _reconstruct_verifier_context(
         != [dict(event.material_state_diff_hashes) for event in events]
     ):
         raise ValueError("retained regression checkpoint diff is stale")
-    if dict(initial_event.revision) != dict(revision) or any(
-        dict(event.revision) != dict(revision) for event in events
+    if (
+        dict(initial_event.revision) != dict(revision)
+        or any(
+            dict(event.revision) != dict(revision)
+            for event in (*setup_events, *events)
+        )
     ):
         raise ValueError("retained regression runtime revision is stale")
     context = JourneyVerifierContext(
@@ -2359,6 +2385,7 @@ def _reconstruct_verifier_context(
         observed_edge_keys=(),
         latest_turn=turns[-1],
         completed_events=events,
+        setup_events=setup_events,
         completed_decisions=tuple(decisions),
         verifier_input_contract=verifier_input,
     )

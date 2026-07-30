@@ -48,6 +48,7 @@ class ResponseAuthorityTests(unittest.TestCase):
                 retryable=False,
                 severity="critical",
             ),
+            suppress_pending_render=True,
         )
 
         serialized = handler_result_to_dict(result)
@@ -60,6 +61,7 @@ class ResponseAuthorityTests(unittest.TestCase):
             "harness.failure.internal_contract_violation",
         )
         self.assertEqual(serialized["blocker"]["severity"], "critical")
+        self.assertTrue(serialized["suppress_pending_render"])
 
     def test_content_compatibility_is_rejected(self) -> None:
         with self.assertRaises(TypeError):

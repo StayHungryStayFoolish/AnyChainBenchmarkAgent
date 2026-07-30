@@ -22,7 +22,11 @@ from ..secret_refs import (
 from ..sync_observe_contract import SyncObserveRequest
 from ..contracts import HandlerResult, RecoveryCommand, ResponseFragment, StateDelta
 from ..failures import failure_record_from_job, failure_record_from_preflight
-from .rpc_catalog import validated_contracts_view
+from .rpc_catalog import (
+    effective_custom_workload_methods,
+    selected_validated_contracts_view,
+    validated_method_contract_is_current,
+)
 from .rpc_receipts import emit_materialization_receipt
 
 
@@ -342,6 +346,9 @@ def _prepare_kwargs(state: AgentGraphState) -> dict[str, Any]:
         kwargs["blockchain_process_names"] = [process_names]
     if confirmed.get("MAINNET_RPC_URL"):
         kwargs["mainnet_rpc_url"] = str(confirmed.get("MAINNET_RPC_URL") or "")
+    kwargs["mainnet_rpc_url_disabled"] = bool(
+        confirmed.get("MAINNET_RPC_URL_DISABLED")
+    )
     methods = workload.get("methods")
     weights = workload.get("mixed_weights")
     if isinstance(methods, list) and methods:
@@ -358,11 +365,21 @@ def _prepare_benchmark_with_runtime_contract(state: AgentGraphState) -> dict[str
     workload = state.get("workload") or {}
     if workload.get("job_local_override"):
         identity = state.get("chain_identity") or {}
+        custom_methods = effective_custom_workload_methods(state)
         validated = [
             dict(item)
-            for item in validated_contracts_view(state)
+            for item in selected_validated_contracts_view(state)
             if isinstance(item, dict)
         ]
+        if custom_methods and (
+            not validated or any(
+                not validated_method_contract_is_current(state, item)
+                for item in validated
+            )
+        ):
+            raise RuntimeError(
+                "custom RPC execution requires current validated method proof"
+            )
         chain = str(
             identity.get("canonical") or identity.get("raw") or ""
         ).strip().lower()
@@ -373,16 +390,20 @@ def _prepare_benchmark_with_runtime_contract(state: AgentGraphState) -> dict[str
             rpc_mode=str(state.get("rpc_mode") or "single"),
             workload=dict(workload),
             validated_methods=validated,
+            contract_state=state,
         )
-        if override:
-            materialization_evidence = (
-                (override.get("_meta") or {}).get("materialization_evidence")
-                if isinstance(override.get("_meta"), dict)
-                else {}
+        if not override:
+            raise RuntimeError(
+                "validated custom RPC contract could not be materialized"
             )
-            if isinstance(materialization_evidence, dict):
-                emit_materialization_receipt(state, materialization_evidence)
-            prepare_kwargs["chain_config_override"] = override
+        materialization_evidence = (
+            (override.get("_meta") or {}).get("materialization_evidence")
+            if isinstance(override.get("_meta"), dict)
+            else {}
+        )
+        if isinstance(materialization_evidence, dict):
+            emit_materialization_receipt(state, materialization_evidence)
+        prepare_kwargs["chain_config_override"] = override
     prepared_result = execution_service.execute(
         ExecutionRequest(
             operation=ExecutionOperation.PREPARE,

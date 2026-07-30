@@ -8,7 +8,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from agent.runners.private_files import atomic_write_private_text
 
@@ -103,6 +103,9 @@ def generate_plan(request: dict[str, Any], discovery: dict[str, Any] | None = No
         "SYNC_OBSERVE_RPC_URL": request.get("sync_observe_rpc_url", ""),
         "NODE_PROMETHEUS_METRICS_URL": request.get("node_prometheus_metrics_url", ""),
         "MAINNET_RPC_URL": request.get("mainnet_rpc_url", ""),
+        "MAINNET_RPC_URL_DISABLED": str(
+            bool(request.get("mainnet_rpc_url_disabled"))
+        ).lower(),
         f"{qps_prefix}_INITIAL_QPS": str(qps.get("initial", "")),
         f"{qps_prefix}_MAX_QPS": str(qps.get("max", "")),
         f"{qps_prefix}_QPS_STEP": str(qps.get("step", "")),
@@ -399,6 +402,7 @@ def materialize_custom_rpc_template(
     rpc_mode: str,
     workload: dict[str, Any],
     validated_methods: list[dict[str, Any]],
+    contract_state: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the complete job-local template for a validated custom workload.
 
@@ -470,6 +474,26 @@ def materialize_custom_rpc_template(
     contract_required = set(selected) if not has_canonical_template else set(selected) - canonical_methods
     if any(method not in contracts for method in contract_required):
         return {}
+    selected_contracts = [
+        contracts[method]
+        for method in selected
+        if method in contracts
+    ]
+    if selected_contracts:
+        if contract_state is None:
+            return {}
+        from agent.harness.domains.rpc_catalog import (
+            validated_method_contract_is_current,
+        )
+
+        if any(
+            not validated_method_contract_is_current(
+                contract_state,
+                contract,
+            )
+            for contract in selected_contracts
+        ):
+            return {}
 
     template["rpc_methods"] = rpc_methods
     param_formats = dict(template.get("param_formats") or {})

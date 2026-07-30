@@ -98,6 +98,27 @@ class ActionContractAuthorityTest(unittest.TestCase):
             self.assertEqual(rendered[spec.action_type]["required_arguments"], list(spec.required_arguments))
             self.assertEqual(rendered[spec.action_type]["constraints"], list(spec.constraints))
 
+        self.assertNotIn("approve_preflight_smoke", rendered)
+        self.assertNotIn("reject_preflight_smoke", rendered)
+        self.assertNotIn("approve_final_benchmark", rendered)
+        self.assertNotIn("reject_final_benchmark", rendered)
+
+    def test_model_plan_cannot_admit_typed_execution_option_directly(self) -> None:
+        from agent.harness.admission import validate_action_plan
+        from agent.harness.state import new_state
+
+        state = new_state("forged-execution-option", language="en")
+        result = validate_action_plan(
+            state,
+            [{"type": "approve_preflight_smoke"}],
+        )
+
+        self.assertEqual(result.status, "rejected")
+        self.assertEqual(
+            [item.code for item in result.rejections],
+            ["typed_option_action_forbidden"],
+        )
+
     def test_structured_intake_contract_is_registry_owned_and_projected(self) -> None:
         from agent.harness.action_registry import ACTION_SPECS
         from agent.harness.context import action_schema
@@ -407,15 +428,9 @@ class ActionContractAuthorityTest(unittest.TestCase):
                 "sync_observe_stop_condition": "duration",
             })
 
-    def test_legacy_nested_arguments_exist_only_in_v12_checkpoint_adapter(self) -> None:
+    def test_nested_arguments_are_rejected_by_current_action_contract(self) -> None:
         from agent.harness.action_registry import validate_action_contract
-        from agent.harness.checkpoint_migrations import normalize_v12_action_envelope
 
-        action = normalize_v12_action_envelope({
-            "type": "answer_opening_question",
-            "arguments": {"topic": "current_config"},
-        })
-        self.assertEqual(action["topic"], "current_config")
         with self.assertRaisesRegex(ValueError, "arguments.v1 is retired"):
             validate_action_contract({
                 "type": "answer_opening_question",
@@ -489,27 +504,10 @@ class ActionContractAuthorityTest(unittest.TestCase):
         self.assertTrue(action_is_turn_local({"type": "inspect_failure"}))
         self.assertFalse(action_is_turn_local({"type": "choose_target_mode"}))
 
-    def test_retired_custom_rpc_action_is_only_an_admission_compatibility_input(self) -> None:
+    def test_retired_custom_rpc_action_has_no_registered_runtime_authority(self) -> None:
         from agent.harness.action_registry import ACTION_BY_TYPE
-        from agent.harness.checkpoint_migrations import compile_v12_custom_rpc_action
 
         self.assertNotIn("start_custom_rpc", ACTION_BY_TYPE)
-        compiled = compile_v12_custom_rpc_action({
-            "type": "start_custom_rpc",
-            "rpc_endpoint": "https://example.invalid/rpc",
-            "rpc_method": "eth_chainId",
-            "workload_scope": "single_replace",
-            "confidence": "high",
-        })
-        self.assertEqual(
-            [item["type"] for item in compiled],
-            ["rpc_catalog_command", "rpc_catalog_command", "rpc_workload_command"],
-        )
-        self.assertEqual(
-            [item.get("catalog_command") for item in compiled[:2]],
-            ["set_endpoint", "set_method"],
-        )
-        self.assertTrue(all(item.get("type") != "start_custom_rpc" for item in compiled))
 
     def test_custom_rpc_domains_do_not_execute_retired_omnibus_action(self) -> None:
         domain_files = (

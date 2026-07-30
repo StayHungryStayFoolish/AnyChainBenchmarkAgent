@@ -7,7 +7,7 @@ mutates benchmark configuration.
 from __future__ import annotations
 
 from functools import partial
-from typing import Any
+from typing import Any, Mapping
 
 from agent.knowledge.entry_contract import ALL_RUNTIME_FIELDS
 from agent.knowledge.chain_identity import canonicalize_chain_scalar, repo_chain_names
@@ -54,7 +54,11 @@ def has_resumable_configuration(state: AgentGraphState) -> bool:
     )
 
 
-def resume_question(state: AgentGraphState) -> dict[str, Any]:
+def resume_question(
+    state: AgentGraphState,
+    *,
+    active_action_id: str = "",
+) -> dict[str, Any]:
     recovery = state.get("checkpoint_recovery") or {}
     if recovery.get("status") == "quarantined":
         prompt = question_text("question.orientation.resume_quarantined.prompt")
@@ -81,7 +85,10 @@ def resume_question(state: AgentGraphState) -> dict[str, Any]:
                 if confirmed
                 else "<none>"
             ),
-            deferred_request_count=len(state.get("action_queue") or []),
+            deferred_request_count=_deferred_action_count(
+                state,
+                active_action_id=active_action_id,
+            ),
             saved_workflow_goals=(
                 "; ".join(
                     ": ".join(
@@ -138,6 +145,25 @@ def resume_question(state: AgentGraphState) -> dict[str, Any]:
     if state.get("action_queue"):
         question["resume_action_queue"] = True
     return question
+
+
+def _deferred_action_count(
+    state: AgentGraphState,
+    *,
+    active_action_id: str = "",
+) -> int:
+    """Count queued work without treating the executing action as deferred."""
+
+    excluded = str(active_action_id or "")
+    return sum(
+        1
+        for item in state.get("action_queue") or ()
+        if isinstance(item, dict)
+        and (
+            not excluded
+            or str(item.get("action_id") or "") != excluded
+        )
+    )
 
 
 def _resume_option_label(value: str):
@@ -208,7 +234,14 @@ def apply_orientation_action(state: AgentGraphState, action: ActionProposal) -> 
     if action_type == "prepare_session_entry":
         current_pending = dict(state.get("pending_question") or {})
         resumable = has_resumable_configuration(state)
-        question = resume_question(state) if resumable else opening_question(state)
+        question = (
+            resume_question(
+                state,
+                active_action_id=action.action_id,
+            )
+            if resumable
+            else opening_question(state)
+        )
         delta = StateDelta()
         if (
             resumable
@@ -264,7 +297,7 @@ def apply_orientation_action(state: AgentGraphState, action: ActionProposal) -> 
                     state,
                     action,
                     topic="identity",
-                    response=fragment.message_id,
+                    response_fragments=(fragment,),
                 ),
             ),
             pending_question=question,
@@ -316,12 +349,46 @@ def apply_orientation_action(state: AgentGraphState, action: ActionProposal) -> 
         )
     if action_type in {"ask_capabilities", "answer_opening_question"}:
         raw = {"topic": "capabilities"} if action_type == "ask_capabilities" else dict(action.arguments)
-        topic = canonical_consultation_topic(raw.get("topic"))
+        requested_topic = canonical_consultation_topic(raw.get("topic"))
+        topic = effective_consultation_topic(state, raw.get("topic"))
+        raw["topic"] = topic
+        job_facts = None
+        if topic in {
+            "current_context",
+            "next_action",
+            "current_job",
+            "job_status",
+            "execution_status",
+        }:
+            job_facts = _job_status_facts(state)
         pending = dict(state.get("pending_question") or {})
         if topic == "recommendation" and not pending and not state.get("target_mode"):
             pending = recommendation_question(state)
-        fragment = consultation_fragment(state, raw)
+        fragment = consultation_fragment(
+            state,
+            raw,
+            job_facts=job_facts[:3] if job_facts is not None else None,
+        )
+        source_receipts: tuple[Mapping[str, Any], ...] = ()
+        if (
+            fragment.message_id
+            == "harness.orientation.consultation.job_verified"
+            and job_facts is not None
+            and job_facts[2]
+            and job_facts[3]
+        ):
+            source_receipts = (job_facts[3],)
         fragments = [fragment]
+        if (
+            requested_topic in {"requirements", "workflow"}
+            and _at_preflight_gate(state)
+        ):
+            fragments.append(
+                consultation_fragment(
+                    state,
+                    {"topic": "execution_preflight_smoke"},
+                )
+            )
         active_failure = _active_failure_record(state)
         if topic == "current_config" and active_failure:
             fragments.insert(0, failure_record_response_fragment(active_failure))
@@ -332,10 +399,15 @@ def apply_orientation_action(state: AgentGraphState, action: ActionProposal) -> 
                     state,
                     action,
                     topic=topic or "capabilities",
-                    response=(
-                        f"{fragment.message_id}:"
-                        f"{sorted(fragment.arguments.items())}:"
-                        f"{sorted(fragment.payload.items())}"
+                    response_fragments=tuple(fragments),
+                    source_receipts=source_receipts,
+                    projection_override=(
+                        {
+                            "job_id": str(job_facts[0]),
+                            "job_status": str(job_facts[1]),
+                        }
+                        if source_receipts and job_facts is not None
+                        else None
                     ),
                 ),
             ),
@@ -368,13 +440,41 @@ def apply_orientation_action(state: AgentGraphState, action: ActionProposal) -> 
     )
 
 
+def effective_consultation_topic(
+    state: AgentGraphState,
+    requested_topic: Any,
+) -> str:
+    """Resolve state-dependent consultation semantics at one authority."""
+
+    topic = canonical_consultation_topic(requested_topic)
+    if topic != "next_action":
+        return topic
+    pending = state.get("pending_question") or {}
+    if str(pending.get("group") or "") == "preflight_smoke_execution":
+        return "execution_preflight_smoke"
+    if compute_next_action(state).next_blocking_group == "preflight_smoke_execution":
+        return "execution_preflight_smoke"
+    return topic
+
+
+def _at_preflight_gate(state: AgentGraphState) -> bool:
+    pending = state.get("pending_question") or {}
+    return bool(
+        str(pending.get("group") or "") == "preflight_smoke_execution"
+        or compute_next_action(state).next_blocking_group
+        == "preflight_smoke_execution"
+    )
+
+
 def consultation_fragment(
     state: AgentGraphState,
     action: dict[str, Any],
+    *,
+    job_facts: tuple[str, str, bool] | None = None,
 ) -> ResponseFragment:
     """Translate a consultation topic into one registered response contract."""
 
-    topic = canonical_consultation_topic(action.get("topic"))
+    topic = effective_consultation_topic(state, action.get("topic"))
     subject = str(action.get("subject") or "").strip()
     facts = state.get("framework_summary") or {}
     static_ids = {
@@ -604,6 +704,22 @@ def consultation_fragment(
                 },
                 source=__name__,
             )
+        if str((state.get("job") or {}).get("job_id") or "").strip():
+            job_id, status, verified = (
+                job_facts
+                if job_facts is not None
+                else _job_status_facts(state)[:3]
+            )
+            return ResponseFragment(
+                kind="message",
+                message_id=(
+                    "harness.orientation.consultation.job_verified"
+                    if verified
+                    else "harness.orientation.consultation.job_unverified"
+                ),
+                arguments={"job_id": job_id, "status": status},
+                source=__name__,
+            )
         if next_action.next_blocking_group == "preflight_smoke_execution":
             return ResponseFragment(
                 kind="message",
@@ -658,6 +774,21 @@ def consultation_fragment(
         )
     if topic == "config_explanation":
         identifier = subject or str(pending.get("field") or pending.get("id") or "")
+        normalized_identifier = (
+            identifier.strip().lower().replace("-", "_").replace(" ", "_")
+        )
+        if normalized_identifier in {
+            "single",
+            "mixed",
+            "rpc_mode",
+            "rpc_mode_single",
+            "rpc_mode_mixed",
+        }:
+            return ResponseFragment(
+                kind="message",
+                message_id="harness.orientation.consultation.rpc_mode",
+                source=__name__,
+            )
         field = _runtime_field(identifier)
         if field is not None:
             return ResponseFragment(
@@ -696,7 +827,11 @@ def consultation_fragment(
                 source=__name__,
             )
     if topic in {"current_job", "job_status", "execution_status"}:
-        job_id, status, verified = _job_status_facts(state)
+        job_id, status, verified = (
+            job_facts
+            if job_facts is not None
+            else _job_status_facts(state)[:3]
+        )
         return ResponseFragment(
             kind="message",
             message_id=(
@@ -739,7 +874,9 @@ def _runtime_field(identifier: str):
     )
 
 
-def _job_status_facts(state: AgentGraphState) -> tuple[str, str, bool]:
+def _job_status_facts(
+    state: AgentGraphState,
+) -> tuple[str, str, bool, dict[str, Any]]:
     job = dict(state.get("job") or {})
     job_id = str(job.get("job_id") or "").strip()
     if not job_id:
@@ -748,29 +885,27 @@ def _job_status_facts(state: AgentGraphState) -> tuple[str, str, bool]:
             job = dict(jobs[0]) if jobs else {}
             job_id = str(job.get("job_id") or "").strip()
         except Exception:
-            return "", "", False
+            return "", "", False, {}
     if not job_id:
-        return "", "", False
+        return "", "", False, {}
     try:
         persisted = get_job(job_id)
     except (FileNotFoundError, OSError, ValueError):
-        return job_id, str(job.get("status") or "unknown"), False
+        return job_id, str(job.get("status") or "unknown"), False, {}
     receipts = persisted.get("execution_receipts") or {}
     receipt = dict(receipts.get("last_read") or {}) if isinstance(receipts, dict) else {}
     verified = bool(
         verify_job_receipt(receipt)
         and receipt.get("job_id") == job_id
         and receipt.get("observed_status") == persisted.get("status")
+        and receipt.get("observed_status") == receipt.get("persisted_status")
     )
-    return (
-        job_id,
-        str(
-            receipt.get("observed_status")
-            if verified
-            else job.get("status") or persisted.get("status") or "unknown"
-        ),
-        verified,
+    status = str(
+        receipt.get("observed_status")
+        if verified
+        else job.get("status") or persisted.get("status") or "unknown"
     )
+    return job_id, status, verified, receipt if verified else {}
 
 
 def apply_orientation_answer(

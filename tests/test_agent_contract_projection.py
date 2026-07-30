@@ -51,16 +51,6 @@ class AgentContractProjectionTest(unittest.TestCase):
         self.assertEqual(actions[0]["type"], "unknown")
         self.assertIn("undeclared action type", actions[0]["reason"])
 
-    def test_checkpoint_migrator_can_still_compile_retired_custom_rpc(self) -> None:
-        from agent.harness.checkpoint_migrations import compile_v12_custom_rpc_action
-
-        actions = compile_v12_custom_rpc_action({
-            "type": "start_custom_rpc",
-            "rpc_endpoint": "http://example.invalid",
-            "source_evidence": "http://example.invalid",
-        })
-        self.assertEqual([action["type"] for action in actions], ["rpc_catalog_command"])
-
     def test_every_cataloged_option_uses_a_current_action(self) -> None:
         from agent.harness.action_registry import ACTION_BY_TYPE
         from tests.agent_live.generate_harness_coverage_ledger import build_ledger
