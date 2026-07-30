@@ -68,6 +68,7 @@ from .semantic_drafts import (
     semantic_draft_question_binding,
     validate_semantic_plan_draft,
 )
+from .semantic_policy import FRAMED_REQUEST_SEMANTIC_POLICY
 from .secret_refs import (
     authorize_secret_reference,
     new_secret_reference,
@@ -883,10 +884,7 @@ def _stage_a_prompt() -> str:
         "domain_request unit. Do not split its framing into a second pending_answer or "
         "unresolved demand unless that framing independently answers the active question or "
         "requests another operation. "
-        "Interrogative, permission-seeking, hedging, and politeness framing around one present "
-        "request belongs to that request. It is not a separate consultation or unresolved unit "
-        "unless the user independently asks for information beyond whether the requested "
-        "operation can proceed. "
+        f"{FRAMED_REQUEST_SEMANTIC_POLICY}"
         "A semantic option selection and adjacent prose that only explains the reason, uncertainty, "
         "basis, referential application, or declared completion effect for that same selection form "
         "one pending_answer operation even when punctuation or line breaks create several clauses. "
@@ -1882,9 +1880,7 @@ def _stage_a_admission_prompt() -> str:
         "unit already represents a compact registered-domain request, adjacent operation framing "
         "that adds no independent value, question, navigation, analysis, or mutation supports "
         "that unit; it is not a second pending answer or unresolved demand. "
-        "Interrogative, permission-seeking, hedging, or politeness wording that only frames "
-        "whether the same present request can proceed is redundant support for that request, "
-        "not an independent consultation or unresolved demand. "
+        f"{FRAMED_REQUEST_SEMANTIC_POLICY}"
         "An explicit keep, reuse, or reconfirm instruction for one concrete registered value "
         "is complete only when routed as the owning idempotent domain request; equality with "
         "current state does not make it context or redundant. A statement that a value or "

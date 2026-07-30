@@ -1,5 +1,15 @@
 """Shared semantic policy fragments used by every intent authority."""
 
+FRAMED_REQUEST_SEMANTIC_POLICY = (
+    "Interrogative, permission-seeking, hedging, and politeness wording that "
+    "only frames whether the same present request can proceed belongs to that "
+    "request. It is support, not an independent consultation, omitted demand, "
+    "or unresolved unit. It becomes an independent consultation only when the "
+    "source separately asks for information, explanation, comparison, "
+    "validation, consequences, or another result beyond whether that same "
+    "request can proceed. "
+)
+
 PENDING_CANDIDATE_SEMANTIC_POLICY = (
     "Syntax candidates are not selections. A value mentioned only as an example, "
     "quotation, rejected option, negated operation, correction target, or value "

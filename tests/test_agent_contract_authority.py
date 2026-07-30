@@ -490,6 +490,34 @@ class ActionContractAuthorityTest(unittest.TestCase):
             PENDING_CANDIDATE_SEMANTIC_POLICY,
         )
 
+    def test_all_semantic_authorities_share_framed_request_policy(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _stage_a_admission_prompt,
+            _stage_a_prompt,
+        )
+        from agent.harness.semantic_admission import _semantic_fulfillment_prompt
+        from agent.harness.semantic_policy import FRAMED_REQUEST_SEMANTIC_POLICY
+
+        prompts = (
+            _stage_a_prompt(),
+            _stage_a_admission_prompt(),
+            _semantic_fulfillment_prompt(),
+        )
+        for prompt in prompts:
+            self.assertEqual(prompt.count(FRAMED_REQUEST_SEMANTIC_POLICY), 1)
+            self.assertIn(
+                "only frames whether the same present request can proceed",
+                prompt,
+            )
+            self.assertIn(
+                "separately asks for information, explanation, comparison",
+                prompt,
+            )
+        self.assertNotIn(
+            "A present answer, question, selection",
+            prompts[-1],
+        )
+
 
     def test_r36_turn_local_lifetime_contract_is_preserved(self) -> None:
         from agent.harness.action_registry import action_is_turn_local
