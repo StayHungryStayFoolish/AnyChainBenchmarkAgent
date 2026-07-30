@@ -1542,7 +1542,7 @@ def _real_node_selection_executed_at_source(
         and dict(action.get("argument_value_hashes") or {}).get("target_mode")
         == _value_hash("real-node")
         and str(action.get("action_id") or "")
-        in admitted_ids & execution_order & transition_consumers
+        in admitted_ids & execution_order
     ]
     matching_action_ids = {
         str(action.get("action_id") or "")
@@ -1593,6 +1593,7 @@ def _real_node_selection_executed_at_source(
         and transition["after_id"] == "chain"
         and transition["after_group"] == "chain_identity"
         and len(matching_actions) == 1
+        and transition_consumers == matching_pending_action_ids
         and causally_ordered
         and len(matching_receipts) == 1
         and (material_diffs.get("target_mode") or {}).get("after")
@@ -1644,7 +1645,7 @@ def _mode_consultation_preserves_chain_pending(
         and dict(action.get("argument_value_hashes") or {}).get("topic")
         == _value_hash(MODE_COMPARISON_TOPIC)
         and str(action.get("action_id") or "")
-        in admitted_ids & execution_order & transition_consumers
+        in admitted_ids & execution_order
     ]
     matching_action_ids = {
         str(action.get("action_id") or "")
@@ -1671,6 +1672,7 @@ def _mode_consultation_preserves_chain_pending(
         and transition["after_id"] == transition["before_id"]
         and transition["after_group"] == transition["before_group"]
         and transition["after_hash"] == transition["before_hash"]
+        and not transition_consumers
         and len(matching_actions) == 1
         and len(matching_receipts) == 1
         and not material_paths
@@ -1684,6 +1686,7 @@ def _mode_consultation_preserves_chain_pending(
         turn_index=turn_index,
         pending_transition=dict(transition or {}),
         matching_admitted_action_ids=sorted(matching_action_ids),
+        pending_consumer_action_ids=sorted(transition_consumers),
         material_state_paths=material_paths,
     )
 

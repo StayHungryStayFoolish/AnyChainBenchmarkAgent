@@ -1857,7 +1857,7 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
                 "after_id": "chain",
                 "after_group": "chain_identity",
                 "after_hash": "2" * 64,
-                "consumer_action_ids": ["action-0", "action-1"],
+                "consumer_action_ids": ["action-0"],
             },
             turn_receipt={
                 "admitted_action_ids": ["action-0", "action-1"],
@@ -1914,7 +1914,7 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
                 "after_id": "chain",
                 "after_group": "chain_identity",
                 "after_hash": "2" * 64,
-                "consumer_action_ids": ["action-2"],
+                "consumer_action_ids": [],
             },
             turn_receipt={
                 "admitted_action_ids": ["action-2"],
@@ -2024,11 +2024,18 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
                     "execution_order": ["action-1", "action-0"],
                 },
             ),
-            "missing_transition_consumer": replace(
+            "missing_pending_consumer": replace(
                 selected,
                 pending_transition={
                     **selected.pending_transition,
-                    "consumer_action_ids": ["action-0"],
+                    "consumer_action_ids": [],
+                },
+            ),
+            "domain_action_claims_pending_consumption": replace(
+                selected,
+                pending_transition={
+                    **selected.pending_transition,
+                    "consumer_action_ids": ["action-0", "action-1"],
                 },
             ),
             "receipt_bound_to_followup": replace(
@@ -2080,6 +2087,23 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
         ](_context(
             selected,
             changed_pending,
+            turns=turns,
+            verifier_input_contract=contract,
+        ))
+        self.assertFalse(consultation_ok, details)
+
+        consuming_consultation = replace(
+            consulted,
+            pending_transition={
+                **consulted.pending_transition,
+                "consumer_action_ids": ["action-2"],
+            },
+        )
+        consultation_ok, details = POSTCONDITION_EVALUATORS[
+            "mode_consultation_preserves_chain_pending"
+        ](_context(
+            selected,
+            consuming_consultation,
             turns=turns,
             verifier_input_contract=contract,
         ))
