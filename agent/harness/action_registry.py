@@ -560,8 +560,12 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
         mutation_dimension="chain",
         provides_capabilities=("chain_identity",),
         crosses_pending_barrier=True,
+        effect="workflow_navigation",
         required_arguments=("source_evidence",),
-        semantic_support_relations=FRAMED_OPERATION_SUPPORT_RELATIONS,
+        semantic_support_relations=(
+            *FRAMED_OPERATION_SUPPORT_RELATIONS,
+            "non_mutation_scope",
+        ),
         semantic_value_grounding_arguments=("chain_text", "chain_candidates"),
         open_identity_grounding_arguments=("chain_text", "chain_candidates"),
         entry_intake=True,

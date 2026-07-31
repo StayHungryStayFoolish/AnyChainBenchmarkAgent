@@ -372,6 +372,53 @@ def _grounded_mutation_admission_fixture(
     return plan, _whole_plan_admission_payload(request)
 
 
+def _confirmation_proposal_admission_fixture() -> tuple[Any, dict[str, Any]]:
+    from agent.harness.action_registry import ACTION_BY_TYPE
+    from agent.harness.semantic_compiler import freeze_semantic_plan
+
+    source = "Change the chain to BNB."
+    action = {
+        "type": "change_chain",
+        "chain_text": "BNB",
+        "source_evidence": "BNB",
+    }
+    unit = {
+        "unit_id": "unit-1",
+        "clause_id": "clause-1",
+        "source_text": source,
+        "disposition": "action",
+        "action_indexes": [0],
+    }
+    spec = ACTION_BY_TYPE["change_chain"]
+    plan = freeze_semantic_plan(
+        {"actions": [action], "semantic_units": [unit]},
+        action_records=[{
+            "action_id": "action-1",
+            "action_index": 0,
+            "action": action,
+            "registry_effect": spec.effect,
+            "required_value_grounding_arguments": ["chain_text"],
+            "open_identity_grounding_arguments": ["chain_text"],
+            "unit_ids": ["unit-1"],
+            "allowed_support_relations": [],
+        }],
+        unit_records=[{
+            "unit_id": "unit-1",
+            "unit_index": 0,
+            "unit": unit,
+            "source_text": source,
+            "evidence_sources": [source],
+            "disposition": "action",
+            "owner_action_ids": ["action-1"],
+        }],
+        review_context={"pending_question": {}},
+    )
+    request = SimpleNamespace(
+        messages=[None, SimpleNamespace(content=plan.request_json)]
+    )
+    return plan, _whole_plan_admission_payload(request)
+
+
 def _closed_enum_grounding_payload(
     plan: Any,
     *,
@@ -442,6 +489,32 @@ def _immutable_required_relation_fixture() -> tuple[Any, dict[str, Any]]:
 
 
 class BoundedSemanticAdmissionTest(unittest.TestCase):
+    def test_confirmation_proposal_uses_one_admission_before_typed_confirmation(
+        self,
+    ) -> None:
+        from agent.harness.action_registry import ACTION_BY_TYPE
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import request_whole_plan_admission
+
+        plan, valid = _confirmation_proposal_admission_fixture()
+        provider = Mock()
+        provider.complete.return_value = SimpleNamespace(
+            text=json.dumps(valid, sort_keys=True),
+        )
+
+        admission = request_whole_plan_admission(
+            provider,
+            plan,
+            semantic_policy="preserve the immutable plan",
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+
+        self.assertEqual(ACTION_BY_TYPE["change_chain"].effect, "workflow_navigation")
+        self.assertEqual(ACTION_BY_TYPE["choose_chain"].effect, "configuration_mutation")
+        self.assertTrue(admission.valid, admission.errors)
+        self.assertFalse(admission.consensus_required)
+        self.assertEqual(provider.complete.call_count, 1)
+
     def test_grounded_mutation_requires_two_independent_admissions(self) -> None:
         from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
         from agent.harness.semantic_compiler import request_whole_plan_admission

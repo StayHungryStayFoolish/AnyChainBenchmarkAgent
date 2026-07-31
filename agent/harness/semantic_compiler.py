@@ -823,11 +823,15 @@ def request_whole_plan_admission(
 def _requires_grounded_mutation_consensus(
     plan: ImmutableSemanticPlan,
 ) -> bool:
-    """Return whether one immutable plan needs two semantic admissions."""
+    """Return whether one immutable plan can directly commit product state."""
 
     return any(
         isinstance(record, Mapping)
-        and str(record.get("registry_effect") or "") != "read_only"
+        and str(record.get("registry_effect") or "") in {
+            "configuration_mutation",
+            "workflow_state_mutation",
+            "execution",
+        }
         and bool(record.get("required_value_grounding_arguments"))
         for record in plan.request_payload().get("actions") or ()
     )
