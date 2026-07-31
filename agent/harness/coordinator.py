@@ -88,6 +88,7 @@ from .contracts import (
 )
 from .control_receipts import (
     EXECUTION_APPROVAL_CONTRACTS,
+    SEMANTIC_PARTITION_PLANNING_LANES,
     execution_intent_projection,
     execution_side_effect_receipt_id,
     execution_side_effect_projection,
@@ -1815,6 +1816,8 @@ def partition_turn_step(state: AgentGraphState) -> AgentGraphState:
         document = hierarchical_planner.begin_semantic_partition(state, text)
         if not finalizing_draft:
             planning_lane = "hierarchical"
+    if planning_lane not in SEMANTIC_PARTITION_PLANNING_LANES:
+        raise StateInvariantError("semantic partition planning lane is unregistered")
     state["semantic_planning"] = document
     _append_control_receipt(
         state,

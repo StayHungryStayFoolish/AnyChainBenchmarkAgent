@@ -111,6 +111,15 @@ class ControlPlaneResponseContractTest(unittest.TestCase):
             validate_coordinator_control_receipt(bounded, turn_index=3),
             (True, ""),
         )
+        draft_finalization = dict(bounded)
+        draft_finalization["planning_lane"] = "semantic_draft_finalization"
+        draft_finalization.pop("receipt_id")
+        self.assertEqual(
+            validate_coordinator_control_receipt(
+                _signed_receipt(draft_finalization), turn_index=3
+            ),
+            (True, ""),
+        )
         unsupported_lane = dict(bounded)
         unsupported_lane["planning_lane"] = "transcript_specific"
         unsupported_lane.pop("receipt_id")

@@ -46,6 +46,11 @@ EXECUTION_APPROVAL_CONTRACTS = {
     "real_node_smoke_confirm": "approve_preflight_smoke",
     "real_node_final_benchmark_confirm": "approve_final_benchmark",
 }
+SEMANTIC_PARTITION_PLANNING_LANES = frozenset({
+    "bounded_semantic_value",
+    "hierarchical",
+    "semantic_draft_finalization",
+})
 
 
 def _content_hash(value: Mapping[str, Any]) -> str:
@@ -353,8 +358,7 @@ def _validate_semantic_partition(
     if not _exact_fields(receipt, fields):
         return False, "semantic-partition receipt shape is invalid"
     if (
-        receipt.get("planning_lane")
-        not in {"bounded_semantic_value", "hierarchical"}
+        receipt.get("planning_lane") not in SEMANTIC_PARTITION_PLANNING_LANES
         or receipt.get("status") not in {"compile_owner", "review_plan", "failed"}
         or not _valid_nonnegative_integer(receipt.get("unit_count"))
         or not _valid_nonnegative_integer(receipt.get("owner_count"))
