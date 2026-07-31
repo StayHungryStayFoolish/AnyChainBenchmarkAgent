@@ -444,6 +444,7 @@ class AnyChainGraphRuntime:
         invocation_context["input_secret_bindings"] = {
             "items": [dict(item) for item in input_secret_bindings],
         }
+        invocation_context["submitted_input_hash"] = user_input_hash(text)
         state = ensure_session_metadata(state, self.thread_id, self.session_purpose)
         attempt = self._begin_turn_attempt(before)
         self._bind_registry_to_attempt(registry_transaction, attempt)
@@ -618,6 +619,7 @@ class AnyChainGraphRuntime:
                 f"{int(recovered.get('turn_index') or 0)}"
             ),
             input_hash=submitted_input_hash,
+            submitted_input_hash=submitted_input_hash,
             language=language,
             input_shape=input_shape,
             pending_before=deepcopy(
@@ -760,6 +762,7 @@ class AnyChainGraphRuntime:
                     "runtime_action": deepcopy(dict(action)),
                     "repository_revision": {},
                     "product_head": product_head_context,
+                    "submitted_input_hash": user_input_hash(""),
                 },
             )
             validate_state(result)
@@ -1737,6 +1740,9 @@ def _turn_receipt_summary(state: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "turn_id": str(receipt.get("turn_id") or ""),
         "input_hash": str(receipt.get("input_hash") or ""),
+        "submitted_input_hash": str(
+            receipt.get("submitted_input_hash") or ""
+        ),
         "language": str(receipt.get("language") or ""),
         "input_shape": str(receipt.get("input_shape") or ""),
         "status": str(receipt.get("status") or ""),
@@ -2114,6 +2120,7 @@ class InvocationContext(TypedDict, total=False):
     repository_revision: dict[str, str]
     product_head: dict[str, Any]
     input_secret_bindings: dict[str, Any]
+    submitted_input_hash: str
 
 
 _INVOCATION_CONTEXT_KEYS = (
@@ -2159,6 +2166,14 @@ def _prepare_graph_step(
     for key in _INVOCATION_CONTEXT_KEYS:
         contextual[key] = deepcopy(invocation_context.get(key) or {})
     result = prepare_turn_step(contextual)
+    receipt = dict(result.get("turn_receipt") or {})
+    if receipt:
+        receipt["submitted_input_hash"] = str(
+            invocation_context.get("submitted_input_hash")
+            or receipt.get("input_hash")
+            or ""
+        )
+        result["turn_receipt"] = receipt
     revision = dict(invocation_context.get("repository_revision") or {})
     if revision:
         result.setdefault("turn_context", {})["repository_revision"] = revision

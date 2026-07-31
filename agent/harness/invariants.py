@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from copy import deepcopy
 from typing import Any, Mapping
 
@@ -649,6 +650,15 @@ def validate_state(state: AgentGraphState) -> None:
             raise StateInvariantError("turn receipt has no turn identity")
         if not str(turn_receipt.get("input_hash") or ""):
             raise StateInvariantError("turn receipt has no input hash")
+        submitted_input_hash = str(
+            turn_receipt.get("submitted_input_hash")
+            or turn_receipt.get("input_hash")
+            or ""
+        )
+        if re.fullmatch(r"[0-9a-f]{64}", submitted_input_hash) is None:
+            raise StateInvariantError(
+                "turn receipt has no submitted input identity"
+            )
         admitted_ids = [
             str(item)
             for item in turn_receipt.get("admitted_action_ids") or []

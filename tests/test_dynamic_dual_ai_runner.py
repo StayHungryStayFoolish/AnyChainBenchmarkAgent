@@ -892,6 +892,7 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             turn_receipt_summary={
                 "turn_id": f"test:{turn_index}",
                 "input_hash": user_input_hash(submitted_input),
+                "submitted_input_hash": user_input_hash(submitted_input),
                 "admitted_action_ids": [],
                 "execution_order": [],
             },
@@ -1197,6 +1198,28 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             observation="turn_committed",
             thread_id="test-session",
             session_purpose="chaos",
+            admitted_action_types=(
+                "resolve_semantic_draft_atom",
+                "clarify_unresolved",
+            ),
+            admitted_action_provenance=(
+                {
+                    "type": "resolve_semantic_draft_atom",
+                    "action_id": "resolve-action",
+                    "argument_names": [],
+                    "argument_value_hashes": {},
+                    "arguments_hash": "1" * 64,
+                    "source_hash": "2" * 64,
+                },
+                {
+                    "type": "clarify_unresolved",
+                    "action_id": "final-action",
+                    "argument_names": [],
+                    "argument_value_hashes": {},
+                    "arguments_hash": "3" * 64,
+                    "source_hash": "4" * 64,
+                },
+            ),
             product_authority_id="chaos:test-session",
             base_revision=2,
             base_checkpoint_thread_id="head",
@@ -1220,9 +1243,10 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
             render_manifest={"fragment_hashes": []},
             turn_receipt_summary={
                 "turn_id": "test:2",
-                "input_hash": user_input_hash("test input"),
-                "admitted_action_ids": [],
-                "execution_order": [],
+                "input_hash": user_input_hash("semantic-secret:projected"),
+                "submitted_input_hash": user_input_hash("test input"),
+                "admitted_action_ids": ["final-action"],
+                "execution_order": ["final-action"],
             },
         )
         runtime_stream = FakeRuntimeEventStream([event])

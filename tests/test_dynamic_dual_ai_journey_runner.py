@@ -407,6 +407,7 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
             turn_receipt_summary={
                 "turn_id": f"test:{turn_index}",
                 "input_hash": user_input_hash(submitted_input),
+                "submitted_input_hash": user_input_hash(submitted_input),
                 "admitted_action_ids": [],
                 "execution_order": [],
             },

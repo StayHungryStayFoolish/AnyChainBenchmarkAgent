@@ -1492,6 +1492,7 @@ def prepare_turn_step(state: AgentGraphState) -> AgentGraphState:
         TurnReceipt(
             turn_id=turn_id,
             input_hash=user_input_hash(text),
+            submitted_input_hash=user_input_hash(text),
             language=str(state.get("language") or "en"),
             input_shape=input_shape,
             clauses=tuple(clause.as_dict() for clause in clauses),
@@ -3789,6 +3790,12 @@ def _prepare_ready_semantic_draft_finalization(
             f"{int(ready_draft.get('revision') or 0)}"
         ),
         input_hash=str(ready_draft.get("original_input_hash") or ""),
+        submitted_input_hash=str(
+            clarification_receipt.get("submitted_input_hash")
+            or clarification_receipt.get("input_hash")
+            or ready_draft.get("original_input_hash")
+            or ""
+        ),
         language=str(state.get("language") or "en"),
         input_shape="semantic_draft_finalization",
         clauses=tuple(

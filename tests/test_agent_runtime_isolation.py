@@ -128,6 +128,54 @@ class AgentRuntimeIsolationTests(unittest.TestCase):
                 json.dumps(event, ensure_ascii=False),
             )
 
+    def test_runtime_binds_secret_projected_turn_to_original_submission(self) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.input_identity import user_input_hash
+        from tests.agent_live.graph_turn import (
+            reviewed_action_plan,
+            reviewed_stage_planner,
+        )
+
+        submitted = (
+            "Use endpoint "
+            "https://user:password@example.invalid/secret-token"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            event_file = root / "turn-events.jsonl"
+            with (
+                patch.dict(
+                    os.environ,
+                    {"ANYCHAIN_AGENT_TURN_EVENT_FILE": str(event_file)},
+                ),
+                reviewed_stage_planner(
+                    lambda state, text: reviewed_action_plan(
+                        state,
+                        text,
+                        [{"type": "greeting", "confidence": "high"}],
+                    )
+                ),
+                AnyChainGraphRuntime(
+                    "secret-input-runtime",
+                    checkpoint_path=root / "checkpoints.sqlite",
+                    session_purpose="chaos",
+                ) as runtime,
+            ):
+                runtime.invoke(submitted, language="en")
+
+            event = json.loads(
+                event_file.read_text(encoding="utf-8").splitlines()[-1]
+            )
+            receipt = event["turn_receipt_summary"]
+            self.assertEqual(
+                receipt["submitted_input_hash"],
+                user_input_hash(submitted),
+            )
+            self.assertNotIn(
+                "secret-token",
+                json.dumps(event, ensure_ascii=False),
+            )
+
     def test_invariant_recovery_emits_one_committed_turn_observation(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
         from agent.harness.input_identity import user_input_hash

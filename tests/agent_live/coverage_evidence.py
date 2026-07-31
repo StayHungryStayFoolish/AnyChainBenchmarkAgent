@@ -3639,6 +3639,12 @@ def _validate_runtime_event(event: RuntimeTurnEvent) -> None:
                 or not _is_sha256(str(turn_receipt.get("input_hash") or ""))
             ):
                 raise ValueError("runtime turn receipt identity is invalid")
+            if event.schema_version >= 6 and not _is_sha256(
+                str(turn_receipt.get("submitted_input_hash") or "")
+            ):
+                raise ValueError(
+                    "runtime submitted input identity is invalid"
+                )
             admitted_ids = [
                 str(item)
                 for item in turn_receipt.get("admitted_action_ids") or ()
@@ -3649,9 +3655,12 @@ def _validate_runtime_event(event: RuntimeTurnEvent) -> None:
                 for item in event.admitted_action_provenance
                 if str(item.get("action_id") or "")
             ]
-            if provenance_ids != admitted_ids:
+            if (
+                len(provenance_ids) != len(set(provenance_ids))
+                or any(item not in provenance_ids for item in admitted_ids)
+            ):
                 raise ValueError(
-                    "runtime action provenance differs from turn admission order"
+                    "runtime turn receipt is not covered by transaction action provenance"
                 )
             execution_order = [
                 str(item)

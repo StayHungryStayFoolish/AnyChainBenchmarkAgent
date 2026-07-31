@@ -552,6 +552,7 @@ class TurnReceipt:
 
     turn_id: str
     input_hash: str
+    submitted_input_hash: str
     language: str
     input_shape: str
     clauses: tuple[Mapping[str, Any], ...] = ()
@@ -1033,6 +1034,7 @@ def turn_receipt_to_dict(receipt: TurnReceipt) -> dict[str, Any]:
     return {
         "turn_id": receipt.turn_id,
         "input_hash": receipt.input_hash,
+        "submitted_input_hash": receipt.submitted_input_hash,
         "language": receipt.language,
         "input_shape": receipt.input_shape,
         "clauses": [deepcopy(dict(item)) for item in receipt.clauses],

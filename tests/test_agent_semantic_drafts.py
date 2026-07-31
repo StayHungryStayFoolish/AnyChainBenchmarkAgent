@@ -1528,6 +1528,10 @@ class SemanticPlanDraftTests(unittest.TestCase):
             draft["original_input"],
         )
         self.assertEqual(committed["action_queue"], [])
+        self.assertEqual(
+            committed["turn_receipt"]["submitted_input_hash"],
+            draft["original_input_hash"],
+        )
         validate_state(committed)
 
     def test_draft_command_guard_invalidates_replaced_product_head(self) -> None:

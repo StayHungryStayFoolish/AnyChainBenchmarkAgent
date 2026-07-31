@@ -1353,9 +1353,9 @@ def wait_for_turn_completion(
             response=response,
             event=event,
         )
-    if str(event.turn_receipt_summary.get("input_hash") or "") != user_input_hash(
-        expectation.submitted_input
-    ):
+    if str(
+        event.turn_receipt_summary.get("submitted_input_hash") or ""
+    ) != user_input_hash(expectation.submitted_input):
         raise TerminalProtocolViolation(
             "runtime event is bound to a different submitted input",
             response=response,
