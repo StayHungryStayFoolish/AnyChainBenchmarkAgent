@@ -30,7 +30,9 @@ from tests.agent_live.coverage_evidence import (
     VerifiedPostcondition,
     content_hash,
     pty_transcript_hash,
+    _runtime_event_payload,
 )
+from tests.agent_live.harness_contract_scenarios import QuestionScenario
 from tests.agent_live.codex_simulator_bridge import (
     build_simulator_attestation,
     simulator_context_binding,
@@ -87,6 +89,7 @@ def _independent_journey_outcome(
     turn_index: int,
     *,
     response: str = "Agent> fixture response",
+    runtime_event_payload_hash: str = "9" * 64,
 ) -> TerminalOutcomeObservation:
     transaction_id = f"00000000-0000-0000-0000-{turn_index:012d}"
     physical_thread_id = f"attempt:{transaction_id}"
@@ -120,7 +123,7 @@ def _independent_journey_outcome(
         render_hash="f" * 64,
         runtime_event_id=f"runtime-{turn_index}",
         runtime_event_sequence=turn_index,
-        runtime_event_payload_hash="9" * 64,
+        runtime_event_payload_hash=runtime_event_payload_hash,
         presentation_hash=presentation_hash(response),
         origin_revision=REVISION,
         delivery_phase="live",
@@ -258,8 +261,10 @@ class FakeTerminalOutcomeStream:
         startup_product_revision: int = 1,
         startup_product_fingerprint: str = "b" * 64,
         responses: list[str] | None = None,
+        runtime_event_hashes: Mapping[int, str] | None = None,
     ) -> None:
         response_frames = list(responses or ())
+        event_hashes = dict(runtime_event_hashes or {})
         self.outcomes = [
             _independent_journey_outcome(
                 index,
@@ -268,12 +273,20 @@ class FakeTerminalOutcomeStream:
                     if index <= len(response_frames)
                     else f"Agent> fixture response {index}"
                 ),
+                runtime_event_payload_hash=event_hashes.get(
+                    index,
+                    "9" * 64,
+                ),
             )
             for index in range(1, turn_count + 1)
         ]
         self._outcome_cursor = 0
         self._startup_product_revision = startup_product_revision
         self._startup_product_fingerprint = startup_product_fingerprint
+        self._startup_runtime_event_hash = event_hashes.get(
+            startup_product_revision,
+            "9" * 64,
+        )
 
     def baseline_session_events(
         self,
@@ -312,7 +325,7 @@ class FakeTerminalOutcomeStream:
                 runtime_event_fence_id=(
                     f"runtime-{self._startup_product_revision}"
                 ),
-                runtime_event_fence_hash="9" * 64,
+                runtime_event_fence_hash=self._startup_runtime_event_hash,
                 rendered_frame=startup_response,
                 origin_revision=REVISION,
             ),
@@ -376,7 +389,7 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
     ) -> RuntimeTurnEvent:
         transaction_id = f"00000000-0000-0000-0000-{turn_index:012d}"
         physical_thread_id = f"attempt:{transaction_id}"
-        return RuntimeTurnEvent(
+        event = RuntimeTurnEvent(
             schema_version=6,
             event_type="turn_committed",
             thread_id="journey-session",
@@ -428,6 +441,12 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
             product_authority_id="dynamic-dual-ai-chaos:journey-session",
             physical_thread_id=physical_thread_id,
             attempt_checkpoint_id=f"checkpoint-{turn_index}",
+        )
+        unsigned = _runtime_event_payload(event)
+        unsigned.pop("runtime_event_payload_hash", None)
+        return replace(
+            event,
+            runtime_event_payload_hash=content_hash(unsigned),
         )
 
     def _schedule(
@@ -978,6 +997,10 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
                 startup_product_revision=startup_product_revision,
                 startup_product_fingerprint=startup_product_fingerprint,
                 responses=list(transport.responses),
+                runtime_event_hashes={
+                    event.turn_index: event.runtime_event_payload_hash
+                    for event in events
+                },
             ),
             revision=REVISION,
             clock_ns=OrderedClock(),
@@ -1028,7 +1051,7 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
                 (),
             )
 
-    def test_initial_controller_fact_never_persists_raw_secrets(
+    def test_initial_controller_fact_rejects_raw_secrets(
         self,
     ) -> None:
         schedule = self._schedule(max_turns=1)
@@ -1050,21 +1073,23 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
             },
         )
 
-        ledger.observe_initial(
-            initial_event=initial,
-            terminal=None,
-            forbidden=(),
+        unsigned = _runtime_event_payload(initial)
+        unsigned.pop("runtime_event_payload_hash", None)
+        initial = replace(
+            initial,
+            runtime_event_payload_hash=content_hash(unsigned),
         )
 
-        serialized = json.dumps(
-            _controller_fact_payloads(
-                state,
-                lane="journey_initial",
-            ),
-            sort_keys=True,
+        with self.assertRaisesRegex(ValueError, "raw secret-bearing"):
+            ledger.observe_initial(
+                initial_event=initial,
+                terminal=None,
+                forbidden=(),
+            )
+        self.assertEqual(
+            _controller_fact_payloads(state, lane="journey_initial"),
+            (),
         )
-        self.assertNotIn(secret, serialized)
-        self.assertNotIn("semantic-secret:", serialized)
 
     def _run(self, runner, *, reviewed_question=None):
         seed_state = {}
@@ -1082,9 +1107,8 @@ class DynamicDualAiJourneyRunnerTest(unittest.TestCase):
         if reviewed_question is not None:
             question = dict(reviewed_question)
             seed_state = {"pending_question": dict(question)}
-        scenario = SimpleNamespace(
+        scenario = QuestionScenario(
             scenario_id=runner.schedule.start_scenario,
-            state_fingerprint="scenario-fingerprint",
             seed_state=seed_state,
             question=question,
         )

@@ -35,6 +35,7 @@ from tests.agent_live.coverage_evidence import (
     TurnObservation,
     VerifiedPostcondition,
     _html_report_error,
+    _project_runtime_event_payload,
     _rpc_benchmark_content_error,
     _sync_observe_content_error,
     _validate_runtime_event,
@@ -288,6 +289,14 @@ class CoverageEvidenceTest(unittest.TestCase):
             },
         )
         _validate_runtime_event(event)
+        projected = _project_runtime_event_payload(
+            event,
+            protected_values=("1", "back", "semantic"),
+        )
+        self.assertEqual(
+            projected,
+            coverage_evidence_module._runtime_event_payload(event),
+        )
 
         tampered_receipt = dict(receipt)
         tampered_receipt["resolver_invoked"] = False

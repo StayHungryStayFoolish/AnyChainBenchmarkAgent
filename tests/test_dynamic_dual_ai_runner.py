@@ -36,6 +36,7 @@ from tests.agent_live.coverage_evidence import (
     create_pty_authority_signer,
     load_pty_authority_receipt,
     load_valid_evidence_reference,
+    _runtime_event_payload,
     validate_pty_diagnostic_artifact,
     validate_pty_cli_candidate_artifact,
     validate_pty_cli_evidence_artifact,
@@ -207,6 +208,7 @@ def _independent_workflow_outcome(
     turn_index: int,
     *,
     response: str = "Agent> fixture response",
+    runtime_event_payload_hash: str = "9" * 64,
 ) -> TerminalOutcomeObservation:
     transaction_id = f"00000000-0000-0000-0000-{turn_index:012d}"
     physical_thread_id = f"attempt:{transaction_id}"
@@ -240,7 +242,7 @@ def _independent_workflow_outcome(
         render_hash="f" * 64,
         runtime_event_id=f"runtime-{turn_index}",
         runtime_event_sequence=turn_index,
-        runtime_event_payload_hash="9" * 64,
+        runtime_event_payload_hash=runtime_event_payload_hash,
         presentation_hash=presentation_hash(response),
         origin_revision=REVISION,
         delivery_phase="live",
@@ -267,6 +269,15 @@ def _seal_terminal_outcome(
         ).encode("utf-8")
     ).hexdigest()
     return validate_terminal_outcome_projection(payload)
+
+
+def _seal_runtime_event(event: RuntimeTurnEvent) -> RuntimeTurnEvent:
+    payload = _runtime_event_payload(event)
+    payload.pop("runtime_event_payload_hash", None)
+    return replace(
+        event,
+        runtime_event_payload_hash=content_hash(payload),
+    )
 
 
 class FakeTransport:
@@ -333,8 +344,10 @@ class FakeTerminalOutcomeStream:
         startup_product_revision: int = 1,
         startup_outcome_count: int | None = None,
         responses: list[str] | None = None,
+        runtime_event_hashes: Mapping[int, str] | None = None,
     ) -> None:
         response_frames = list(responses or ())
+        event_hashes = dict(runtime_event_hashes or {})
         self.outcomes = list(outcomes) if outcomes is not None else [
             _independent_workflow_outcome(
                 index,
@@ -342,6 +355,10 @@ class FakeTerminalOutcomeStream:
                     response_frames[index - 1]
                     if index <= len(response_frames)
                     else f"Agent> fixture response {index}"
+                ),
+                runtime_event_payload_hash=event_hashes.get(
+                    index,
+                    "9" * 64,
                 ),
             )
             for index in range(1, turn_count + 1)
@@ -353,6 +370,10 @@ class FakeTerminalOutcomeStream:
             startup_product_revision
             if startup_outcome_count is None
             else startup_outcome_count
+        )
+        self._startup_runtime_event_hash = event_hashes.get(
+            startup_product_revision,
+            "9" * 64,
         )
 
     def baseline_session_events(
@@ -371,6 +392,7 @@ class FakeTerminalOutcomeStream:
                 session_id=session_id,
                 session_purpose=session_purpose,
                 product_revision=self._startup_product_revision,
+                runtime_event_fence_hash=self._startup_runtime_event_hash,
             ),
         )
 
@@ -416,6 +438,7 @@ def _ready_session_event(
     product_checkpoint_id: str | None = None,
     runtime_event_fence_terminal_event_id: str | None = None,
     runtime_event_fence_id: str | None = None,
+    runtime_event_fence_hash: str = "9" * 64,
 ) -> TerminalSessionEvent:
     transaction_id = (
         f"00000000-0000-0000-0000-{product_revision:012d}"
@@ -451,7 +474,7 @@ def _ready_session_event(
         runtime_event_fence_id=(
             runtime_event_fence_id or f"runtime-{product_revision}"
         ),
-        runtime_event_fence_hash="9" * 64,
+        runtime_event_fence_hash=runtime_event_fence_hash,
         rendered_frame=startup_response,
         origin_revision=revision,
     )
@@ -978,25 +1001,34 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                     target_coverage_ids=(context.scheduled_target.edge_key,),
                 )
 
-            runner = DynamicDualAiChaosRunner(
-                ChaosRunConfig.linux(root, session_id="contract-session"),
-                simulator,
-                ledger=ledger,
-                schedule=self._schedule(ledger),
-                transport=transport,
-                event_stream=FakeRuntimeEventStream([
-                    self._event(1, "a" * 64, "b" * 64, "opening_next_action"),
+            events = [
+                _seal_runtime_event(
+                    self._event(1, "a" * 64, "b" * 64, "opening_next_action")
+                ),
+                _seal_runtime_event(
                     self._event(
                         2,
                         "b" * 64,
                         "c" * 64,
                         "opening_next_action",
                         "I only want a safe dry run first.",
-                    ),
-                ]),
+                    )
+                ),
+            ]
+            runner = DynamicDualAiChaosRunner(
+                ChaosRunConfig.linux(root, session_id="contract-session"),
+                simulator,
+                ledger=ledger,
+                schedule=self._schedule(ledger),
+                transport=transport,
+                event_stream=FakeRuntimeEventStream(events),
                 terminal_outcome_stream=FakeTerminalOutcomeStream(
                     turn_count=2,
                     responses=list(transport.responses),
+                    runtime_event_hashes={
+                        event.turn_index: event.runtime_event_payload_hash
+                        for event in events
+                    },
                 ),
                 revision=REVISION,
                 clock_ns=OrderedClock(),
@@ -2067,6 +2099,23 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 "Agent> Authorization: Bearer super-secret-token. Next question.",
             ])
 
+            events = [
+                _seal_runtime_event(
+                    self._event(1, "a" * 64, "b" * 64, "opening_next_action")
+                ),
+                _seal_runtime_event(
+                    replace(
+                        self._event(
+                            2,
+                            "b" * 64,
+                            "c" * 64,
+                            "chain_select",
+                            "https://rpc.example/abcdefghijklmnopqrstuvwxyz123456",
+                        ),
+                        admitted_action_types=(),
+                    )
+                ),
+            ]
             runner = DynamicDualAiChaosRunner(
                 ChaosRunConfig.linux(root, session_id="contract-session"),
                 lambda context: SimulatorDecision(
@@ -2079,22 +2128,14 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 ledger=ledger,
                 schedule=self._schedule(ledger),
                 transport=transport,
-                event_stream=FakeRuntimeEventStream([
-                    self._event(1, "a" * 64, "b" * 64, "opening_next_action"),
-                    replace(
-                        self._event(
-                            2,
-                            "b" * 64,
-                            "c" * 64,
-                            "chain_select",
-                            "https://rpc.example/abcdefghijklmnopqrstuvwxyz123456",
-                        ),
-                        admitted_action_types=(),
-                    ),
-                ]),
+                event_stream=FakeRuntimeEventStream(events),
                 terminal_outcome_stream=FakeTerminalOutcomeStream(
                     turn_count=2,
                     responses=list(transport.responses),
+                    runtime_event_hashes={
+                        event.turn_index: event.runtime_event_payload_hash
+                        for event in events
+                    },
                 ),
                 revision=REVISION,
             )
@@ -2260,6 +2301,10 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                     "group": "sync_observe",
                 },
             )
+            events = [
+                _seal_runtime_event(event)
+                for event in (baseline, deferred, terminal)
+            ]
             transport = FakeTransport([
                 "Agent> Model config: provider=deepseek, model=deepseek-chat, auth=api_key\n"
                 "Agent> What would you like to change?",
@@ -2298,10 +2343,14 @@ class DynamicDualAiRunnerTest(unittest.TestCase):
                 ledger=ledger,
                 schedule=schedule,
                 transport=transport,
-                event_stream=FakeRuntimeEventStream([baseline, deferred, terminal]),
+                event_stream=FakeRuntimeEventStream(events),
                 terminal_outcome_stream=FakeTerminalOutcomeStream(
                     turn_count=3,
                     responses=list(transport.responses),
+                    runtime_event_hashes={
+                        event.turn_index: event.runtime_event_payload_hash
+                        for event in events
+                    },
                 ),
                 revision=REVISION,
                 clock_ns=OrderedClock(),

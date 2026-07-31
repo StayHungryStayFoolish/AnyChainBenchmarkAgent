@@ -12,10 +12,26 @@ from tests.agent_live.harness_contract_scenarios import (
     question_scenarios,
 )
 from tests.agent_live.graph_turn import answer_pending
-from tests.agent_live.runtime_checkpoint import reviewed_scenario_state
+from tests.agent_live.runtime_checkpoint import (
+    reviewed_pending_contract,
+    reviewed_scenario,
+    reviewed_scenario_state,
+)
 
 
 class HarnessContractScenarioTest(unittest.TestCase):
+    def test_typed_start_scenarios_expose_pending_contract_explicitly(
+        self,
+    ) -> None:
+        question = reviewed_scenario("opening")
+        transition = reviewed_scenario("action_change_group")
+
+        self.assertEqual(
+            reviewed_pending_contract(question)["id"],
+            "opening_next_action",
+        )
+        self.assertEqual(reviewed_pending_contract(transition), {})
+
     def test_every_contract_scenario_has_one_reviewed_seed_authority(self) -> None:
         scenarios = question_scenarios("en")
         self.assertGreaterEqual(len(scenarios), 50)

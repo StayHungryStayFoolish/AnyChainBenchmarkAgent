@@ -1622,6 +1622,17 @@ async def run_batch(
     async def run_bounded(shard: FrozenShardSpec) -> ShardResult:
         try:
             async with semaphore:
+                if (
+                    interruption_event is not None
+                    and interruption_event.is_set()
+                ):
+                    return _not_started_interruption_result(
+                        frozen,
+                        shard,
+                        asyncio.CancelledError(
+                            "batch interruption preceded shard admission"
+                        ),
+                    )
                 runner = (
                     _run_controller_owned_shard
                     if frozen.controller_owned_execution

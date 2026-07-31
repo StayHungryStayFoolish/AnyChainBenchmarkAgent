@@ -945,7 +945,9 @@ def _resume_action_contract_exposed(context: Any) -> PredicateResult:
             "matched_turn_indexes": [],
             "error": "reviewed start scenario is unavailable",
         }
-    expected_contract = dict(scenario.question or {})
+    from tests.agent_live.runtime_checkpoint import reviewed_pending_contract
+
+    expected_contract = reviewed_pending_contract(scenario)
     expected_hash = (
         content_hash(canonical_question_contract(expected_contract))
         if expected_contract

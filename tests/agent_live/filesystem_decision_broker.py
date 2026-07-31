@@ -61,6 +61,12 @@ class FilesystemDecisionBroker:
         self.poll_seconds = float(poll_seconds)
         self._lock = threading.Lock()
         self._sequence_by_shard: dict[str, int] = {}
+        self._closed = threading.Event()
+
+    def close(self) -> None:
+        """Release every pending decision wait during controller shutdown."""
+
+        self._closed.set()
 
     async def __call__(self, shard_id: str, context: Mapping[str, Any]) -> Mapping[str, Any]:
         response_hash = str(context.get("previous_response_hash") or "").strip()
@@ -107,6 +113,10 @@ class FilesystemDecisionBroker:
         wire_buffer = bytearray()
         try:
             while time.monotonic() < deadline:
+                if self._closed.is_set():
+                    raise ExternalDecisionBlocked(
+                        "external decision broker is shutting down"
+                    )
                 try:
                     chunk = os.read(channel_fd, 65536)
                 except BlockingIOError:
@@ -635,6 +645,9 @@ async def _run_with_signal_cleanup(
         if interrupted_by:
             return
         interrupted_by = signum
+        close_broker = getattr(broker, "close", None)
+        if callable(close_broker):
+            close_broker()
         interruption_event.set()
 
     installed: list[int] = []

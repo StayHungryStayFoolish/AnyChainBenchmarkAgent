@@ -3443,7 +3443,13 @@ class DynamicDualAiJourneyRunner:
                 baseline_event.pending_contract,
                 desired="continue",
             )
-            reviewed_pending_contract = dict(start_scenario.question or {})
+            from tests.agent_live.runtime_checkpoint import (
+                reviewed_pending_contract as pending_contract_for_scenario,
+            )
+
+            reviewed_pending_contract = pending_contract_for_scenario(
+                start_scenario
+            )
             reviewed_pending_contract_hash = (
                 content_hash(canonical_question_contract(reviewed_pending_contract))
                 if reviewed_pending_contract

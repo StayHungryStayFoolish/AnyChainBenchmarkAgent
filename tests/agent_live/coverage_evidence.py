@@ -54,7 +54,7 @@ from agent.harness.secret_refs import (
     redact_secret_references,
     secret_references_in_value,
 )
-from agent.utils.redaction import redact
+from agent.utils.redaction import redact, secret_values
 from tests.agent_live.real_execution_host_attestation import (
     validate_host_attestation_file,
 )
@@ -2289,17 +2289,53 @@ def _project_runtime_event_payload(
     *,
     protected_values: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    """Project one event and rebind its complete-payload integrity hash."""
+    """Return one validated immutable product event for retained evidence.
 
-    payload = _evidence_projection(_project_tainted_free_text(
-        _runtime_event_payload(event),
-        protected_values,
-    ))
-    if int(payload.get("schema_version") or 0) >= 5:
-        unsigned = dict(payload)
-        unsigned.pop("runtime_event_payload_hash", None)
-        payload["runtime_event_payload_hash"] = content_hash(unsigned)
+    Product runtime events contain hashes and non-secret identifiers rather
+    than submitted free text. Treating arbitrary matching substrings as taint
+    corrupts those identities and the receipts bound to them. The unused
+    ``protected_values`` parameter remains part of the caller contract because
+    transcript and postcondition projections still use it independently.
+    """
+
+    del protected_values
+    validate_runtime_turn_event(event)
+    payload = _runtime_event_payload(event)
+    if not _runtime_event_evidence_safe(payload):
+        raise ValueError(
+            "validated runtime event contains raw secret-bearing content"
+        )
     return payload
+
+
+def _runtime_event_evidence_safe(value: Any) -> bool:
+    """Reject secret material while allowing already-hashed sensitive facts."""
+
+    if secret_references_in_value(value):
+        return False
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            projected = redact({key: item})
+            if projected != {key: item} and not _hash_only_projection(item):
+                return False
+            if not _runtime_event_evidence_safe(item):
+                return False
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(_runtime_event_evidence_safe(item) for item in value)
+    if isinstance(value, str):
+        return not secret_values(value) and redact(value) == value
+    return True
+
+
+def _hash_only_projection(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        return all(_hash_only_projection(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return all(_hash_only_projection(item) for item in value)
+    return value in {"", None} or (
+        isinstance(value, str) and _is_sha256(value)
+    )
 
 
 def _runtime_event_payload_hash_is_valid(

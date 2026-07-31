@@ -15,11 +15,15 @@ from agent.harness.invariants import validate_state
 from agent.harness.state import project_checkpoint_state
 from tests.agent_live.coverage_evidence import content_hash
 from tests.agent_live.harness_contract_scenarios import (
+    ActionTransitionScenario,
+    QuestionScenario,
     action_transition_scenarios,
     canonical_question_contract,
     canonical_scenario_state,
     question_scenarios,
 )
+
+ReviewedScenario = QuestionScenario | ActionTransitionScenario
 
 
 def reviewed_scenario_state(scenario_id: str) -> Mapping[str, Any]:
@@ -36,7 +40,7 @@ def reviewed_scenario_state(scenario_id: str) -> Mapping[str, Any]:
 
 
 @lru_cache(maxsize=None)
-def reviewed_scenario(scenario_id: str) -> Any:
+def reviewed_scenario(scenario_id: str) -> ReviewedScenario:
     """Return one authoritative executable scenario for evidence setup."""
 
     scenarios = {
@@ -47,6 +51,18 @@ def reviewed_scenario(scenario_id: str) -> Any:
     if scenario is None or not scenario.seed_state:
         raise ValueError(f"evidence target requires an executable scenario: {scenario_id}")
     return scenario
+
+
+def reviewed_pending_contract(
+    scenario: ReviewedScenario,
+) -> dict[str, Any]:
+    """Return the reviewed pending contract for a typed start scenario."""
+
+    if isinstance(scenario, QuestionScenario):
+        return deepcopy(dict(scenario.question))
+    if isinstance(scenario, ActionTransitionScenario):
+        return {}
+    raise TypeError(f"unsupported reviewed scenario: {type(scenario).__name__}")
 
 
 @dataclass(frozen=True)

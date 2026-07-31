@@ -25,6 +25,7 @@ from agent.harness.response_catalog import (
     semantic_hash,
 )
 from tests.agent_live.coverage_evidence import RuntimeTurnEvent, content_hash
+from tests.agent_live.harness_contract_scenarios import QuestionScenario
 from tests.agent_live.retained_regression_attestations import (
     build_source_contract,
     build_variant_attestation,
@@ -3433,7 +3434,11 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
         )
         with patch(
             "tests.agent_live.runtime_checkpoint.reviewed_scenario",
-            return_value=SimpleNamespace(question=resume_contract),
+            return_value=QuestionScenario(
+                scenario_id="resume-scenario",
+                question=resume_contract,
+                seed_state={"pending_question": resume_contract},
+            ),
         ):
             exposed, _ = POSTCONDITION_EVALUATORS[
                 "resume_action_contract_exposed"
@@ -3456,7 +3461,11 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
         )
         with patch(
             "tests.agent_live.runtime_checkpoint.reviewed_scenario",
-            return_value=SimpleNamespace(question=resume_contract),
+            return_value=QuestionScenario(
+                scenario_id="resume-scenario",
+                question=resume_contract,
+                seed_state={"pending_question": resume_contract},
+            ),
         ):
             exposed, details = POSTCONDITION_EVALUATORS[
                 "resume_action_contract_exposed"
@@ -3505,7 +3514,11 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
         )
         with patch(
             "tests.agent_live.runtime_checkpoint.reviewed_scenario",
-            return_value=SimpleNamespace(question=resume_contract),
+            return_value=QuestionScenario(
+                scenario_id="resume-scenario",
+                question=resume_contract,
+                seed_state={"pending_question": resume_contract},
+            ),
         ):
             exposed, details = POSTCONDITION_EVALUATORS[
                 "resume_action_contract_exposed"
@@ -3546,7 +3559,11 @@ class RetainedRegressionPredicatesTest(unittest.TestCase):
         )
         with patch(
             "tests.agent_live.runtime_checkpoint.reviewed_scenario",
-            return_value=SimpleNamespace(question=resume_contract),
+            return_value=QuestionScenario(
+                scenario_id="resume-scenario",
+                question=resume_contract,
+                seed_state={"pending_question": resume_contract},
+            ),
         ):
             exposed, details = POSTCONDITION_EVALUATORS[
                 "resume_action_contract_exposed"

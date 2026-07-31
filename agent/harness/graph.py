@@ -591,6 +591,18 @@ class AnyChainGraphRuntime:
         recovered["pending_question"] = (
             question_for_recovery(recovered, "failure_recovery") or {}
         )
+        recovered["turn_context"] = {
+            "id": int(recovered.get("turn_index") or 0),
+            "kind": "invariant_recovery",
+            "text": "",
+            "input_shape": str(candidate_state.get("input_shape") or "prose"),
+            "origin_group": str(base_state.get("active_group") or ""),
+            "pending_snapshot": deepcopy(
+                base_state.get("pending_question") or {}
+            ),
+            "admitted_actions": [],
+        }
+        recovered["turn_receipt"] = {}
         reconcile_state_secret_bindings(recovered)
         reset_turn_response(recovered)
         recovered = finalize_turn_response(recovered)

@@ -33,6 +33,37 @@ from tests.agent_live.retained_regression_attestations import (
 
 
 class FilesystemDecisionBrokerTest(unittest.TestCase):
+    def test_close_releases_every_pending_decision_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            broker = FilesystemDecisionBroker(
+                root,
+                batch_id="batch-close",
+                timeout_seconds=30,
+                poll_seconds=0.01,
+            )
+            observed: list[BaseException] = []
+
+            def run() -> None:
+                try:
+                    asyncio.run(broker("closing-shard", self._context()))
+                except BaseException as exc:
+                    observed.append(exc)
+
+            thread = threading.Thread(target=run)
+            thread.start()
+            deadline = time.monotonic() + 1
+            while not pending_requests(root) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            broker.close()
+            thread.join(timeout=1)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(observed), 1)
+            self.assertIsInstance(observed[0], ExternalDecisionBlocked)
+            self.assertIn("shutting down", str(observed[0]))
+            self.assertEqual(pending_requests(root), ())
+
     def test_expired_request_is_not_pending_and_cannot_leave_decision(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -673,7 +704,12 @@ class FilesystemDecisionBrokerTest(unittest.TestCase):
                     "started": False,
                     "cleaned": False,
                     "interrupted": False,
+                    "broker_closed": False,
                 }
+
+                class Broker:
+                    def close(self) -> None:
+                        lifecycle["broker_closed"] = True
 
                 async def fake_run_batch(*_args, interruption_event, **_kwargs):
                     lifecycle["started"] = True
@@ -696,7 +732,7 @@ class FilesystemDecisionBrokerTest(unittest.TestCase):
                     ):
                         interrupted_by = await _run_with_signal_cleanup(
                             object(),
-                            broker=object(),
+                            broker=Broker(),
                             result_index_path="unused.json",
                             authority_signer=object(),
                         )
@@ -708,6 +744,7 @@ class FilesystemDecisionBrokerTest(unittest.TestCase):
                 self.assertEqual(interrupted_by, signum)
                 self.assertTrue(lifecycle["interrupted"])
                 self.assertTrue(lifecycle["cleaned"])
+                self.assertTrue(lifecycle["broker_closed"])
 
 
 if __name__ == "__main__":

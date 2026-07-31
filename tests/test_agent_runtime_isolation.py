@@ -155,6 +155,64 @@ class AgentRuntimeIsolationTests(unittest.TestCase):
             self.assertEqual(events[0]["turn_index"], result["turn_index"])
             self.assertEqual(result["active_group"], "failure_recovery")
             self.assertEqual(events[0]["pending_question_id"], "failure_recovery_action")
+            self.assertEqual(events[0]["control_receipts"], [])
+            self.assertEqual(result["turn_context"]["id"], result["turn_index"])
+
+    def test_invariant_recovery_does_not_carry_prior_turn_receipts(self) -> None:
+        from copy import deepcopy
+
+        from agent.harness.graph import AnyChainGraphRuntime
+        from tests.agent_live.graph_turn import (
+            reviewed_action_plan,
+            reviewed_stage_planner,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            event_file = root / "turn-events.jsonl"
+            with (
+                patch.dict(
+                    os.environ,
+                    {"ANYCHAIN_AGENT_TURN_EVENT_FILE": str(event_file)},
+                ),
+                AnyChainGraphRuntime(
+                    "recovery-after-receipts",
+                    checkpoint_path=root / "checkpoints.sqlite",
+                    session_purpose="chaos",
+                ) as runtime,
+            ):
+                with reviewed_stage_planner(
+                    lambda state, text: reviewed_action_plan(
+                        state,
+                        text,
+                        [{"type": "greeting", "confidence": "high"}],
+                    )
+                ):
+                    previous = runtime.invoke("Hi", language="en")
+                self.assertTrue(
+                    (previous.get("turn_context") or {}).get(
+                        "control_receipts"
+                    )
+                )
+                invalid = deepcopy(previous)
+                invalid["active_group"] = "not-a-real-group"
+                with patch.object(runtime.graph, "invoke", return_value=invalid):
+                    recovered = runtime.invoke(
+                        "change several settings",
+                        language="en",
+                    )
+
+            events = [
+                json.loads(line)
+                for line in event_file.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(events), 2)
+            self.assertEqual(events[-1]["observation"], "turn_recovered")
+            self.assertEqual(events[-1]["control_receipts"], [])
+            self.assertEqual(
+                recovered["turn_context"]["id"],
+                recovered["turn_index"],
+            )
 
     def test_invariant_raised_inside_graph_is_recovered_at_transaction_boundary(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
