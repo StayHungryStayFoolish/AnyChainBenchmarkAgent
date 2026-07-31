@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields, replace
@@ -155,6 +156,48 @@ JOURNEY_CONTROLLER_OBSERVATION_FIELDS = frozenset({
     "previous_controller_observation_hash",
     "controller_observation_hash",
 })
+
+
+_LEDGER_SNAPSHOT_LOCK = threading.Lock()
+_LEDGER_SNAPSHOT_BYTES: dict[str, bytes] = {}
+
+
+def _authoritative_ledger_snapshot(
+    revision: Mapping[str, str],
+) -> dict[str, Any]:
+    """Return an isolated copy of one process-wide ledger per revision.
+
+    Reviewed scenario compilation temporarily controls the semantic planner,
+    so rebuilding the ledger concurrently would make independent shards race
+    over that process-level authority. The first caller serializes one
+    canonical snapshot; every consumer receives a private decoded copy.
+    """
+
+    revision_payload = {
+        str(key): str(value)
+        for key, value in sorted(revision.items())
+    }
+    cache_key = json.dumps(
+        revision_payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    with _LEDGER_SNAPSHOT_LOCK:
+        encoded = _LEDGER_SNAPSHOT_BYTES.get(cache_key)
+        if encoded is None:
+            ledger = build_ledger(revision=revision_payload)
+            encoded = json.dumps(
+                ledger,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            _LEDGER_SNAPSHOT_BYTES[cache_key] = encoded
+    decoded = json.loads(encoded)
+    if not isinstance(decoded, dict):
+        raise ValueError("authoritative coverage ledger is not a mapping")
+    return decoded
 
 
 class ExternalDecisionBlocked(RuntimeError):
@@ -1107,7 +1150,7 @@ def freeze_batch_manifest(
     if expected_revision is not None and dict(expected_revision) != revision:
         raise ValueError("repository revision does not match the requested batch revision")
 
-    ledger = build_ledger(revision=revision)
+    ledger = _authoritative_ledger_snapshot(revision)
     edge_index = {
         str(edge.get("edge_key") or ""): edge
         for edge in ledger.get("edges") or ()
@@ -1517,7 +1560,7 @@ def validate_frozen_manifest(
                 Path(manifest.repo_root),
                 broker_decision_timeout_seconds=manifest.timeout_policy.decision_seconds,
             )
-    ledger = build_ledger(revision=manifest.revision)
+    ledger = _authoritative_ledger_snapshot(manifest.revision)
     for shard in manifest.shards:
         target_payload = _load_json(Path(shard.target_path))
         if _target_lane(target_payload) != shard.lane:
@@ -2277,7 +2320,7 @@ def _execute_controller_owned_runner(
     """Run the real Agent PTY inside the controller process."""
 
     target_payload = _load_json(Path(shard.target_path))
-    ledger = build_ledger(revision=manifest.revision)
+    ledger = _authoritative_ledger_snapshot(manifest.revision)
     adapter = _ControllerDecisionAdapter(
         loop=loop,
         broker=broker,
@@ -3133,7 +3176,7 @@ def _artifact_hashes(
             _require_contained(path, runtime_roots, label=name)
 
         expected_schedule = build_chaos_schedule(
-            build_ledger(revision=manifest.revision),
+            _authoritative_ledger_snapshot(manifest.revision),
             revision=manifest.revision,
             seed=shard.seed,
             targets=_target_rows(_load_json(Path(shard.target_path))),
@@ -3143,7 +3186,7 @@ def _artifact_hashes(
         schedule_result = _load_json(result_path)
         _validate_schedule_result(manifest, shard, schedule_result, data, runtime_roots)
 
-        ledger = build_ledger(revision=manifest.revision)
+        ledger = _authoritative_ledger_snapshot(manifest.revision)
         edge_index = {
             str(edge.get("edge_key") or ""): edge
             for edge in ledger.get("edges") or ()
@@ -4085,7 +4128,7 @@ def _validate_and_recompute_journey_controller_facts(
         raise ValueError("Journey verifier registry identity changed")
     edge_index = {
         str(edge.get("edge_key") or ""): edge
-        for edge in build_ledger(revision=manifest.revision).get("edges") or ()
+        for edge in _authoritative_ledger_snapshot(manifest.revision).get("edges") or ()
     }
 
     if set(controller_initial_fact) != {

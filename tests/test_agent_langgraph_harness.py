@@ -2583,6 +2583,43 @@ class LangGraphHarnessSkeletonTest(unittest.TestCase):
             all(item.get("type") == "answer_pending" for item in admitted)
         )
 
+    def test_resume_without_saved_pending_advances_through_group_fallback(self) -> None:
+        from agent.harness.domains.orientation import resume_question
+        from agent.harness.state import new_state
+        from tests.agent_live.graph_turn import invoke_product_graph_turn as process_turn
+
+        state = new_state("resume-without-pending", language="en")
+        state.update({
+            "target_mode": "fake-node",
+            "workflow_mode": "rpc_benchmark",
+            "chain_identity": {
+                "canonical": "ethereum",
+                "status": "confirmed",
+            },
+            "resume_context": {},
+        })
+        state["pending_question"] = resume_question(state)
+        state["active_group"] = "opening"
+        state["last_user_input"] = "1"
+
+        with patch(
+            "tests.agent_live.graph_turn.TEST_SEMANTIC_PLANNER",
+            return_value=_admitted_mock_plan(state, "1", {"actions": [{
+                "type": "answer_pending",
+                "selected_value": "continue",
+                "source_evidence": "1",
+                "confidence": "high",
+            }]}),
+        ):
+            result = process_turn(state)
+
+        self.assertEqual(result.get("resume_context"), {})
+        self.assertEqual(result["active_group"], "provider_deployment")
+        self.assertEqual(result["pending_question"]["id"], "CLOUD_REGION")
+        visible = "\n".join(result.get("visible_response") or [])
+        self.assertIn("Continuing the previous configuration", visible)
+        self.assertIn("CLOUD_REGION", visible)
+
     def test_resume_question_does_not_count_the_executing_action_as_deferred(self) -> None:
         from agent.harness.domains.orientation import resume_question
         from agent.harness.state import new_state

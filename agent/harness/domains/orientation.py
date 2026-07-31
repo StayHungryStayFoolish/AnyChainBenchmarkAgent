@@ -992,7 +992,10 @@ def apply_orientation_answer(
                 ),
             ),
             completion="blocked" if restored_pending else "completed",
-            stop_after_response=True,
+            # A restored question is already an actionable stopping point.
+            # Without one, continue through the normal group fallback so a
+            # resumed session cannot end on a status-only response.
+            stop_after_response=bool(restored_pending),
         )
     if question_id == "accept_recommendation":
         if not value:

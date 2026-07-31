@@ -14,6 +14,7 @@ import textwrap
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -50,6 +51,7 @@ from tests.agent_live.batch_orchestrator import (
     _approved_submission_bindings,
     _append_controller_fact,
     _append_discovery_results,
+    _authoritative_ledger_snapshot,
     _classify,
     _controller_fact_payloads,
     _scan_batch_execution_ids,
@@ -308,6 +310,55 @@ sys.exit(exit_code)
 
 
 class BatchOrchestratorTests(unittest.TestCase):
+    def test_authoritative_ledger_snapshot_is_single_build_under_concurrency(self) -> None:
+        import tests.agent_live.batch_orchestrator as orchestrator
+
+        revision = repository_revision(Path(__file__).resolve().parents[1])
+        cache_key = json.dumps(
+            {str(key): str(value) for key, value in sorted(revision.items())},
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with orchestrator._LEDGER_SNAPSHOT_LOCK:
+            orchestrator._LEDGER_SNAPSHOT_BYTES.pop(cache_key, None)
+
+        with patch.object(orchestrator, "build_ledger", wraps=build_ledger) as builder:
+            with ThreadPoolExecutor(max_workers=32) as executor:
+                snapshots = list(executor.map(
+                    lambda _index: _authoritative_ledger_snapshot(revision),
+                    range(64),
+                ))
+
+        self.assertEqual(builder.call_count, 1)
+        hashes = {
+            content_hash(snapshot)
+            for snapshot in snapshots
+        }
+        self.assertEqual(len(hashes), 1)
+        self.assertTrue(snapshots[0].get("edges"))
+        snapshots[0]["edges"].clear()
+        self.assertTrue(snapshots[1].get("edges"))
+
+    def test_direct_ledger_build_is_stable_under_concurrent_scenario_compilation(self) -> None:
+        revision = repository_revision(Path(__file__).resolve().parents[1])
+        baseline = build_ledger(revision=revision)
+        expected_identity = (
+            len(baseline.get("edges") or []),
+            content_hash(baseline),
+        )
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            ledgers = list(executor.map(
+                lambda _index: build_ledger(revision=revision),
+                range(32),
+            ))
+
+        identities = {
+            (len(ledger.get("edges") or []), content_hash(ledger))
+            for ledger in ledgers
+        }
+        self.assertEqual(identities, {expected_identity})
+
     def test_typed_worker_result_classifies_simulator_invalid_without_stderr(self) -> None:
         classification, reason = _classify(
             None,

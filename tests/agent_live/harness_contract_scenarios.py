@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field
+import threading
 from typing import Any, Mapping
 from unittest.mock import patch
 
@@ -34,6 +35,7 @@ from tests.agent_live.graph_turn import invoke_product_graph_turn
 _COVERAGE_EVM_PROBE_FIXTURE = (
     "tests/agent_live/fixtures/rpc_probe/coverage-evm-eth-block-number.json"
 )
+_SCENARIO_GRAPH_COMPILE_LOCK = threading.Lock()
 
 
 def _validation_endpoint_receipt(
@@ -369,11 +371,15 @@ def _compiled_action_state(
 
     prepared = deepcopy(dict(state))
     prepared["last_user_input"] = user_text
-    with patch(
-        "tests.agent_live.graph_turn.TEST_SEMANTIC_PLANNER",
-        return_value={"actions": [dict(action)]},
-    ):
-        result = invoke_product_graph_turn(prepared)
+    # The deterministic planner adapter is process-level. Keep installation
+    # and graph execution atomic so concurrent ledger builders cannot observe
+    # another scenario's temporary planner.
+    with _SCENARIO_GRAPH_COMPILE_LOCK:
+        with patch(
+            "tests.agent_live.graph_turn.TEST_SEMANTIC_PLANNER",
+            return_value={"actions": [dict(action)]},
+        ):
+            result = invoke_product_graph_turn(prepared)
     question = dict(result.get("pending_question") or {})
     if not question:
         raise AssertionError(f"compiled action produced no pending question: {action}")
