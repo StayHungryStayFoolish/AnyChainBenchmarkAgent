@@ -1945,6 +1945,47 @@ class SemanticPlanDraftTests(unittest.TestCase):
         self.assertEqual(committed["action_queue"], [])
         self.assertEqual(committed["control"]["phase"], "compose")
 
+    def test_pending_cancel_option_commits_with_semantic_draft_atomically(
+        self,
+    ) -> None:
+        from types import SimpleNamespace
+
+        from agent.harness.coordinator import (
+            _apply_handler_result,
+            _prepare_pending_answer_result,
+            _semantic_draft_question,
+        )
+
+        draft = self._draft(active_group="opening")
+        state = new_state("draft-test", language="en")
+        state["turn_index"] = draft["creation_turn"]
+        state["active_group"] = "opening"
+        _bind_product_head(state)
+        state["semantic_plan_draft"] = deepcopy(draft)
+        state["pending_question"] = _semantic_draft_question(draft)
+
+        result = _prepare_pending_answer_result(
+            state,
+            {
+                "answer": "Cancel the complete pending plan.",
+                "selected_value": "cancel",
+                "source_evidence": "Cancel the complete pending plan.",
+            },
+            SimpleNamespace(action_id="cancel-answer", confidence="high"),
+        )
+
+        self.assertEqual(result.followup_actions, ())
+        self.assertIsNotNone(result.semantic_draft_command)
+        self.assertEqual(result.semantic_draft_command.operation, "cancel")
+        committed = _apply_handler_result(
+            state,
+            result,
+            owner="coordinator",
+        )
+        self.assertEqual(committed["semantic_plan_draft"]["status"], "cancelled")
+        self.assertEqual(committed["pending_question"], {})
+        validate_state(committed)
+
     def test_structured_multi_atom_draft_finalizes_one_complete_transaction(
         self,
     ) -> None:

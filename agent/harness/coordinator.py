@@ -3376,6 +3376,17 @@ def _prepare_pending_answer_result(
             followup["source_evidence"] = str(raw_answer or "").strip()
         followup["confidence"] = "high"
         followup["selection_contract_verified"] = True
+        if isinstance(pending.get("semantic_draft_binding"), Mapping):
+            atomic_action = dict(followup)
+            atomic_action.pop("selection_contract_verified", None)
+            result = apply_coordinator_action(
+                deepcopy(state),
+                _action_proposal(atomic_action, envelope.confidence),
+            )
+            return replace(
+                result,
+                consumed_action_ids=(envelope.action_id,),
+            )
         policy = _option_return_policy(pending, value)
         return HandlerResult(
             consumed_action_ids=(envelope.action_id,),
