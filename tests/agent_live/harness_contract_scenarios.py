@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Mapping
 from unittest.mock import patch
 
@@ -30,6 +29,11 @@ from agent.harness.domains.sync_observe import question_for_sync_observe
 from agent.harness.state import AgentGraphState, new_state
 from tests.agent_live.coverage_evidence import content_hash
 from tests.agent_live.graph_turn import invoke_product_graph_turn
+
+
+_COVERAGE_EVM_PROBE_FIXTURE = (
+    "tests/agent_live/fixtures/rpc_probe/coverage-evm-eth-block-number.json"
+)
 
 
 def _validation_endpoint_receipt(
@@ -139,12 +143,7 @@ def _new_chain_response_confirmation_seed() -> dict[str, Any]:
 
     chain = "coverage-evm"
     endpoint = "http://geth-dev:8545"
-    evidence_file = str(
-        Path(__file__).resolve().parent
-        / "fixtures"
-        / "rpc_probe"
-        / "coverage-evm-eth-block-number.json"
-    )
+    evidence_file = _COVERAGE_EVM_PROBE_FIXTURE
     validated = _validated_method_contract(
         method="eth_blockNumber",
         endpoint=endpoint,
@@ -1158,12 +1157,7 @@ def _explicit_scenarios(language: str) -> dict[str, QuestionScenario]:
                                 method="eth_blockNumber",
                                 endpoint="http://geth-dev:8545",
                                 chain="coverage-evm",
-                                evidence_file=str(
-                                    Path(__file__).resolve().parent
-                                    / "fixtures"
-                                    / "rpc_probe"
-                                    / "coverage-evm-eth-block-number.json"
-                                ),
+                                evidence_file=_COVERAGE_EVM_PROBE_FIXTURE,
                             ),
                         ],
                         "finished": True,

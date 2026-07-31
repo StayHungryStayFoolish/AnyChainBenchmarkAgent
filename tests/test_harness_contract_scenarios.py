@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from pathlib import Path
 import unittest
 
+from agent.harness.domains.rpc_catalog import probe_evidence_content_hash
 from agent.harness.invariants import validate_state
 from tests.agent_live.harness_contract_scenarios import (
     action_transition_scenarios,
@@ -77,6 +79,18 @@ class HarnessContractScenarioTest(unittest.TestCase):
     def test_new_chain_response_seed_finalizes_validated_method_once(self) -> None:
         state = reviewed_scenario_state("new_chain_response")
         state["thread_id"] = "unit-new-chain-response-valid"
+
+        draft = (
+            ((state.get("custom_rpc") or {}).get("catalog") or {}).get("draft")
+            or {}
+        )
+        evidence_file = str((draft.get("probe") or {}).get("evidence_file") or "")
+        receipt = (draft.get("probe") or {}).get("probe_receipt") or {}
+        self.assertFalse(Path(evidence_file).is_absolute())
+        self.assertEqual(
+            receipt.get("evidence_file_hash"),
+            probe_evidence_content_hash(evidence_file),
+        )
 
         self.assertEqual(
             (state.get("pending_question") or {}).get("id"),
