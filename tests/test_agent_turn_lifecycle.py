@@ -2694,6 +2694,118 @@ class TurnCheckpointContractTest(unittest.TestCase):
         self.assertEqual(outcome.outcome, "reconciliation_required")
         self.assertEqual(outcome.failure_category, "unexpected_failure")
 
+    def test_inherited_effect_receipt_is_not_current_attempt_evidence(self) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = AnyChainGraphRuntime(
+                thread_id="inherited-effect-receipt",
+                checkpoint_path=Path(tmpdir) / "checkpoint.sqlite",
+            )
+            baseline = runtime.snapshot()
+            baseline["side_effect_intent"] = {
+                "intent_id": "prior-intent",
+                "status": "succeeded",
+            }
+            baseline["side_effect_receipt"] = {
+                "intent_id": "prior-intent",
+                "receipt_id": "prior-receipt",
+                "status": "succeeded",
+            }
+            runtime._persist_state(baseline)
+            attempt = runtime._begin_turn_attempt(runtime.snapshot())
+
+            evidence = runtime._attempt_effect_evidence(attempt)
+            outcome = runtime._finish_failed_turn_attempt(
+                attempt,
+                RuntimeError("read-only report analysis failed"),
+            )
+            runtime.close()
+
+        self.assertFalse(evidence[0])
+        self.assertTrue(evidence[1])
+        self.assertTrue(evidence[2])
+        self.assertEqual(outcome.outcome, "aborted")
+
+    def test_new_invoking_intent_is_current_attempt_evidence(self) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = AnyChainGraphRuntime(
+                thread_id="new-effect-intent",
+                checkpoint_path=Path(tmpdir) / "checkpoint.sqlite",
+            )
+            before = runtime.snapshot()
+            attempt = runtime._begin_turn_attempt(before)
+            changed = dict(before)
+            changed["side_effect_intent"] = {
+                "intent_id": "current-intent",
+                "status": "invoking",
+            }
+            runtime.graph.update_state(
+                {
+                    "configurable": {
+                        "thread_id": attempt.physical_thread_id,
+                    }
+                },
+                changed,
+                as_node="perform_effect",
+            )
+
+            evidence = runtime._attempt_effect_evidence(attempt)
+            outcome = runtime._finish_failed_turn_attempt(
+                attempt,
+                RuntimeError("connection lost after invocation"),
+            )
+            runtime.close()
+
+        self.assertTrue(evidence[0])
+        self.assertTrue(evidence[1])
+        self.assertTrue(evidence[2])
+        self.assertEqual(outcome.outcome, "reconciliation_required")
+
+    def test_new_effect_receipt_is_current_attempt_evidence(self) -> None:
+        from agent.harness.graph import AnyChainGraphRuntime
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime = AnyChainGraphRuntime(
+                thread_id="new-effect-receipt",
+                checkpoint_path=Path(tmpdir) / "checkpoint.sqlite",
+            )
+            before = runtime.snapshot()
+            attempt = runtime._begin_turn_attempt(before)
+            changed = dict(before)
+            changed["side_effect_intent"] = {
+                "intent_id": "current-intent",
+                "status": "succeeded",
+            }
+            changed["side_effect_receipt"] = {
+                "intent_id": "current-intent",
+                "receipt_id": "current-receipt",
+                "status": "succeeded",
+            }
+            runtime.graph.update_state(
+                {
+                    "configurable": {
+                        "thread_id": attempt.physical_thread_id,
+                    }
+                },
+                changed,
+                as_node="commit_receipt",
+            )
+
+            evidence = runtime._attempt_effect_evidence(attempt)
+            outcome = runtime._finish_failed_turn_attempt(
+                attempt,
+                RuntimeError("connection lost after receipt observation"),
+            )
+            runtime.close()
+
+        self.assertTrue(evidence[0])
+        self.assertTrue(evidence[1])
+        self.assertTrue(evidence[2])
+        self.assertEqual(outcome.outcome, "reconciliation_required")
+
     def test_commit_window_failure_leaves_no_active_attempt(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
         from tests.agent_live.graph_turn import (

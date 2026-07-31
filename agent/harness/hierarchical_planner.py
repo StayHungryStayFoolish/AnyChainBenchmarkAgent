@@ -688,19 +688,26 @@ def review_semantic_plan(
                 plan = repaired_plan
                 admission = repaired_admission
                 admission_errors = repaired_errors
-    result = (
-        _admitted_action_queue(plan, admission, state)
-        if admission is not None and admission.valid and plan is not None
-        else _unresolved_action_queue(
+    semantic_units = [
+        dict(item)
+        for item in candidate.get("semantic_units") or []
+        if isinstance(item, Mapping)
+    ]
+    if admission is not None and admission.valid and plan is not None:
+        try:
+            result = _admitted_action_queue(plan, admission, state)
+        except ValueError as exc:
+            result = _unresolved_action_queue(
+                clauses,
+                (f"immutable semantic plan rejected: {exc}",),
+                semantic_units=semantic_units,
+            )
+    else:
+        result = _unresolved_action_queue(
             clauses,
             admission_errors,
-            semantic_units=[
-                dict(item)
-                for item in candidate.get("semantic_units") or []
-                if isinstance(item, Mapping)
-            ],
+            semantic_units=semantic_units,
         )
-    )
     return _with_metrics(
         result,
         started,

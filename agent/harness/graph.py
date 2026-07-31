@@ -1490,25 +1490,47 @@ class AnyChainGraphRuntime:
         attempt: TurnAttempt,
     ) -> tuple[bool, str, str]:
         try:
+            baseline = self._checkpoint_state(
+                attempt.base_checkpoint_thread_id,
+                attempt.base_checkpoint_id,
+                attempt.base_fingerprint,
+            )
             snapshot = self.graph.get_state({
                 "configurable": {"thread_id": attempt.physical_thread_id}
             })
             values = dict(getattr(snapshot, "values", None) or {})
-            intent = dict(values.get("side_effect_intent") or {})
-            receipt = dict(values.get("side_effect_receipt") or {})
             checkpoint_id = str(
                 (getattr(snapshot, "config", {}) or {})
                 .get("configurable", {})
                 .get("checkpoint_id", "")
             )
-            fingerprint = (
-                _state_fingerprint(values)
-                if checkpoint_id and values
-                else ""
+            if not checkpoint_id or not values:
+                raise RuntimeError(
+                    "turn attempt has no verifiable checkpoint identity"
+                )
+            fingerprint = _state_fingerprint(values)
+            baseline_intent = dict(
+                baseline.get("side_effect_intent") or {}
+            )
+            baseline_receipt = dict(
+                baseline.get("side_effect_receipt") or {}
+            )
+            current_intent = dict(
+                values.get("side_effect_intent") or {}
+            )
+            current_receipt = dict(
+                values.get("side_effect_receipt") or {}
+            )
+            new_invocation = (
+                str(current_intent.get("status") or "") == "invoking"
+                and current_intent != baseline_intent
+            )
+            new_receipt = (
+                bool(current_receipt)
+                and current_receipt != baseline_receipt
             )
             return (
-                str(intent.get("status") or "") == "invoking"
-                or bool(receipt),
+                new_invocation or new_receipt,
                 checkpoint_id,
                 fingerprint,
             )

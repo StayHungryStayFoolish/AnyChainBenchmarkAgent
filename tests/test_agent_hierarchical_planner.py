@@ -45,6 +45,111 @@ def _closed_enum_review_response(payload: dict) -> dict:
 
 
 class HierarchicalPlannerContractTest(unittest.TestCase):
+    def test_receipt_attachment_rejection_becomes_typed_unresolved_work(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import review_semantic_plan
+        from agent.harness.plan_coverage import PlanCoverageResult
+        from agent.harness.state import new_state
+
+        text = (
+            "Switch to network; use eth0, but do not use eth0; "
+            "show current network evidence."
+        )
+        unit = {
+            "unit_id": "network-unit",
+            "clause_id": "network-clause",
+            "source_text": text,
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "environment",
+                "group": "network",
+            }],
+            "reason": "contradictory network proposal",
+        }
+        document = {
+            "status": "review_plan",
+            "clauses": [{
+                "clause_id": "network-clause",
+                "text": text,
+                "input_shape": "prose",
+            }],
+            "source_partition": [unit],
+            "routed_partition": [unit],
+            "owner_documents": {
+                "environment": {
+                    "actions": [{
+                        "type": "set_config_value",
+                        "key": "NETWORK_INTERFACE",
+                        "value": "eth0",
+                    }],
+                    "bindings": [{
+                        "unit_id": "network-unit",
+                        "action_indexes": [0],
+                        "disposition": "action",
+                        "reason": "compiled",
+                    }],
+                },
+            },
+        }
+        state = new_state("receipt-rejection", language="en")
+        state["semantic_plan_draft"] = {
+            "status": "ready_for_review",
+            "draft_id": "preserve-product-head",
+        }
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.prepare_hierarchical_candidate",
+                side_effect=lambda candidate, *_args, **_kwargs: (
+                    candidate,
+                    PlanCoverageResult(True, (), ()),
+                ),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner._review_bounded_semantic_candidate",
+                return_value=(
+                    SimpleNamespace(request_json="{}"),
+                    SimpleNamespace(
+                        valid=True,
+                        errors=(),
+                        request_count=1,
+                        request_sizes=(),
+                    ),
+                    (),
+                ),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner._admitted_action_queue",
+                side_effect=ValueError(
+                    "configuration proposal lacks current-turn provenance: "
+                    "NETWORK_INTERFACE"
+                ),
+            ),
+        ):
+            result = review_semantic_plan(state, document)
+
+        self.assertEqual(
+            [action["type"] for action in result["actions"]],
+            ["clarify_unresolved"],
+        )
+        self.assertEqual(
+            result["semantic_units"][0]["disposition"],
+            "unresolved",
+        )
+        self.assertIn(
+            "lacks current-turn provenance",
+            result["coverage_errors"][0],
+        )
+        self.assertEqual(
+            state["semantic_plan_draft"]["draft_id"],
+            "preserve-product-head",
+        )
+
     def test_owner_compile_failure_is_preserved_as_typed_unresolved_work(
         self,
     ) -> None:
