@@ -424,6 +424,7 @@ def _validate_whole_plan_review(
         "status",
         "result_hash",
         "admission_calls",
+        "authority_chain",
     }
     if not _exact_fields(receipt, fields):
         return False, "whole-plan-review receipt shape is invalid"
@@ -431,9 +432,85 @@ def _validate_whole_plan_review(
         receipt.get("status") != "reviewed"
         or not _valid_hash(receipt.get("result_hash"))
         or not _valid_nonnegative_integer(receipt.get("admission_calls"))
+        or not _valid_planner_authority_chain(receipt.get("authority_chain"))
     ):
         return False, "whole-plan-review receipt semantics are invalid"
     return True, ""
+
+
+def _valid_request_sizes(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and all(
+            _valid_nonnegative_integer(item) and int(item) > 0
+            for item in value
+        )
+    )
+
+
+def _valid_planner_authority_chain(value: Any) -> bool:
+    if not isinstance(value, Mapping) or set(value) != {
+        "stage_a_convergence",
+        "stage_b_semantic_reviews",
+    }:
+        return False
+    stage_a = value.get("stage_a_convergence")
+    if not isinstance(stage_a, Mapping):
+        return False
+    if stage_a:
+        if set(stage_a) != {
+            "primary_hash",
+            "secondary_hash",
+            "selected_proposal",
+            "verdict_hash",
+            "request_count",
+            "request_sizes",
+            "valid",
+        }:
+            return False
+        if (
+            not _valid_hash(stage_a.get("primary_hash"))
+            or not _valid_hash(stage_a.get("secondary_hash"))
+            or not _valid_hash(stage_a.get("verdict_hash"))
+            or stage_a.get("selected_proposal")
+            not in {"primary", "secondary", "none", "rejected"}
+            or not _valid_nonnegative_integer(stage_a.get("request_count"))
+            or not _valid_request_sizes(stage_a.get("request_sizes"))
+            or int(stage_a["request_count"]) != len(stage_a["request_sizes"])
+            or int(stage_a["request_count"]) == 0
+            or not isinstance(stage_a.get("valid"), bool)
+            or (
+                stage_a.get("valid") is True
+                and stage_a.get("selected_proposal")
+                not in {"primary", "secondary"}
+            )
+        ):
+            return False
+    reviews = value.get("stage_b_semantic_reviews")
+    if not isinstance(reviews, list):
+        return False
+    for review in reviews:
+        if not isinstance(review, Mapping) or set(review) != {
+            "owner",
+            "proposal_hash",
+            "review_hash",
+            "request_count",
+            "request_sizes",
+            "valid",
+        }:
+            return False
+        if (
+            not str(review.get("owner") or "")
+            or not _valid_hash(review.get("proposal_hash"))
+            or not _valid_hash(review.get("review_hash"))
+            or not _valid_nonnegative_integer(review.get("request_count"))
+            or not _valid_request_sizes(review.get("request_sizes"))
+            or int(review["request_count"]) != len(review["request_sizes"])
+            or int(review["request_count"]) == 0
+            or not isinstance(review.get("valid"), bool)
+        ):
+            return False
+    return True
 
 
 def _validate_fallback_selection(

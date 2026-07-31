@@ -1620,7 +1620,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             "clause_id": "clause-1",
             "source_text": "None of these fit and I am not sure.",
             "operation": "pending_answer",
-            "owner_routes": [{"owner": "coordinator", "group": ""}],
+            "owner_routes": [{"owner": "orientation", "group": ""}],
             "reason": "semantic option selection",
         }]
 
@@ -2309,6 +2309,11 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                 "agent.harness.hierarchical_planner.request_semantic_compilation",
                 side_effect=[json.dumps(partition), json.dumps(rejected)],
             ) as compiler,
+            patch(
+                "agent.harness.hierarchical_planner."
+                "_partition_requires_independent_proposal",
+                return_value=False,
+            ),
         ):
             result = begin_semantic_partition(state, text)
 
@@ -2316,6 +2321,529 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(result["stage_a_calls"], 1)
         self.assertEqual(result["admission_calls"], 1)
         self.assertEqual(compiler.call_count, 2)
+
+    def test_unresolved_partition_converges_to_independent_routed_proposal(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import begin_semantic_partition
+
+        text = "Return to the previous step.\nChange the RPC endpoint."
+        primary = {
+            "semantic_units": [
+                {
+                    "unit_id": "primary-1",
+                    "clause_id": "clause-1",
+                    "source_text": "Return to the previous step.",
+                    "operation": "unresolved",
+                    "owner_routes": [],
+                    "reason": "the operation was not resolved",
+                },
+                {
+                    "unit_id": "primary-2",
+                    "clause_id": "clause-2",
+                    "source_text": "Change the RPC endpoint.",
+                    "operation": "unresolved",
+                    "owner_routes": [],
+                    "reason": "the operation was not resolved",
+                },
+            ],
+            "reason": "incomplete first proposal",
+        }
+        secondary = {
+            "semantic_units": [
+                {
+                    "unit_id": "secondary-1",
+                    "clause_id": "clause-1",
+                    "source_text": "Return to the previous step.",
+                    "operation": "navigation",
+                    "owner_routes": [{
+                        "owner": "coordinator",
+                        "group": "sync_observe",
+                    }],
+                    "reason": "explicit navigation",
+                },
+                {
+                    "unit_id": "secondary-2",
+                    "clause_id": "clause-2",
+                    "source_text": "Change the RPC endpoint.",
+                    "operation": "domain_request",
+                    "owner_routes": [{
+                        "owner": "chain_rpc",
+                        "group": "endpoint_process",
+                    }],
+                    "reason": "explicit endpoint reconfiguration",
+                },
+            ],
+            "reason": "complete independent proposal",
+        }
+        proposal_calls = 0
+
+        def semantic_response(*_args, **kwargs):
+            nonlocal proposal_calls
+            system = kwargs["system_prompt"]
+            payload = kwargs["request_payload"]
+            if "Stage A semantic partition" in system:
+                proposal_calls += 1
+                return json.dumps(primary if proposal_calls == 1 else secondary)
+            if "Stage A proposal convergence authority" in system:
+                return json.dumps({
+                    "selected_proposal": "secondary",
+                    "primary_hash": payload["primary"]["hash"],
+                    "secondary_hash": payload["secondary"]["hash"],
+                    "reason": "only the secondary routes both explicit operations",
+                })
+            if "Stage A coverage authority" in system:
+                units = payload["semantic_units"]
+                unresolved = any(
+                    unit["operation"] == "unresolved" for unit in units
+                )
+                return json.dumps({
+                    "unit_verdicts": [
+                        {
+                            "unit_id": unit["unit_id"],
+                            "verdict": (
+                                "unresolved" if unresolved else "complete"
+                            ),
+                            "supports_unit_id": "",
+                            "reason": "reviewed against the complete source",
+                        }
+                        for unit in units
+                    ],
+                    "clause_verdicts": [
+                        {
+                            "clause_id": clause["clause_id"],
+                            "verdict": (
+                                "unresolved" if unresolved else "complete"
+                            ),
+                            "omitted_owner_routes": [],
+                            "reason": "reviewed against the complete source",
+                        }
+                        for clause in payload["clauses"]
+                    ],
+                    "reason": "coverage review complete",
+                })
+            raise AssertionError(system)
+
+        state = {
+            "active_group": "sync_observe",
+            "pending_question": {
+                "id": "duration",
+                "group": "sync_observe",
+                "owner": "performance",
+                "kind": "freeform",
+                "manual_input_allowed": True,
+            },
+        }
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                side_effect=semantic_response,
+            ) as compiler,
+        ):
+            result = begin_semantic_partition(state, text)
+
+        self.assertEqual(result["status"], "compile_owner", result)
+        self.assertEqual(result["stage_a_calls"], 2)
+        self.assertEqual(result["admission_calls"], 3)
+        self.assertEqual(compiler.call_count, 5)
+        self.assertEqual(
+            [unit["operation"] for unit in result["routed_partition"]],
+            ["navigation", "domain_request"],
+        )
+        self.assertEqual(
+            result["stage_a_convergence"]["selected_proposal"],
+            "secondary",
+        )
+
+    def test_stage_a_convergence_rejects_selector_hash_substitution(self) -> None:
+        from agent.harness.hierarchical_planner import _select_stage_a_proposal
+
+        primary = [{
+            "unit_id": "primary",
+            "clause_id": "clause-1",
+            "source_text": "change it",
+            "operation": "unresolved",
+            "owner_routes": [],
+            "reason": "uncertain",
+        }]
+        secondary = [{
+            "unit_id": "secondary",
+            "clause_id": "clause-1",
+            "source_text": "change it",
+            "operation": "navigation",
+            "owner_routes": [{"owner": "coordinator", "group": "opening"}],
+            "reason": "navigation",
+        }]
+        payload = {
+            "user_text": "change it",
+            "clauses": [{
+                "clause_id": "clause-1",
+                "text": "change it",
+                "input_shape": "prose",
+            }],
+            "pending_question": {},
+            "groups": [],
+            "universal_operation_purposes": {},
+        }
+        forged = json.dumps({
+            "selected_proposal": "secondary",
+            "primary_hash": "0" * 64,
+            "secondary_hash": "1" * 64,
+            "reason": "forged selection",
+        })
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            return_value=forged,
+        ):
+            _selected, errors, _sizes, receipt = _select_stage_a_proposal(
+                object(), payload, primary, secondary
+            )
+
+        self.assertTrue(any("primary proposal hash" in error for error in errors))
+        self.assertTrue(any("secondary proposal hash" in error for error in errors))
+        self.assertEqual(receipt["selected_proposal"], "secondary")
+
+    def test_malformed_independent_stage_a_proposal_fails_closed(self) -> None:
+        from agent.harness.hierarchical_planner import begin_semantic_partition
+
+        text = "Reset this session and explain the previous failure."
+        primary = {
+            "semantic_units": [{
+                "unit_id": "primary",
+                "clause_id": "clause-1",
+                "source_text": text,
+                "operation": "unresolved",
+                "owner_routes": [],
+                "reason": "unresolved compound request",
+            }],
+        }
+        malformed = "not-json"
+        calls = 0
+
+        def semantic_response(*_args, **kwargs):
+            nonlocal calls
+            system = kwargs["system_prompt"]
+            if "Stage A semantic partition" in system:
+                calls += 1
+                return json.dumps(primary) if calls == 1 else malformed
+            if "Stage A coverage authority" in system:
+                return json.dumps({
+                    "unit_verdicts": [{
+                        "unit_id": "primary",
+                        "verdict": "unresolved",
+                        "supports_unit_id": "",
+                        "reason": "unresolved",
+                    }],
+                    "clause_verdicts": [{
+                        "clause_id": "clause-1",
+                        "verdict": "unresolved",
+                        "omitted_owner_routes": [],
+                        "reason": "unresolved",
+                    }],
+                    "reason": "reviewed",
+                })
+            raise AssertionError(system)
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                side_effect=semantic_response,
+            ),
+        ):
+            result = begin_semantic_partition({}, text)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["stage_a_calls"], 3)
+        self.assertTrue(result["errors"])
+
+    def test_stage_b_semantic_rejection_recompiles_complete_owner_document(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import _compile_owner_document
+
+        text = "Clear this configuration and start over."
+        partition = [{
+            "unit_id": "reset-unit",
+            "clause_id": "clause-1",
+            "source_text": text,
+            "operation": "administrative",
+            "owner_routes": [{"owner": "orientation", "group": ""}],
+            "reason": "session reset",
+        }]
+        wrong = {
+            "actions": [{
+                "type": "set_response_language",
+                "language": "en",
+                "source_evidence": text,
+            }],
+            "bindings": [{
+                "unit_id": "reset-unit",
+                "action_indexes": [0],
+                "disposition": "action",
+                "reason": "wrong registered action",
+            }],
+            "reason": "wrong first proposal",
+        }
+        corrected = {
+            "actions": [{"type": "reset_session"}],
+            "bindings": [{
+                "unit_id": "reset-unit",
+                "action_indexes": [0],
+                "disposition": "action",
+                "reason": "exact reset action",
+            }],
+            "reason": "corrected proposal",
+        }
+        compiler_calls = 0
+        reviewer_calls = 0
+
+        def response(*_args, **kwargs):
+            nonlocal compiler_calls, reviewer_calls
+            system = kwargs["system_prompt"]
+            if "Stage B semantic review authority" in system:
+                reviewer_calls += 1
+                payload = kwargs["request_payload"]
+                verdict = "reject" if reviewer_calls == 1 else "admit"
+                return json.dumps({
+                    "proposal_hash": payload["proposal_hash"],
+                    "unit_verdicts": [{
+                        "unit_id": "reset-unit",
+                        "verdict": verdict,
+                        "reason": (
+                            "the action purpose does not clear a session"
+                            if verdict == "reject"
+                            else "the action clears the requested session"
+                        ),
+                    }],
+                    "action_verdicts": [{
+                        "action_index": 0,
+                        "verdict": verdict,
+                        "reason": (
+                            "the language selection is absent from the source"
+                            if verdict == "reject"
+                            else "the reset action is source authorized"
+                        ),
+                    }],
+                    "reason": (
+                        "candidate is not source authorized"
+                        if verdict == "reject"
+                        else "candidate is source authorized"
+                    ),
+                })
+            compiler_calls += 1
+            return json.dumps(wrong if compiler_calls == 1 else corrected)
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                side_effect=response,
+            ) as compiler,
+        ):
+            document, errors, sizes = _compile_owner_document(
+                {}, "orientation", frozenset(), partition, ("reset-unit",)
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(document["actions"], [{"type": "reset_session"}])
+        self.assertEqual(len(document["semantic_review_receipts"]), 2)
+        self.assertEqual(len(sizes), 4)
+        self.assertEqual(compiler.call_count, 4)
+
+    def test_stage_b_semantic_reviewer_malformed_twice_fails_closed(self) -> None:
+        from agent.harness.hierarchical_planner import _compile_owner_document
+
+        text = "Clear this configuration and start over."
+        partition = [{
+            "unit_id": "reset-unit",
+            "clause_id": "clause-1",
+            "source_text": text,
+            "operation": "administrative",
+            "owner_routes": [{"owner": "orientation", "group": ""}],
+            "reason": "session reset",
+        }]
+        wrong = json.dumps({
+            "actions": [{
+                "type": "set_response_language",
+                "language": "en",
+                "source_evidence": text,
+            }],
+            "bindings": [{
+                "unit_id": "reset-unit",
+                "action_indexes": [0],
+                "disposition": "action",
+                "reason": "wrong registered action",
+            }],
+            "reason": "wrong proposal",
+        })
+
+        def response(*_args, **kwargs):
+            if "Stage B semantic review authority" in kwargs["system_prompt"]:
+                return "not-json"
+            return wrong
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                side_effect=response,
+            ),
+        ):
+            document, errors, sizes = _compile_owner_document(
+                {}, "orientation", frozenset(), partition, ("reset-unit",)
+            )
+
+        self.assertTrue(errors)
+        self.assertEqual(len(document["semantic_review_receipts"]), 2)
+        self.assertEqual(len(sizes), 4)
+
+    def test_stage_b_semantic_second_rejection_fails_closed(self) -> None:
+        from agent.harness.hierarchical_planner import _compile_owner_document
+
+        text = "Clear this configuration and start over."
+        partition = [{
+            "unit_id": "reset-unit",
+            "clause_id": "clause-1",
+            "source_text": text,
+            "operation": "administrative",
+            "owner_routes": [{"owner": "orientation", "group": ""}],
+            "reason": "session reset",
+        }]
+        wrong = {
+            "actions": [{
+                "type": "set_response_language",
+                "language": "en",
+                "source_evidence": text,
+            }],
+            "bindings": [{
+                "unit_id": "reset-unit",
+                "action_indexes": [0],
+                "disposition": "action",
+                "reason": "wrong registered action",
+            }],
+            "reason": "wrong proposal",
+        }
+
+        def response(*_args, **kwargs):
+            payload = kwargs["request_payload"]
+            if "Stage B semantic review authority" in kwargs["system_prompt"]:
+                return json.dumps({
+                    "proposal_hash": payload["proposal_hash"],
+                    "unit_verdicts": [{
+                        "unit_id": "reset-unit",
+                        "verdict": "reject",
+                        "reason": "wrong purpose",
+                    }],
+                    "action_verdicts": [{
+                        "action_index": 0,
+                        "verdict": "reject",
+                        "reason": "wrong action",
+                    }],
+                    "reason": "rejected",
+                })
+            return json.dumps(wrong)
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner.request_semantic_compilation",
+                side_effect=response,
+            ),
+        ):
+            document, errors, sizes = _compile_owner_document(
+                {}, "orientation", frozenset(), partition, ("reset-unit",)
+            )
+
+        self.assertTrue(any("rejected action" in error for error in errors))
+        self.assertEqual(len(document["semantic_review_receipts"]), 2)
+        self.assertEqual(len(sizes), 4)
+
+    def test_stage_b_semantic_review_rejects_hash_substitution(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_owner_document_semantics,
+        )
+
+        payload = {
+            "owner": "coordinator",
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "source_text": "clear it",
+            }],
+            "owner_action_schema": [],
+        }
+        document = {
+            "actions": [{"type": "reset_session"}],
+            "bindings": [],
+        }
+        forged = json.dumps({
+            "proposal_hash": "0" * 64,
+            "unit_verdicts": [{
+                "unit_id": "unit-1",
+                "verdict": "admit",
+                "reason": "accepted",
+            }],
+            "action_verdicts": [{
+                "action_index": 0,
+                "verdict": "admit",
+                "reason": "accepted",
+            }],
+            "reason": "accepted",
+        })
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            return_value=forged,
+        ):
+            errors, _size, receipt = _review_owner_document_semantics(
+                object(), payload, document
+            )
+
+        self.assertIn("changed proposal hash", "; ".join(errors))
+        self.assertFalse(receipt["valid"])
+
+    def test_single_reachable_stage_b_action_needs_no_extra_review(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _owner_document_requires_semantic_review,
+        )
+
+        payload = {
+            "owner_action_schema": [{"type": "queue_workflow_goal"}],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "source_text": "save it for later",
+            }],
+        }
+        document = {
+            "actions": [{
+                "type": "queue_workflow_goal",
+                "target_mode": "real-node",
+            }],
+            "bindings": [{
+                "unit_id": "unit-1",
+                "action_indexes": [0],
+            }],
+        }
+
+        self.assertFalse(
+            _owner_document_requires_semantic_review(payload, document)
+        )
 
     def test_admission_repair_preserves_independent_consultation(
         self,
@@ -2630,6 +3158,11 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                     json.dumps(repaired),
                 ],
             ) as compiler,
+            patch(
+                "agent.harness.hierarchical_planner."
+                "_partition_requires_independent_proposal",
+                return_value=False,
+            ),
         ):
             result = begin_semantic_partition(state, text)
 
@@ -2934,6 +3467,11 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             patch(
                 "agent.harness.hierarchical_planner._review_stage_a_partition",
                 return_value=((), (333,), frozenset()),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner."
+                "_partition_requires_independent_proposal",
+                return_value=False,
             ),
             patch(
                 "agent.harness.hierarchical_planner._compile_owner_document",
@@ -3531,6 +4069,13 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                         "semantic_units": units,
                         "reason": "unresolved compound turn",
                     }))
+                if "Stage A proposal convergence authority" in system:
+                    return SimpleNamespace(text=json.dumps({
+                        "selected_proposal": "primary",
+                        "primary_hash": payload["primary"]["hash"],
+                        "secondary_hash": payload["secondary"]["hash"],
+                        "reason": "both proposals preserve the unresolved sibling",
+                    }))
                 if "Stage A coverage authority" in system:
                     units = payload["semantic_units"]
                     return SimpleNamespace(text=json.dumps({
@@ -3964,7 +4509,17 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                     )
                 ) and str(payload.get("user_text") or "").strip() == "quick"
                 model_calls.append((system, has_resolution))
-                if "Stage A semantic partition" in system:
+                if "Stage A proposal convergence authority" in system:
+                    response = {
+                        "selected_proposal": "primary",
+                        "primary_hash": payload["primary"]["hash"],
+                        "secondary_hash": payload["secondary"]["hash"],
+                        "reason": (
+                            "both proposals preserve the same unresolved "
+                            "profile demand"
+                        ),
+                    }
+                elif "Stage A semantic partition" in system:
                     clauses = payload["clauses"]
                     response = {
                         "semantic_units": [{

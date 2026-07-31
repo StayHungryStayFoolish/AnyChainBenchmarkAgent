@@ -8,6 +8,7 @@ the graph owns the complete turn receipt in Phase 3.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -68,7 +69,10 @@ from .semantic_drafts import (
     semantic_draft_question_binding,
     validate_semantic_plan_draft,
 )
-from .semantic_policy import FRAMED_REQUEST_SEMANTIC_POLICY
+from .semantic_policy import (
+    FRAMED_REQUEST_SEMANTIC_POLICY,
+    PENDING_CANDIDATE_SEMANTIC_POLICY,
+)
 from .secret_refs import (
     authorize_secret_reference,
     new_secret_reference,
@@ -201,55 +205,16 @@ def begin_semantic_partition(
     try:
         provider = provider_from_config()
         stage_a_payload = _stage_a_payload(state, text, clauses)
-        partition: list[dict[str, Any]] = []
-        partition_errors: tuple[str, ...] = ()
         stage_a_prompt = _stage_a_prompt()
-        previous_output = ""
-        for attempt in range(2):
-            request_payload = dict(stage_a_payload)
-            request_prompt = stage_a_prompt
-            if attempt:
-                request_payload["contract_repair"] = {
-                    "prior_invalid_output": previous_output,
-                    "validation_errors": list(partition_errors),
-                    "instruction": (
-                        "Return a complete replacement document. Correct every "
-                        "validation error without dropping or paraphrasing source text."
-                    ),
-                }
-                request_prompt = (
-                    f"{stage_a_prompt} This is a contract-repair attempt. The prior "
-                    f"document was rejected for: {'; '.join(partition_errors)}. "
-                    "Return a new full document that satisfies those errors exactly."
-                )
-            document["request_sizes"].append(
-                _wire_size(request_prompt, request_payload)
-            )
-            document["stage_a_calls"] += 1
-            previous_output = request_semantic_compilation(
-                provider,
-                system_prompt=request_prompt,
-                request_payload=request_payload,
-                max_tokens=2600,
-                reasoning_mode=STRICT_JSON_REASONING_MODE,
-            )
-            partition, partition_errors = _validate_partition_document(
-                previous_output,
-                clauses,
-                state=state,
-            )
-            partition, _ = _canonicalize_unique_option_pending_partition(
-                state,
-                clauses,
-                partition,
-                partition,
-            )
-            partition_errors = tuple(dict.fromkeys((
-                *partition_errors,
-                *_cross_domain_pending_errors(partition, state),
-            )))
-            if not partition_errors:
-                break
+        partition, partition_errors, proposal_sizes = _request_stage_a_proposal(
+            provider,
+            stage_a_payload,
+            clauses,
+            state,
+            stage_a_prompt,
+        )
+        document["request_sizes"].extend(proposal_sizes)
+        document["stage_a_calls"] += len(proposal_sizes)
         if partition_errors:
             document["status"] = "failed"
             document["errors"] = list(partition_errors)
@@ -270,6 +235,71 @@ def begin_semantic_partition(
         source_partition, compilation_partition = (
             _partition_after_stage_a_admission(partition, redundant_unit_ids)
         )
+        if _partition_requires_independent_proposal(
+            source_partition,
+            stage_a_payload,
+        ):
+            (
+                independent_partition,
+                independent_errors,
+                independent_sizes,
+            ) = _request_stage_a_proposal(
+                provider,
+                stage_a_payload,
+                clauses,
+                state,
+                stage_a_prompt,
+                independent=True,
+            )
+            document["request_sizes"].extend(independent_sizes)
+            document["stage_a_calls"] += len(independent_sizes)
+            if independent_errors:
+                document["status"] = "failed"
+                document["errors"] = list(independent_errors)
+                document["unit_count"] = len(source_partition)
+                return document
+            (
+                selected_partition,
+                convergence_errors,
+                convergence_sizes,
+                convergence_receipt,
+            ) = _select_stage_a_proposal(
+                provider,
+                stage_a_payload,
+                source_partition,
+                independent_partition,
+            )
+            document["request_sizes"].extend(convergence_sizes)
+            document["admission_calls"] += len(convergence_sizes)
+            document["stage_a_convergence"] = convergence_receipt
+            if convergence_errors:
+                document["status"] = "failed"
+                document["errors"] = list(convergence_errors)
+                document["unit_count"] = len(source_partition)
+                return document
+            if convergence_receipt["selected_proposal"] == "secondary":
+                (
+                    secondary_admission_errors,
+                    secondary_admission_sizes,
+                    secondary_redundant_unit_ids,
+                ) = _review_stage_a_partition(
+                    provider,
+                    stage_a_payload,
+                    selected_partition,
+                )
+                document["request_sizes"].extend(secondary_admission_sizes)
+                document["admission_calls"] += len(secondary_admission_sizes)
+                if secondary_admission_errors:
+                    document["status"] = "failed"
+                    document["errors"] = list(secondary_admission_errors)
+                    document["unit_count"] = len(selected_partition)
+                    return document
+                source_partition, compilation_partition = (
+                    _partition_after_stage_a_admission(
+                        selected_partition,
+                        secondary_redundant_unit_ids,
+                    )
+                )
         source_partition, compilation_partition = (
             _canonicalize_atomic_evidence_partition(
                 state, clauses, source_partition, compilation_partition
@@ -332,6 +362,236 @@ def begin_semantic_partition(
         return document
 
 
+def _request_stage_a_proposal(
+    provider: Any,
+    stage_a_payload: Mapping[str, Any],
+    clauses: Sequence[TurnClause],
+    state: AgentGraphState,
+    prompt: str,
+    *,
+    independent: bool = False,
+) -> tuple[list[dict[str, Any]], tuple[str, ...], tuple[int, ...]]:
+    """Build one structurally valid proposal without seeing another proposal."""
+
+    partition: list[dict[str, Any]] = []
+    errors: tuple[str, ...] = ()
+    previous_output = ""
+    request_sizes: list[int] = []
+    role_prompt = prompt
+    if independent:
+        role_prompt = (
+            f"{prompt} Produce an independent semantic partition from the immutable "
+            "source and registries. You have not seen and must not assume another "
+            "partition."
+        )
+    for attempt in range(2):
+        request_payload = dict(stage_a_payload)
+        request_prompt = role_prompt
+        if attempt:
+            request_payload["contract_repair"] = {
+                "prior_invalid_output": previous_output,
+                "validation_errors": list(errors),
+                "instruction": (
+                    "Return a complete replacement document. Correct every "
+                    "validation error without dropping or paraphrasing source text."
+                ),
+            }
+            request_prompt = (
+                f"{role_prompt} This is a contract-repair attempt. The prior "
+                f"document was rejected for: {'; '.join(errors)}. Return a new full "
+                "document that satisfies those errors exactly."
+            )
+        request_sizes.append(_wire_size(request_prompt, request_payload))
+        previous_output = request_semantic_compilation(
+            provider,
+            system_prompt=request_prompt,
+            request_payload=request_payload,
+            max_tokens=2600,
+            reasoning_mode=STRICT_JSON_REASONING_MODE,
+        )
+        partition, errors = _validate_partition_document(
+            previous_output,
+            clauses,
+            state=state,
+        )
+        partition, _ = _canonicalize_unique_option_pending_partition(
+            state,
+            clauses,
+            partition,
+            partition,
+        )
+        errors = tuple(dict.fromkeys((
+            *errors,
+            *_cross_domain_pending_errors(partition, state),
+        )))
+        if not errors:
+            break
+    return partition, errors, tuple(request_sizes)
+
+
+def _partition_requires_independent_proposal(
+    partition: Sequence[Mapping[str, Any]],
+    stage_a_payload: Mapping[str, Any] | None = None,
+) -> bool:
+    if any(
+        str(unit.get("operation") or "") == "unresolved"
+        for unit in partition
+    ):
+        return True
+    if any(
+        len(_UNIVERSAL_OPERATION_OWNERS.get(str(unit.get("operation") or ""), ()))
+        > 1
+        for unit in partition
+    ):
+        return True
+    has_semantic_pending_claim = any(
+        str(unit.get("operation") or "") == "pending_answer"
+        for unit in partition
+    )
+    if not has_semantic_pending_claim:
+        return False
+    payload = stage_a_payload or {}
+    return not (
+        payload.get("contract_proven_pending_prefixes")
+        or payload.get("pending_typed_candidates")
+    )
+
+
+def _partition_hash(partition: Sequence[Mapping[str, Any]]) -> str:
+    encoded = json.dumps(
+        [dict(unit) for unit in partition],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _stage_a_convergence_prompt() -> str:
+    return (
+        "You are the independent Stage A proposal convergence authority for "
+        "AnyChain Benchmark Agent. Compare two already validated immutable "
+        "semantic partitions against the complete source clauses, operation "
+        "purposes, owner/group purposes, and pending contract. You may select "
+        "only primary, secondary, or none. You must not create, merge, repair, "
+        "relabel, paraphrase, or synthesize units, routes, operations, or actions. "
+        "Select a proposal only when it preserves every present request, question, "
+        "correction, navigation, administrative instruction, evidence-analysis "
+        "request, and context contribution with safe registered ownership. A "
+        "proposal that calls an explicitly routable operation unresolved is not "
+        "complete. When an operation has several registered owners, compare each "
+        "proposal's owner with universal_owner_action_purposes and reject a route "
+        "whose owner has no action purpose matching the exact source demand. A "
+        "request to ingest, diagnose, or explain logs, errors, traces, diagnostics, "
+        "failures, or other evidence is evidence_analysis rather than generic "
+        "consultation even when the evidence has not been supplied yet. A "
+        "pending_answer not proven by a signed option prefix or typed "
+        "candidate must still semantically provide or authorize a value accepted by "
+        "the exact active pending contract. Rejection, deferral, explanation, or "
+        "navigation away from that question is not a pending answer. Genuine "
+        "semantic uncertainty may remain unresolved when neither "
+        "proposal has a safe source-grounded route. Return one strict JSON object "
+        "with exactly selected_proposal, primary_hash, secondary_hash, and reason. "
+        "Copy both supplied hashes exactly. "
+        f"{PENDING_CANDIDATE_SEMANTIC_POLICY}"
+    )
+
+
+def _select_stage_a_proposal(
+    provider: Any,
+    stage_a_payload: Mapping[str, Any],
+    primary: Sequence[Mapping[str, Any]],
+    secondary: Sequence[Mapping[str, Any]],
+) -> tuple[
+    list[dict[str, Any]],
+    tuple[str, ...],
+    tuple[int, ...],
+    dict[str, Any],
+]:
+    primary_hash = _partition_hash(primary)
+    secondary_hash = _partition_hash(secondary)
+    payload = {
+        "user_text": stage_a_payload["user_text"],
+        "clauses": stage_a_payload["clauses"],
+        "pending_question": dict(stage_a_payload.get("pending_question") or {}),
+        "pending_barrier_contract": dict(
+            stage_a_payload.get("pending_barrier_contract") or {}
+        ),
+        "pending_typed_candidates": list(
+            stage_a_payload.get("pending_typed_candidates") or []
+        ),
+        "contract_proven_pending_prefixes": list(
+            stage_a_payload.get("contract_proven_pending_prefixes") or []
+        ),
+        "groups": stage_a_payload["groups"],
+        "universal_operation_purposes": dict(
+            stage_a_payload.get("universal_operation_purposes")
+            or SEMANTIC_OPERATION_PURPOSES
+        ),
+        "universal_owner_action_purposes": dict(
+            stage_a_payload.get("universal_owner_action_purposes") or {}
+        ),
+        "primary": {
+            "hash": primary_hash,
+            "semantic_units": [dict(unit) for unit in primary],
+        },
+        "secondary": {
+            "hash": secondary_hash,
+            "semantic_units": [dict(unit) for unit in secondary],
+        },
+    }
+    prompt = _stage_a_convergence_prompt()
+    response = request_semantic_compilation(
+        provider,
+        system_prompt=prompt,
+        request_payload=payload,
+        max_tokens=900,
+        reasoning_mode=STRICT_JSON_REASONING_MODE,
+    )
+    request_sizes = (_wire_size(prompt, payload),)
+    errors: list[str] = []
+    try:
+        verdict = json.loads(response)
+    except json.JSONDecodeError:
+        verdict = {}
+        errors.append("Stage A convergence did not return strict JSON")
+    if not isinstance(verdict, Mapping) or set(verdict) != {
+        "selected_proposal",
+        "primary_hash",
+        "secondary_hash",
+        "reason",
+    }:
+        errors.append("Stage A convergence returned an invalid contract")
+        verdict = {}
+    selected = str(verdict.get("selected_proposal") or "")
+    if selected not in {"primary", "secondary", "none"}:
+        errors.append("Stage A convergence selected an invalid proposal")
+    if str(verdict.get("primary_hash") or "") != primary_hash:
+        errors.append("Stage A convergence changed the primary proposal hash")
+    if str(verdict.get("secondary_hash") or "") != secondary_hash:
+        errors.append("Stage A convergence changed the secondary proposal hash")
+    if not str(verdict.get("reason") or "").strip():
+        errors.append("Stage A convergence has no reason")
+    if selected == "none":
+        errors.append("Stage A proposals did not converge on complete turn coverage")
+    receipt = {
+        "primary_hash": primary_hash,
+        "secondary_hash": secondary_hash,
+        "selected_proposal": selected,
+        "verdict_hash": hashlib.sha256(response.encode("utf-8")).hexdigest(),
+        "request_count": len(request_sizes),
+        "request_sizes": list(request_sizes),
+        "valid": not errors,
+    }
+    chosen = secondary if selected == "secondary" else primary
+    return (
+        [dict(unit) for unit in chosen],
+        tuple(dict.fromkeys(errors)),
+        request_sizes,
+        receipt,
+    )
+
+
 def compile_next_owner(
     state: AgentGraphState,
     document: Mapping[str, Any],
@@ -388,6 +648,11 @@ def compile_next_owner(
         if isinstance(item, Mapping)
     ]
     if errors:
+        semantic_review_receipts = [
+            dict(receipt)
+            for receipt in owner_document.get("semantic_review_receipts") or ()
+            if isinstance(receipt, Mapping)
+        ]
         owner_document = {
             "actions": [],
             "bindings": [
@@ -403,6 +668,11 @@ def compile_next_owner(
                 for unit_id in request.get("unit_ids") or ()
                 if str(unit_id)
             ],
+            **(
+                {"semantic_review_receipts": semantic_review_receipts}
+                if semantic_review_receipts
+                else {}
+            ),
         }
         owner_failures.append({
             "owner": owner,
@@ -838,6 +1108,7 @@ def _stage_a_prompt() -> str:
         "explanation question is consultation and never authorizes the pending action. A request "
         "to analyze logs, errors, traces, or other evidence is evidence_analysis even when the "
         "user has not pasted the evidence yet. "
+        f"{PENDING_CANDIDATE_SEMANTIC_POLICY}"
         "A source-grounded instruction to keep, reuse, or reconfirm one concrete registered "
         "value is a present idempotent domain_request even when owner state already contains "
         "that value. A statement that a value or evidence will be supplied later is temporal "
@@ -927,6 +1198,11 @@ def _stage_a_prompt() -> str:
         "exactly one owner from the declared list for that operation. The group on a "
         "consultation route identifies its subject but never transfers read-only consultation "
         "ownership away from orientation. "
+        "When one universal operation declares several owners, use "
+        "universal_owner_action_purposes to select the owner whose registered action purpose "
+        "can represent the exact source demand. Do not select an owner merely because it owns "
+        "another action with the same broad operation label. If no owner purpose safely fits, "
+        "mark the unit unresolved. "
         "Use exact owner and group identifiers from the supplied registries. "
         "Do not infer a mutation from examples, hypothetical values, logs, or current state."
         " When semantic_draft_resolutions is present, each row is an exact "
@@ -1034,6 +1310,19 @@ def _stage_a_payload(
         "universal_operation_purposes": dict(SEMANTIC_OPERATION_PURPOSES),
         "universal_operation_owners": {
             operation: list(owners)
+            for operation, owners in _UNIVERSAL_OPERATION_OWNERS.items()
+        },
+        "universal_owner_action_purposes": {
+            operation: {
+                owner: [
+                    {"action_type": spec.action_type, "purpose": spec.purpose}
+                    for spec in ACTION_SPECS
+                    if not spec.internal_only
+                    and spec.owner == owner
+                    and operation in spec.semantic_operations
+                ]
+                for owner in owners
+            }
             for operation, owners in _UNIVERSAL_OPERATION_OWNERS.items()
         },
         "owners": sorted(_OWNERS),
@@ -1875,6 +2164,10 @@ def _stage_a_admission_prompt() -> str:
         "hypothetical, counterfactual, consequence, explanation, or capability question because "
         "it contains no present authorization. Require evidence_analysis for a request to ingest "
         "or analyze logs, errors, traces, or evidence even when the evidence will be pasted later. "
+        f"{PENDING_CANDIDATE_SEMANTIC_POLICY}"
+        "For an operation with several registered owners, a unit is complete only "
+        "when universal_owner_action_purposes proves that the selected owner has an "
+        "action purpose matching the exact source demand. "
         "Return one strict JSON object with exactly unit_verdicts, clause_verdicts, and reason. "
         "unit_verdicts contains exactly one row per supplied unit in order: "
         "{unit_id,verdict:'complete'|'redundant'|'unresolved',supports_unit_id,reason}. "
@@ -1979,6 +2272,9 @@ def _review_stage_a_partition(
         "universal_operation_purposes": dict(
             stage_a_payload.get("universal_operation_purposes")
             or SEMANTIC_OPERATION_PURPOSES
+        ),
+        "universal_owner_action_purposes": dict(
+            stage_a_payload.get("universal_owner_action_purposes") or {}
         ),
     }
     request_sizes: list[int] = []
@@ -2609,6 +2905,8 @@ def _compile_owner_document(
     response = ""
     document: dict[str, Any] = {}
     errors: tuple[str, ...] = ()
+    semantic_receipts: list[dict[str, Any]] = []
+    semantic_review_started = False
     for attempt in range(2):
         request_payload = payload
         request_prompt = prompt
@@ -2647,9 +2945,185 @@ def _compile_owner_document(
             expected_sources=expected_sources,
             pending_question=dict(state.get("pending_question") or {}),
         )
+        if not errors and (
+            semantic_review_started
+            or _owner_document_requires_semantic_review(payload, document)
+        ):
+            semantic_review_started = True
+            semantic_errors, semantic_size, semantic_receipt = (
+                _review_owner_document_semantics(
+                    provider,
+                    payload,
+                    document,
+                )
+            )
+            request_sizes.append(semantic_size)
+            semantic_receipts.append(semantic_receipt)
+            errors = semantic_errors
         if not errors:
             break
+    if semantic_receipts:
+        document["semantic_review_receipts"] = semantic_receipts
     return document, errors, tuple(request_sizes)
+
+
+def _owner_document_requires_semantic_review(
+    payload: Mapping[str, Any],
+    document: Mapping[str, Any],
+) -> bool:
+    """Review an ambiguous grounded selection that syntax cannot prove."""
+
+    if len(payload.get("owner_action_schema") or []) <= 1:
+        return False
+    units = {
+        str(unit.get("unit_id") or ""): tuple(
+            value
+            for value in (
+                str(unit.get("source_text") or ""),
+                str(unit.get("resolution_evidence") or ""),
+            )
+            if value
+        )
+        for unit in payload.get("semantic_units") or []
+        if isinstance(unit, Mapping)
+    }
+    sources_by_action: dict[int, list[str]] = defaultdict(list)
+    for binding in document.get("bindings") or []:
+        if not isinstance(binding, Mapping):
+            continue
+        unit_sources = units.get(str(binding.get("unit_id") or ""), ())
+        for index in binding.get("action_indexes") or []:
+            if isinstance(index, int):
+                sources_by_action[index].extend(unit_sources)
+    for index, action in enumerate(document.get("actions") or []):
+        if not isinstance(action, Mapping):
+            continue
+        sources = sources_by_action.get(index, [])
+        for argument in semantic_grounding_arguments(action):
+            value = str(action.get(argument) or "").strip()
+            if value and not any(
+                value.casefold() in source.casefold() for source in sources
+            ):
+                return True
+    return False
+
+
+def _stage_b_semantic_review_prompt(owner: str) -> str:
+    return (
+        f"You are the independent Stage B semantic review authority for the "
+        f"AnyChain owner {owner}. Review one immutable, structurally valid owner "
+        "proposal against only the supplied semantic units and registry-derived "
+        "action purposes. You are not a compiler. You must not create, edit, "
+        "replace, reorder, bind, or execute actions. Admit an action only when its "
+        "exact registered purpose and every concrete argument are authorized by "
+        "the source unit bound to that action. A registered action with a similar "
+        "operation label is still wrong when its purpose differs. Values from "
+        "owner state, defaults, examples, or unrelated units are not source "
+        "authorization. Return strict JSON with exactly proposal_hash, "
+        "unit_verdicts, action_verdicts, and reason. unit_verdicts must contain one "
+        "row per semantic unit in order: {unit_id,verdict:'admit'|'reject',reason}. "
+        "action_verdicts must contain one row per candidate action in order: "
+        "{action_index,verdict:'admit'|'reject',reason}. Copy proposal_hash exactly."
+    )
+
+
+def _review_owner_document_semantics(
+    provider: Any,
+    payload: Mapping[str, Any],
+    document: Mapping[str, Any],
+) -> tuple[tuple[str, ...], int, dict[str, Any]]:
+    owner = str(payload.get("owner") or "")
+    proposal_hash = hashlib.sha256(
+        json.dumps(
+            dict(document),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    review_payload = {
+        "owner": owner,
+        "semantic_units": [
+            dict(unit) for unit in payload.get("semantic_units") or []
+        ],
+        "owner_action_schema": [
+            dict(row) for row in payload.get("owner_action_schema") or []
+        ],
+        "candidate": dict(document),
+        "proposal_hash": proposal_hash,
+    }
+    prompt = _stage_b_semantic_review_prompt(owner)
+    response = request_semantic_compilation(
+        provider,
+        system_prompt=prompt,
+        request_payload=review_payload,
+        max_tokens=1800,
+        reasoning_mode=STRICT_JSON_REASONING_MODE,
+    )
+    request_size = _wire_size(prompt, review_payload)
+    errors: list[str] = []
+    try:
+        verdict = json.loads(response)
+    except json.JSONDecodeError:
+        verdict = {}
+        errors.append(f"Stage B {owner} semantic review did not return strict JSON")
+    if not isinstance(verdict, Mapping) or set(verdict) != {
+        "proposal_hash",
+        "unit_verdicts",
+        "action_verdicts",
+        "reason",
+    }:
+        errors.append(f"Stage B {owner} semantic review contract is invalid")
+        verdict = {}
+    if str(verdict.get("proposal_hash") or "") != proposal_hash:
+        errors.append(f"Stage B {owner} semantic review changed proposal hash")
+    units = [dict(unit) for unit in payload.get("semantic_units") or []]
+    unit_verdicts = verdict.get("unit_verdicts")
+    expected_unit_ids = [str(unit.get("unit_id") or "") for unit in units]
+    if not isinstance(unit_verdicts, list) or [
+        str(row.get("unit_id") or "") if isinstance(row, Mapping) else ""
+        for row in unit_verdicts
+    ] != expected_unit_ids:
+        errors.append(f"Stage B {owner} semantic review unit cardinality is invalid")
+        unit_verdicts = []
+    actions = [dict(action) for action in document.get("actions") or []]
+    action_verdicts = verdict.get("action_verdicts")
+    if not isinstance(action_verdicts, list) or [
+        row.get("action_index") if isinstance(row, Mapping) else None
+        for row in action_verdicts
+    ] != list(range(len(actions))):
+        errors.append(f"Stage B {owner} semantic review action cardinality is invalid")
+        action_verdicts = []
+    expected_row_fields = {
+        "unit": {"unit_id", "verdict", "reason"},
+        "action": {"action_index", "verdict", "reason"},
+    }
+    for kind, rows in (("unit", unit_verdicts), ("action", action_verdicts)):
+        for row in rows:
+            if (
+                not isinstance(row, Mapping)
+                or set(row) != expected_row_fields[kind]
+                or str(row.get("verdict") or "") not in {"admit", "reject"}
+                or not str(row.get("reason") or "").strip()
+            ):
+                errors.append(f"Stage B {owner} semantic review {kind} verdict is invalid")
+                continue
+            if str(row.get("verdict")) == "reject":
+                identity = row.get("unit_id", row.get("action_index"))
+                errors.append(
+                    f"Stage B {owner} semantic review rejected {kind} {identity}: "
+                    f"{str(row.get('reason') or '').strip()}"
+                )
+    if not str(verdict.get("reason") or "").strip():
+        errors.append(f"Stage B {owner} semantic review has no reason")
+    receipt = {
+        "proposal_hash": proposal_hash,
+        "review_hash": hashlib.sha256(response.encode("utf-8")).hexdigest(),
+        "request_count": 1,
+        "request_size": request_size,
+        "valid": not errors,
+    }
+    return tuple(dict.fromkeys(errors)), request_size, receipt
 
 
 def _validate_owner_document(

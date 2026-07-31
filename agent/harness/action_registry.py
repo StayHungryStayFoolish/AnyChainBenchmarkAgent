@@ -100,7 +100,7 @@ SEMANTIC_OPERATION_PURPOSES: Mapping[str, str] = {
         "benchmark workflow domain."
     ),
     "evidence_analysis": (
-        "A request to ingest or analyze logs, errors, traces, diagnostics, or "
+        "A request to ingest, diagnose, or explain logs, errors, traces, diagnostics, failures, or "
         "other evidence, including a request made before the evidence is pasted; "
         "or the evidence contribution itself."
     ),

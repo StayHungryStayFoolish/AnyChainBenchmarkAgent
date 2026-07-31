@@ -1903,9 +1903,46 @@ def review_plan_turn_step(state: AgentGraphState) -> AgentGraphState:
             "admission_calls": int(
                 (queue.get("planner_metrics") or {}).get("admission_calls") or 0
             ),
+            "authority_chain": _planner_authority_chain(document),
         },
     )
     return _consume_planner_queue(state, queue)
+
+
+def _planner_authority_chain(
+    document: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project immutable semantic-review evidence into the final receipt."""
+
+    convergence = document.get("stage_a_convergence")
+    stage_a = dict(convergence) if isinstance(convergence, Mapping) else {}
+    if stage_a and str(stage_a.get("selected_proposal") or "") not in {
+        "primary",
+        "secondary",
+        "none",
+    }:
+        stage_a["selected_proposal"] = "rejected"
+    owner_reviews: list[dict[str, Any]] = []
+    for owner, owner_document in sorted(
+        dict(document.get("owner_documents") or {}).items()
+    ):
+        if not isinstance(owner_document, Mapping):
+            continue
+        for receipt in owner_document.get("semantic_review_receipts") or ():
+            if not isinstance(receipt, Mapping):
+                continue
+            owner_reviews.append({
+                "owner": str(owner),
+                "proposal_hash": str(receipt.get("proposal_hash") or ""),
+                "review_hash": str(receipt.get("review_hash") or ""),
+                "request_count": int(receipt.get("request_count") or 0),
+                "request_sizes": [int(receipt.get("request_size") or 0)],
+                "valid": receipt.get("valid") is True,
+            })
+    return {
+        "stage_a_convergence": stage_a,
+        "stage_b_semantic_reviews": owner_reviews,
+    }
 
 
 def _consume_planner_queue(

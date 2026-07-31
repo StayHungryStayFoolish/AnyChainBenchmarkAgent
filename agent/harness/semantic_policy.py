@@ -11,6 +11,14 @@ FRAMED_REQUEST_SEMANTIC_POLICY = (
 )
 
 PENDING_CANDIDATE_SEMANTIC_POLICY = (
+    "A present commitment is a pending answer only when it authorizes one action "
+    "or option accepted by the exact signed pending contract, or supplies one "
+    "admissible manual value for that contract. Refusal, deferral, cancellation, "
+    "or navigation away from a pending question is a pending answer only when the "
+    "signed contract declares that exact effect as an accepted option or action. "
+    "Committing to withhold an answer is not authorization of the pending action. "
+    "Otherwise preserve that source as support for its independently grounded "
+    "operation or as unresolved work. "
     "Syntax candidates are not selections. A value mentioned only as an example, "
     "quotation, rejected option, negated operation, correction target, or value "
     "the user explicitly says not to apply does not answer the pending question. "

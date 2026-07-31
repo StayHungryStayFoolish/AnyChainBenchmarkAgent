@@ -72,6 +72,10 @@ class ControlPlaneResponseContractTest(unittest.TestCase):
                 "status": "reviewed",
                 "result_hash": "4" * 64,
                 "admission_calls": 1,
+                "authority_chain": {
+                    "stage_a_convergence": {},
+                    "stage_b_semantic_reviews": [],
+                },
             },
         )
         for payload in receipts:
@@ -159,6 +163,50 @@ class ControlPlaneResponseContractTest(unittest.TestCase):
         )
         self.assertFalse(valid)
         self.assertIn("failed owner-compilation", reason)
+
+    def test_whole_plan_receipt_binds_semantic_authority_chain(self) -> None:
+        payload = {
+            "receipt_type": "whole_plan_review",
+            "turn_index": 3,
+            "status": "reviewed",
+            "result_hash": "6" * 64,
+            "admission_calls": 3,
+            "authority_chain": {
+                "stage_a_convergence": {
+                    "primary_hash": "1" * 64,
+                    "secondary_hash": "2" * 64,
+                    "selected_proposal": "secondary",
+                    "verdict_hash": "3" * 64,
+                    "request_count": 1,
+                    "request_sizes": [2048],
+                    "valid": True,
+                },
+                "stage_b_semantic_reviews": [{
+                    "owner": "orientation",
+                    "proposal_hash": "4" * 64,
+                    "review_hash": "5" * 64,
+                    "request_count": 1,
+                    "request_sizes": [1024],
+                    "valid": False,
+                }],
+            },
+        }
+
+        self.assertEqual(
+            validate_coordinator_control_receipt(
+                _signed_receipt(payload), turn_index=3
+            ),
+            (True, ""),
+        )
+        forged = json.loads(json.dumps(payload))
+        forged["authority_chain"]["stage_a_convergence"][
+            "request_count"
+        ] = 2
+        valid, reason = validate_coordinator_control_receipt(
+            _signed_receipt(forged), turn_index=3
+        )
+        self.assertFalse(valid)
+        self.assertIn("semantics", reason)
 
     def test_every_registered_control_message_renders_in_both_languages(self) -> None:
         value_by_type = {
