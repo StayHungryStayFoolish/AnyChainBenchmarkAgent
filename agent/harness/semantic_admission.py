@@ -45,6 +45,7 @@ from .questions import (
     coerce_pending_answer,
     declared_option_label_variants,
     exact_answer,
+    manual_action_for_value,
     pending_option_value_exists,
     pending_value_identity,
     semantic_pending_question,
@@ -184,6 +185,43 @@ def _canonicalize_pending_choice_actions(
             ):
                 continue
             if _action_answers_bound_semantic_draft(action, pending):
+                continue
+            declared_manual_action = manual_action_for_value(
+                pending,
+                manual_value,
+            )
+            if (
+                declared_manual_action
+                and str(declared_manual_action.get("type") or "")
+                != "answer_pending"
+                and (
+                    isinstance(
+                        pending.get("semantic_draft_binding"),
+                        Mapping,
+                    )
+                    or isinstance(
+                        pending.get("secret_reentry_binding"),
+                        Mapping,
+                    )
+                )
+            ):
+                declared_spec = ACTION_BY_TYPE.get(
+                    str(declared_manual_action.get("type") or "")
+                )
+                if (
+                    declared_spec is not None
+                    and "source_evidence" in declared_spec.allowed_arguments
+                    and not str(
+                        declared_manual_action.get("source_evidence") or ""
+                    ).strip()
+                ):
+                    declared_manual_action["source_evidence"] = source
+                declared_manual_action["confidence"] = str(
+                    action.get("confidence") or "medium"
+                )
+                actions[index] = validate_action_contract(
+                    declared_manual_action
+                )
                 continue
             canonical = {
                 "type": "answer_pending",

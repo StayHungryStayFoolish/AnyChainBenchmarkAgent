@@ -151,6 +151,54 @@ class SemanticPlanDraftTests(unittest.TestCase):
         self.assertEqual(resolved["active_atom_id"], "")
         validate_semantic_plan_draft(resolved)
 
+    def test_pending_answer_is_canonicalized_to_atomic_draft_resolution(
+        self,
+    ) -> None:
+        from agent.harness.coordinator import _semantic_draft_question
+        from agent.harness.plan_coverage import segment_user_turn
+        from agent.harness.semantic_admission import (
+            prepare_hierarchical_candidate,
+        )
+
+        draft = self._draft(active_group="chain_identity")
+        state = new_state(draft["session_id"], language="en")
+        state["turn_index"] = draft["creation_turn"]
+        state["active_group"] = "chain_identity"
+        _bind_product_head(state)
+        state["semantic_plan_draft"] = draft
+        state["pending_question"] = _semantic_draft_question(draft)
+        clauses = tuple(segment_user_turn("real-node"))
+        candidate = {
+            "actions": [{
+                "type": "answer_pending",
+                "answer": "real-node",
+                "source_evidence": "real-node",
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": clauses[0].clause_id,
+                "source_text": "real-node",
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "manual draft resolution",
+            }],
+        }
+
+        prepared, validation = prepare_hierarchical_candidate(
+            json.dumps(candidate),
+            state,
+            clauses,
+            pending_choice_unit_ids=frozenset({"unit-1"}),
+        )
+
+        self.assertTrue(validation.valid, validation.errors)
+        action = json.loads(prepared)["actions"][0]
+        self.assertEqual(action["type"], "resolve_semantic_draft_atom")
+        self.assertEqual(action["draft_id"], draft["draft_id"])
+        self.assertEqual(action["revision"], draft["revision"])
+        self.assertEqual(action["atom_id"], draft["active_atom_id"])
+        self.assertEqual(action["resolution"], "real-node")
+
     def test_secret_resolution_persists_only_scoped_reference_and_hash(
         self,
     ) -> None:

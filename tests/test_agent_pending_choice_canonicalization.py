@@ -464,6 +464,73 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
             "none",
         )
 
+    def test_bound_manual_answer_dispatches_directly_to_declared_owner(
+        self,
+    ) -> None:
+        from agent.harness.semantic_admission import (
+            _canonicalize_pending_choice_actions,
+        )
+
+        state = _state(active_group="chain_identity")
+        state["pending_question"] = {
+            "id": "semantic-draft-question",
+            "group": "chain_identity",
+            "owner": "coordinator",
+            "kind": "numbered_choice",
+            "manual_input_allowed": True,
+            "options": [],
+            "manual_action": {
+                "type": "resolve_semantic_draft_atom",
+                "draft_id": "draft-id",
+                "revision": 3,
+                "atom_id": "atom-id",
+                "value_argument": "resolution",
+            },
+            "validation": {
+                "value_type": "evidence_contribution",
+                "max_length": 65536,
+            },
+            "semantic_draft_binding": {
+                "draft_id": "draft-id",
+                "revision": 3,
+                "atom_id": "atom-id",
+                "sensitive_input": False,
+            },
+        }
+        candidate = json.dumps({
+            "actions": [{
+                "type": "answer_pending",
+                "answer": "real-node",
+                "source_evidence": "real-node",
+            }],
+            "semantic_units": [{
+                "unit_id": "unit-1",
+                "clause_id": "clause-1",
+                "source_text": "real-node",
+                "disposition": "action",
+                "action_indexes": [0],
+                "reason": "manual draft evidence",
+            }],
+        })
+
+        canonical = json.loads(
+            _canonicalize_pending_choice_actions(candidate, state)
+        )
+
+        self.assertEqual(
+            canonical["actions"],
+            [{
+                "type": "resolve_semantic_draft_atom",
+                "draft_id": "draft-id",
+                "revision": 3,
+                "atom_id": "atom-id",
+                "resolution": "real-node",
+                "source_evidence": "real-node",
+                "confidence": "medium",
+            }],
+        )
+        self.assertNotIn("pending_choice_contracts", canonical)
+
 
     def test_semantic_review_derives_incomplete_intake_from_registry(self) -> None:
         from agent.harness.domains.chain_rpc_questions import _target_change_scope_question
