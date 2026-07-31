@@ -464,8 +464,11 @@ def _valid_planner_authority_chain(value: Any) -> bool:
     if stage_a:
         if set(stage_a) != {
             "primary_hash",
+            "primary_eligible",
             "secondary_hash",
+            "secondary_eligible",
             "selected_proposal",
+            "selection_authority",
             "verdict_hash",
             "request_count",
             "request_sizes",
@@ -475,13 +478,43 @@ def _valid_planner_authority_chain(value: Any) -> bool:
         if (
             not _valid_hash(stage_a.get("primary_hash"))
             or not _valid_hash(stage_a.get("secondary_hash"))
+            or not isinstance(stage_a.get("primary_eligible"), bool)
+            or not isinstance(stage_a.get("secondary_eligible"), bool)
             or not _valid_hash(stage_a.get("verdict_hash"))
             or stage_a.get("selected_proposal")
             not in {"primary", "secondary", "none", "rejected"}
+            or stage_a.get("selection_authority")
+            not in {"harness_eligibility", "model_convergence"}
             or not _valid_nonnegative_integer(stage_a.get("request_count"))
             or not _valid_request_sizes(stage_a.get("request_sizes"))
             or int(stage_a["request_count"]) != len(stage_a["request_sizes"])
-            or int(stage_a["request_count"]) == 0
+            or (
+                stage_a.get("selection_authority") == "model_convergence"
+                and int(stage_a["request_count"]) == 0
+            )
+            or (
+                stage_a.get("selection_authority") == "harness_eligibility"
+                and int(stage_a["request_count"]) != 0
+            )
+            or (
+                stage_a.get("selection_authority") == "harness_eligibility"
+                and (
+                    stage_a["primary_eligible"]
+                    == stage_a["secondary_eligible"]
+                    or stage_a.get("selected_proposal")
+                    != (
+                        "primary"
+                        if stage_a["primary_eligible"]
+                        else "secondary"
+                    )
+                    or stage_a.get("valid") is not True
+                )
+            )
+            or (
+                stage_a.get("selection_authority") == "model_convergence"
+                and stage_a["primary_eligible"]
+                != stage_a["secondary_eligible"]
+            )
             or not isinstance(stage_a.get("valid"), bool)
             or (
                 stage_a.get("valid") is True

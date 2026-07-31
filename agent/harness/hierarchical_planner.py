@@ -224,20 +224,42 @@ def begin_semantic_partition(
             admission_errors,
             stage_a_admission_sizes,
             redundant_unit_ids,
-        ) = _review_stage_a_partition(provider, stage_a_payload, partition)
+            primary_review_contract_valid,
+        ) = _stage_a_review_result(
+            _review_stage_a_partition(
+                provider,
+                stage_a_payload,
+                partition,
+                include_contract_valid=True,
+            )
+        )
         document["request_sizes"].extend(stage_a_admission_sizes)
         document["admission_calls"] += len(stage_a_admission_sizes)
-        if admission_errors:
-            document["status"] = "failed"
-            document["errors"] = list(admission_errors)
-            document["unit_count"] = len(partition)
-            return document
-        source_partition, compilation_partition = (
-            _partition_after_stage_a_admission(partition, redundant_unit_ids)
+        primary_review_valid = not admission_errors
+        if primary_review_valid:
+            source_partition, compilation_partition = (
+                _partition_after_stage_a_admission(
+                    partition,
+                    redundant_unit_ids,
+                )
+            )
+        else:
+            source_partition = [dict(unit) for unit in partition]
+            compilation_partition = []
+        recoverable_primary_rejection = bool(
+            admission_errors
+            and primary_review_contract_valid
+            and any(
+                str(unit.get("operation") or "") == "unresolved"
+                for unit in partition
+            )
         )
-        if _partition_requires_independent_proposal(
-            source_partition,
-            stage_a_payload,
+        if recoverable_primary_rejection or (
+            not admission_errors
+            and _partition_requires_independent_proposal(
+                source_partition,
+                stage_a_payload,
+            )
         ):
             (
                 independent_partition,
@@ -262,16 +284,23 @@ def begin_semantic_partition(
                 independent_admission_errors,
                 independent_admission_sizes,
                 independent_redundant_unit_ids,
-            ) = _review_stage_a_partition(
-                provider,
-                stage_a_payload,
-                independent_partition,
+                _independent_review_contract_valid,
+            ) = _stage_a_review_result(
+                _review_stage_a_partition(
+                    provider,
+                    stage_a_payload,
+                    independent_partition,
+                    include_contract_valid=True,
+                )
             )
             document["request_sizes"].extend(independent_admission_sizes)
             document["admission_calls"] += len(independent_admission_sizes)
             if independent_admission_errors:
                 document["status"] = "failed"
-                document["errors"] = list(independent_admission_errors)
+                document["errors"] = list(dict.fromkeys((
+                    *admission_errors,
+                    *independent_admission_errors,
+                )))
                 document["unit_count"] = len(source_partition)
                 return document
             (
@@ -291,6 +320,13 @@ def begin_semantic_partition(
                 stage_a_payload,
                 source_partition,
                 independent_source_partition,
+                primary_eligible=(
+                    primary_review_valid
+                    and _proposal_selection_eligible(source_partition)
+                ),
+                secondary_eligible=_proposal_selection_eligible(
+                    independent_source_partition
+                ),
             )
             document["request_sizes"].extend(convergence_sizes)
             document["admission_calls"] += len(convergence_sizes)
@@ -303,6 +339,11 @@ def begin_semantic_partition(
             if convergence_receipt["selected_proposal"] == "secondary":
                 source_partition = independent_source_partition
                 compilation_partition = independent_compilation_partition
+        elif admission_errors:
+            document["status"] = "failed"
+            document["errors"] = list(admission_errors)
+            document["unit_count"] = len(partition)
+            return document
         source_partition, compilation_partition = (
             _canonicalize_atomic_evidence_partition(
                 state, clauses, source_partition, compilation_partition
@@ -520,6 +561,9 @@ def _select_stage_a_proposal(
     stage_a_payload: Mapping[str, Any],
     primary: Sequence[Mapping[str, Any]],
     secondary: Sequence[Mapping[str, Any]],
+    *,
+    primary_eligible: bool | None = None,
+    secondary_eligible: bool | None = None,
 ) -> tuple[
     list[dict[str, Any]],
     tuple[str, ...],
@@ -528,6 +572,47 @@ def _select_stage_a_proposal(
 ]:
     primary_hash = _partition_hash(primary)
     secondary_hash = _partition_hash(secondary)
+    primary_can_select = (
+        _proposal_selection_eligible(primary)
+        if primary_eligible is None
+        else bool(primary_eligible)
+    )
+    secondary_can_select = (
+        _proposal_selection_eligible(secondary)
+        if secondary_eligible is None
+        else bool(secondary_eligible)
+    )
+    if primary_can_select != secondary_can_select:
+        selected = "primary" if primary_can_select else "secondary"
+        selected_partition = primary if primary_can_select else secondary
+        verdict = {
+            "selected_proposal": selected,
+            "primary_hash": primary_hash,
+            "primary_eligible": primary_can_select,
+            "secondary_hash": secondary_hash,
+            "secondary_eligible": secondary_can_select,
+            "reason": "Harness selected the sole independently eligible proposal.",
+        }
+        receipt = {
+            "primary_hash": primary_hash,
+            "primary_eligible": primary_can_select,
+            "secondary_hash": secondary_hash,
+            "secondary_eligible": secondary_can_select,
+            "selected_proposal": selected,
+            "selection_authority": "harness_eligibility",
+            "verdict_hash": hashlib.sha256(
+                json.dumps(
+                    verdict,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "request_count": 0,
+            "request_sizes": [],
+            "valid": True,
+        }
+        return [dict(unit) for unit in selected_partition], (), (), receipt
     payload = {
         "user_text": stage_a_payload["user_text"],
         "clauses": stage_a_payload["clauses"],
@@ -551,12 +636,12 @@ def _select_stage_a_proposal(
         ),
         "primary": {
             "hash": primary_hash,
-            "selection_eligible": _proposal_selection_eligible(primary),
+            "selection_eligible": primary_can_select,
             "semantic_units": [dict(unit) for unit in primary],
         },
         "secondary": {
             "hash": secondary_hash,
-            "selection_eligible": _proposal_selection_eligible(secondary),
+            "selection_eligible": secondary_can_select,
             "semantic_units": [dict(unit) for unit in secondary],
         },
     }
@@ -595,16 +680,25 @@ def _select_stage_a_proposal(
     if selected == "none":
         errors.append("Stage A proposals did not converge on complete turn coverage")
     selected_partition = secondary if selected == "secondary" else primary
+    selected_eligible = (
+        secondary_can_select if selected == "secondary" else primary_can_select
+    )
     if (
         selected in {"primary", "secondary"}
-        and not _proposal_selection_eligible(selected_partition)
-        and primary_hash != secondary_hash
+        and not selected_eligible
+        and not (
+            primary_hash == secondary_hash
+            and primary_can_select == secondary_can_select
+        )
     ):
         errors.append("Stage A convergence selected an incomplete proposal")
     receipt = {
         "primary_hash": primary_hash,
+        "primary_eligible": primary_can_select,
         "secondary_hash": secondary_hash,
+        "secondary_eligible": secondary_can_select,
         "selected_proposal": selected,
+        "selection_authority": "model_convergence",
         "verdict_hash": hashlib.sha256(response.encode("utf-8")).hexdigest(),
         "request_count": len(request_sizes),
         "request_sizes": list(request_sizes),
@@ -2257,7 +2351,44 @@ def _review_stage_a_partition(
     provider: Any,
     stage_a_payload: Mapping[str, Any],
     partition: Sequence[Mapping[str, Any]],
-) -> tuple[tuple[str, ...], tuple[int, ...], frozenset[str]]:
+    *,
+    include_contract_valid: bool = False,
+) -> (
+    tuple[tuple[str, ...], tuple[int, ...], frozenset[str]]
+    | tuple[tuple[str, ...], tuple[int, ...], frozenset[str], bool]
+):
+    errors, sizes, redundant, _contract_valid = (
+        _review_stage_a_partition_detailed(
+            provider,
+            stage_a_payload,
+            partition,
+        )
+    )
+    if include_contract_valid:
+        return errors, sizes, redundant, _contract_valid
+    return errors, sizes, redundant
+
+
+def _stage_a_review_result(
+    result: (
+        tuple[tuple[str, ...], tuple[int, ...], frozenset[str]]
+        | tuple[tuple[str, ...], tuple[int, ...], frozenset[str], bool]
+    ),
+) -> tuple[tuple[str, ...], tuple[int, ...], frozenset[str], bool]:
+    """Normalize compact and contract-aware admission results."""
+
+    if len(result) == 4:
+        errors, sizes, redundant, contract_valid = result
+        return errors, sizes, redundant, bool(contract_valid)
+    errors, sizes, redundant = result
+    return errors, sizes, redundant, not errors
+
+
+def _review_stage_a_partition_detailed(
+    provider: Any,
+    stage_a_payload: Mapping[str, Any],
+    partition: Sequence[Mapping[str, Any]],
+) -> tuple[tuple[str, ...], tuple[int, ...], frozenset[str], bool]:
     prompt = _stage_a_admission_prompt()
     payload = {
         "user_text": stage_a_payload["user_text"],
@@ -2346,11 +2477,17 @@ def _review_stage_a_partition(
             )
         )
         if not contract_errors:
-            return semantic_errors, tuple(request_sizes), redundant_unit_ids
+            return (
+                semantic_errors,
+                tuple(request_sizes),
+                redundant_unit_ids,
+                True,
+            )
     return (
         tuple(dict.fromkeys((*contract_errors, *semantic_errors))),
         tuple(request_sizes),
         frozenset(),
+        False,
     )
 
 

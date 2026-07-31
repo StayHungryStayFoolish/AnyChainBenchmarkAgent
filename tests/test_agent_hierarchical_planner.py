@@ -2385,13 +2385,6 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             if "Stage A semantic partition" in system:
                 proposal_calls += 1
                 return json.dumps(primary if proposal_calls == 1 else secondary)
-            if "Stage A proposal convergence authority" in system:
-                return json.dumps({
-                    "selected_proposal": "secondary",
-                    "primary_hash": payload["primary"]["hash"],
-                    "secondary_hash": payload["secondary"]["hash"],
-                    "reason": "only the secondary routes both explicit operations",
-                })
             if "Stage A coverage authority" in system:
                 units = payload["semantic_units"]
                 unresolved = any(
@@ -2448,8 +2441,8 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "compile_owner", result)
         self.assertEqual(result["stage_a_calls"], 2)
-        self.assertEqual(result["admission_calls"], 3)
-        self.assertEqual(compiler.call_count, 5)
+        self.assertEqual(result["admission_calls"], 2)
+        self.assertEqual(compiler.call_count, 4)
         self.assertEqual(
             [unit["operation"] for unit in result["routed_partition"]],
             ["navigation", "domain_request"],
@@ -2457,6 +2450,10 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(
             result["stage_a_convergence"]["selected_proposal"],
             "secondary",
+        )
+        self.assertEqual(
+            result["stage_a_convergence"]["request_count"],
+            0,
         )
 
     def test_stage_a_convergence_rejects_selector_hash_substitution(self) -> None:
@@ -2466,9 +2463,9 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             "unit_id": "primary",
             "clause_id": "clause-1",
             "source_text": "change it",
-            "operation": "unresolved",
-            "owner_routes": [],
-            "reason": "uncertain",
+            "operation": "navigation",
+            "owner_routes": [{"owner": "coordinator", "group": "opening"}],
+            "reason": "navigation",
         }]
         secondary = [{
             "unit_id": "secondary",
@@ -2507,7 +2504,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertTrue(any("secondary proposal hash" in error for error in errors))
         self.assertEqual(receipt["selected_proposal"], "secondary")
 
-    def test_stage_a_convergence_rejects_distinct_incomplete_selection(
+    def test_stage_a_convergence_selects_the_only_eligible_proposal(
         self,
     ) -> None:
         from agent.harness.hierarchical_planner import _select_stage_a_proposal
@@ -2540,30 +2537,23 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             "universal_operation_purposes": {},
         }
 
-        def response(*_args, **kwargs):
-            request = kwargs["request_payload"]
-            self.assertFalse(request["primary"]["selection_eligible"])
-            self.assertTrue(request["secondary"]["selection_eligible"])
-            return json.dumps({
-                "selected_proposal": "primary",
-                "primary_hash": request["primary"]["hash"],
-                "secondary_hash": request["secondary"]["hash"],
-                "reason": "selected the unresolved proposal",
-            })
-
         with patch(
             "agent.harness.hierarchical_planner.request_semantic_compilation",
-            side_effect=response,
-        ):
-            _selected, errors, _sizes, receipt = _select_stage_a_proposal(
+        ) as compiler:
+            selected, errors, sizes, receipt = _select_stage_a_proposal(
                 object(), payload, primary, secondary
             )
 
-        self.assertIn(
-            "Stage A convergence selected an incomplete proposal",
-            errors,
-        )
-        self.assertFalse(receipt["valid"])
+        compiler.assert_not_called()
+        self.assertEqual(selected, secondary)
+        self.assertEqual(errors, ())
+        self.assertEqual(sizes, ())
+        self.assertTrue(receipt["valid"])
+        self.assertEqual(receipt["selected_proposal"], "secondary")
+        self.assertEqual(receipt["selection_authority"], "harness_eligibility")
+        self.assertFalse(receipt["primary_eligible"])
+        self.assertTrue(receipt["secondary_eligible"])
+        self.assertEqual(receipt["request_count"], 0)
 
     def test_malformed_independent_stage_a_proposal_fails_closed(self) -> None:
         from agent.harness.hierarchical_planner import begin_semantic_partition

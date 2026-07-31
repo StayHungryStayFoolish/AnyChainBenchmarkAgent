@@ -211,8 +211,11 @@ class ControlPlaneResponseContractTest(unittest.TestCase):
             "authority_chain": {
                 "stage_a_convergence": {
                     "primary_hash": "1" * 64,
+                    "primary_eligible": True,
                     "secondary_hash": "2" * 64,
+                    "secondary_eligible": True,
                     "selected_proposal": "secondary",
+                    "selection_authority": "model_convergence",
                     "verdict_hash": "3" * 64,
                     "request_count": 1,
                     "request_sizes": [2048],
@@ -241,6 +244,36 @@ class ControlPlaneResponseContractTest(unittest.TestCase):
         ] = 2
         valid, reason = validate_coordinator_control_receipt(
             _signed_receipt(forged), turn_index=3
+        )
+        self.assertFalse(valid)
+        self.assertIn("semantics", reason)
+
+        deterministic = json.loads(json.dumps(payload))
+        convergence = deterministic["authority_chain"]["stage_a_convergence"]
+        convergence["selection_authority"] = "harness_eligibility"
+        convergence["primary_eligible"] = False
+        convergence["secondary_eligible"] = True
+        convergence["request_count"] = 0
+        convergence["request_sizes"] = []
+        self.assertEqual(
+            validate_coordinator_control_receipt(
+                _signed_receipt(deterministic), turn_index=3
+            ),
+            (True, ""),
+        )
+        convergence["request_count"] = 1
+        convergence["request_sizes"] = [2048]
+        valid, reason = validate_coordinator_control_receipt(
+            _signed_receipt(deterministic), turn_index=3
+        )
+        self.assertFalse(valid)
+        self.assertIn("semantics", reason)
+
+        convergence["request_count"] = 0
+        convergence["request_sizes"] = []
+        convergence["primary_eligible"] = True
+        valid, reason = validate_coordinator_control_receipt(
+            _signed_receipt(deterministic), turn_index=3
         )
         self.assertFalse(valid)
         self.assertIn("semantics", reason)
