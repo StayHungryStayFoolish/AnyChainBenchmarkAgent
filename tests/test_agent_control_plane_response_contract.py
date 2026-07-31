@@ -44,6 +44,34 @@ def _manifest(role: str = "error") -> dict[str, str]:
 
 
 class ControlPlaneResponseContractTest(unittest.TestCase):
+    def test_runtime_turn_summary_preserves_external_clarification_receipt(
+        self,
+    ) -> None:
+        from agent.harness.graph import _turn_receipt_summary
+
+        state = new_state("draft-runtime-lineage", language="en")
+        state["turn_receipt"] = {
+            "turn_id": "source-replay",
+            "input_hash": "a" * 64,
+            "submitted_input_hash": "b" * 64,
+            "input_shape": "semantic_draft_finalization",
+            "language": "en",
+        }
+        state["turn_context"]["semantic_draft_clarification_receipt"] = {
+            "turn_id": "external-turn",
+            "input_hash": "c" * 64,
+            "submitted_input_hash": "c" * 64,
+            "input_shape": "prose",
+            "language": "en",
+        }
+
+        summary = _turn_receipt_summary(state)
+
+        self.assertEqual(summary["turn_id"], "external-turn")
+        self.assertEqual(summary["input_hash"], "c" * 64)
+        self.assertEqual(summary["input_shape"], "prose")
+        self.assertEqual(state["turn_receipt"]["turn_id"], "source-replay")
+
     def test_hierarchical_planner_stage_receipts_are_registered_and_strict(self) -> None:
         receipts = (
             {

@@ -1689,7 +1689,15 @@ def _admitted_action_provenance(state: Mapping[str, Any]) -> list[dict[str, Any]
 
 
 def _turn_receipt_summary(state: Mapping[str, Any]) -> dict[str, Any]:
-    receipt = dict(state.get("turn_receipt") or {})
+    turn_context = dict(state.get("turn_context") or {})
+    clarification_receipt = turn_context.get(
+        "semantic_draft_clarification_receipt"
+    )
+    receipt = dict(
+        clarification_receipt
+        if isinstance(clarification_receipt, Mapping)
+        else state.get("turn_receipt") or {}
+    )
     if not receipt:
         return {}
     semantic_units = []

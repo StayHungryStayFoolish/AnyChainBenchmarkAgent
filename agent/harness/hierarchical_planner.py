@@ -259,6 +259,29 @@ def begin_semantic_partition(
                 document["unit_count"] = len(source_partition)
                 return document
             (
+                independent_admission_errors,
+                independent_admission_sizes,
+                independent_redundant_unit_ids,
+            ) = _review_stage_a_partition(
+                provider,
+                stage_a_payload,
+                independent_partition,
+            )
+            document["request_sizes"].extend(independent_admission_sizes)
+            document["admission_calls"] += len(independent_admission_sizes)
+            if independent_admission_errors:
+                document["status"] = "failed"
+                document["errors"] = list(independent_admission_errors)
+                document["unit_count"] = len(source_partition)
+                return document
+            (
+                independent_source_partition,
+                independent_compilation_partition,
+            ) = _partition_after_stage_a_admission(
+                independent_partition,
+                independent_redundant_unit_ids,
+            )
+            (
                 selected_partition,
                 convergence_errors,
                 convergence_sizes,
@@ -267,7 +290,7 @@ def begin_semantic_partition(
                 provider,
                 stage_a_payload,
                 source_partition,
-                independent_partition,
+                independent_source_partition,
             )
             document["request_sizes"].extend(convergence_sizes)
             document["admission_calls"] += len(convergence_sizes)
@@ -278,28 +301,8 @@ def begin_semantic_partition(
                 document["unit_count"] = len(source_partition)
                 return document
             if convergence_receipt["selected_proposal"] == "secondary":
-                (
-                    secondary_admission_errors,
-                    secondary_admission_sizes,
-                    secondary_redundant_unit_ids,
-                ) = _review_stage_a_partition(
-                    provider,
-                    stage_a_payload,
-                    selected_partition,
-                )
-                document["request_sizes"].extend(secondary_admission_sizes)
-                document["admission_calls"] += len(secondary_admission_sizes)
-                if secondary_admission_errors:
-                    document["status"] = "failed"
-                    document["errors"] = list(secondary_admission_errors)
-                    document["unit_count"] = len(selected_partition)
-                    return document
-                source_partition, compilation_partition = (
-                    _partition_after_stage_a_admission(
-                        selected_partition,
-                        secondary_redundant_unit_ids,
-                    )
-                )
+                source_partition = independent_source_partition
+                compilation_partition = independent_compilation_partition
         source_partition, compilation_partition = (
             _canonicalize_atomic_evidence_partition(
                 state, clauses, source_partition, compilation_partition
@@ -467,6 +470,17 @@ def _partition_hash(partition: Sequence[Mapping[str, Any]]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _proposal_selection_eligible(
+    partition: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Return whether a reviewed proposal is complete enough to select."""
+
+    return bool(partition) and not any(
+        str(unit.get("operation") or "") == "unresolved"
+        for unit in partition
+    )
+
+
 def _stage_a_convergence_prompt() -> str:
     return (
         "You are the independent Stage A proposal convergence authority for "
@@ -490,7 +504,11 @@ def _stage_a_convergence_prompt() -> str:
         "the exact active pending contract. Rejection, deferral, explanation, or "
         "navigation away from that question is not a pending answer. Genuine "
         "semantic uncertainty may remain unresolved when neither "
-        "proposal has a safe source-grounded route. Return one strict JSON object "
+        "proposal has a safe source-grounded route. selection_eligible is a "
+        "Harness-derived completeness fact. Never select an ineligible proposal "
+        "unless both independently reviewed proposals are byte-identical; that "
+        "identity represents convergence on the same clarification boundary, not "
+        "authority to execute the unresolved unit. Return one strict JSON object "
         "with exactly selected_proposal, primary_hash, secondary_hash, and reason. "
         "Copy both supplied hashes exactly. "
         f"{PENDING_CANDIDATE_SEMANTIC_POLICY}"
@@ -533,10 +551,12 @@ def _select_stage_a_proposal(
         ),
         "primary": {
             "hash": primary_hash,
+            "selection_eligible": _proposal_selection_eligible(primary),
             "semantic_units": [dict(unit) for unit in primary],
         },
         "secondary": {
             "hash": secondary_hash,
+            "selection_eligible": _proposal_selection_eligible(secondary),
             "semantic_units": [dict(unit) for unit in secondary],
         },
     }
@@ -574,6 +594,13 @@ def _select_stage_a_proposal(
         errors.append("Stage A convergence has no reason")
     if selected == "none":
         errors.append("Stage A proposals did not converge on complete turn coverage")
+    selected_partition = secondary if selected == "secondary" else primary
+    if (
+        selected in {"primary", "secondary"}
+        and not _proposal_selection_eligible(selected_partition)
+        and primary_hash != secondary_hash
+    ):
+        errors.append("Stage A convergence selected an incomplete proposal")
     receipt = {
         "primary_hash": primary_hash,
         "secondary_hash": secondary_hash,
@@ -583,7 +610,7 @@ def _select_stage_a_proposal(
         "request_sizes": list(request_sizes),
         "valid": not errors,
     }
-    chosen = secondary if selected == "secondary" else primary
+    chosen = selected_partition
     return (
         [dict(unit) for unit in chosen],
         tuple(dict.fromkeys(errors)),
