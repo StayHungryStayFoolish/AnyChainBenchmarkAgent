@@ -1335,7 +1335,7 @@ TRUSTED_ACTION_METADATA_FIELDS = frozenset({
     "_merged_origin_texts",
 })
 
-SEMANTIC_ADMISSION_RECEIPT_VERSION = 2
+SEMANTIC_ADMISSION_RECEIPT_VERSION = 3
 
 
 def action_registry_contract_hash() -> str:
@@ -1777,7 +1777,16 @@ def build_semantic_consensus_receipt(
     request_count: int,
     request_sizes: Sequence[int],
 ) -> dict[str, Any]:
-    """Mint one durable two-review receipt for grounded state mutations."""
+    """Mint one durable receipt for every grounded-mutation authority."""
+
+    normalized_review_hashes = [
+        str(value).strip()
+        for value in review_hashes
+        if str(value).strip()
+    ]
+    review_ids = ["primary", "consensus"]
+    if len(normalized_review_hashes) == 3:
+        review_ids.append("closed_enum_grounding")
 
     payload = {
         "version": SEMANTIC_ADMISSION_RECEIPT_VERSION,
@@ -1792,12 +1801,8 @@ def build_semantic_consensus_receipt(
             for value in admission_action_ids
             if str(value).strip()
         ],
-        "review_hashes": [
-            str(value).strip()
-            for value in review_hashes
-            if str(value).strip()
-        ],
-        "review_ids": ["primary", "consensus"],
+        "review_hashes": normalized_review_hashes,
+        "review_ids": review_ids,
         "request_count": int(request_count),
         "request_sizes": [int(value) for value in request_sizes],
         "action_contract_hash": action_registry_contract_hash(),
@@ -1813,7 +1818,8 @@ def build_semantic_consensus_receipt(
                 "plan_hash",
             )
         )
-        or len(payload["review_hashes"]) != 2
+        or len(payload["review_hashes"]) not in {2, 3}
+        or len(payload["review_ids"]) != len(payload["review_hashes"])
         or not payload["admission_action_ids"]
         or payload["request_count"] != len(payload["request_sizes"])
         or payload["request_count"] < 2

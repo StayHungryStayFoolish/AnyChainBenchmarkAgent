@@ -1,9 +1,10 @@
 """Bounded semantic compilation and immutable whole-plan admission.
 
 The configured model gets one compilation call and an independent admission
-boundary.  Plans that mutate state through a model-grounded semantic value
-require two independent admissions.  Admission can reject a complete
-candidate, but it cannot edit the candidate.  The caller may run one repair
+boundary. Plans that mutate state through a model-grounded semantic value
+require two independent whole-plan admissions. Closed-enum mutations also
+require a compact value-polarity admission. Admission can reject a complete
+candidate, but it cannot edit the candidate. The caller may run one repair
 compilation followed by final admission; this module never retries per action
 or per semantic unit.
 """
@@ -450,6 +451,221 @@ def whole_plan_admission_prompt(semantic_policy: str) -> str:
     )
 
 
+def closed_enum_grounding_prompt() -> str:
+    """Return the independent compact value-polarity review contract."""
+
+    return (
+        "You are the independent closed-enum value grounding authority for "
+        "AnyChain. You are not a planner and must not create, replace, infer, "
+        "or repair an action. Judge only whether each supplied selected_value "
+        "is affirmatively selected by its exact source units. Return exactly "
+        "one JSON object with exactly these keys: plan_hash, verdicts, reason. "
+        "Echo plan_hash exactly. Return exactly one verdict for every supplied "
+        "grounding in order. Each verdict is "
+        "{action_id,argument_name,selected_value,status,evidence_quote,reason}. "
+        "Copy action_id, argument_name, and selected_value exactly. status must "
+        "be exactly one of selected, rejected, mentioned_only, or unresolved. "
+        "selected means the source affirmatively chooses that exact value. "
+        "rejected means the source negates, excludes, refuses, replaces, or "
+        "says not to apply that value. mentioned_only means the value is an "
+        "example, comparison, quotation, old value, context, or bare mention "
+        "without selecting it. unresolved means the source asks to change the "
+        "dimension or excludes one value while several legal alternatives "
+        "remain, but does not affirmatively select one exact remaining value. "
+        "A negated value is never selected. Do not infer a remaining enum value "
+        "from exclusion. evidence_quote must be the shortest exact substring "
+        "of one supplied evidence_source that proves the status, including the "
+        "negation or contrast when status is rejected or unresolved. Give a "
+        "non-empty reason for every verdict. Malformed ids, missing rows, "
+        "invented quotes, uncertainty, or conflicting evidence fail closed."
+    )
+
+
+def _closed_enum_grounding_request(
+    plan: ImmutableSemanticPlan,
+) -> dict[str, Any] | None:
+    request = plan.request_payload()
+    units = {
+        str(row.get("unit_id") or ""): row
+        for row in request.get("semantic_units") or []
+        if isinstance(row, Mapping)
+    }
+    groundings: list[dict[str, Any]] = []
+    for record in request.get("actions") or []:
+        if not isinstance(record, Mapping):
+            continue
+        action_id = str(record.get("action_id") or "")
+        operation_arguments = (
+            record.get("operation_arguments")
+            if isinstance(record.get("operation_arguments"), Mapping)
+            else {}
+        )
+        enum_domains = (
+            record.get("closed_enum_grounding_values")
+            if isinstance(record.get("closed_enum_grounding_values"), Mapping)
+            else {}
+        )
+        source_units = [
+            {
+                "unit_id": unit_id,
+                "evidence_sources": [
+                    str(value)
+                    for value in (
+                        (units.get(unit_id) or {}).get("evidence_sources")
+                        or [
+                            str(
+                                (units.get(unit_id) or {}).get("source_text")
+                                or ""
+                            )
+                        ]
+                    )
+                    if str(value)
+                ],
+            }
+            for unit_id in record.get("unit_ids") or []
+            if str(unit_id) in units
+        ]
+        for argument in record.get("required_value_grounding_arguments") or []:
+            argument_name = str(argument or "")
+            enum_values = enum_domains.get(argument_name)
+            selected_value = operation_arguments.get(argument_name)
+            if (
+                not argument_name
+                or not isinstance(enum_values, list)
+                or selected_value in (None, "")
+            ):
+                continue
+            groundings.append({
+                "action_id": action_id,
+                "argument_name": argument_name,
+                "selected_value": selected_value,
+                "enum_values": list(enum_values),
+                "source_units": source_units,
+            })
+    if not groundings:
+        return None
+    return {
+        "plan_hash": plan.plan_hash,
+        "groundings": groundings,
+    }
+
+
+def _validate_closed_enum_grounding(
+    text: str,
+    request: Mapping[str, Any],
+) -> tuple[bool, tuple[str, ...], frozenset[str], Mapping[str, Any] | None]:
+    expected = [
+        dict(row)
+        for row in request.get("groundings") or []
+        if isinstance(row, Mapping)
+    ]
+    expected_action_ids = frozenset(
+        str(row.get("action_id") or "")
+        for row in expected
+        if str(row.get("action_id") or "")
+    )
+    errors: list[str] = []
+    try:
+        payload = _strict_json_object(text)
+    except ValueError as exc:
+        return False, (str(exc),), expected_action_ids, None
+    if set(payload) != {"plan_hash", "verdicts", "reason"}:
+        errors.append(
+            "closed-enum grounding response has missing or undeclared keys"
+        )
+    if str(payload.get("plan_hash") or "") != str(
+        request.get("plan_hash") or ""
+    ):
+        errors.append("closed-enum grounding plan hash mismatch")
+    if not str(payload.get("reason") or "").strip():
+        errors.append("closed-enum grounding response has no reason")
+    verdicts = payload.get("verdicts")
+    rows = list(verdicts) if isinstance(verdicts, list) else []
+    if not isinstance(verdicts, list):
+        errors.append("closed-enum grounding verdicts is not a list")
+    if len(rows) != len(expected):
+        errors.append("closed-enum grounding verdict cardinality mismatch")
+    rejected: set[str] = set()
+    verdict_keys = {
+        "action_id",
+        "argument_name",
+        "selected_value",
+        "status",
+        "evidence_quote",
+        "reason",
+    }
+    for index, expected_row in enumerate(expected):
+        if index >= len(rows) or not isinstance(rows[index], Mapping):
+            rejected.add(str(expected_row.get("action_id") or ""))
+            continue
+        row = dict(rows[index])
+        action_id = str(expected_row.get("action_id") or "")
+        if set(row) != verdict_keys:
+            errors.append(
+                "closed-enum grounding verdict has missing or undeclared keys: "
+                f"{action_id or '<missing>'}"
+            )
+        for key in ("action_id", "argument_name", "selected_value"):
+            if row.get(key) != expected_row.get(key):
+                errors.append(
+                    "closed-enum grounding verdict identity mismatch: "
+                    f"{action_id or '<missing>'}/{key}"
+                )
+        status = str(row.get("status") or "")
+        if status not in {
+            "selected",
+            "rejected",
+            "mentioned_only",
+            "unresolved",
+        }:
+            errors.append(
+                "closed-enum grounding verdict status is invalid: "
+                f"{action_id or '<missing>'}"
+            )
+        quote = str(row.get("evidence_quote") or "")
+        sources = [
+            str(source)
+            for unit in expected_row.get("source_units") or []
+            if isinstance(unit, Mapping)
+            for source in unit.get("evidence_sources") or []
+            if str(source)
+        ]
+        if not quote or not any(quote in source for source in sources):
+            errors.append(
+                "closed-enum grounding evidence is not exact: "
+                f"{action_id or '<missing>'}"
+            )
+        if not str(row.get("reason") or "").strip():
+            errors.append(
+                "closed-enum grounding verdict has no reason: "
+                f"{action_id or '<missing>'}"
+            )
+        if status != "selected":
+            rejected.add(action_id)
+    if errors:
+        rejected.update(expected_action_ids)
+    rejected.discard("")
+    return not errors and not rejected, tuple(errors), frozenset(rejected), payload
+
+
+def _reject_closed_enum_actions(
+    admission: WholePlanAdmission,
+    action_ids: Collection[str],
+) -> tuple[dict[str, Any], ...]:
+    rejected = {str(value) for value in action_ids if str(value)}
+    rows: list[dict[str, Any]] = []
+    for raw in admission.action_verdicts:
+        row = dict(raw)
+        if str(row.get("action_id") or "") in rejected:
+            row["verdict"] = "reject"
+            row["reason"] = (
+                "independent closed-enum grounding did not affirm the "
+                "immutable selected value"
+            )
+        rows.append(row)
+    return tuple(rows)
+
+
 def request_whole_plan_admission(
     provider: Any,
     plan: ImmutableSemanticPlan,
@@ -552,6 +768,49 @@ def request_whole_plan_admission(
             consensus_required=True,
             review_hashes=tuple(review_hashes),
         )
+    grounding_request = _closed_enum_grounding_request(plan)
+    if grounding_request is not None:
+        prompt = closed_enum_grounding_prompt()
+        payload_text = _canonical_json(grounding_request)
+        request_sizes.append(
+            len(prompt.encode("utf-8")) + len(payload_text.encode("utf-8"))
+        )
+        response = provider.complete(LLMRequest(
+            messages=[
+                LLMMessage(role="system", content=prompt),
+                LLMMessage(role="user", content=payload_text),
+            ],
+            temperature=0.0,
+            max_tokens=min(max_tokens, 2400),
+            reasoning_mode=reasoning_mode,
+            replay_safety="side_effect_free",
+        ))
+        grounding_valid, grounding_errors, rejected_ids, grounding_payload = (
+            _validate_closed_enum_grounding(
+                str(response.text or ""),
+                grounding_request,
+            )
+        )
+        review_hashes.append(
+            _content_hash(grounding_payload or str(response.text or ""))
+        )
+        if not grounding_valid:
+            return replace(
+                primary,
+                valid=False,
+                errors=tuple(dict.fromkeys([
+                    "independent closed-enum grounding rejected the immutable plan",
+                    *grounding_errors,
+                ])),
+                action_verdicts=_reject_closed_enum_actions(
+                    primary,
+                    rejected_ids,
+                ),
+                request_count=len(request_sizes),
+                request_sizes=tuple(request_sizes),
+                consensus_required=True,
+                review_hashes=tuple(review_hashes),
+            )
     return replace(
         primary,
         request_count=len(request_sizes),

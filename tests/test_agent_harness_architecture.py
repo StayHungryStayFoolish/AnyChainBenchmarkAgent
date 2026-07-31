@@ -317,10 +317,12 @@ def _immutable_admission_fixture() -> tuple[Any, dict[str, Any]]:
     return plan, _whole_plan_admission_payload(request)
 
 
-def _grounded_mutation_admission_fixture() -> tuple[Any, dict[str, Any]]:
+def _grounded_mutation_admission_fixture(
+    *,
+    source: str = "Use fake-node.",
+) -> tuple[Any, dict[str, Any]]:
     from agent.harness.semantic_compiler import freeze_semantic_plan
 
-    source = "Use fake-node."
     action = {
         "type": "choose_target_mode",
         "target_mode": "fake-node",
@@ -368,6 +370,33 @@ def _grounded_mutation_admission_fixture() -> tuple[Any, dict[str, Any]]:
         messages=[None, SimpleNamespace(content=plan.request_json)]
     )
     return plan, _whole_plan_admission_payload(request)
+
+
+def _closed_enum_grounding_payload(
+    plan: Any,
+    *,
+    status: str = "selected",
+    evidence_quote: str = "fake-node",
+) -> dict[str, Any]:
+    from agent.harness.semantic_compiler import _closed_enum_grounding_request
+
+    request = _closed_enum_grounding_request(plan)
+    assert request is not None
+    return {
+        "plan_hash": request["plan_hash"],
+        "verdicts": [
+            {
+                "action_id": row["action_id"],
+                "argument_name": row["argument_name"],
+                "selected_value": row["selected_value"],
+                "status": status,
+                "evidence_quote": evidence_quote,
+                "reason": f"the exact source classifies the value as {status}",
+            }
+            for row in request["groundings"]
+        ],
+        "reason": "independent closed-enum grounding review",
+    }
 
 
 def _immutable_required_relation_fixture() -> tuple[Any, dict[str, Any]]:
@@ -419,9 +448,16 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
 
         plan, valid = _grounded_mutation_admission_fixture()
         provider = Mock()
-        provider.complete.return_value = SimpleNamespace(
-            text=json.dumps(valid, sort_keys=True),
-        )
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
+            SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
+            SimpleNamespace(
+                text=json.dumps(
+                    _closed_enum_grounding_payload(plan),
+                    sort_keys=True,
+                )
+            ),
+        ]
 
         admission = request_whole_plan_admission(
             provider,
@@ -432,9 +468,68 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
 
         self.assertTrue(admission.valid, admission.errors)
         self.assertTrue(admission.consensus_required)
-        self.assertEqual(provider.complete.call_count, 2)
-        self.assertEqual(admission.request_count, 2)
-        self.assertEqual(len(admission.review_hashes), 2)
+        self.assertEqual(provider.complete.call_count, 3)
+        self.assertEqual(admission.request_count, 3)
+        self.assertEqual(len(admission.review_hashes), 3)
+
+    def test_closed_enum_negation_fails_closed_after_whole_plan_consensus(
+        self,
+    ) -> None:
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import request_whole_plan_admission
+
+        source = "不使用 fake-node 模式"
+        plan, valid = _grounded_mutation_admission_fixture(source=source)
+        rejected = _closed_enum_grounding_payload(
+            plan,
+            status="rejected",
+            evidence_quote=source,
+        )
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
+            SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
+            SimpleNamespace(text=json.dumps(rejected, ensure_ascii=False)),
+        ]
+
+        admission = request_whole_plan_admission(
+            provider,
+            plan,
+            semantic_policy="preserve the immutable plan",
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+
+        self.assertFalse(admission.valid)
+        self.assertEqual(provider.complete.call_count, 3)
+        self.assertEqual(admission.request_count, 3)
+        self.assertEqual(admission.action_verdicts[0]["verdict"], "reject")
+        self.assertIn(
+            "independent closed-enum grounding rejected",
+            "; ".join(admission.errors),
+        )
+
+    def test_malformed_closed_enum_grounding_fails_closed(self) -> None:
+        from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES
+        from agent.harness.semantic_compiler import request_whole_plan_admission
+
+        plan, valid = _grounded_mutation_admission_fixture()
+        provider = Mock()
+        provider.complete.side_effect = [
+            SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
+            SimpleNamespace(text=json.dumps(valid, sort_keys=True)),
+            SimpleNamespace(text="{}"),
+        ]
+
+        admission = request_whole_plan_admission(
+            provider,
+            plan,
+            semantic_policy="preserve the immutable plan",
+            allowed_action_types=ALLOWED_ACTION_TYPES,
+        )
+
+        self.assertFalse(admission.valid)
+        self.assertEqual(provider.complete.call_count, 3)
+        self.assertEqual(admission.action_verdicts[0]["verdict"], "reject")
 
     def test_grounded_mutation_consensus_rejection_is_atomic(self) -> None:
         from agent.harness.semantic_admission import ALLOWED_ACTION_TYPES

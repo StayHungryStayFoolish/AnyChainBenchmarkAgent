@@ -9,6 +9,41 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 
+def _closed_enum_review_response(payload: dict) -> dict:
+    verdicts = []
+    for grounding in payload["groundings"]:
+        selected = str(grounding["selected_value"])
+        sources = [
+            str(source)
+            for unit in grounding["source_units"]
+            for source in unit["evidence_sources"]
+        ]
+        quote = next(
+            (
+                source[
+                    source.casefold().index(selected.casefold()):
+                    source.casefold().index(selected.casefold()) + len(selected)
+                ]
+                for source in sources
+                if selected.casefold() in source.casefold()
+            ),
+            "",
+        )
+        verdicts.append({
+            "action_id": grounding["action_id"],
+            "argument_name": grounding["argument_name"],
+            "selected_value": grounding["selected_value"],
+            "status": "selected",
+            "evidence_quote": quote,
+            "reason": "the exact source affirmatively selects this enum value",
+        })
+    return {
+        "plan_hash": payload["plan_hash"],
+        "verdicts": verdicts,
+        "reason": "all closed-enum values are affirmatively selected",
+    }
+
+
 class HierarchicalPlannerContractTest(unittest.TestCase):
     def test_owner_compile_failure_is_preserved_as_typed_unresolved_work(
         self,
@@ -3750,6 +3785,8 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                         ],
                         "reason": "complete and grounded",
                     }
+                elif "closed-enum value grounding authority" in system:
+                    response = _closed_enum_review_response(payload)
                 else:
                     raise AssertionError(system)
                 return SimpleNamespace(text=json.dumps(response))
@@ -3784,8 +3821,8 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             whole_plan_attempts,
             [False, True, False, True],
         )
-        self.assertEqual(result["planner_metrics"]["model_calls"], 8)
-        self.assertEqual(result["planner_metrics"]["admission_calls"], 5)
+        self.assertEqual(result["planner_metrics"]["model_calls"], 9)
+        self.assertEqual(result["planner_metrics"]["admission_calls"], 6)
 
     def test_semantic_draft_recompiles_clarification_through_real_admission(
         self,
@@ -4043,6 +4080,8 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                         ],
                         "reason": "complete plan admitted",
                     }
+                elif "closed-enum value grounding authority" in system:
+                    response = _closed_enum_review_response(payload)
                 else:
                     raise AssertionError(system)
                 return SimpleNamespace(text=json.dumps(response))
