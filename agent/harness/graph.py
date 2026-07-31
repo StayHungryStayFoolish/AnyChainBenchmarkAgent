@@ -13,6 +13,7 @@ from typing import Any, Callable, Mapping, TypedDict
 from langgraph.runtime import Runtime
 
 from .checkpoints import create_sqlite_checkpointer, default_checkpoint_path
+from .contracts import TurnReceipt, turn_receipt_to_dict
 from .control_receipts import validate_persisted_domain_control_receipt
 from ..llm.config import load_llm_config
 from ..llm.types import (
@@ -41,6 +42,7 @@ from .coordinator import (
 )
 from .failures import build_failure_record
 from .invariants import StateInvariantError, validate_state
+from .input_identity import user_input_hash
 from .domains.recovery import question_for_recovery
 from .response import finalize_turn_response, reset_turn_response
 from .questions import (
@@ -479,6 +481,9 @@ class AnyChainGraphRuntime:
                         candidate,
                         exc,
                         attempt,
+                        current_input=safe_text,
+                        submitted_input_hash=user_input_hash(text),
+                        language=language,
                         registry_transaction=registry_transaction,
                         input_secret_bindings=input_secret_bindings,
                     )
@@ -536,6 +541,9 @@ class AnyChainGraphRuntime:
         exc: StateInvariantError,
         attempt: TurnAttempt,
         *,
+        current_input: str,
+        submitted_input_hash: str,
+        language: str,
         registry_transaction: SecretRegistryTransaction,
         input_secret_bindings: tuple[Mapping[str, str], ...],
     ) -> AgentGraphState:
@@ -591,18 +599,35 @@ class AnyChainGraphRuntime:
         recovered["pending_question"] = (
             question_for_recovery(recovered, "failure_recovery") or {}
         )
+        recovered["last_user_input"] = current_input
+        input_shape = str(candidate_state.get("input_shape") or "prose")
         recovered["turn_context"] = {
             "id": int(recovered.get("turn_index") or 0),
             "kind": "invariant_recovery",
-            "text": "",
-            "input_shape": str(candidate_state.get("input_shape") or "prose"),
+            "text": current_input,
+            "input_shape": input_shape,
             "origin_group": str(base_state.get("active_group") or ""),
             "pending_snapshot": deepcopy(
                 base_state.get("pending_question") or {}
             ),
             "admitted_actions": [],
         }
-        recovered["turn_receipt"] = {}
+        recovered["turn_receipt"] = turn_receipt_to_dict(TurnReceipt(
+            turn_id=(
+                f"{recovered.get('thread_id') or self.thread_id}:"
+                f"{int(recovered.get('turn_index') or 0)}"
+            ),
+            input_hash=submitted_input_hash,
+            language=language,
+            input_shape=input_shape,
+            pending_before=deepcopy(
+                base_state.get("pending_question") or {}
+            ),
+            pending_after=deepcopy(
+                recovered.get("pending_question") or {}
+            ),
+            status="failed",
+        ))
         reconcile_state_secret_bindings(recovered)
         reset_turn_response(recovered)
         recovered = finalize_turn_response(recovered)

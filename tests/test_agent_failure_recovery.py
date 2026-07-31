@@ -457,6 +457,9 @@ class FailureRecoveryTest(unittest.TestCase):
                         candidate,
                         StateInvariantError("unknown active group"),
                         attempt,
+                        current_input="current input",
+                        submitted_input_hash="a" * 64,
+                        language="en",
                         registry_transaction=transaction,
                         input_secret_bindings=(),
                     )

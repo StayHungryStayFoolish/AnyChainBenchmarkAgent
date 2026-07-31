@@ -130,8 +130,10 @@ class AgentRuntimeIsolationTests(unittest.TestCase):
 
     def test_invariant_recovery_emits_one_committed_turn_observation(self) -> None:
         from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.input_identity import user_input_hash
         from agent.harness.state import new_state
 
+        submitted_input = "trigger invalid transition"
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             event_file = root / "turn-events.jsonl"
@@ -147,7 +149,7 @@ class AgentRuntimeIsolationTests(unittest.TestCase):
                 ) as runtime,
                 patch.object(runtime.graph, "invoke", return_value=invalid),
             ):
-                result = runtime.invoke("trigger invalid transition", language="en")
+                result = runtime.invoke(submitted_input, language="en")
 
             events = [json.loads(line) for line in event_file.read_text(encoding="utf-8").splitlines()]
             self.assertEqual([event["event_type"] for event in events], ["turn_committed"])
@@ -157,11 +159,20 @@ class AgentRuntimeIsolationTests(unittest.TestCase):
             self.assertEqual(events[0]["pending_question_id"], "failure_recovery_action")
             self.assertEqual(events[0]["control_receipts"], [])
             self.assertEqual(result["turn_context"]["id"], result["turn_index"])
+            self.assertEqual(result["last_user_input"], submitted_input)
+            self.assertEqual(result["turn_context"]["text"], submitted_input)
+            self.assertEqual(result["turn_receipt"]["status"], "failed")
+            self.assertEqual(result["turn_receipt"]["admitted_action_ids"], [])
+            self.assertEqual(
+                events[0]["turn_receipt_summary"]["input_hash"],
+                user_input_hash(submitted_input),
+            )
 
     def test_invariant_recovery_does_not_carry_prior_turn_receipts(self) -> None:
         from copy import deepcopy
 
         from agent.harness.graph import AnyChainGraphRuntime
+        from agent.harness.input_identity import user_input_hash
         from tests.agent_live.graph_turn import (
             reviewed_action_plan,
             reviewed_stage_planner,
@@ -197,10 +208,8 @@ class AgentRuntimeIsolationTests(unittest.TestCase):
                 invalid = deepcopy(previous)
                 invalid["active_group"] = "not-a-real-group"
                 with patch.object(runtime.graph, "invoke", return_value=invalid):
-                    recovered = runtime.invoke(
-                        "change several settings",
-                        language="en",
-                    )
+                    submitted_input = "change several settings"
+                    recovered = runtime.invoke(submitted_input, language="en")
 
             events = [
                 json.loads(line)
@@ -210,8 +219,18 @@ class AgentRuntimeIsolationTests(unittest.TestCase):
             self.assertEqual(events[-1]["observation"], "turn_recovered")
             self.assertEqual(events[-1]["control_receipts"], [])
             self.assertEqual(
+                events[-1]["turn_receipt_summary"]["input_hash"],
+                user_input_hash(submitted_input),
+            )
+            self.assertEqual(
                 recovered["turn_context"]["id"],
                 recovered["turn_index"],
+            )
+            self.assertEqual(recovered["last_user_input"], submitted_input)
+            self.assertEqual(recovered["turn_receipt"]["status"], "failed")
+            self.assertEqual(
+                recovered["turn_receipt"]["admitted_action_ids"],
+                [],
             )
 
     def test_invariant_raised_inside_graph_is_recovered_at_transaction_boundary(self) -> None:
