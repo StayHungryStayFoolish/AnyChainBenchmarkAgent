@@ -1846,7 +1846,13 @@ def _pending_answer_contract_errors(
     partition: Sequence[Mapping[str, Any]],
     state: AgentGraphState,
 ) -> tuple[str, ...]:
-    """Reject manual pending claims that cannot satisfy the signed contract."""
+    """Reject parser-bound pending values that violate the signed contract.
+
+    A prose unit is only a semantic claim that the source contains an answer;
+    Stage B still owns value extraction.  Applying the scalar validator to the
+    complete prose span would incorrectly reject labelled values and sibling
+    demands before semantic compilation can isolate them.
+    """
 
     pending = dict(state.get("pending_question") or {})
     if not pending or pending.get("options"):
@@ -1855,11 +1861,13 @@ def _pending_answer_contract_errors(
     for unit in partition:
         if str(unit.get("operation") or "") != "pending_answer":
             continue
-        source = _semantic_source_for_unit(unit)
-        if not value_satisfies_pending_contract(source, pending):
+        if not str(unit.get("source_path") or "").strip():
+            continue
+        value = _semantic_value_for_unit(unit)
+        if not value_satisfies_pending_contract(value, pending):
             errors.append(
-                "Stage A pending answer does not satisfy the active signed "
-                f"manual contract: {unit.get('unit_id')}/{pending.get('id')}"
+                "Stage A parser-bound pending value does not satisfy the active "
+                f"signed manual contract: {unit.get('unit_id')}/{pending.get('id')}"
             )
     return tuple(dict.fromkeys(errors))
 
@@ -2686,6 +2694,11 @@ def _stage_a_admission_prompt() -> str:
         "hypothetical, counterfactual, consequence, explanation, or capability question because "
         "it contains no present authorization. Require evidence_analysis for a request to ingest "
         "or analyze logs, errors, traces, or evidence even when the evidence will be pasted later. "
+        "When pending_question accepts manual input, a prose pending_answer is complete only "
+        "when its exact source supplies one concrete value for that active typed question. A "
+        "field label may surround the value, but another operation, a refusal, a question, or "
+        "unrelated prose is not a manual answer. Stage B owns extraction and final admission "
+        "owns value validation; this authority only accepts or rejects the semantic partition. "
         f"{PENDING_CANDIDATE_SEMANTIC_POLICY}"
         "For an operation with several registered owners, a unit is complete only "
         "when universal_owner_action_purposes proves that the selected owner has an "
@@ -2852,7 +2865,10 @@ def _pending_entailment_prompt() -> str:
         "evidence_quote, and reason. Copy claim_hash exactly. verdict must be "
         "answers, different_request, or uncertain. For answers, evidence_quote "
         "must be the shortest non-empty exact substring that commits to the pending "
-        "answer. For other verdicts it must be an exact non-empty substring showing "
+        "answer. When the pending question accepts a manual value, the quote must "
+        "be the shortest exact source substring containing only the proposed value "
+        "that can be validated against that question; do not include its field "
+        "label or sibling demands. For other verdicts it must be an exact non-empty substring showing "
         "why the source is not an answer. Never infer an answer from consequence or "
         "convenience."
     )
@@ -3005,6 +3021,7 @@ def _review_stage_a_pending_entailment(
         not pending
         or not pending.get("options")
         or pending.get("manual_input_allowed") is True
+        or isinstance(pending.get("semantic_draft_binding"), Mapping)
         or stage_a_payload.get("contract_proven_pending_prefixes")
         or stage_a_payload.get("pending_typed_candidates")
     ):
@@ -3069,7 +3086,13 @@ def _review_stage_a_pending_entailment(
                 or not str(verdict.get("reason") or "").strip()
             ):
                 continue
-            if str(verdict.get("verdict") or "") == "answers":
+            if (
+                str(verdict.get("verdict") or "") == "answers"
+                and (
+                    pending.get("manual_input_allowed") is not True
+                    or value_satisfies_pending_contract(evidence, pending)
+                )
+            ):
                 admitted_members += 1
         if admitted_members < 2:
             errors.append(
@@ -3485,7 +3508,12 @@ def _stage_b_prompt(owner: str) -> str:
         "Use semantic_source as the exact source_evidence when the registered action declares "
         "that argument. For a pending_answer DemandAtom "
         "whose pending_question allows manual input and has no options, emit answer equal to "
-        "semantic_value and never emit selected_value. "
+        "semantic_value and never emit selected_value when semantic_value is present. For a "
+        "prose pending_answer without semantic_value, extract exactly one shortest literal "
+        "value from semantic_source that satisfies the pending question's validation contract; "
+        "use that literal as both answer and source_evidence. If there is no unique valid "
+        "literal, keep the unit unresolved. Never use the complete labelled sentence as a "
+        "scalar answer and never consume sibling demands. "
         "Every action object MUST be flat: place type and every "
         "allowed argument in the same object and NEVER emit an arguments object. For example, "
         "{\"type\":\"declared_type\",\"declared_argument\":\"value\"}, not "

@@ -6474,6 +6474,94 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
         self.assertEqual(errors, ())
         self.assertEqual(sizes, ())
 
+    def test_manual_pending_uses_existing_stage_a_coverage_authority(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_stage_a_pending_entailment,
+            _stage_a_admission_prompt,
+        )
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+        ) as compiler:
+            errors, sizes = _review_stage_a_pending_entailment(
+                object(),
+                {
+                    "pending_question": {
+                        "id": "CLOUD_REGION",
+                        "group": "cloud_environment",
+                        "manual_input_allowed": True,
+                        "validation": {"value_type": "scalar_token"},
+                    },
+                    "contract_proven_pending_prefixes": [],
+                    "pending_typed_candidates": [],
+                },
+                [{
+                    "unit_id": "unit-1",
+                    "clause_id": "clause-1",
+                    "source_text": "region is us-1",
+                    "operation": "pending_answer",
+                    "owner_routes": [{
+                        "owner": "coordinator",
+                        "group": "cloud_environment",
+                    }],
+                }],
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(sizes, ())
+        compiler.assert_not_called()
+        self.assertIn(
+            "a prose pending_answer is complete only when its exact source "
+            "supplies one concrete value",
+            _stage_a_admission_prompt(),
+        )
+
+    def test_pending_entailment_jury_remains_for_semantic_options(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_stage_a_pending_entailment,
+        )
+
+        source = "Go ahead and clear the workflow."
+        payload = {
+            "pending_question": {
+                "id": "reset_confirm",
+                "group": "opening",
+                "options": [
+                    {"id": "yes", "value": True},
+                    {"id": "no", "value": False},
+                ],
+            },
+            "contract_proven_pending_prefixes": [],
+            "pending_typed_candidates": [],
+        }
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "operation": "pending_answer",
+            "owner_routes": [{"owner": "coordinator", "group": "opening"}],
+        }]
+
+        def response(*_args, **kwargs):
+            return json.dumps({
+                "claim_hash": kwargs["request_payload"]["claim_hash"],
+                "verdict": "answers",
+                "evidence_quote": "clear the workflow",
+                "reason": "the option effect is explicit",
+            })
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=response,
+        ) as compiler:
+            errors, sizes = _review_stage_a_pending_entailment(
+                object(), payload, partition
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(compiler.call_count, 3)
+        self.assertEqual(len(sizes), 3)
+
     def test_explicit_scope_jury_rejects_business_retry_as_session_reset(self) -> None:
         from agent.harness.hierarchical_planner import (
             _review_stage_a_explicit_scope_authorization,
@@ -9050,7 +9138,7 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                         (spec.action_type, operation, group),
                     )
 
-    def test_manual_pending_claim_must_satisfy_signed_value_contract(self) -> None:
+    def test_only_parser_bound_manual_pending_value_is_checked_in_stage_a(self) -> None:
         from agent.harness.hierarchical_planner import (
             _pending_answer_contract_errors,
         )
@@ -9064,19 +9152,20 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                 "validation": {"value_type": "positive_integer"},
             }
         }
-        rejected = [{
+        prose = [{
             "unit_id": "unit-1",
             "source_text": "Do not continue this observation.",
             "operation": "pending_answer",
         }]
-        accepted = [{
+        parser_bound = [{
             "unit_id": "unit-1",
-            "source_text": "120",
+            "source_text": json.dumps({"duration": "invalid"}),
+            "source_path": "duration",
             "operation": "pending_answer",
         }]
 
-        self.assertTrue(_pending_answer_contract_errors(rejected, state))
-        self.assertEqual(_pending_answer_contract_errors(accepted, state), ())
+        self.assertEqual(_pending_answer_contract_errors(prose, state), ())
+        self.assertTrue(_pending_answer_contract_errors(parser_bound, state))
 
     def test_structured_literal_validation_uses_atom_value_not_schema_key(self) -> None:
         from agent.harness.plan_coverage import _structured_atom_source
