@@ -569,7 +569,11 @@ class CanonicalPendingChoiceTests(unittest.TestCase):
 
         self.assertIs(record["registry_incomplete_mutation_intake"], True)
         self.assertIs(record["registry_pending_option_admission"], True)
-        self.assertIn("initial selection or replacement", record["declared_purpose"])
+        self.assertIn(
+            "no single replacement target mode is affirmatively selected",
+            record["declared_purpose"],
+        )
+        self.assertIn("only exclude", record["declared_purpose"])
         self.assertIn("registry_incomplete_mutation_intake=true", policy)
         self.assertNotIn("A target-mode-intake purpose", policy)
 

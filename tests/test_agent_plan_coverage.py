@@ -800,8 +800,9 @@ class PlanCoverageTest(unittest.TestCase):
 
         purpose = ACTION_BY_TYPE["request_target_mode_selection"].purpose
 
-        self.assertIn("when it is unresolved", purpose)
+        self.assertIn("no single replacement target mode is affirmatively selected", purpose)
         self.assertIn("replacement", purpose)
+        self.assertIn("only exclude", purpose)
         self.assertNotIn("Ask for a replacement target mode", purpose)
 
     def test_consultation_and_analysis_actions_require_source_purpose_review(self) -> None:

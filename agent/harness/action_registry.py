@@ -600,7 +600,7 @@ ACTION_SPECS: tuple[ActionSpec, ...] = (
     ActionSpec(
         "request_target_mode_selection",
         "chain_rpc",
-        "Open typed target-mode intake when it is unresolved, including initial selection or replacement requests that supply no concrete target mode.",
+        "Open typed target-mode intake when no single replacement target mode is affirmatively selected, including initial selection, replacement requests with no named mode, and requests that only exclude the current or another candidate mode.",
         ("source_evidence",),
         execution_phase=24,
         target_group="target_mode",
