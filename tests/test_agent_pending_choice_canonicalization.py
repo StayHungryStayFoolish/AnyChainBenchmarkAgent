@@ -39,7 +39,6 @@ def _admission_response(
         for action in review["actions"]
     }
     return SimpleNamespace(text=json.dumps({
-        "plan_hash": review["plan_hash"],
         "action_verdicts": [
             {
                 "action_id": action["action_id"],

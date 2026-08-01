@@ -38,7 +38,6 @@ def _closed_enum_review_response(payload: dict) -> dict:
             "reason": "the exact source affirmatively selects this enum value",
         })
     return {
-        "plan_hash": payload["plan_hash"],
         "verdicts": verdicts,
         "reason": "all closed-enum values are affirmatively selected",
     }
@@ -4196,7 +4195,6 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                         for row in payload["semantic_units"]
                     }
                     response = {
-                        "plan_hash": payload["plan_hash"],
                         "action_verdicts": [
                             {
                                 "action_id": row["action_id"],
@@ -5374,6 +5372,14 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             prompt,
         )
         self.assertNotIn("adapter_family_confirm", prompt)
+        self.assertIn(
+            "Request identity is bound by the Harness transport",
+            prompt,
+        )
+        self.assertNotIn(
+            "exactly these keys: plan_hash",
+            prompt,
+        )
 
     def test_product_resolver_end_to_end_contract_without_internal_boundary_mocks(
         self,
@@ -5479,7 +5485,6 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                         row["unit_id"]: row for row in units
                     }
                     response = {
-                        "plan_hash": payload["plan_hash"],
                         "action_verdicts": [
                             {
                                 "action_id": row["action_id"],
@@ -5812,7 +5817,6 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
                         for row in payload["semantic_units"]
                     }
                     response = {
-                        "plan_hash": payload["plan_hash"],
                         "action_verdicts": [
                             {
                                 "action_id": row["action_id"],

@@ -421,7 +421,6 @@ def reviewed_semantic_plan(
             "reason": "the explicit reviewed action preserves its source units",
         })
     admission_payload = {
-        "plan_hash": request["plan_hash"],
         "action_verdicts": action_verdicts,
         "unit_verdicts": [
             {

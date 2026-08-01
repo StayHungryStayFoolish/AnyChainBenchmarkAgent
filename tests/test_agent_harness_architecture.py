@@ -162,7 +162,6 @@ def _whole_plan_admission_payload(
             "reason": "the immutable unit has its declared owner",
         })
     return {
-        "plan_hash": review["plan_hash"],
         "action_verdicts": action_verdicts,
         "unit_verdicts": unit_verdicts,
         "reason": "the complete immutable plan is admitted",
@@ -430,7 +429,6 @@ def _closed_enum_grounding_payload(
     request = _closed_enum_grounding_request(plan)
     assert request is not None
     return {
-        "plan_hash": request["plan_hash"],
         "verdicts": [
             {
                 "action_id": row["action_id"],
@@ -1403,18 +1401,26 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
         self.assertFalse(result.valid)
         self.assertIn("undeclared keys", "; ".join(result.errors))
 
-    def test_exact_quote_and_plan_hash_grounding_fail_closed(self) -> None:
+    def test_exact_quote_and_transport_bound_plan_identity_fail_closed(self) -> None:
         _plan, valid = _immutable_admission_fixture()
         invented = deepcopy(valid)
         invented["action_verdicts"][0]["evidence"][0]["quote"] = "invented"
         invented["unit_verdicts"][0]["evidence_quote"] = "invented"
         self.assertFalse(self._validate(invented).valid)
 
-        forged_hash = deepcopy(valid)
-        forged_hash["plan_hash"] = "forged"
-        result = self._validate(forged_hash)
+        forged_request_identity = deepcopy(valid)
+        forged_request_identity["plan_hash"] = "forged"
+        result = self._validate(forged_request_identity)
         self.assertFalse(result.valid)
-        self.assertIn("plan_hash mismatch", "; ".join(result.errors))
+        self.assertIn("undeclared top-level keys", "; ".join(result.errors))
+
+    def test_reviewer_response_uses_local_request_binding(self) -> None:
+        plan, valid = _immutable_admission_fixture()
+
+        self.assertNotIn("plan_hash", valid)
+        result = self._validate(valid)
+        self.assertTrue(result.valid, result.errors)
+        self.assertEqual(len(plan.plan_hash), 64)
 
     def test_registry_expressible_omission_rejects_the_whole_plan(self) -> None:
         _plan, valid = _immutable_admission_fixture()
@@ -1483,7 +1489,6 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
             review_context={"pending_question": {}},
         )
         payload = {
-            "plan_hash": plan.plan_hash,
             "action_verdicts": [{
                 "action_id": "action-1",
                 "verdict": "admit",
@@ -1606,7 +1611,6 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
             review_context={"pending_question": {}},
         )
         payload = {
-            "plan_hash": plan.plan_hash,
             "action_verdicts": [{
                 "action_id": "action-1",
                 "verdict": "admit",
@@ -1694,7 +1698,6 @@ class BoundedSemanticAdmissionTest(unittest.TestCase):
             review_context={"pending_question": {}},
         )
         competing_payload = deepcopy(payload)
-        competing_payload["plan_hash"] = competing_plan.plan_hash
         competing_payload["action_verdicts"][0]["evidence"][0]["quote"] = (
             competing_source
         )
@@ -1898,7 +1901,6 @@ class HarnessArchitectureTest(unittest.TestCase):
             review_context={"pending_question": {}},
         )
         payload = {
-            "plan_hash": plan.plan_hash,
             "action_verdicts": [{
                 "action_id": "action-1",
                 "verdict": "admit",
@@ -2082,7 +2084,6 @@ class HarnessArchitectureTest(unittest.TestCase):
             review_context={"pending_question": {}},
         )
         payload = {
-            "plan_hash": plan.plan_hash,
             "action_verdicts": [{
                 "action_id": "action-1",
                 "verdict": "admit",

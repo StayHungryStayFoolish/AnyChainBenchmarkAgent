@@ -52,7 +52,6 @@ def closed_enum_quote_names_only_competing_values(
 
 
 _ADMISSION_TOP_LEVEL_KEYS = frozenset({
-    "plan_hash",
     "action_verdicts",
     "unit_verdicts",
     "reason",
@@ -432,8 +431,8 @@ def whole_plan_admission_prompt(semantic_policy: str) -> str:
         "You are not a planner. Never create, repair, replace, rename, remove, merge, split, or reorder an action or semantic unit. "
         "Judge only the supplied immutable ids, actions, registry purposes, source units, pending contract, and workflow state. "
         "The supplied review_context.original_request clauses are the authoritative complete user turn. Compare them with the immutable semantic units before admitting coverage; a planner unit cannot hide a sibling demand merely by spanning the same prose. "
-        "Return exactly one JSON object with exactly these keys: plan_hash, action_verdicts, unit_verdicts, reason. "
-        "Echo plan_hash exactly. Return exactly one action_verdict for every supplied action_id and exactly one unit_verdict for every supplied unit_id; never add an id. "
+        "Return exactly one JSON object with exactly these keys: action_verdicts, unit_verdicts, reason. "
+        "Request identity is bound by the Harness transport; never return a plan hash or request id. Return exactly one action_verdict for every supplied action_id and exactly one unit_verdict for every supplied unit_id; never add an id. "
         "Each action_verdict is {action_id,verdict:'admit'|'reject',unit_ids:[string],evidence:[{unit_id,quote,relation:'direct'|'support',support_relation:string}],grounded_arguments:[{argument_name:string,evidence_quote:string}],pending_answer_argument:string,turn_candidate_verdicts:[{candidate_id:string,verdict:'selected'|'not_selected',evidence_quote:string,reason:string}],reason}. "
         "A pending option may be selected by its number, id, canonical value, label, or a clear natural-language semantic equivalent. Do not require the source to repeat an option number or full label when it directly names the declared value or meaning. "
         "unit_ids must exactly equal that action's supplied immutable unit_ids. An admitted action needs one evidence row for every unit_id, every quote must be a non-empty exact substring of that unit, at least one relation must be direct, and a support row may use only one supplied allowed_support_relation. Direct rows use an empty support_relation. When an action supplies required_evidence_relations, copy each declared relation and support_relation exactly for that unit; this role was already decided by the independent partition authority and is not open to reinterpretation. "
@@ -460,8 +459,9 @@ def closed_enum_grounding_prompt() -> str:
         "AnyChain. You are not a planner and must not create, replace, infer, "
         "or repair an action. Judge only whether each supplied selected_value "
         "is affirmatively selected by its exact source units. Return exactly "
-        "one JSON object with exactly these keys: plan_hash, verdicts, reason. "
-        "Echo plan_hash exactly. Return exactly one verdict for every supplied "
+        "one JSON object with exactly these keys: verdicts, reason. Request "
+        "identity is bound by the Harness transport; never return a plan hash "
+        "or request id. Return exactly one verdict for every supplied "
         "grounding in order. Each verdict is "
         "{action_id,argument_name,selected_value,status,evidence_quote,reason}. "
         "Copy action_id, argument_name, and selected_value exactly. status must "
@@ -570,14 +570,10 @@ def _validate_closed_enum_grounding(
         payload = _strict_json_object(text)
     except ValueError as exc:
         return False, (str(exc),), expected_action_ids, None
-    if set(payload) != {"plan_hash", "verdicts", "reason"}:
+    if set(payload) != {"verdicts", "reason"}:
         errors.append(
             "closed-enum grounding response has missing or undeclared keys"
         )
-    if str(payload.get("plan_hash") or "") != str(
-        request.get("plan_hash") or ""
-    ):
-        errors.append("closed-enum grounding plan hash mismatch")
     if not str(payload.get("reason") or "").strip():
         errors.append("closed-enum grounding response has no reason")
     verdicts = payload.get("verdicts")
@@ -696,7 +692,11 @@ def request_whole_plan_admission(
         for attempt in range(2 if contract_repair else 1):
             ensure_turn_active()
             prompt = base_prompt
-            payload = dict(base_payload)
+            payload = {
+                key: value
+                for key, value in base_payload.items()
+                if key != "plan_hash"
+            }
             if consensus_index:
                 prompt = (
                     f"{base_prompt} This is an independent consensus review of "
@@ -793,7 +793,11 @@ def request_whole_plan_admission(
     grounding_request = _closed_enum_grounding_request(plan)
     if grounding_request is not None:
         prompt = closed_enum_grounding_prompt()
-        payload_text = _canonical_json(grounding_request)
+        payload_text = _canonical_json({
+            key: value
+            for key, value in grounding_request.items()
+            if key != "plan_hash"
+        })
         request_sizes.append(
             len(prompt.encode("utf-8")) + len(payload_text.encode("utf-8"))
         )
@@ -936,8 +940,6 @@ def validate_whole_plan_admission(
     errors: list[str] = []
     if set(payload) != _ADMISSION_TOP_LEVEL_KEYS:
         errors.append("whole-plan admission has missing or undeclared top-level keys")
-    if str(payload.get("plan_hash") or "") != plan.plan_hash:
-        errors.append("whole-plan admission plan_hash mismatch")
     if not str(payload.get("reason") or "").strip():
         errors.append("whole-plan admission has no reason")
 
