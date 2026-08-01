@@ -4290,6 +4290,11 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             ),
             patch(
                 "agent.harness.hierarchical_planner."
+                "_review_stage_a_pending_entailment",
+                return_value=((), (101, 102, 103)),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner."
                 "_partition_requires_independent_proposal",
                 return_value=False,
             ),
@@ -6355,6 +6360,203 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             )
 
         self.assertTrue(any("omitted demand" in error for error in errors))
+
+    def test_pending_entailment_jury_rejects_unrelated_workflow_request(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_stage_a_pending_entailment,
+        )
+
+        source = "I need to benchmark a different chain."
+        payload = {
+            "pending_question": {
+                "id": "reset_confirm",
+                "group": "opening",
+                "options": [
+                    {"id": "yes", "value": True},
+                    {"id": "no", "value": False},
+                ],
+            },
+            "contract_proven_pending_prefixes": [],
+            "pending_typed_candidates": [],
+        }
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "operation": "pending_answer",
+            "owner_routes": [{"owner": "coordinator", "group": "opening"}],
+        }]
+        claim_hash = ""
+
+        def response(*_args, **kwargs):
+            nonlocal claim_hash
+            claim_hash = kwargs["request_payload"]["claim_hash"]
+            return json.dumps({
+                "claim_hash": claim_hash,
+                "verdict": "different_request",
+                "evidence_quote": "different chain",
+                "reason": "the source requests another workflow",
+            })
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=response,
+        ) as compiler:
+            errors, sizes = _review_stage_a_pending_entailment(
+                object(), payload, partition
+            )
+
+        self.assertEqual(compiler.call_count, 3)
+        self.assertEqual(len(sizes), 3)
+        self.assertTrue(any("quorum rejected" in error for error in errors))
+
+    def test_pending_entailment_jury_requires_two_answer_votes(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_stage_a_pending_entailment,
+        )
+
+        source = "Go ahead and clear the workflow."
+        payload = {
+            "pending_question": {
+                "id": "reset_confirm",
+                "group": "opening",
+                "options": [
+                    {"id": "yes", "value": True},
+                    {"id": "no", "value": False},
+                ],
+            },
+            "contract_proven_pending_prefixes": [],
+            "pending_typed_candidates": [],
+        }
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "operation": "pending_answer",
+            "owner_routes": [{"owner": "coordinator", "group": "opening"}],
+        }]
+        votes = iter(("answers", "different_request", "answers"))
+
+        def response(*_args, **kwargs):
+            return json.dumps({
+                "claim_hash": kwargs["request_payload"]["claim_hash"],
+                "verdict": next(votes),
+                "evidence_quote": "clear the workflow",
+                "reason": "independent entailment verdict",
+            })
+
+        with patch(
+            "agent.harness.hierarchical_planner.request_semantic_compilation",
+            side_effect=response,
+        ):
+            errors, sizes = _review_stage_a_pending_entailment(
+                object(), payload, partition
+            )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(len(sizes), 3)
+
+    def test_pending_entailment_jury_is_skipped_for_signed_exact_option(self) -> None:
+        from agent.harness.hierarchical_planner import (
+            _review_stage_a_pending_entailment,
+        )
+
+        errors, sizes = _review_stage_a_pending_entailment(
+            object(),
+            {
+                "pending_question": {"id": "confirm"},
+                "contract_proven_pending_prefixes": [{"source_text": "Y"}],
+                "pending_typed_candidates": [],
+            },
+            [{"operation": "pending_answer"}],
+        )
+
+        self.assertEqual(errors, ())
+        self.assertEqual(sizes, ())
+
+    def test_stage_a_selects_counterfactual_request_after_pending_claim_rejected(
+        self,
+    ) -> None:
+        from agent.harness.hierarchical_planner import begin_semantic_partition
+        from agent.harness.state import new_state
+
+        state = new_state("pending-counterfactual", language="en")
+        state["pending_question"] = {
+            "id": "reset_confirm",
+            "group": "opening",
+            "kind": "yes_no",
+            "manual_input_allowed": False,
+            "options": [
+                {"id": "yes", "value": True},
+                {"id": "no", "value": False},
+            ],
+        }
+        source = "I need to benchmark a different chain."
+        primary = [{
+            "unit_id": "unit-primary",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "operation": "pending_answer",
+            "owner_routes": [{"owner": "coordinator", "group": "opening"}],
+            "reason": "incorrect pending interpretation",
+        }]
+        secondary = [{
+            "unit_id": "unit-secondary",
+            "clause_id": "clause-1",
+            "source_text": source,
+            "operation": "domain_request",
+            "owner_routes": [{
+                "owner": "chain_rpc",
+                "group": "chain_identity",
+            }],
+            "reason": "standalone chain replacement request",
+        }]
+
+        with (
+            patch(
+                "agent.harness.hierarchical_planner.provider_from_config",
+                return_value=object(),
+            ),
+            patch(
+                "agent.harness.hierarchical_planner._request_stage_a_proposal",
+                side_effect=[
+                    (primary, (), (101,)),
+                    (secondary, (), (102,)),
+                ],
+            ),
+            patch(
+                "agent.harness.hierarchical_planner._review_stage_a_partition",
+                side_effect=[
+                    ((), (201,), frozenset(), True),
+                    ((), (202,), frozenset(), True),
+                ],
+            ),
+            patch(
+                "agent.harness.hierarchical_planner."
+                "_review_stage_a_pending_entailment",
+                side_effect=[
+                    (("pending claim rejected",), (301, 302, 303)),
+                    ((), ()),
+                ],
+            ),
+        ):
+            document = begin_semantic_partition(state, source)
+
+        self.assertEqual(document["status"], "compile_owner")
+        self.assertEqual(document["source_partition"], secondary)
+        self.assertEqual(document["owner_requests"], [{
+            "owner": "chain_rpc",
+            "unit_ids": ["unit-secondary"],
+            "groups": ["chain_identity"],
+        }])
+        self.assertEqual(
+            document["stage_a_convergence"]["selected_proposal"],
+            "secondary",
+        )
+        self.assertEqual(
+            document["stage_a_convergence"]["selection_authority"],
+            "harness_eligibility",
+        )
 
     def test_stage_a_admission_repairs_only_malformed_contract_output(
         self,

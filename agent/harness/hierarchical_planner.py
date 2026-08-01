@@ -238,6 +238,21 @@ def begin_semantic_partition(
         )
         document["request_sizes"].extend(stage_a_admission_sizes)
         document["admission_calls"] += len(stage_a_admission_sizes)
+        if not admission_errors:
+            (
+                pending_entailment_errors,
+                pending_entailment_sizes,
+            ) = _review_stage_a_pending_entailment(
+                provider,
+                stage_a_payload,
+                partition,
+            )
+            document["request_sizes"].extend(pending_entailment_sizes)
+            document["admission_calls"] += len(pending_entailment_sizes)
+            admission_errors = tuple(dict.fromkeys((
+                *admission_errors,
+                *pending_entailment_errors,
+            )))
         primary_review_valid = not admission_errors
         if primary_review_valid:
             source_partition, compilation_partition = (
@@ -293,6 +308,21 @@ def begin_semantic_partition(
             )
             document["request_sizes"].extend(independent_admission_sizes)
             document["admission_calls"] += len(independent_admission_sizes)
+            if not independent_admission_errors:
+                (
+                    independent_pending_errors,
+                    independent_pending_sizes,
+                ) = _review_stage_a_pending_entailment(
+                    provider,
+                    stage_a_payload,
+                    independent_partition,
+                )
+                document["request_sizes"].extend(independent_pending_sizes)
+                document["admission_calls"] += len(independent_pending_sizes)
+                independent_admission_errors = tuple(dict.fromkeys((
+                    *independent_admission_errors,
+                    *independent_pending_errors,
+                )))
             if independent_admission_errors:
                 document["status"] = "failed"
                 document["errors"] = list(dict.fromkeys((
@@ -424,7 +454,12 @@ def _request_stage_a_proposal(
         role_prompt = (
             f"{prompt} Produce an independent semantic partition from the immutable "
             "source and registries. You have not seen and must not assume another "
-            "partition."
+            "partition. Use a counterfactual source-first decomposition: first "
+            "identify every standalone present request without assuming that the "
+            "active pending question was answered. Classify a span as "
+            "pending_answer only when the source itself commits to the pending "
+            "question's effect; otherwise preserve the standalone request under "
+            "its registered operation and owner."
         )
     for attempt in range(2):
         request_payload = dict(stage_a_payload)
@@ -2720,6 +2755,116 @@ def _stage_a_review_result(
         return errors, sizes, redundant, bool(contract_valid)
     errors, sizes, redundant = result
     return errors, sizes, redundant, not errors
+
+
+def _pending_entailment_prompt() -> str:
+    """Return the reject-only contract for one semantic pending-answer claim."""
+
+    return (
+        "You are the independent pending-answer entailment auditor for AnyChain. "
+        "You are not a planner and cannot create, route, rename, repair, or execute "
+        "an operation. Judge only whether the exact proposed_source itself answers "
+        "the active pending_question. Workflow state and the mere existence of a "
+        "pending question are not user evidence. A request for another operation, "
+        "a question about capability, a navigation request, a correction, a "
+        "deferral, or unrelated information does not answer the pending question, "
+        "even if satisfying that request would eventually replace or make the old "
+        "question irrelevant. A natural-language answer is valid only when it "
+        "commits to one declared option or directly authorizes the pending effect. "
+        "Return exactly one JSON object with exactly claim_hash, verdict, "
+        "evidence_quote, and reason. Copy claim_hash exactly. verdict must be "
+        "answers, different_request, or uncertain. For answers, evidence_quote "
+        "must be the shortest non-empty exact substring that commits to the pending "
+        "answer. For other verdicts it must be an exact non-empty substring showing "
+        "why the source is not an answer. Never infer an answer from consequence or "
+        "convenience."
+    )
+
+
+def _review_stage_a_pending_entailment(
+    provider: Any,
+    stage_a_payload: Mapping[str, Any],
+    partition: Sequence[Mapping[str, Any]],
+) -> tuple[tuple[str, ...], tuple[int, ...]]:
+    """Require quorum before a semantic, non-literal pending claim is selectable."""
+
+    pending = dict(stage_a_payload.get("pending_question") or {})
+    if (
+        not pending
+        or not pending.get("options")
+        or pending.get("manual_input_allowed") is True
+        or stage_a_payload.get("contract_proven_pending_prefixes")
+        or stage_a_payload.get("pending_typed_candidates")
+    ):
+        return (), ()
+    claims = [
+        {
+            "unit_id": str(unit.get("unit_id") or ""),
+            "clause_id": str(unit.get("clause_id") or ""),
+            "proposed_source": str(unit.get("source_text") or ""),
+        }
+        for unit in partition
+        if str(unit.get("operation") or "") == "pending_answer"
+    ]
+    if not claims:
+        return (), ()
+
+    prompt = _pending_entailment_prompt()
+    request_sizes: list[int] = []
+    errors: list[str] = []
+    for claim in claims:
+        claim_payload = {
+            "pending_question": pending,
+            **claim,
+        }
+        claim_hash = hashlib.sha256(
+            json.dumps(
+                claim_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        payload = {"claim_hash": claim_hash, **claim_payload}
+        admitted_members = 0
+        for _member in range(3):
+            request_sizes.append(_wire_size(prompt, payload))
+            response = request_semantic_compilation(
+                provider,
+                system_prompt=prompt,
+                request_payload=payload,
+                max_tokens=700,
+                reasoning_mode=STRICT_JSON_REASONING_MODE,
+            )
+            try:
+                verdict = json.loads(response)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(verdict, Mapping) or set(verdict) != {
+                "claim_hash",
+                "verdict",
+                "evidence_quote",
+                "reason",
+            }:
+                continue
+            evidence = str(verdict.get("evidence_quote") or "")
+            if (
+                str(verdict.get("claim_hash") or "") != claim_hash
+                or str(verdict.get("verdict") or "")
+                not in {"answers", "different_request", "uncertain"}
+                or not evidence
+                or evidence not in claim["proposed_source"]
+                or not str(verdict.get("reason") or "").strip()
+            ):
+                continue
+            if str(verdict.get("verdict") or "") == "answers":
+                admitted_members += 1
+        if admitted_members < 2:
+            errors.append(
+                "Stage A pending-answer entailment quorum rejected unit: "
+                f"{claim['unit_id']}"
+            )
+    return tuple(errors), tuple(request_sizes)
 
 
 def _review_stage_a_partition_detailed(
