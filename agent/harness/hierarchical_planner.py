@@ -1495,6 +1495,11 @@ def _stage_a_prompt() -> str:
         "can represent the exact source demand. Do not select an owner merely because it owns "
         "another action with the same broad operation label. If no owner purpose safely fits, "
         "mark the unit unresolved. "
+        "For a consultation action with consultation_topic_purposes, those closed topic "
+        "purposes are the authoritative read-only capabilities of that action. Route a "
+        "question when exactly one registered topic purpose represents it; do not require "
+        "the user to name the topic identifier and do not convert the question into a "
+        "mutation or pending answer. "
         "Use exact owner and group identifiers from the supplied registries. "
         "Do not infer a mutation from examples, hypothetical values, logs, or current state."
         " When semantic_draft_resolutions is present, each row is an exact "
@@ -1559,6 +1564,18 @@ def _stage_a_payload(
         and str(item.get("resolution") or "").strip()
     ] if draft.get("status") == "ready_for_review" else []
     option_prefix = _unique_option_prefix_candidate(state, clauses)
+    projected_actions = action_schema()
+
+    def semantic_purpose(row: Mapping[str, Any]) -> dict[str, Any]:
+        purpose = {
+            "action_type": str(row["type"]),
+            "purpose": str(row["purpose"]),
+        }
+        topic_purposes = row.get("topic_purposes")
+        if isinstance(topic_purposes, Mapping) and topic_purposes:
+            purpose["consultation_topic_purposes"] = dict(topic_purposes)
+        return purpose
+
     return {
         "product": "AnyChain Benchmark Agent",
         "user_text": text,
@@ -1611,11 +1628,10 @@ def _stage_a_payload(
         "universal_owner_action_purposes": {
             operation: {
                 owner: [
-                    {"action_type": spec.action_type, "purpose": spec.purpose}
-                    for spec in ACTION_SPECS
-                    if not spec.internal_only
-                    and spec.owner == owner
-                    and operation in spec.semantic_operations
+                    semantic_purpose(row)
+                    for row in projected_actions
+                    if str(row["owner"]) == owner
+                    and operation in row["semantic_operations"]
                 ]
                 for owner in owners
             }
@@ -1638,7 +1654,12 @@ def _stage_a_payload(
                         "semantic_operations": action["semantic_operations"],
                         "route_groups": action["route_groups"],
                     }
-                    for action in action_schema(groups=frozenset({row["name"]}))
+                    for action in projected_actions
+                    if _action_schema_applies(
+                        action,
+                        groups=frozenset({row["name"]}),
+                        operations=frozenset(action["semantic_operations"]),
+                    )
                 ],
             }
             for row in group_schema()
@@ -2703,6 +2724,10 @@ def _stage_a_admission_prompt() -> str:
         "For an operation with several registered owners, a unit is complete only "
         "when universal_owner_action_purposes proves that the selected owner has an "
         "action purpose matching the exact source demand. "
+        "When that purpose declares consultation_topic_purposes, treat the closed topic "
+        "map as authoritative: a read-only question is safely represented only when one "
+        "topic purpose matches its complete subject. The topic identifier need not appear "
+        "verbatim in user text. "
         "Return one strict JSON object with exactly unit_verdicts, clause_verdicts, and reason. "
         "unit_verdicts contains exactly one row per supplied unit in order: "
         "{unit_id,verdict:'complete'|'redundant'|'unresolved',supports_unit_id,reason}. "
@@ -3544,7 +3569,10 @@ def _stage_b_prompt(owner: str) -> str:
         "some other or another category member are missing values; emit the unique "
         "registered incomplete_mutation_intake for that routed group instead. "
         "Questions and "
-        "explanations are read-only actions. A concrete request owned by another group has "
+        "explanations are read-only actions. When a read-only action declares allowed_topics "
+        "and topic_purposes, select the one topic whose registered purpose represents the "
+        "complete question and emit that exact topic identifier. Do not emit a generic topic "
+        "when a more specific registered topic applies. A concrete request owned by another group has "
         "no valid action in this owner schema: mark that binding unresolved so Stage A can be "
         "corrected, rather than coercing it into a superficially similar action. Ambiguous or "
         "incomplete demands remain unresolved instead of being guessed, except when the unit "

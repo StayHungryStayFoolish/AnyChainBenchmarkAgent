@@ -2288,6 +2288,78 @@ class HierarchicalPlannerContractTest(unittest.TestCase):
             dict(SEMANTIC_OPERATION_PURPOSES),
         )
 
+    def test_stage_a_projects_closed_consultation_topic_purposes(self) -> None:
+        from agent.harness.action_registry import CONSULTATION_TOPIC_PURPOSES
+        from agent.harness.hierarchical_planner import _stage_a_payload
+        from agent.harness.plan_coverage import segment_user_turn
+
+        text = "What is the current template workload?"
+        payload = _stage_a_payload({}, text, segment_user_turn(text))
+        orientation = payload["universal_owner_action_purposes"][
+            "consultation"
+        ]["orientation"]
+        answer = next(
+            row
+            for row in orientation
+            if row["action_type"] == "answer_opening_question"
+        )
+        self.assertEqual(
+            answer["consultation_topic_purposes"],
+            dict(CONSULTATION_TOPIC_PURPOSES),
+        )
+
+    def test_stage_b_projects_consultation_topics_without_consuming_pending(
+        self,
+    ) -> None:
+        from agent.harness.action_registry import CONSULTATION_TOPIC_PURPOSES
+        from agent.harness.hierarchical_planner import _stage_b_payload
+
+        pending = {
+            "id": "rpc_mode",
+            "group": "workload_rpc",
+            "owner": "chain_rpc",
+            "field": "rpc_mode",
+            "kind": "choice",
+            "options": [
+                {"id": "1", "label": "single", "value": "single"},
+                {"id": "2", "label": "mixed", "value": "mixed"},
+            ],
+        }
+        state = {
+            "language": "en",
+            "active_group": "workload_rpc",
+            "pending_question": pending,
+            "chain_identity": {"canonical": "bsc", "status": "confirmed"},
+        }
+        partition = [{
+            "unit_id": "unit-1",
+            "clause_id": "clause-1",
+            "source_text": "What is the current template workload?",
+            "operation": "consultation",
+            "owner_routes": [{
+                "owner": "orientation",
+                "group": "workload_rpc",
+            }],
+            "reason": "read-only workload question",
+        }]
+
+        payload = _stage_b_payload(
+            state,
+            "orientation",
+            frozenset({"workload_rpc"}),
+            partition,
+            ("unit-1",),
+        )
+        answer = next(
+            row
+            for row in payload["owner_action_schema"]
+            if row["type"] == "answer_opening_question"
+        )
+
+        self.assertEqual(answer["topic_purposes"], dict(CONSULTATION_TOPIC_PURPOSES))
+        self.assertEqual(payload["pending_question"], pending)
+        self.assertEqual(payload["semantic_units"], partition)
+
     def test_production_partition_rechecks_when_stage_a_admission_rejects(
         self,
     ) -> None:
